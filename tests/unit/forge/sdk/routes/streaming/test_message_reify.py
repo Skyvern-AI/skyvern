@@ -11,6 +11,7 @@ from starlette.websockets import WebSocketState
 
 from skyvern.config import settings
 from skyvern.forge.sdk.routes.streaming.channels import message as message_module
+from skyvern.forge.sdk.routes.streaming.channels.cdp import CdpChannel
 from skyvern.forge.sdk.routes.streaming.channels.execution import ExecutionChannel, LocalExecutionChannel
 from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageChannel,
@@ -175,6 +176,31 @@ class TestExecutionChannelHelpers:
         page.reload.assert_awaited_once_with(**timeout_kwargs)
         page.go_back.assert_awaited_once_with(**timeout_kwargs)
         page.go_forward.assert_awaited_once_with(**timeout_kwargs)
+
+
+class TestCdpChannelSelection:
+    def test_select_browser_context_prefers_populated_context(self) -> None:
+        empty_context = MagicMock()
+        empty_context.pages = []
+
+        populated_page = MagicMock()
+        populated_page.url = "https://example.com"
+        populated_context = MagicMock()
+        populated_context.pages = [populated_page]
+
+        assert CdpChannel._select_browser_context([empty_context, populated_context]) is populated_context
+
+    def test_select_page_prefers_non_devtools_page(self) -> None:
+        devtools_page = MagicMock()
+        devtools_page.url = "devtools://devtools/bundled/inspector.html"
+
+        regular_page = MagicMock()
+        regular_page.url = "https://example.com"
+
+        browser_context = MagicMock()
+        browser_context.pages = [devtools_page, regular_page]
+
+        assert CdpChannel._select_page(browser_context) is regular_page
 
 
 class TestLocalExecutionChannel:
