@@ -120,6 +120,21 @@ BAD (1 block):
 **Login + Action**: login (authenticate) -> navigation (do work) -> extraction (results)
 **Batch processing**: for_loop over URLs -> navigation (process each) -> extraction (gather data)
 
+### Authenticated remote reuse
+
+For repeated authenticated remote workflows, prefer cloud browser profiles over logging in every run.
+If the user clearly asks to "save" or "remember" the authenticated state, save it once with
+skyvern_browser_profile_create and reuse the returned browser_profile_id on future runs.
+Two source paths:
+- From a browser_session_id (pbs_...): close the session first with skyvern_browser_session_close
+  and wait ~5-10s for the archive to upload before calling skyvern_browser_profile_create; the
+  server returns ARCHIVE_NOT_READY until it finishes.
+- From a workflow_run_id (wr_...): the run must have been defined with persist_browser_session=true,
+  and the server polls internally so no extra close-wait is required. tsk_v2_ task IDs are not accepted.
+Reuse the returned browser_profile_id with skyvern_workflow_run for automated runs or
+skyvern_browser_session_create for interactive cloud work.
+Do not use state_save/state_load for cloud profile reuse; those are local browser-state files.
+
 ---
 
 ## Parameterize for Reuse

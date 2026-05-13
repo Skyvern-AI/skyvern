@@ -189,6 +189,11 @@ def _handle_tool_error(e: Exception, *, tool: str, hint: str, json_output: bool)
 def session_create(
     timeout: int = typer.Option(60, help="Session timeout in minutes."),
     proxy: str | None = typer.Option(None, help="Proxy location (e.g. RESIDENTIAL)."),
+    browser_profile_id: str | None = typer.Option(
+        None,
+        "--browser-profile-id",
+        help="Cloud browser profile ID (bp_...) with saved authenticated state to load.",
+    ),
     local: bool = typer.Option(False, "--local", help="Launch a local browser instead of cloud."),
     headless: bool = typer.Option(False, "--headless", help="Run local browser headless."),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
@@ -207,13 +212,17 @@ def session_create(
             skyvern,
             timeout=timeout,
             proxy_location=proxy,
+            browser_profile_id=browser_profile_id,
         )
         save_state(CLIState(session_id=result.session_id, cdp_url=None, mode="cloud"))
-        return {
+        data = {
             "session_id": result.session_id,
             "mode": "cloud",
             "timeout_minutes": result.timeout_minutes,
         }
+        if result.browser_profile_id:
+            data["browser_profile_id"] = result.browser_profile_id
+        return data
 
     try:
         data = asyncio.run(_run())

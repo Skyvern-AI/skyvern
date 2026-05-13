@@ -16,6 +16,7 @@ class SessionCreateResult:
     local: bool = False
     headless: bool = False
     timeout_minutes: int | None = None
+    browser_profile_id: str | None = None
 
 
 @dataclass
@@ -65,20 +66,28 @@ async def do_session_create(
     extensions: list[Extensions] | None = None,
     local: bool = False,
     headless: bool = False,
+    browser_profile_id: str | None = None,
 ) -> tuple[Any, SessionCreateResult]:
     """Create browser session. Returns (browser, result)."""
     if local:
+        if browser_profile_id:
+            raise ValueError("browser_profile_id is only supported for cloud browser sessions")
         browser = await skyvern.launch_local_browser(headless=headless)
         return browser, SessionCreateResult(session_id=None, local=True, headless=headless)
 
     proxy = coerce_proxy_location(proxy_location)
     launch_kwargs: dict[str, Any] = {"timeout": timeout, "proxy_location": proxy}
+    if browser_profile_id is not None:
+        launch_kwargs["browser_profile_id"] = browser_profile_id
     if extensions is not None:
         launch_kwargs["extensions"] = extensions
     browser = await skyvern.launch_cloud_browser(**launch_kwargs)
+    # SkyvernBrowser does not expose browser_profile_id today; surface the
+    # requested id so callers (CLI result, MCP data) can display what was sent.
     return browser, SessionCreateResult(
         session_id=browser.browser_session_id,
         timeout_minutes=timeout,
+        browser_profile_id=browser_profile_id,
     )
 
 
