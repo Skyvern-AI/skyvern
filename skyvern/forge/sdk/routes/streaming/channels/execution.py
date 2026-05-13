@@ -220,7 +220,7 @@ class ExecutionChannel(CdpChannel):
         candidate = url.strip()
         if not candidate:
             raise ValueError("URL must not be empty")
-        if candidate.startswith("/"):
+        if candidate.startswith("//"):
             raise ValueError("URL must include an explicit http(s) scheme or host")
 
         parsed = urlparse(candidate)
@@ -228,7 +228,7 @@ class ExecutionChannel(CdpChannel):
             return candidate
         if parsed.scheme:
             raise ValueError(f"refusing to navigate to non-http(s) scheme: {parsed.scheme}")
-        # Bare host -- prepend https://.
+        # Bare host or path -- prepend https://.
         return f"https://{candidate}"
 
     @staticmethod

@@ -361,6 +361,7 @@ class Skyvern(AsyncSkyvern):
         browser_address: str | None = None,
         ai_fallback: bool | None = None,
         run_with: str | None = None,
+        run_metadata: dict[str, str] | None = None,
         wait_for_completion: bool = False,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
         request_options: RequestOptions | None = None,
@@ -383,6 +384,7 @@ class Skyvern(AsyncSkyvern):
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            run_metadata=run_metadata,
             request_options=request_options,
         )
         if wait_for_completion:

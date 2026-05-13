@@ -468,6 +468,16 @@ class AgentFunction:
         """
         return False
 
+    async def record_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Persist per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
     MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (

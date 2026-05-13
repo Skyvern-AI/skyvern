@@ -454,7 +454,7 @@ function FloatingWindow({
     setIsMinimized(true);
 
     const defaultLeft = 0;
-    const parentBottom = parentRef.current?.offsetHeight ?? 0;
+    const parentBottom = parentRef.current?.offsetHeight;
     const defaultTop = parentBottom - Constants.MinHeight - 16;
     const left = minimizedPosition?.x ?? defaultLeft;
     const top = minimizedPosition?.y ?? defaultTop;

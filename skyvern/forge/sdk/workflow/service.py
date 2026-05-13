@@ -356,6 +356,52 @@ class WorkflowService:
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
 
     @staticmethod
+    async def _record_workflow_run_metadata_best_effort(
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Persist optional workflow-run metadata while swallowing write failures."""
+        if not run_metadata:
+            return
+
+        try:
+            await app.AGENT_FUNCTION.record_workflow_run_metadata(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                run_metadata=run_metadata,
+            )
+        except Exception:
+            LOG.warning(
+                "Failed to record workflow run metadata",
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+
+    def _record_workflow_run_metadata_in_background(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+        run_metadata: dict[str, str] | None,
+    ) -> None:
+        """Schedule optional workflow-run metadata persistence off the run-creation path."""
+        if not run_metadata:
+            return
+
+        task = asyncio.create_task(
+            self._record_workflow_run_metadata_best_effort(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                run_metadata=run_metadata,
+            )
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    @staticmethod
     def _determine_cache_invalidation(
         previous_blocks: list[dict[str, Any]],
         new_blocks: list[dict[str, Any]],
@@ -857,6 +903,12 @@ class WorkflowService:
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
             )
+            self._record_workflow_run_metadata_in_background(
+                workflow_run_id=workflow_run.workflow_run_id,
+                organization_id=organization.organization_id,
+                run_metadata=workflow_request.run_metadata,
+            )
+
             LOG.info(
                 f"Created workflow run {workflow_run.workflow_run_id} for workflow {workflow.workflow_id}",
                 request_id=request_id,

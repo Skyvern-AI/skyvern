@@ -442,6 +442,7 @@ async def run_workflow(
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
+        run_metadata=workflow_run_request.run_metadata,
     )
 
     trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
