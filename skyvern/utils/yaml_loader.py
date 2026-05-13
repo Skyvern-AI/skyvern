@@ -41,3 +41,24 @@ def safe_load_no_dates(stream: Any) -> Any:
         return loader.get_single_data()
     finally:
         loader.dispose()  # type: ignore[no-untyped-call]
+
+
+def format_yaml_error(exc: yaml.YAMLError) -> str:
+    """Build a user-actionable detail string from a PyYAML parse error.
+
+    ``MarkedYAMLError`` (parent of ScannerError/ParserError/ComposerError) carries
+    a ``problem`` description plus 1-indexed-friendly line/column marks. Plain
+    ``yaml.YAMLError`` instances fall back to ``str(exc)``.
+    """
+    if isinstance(exc, yaml.MarkedYAMLError):
+        problem = (exc.problem or "could not parse YAML").strip()
+        parts = [f"Invalid YAML: {problem}"]
+        if exc.problem_mark is not None:
+            parts.append(f"at line {exc.problem_mark.line + 1}, column {exc.problem_mark.column + 1}")
+        if exc.context and exc.context_mark is not None:
+            parts.append(
+                f"({exc.context.strip()} at line {exc.context_mark.line + 1}, column {exc.context_mark.column + 1})"
+            )
+        return " ".join(parts)
+    message = str(exc).strip()
+    return f"Invalid YAML: {message}" if message else "Invalid YAML"

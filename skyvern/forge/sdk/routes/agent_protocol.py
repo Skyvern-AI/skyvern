@@ -142,7 +142,7 @@ from skyvern.schemas.workflows import (
 )
 from skyvern.services import block_service, run_service, task_v1_service, task_v2_service, workflow_service
 from skyvern.services.pdf_import_service import pdf_import_service
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.utils.yaml_loader import format_yaml_error, safe_load_no_dates
 from skyvern.webeye.actions.actions import Action
 
 LOG = structlog.get_logger()
@@ -601,8 +601,8 @@ async def create_workflow_legacy(
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     # Auto-sanitize block labels and update references for imports
     workflow_yaml = sanitize_workflow_yaml_with_references(workflow_yaml)
@@ -678,8 +678,8 @@ async def create_workflow(
             organization=current_org,
             request=workflow_definition,
         )
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
@@ -1007,8 +1007,8 @@ async def update_workflow_legacy(
     raw_yaml = await request.body()
     try:
         workflow_yaml = safe_load_no_dates(raw_yaml)
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
 
     try:
         workflow_create_request = WorkflowCreateYAMLRequest.model_validate(workflow_yaml)
@@ -1091,8 +1091,8 @@ async def update_workflow(
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
         )
-    except yaml.YAMLError:
-        raise HTTPException(status_code=422, detail="Invalid YAML")
+    except yaml.YAMLError as exc:
+        raise HTTPException(status_code=422, detail=format_yaml_error(exc))
     except WorkflowDefinitionValidationException as e:
         raise e
     except (SkyvernHTTPException, ValidationError) as e:
