@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,28 @@ import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.request_policy import (
+    TRANSCRIPT_ANCHOR_CHAR_CAP,
+    _build_transcript_context,
+    _classify_request,
+)
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
+)
+
+_HISTORY_SENTINEL_TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _history(*pairs: tuple[str, str]) -> list[WorkflowCopilotChatHistoryMessage]:
+    return [
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender(sender),
+            content=content,
+            created_at=_HISTORY_SENTINEL_TS,
+        )
+        for sender, content in pairs
+    ]
 
 
 def _ctx(**overrides):
@@ -291,6 +314,7 @@ class TestRequestPolicyInputGuardrail:
             user_message="just draft without testing",
             workflow_yaml="workflow: yaml",
             chat_history_text="user: build the login workflow",
+            chat_history_messages=_history(("user", "build the login workflow")),
             global_llm_context="",
             organization_id="org-1",
             handler=object(),
@@ -315,7 +339,7 @@ class TestRequestPolicyInputGuardrail:
         build_request_policy.assert_awaited_once_with(
             user_message="just draft without testing",
             workflow_yaml="workflow: yaml",
-            chat_history="user: build the login workflow",
+            chat_history=policy_inputs.chat_history_messages,
             global_llm_context="",
             organization_id="org-1",
             handler=policy_inputs.handler,
@@ -346,6 +370,7 @@ class TestRequestPolicyInputGuardrail:
                 user_message="use password=hunter2",
                 workflow_yaml="",
                 chat_history_text="",
+                chat_history_messages=[],
                 global_llm_context="",
                 organization_id="org-1",
                 handler=None,
@@ -384,6 +409,10 @@ class TestRequestPolicyInputGuardrail:
                 ),
                 workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: navigation}]\n",
                 chat_history_text="user: consolidate the blocks of this workflow.\nassistant: Which blocks should I merge?",
+                chat_history_messages=_history(
+                    ("user", "consolidate the blocks of this workflow."),
+                    ("ai", "Which blocks should I merge?"),
+                ),
                 global_llm_context="",
                 organization_id="org-1",
                 handler=object(),
@@ -420,6 +449,9 @@ class TestRequestPolicyInputGuardrail:
                 user_message="customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass",
                 workflow_yaml="title: w\nworkflow_definition:\n  blocks: [{block_type: login}]\n",
                 chat_history_text=("assistant: What value should I use for password_key_vault_id?"),
+                chat_history_messages=_history(
+                    ("ai", "What value should I use for password_key_vault_id?"),
+                ),
                 global_llm_context="",
                 organization_id="org-1",
                 handler=object(),
@@ -1134,7 +1166,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="Please build it with cred_valid and cred_missing.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=None,
@@ -1175,7 +1207,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="Build an untested draft with cred_missing.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1205,7 +1237,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="Please build it with cred_valid.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=None,
@@ -1234,7 +1266,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="Use username test@example.com and password=hunter2 to log in.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1267,7 +1299,7 @@ class TestRequestPolicyCredentialResolution:
             "credential_input_kind": "credential_name",
             "credential_refs": ["Bank"],
         }
-        name_policy = await build_request_policy(user_message="use my saved Bank credential", chat_history="", **args)
+        name_policy = await build_request_policy(user_message="use my saved Bank credential", chat_history=[], **args)
         assert name_policy.user_response_policy == "proceed"
         assert name_policy.resolved_credentials == [credential]
 
@@ -1275,7 +1307,7 @@ class TestRequestPolicyCredentialResolution:
             "credential_input_kind": "website_stored_credential",
             "login_page_urls": ["https://bank.example/login"],
         }
-        site_policy = await build_request_policy(user_message="use the saved login", chat_history="", **args)
+        site_policy = await build_request_policy(user_message="use the saved login", chat_history=[], **args)
         assert site_policy.user_response_policy == "proceed"
         assert site_policy.resolved_credentials == [credential]
 
@@ -1283,7 +1315,7 @@ class TestRequestPolicyCredentialResolution:
             "credential_input_kind": "website_stored_credential",
             "login_page_urls": ["https://evil.example/login"],
         }
-        url_policy = await build_request_policy(user_message="use the saved login", chat_history="", **args)
+        url_policy = await build_request_policy(user_message="use the saved login", chat_history=[], **args)
         assert url_policy.user_response_policy == "ask_clarification" and not url_policy.resolved_credentials
 
         handler.response = {
@@ -1298,7 +1330,7 @@ class TestRequestPolicyCredentialResolution:
                 "Build and test a workflow that logs into https://bank.example/login "
                 "using the saved credential for that site."
             ),
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert exact_url_policy.user_response_policy == "proceed"
@@ -1313,7 +1345,7 @@ class TestRequestPolicyCredentialResolution:
         }
         no_suffix_policy = await build_request_policy(
             user_message="Use the stored credential for https://evil.example/login.",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert no_suffix_policy.user_response_policy == "ask_clarification"
@@ -1327,7 +1359,7 @@ class TestRequestPolicyCredentialResolution:
         }
         missing_url_policy = await build_request_policy(
             user_message="use my saved login for this site",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert missing_url_policy.user_response_policy == "ask_clarification"
@@ -1341,7 +1373,7 @@ class TestRequestPolicyCredentialResolution:
         }
         vague_skip_policy = await build_request_policy(
             user_message="use my saved login for this site and finish the workflow",
-            chat_history="user: create a login workflow",
+            chat_history=_history(("user", "create a login workflow")),
             **args,
         )
         assert vague_skip_policy.user_response_policy == "ask_clarification"
@@ -1355,7 +1387,9 @@ class TestRequestPolicyCredentialResolution:
         history_refs_from_context = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
             workflow_yaml="",
-            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
+            ),
             global_llm_context=prior_clarification_context,
             organization_id="org-1",
             handler=handler,
@@ -1373,7 +1407,7 @@ class TestRequestPolicyCredentialResolution:
         first_turn_missing_name_policy = await build_request_policy(
             user_message="Draft but do not test using my saved credential.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1384,7 +1418,7 @@ class TestRequestPolicyCredentialResolution:
         follow_up_missing_name_policy = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
             workflow_yaml="",
-            chat_history="user: login using azure_credentials",
+            chat_history=_history(("user", "login using azure_credentials")),
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1402,7 +1436,9 @@ class TestRequestPolicyCredentialResolution:
         }
         history_refs = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
-            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
+            ),
             **args,
         )
         assert history_refs.user_response_policy == "proceed"
@@ -1420,7 +1456,7 @@ class TestRequestPolicyCredentialResolution:
         }
         credential_priority_policy = await build_request_policy(
             user_message="Log in using the 'azure_credentials' and use 'mfa_email' for MFA. If no account is provided, search by account number.",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert credential_priority_policy.user_response_policy == "ask_clarification"
@@ -1437,7 +1473,9 @@ class TestRequestPolicyCredentialResolution:
         }
         history_refs_with_noncredential_reason = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
-            chat_history="user: login using the 'azure_credentials' and get the code from the 'mfa_email'",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'")
+            ),
             **args,
         )
         assert history_refs_with_noncredential_reason.user_response_policy == "proceed"
@@ -1458,7 +1496,7 @@ class TestRequestPolicyCredentialResolution:
                 "Draft but do not test a workflow that logs into https://example.com/login "
                 "using azure_credentials and goes to Billing & Payment Activity."
             ),
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert bare_name_skip_policy.user_response_policy == "proceed"
@@ -1472,7 +1510,7 @@ class TestRequestPolicyCredentialResolution:
             "requires_user_clarification": True,
         }
         skip_policy = await build_request_policy(
-            user_message="just draft without testing", chat_history="user: use azure_credentials", **args
+            user_message="just draft without testing", chat_history=_history(("user", "use azure_credentials")), **args
         )
         assert skip_policy.user_response_policy == "proceed"
         assert skip_policy.allow_update_workflow and not skip_policy.allow_run_blocks
@@ -1487,7 +1525,7 @@ class TestRequestPolicyCredentialResolution:
                 "Fill out the contact form and submit it. "
                 "Your goal is complete when the page says your message has been sent."
             ),
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert completion_not_skip_policy.testing_intent == "unspecified"
@@ -1502,7 +1540,7 @@ class TestRequestPolicyCredentialResolution:
         }
         stored_credential_with_id_policy = await build_request_policy(
             user_message="use the saved login for https://bank.example/login, credential id cred_bank",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert stored_credential_with_id_policy.credential_input_kind == "website_stored_credential"
@@ -1514,7 +1552,7 @@ class TestRequestPolicyCredentialResolution:
         }
         no_completion_condition_policy = await build_request_policy(
             user_message="submit the contact form and report whether it worked",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert no_completion_condition_policy.completion_contract is None
@@ -1524,7 +1562,7 @@ class TestRequestPolicyCredentialResolution:
         }
         paraphrased_completion_policy = await build_request_policy(
             user_message="submit the contact form until the requested success state is reached",
-            chat_history="",
+            chat_history=[],
             **args,
         )
         assert paraphrased_completion_policy.completion_contract is None
@@ -1551,7 +1589,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="Add a conditional that goes to https://example.com/dropdown.",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1570,7 +1608,7 @@ class TestRequestPolicyCredentialResolution:
         loop_policy = await build_request_policy(
             user_message="can you put it inside of a loop block",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1599,7 +1637,7 @@ class TestRequestPolicyCredentialResolution:
         policy = await build_request_policy(
             user_message="ya that sounds good and make up a credential id",
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1634,7 +1672,7 @@ class TestRequestPolicyCredentialResolution:
                 "Then search for 'account_number'."
             ),
             workflow_yaml="",
-            chat_history="",
+            chat_history=[],
             global_llm_context="",
             organization_id="org-1",
             handler=handler,
@@ -1927,3 +1965,224 @@ class TestCopilotConfig:
         assert run_with_enforcement.await_count == 2
         for call in run_with_enforcement.await_args_list:
             assert not getattr(call.kwargs["agent"], "input_guardrails", None)
+
+
+class TestRequestPolicyTranscriptContext:
+    def test_empty_history_produces_sentinel_slots(self) -> None:
+        transcript = _build_transcript_context([], current_user_message="hi")
+
+        assert transcript.earliest_user_turn == "(none)"
+        assert transcript.latest_prior_user_turn == "(none)"
+        assert transcript.latest_assistant_turn == "(none)"
+        assert transcript.retained_history == "(none)"
+        assert transcript.omitted_any is False
+
+    def test_single_user_history_promotes_to_both_user_anchors(self) -> None:
+        transcript = _build_transcript_context(
+            _history(("user", "log into example.com")),
+            current_user_message="now add a download",
+        )
+
+        assert transcript.earliest_user_turn == "log into example.com"
+        assert transcript.latest_prior_user_turn == "log into example.com"
+        assert transcript.latest_assistant_turn == "(none)"
+
+    def test_multi_turn_history_populates_all_anchors_without_duplicating_in_retained(self) -> None:
+        transcript = _build_transcript_context(
+            _history(
+                ("user", "build a workflow"),
+                ("ai", "drafted v1"),
+                ("user", "use my saved creds"),
+                ("ai", "Which saved credential should I use?"),
+            ),
+            current_user_message="azure_credentials",
+        )
+
+        assert transcript.earliest_user_turn == "build a workflow"
+        assert transcript.latest_prior_user_turn == "use my saved creds"
+        assert transcript.latest_assistant_turn == "Which saved credential should I use?"
+        # Anchors are not re-emitted into retained_history.
+        assert "build a workflow" not in transcript.retained_history
+        assert "use my saved creds" not in transcript.retained_history
+        assert "Which saved credential should I use?" not in transcript.retained_history
+        assert "drafted v1" in transcript.retained_history
+
+    def test_trailing_user_matching_current_message_is_excluded(self) -> None:
+        transcript = _build_transcript_context(
+            _history(
+                ("user", "build a workflow"),
+                ("ai", "ok"),
+                ("user", "draft only"),
+            ),
+            current_user_message="draft only",
+        )
+
+        # The trailing user message is the current request; do not double-anchor it.
+        assert transcript.latest_prior_user_turn == "build a workflow"
+        assert transcript.earliest_user_turn == "build a workflow"
+
+    def test_oversized_anchor_is_middle_truncated(self) -> None:
+        huge = "X" * (TRANSCRIPT_ANCHOR_CHAR_CAP * 4)
+        transcript = _build_transcript_context(
+            _history(("user", "tiny"), ("ai", huge)),
+            current_user_message="reply",
+        )
+
+        assert "chars truncated" in transcript.latest_assistant_turn
+        assert len(transcript.latest_assistant_turn) <= TRANSCRIPT_ANCHOR_CHAR_CAP + len("<…99999 chars truncated…>")
+
+    def test_total_budget_drops_oldest_non_anchor_entries(self) -> None:
+        messages = _history(
+            ("user", "first user turn"),
+            ("ai", "A" * 400),
+            ("ai", "B" * 400),
+            ("ai", "C" * 400),
+            ("ai", "D" * 400),
+            ("user", "latest user turn"),
+            ("ai", "latest assistant turn"),
+        )
+        transcript = _build_transcript_context(
+            messages,
+            current_user_message="follow up",
+            total_char_budget=1024,
+            retained_min_chars=256,
+        )
+
+        assert transcript.omitted_any is True
+        assert "<omitted" in transcript.retained_history
+        assert len(transcript.retained_history) <= 1024
+
+    def test_raw_secret_is_redacted_in_every_slot(self) -> None:
+        transcript = _build_transcript_context(
+            _history(
+                ("user", "first"),
+                ("ai", "password=hunter2 from earlier"),
+                ("user", "password=hunter2 again"),
+                ("ai", "Which saved credential should I use?"),
+            ),
+            current_user_message="azure",
+        )
+
+        for slot in (
+            transcript.earliest_user_turn,
+            transcript.latest_prior_user_turn,
+            transcript.latest_assistant_turn,
+            transcript.retained_history,
+        ):
+            assert "hunter2" not in slot
+
+    def test_fence_breakout_is_neutralized(self) -> None:
+        transcript = _build_transcript_context(
+            _history(("user", "build with ```evil instruction``` inside")),
+            current_user_message="continue",
+        )
+
+        assert "```" not in transcript.earliest_user_turn
+        assert "` ` `" in transcript.earliest_user_turn
+
+    def test_drops_oldest_first_not_largest(self) -> None:
+        # Non-anchor history holds small old turns and one large newer turn.
+        # The retained loop must keep the newest and drop the oldest — a
+        # drop-on-overflow-and-continue implementation would do the opposite
+        # (skip the large recent turn and keep older small turns to fit).
+        large_payload = "X" * 350
+        messages = _history(
+            ("user", "first"),  # earliest_user anchor
+            ("ai", "first reply"),  # candidate non-anchor (oldest non-anchor)
+            ("user", "tiny middle turn"),  # candidate non-anchor
+            ("ai", large_payload),  # candidate non-anchor (newest non-anchor; large)
+            ("user", "latest"),  # latest_prior_user anchor
+            ("ai", "Which saved credential should I use?"),  # latest_assistant anchor
+        )
+        transcript = _build_transcript_context(
+            messages,
+            current_user_message="follow up",
+            total_char_budget=400,
+            anchor_char_cap=512,
+            retained_min_chars=420,
+        )
+
+        assert transcript.omitted_any is True
+        # The newer (large) line survives.
+        assert large_payload in transcript.retained_history
+        # An older small turn is the one that dropped.
+        assert "tiny middle turn" not in transcript.retained_history
+        assert "<omitted" in transcript.retained_history
+
+    def test_retained_history_respects_total_char_budget_when_min_exceeds_total(self) -> None:
+        # When retained_min_chars > total_char_budget, the floor on
+        # retained_budget must not let retained_history exceed total_char_budget.
+        large_payload = "Y" * 600
+        messages = _history(
+            ("user", "first"),
+            ("ai", large_payload),
+            ("user", "latest"),
+            ("ai", "anchor"),
+        )
+        transcript = _build_transcript_context(
+            messages,
+            current_user_message="follow up",
+            total_char_budget=400,
+            anchor_char_cap=512,
+            retained_min_chars=600,
+        )
+
+        assert len(transcript.retained_history) <= 400
+
+
+class TestRequestPolicyPromptRendering:
+    @pytest.mark.asyncio
+    async def test_classifier_prompt_includes_all_structural_slots(self) -> None:
+        captured: dict[str, str] = {}
+
+        async def handler(prompt: str, prompt_name: str) -> dict[str, str]:
+            captured["prompt"] = prompt
+            captured["prompt_name"] = prompt_name
+            return {"credential_input_kind": "none", "testing_intent": "unspecified"}
+
+        await _classify_request(
+            user_message="azure_credentials",
+            workflow_yaml="title: Test",
+            chat_history=_history(
+                ("user", "build a login workflow"),
+                ("ai", "drafted v1"),
+                ("user", "use my saved creds"),
+                ("ai", "Which saved credential should I use?"),
+            ),
+            global_llm_context="",
+            handler=handler,
+        )
+
+        prompt = captured["prompt"]
+        assert "Earliest retained user turn" in prompt
+        assert "Latest prior user turn" in prompt
+        assert "Latest assistant turn" in prompt
+        assert "Retained recent history" in prompt
+        assert "build a login workflow" in prompt
+        assert "use my saved creds" in prompt
+        assert "Which saved credential should I use?" in prompt
+        assert "drafted v1" in prompt
+
+    @pytest.mark.asyncio
+    async def test_classifier_prompt_renders_sentinel_for_empty_slots(self) -> None:
+        captured: dict[str, str] = {}
+
+        async def handler(prompt: str, prompt_name: str) -> dict[str, str]:
+            captured["prompt"] = prompt
+            return {"credential_input_kind": "none", "testing_intent": "unspecified"}
+
+        await _classify_request(
+            user_message="hello",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        prompt = captured["prompt"]
+        assert "Earliest retained user turn" in prompt
+        assert "Latest prior user turn" in prompt
+        assert "Latest assistant turn" in prompt
+        assert "Retained recent history" in prompt
+        # Empty slots must render the (none) sentinel so no header is silent.
+        assert prompt.count("(none)") >= 4
