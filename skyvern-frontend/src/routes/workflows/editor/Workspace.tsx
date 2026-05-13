@@ -46,6 +46,7 @@ import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSidebarStore } from "@/store/SidebarStore";
+import { useBrowserLoadingFlag } from "../hooks/useBrowserLoadingFlag";
 
 import { AnimatedWave } from "@/components/AnimatedWave";
 import { Button } from "@/components/ui/button";
@@ -588,6 +589,8 @@ function Workspace({
     },
     [],
   );
+
+  useBrowserLoadingFlag(shouldFetchDebugSession, readyBrowserSessionId);
 
   const hasLoopBlock = nodes.some((node) => node.type === "loop");
   const hasHttpBlock = nodes.some((node) => node.type === "http_request");
