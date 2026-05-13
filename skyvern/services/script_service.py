@@ -3193,7 +3193,14 @@ async def loop(
     # step 5. start the loop
     try:
         # Iterates loop values; captures baseline files; yields items with metadata
+        total_iterations = len(loop_values)
         for index, value in enumerate(loop_values):
+            LOG.info(
+                "skyvern.loop iteration",
+                block_label=label,
+                loop_index=index,
+                total_iterations=total_iterations,
+            )
             downloaded_file_signatures_before_iteration: list[tuple[str | None, str | None, str | None]] = []
             baseline_timed_out = False
             try:
@@ -3250,7 +3257,7 @@ async def loop(
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus.failed,
-                failure_reason=str(e),
+                failure_reason=str(e).strip() or type(e).__name__,
                 output=block_validation_output.context.loop_output_values,
                 label=label,
             )
@@ -3383,6 +3390,11 @@ async def while_loop(
             # Invariant: loop_output_values was set to [] before the while True loop.
             assert block_validation_output.context.loop_output_values is not None
             block_validation_output.context.loop_output_values.append([])
+            LOG.info(
+                "skyvern.while_loop iteration",
+                block_label=label,
+                loop_index=loop_idx,
+            )
             yield SkyvernLoopItem(loop_idx, None)
             loop_idx += 1
 
@@ -3398,7 +3410,7 @@ async def while_loop(
             await _update_workflow_block(
                 workflow_run_block_id,
                 BlockStatus.failed,
-                failure_reason=str(e),
+                failure_reason=str(e).strip() or type(e).__name__,
                 output=block_validation_output.context.loop_output_values,
                 label=label,
             )
