@@ -46,37 +46,167 @@ class ExfiltratedEvent:
 OnExfiltrationEvent = t.Callable[[list[ExfiltratedEvent]], None]
 
 
+@dataclasses.dataclass
+class PageConsoleCapture:
+    page: Page
+    console_listener: t.Callable[[ConsoleMessage], object]
+    cdp_session: CDPSession | None = None
+
+
 class ExfiltrationChannel(CdpChannel):
     """
     ExfiltrationChannel.
     """
 
+    CONSOLE_DEDUP_TTL_SECONDS: t.ClassVar[float] = 5.0
+
     def __init__(self, *, on_event: OnExfiltrationEvent, vnc_channel: VncChannel) -> None:
         self.cdp_session: CDPSession | None = None
         self.on_event = on_event
+        self._page_console_captures: dict[int, PageConsoleCapture] = {}
+        self._recent_console_event_fingerprints: dict[str, float] = {}
 
         super().__init__(vnc_channel=vnc_channel)
 
-    def _handle_console_event(self, msg: ConsoleMessage) -> None:
-        """Parse console messages for exfiltrated event data."""
-        text = msg.text
-        if text.startswith("[EXFIL]"):
+    def _parse_exfil_payload(self, payload: object) -> dict[str, t.Any] | None:
+        if isinstance(payload, str):
             try:
-                event_data = json.loads(text[7:])  # Strip '[EXFIL]' prefix
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                return None
 
-                messages = [
-                    ExfiltratedEvent(
-                        kind="exfiltrated-event",
-                        event_name="user_interaction",
-                        params=event_data,
-                        source=ExfiltratedEventSource.CONSOLE,
-                        timestamp=time.time(),
-                    ),
-                ]
+        if isinstance(payload, dict):
+            return t.cast(dict[str, t.Any], payload)
 
-                self.on_event(messages)
-            except Exception:
-                LOG.exception(f"{self.class_name} Failed to parse exfiltrated event", text=text)
+        return None
+
+    def _parse_exfil_text(self, text: str) -> dict[str, t.Any] | None:
+        if not text.startswith("[EXFIL]"):
+            return None
+
+        return self._parse_exfil_payload(text[7:].strip())
+
+    def _parse_exfil_args(self, args: list[object]) -> dict[str, t.Any] | None:
+        if len(args) < 2 or args[0] != "[EXFIL]":
+            return None
+
+        return self._parse_exfil_payload(args[1])
+
+    def _extract_cdp_remote_object_value(self, arg: object) -> object:
+        if not isinstance(arg, dict):
+            return arg
+
+        if "value" in arg:
+            return arg["value"]
+
+        if arg.get("type") == "string" and "description" in arg:
+            return arg["description"]
+
+        preview = arg.get("preview")
+        if isinstance(preview, dict):
+            properties = preview.get("properties")
+            if isinstance(properties, list):
+                materialized: dict[str, object] = {}
+                for prop in properties:
+                    if not isinstance(prop, dict):
+                        continue
+                    name = prop.get("name")
+                    if not isinstance(name, str):
+                        continue
+                    if "value" in prop:
+                        materialized[name] = prop["value"]
+                    elif isinstance(prop.get("valuePreview"), dict) and "value" in prop["valuePreview"]:
+                        materialized[name] = prop["valuePreview"]["value"]
+                if materialized:
+                    return materialized
+
+        return arg
+
+    def _prune_console_dedup_cache(self, now: float) -> None:
+        expired = [
+            fingerprint
+            for fingerprint, emitted_at in self._recent_console_event_fingerprints.items()
+            if now - emitted_at > self.CONSOLE_DEDUP_TTL_SECONDS
+        ]
+        for fingerprint in expired:
+            self._recent_console_event_fingerprints.pop(fingerprint, None)
+
+    def _should_emit_console_event(self, event_data: dict[str, t.Any]) -> bool:
+        try:
+            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            fingerprint = json.dumps(event_data, sort_keys=True, separators=(",", ":"), default=str)
+
+        now = time.monotonic()
+        self._prune_console_dedup_cache(now)
+        previous = self._recent_console_event_fingerprints.get(fingerprint)
+        if previous is not None and now - previous <= self.CONSOLE_DEDUP_TTL_SECONDS:
+            return False
+
+        self._recent_console_event_fingerprints[fingerprint] = now
+        return True
+
+    def _emit_console_event(self, event_data: dict[str, t.Any]) -> None:
+        if not self._should_emit_console_event(event_data):
+            return
+
+        LOG.debug(
+            f"{self.class_name} emitting console EXFIL event",
+            event_name="user_interaction",
+            interaction_type=event_data.get("type"),
+        )
+
+        self.on_event(
+            [
+                ExfiltratedEvent(
+                    kind="exfiltrated-event",
+                    event_name="user_interaction",
+                    params=event_data,
+                    source=ExfiltratedEventSource.CONSOLE,
+                    timestamp=time.time(),
+                )
+            ]
+        )
+
+    async def _handle_console_event_async(self, msg: ConsoleMessage) -> None:
+        """Parse Playwright console messages for exfiltrated event data."""
+        event_data: dict[str, t.Any] | None = None
+        try:
+            args = []
+            for arg in msg.args[:2]:
+                args.append(await arg.json_value())
+            event_data = self._parse_exfil_args(args)
+        except Exception:
+            LOG.debug(f"{self.class_name} Failed to inspect console args for EXFIL event", exc_info=True)
+
+        text = msg.text
+        if event_data is None:
+            event_data = self._parse_exfil_text(text)
+
+        if event_data is None:
+            return
+
+        self._emit_console_event(event_data)
+
+    async def _handle_runtime_console_event_async(self, params: dict[str, t.Any]) -> None:
+        raw_args = params.get("args")
+        if not isinstance(raw_args, list):
+            return
+
+        event_data = self._parse_exfil_args([self._extract_cdp_remote_object_value(arg) for arg in raw_args[:2]])
+        if event_data is None:
+            return
+
+        self._emit_console_event(event_data)
+
+    async def _attach_page_console_capture(self, page: Page) -> CDPSession | None:
+        cdp_session = await page.context.new_cdp_session(page)
+        await cdp_session.send("Runtime.enable")
+        cdp_session.on(
+            "Runtime.consoleAPICalled",
+            lambda params: asyncio.create_task(self._handle_runtime_console_event_async(params)),
+        )
+        return cdp_session
 
     def _handle_cdp_event(self, event_name: str, params: dict) -> None:
         LOG.debug(f"{self.class_name} cdp event captured: {event_name}", params=params)
@@ -136,12 +266,26 @@ class ExfiltrationChannel(CdpChannel):
         if page.url.startswith("devtools:"):
             return self
 
+        page_id = id(page)
+        if page_id in self._page_console_captures:
+            return self
+
         LOG.info(f"{self.class_name} setting up exfiltration on new page.", url=page.url)
 
-        page.on("console", self._handle_console_event)
+        def console_listener(msg: ConsoleMessage) -> None:
+            asyncio.create_task(self._handle_console_event_async(msg))
+
+        page.on("console", console_listener)
 
         await page.add_init_script(self.js("exfiltrate"))
         await page.evaluate(self.js("exfiltrate"))
+
+        capture = PageConsoleCapture(page=page, console_listener=console_listener)
+        self._page_console_captures[page_id] = capture
+        try:
+            capture.cdp_session = await self._attach_page_console_capture(page)
+        except Exception:
+            LOG.warning(f"{self.class_name} failed to attach page CDP EXFIL listener", page_url=page.url, exc_info=True)
 
         LOG.info(f"{self.class_name} setup complete on page.", url=page.url)
 
@@ -272,24 +416,41 @@ class ExfiltrationChannel(CdpChannel):
     async def stop(self) -> t.Self:
         LOG.info(f"{self.class_name} stopping.")
 
-        if not self.cdp_session:
-            return self
+        if self.cdp_session:
+            try:
+                await self.cdp_session.detach()
+            except Exception:
+                pass
+            self.cdp_session = None
 
-        try:
-            await self.cdp_session.detach()
-        except Exception:
-            pass
+        captures = list(self._page_console_captures.values())
+        self._page_console_captures.clear()
 
-        self.cdp_session = None
+        pages = [capture.page for capture in captures]
+        if self.browser_context:
+            for page in self.browser_context.pages:
+                if all(existing is not page for existing in pages):
+                    pages.append(page)
 
-        pages = self.browser_context.pages if self.browser_context else []
+        for capture in captures:
+            try:
+                capture.page.remove_listener("console", capture.console_listener)
+            except KeyError:
+                pass
+
+            if capture.cdp_session:
+                try:
+                    await capture.cdp_session.detach()
+                except Exception:
+                    pass
 
         for page in pages:
             try:
-                page.remove_listener("console", self._handle_console_event)
-            except KeyError:
-                pass  # listener not found
-            await self.undecorate(page)
+                await self.undecorate(page)
+            except Exception:
+                LOG.debug(f"{self.class_name} failed to undecorate page during shutdown", url=page.url, exc_info=True)
+
+        self._recent_console_event_fingerprints.clear()
 
         LOG.info(f"{self.class_name} stopped.")
 

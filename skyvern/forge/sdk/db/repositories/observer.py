@@ -25,6 +25,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_task_v2,
     convert_to_workflow_run_block,
     serialize_proxy_location,
+    truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Status, Thought, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
@@ -414,6 +415,11 @@ class ObserverRepository(BaseRepository):
         current_value: str | None = None,
         current_index: int | None = None,
     ) -> WorkflowRunBlock:
+        if output is not None:
+            output = truncate_oversized_jsonb_value(
+                output,
+                context={"workflow_run_id": workflow_run_id, "label": label, "block_type": block_type},
+            )
         async with self.Session() as session:
             new_workflow_run_block = WorkflowRunBlockModel(
                 workflow_run_id=workflow_run_id,
@@ -494,6 +500,11 @@ class ObserverRepository(BaseRepository):
         executed_branch_result: bool | None = None,
         executed_branch_next_block: str | None = None,
     ) -> WorkflowRunBlock:
+        if output is not None:
+            output = truncate_oversized_jsonb_value(
+                output,
+                context={"workflow_run_block_id": workflow_run_block_id},
+            )
         async with self.Session() as session:
             workflow_run_block = (
                 await session.scalars(

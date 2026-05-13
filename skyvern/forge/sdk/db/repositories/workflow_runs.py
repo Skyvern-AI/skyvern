@@ -36,6 +36,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_workflow_run_output_parameter,
     convert_to_workflow_run_parameter,
     serialize_proxy_location,
+    truncate_oversized_jsonb_value,
 )
 from skyvern.forge.sdk.log_artifacts import save_workflow_run_logs
 from skyvern.forge.sdk.schemas.tasks import Task
@@ -1056,6 +1057,10 @@ class WorkflowRunsRepository(BaseRepository):
         output_parameter_id: str,
         value: dict[str, Any] | list | str | None,
     ) -> WorkflowRunOutputParameter:
+        value = truncate_oversized_jsonb_value(
+            value,
+            context={"workflow_run_id": workflow_run_id, "output_parameter_id": output_parameter_id},
+        )
         async with self.Session() as session:
             # check if the workflow run output parameter already exists
             # if it does, update the value
@@ -1094,6 +1099,10 @@ class WorkflowRunsRepository(BaseRepository):
         output_parameter_id: str,
         value: dict[str, Any] | list | str | None,
     ) -> WorkflowRunOutputParameter:
+        value = truncate_oversized_jsonb_value(
+            value,
+            context={"workflow_run_id": workflow_run_id, "output_parameter_id": output_parameter_id},
+        )
         async with self.Session() as session:
             workflow_run_output_parameter = (
                 await session.scalars(

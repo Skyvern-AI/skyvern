@@ -47,6 +47,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatMessage as WorkflowCopilotChatMessageSchema
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.schemas.workflow_schedules import WorkflowSchedule
+from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.models.parameter import (
     AWSSecretParameter,
     BitwardenLoginCredentialParameter,
@@ -221,6 +222,43 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     Encodes json in the same way that pydantic does.
     """
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
+
+
+def truncate_oversized_jsonb_value(value: typing.Any, *, context: dict | None = None) -> typing.Any:
+    """Fail-open size guard for jsonb-column writes (SKY-9779)."""
+    # Fast-path: None and scalars can't approach the cap; skip the full re-serialization
+    # that 99.9% of writes would pay for nothing.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str) and len(value) <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
+        return value
+
+    try:
+        serialized = _custom_json_serializer(value)
+    except Exception:
+        LOG.warning(
+            "Failed to measure jsonb value size; passing through unchanged",
+            exc_info=True,
+            context=context or {},
+        )
+        return value
+
+    size_bytes = len(serialized.encode("utf-8"))
+    if size_bytes <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
+        return value
+
+    LOG.warning(
+        "Truncating oversized jsonb value",
+        original_size_bytes=size_bytes,
+        limit_bytes=OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+        **(context or {}),
+    )
+    return {
+        "truncated": True,
+        "reason": "exceeded_max_jsonb_value_size",
+        "original_size_bytes": size_bytes,
+        "limit_bytes": OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+    }
 
 
 def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_permanent_id: str | None = None) -> Task:

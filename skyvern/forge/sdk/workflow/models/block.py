@@ -89,6 +89,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, render_pdf_pages_as_images, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
+from skyvern.forge.sdk.workflow.constants import OUTPUT_PARAMETER_MAX_VALUE_BYTES
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -260,6 +261,58 @@ DEFAULT_MAX_LOOP_ITERATIONS = 500
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
 DEFAULT_MAX_STEPS_PER_ITERATION = 50
+
+# Per-field cap for DecisionBlock debug payload (rendered_expression, llm_response, llm_prompt).
+# Same fields exist as branch_metadata debug surface for script-reviewer / UI display; their
+# unbounded form has produced multi-hundred-MB output_parameter rows under recursive Jinja.
+DECISION_BLOCK_FIELD_MAX_BYTES = 64 * 1024
+
+
+def _maybe_truncate_loop_outputs(
+    outputs_with_loop_values: list[list[dict[str, Any]]],
+    *,
+    workflow_run_id: str,
+    output_parameter_id: str | None,
+) -> None:
+    """Fail-open in-memory cap for loop accumulators; preserves per-entry schema (SKY-9779)."""
+    try:
+        size_bytes = len(json.dumps(outputs_with_loop_values, default=str).encode("utf-8"))
+    except Exception:
+        LOG.warning(
+            "Failed to measure loop output size; skipping truncation",
+            workflow_run_id=workflow_run_id,
+            output_parameter_id=output_parameter_id,
+            exc_info=True,
+        )
+        return
+
+    if size_bytes <= OUTPUT_PARAMETER_MAX_VALUE_BYTES:
+        return
+
+    summarized_through = len(outputs_with_loop_values) - 1
+    summary_entry = [
+        {
+            "loop_value": None,
+            "output_parameter": None,
+            "output_value": {
+                "truncated": True,
+                "reason": "loop_output_size_exceeded",
+                "iterations_summarized_through": summarized_through,
+            },
+        }
+    ]
+    LOG.warning(
+        "Truncating loop output accumulator",
+        workflow_run_id=workflow_run_id,
+        output_parameter_id=output_parameter_id,
+        size_bytes=size_bytes,
+        limit_bytes=OUTPUT_PARAMETER_MAX_VALUE_BYTES,
+        iterations_summarized_through=summarized_through,
+    )
+    last = outputs_with_loop_values[-1]
+    outputs_with_loop_values.clear()
+    outputs_with_loop_values.append(summary_entry)
+    outputs_with_loop_values.append(last)
 
 
 class Block(BaseModel, abc.ABC):
@@ -2112,6 +2165,11 @@ class ForLoopBlock(Block):
         cancellation) always persist since they are terminal."""
         if not self.output_parameter:
             return
+        _maybe_truncate_loop_outputs(
+            outputs_with_loop_values,
+            workflow_run_id=workflow_run_id,
+            output_parameter_id=self.output_parameter.output_parameter_id,
+        )
         try:
             await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
                 workflow_run_id=workflow_run_id,
@@ -2722,6 +2780,11 @@ class WhileLoopBlock(Block):
         """
         if not self.output_parameter:
             return
+        _maybe_truncate_loop_outputs(
+            outputs_with_loop_values,
+            workflow_run_id=workflow_run_id,
+            output_parameter_id=self.output_parameter.output_parameter_id,
+        )
         try:
             await app.DATABASE.workflow_runs.create_or_update_workflow_run_output_parameter(
                 workflow_run_id=workflow_run_id,
@@ -7182,6 +7245,34 @@ def _make_empty_params_explicit(
     return "".join(result_parts), True
 
 
+def _cap_debug_field(value: Any, *, limit_bytes: int = DECISION_BLOCK_FIELD_MAX_BYTES) -> Any:
+    """Cap a string at ``limit_bytes`` UTF-8 bytes (suffix included); non-strings pass through (SKY-9779)."""
+    if not isinstance(value, str):
+        return value
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit_bytes:
+        return value
+    overflow_bytes = len(encoded) - limit_bytes
+    suffix = f"…[truncated {overflow_bytes} bytes]"
+    suffix_bytes = len(suffix.encode("utf-8"))
+    head_budget = max(0, limit_bytes - suffix_bytes)
+    return encoded[:head_budget].decode("utf-8", errors="ignore") + suffix
+
+
+def _trim_branch_evaluations(branch_evaluations: list[dict] | None) -> list[dict] | None:
+    """Drop ``rendered_expression`` on non-matched branches; cap the matched one (SKY-9779)."""
+    if not branch_evaluations:
+        return branch_evaluations
+    trimmed: list[dict] = []
+    for ev in branch_evaluations:
+        if ev.get("is_matched"):
+            ev = {**ev, "rendered_expression": _cap_debug_field(ev.get("rendered_expression"))}
+        else:
+            ev = {k: v for k, v in ev.items() if k != "rendered_expression"}
+        trimmed.append(ev)
+    return trimmed
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
@@ -7714,16 +7805,16 @@ class ConditionalBlock(Block):
             if matched_branch and matched_branch.criteria
             else None,
             "next_block_label": next_block_label,
-            # Detailed evaluation info for all branches
-            "evaluations": branch_evaluations_list if branch_evaluations_list else None,
-            # Raw LLM response for debugging prompt-based evaluations (masked for secrets)
-            "llm_response": (
+            # Detailed evaluation info for all branches (rendered_expression trimmed/capped — SKY-9779)
+            "evaluations": _trim_branch_evaluations(branch_evaluations_list) if branch_evaluations_list else None,
+            # Raw LLM response for debugging prompt-based evaluations (masked for secrets, capped)
+            "llm_response": _cap_debug_field(
                 workflow_run_context.mask_secrets_in_data(prompt_llm_response)
                 if workflow_run_context and prompt_llm_response
                 else prompt_llm_response
             ),
-            # The exact prompt sent to LLM for debugging (masked for secrets)
-            "llm_prompt": (
+            # The exact prompt sent to LLM for debugging (masked for secrets, capped)
+            "llm_prompt": _cap_debug_field(
                 workflow_run_context.mask_secrets_in_data(prompt_extraction_goal)
                 if workflow_run_context and prompt_extraction_goal
                 else prompt_extraction_goal
