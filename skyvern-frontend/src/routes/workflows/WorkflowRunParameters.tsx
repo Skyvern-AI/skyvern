@@ -43,6 +43,9 @@ function WorkflowRunParameters() {
     ? (location.state.extraHttpHeaders as Record<string, string>)
     : null;
 
+  const browserProfileId =
+    (location.state?.browserProfileId as string | null | undefined) ?? null;
+
   const runWith = (location.state?.runWith as string) ?? undefined;
 
   const initialValues = getInitialValues(location, workflowParameters ?? []);
@@ -79,6 +82,8 @@ function WorkflowRunParameters() {
           maxScreenshotScrolls ?? workflow.max_screenshot_scrolls ?? null,
         extraHttpHeaders:
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
+        browserProfileId:
+          browserProfileId ?? workflow.browser_profile_id ?? null,
         cdpAddress: null,
         runWith,
       }}

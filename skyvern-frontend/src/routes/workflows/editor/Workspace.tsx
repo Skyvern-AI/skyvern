@@ -1241,6 +1241,7 @@ function Workspace({
       proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: workflowData.webhook_callback_url || "",
       persistBrowserSession: workflowData.persist_browser_session ?? false,
+      browserProfileId: workflowData.browser_profile_id ?? null,
       model: workflowData.model ?? null,
       maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
       extraHttpHeaders: workflowData.extra_http_headers
@@ -1301,6 +1302,7 @@ function Workspace({
         selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
+      browserProfileId: selectedVersion.browser_profile_id ?? null,
       model: selectedVersion.model,
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       extraHttpHeaders: selectedVersion.extra_http_headers

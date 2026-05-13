@@ -41,6 +41,7 @@ import { HelpTooltip } from "@/components/HelpTooltip";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
 import { Input } from "@/components/ui/input";
 import { ProxySelector } from "@/components/ProxySelector";
+import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { ModelSelector } from "@/components/ModelSelector";
@@ -71,6 +72,7 @@ interface StartSettings {
   webhookCallbackUrl: string;
   proxyLocation: ProxyLocation;
   persistBrowserSession: boolean;
+  browserProfileId: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
@@ -152,6 +154,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       persistBrowserSession: data.withWorkflowSettings
         ? data.persistBrowserSession
         : false,
+      browserProfileId: data.withWorkflowSettings
+        ? data.browserProfileId
+        : null,
       model: data.withWorkflowSettings ? data.model : null,
       maxScreenshotScrollingTimes: data.withWorkflowSettings
         ? data.maxScreenshotScrolls
@@ -465,6 +470,18 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             </DialogContent>
                           </Dialog>
                         )}
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Default Browser Profile</Label>
+                          <HelpTooltip content="The default browser profile used when running this workflow. Can be overridden per run." />
+                        </div>
+                        <BrowserProfileSelector
+                          value={data.browserProfileId}
+                          onChange={(value) => {
+                            update({ browserProfileId: value });
+                          }}
+                        />
                       </div>
                       <div className="space-y-2">
                         <div className="flex items-center gap-2">

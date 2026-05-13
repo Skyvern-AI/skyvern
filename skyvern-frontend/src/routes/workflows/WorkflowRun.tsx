@@ -498,6 +498,7 @@ function WorkflowRun() {
                     webhookCallbackUrl: workflowRun?.webhook_callback_url ?? "",
                     maxScreenshotScrolls,
                     runWith: workflowRun?.run_with ?? "agent",
+                    browserProfileId: workflowRun?.browser_profile_id ?? null,
                   }}
                 >
                   <PlayIcon className="mr-2 h-4 w-4" />

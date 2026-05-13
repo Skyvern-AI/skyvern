@@ -148,6 +148,7 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         proxy_location: saveData.settings.proxyLocation,
         webhook_callback_url: saveData.settings.webhookCallbackUrl,
         persist_browser_session: saveData.settings.persistBrowserSession,
+        browser_profile_id: saveData.settings.browserProfileId,
         model: saveData.settings.model,
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
