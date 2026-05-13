@@ -2443,6 +2443,7 @@ class WorkflowService:
 
             fallback_episode_id: str | None = None
             form_fields_for_episode: list | None = None
+            script_exception: Exception | None = None
             if valid_to_run_code:
                 script_block = script_blocks_by_label[block.label]
                 LOG.info(
@@ -2579,6 +2580,7 @@ class WorkflowService:
                         block_executed_with_code = False
                 except Exception as e:
                     block_exec_duration_ms = round((time.monotonic() - block_exec_start) * 1000, 1)
+                    script_exception = e
                     LOG.warning(
                         "Failed to execute block with script code, falling back to AI",
                         block_label=block.label,
@@ -2856,8 +2858,13 @@ class WorkflowService:
                         )
 
             if not workflow_run_block_result:
+                if script_exception is not None:
+                    exc_message = str(script_exception) or "<no message>"
+                    no_block_result_reason = f"Script error ({type(script_exception).__name__}): {exc_message}"
+                else:
+                    no_block_result_reason = "Block result is None"
                 workflow_run = await self.mark_workflow_run_as_failed(
-                    workflow_run_id=workflow_run_id, failure_reason="Block result is None"
+                    workflow_run_id=workflow_run_id, failure_reason=no_block_result_reason
                 )
                 return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
 
