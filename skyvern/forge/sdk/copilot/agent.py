@@ -463,6 +463,24 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
     has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
 
+    policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if (
+        policy is not None
+        and policy.clarification_reason == "workflow_credential_inputs_unbound"
+        and ctx.last_workflow is not None
+        and ctx.last_update_block_count is not None
+    ):
+        if ctx.last_update_block_count <= 0:
+            draft_phrase = "a draft workflow"
+        else:
+            block_word = "block" if ctx.last_update_block_count == 1 else "blocks"
+            draft_phrase = f"a draft workflow with {ctx.last_update_block_count} {block_word}"
+        return (
+            f"I applied your requested change as {draft_phrase}. "
+            f"I couldn't test the modified workflow because I couldn't find the required credentials — "
+            f"please add them via the Credentials UI, then I can try again.{keep_draft_affordance}"
+        )
+
     if ctx.last_test_ok is False and ctx.last_update_block_count is not None:
         if ctx.last_update_block_count <= 0:
             draft_phrase = "a draft workflow"
@@ -1036,15 +1054,17 @@ def _agent_output_to_text(agent_output: Any) -> str:
 
 
 def _should_surface_untested_draft_despite_question(ctx: CopilotContext, response_type: str) -> bool:
+    if response_type != "ASK_QUESTION" or ctx.last_workflow is None or not ctx.last_workflow_yaml:
+        return False
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if request_policy is None or ctx.last_test_ok is not None:
+        return False
+    if request_policy.testing_intent == "skip_test" and ctx.allow_untested_workflow_draft:
+        return True
     return (
-        response_type == "ASK_QUESTION"
-        and request_policy is not None
-        and request_policy.testing_intent == "skip_test"
-        and ctx.allow_untested_workflow_draft
-        and ctx.last_workflow is not None
-        and bool(ctx.last_workflow_yaml)
-        and ctx.last_test_ok is None
+        request_policy.clarification_reason == "workflow_credential_inputs_unbound"
+        and not request_policy.allow_run_blocks
+        and request_policy.allow_missing_credentials_in_draft
     )
 
 
@@ -1073,10 +1093,14 @@ def _evaluate_copilot_final_output_policy(
     updated_workflow_for_kind = (
         ctx.last_workflow if ctx.last_workflow is not None else WORKFLOW_PRESENT_SENTINEL if workflow_yaml else None
     )
-    output_kind = (
-        CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL
-        if surface_untested_draft
-        else derive_output_kind(
+    if surface_untested_draft:
+        output_kind = (
+            CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL
+            if ctx.workflow_persisted
+            else CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL
+        )
+    else:
+        output_kind = derive_output_kind(
             response_type=response_type,
             request_policy=ctx.request_policy,
             updated_workflow=updated_workflow_for_kind,
@@ -1084,7 +1108,6 @@ def _evaluate_copilot_final_output_policy(
             workflow_attempted=workflow_attempted,
             unvalidated=False,
         )
-    )
     verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type=policy_response_type,

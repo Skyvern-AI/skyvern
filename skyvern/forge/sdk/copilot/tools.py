@@ -806,6 +806,14 @@ def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
         if policy.testing_intent == "skip_test":
             return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        if policy.clarification_reason == "workflow_credential_inputs_unbound":
+            return (
+                "Skipped test run: the existing workflow references credential parameters "
+                "whose keys point to workflow inputs that are not configured. REPLY to the user "
+                "with: 'I applied your requested change. I couldn't test the modified workflow "
+                "because I couldn't find the required credentials — please add them via the "
+                "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
+            )
         return (
             "Request policy blocks block-running tools for the latest user message. "
             "Ask the user for the required safe credential or clarification before testing."
@@ -3906,8 +3914,15 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    policy = getattr(copilot_ctx, "request_policy", None)
+    skip_run_after_update = (
+        isinstance(policy, RequestPolicy)
+        and policy.allow_update_workflow
+        and not policy.allow_run_blocks
+        and policy.clarification_reason == "workflow_credential_inputs_unbound"
+    )
     policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
-    if policy_error:
+    if not skip_run_after_update and policy_error:
         return json.dumps({"ok": False, "error": policy_error})
 
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
@@ -3954,6 +3969,25 @@ async def update_and_run_blocks_tool(
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
         return json.dumps(result)
+
+    if skip_run_after_update:
+        skip_message = policy_error or "Skipped test run: required credentials are not configured."
+        skip_result = {
+            "ok": False,
+            "error": skip_message,
+            "data": {
+                "block_count": copilot_ctx.last_update_block_count,
+                "workflow_updated": True,
+                "skipped_run": True,
+                "skip_reason": "workflow_credential_inputs_unbound",
+            },
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
+        LOG.info(
+            "update_and_run_blocks skipped run on unbound credential workflow inputs",
+            workflow_permanent_id=copilot_ctx.workflow_permanent_id,
+        )
+        return json.dumps(skip_result)
 
     # Step 2: Compute frontier and run the blocks
     new_definition = None
