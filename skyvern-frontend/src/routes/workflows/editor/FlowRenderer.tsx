@@ -340,9 +340,7 @@ function FlowRenderer({
     "pre-layout" | "initial-load" | "ready"
   >("pre-layout");
   const hasCompletedInitialLoad = useRef(false);
-  const fadeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
-    undefined,
-  );
+  const fadeTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const flowIsConstrained = debugStore.isDebugMode;
 
   // Track if this is the initial load to prevent false "unsaved changes" detection
