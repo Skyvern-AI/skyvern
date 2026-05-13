@@ -9,6 +9,7 @@ type TableSearchInputProps = {
   placeholder?: string;
   className?: string;
   inputClassName?: string;
+  disabled?: boolean;
 };
 
 function TableSearchInput({
@@ -17,6 +18,7 @@ function TableSearchInput({
   placeholder = "Search…",
   className,
   inputClassName,
+  disabled,
 }: TableSearchInputProps) {
   function handleChange(event: ChangeEvent<HTMLInputElement>) {
     onChange(event.target.value);
@@ -31,6 +33,7 @@ function TableSearchInput({
         value={value}
         onChange={handleChange}
         placeholder={placeholder}
+        disabled={disabled}
         className={cn("pl-9", inputClassName)}
       />
     </div>

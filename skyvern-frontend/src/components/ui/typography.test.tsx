@@ -8,8 +8,6 @@ describe("TitleDescription", () => {
       <TitleDescription title="Usage & Operations" />,
     );
     expect(html).toContain("Usage &amp; Operations");
-    // Default heading level is h2 — recognized by both screen readers and
-    // the DS visual scale. Override via `as` if the page already has an h1.
     expect(html).toMatch(/<h2\b/);
   });
 
@@ -25,8 +23,6 @@ describe("TitleDescription", () => {
   });
 
   it("omits the description <p> entirely when description is undefined", () => {
-    // No empty paragraph — the screen reader / visual rhythm should not
-    // pick up a phantom slot.
     const html = renderToStaticMarkup(
       <TitleDescription title="Just a title" />,
     );
@@ -41,9 +37,6 @@ describe("TitleDescription", () => {
   });
 
   it("respects the `as` prop to override the default heading level", () => {
-    // Page-level header consumers (e.g. /analytics page) already have an
-    // <h1> from the route layout; they want this primitive to render <h2>
-    // by default but be able to drop to <h3> for sub-section headers.
     const html = renderToStaticMarkup(
       <TitleDescription as="h3" title="Sub-section" />,
     );

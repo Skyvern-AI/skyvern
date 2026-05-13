@@ -36,9 +36,6 @@ function load(file: string): string {
 }
 
 function blockBetween(css: string, openSelector: string): string {
-  // Naive but sufficient: find the selector, then capture from there to the
-  // matching closing brace of its top-level block. The :root and .dark blocks
-  // in our index.css files are flat (no nested rules), so this is safe.
   const idx = css.indexOf(openSelector);
   if (idx === -1) {
     return "";
@@ -79,10 +76,6 @@ describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
     expect(dark).toMatch(/--ring:\s*[^;]+;/);
   });
 
-  // Status tokens — consumed by Card tone variants and any future
-  // status-tinted surface. Required in BOTH :root and .dark of all 3
-  // entrypoints so border-success/border-warning render the same color
-  // regardless of which app loads.
   it("defines --success under :root", () => {
     expect(root).toMatch(/--success:\s*[^;]+;/);
   });
@@ -109,10 +102,6 @@ describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
 });
 
 describe("--ring is consistent across cloud/eval/src", () => {
-  // Sub-pixel drift (4.9% vs 5%) shipped a long time ago and is the kind
-  // of polish gap a leadership walkthrough would notice. Lock the
-  // harmonization in test so a future copy-paste into one entrypoint
-  // can't silently re-introduce the drift.
   function ringValue(css: string, selector: string): string {
     const block = blockBetween(css, selector);
     const m = block.match(/--ring:\s*([^;]+);/);
