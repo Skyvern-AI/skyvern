@@ -29,7 +29,7 @@ class BrowserArtifacts(BaseModel):
             return 0
 
         async with self._browser_console_log_lock:
-            async with aiofiles.open(self.browser_console_log_path, "a") as f:
+            async with aiofiles.open(self.browser_console_log_path, "a", encoding="utf-8") as f:
                 return await f.write(msg)
 
     async def _read_console_log_file(self) -> bytes:
