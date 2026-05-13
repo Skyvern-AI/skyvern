@@ -116,6 +116,15 @@ class ElementTreeBuilder(ABC):
         pass
 
     @abstractmethod
+    def support_lean_elements_tree(self) -> bool:
+        """SKY-9718 Layer 1 — whether this builder implements build_lean_elements_tree.
+
+        Mirrors `support_economy_elements_tree`. Callers of `load_prompt_with_elements`
+        check this before passing lean flags so builders that only implement the
+        plain `build_element_tree` (e.g. `IncrementalScrapePage`) don't crash.
+        """
+
+    @abstractmethod
     def build_element_tree(
         self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
     ) -> str:
@@ -127,6 +136,18 @@ class ElementTreeBuilder(ABC):
         fmt: ElementTreeFormat = ElementTreeFormat.HTML,
         html_need_skyvern_attrs: bool = True,
         percent_to_keep: float = 1,
+    ) -> str:
+        pass
+
+    @abstractmethod
+    def build_lean_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        *,
+        compress_long_href: bool = False,
+        compress_image_src: bool = False,
+        strip_url_query_strings: bool = False,
     ) -> str:
         pass
 
@@ -152,6 +173,10 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
+    # SKY-9718 Layer 1: lazy cache for lean trees, keyed by the 3-flag combo
+    # the caller asked for. Two call sites in one prompt build asking for
+    # different combos each pay the walk cost once.
+    lean_element_tree_cache: dict[tuple[bool, bool, bool], list[dict]] = {}
     last_used_element_tree: list[dict] | None = None
     # Last HTML variant built for the LLM (captures economy / truncation).
     # None when the last build used fmt=JSON or no build has run yet. The
@@ -227,6 +252,9 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         return None
 
     def support_economy_elements_tree(self) -> bool:
+        return True
+
+    def support_lean_elements_tree(self) -> bool:
         return True
 
     def build_element_tree(
@@ -309,6 +337,58 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             element["children"] = new_children
         return element
 
+    def build_lean_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        *,
+        compress_long_href: bool = False,
+        compress_image_src: bool = False,
+        strip_url_query_strings: bool = False,
+    ) -> str:
+        """SKY-9718 Layer 1 — deterministic lean element tree.
+
+        Same shape as `build_economy_elements_tree`: deep-copy the trimmed
+        tree, walk it applying the lean recipe, cache by flag combo, then
+        render.
+
+        Each of the 3 transforms is independently gated by its kwarg. Callers
+        of `load_prompt_with_elements` pick the right combo per template.
+
+        Skyvern internal IDs are *not* a lean flag — drop them by passing
+        `html_need_skyvern_attrs=False` (the existing mechanism). `json_to_html`
+        only copies `element["id"]` into the rendered HTML when that flag is True.
+        """
+        from skyvern.utils.lean_html import apply_lean_to_tree
+
+        cache_key = (
+            compress_long_href,
+            compress_image_src,
+            strip_url_query_strings,
+        )
+        cached = self.lean_element_tree_cache.get(cache_key)
+        if cached is None:
+            cached = apply_lean_to_tree(
+                self.element_tree_trimmed,
+                compress_long_href=compress_long_href,
+                compress_image_src=compress_image_src,
+                strip_url_query_strings=strip_url_query_strings,
+            )
+            self.lean_element_tree_cache[cache_key] = cached
+
+        self.last_used_element_tree = cached
+
+        if fmt == ElementTreeFormat.JSON:
+            self.last_used_element_tree_html = None
+            return json.dumps(cached)
+
+        if fmt == ElementTreeFormat.HTML:
+            result = "".join(json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in cached)
+            self.last_used_element_tree_html = result
+            return result
+
+        raise UnknownElementTreeFormat(fmt=fmt)
+
     async def refresh(self, draw_boxes: bool = True, scroll: bool = True, max_retries: int = 0) -> Self:
         refreshed_page = await self._browser_state.scrape_website(
             url=self.url,
@@ -333,6 +413,16 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         # Defensive: callers today rebuild before reading, but future direct
         # reads of this field post-refresh would otherwise see stale HTML.
         self.last_used_element_tree_html = None
+        # SKY-9718 Layer 1 + pre-existing bug for economy: derived element-tree
+        # caches must be invalidated when the underlying `element_tree_trimmed`
+        # is replaced. Without these resets, the next build_*_elements_tree
+        # call returns a tree from the pre-refresh page state — particularly
+        # bad on the `complete_verify` hot path, where the verifier would
+        # reason about the pre-action page when checking if a post-action
+        # goal was achieved.
+        self.economy_element_tree = None
+        self.lean_element_tree_cache = {}
+        self.last_used_element_tree = None
         return self
 
     async def generate_scraped_page(

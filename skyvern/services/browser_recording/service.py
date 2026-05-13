@@ -28,6 +28,34 @@ from skyvern.services.browser_recording.types import (
     OutputBlock,
 )
 
+
+def summarize_exfiltrated_recording_events(events: list[ExfiltratedEvent]) -> dict[str, t.Any]:
+    cdp_by_event_name: dict[str, int] = {}
+    console_by_dom_type: dict[str, int] = {}
+    console_by_exfil_event_name: dict[str, int] = {}
+    cdp_total = 0
+    console_total = 0
+
+    for ev in events:
+        if isinstance(ev, ExfiltratedCdpEvent):
+            cdp_total += 1
+            cdp_by_event_name[ev.event_name] = cdp_by_event_name.get(ev.event_name, 0) + 1
+        elif isinstance(ev, ExfiltratedConsoleEvent):
+            console_total += 1
+            dom_type = ev.params.type
+            console_by_dom_type[dom_type] = console_by_dom_type.get(dom_type, 0) + 1
+            console_by_exfil_event_name[ev.event_name] = console_by_exfil_event_name.get(ev.event_name, 0) + 1
+
+    return {
+        "recording_exfil_total_events": len(events),
+        "recording_exfil_cdp_event_count": cdp_total,
+        "recording_exfil_console_event_count": console_total,
+        "recording_exfil_cdp_event_name_counts": cdp_by_event_name,
+        "recording_exfil_console_dom_type_counts": console_by_dom_type,
+        "recording_exfil_console_exfil_event_name_counts": console_by_exfil_event_name,
+    }
+
+
 LOG = structlog.get_logger(__name__)
 
 # avoid decompression bombs
@@ -403,6 +431,12 @@ class Processor:
         """
 
         events = self.compressed_chunks_to_events(compressed_chunks)
+        LOG.info(
+            "record_browser.process_recording_payload",
+            recording_compressed_chunk_count=len(compressed_chunks),
+            **summarize_exfiltrated_recording_events(events),
+            **self.identity,
+        )
         actions = self.events_to_actions(events)
         blocks = await self.actions_to_blocks(actions)
         parameters = self.blocks_to_parameters(blocks)
