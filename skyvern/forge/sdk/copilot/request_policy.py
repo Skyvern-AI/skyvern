@@ -15,7 +15,9 @@ from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.schemas.credentials import Credential
+from skyvern.forge.sdk.workflow.models.parameter import ParameterType
 from skyvern.utils.strings import escape_code_fences
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
@@ -29,6 +31,7 @@ ClarificationReason = Literal[
     "ambiguous_loop_edit",
     "missing_conditional_condition",
     "missing_target_context",
+    "workflow_credential_inputs_unbound",
 ]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
@@ -49,6 +52,23 @@ _RAW_SECRET_QUESTION = (
 _SAVED_CREDENTIAL_NAME_QUESTION = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _STORED_CREDENTIAL_URL_QUESTION = "Which website or login page should I use to look up the stored credential?"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+_JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+_CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
+    {
+        "parameter_type",
+        "key",
+        "description",
+        "workflow_id",
+        "created_at",
+        "modified_at",
+        "deleted_at",
+    }
+)
+_LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS = ("username_key", "password_key")
+_WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
+    "I couldn't find the required credentials for the existing workflow. "
+    "Please add them via the Credentials UI and I can try again."
+)
 _RAW_SECRET_PATTERNS = (
     re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
     re.compile(
@@ -323,6 +343,8 @@ def _clarification_question(policy: RequestPolicy) -> str:
         if policy.credential_input_kind == "website_stored_credential":
             return _STORED_CREDENTIAL_URL_QUESTION
         return "Which page or URL should the workflow go to?"
+    if policy.clarification_reason == "workflow_credential_inputs_unbound":
+        return _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION
     if policy.credential_input_kind == "credential_name":
         return _SAVED_CREDENTIAL_NAME_QUESTION
     if policy.credential_input_kind == "website_stored_credential":
@@ -456,6 +478,107 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
         )
 
 
+def _is_login_credential_param(param: dict[str, Any]) -> bool:
+    raw = param.get("parameter_type")
+    if not isinstance(raw, str):
+        return False
+    try:
+        return ParameterType(raw).is_login_credential()
+    except (ValueError, TypeError):
+        return False
+
+
+def _iter_login_credential_params(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    workflow_def = parsed.get("workflow_definition")
+    if not isinstance(workflow_def, dict):
+        return []
+    out: list[tuple[str, dict[str, Any]]] = []
+    for param in workflow_def.get("parameters") or []:
+        if isinstance(param, dict) and _is_login_credential_param(param):
+            out.append(("workflow", param))
+
+    def _walk(block_list: Any) -> None:
+        if not isinstance(block_list, list):
+            return
+        for block in block_list:
+            if not isinstance(block, dict):
+                continue
+            label = str(block.get("label") or "<unlabeled>")
+            for param in block.get("parameters") or []:
+                if isinstance(param, dict) and _is_login_credential_param(param):
+                    out.append((label, param))
+            _walk(block.get("loop_blocks"))
+
+    _walk(workflow_def.get("blocks"))
+    return out
+
+
+def _value_resolves_at_init(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
+def _workflow_credential_inputs_unbound(workflow_yaml: str) -> list[dict[str, str]]:
+    if not workflow_yaml:
+        return []
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+
+    workflow_def = parsed.get("workflow_definition")
+    if not isinstance(workflow_def, dict):
+        return []
+
+    workflow_param_bound: dict[str, bool] = {}
+    for param in workflow_def.get("parameters") or []:
+        if isinstance(param, dict) and param.get("parameter_type") == "workflow":
+            key = param.get("key")
+            if isinstance(key, str):
+                workflow_param_bound[key] = _value_resolves_at_init(param.get("default_value"))
+
+    findings: list[dict[str, str]] = []
+    for location, param in _iter_login_credential_params(parsed):
+        for field_name in _LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS:
+            value = param.get(field_name)
+            if not isinstance(value, str) or value.strip():
+                continue
+            findings.append(
+                {"location": location, "field": field_name, "missing": "<empty>", "kind": "credential_empty"}
+            )
+        for field_name, value in param.items():
+            if field_name in _CREDENTIAL_PARAM_METADATA_FIELDS:
+                continue
+            if not isinstance(value, str):
+                continue
+            for jinja_key in _JINJA_TEMPLATE_VAR_RE.findall(value):
+                if jinja_key in workflow_param_bound:
+                    if not workflow_param_bound[jinja_key]:
+                        findings.append(
+                            {
+                                "location": location,
+                                "field": field_name,
+                                "missing": jinja_key,
+                                "kind": "credential_template_unbound",
+                            }
+                        )
+                else:
+                    findings.append(
+                        {
+                            "location": location,
+                            "field": field_name,
+                            "missing": jinja_key,
+                            "kind": "credential_template_undefined",
+                        }
+                    )
+    return findings
+
+
 async def build_request_policy(
     *,
     user_message: str,
@@ -468,6 +591,12 @@ async def build_request_policy(
     policy = await _classify_request(user_message, workflow_yaml, chat_history, global_llm_context, handler)
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
     _prioritize_credential_clarification(policy)
+
+    if policy.clarification_reason == "none" and not policy.raw_secret_detected:
+        if _workflow_credential_inputs_unbound(workflow_yaml):
+            policy.clarification_reason = "workflow_credential_inputs_unbound"
+            policy.allow_run_blocks = False
+            policy.allow_missing_credentials_in_draft = True
     if policy.testing_intent == "skip_test":
         policy.allow_run_blocks = False
         if (
