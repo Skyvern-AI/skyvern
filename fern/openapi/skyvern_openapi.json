@@ -22000,6 +22000,21 @@
               "agent",
               "code"
             ]
+          },
+          "run_metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Metadata",
+            "description": "String key/value metadata to attach to this workflow run for analytics tag filtering."
           }
         },
         "type": "object",
