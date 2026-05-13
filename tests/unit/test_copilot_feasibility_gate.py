@@ -351,6 +351,12 @@ def test_prompt_lists_inheritable_block_and_field_context() -> None:
     assert "named a block" in prompt
 
 
+def test_prompt_treats_named_target_without_url_as_resolved() -> None:
+    prompt = _render_feasibility_prompt()
+    assert "target by name (a site, brand, product, or service)" in prompt
+    assert "do NOT return `ask_clarification` asking which website/URL to use" in prompt
+
+
 def test_prompt_carries_prior_turns_in_chat_history_section() -> None:
     now = datetime.now(timezone.utc)
     history_messages = [
