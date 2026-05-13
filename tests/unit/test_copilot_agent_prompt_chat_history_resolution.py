@@ -52,3 +52,14 @@ def test_carve_out_section_headers_present_in_prompt() -> None:
     assert "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS:" in rendered
     assert "CREDENTIAL HANDLING - CRITICAL:" in rendered
     assert "PARAMETERIZED REQUESTS WITHOUT A SAMPLE VALUE:" in rendered
+
+
+def test_workflow_credential_inputs_unbound_branch_teaches_reply_framing() -> None:
+    rendered = _render_agent_prompt()
+
+    assert "REQUEST POLICY: WORKFLOW CREDENTIAL INPUTS UNBOUND." in rendered
+    assert "`clarification_reason: workflow_credential_inputs_unbound`" in rendered
+    assert "Call `update_workflow` to land the user's edit" in rendered
+    assert "I applied your requested change. I couldn't test the modified workflow" in rendered
+    assert "add them via the Credentials UI" in rendered
+    assert 'data.skip_reason="workflow_credential_inputs_unbound"' in rendered

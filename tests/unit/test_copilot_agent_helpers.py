@@ -158,6 +158,46 @@ class TestFailedTestResponseNormalization:
         assert "not been verified end-to-end" in rewritten
         assert "successful" not in rewritten.lower()
 
+    def test_should_surface_untested_draft_fires_on_workflow_credential_inputs_unbound(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _should_surface_untested_draft_despite_question
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=None,
+            request_policy=RequestPolicy(
+                clarification_reason="workflow_credential_inputs_unbound",
+                allow_run_blocks=False,
+                allow_missing_credentials_in_draft=True,
+            ),
+        )
+
+        assert _should_surface_untested_draft_despite_question(ctx, "ASK_QUESTION") is True
+        assert _should_surface_untested_draft_despite_question(ctx, "REPLY") is False
+
+    def test_rewrite_uses_credential_framing_when_policy_flags_unbound_inputs(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=12,
+            last_test_ok=None,
+            request_policy=RequestPolicy(
+                clarification_reason="workflow_credential_inputs_unbound",
+                allow_run_blocks=False,
+                allow_missing_credentials_in_draft=True,
+            ),
+        )
+        rewritten = _rewrite_failed_test_response("agent text", ctx)
+
+        assert rewritten.startswith("I applied your requested change as a draft workflow with 12 blocks.")
+        assert "I couldn't find the required credentials" in rewritten
+        assert "add them via the Credentials UI" in rewritten
+        assert "Keep the draft to iterate on, or discard." in rewritten
+
     def test_rewrite_appends_keep_draft_affordance_when_draft_on_hand(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
 
