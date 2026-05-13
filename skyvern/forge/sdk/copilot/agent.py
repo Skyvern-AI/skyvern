@@ -124,6 +124,7 @@ class RequestPolicyGuardrailInputs:
     user_message: str
     workflow_yaml: str
     chat_history_text: str
+    chat_history_messages: list[WorkflowCopilotChatHistoryMessage]
     global_llm_context: str
     organization_id: str
     handler: Any
@@ -1138,7 +1139,7 @@ def _build_copilot_input_guardrails(
             policy = await build_request_policy(
                 user_message=policy_inputs.user_message,
                 workflow_yaml=policy_inputs.workflow_yaml,
-                chat_history=policy_inputs.chat_history_text,
+                chat_history=policy_inputs.chat_history_messages,
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
                 handler=policy_inputs.handler,
@@ -1344,6 +1345,7 @@ async def _run_copilot_turn_impl(
         user_message=chat_request.message,
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
+        chat_history_messages=list(chat_history),
         global_llm_context=safe_global_llm_context,
         organization_id=organization_id,
         handler=_resolve_request_policy_handler(llm_api_handler),
