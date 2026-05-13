@@ -144,7 +144,7 @@ interface WorkflowCopilotChatProps {
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
-  buttonRef?: React.RefObject<HTMLButtonElement | null>;
+  buttonRef?: React.RefObject<HTMLButtonElement>;
   liveBrowserSessionId?: string | null;
   requiresLiveBrowser?: boolean;
   isLiveBrowserReady?: boolean;
@@ -163,7 +163,7 @@ const OFFSET = 24;
 const calculateDefaultPosition = (
   width: number,
   height: number,
-  buttonRef?: React.RefObject<HTMLButtonElement | null>,
+  buttonRef?: React.RefObject<HTMLButtonElement>,
 ) => {
   // If button ref is available, align left edge of window with left edge of button
   if (buttonRef?.current) {
