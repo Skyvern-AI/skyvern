@@ -4,9 +4,11 @@ Just an example unit test for now. Will expand later.
 
 import typing as t
 
-from skyvern.services.browser_recording.service import Processor
+from skyvern.services.browser_recording.service import Processor, summarize_exfiltrated_recording_events
 from skyvern.services.browser_recording.types import (
+    ExfiltratedCdpEvent,
     ExfiltratedConsoleEvent,
+    ExfiltratedEventCdpParams,
 )
 
 ORG_ID = "org_123"
@@ -37,7 +39,7 @@ def make_console_event(
     return ExfiltratedConsoleEvent(
         kind="exfiltrated-event",
         source="console",
-        event_name="user-interaction",
+        event_name="user_interaction",
         params=params,
         timestamp=timestamp,
     )
@@ -75,6 +77,38 @@ def make_mouseleave_event(
     )
 
 
+def make_click_event(
+    target: dict[str, t.Any],
+    timestamp: float,
+) -> ExfiltratedConsoleEvent:
+    params: dict[str, t.Any] = {
+        "type": "click",
+        "target": target,
+        "timestamp": timestamp,
+    }
+
+    return make_console_event(
+        params=params,
+        timestamp=timestamp,
+    )
+
+
+def test_click() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    event = make_click_event(
+        target=target,
+        timestamp=1000.0,
+    )
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions([event])
+
+    assert len(actions) == 1
+    assert actions[0].kind == "click"
+    assert actions[0].target.sky_id == "sky-123"
+
+
 def test_hover() -> None:
     target = dict(id="button-1", skyId="sky-123", text=["Click me"])
 
@@ -92,3 +126,39 @@ def test_hover() -> None:
     actions = processor.events_to_actions([event1, event2])
 
     assert len(actions) == 1
+
+
+def test_summarize_exfiltrated_recording_events_mixed() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+    click = make_click_event(target=target, timestamp=1000.0)
+    keypress = make_console_event(
+        params={
+            "type": "keypress",
+            "target": target,
+            "timestamp": 1001.0,
+        },
+        timestamp=1001.0,
+    )
+    cdp_nav = ExfiltratedCdpEvent(
+        kind="exfiltrated-event",
+        event_name="nav:frame_navigated",
+        params=ExfiltratedEventCdpParams(),
+        source="cdp",
+        timestamp=999.0,
+    )
+    cdp_nav_2 = ExfiltratedCdpEvent(
+        kind="exfiltrated-event",
+        event_name="nav:frame_navigated",
+        params=ExfiltratedEventCdpParams(),
+        source="cdp",
+        timestamp=1002.0,
+    )
+
+    summary = summarize_exfiltrated_recording_events([cdp_nav, click, keypress, cdp_nav_2])
+
+    assert summary["recording_exfil_total_events"] == 4
+    assert summary["recording_exfil_cdp_event_count"] == 2
+    assert summary["recording_exfil_console_event_count"] == 2
+    assert summary["recording_exfil_cdp_event_name_counts"] == {"nav:frame_navigated": 2}
+    assert summary["recording_exfil_console_dom_type_counts"] == {"click": 1, "keypress": 1}
+    assert summary["recording_exfil_console_exfil_event_name_counts"] == {"user_interaction": 2}
