@@ -2505,6 +2505,12 @@ class ForgeAgent:
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
         prompt_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
 
+        # SKY-9718 Layer 1: gate the lean recipe on the PostHog flag at the
+        # call site. complete_verify only needs the visual page state to
+        # decide is_complete / is_terminate / continue — no element-id refs,
+        # no new_elements_ids threading — so we also drop Skyvern IDs.
+        _ctx = skyvern_context.current()
+        lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -2515,6 +2521,10 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            html_need_skyvern_attrs=False,
+            lean_compress_long_href=lean_enabled,
+            lean_compress_image_src=lean_enabled,
+            lean_strip_url_query_strings=lean_enabled,
         )
 
         # This prompt is critical for our agent, we probably should use the primary LLM handler
@@ -2935,6 +2945,32 @@ class ForgeAgent:
                         task_id=task.task_id,
                     )
                     context.enable_speed_optimizations = False
+
+                # SKY-9718 Layer 1: local-override env var for bench / debugging.
+                # `FORCE_ENABLE_LEAN_ELEMENT_TREE=true` bypasses the PostHog gate
+                # and forces lean ON for every run in this process. Never set in
+                # production — the PostHog flag is the only prod control.
+                if os.getenv("FORCE_ENABLE_LEAN_ELEMENT_TREE", "").lower() in ("true", "1", "yes"):
+                    context.enable_lean_element_tree = True
+                    LOG.info(
+                        "ENABLE_LEAN_ELEMENT_TREE forced ON via env var (bypasses PostHog gate)",
+                        task_id=task.task_id,
+                    )
+                else:
+                    try:
+                        distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
+                        context.enable_lean_element_tree = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                            "ENABLE_LEAN_ELEMENT_TREE",
+                            distinct_id,
+                            properties={"organization_id": task.organization_id},
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to check ENABLE_LEAN_ELEMENT_TREE feature flag",
+                            exc_info=True,
+                            task_id=task.task_id,
+                        )
+                        context.enable_lean_element_tree = False
 
                 try:
                     distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
@@ -3405,11 +3441,26 @@ class ForgeAgent:
         )
         enable_speed_optimizations = context.enable_speed_optimizations
         element_tree_format = ElementTreeFormat.HTML
+        # SKY-9718 Layer 1: extract-action is a planner template — keep Skyvern
+        # internal IDs (default `html_need_skyvern_attrs=True`) and apply the
+        # 3 lean transforms. Speed-optimization path uses economy tree which
+        # drops lean for the same firefighting reason as prompt_engine's
+        # overflow path.
+        use_lean_tree = context.enable_lean_element_tree
         if enable_speed_optimizations:
             if step.retry_index == 0:
                 elements_for_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
             else:
                 elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
+        elif use_lean_tree:
+            elements_for_prompt = scraped_page.build_lean_elements_tree(
+                element_tree_format,
+                # compress_long_href stays OFF — the planner reads the href
+                # to decide whether to click a link (destination signal).
+                compress_long_href=False,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+            )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
@@ -3531,6 +3582,14 @@ class ForgeAgent:
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
             recent_dialog_messages_str=recent_dialog_messages_str,
+            # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
+            # (default html_need_skyvern_attrs=True) — the planner emits
+            # `click(id=...)` references. Gate lean on the PostHog flag.
+            # `lean_compress_long_href` intentionally stays OFF — the planner
+            # reads the href to decide whether to click a link.
+            lean_compress_long_href=False,
+            lean_compress_image_src=context.enable_lean_element_tree,
+            lean_strip_url_query_strings=context.enable_lean_element_tree,
         )
 
         # Map template to prompt_name for logging/caching guards

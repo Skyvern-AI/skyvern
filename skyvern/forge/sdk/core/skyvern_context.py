@@ -89,6 +89,10 @@ class SkyvernContext:
     prompt_caching_settings: dict[str, bool] | None = None
     enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
+    # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
+    # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
+    # and read sync from prompt-build sites.
+    enable_lean_element_tree: bool = False
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it

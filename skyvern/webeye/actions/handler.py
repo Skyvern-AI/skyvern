@@ -976,6 +976,12 @@ async def handle_sequential_click_for_dropdown(
         }
         action_history_str = json.dumps(action_result)
 
+    # SKY-9718 Layer 1: sequential-click after-dropdown verifier path. Keep
+    # Skyvern IDs (default html_need_skyvern_attrs=True) because
+    # `new_elements_ids` is threaded and the LLM compares those IDs to what's
+    # rendered. Gate lean on the PostHog flag.
+    _ctx = skyvern_context.current()
+    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_after_open,
         prompt_engine=prompt_engine,
@@ -986,6 +992,9 @@ async def handle_sequential_click_for_dropdown(
         without_screenshots=True,
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        lean_compress_long_href=lean_enabled,
+        lean_compress_image_src=lean_enabled,
+        lean_strip_url_query_strings=lean_enabled,
     )
     response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
         prompt=prompt,
@@ -3692,6 +3701,12 @@ async def select_from_emerging_elements(
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
+    # SKY-9718 Layer 1: custom-select threads `new_elements_ids` so Skyvern IDs
+    # stay (default html_need_skyvern_attrs=True). Gate lean on the PostHog flag.
+    # `lean_compress_long_href` stays OFF — the LLM reads option hrefs to pick
+    # the right select target.
+    _ctx = skyvern_context.current()
+    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_after_open,
         prompt_engine=prompt_engine,
@@ -3704,6 +3719,9 @@ async def select_from_emerging_elements(
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        lean_compress_long_href=False,
+        lean_compress_image_src=lean_enabled,
+        lean_strip_url_query_strings=lean_enabled,
     )
     LOG.info("Calling LLM to find the match element")
 

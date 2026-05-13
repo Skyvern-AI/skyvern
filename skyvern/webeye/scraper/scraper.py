@@ -701,6 +701,9 @@ class IncrementalScrapePage(ElementTreeBuilder):
     def support_economy_elements_tree(self) -> bool:
         return False
 
+    def support_lean_elements_tree(self) -> bool:
+        return False
+
     def build_element_tree(
         self, fmt: ElementTreeFormat = ElementTreeFormat.HTML, html_need_skyvern_attrs: bool = True
     ) -> str:
@@ -718,6 +721,17 @@ class IncrementalScrapePage(ElementTreeBuilder):
         fmt: ElementTreeFormat = ElementTreeFormat.HTML,
         html_need_skyvern_attrs: bool = True,
         percent_to_keep: float = 1,
+    ) -> str:
+        raise NotImplementedError("Not implemented")
+
+    def build_lean_elements_tree(
+        self,
+        fmt: ElementTreeFormat = ElementTreeFormat.HTML,
+        html_need_skyvern_attrs: bool = True,
+        *,
+        compress_long_href: bool = False,
+        compress_image_src: bool = False,
+        strip_url_query_strings: bool = False,
     ) -> str:
         raise NotImplementedError("Not implemented")
 
