@@ -140,6 +140,28 @@ def redact_raw_secrets_for_prompt(text: str) -> str:
     return redacted
 
 
+_CHAT_HISTORY_TRUNCATION_MARKER = "\n...[earlier chat history truncated]...\n"
+
+
+def _clip_chat_history_for_prompt(text: str, limit: int = 2048, head: int = 384) -> str:
+    """Middle-truncate chat history so the most recent assistant turn survives.
+
+    Plain `[:limit]` clips the tail in long conversations, hiding the latest
+    assistant turn that the classifier's slot-fill rule depends on. The head
+    boundary snaps back to the last newline so we do not cut a turn mid-line.
+    """
+    if len(text) <= limit:
+        return text
+    head_text = text[:head]
+    snap = head_text.rfind("\n")
+    if snap > head // 2:
+        head_text = head_text[: snap + 1]
+    tail = limit - len(head_text) - len(_CHAT_HISTORY_TRUNCATION_MARKER)
+    if tail <= 0:
+        return text[-limit:]
+    return head_text + _CHAT_HISTORY_TRUNCATION_MARKER + text[-tail:]
+
+
 def _classification_from_raw(raw: Any) -> RequestPolicy:
     if isinstance(raw, str):
         raw = parse_final_response(raw)
@@ -189,11 +211,15 @@ async def _classify_request(
     if handler is None:
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
 
+    # workflow_yaml and global_llm_context are head-truncated: the front matter
+    # (title, parameters, first blocks) is what the classifier needs. chat_history
+    # is middle-truncated because the slot-fill rule reads the latest assistant
+    # turn at the tail.
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=escape_code_fences(user_message),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
-        chat_history=escape_code_fences(redact_raw_secrets_for_prompt(chat_history)[:2048]),
+        chat_history=escape_code_fences(_clip_chat_history_for_prompt(redact_raw_secrets_for_prompt(chat_history))),
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
     )
     try:

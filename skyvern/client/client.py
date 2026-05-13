@@ -333,6 +333,7 @@ class Skyvern:
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -421,6 +422,9 @@ class Skyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
+        run_metadata : typing.Optional[typing.Dict[str, str]]
+            String key/value metadata to attach to this workflow run for analytics tag filtering.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -461,6 +465,7 @@ class Skyvern:
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            run_metadata=run_metadata,
             request_options=request_options,
         )
         return _response.data
@@ -2786,6 +2791,7 @@ class AsyncSkyvern:
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
         run_with: typing.Optional[str] = OMIT,
+        run_metadata: typing.Optional[typing.Dict[str, str]] = OMIT,
         request_options: typing.Optional[RequestOptions] = None,
     ) -> WorkflowRunResponse:
         """
@@ -2874,6 +2880,9 @@ class AsyncSkyvern:
         run_with : typing.Optional[str]
             Whether to run the workflow with agent or code. Null inherits from the workflow setting.
 
+        run_metadata : typing.Optional[typing.Dict[str, str]]
+            String key/value metadata to attach to this workflow run for analytics tag filtering.
+
         request_options : typing.Optional[RequestOptions]
             Request-specific configuration.
 
@@ -2922,6 +2931,7 @@ class AsyncSkyvern:
             browser_address=browser_address,
             ai_fallback=ai_fallback,
             run_with=run_with,
+            run_metadata=run_metadata,
             request_options=request_options,
         )
         return _response.data

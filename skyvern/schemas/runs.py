@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
+from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
     ERROR_CODE_MAPPING_EXAMPLES,
@@ -236,6 +236,10 @@ class WorkflowRunRequest(BaseModel):
         description="Whether to run the workflow with agent or code. Null inherits from the workflow setting.",
         examples=["agent", "code"],
     )
+    run_metadata: dict[str, str] | None = Field(
+        default=None,
+        description="String key/value metadata to attach to this workflow run for analytics tag filtering.",
+    )
 
     @field_validator("run_with", mode="before")
     @classmethod
@@ -243,6 +247,11 @@ class WorkflowRunRequest(BaseModel):
         if v is None:
             return None
         return normalize_run_with(v)
+
+    @field_validator("run_metadata")
+    @classmethod
+    def _validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return normalize_run_metadata(v)
 
     @field_validator("webhook_url", "totp_url")
     @classmethod

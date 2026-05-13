@@ -1033,7 +1033,7 @@ class TaskRunModel(Base):
             "organization_id",
             desc("created_at"),
             postgresql_using="btree",
-            postgresql_where=text("parent_workflow_run_id IS NULL AND debug_session_id IS NULL AND status IS NOT NULL"),
+            postgresql_where=text("parent_workflow_run_id IS NULL AND debug_session_id IS NULL"),
         ),
         Index(
             "ix_task_runs_org_status_created",

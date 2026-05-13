@@ -111,6 +111,11 @@ class WorkflowRunRequest(UniversalBaseModel):
     Whether to run the workflow with agent or code. Null inherits from the workflow setting.
     """
 
+    run_metadata: typing.Optional[typing.Dict[str, str]] = pydantic.Field(default=None)
+    """
+    String key/value metadata to attach to this workflow run for analytics tag filtering.
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:
