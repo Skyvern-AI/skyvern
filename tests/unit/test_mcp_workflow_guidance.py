@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from skyvern.cli.mcp_tools import mcp
@@ -28,26 +26,6 @@ def test_mcp_instructions_guide_text_prompt_defaults() -> None:
     assert "skyvern_extract" in mcp.instructions
     assert "skyvern_act" in mcp.instructions
     assert "skyvern_observe" in mcp.instructions
-
-
-def test_bundled_skyvern_skill_documents_browser_profile_lifecycle() -> None:
-    # Anchor to this test file rather than CWD so the test doesn't depend on
-    # where pytest is invoked from.
-    repo_root = Path(__file__).resolve().parents[2]
-    skill_dir = repo_root / "skyvern/cli/skills/skyvern"
-    skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-    sessions = (skill_dir / "references" / "sessions.md").read_text(encoding="utf-8")
-    cli_parity = (skill_dir / "references" / "cli-parity.md").read_text(encoding="utf-8")
-    combined = "\n".join([skill_md, sessions, cli_parity])
-    normalized = " ".join(combined.split())
-
-    assert "save" in normalized.lower()
-    assert "reuse" in normalized.lower()
-    assert "skyvern workflow run --id wpid_123 --browser-profile-id" in normalized
-    assert "skyvern browser session create --browser-profile-id" in normalized
-    assert "validate logged-in state before re-login" in normalized.lower()
-    assert "state_save/state_load" in combined
-    assert "not the cloud browser-profile reuse path" in normalized
 
 
 @pytest.mark.asyncio

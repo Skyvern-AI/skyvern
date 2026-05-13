@@ -68,6 +68,7 @@ async def collect_experiment_metadata(
             # Add more experiment flags as needed
             "PROMPT_CACHING_OPTIMIZATION",
             "THINKING_BUDGET_OPTIMIZATION",
+            "GEMINI_3_REASONING_EFFORT",
         ]
 
         for flag in experiment_flags:

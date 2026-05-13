@@ -77,57 +77,6 @@ def validate_run_id(run_id: str, action: str) -> dict[str, Any] | None:
     return None
 
 
-def validate_workflow_run_id(workflow_run_id: str, action: str) -> dict[str, Any] | None:
-    """Accept only wr_-prefixed IDs. The browser-profile-create source
-    lookup is not compatible with tsk_v2_ IDs, so a tsk_v2_ ID must not
-    slip through client-side validation."""
-    if "/" in workflow_run_id or "\\" in workflow_run_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "workflow_run_id must not contain path separators",
-                "Provide a valid workflow run ID (starts with wr_)",
-            ),
-        )
-    if not workflow_run_id.startswith("wr_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid workflow_run_id format: {workflow_run_id!r}",
-                "Workflow run IDs start with wr_. Task-v2 IDs (tsk_v2_) are not accepted here. Use skyvern_workflow_status or skyvern_workflow_run output to find the wr_ ID.",
-            ),
-        )
-    return None
-
-
-def validate_browser_profile_id(browser_profile_id: str, action: str) -> dict[str, Any] | None:
-    if "/" in browser_profile_id or "\\" in browser_profile_id:
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                "browser_profile_id must not contain path separators",
-                "Provide a valid browser profile ID (starts with bp_)",
-            ),
-        )
-    if not browser_profile_id.startswith("bp_"):
-        return make_result(
-            action,
-            ok=False,
-            error=make_error(
-                ErrorCode.INVALID_INPUT,
-                f"Invalid browser_profile_id format: {browser_profile_id!r}",
-                "Browser profile IDs start with bp_. Use skyvern_browser_profile_list to find valid IDs.",
-            ),
-        )
-    return None
-
-
 def validate_schedule_id(workflow_schedule_id: str, action: str) -> dict[str, Any] | None:
     if "/" in workflow_schedule_id or "\\" in workflow_schedule_id:
         return make_result(

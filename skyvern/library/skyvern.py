@@ -547,7 +547,6 @@ class Skyvern(AsyncSkyvern):
         *,
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
-        browser_profile_id: str | None = None,
         extensions: list[Extensions] | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
@@ -559,7 +558,6 @@ class Skyvern(AsyncSkyvern):
                 Must be between 5 and 1440. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
-            browser_profile_id: Browser profile ID to load into the new session.
             extensions: Browser extensions to install in the session.
 
         Returns:
@@ -570,8 +568,6 @@ class Skyvern(AsyncSkyvern):
             "timeout": timeout,
             "proxy_location": proxy_location_to_request(proxy_location),
         }
-        if browser_profile_id is not None:
-            create_kwargs["browser_profile_id"] = browser_profile_id
         if extensions is not None:
             create_kwargs["extensions"] = extensions
         browser_session = await self.create_browser_session(**create_kwargs)

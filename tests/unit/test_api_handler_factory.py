@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import litellm  # type: ignore[import-not-found]
@@ -13,6 +14,7 @@ from skyvern.forge.sdk.api.llm.api_handler_factory import (
 )
 from skyvern.forge.sdk.api.llm.models import LLMConfig
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 from tests.unit.helpers import FakeLLMResponse
 
 
@@ -350,3 +352,162 @@ def test_get_override_llm_api_handler_treats_empty_as_no_override(
 
     resolved = LLMAPIHandlerFactory.get_override_llm_api_handler(override, default=default_handler)
     assert resolved is default_handler
+
+
+# ---------------------------------------------------------------------------
+# SKY-9785: Gemini 3 reasoning_effort experiment
+# ---------------------------------------------------------------------------
+
+
+def _gemini_3_flash_router() -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="gemini-3.0-flash-gpt-5-fallback-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="vertex-gemini-3-flash-preview",
+                litellm_params={"model": "vertex_ai/gemini-3-flash-preview"},
+            ),
+        ],
+        main_model_group="vertex-gemini-3-flash-preview",
+        fallback_model_group="gpt-5-fallback",
+    )
+
+
+def _gemini_2_5_flash_router() -> LLMRouterConfig:
+    return LLMRouterConfig(
+        model_name="gemini-2.5-flash-gpt-5-mini-fallback-router",
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(
+                model_name="vertex-gemini-2.5-flash",
+                litellm_params={"model": "vertex_ai/gemini-2.5-flash"},
+            ),
+        ],
+        main_model_group="vertex-gemini-2.5-flash",
+        fallback_model_group="gpt-5-mini-fallback",
+    )
+
+
+class TestGemini3ReasoningEffortExperiment:
+    """SKY-9785 experiment. Grouped under a class so the autouse reset doesn't
+    couple unrelated tests in this module to the new class-level override."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_gemini_3_override(self) -> Any:
+        """Make sure the class-level override doesn't leak between tests."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(None)
+        yield
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(None)
+
+    def test_is_gemini_3_model_detects_router_primary(self) -> None:
+        """Router primary `main_model_group` carries the gemini-3 substring."""
+        assert LLMAPIHandlerFactory._is_gemini_3_model(_gemini_3_flash_router()) is True
+
+    def test_is_gemini_3_model_rejects_gemini_2(self) -> None:
+        assert LLMAPIHandlerFactory._is_gemini_3_model(_gemini_2_5_flash_router()) is False
+
+    def test_is_gemini_3_model_detects_direct_config(self) -> None:
+        cfg = LLMConfig(
+            model_name="vertex_ai/gemini-3-flash-preview",
+            required_env_vars=[],
+            supports_vision=True,
+            add_assistant_prefix=False,
+        )
+        assert LLMAPIHandlerFactory._is_gemini_3_model(cfg) is True
+
+    def test_apply_gemini_thinking_optimization_uses_reasoning_effort_for_gemini_3(self) -> None:
+        """With the override set, Gemini 3 calls switch to reasoning_effort and drop the
+        legacy `thinking` payload that litellm silently discards for Gemini 3."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("medium")
+        params: dict[str, Any] = {"max_completion_tokens": 65536}
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params,
+            new_budget=1024,
+            llm_config=_gemini_3_flash_router(),
+            prompt_name="extract-information-from-file-text",
+        )
+        assert params["reasoning_effort"] == "medium"
+        assert "thinking" not in params
+
+    def test_apply_gemini_thinking_optimization_strips_existing_thinking_for_gemini_3(self) -> None:
+        """Sending both reasoning_effort and thinking_budget would 400 in litellm for
+        Gemini 3 — the override path must clean up any stale `thinking` payload."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("low")
+        params: dict[str, Any] = {"thinking": {"budget_tokens": 1024}}
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params, new_budget=1024, llm_config=_gemini_3_flash_router(), prompt_name="text-prompt"
+        )
+        assert params["reasoning_effort"] == "low"
+        assert "thinking" not in params
+
+    def test_apply_gemini_thinking_optimization_leaves_gemini_2_5_alone(self) -> None:
+        """The experiment only rewrites Gemini 3 calls. Gemini 2.5 keeps the strict
+        `thinking={budget_tokens:N}` path that Vertex 2.5 honors."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("low")
+        params: dict[str, Any] = {}
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params, new_budget=1024, llm_config=_gemini_2_5_flash_router(), prompt_name="extract-actions"
+        )
+        assert "reasoning_effort" not in params
+        assert params["thinking"]["budget_tokens"] == 1024
+
+    def test_apply_gemini_thinking_optimization_control_leaves_gemini_3_alone(self) -> None:
+        """Override unset (control arm) — Gemini 3 keeps today's behavior so we have a
+        clean comparison baseline."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(None)
+        params: dict[str, Any] = {}
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params, new_budget=1024, llm_config=_gemini_3_flash_router(), prompt_name="extract-actions"
+        )
+        assert "reasoning_effort" not in params
+        assert params["thinking"]["budget_tokens"] == 1024
+
+    @pytest.mark.parametrize("value", ["minimal", "low", "medium", "high", "MEDIUM", " low "])
+    def test_set_gemini_3_reasoning_effort_override_accepts_valid_values(self, value: str) -> None:
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
+        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override == value.strip().lower()
+
+    @pytest.mark.parametrize("value", ["disable", "off", "high-er", 1024])
+    def test_set_gemini_3_reasoning_effort_override_rejects_invalid_values(self, value: Any) -> None:
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override(value)
+        assert LLMAPIHandlerFactory._gemini_3_reasoning_effort_override is None
+
+    def test_apply_gemini_thinking_optimization_overrides_when_thinking_level_pre_merged(self) -> None:
+        """Single-handler path (api_handler_factory.py:1402-1404) merges
+        `llm_config.litellm_params` into parameters before optimization runs. For
+        Gemini 3 configs this lifts `thinking_level="minimal"` into parameters and
+        would otherwise trigger the early-return guard and silently skip the
+        override. The reorder makes the override fire first."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("medium")
+        # Simulate post-merge state from the single-handler path.
+        params: dict[str, Any] = {
+            "max_completion_tokens": 65536,
+            "thinking_level": "minimal",
+            "thinking": {"budget_tokens": 1024},
+        }
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params, new_budget=1024, llm_config=_gemini_3_flash_router(), prompt_name="extract-actions"
+        )
+        assert params["reasoning_effort"] == "medium"
+        assert "thinking_level" not in params
+        assert "thinking" not in params
+
+    def test_apply_gemini_thinking_optimization_keeps_guard_for_gemini_2_5_with_thinking_level(self) -> None:
+        """Override is set, but model is Gemini 2.5 — the override doesn't apply,
+        and the legacy thinking_level guard fires as before (preserves the historic
+        behavior that Gemini 2.5 routes with a thinking_level config field never
+        get a budget_tokens write)."""
+        LLMAPIHandlerFactory.set_gemini_3_reasoning_effort_override("medium")
+        params: dict[str, Any] = {"thinking_level": "minimal"}
+        LLMAPIHandlerFactory._apply_gemini_thinking_optimization(
+            params, new_budget=1024, llm_config=_gemini_2_5_flash_router(), prompt_name="extract-actions"
+        )
+        # Override didn't fire (not gemini-3), guard fired, nothing else changed.
+        assert "reasoning_effort" not in params
+        assert "thinking" not in params
+        assert params["thinking_level"] == "minimal"

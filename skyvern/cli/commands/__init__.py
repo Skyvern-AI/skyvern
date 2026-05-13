@@ -36,12 +36,6 @@ register_lazy_command(
 )
 register_lazy_command("workflow", "skyvern.cli.workflow", "workflow_app", "Workflow management commands.")
 register_lazy_command(
-    "browser-profile",
-    "skyvern.cli.browser_profile",
-    "browser_profile_app",
-    "Manage cloud saved-login browser profiles for reusable authenticated state.",
-)
-register_lazy_command(
     "schedule",
     "skyvern.cli.schedule_command",
     "schedule_app",
