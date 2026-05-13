@@ -4976,15 +4976,14 @@ class WorkflowService:
                     LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
         if not recording_urls:
-            recording_artifact = await app.DATABASE.artifacts.get_artifact_for_run(
+            recording_artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
                 run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
                 artifact_type=ArtifactType.RECORDING,
-                organization_id=organization_id,
+                organization_id=workflow_run.organization_id,
             )
-            if recording_artifact:
-                artifact_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
-                if artifact_url:
-                    recording_urls = [artifact_url]
+            if recording_artifacts:
+                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
+                recording_urls = [u for u in urls if u is not None]
 
         # Preserve legacy singular contract: last element is the newest (old code returned recordings[0] of newest-first list).
         recording_url = recording_urls[-1] if recording_urls else None
