@@ -10,6 +10,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      "@cloud": path.resolve(__dirname, "./cloud"),
+      "@eval": path.resolve(__dirname, "./eval"),
     },
   },
 });
