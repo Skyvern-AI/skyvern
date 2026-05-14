@@ -211,6 +211,16 @@
             },
           };
 
+          const bindingName = window.__skyvern_exfiltration_binding_name;
+          const binding =
+            typeof bindingName === "string" ? window[bindingName] : null;
+
+          if (typeof binding === "function") {
+            Promise.resolve(binding(eventData)).catch((err) => {
+              console.log("[SYS] exfiltration: binding transport failed.", err);
+            });
+          }
+
           console.log("[EXFIL]", JSON.stringify(eventData));
         },
         true,

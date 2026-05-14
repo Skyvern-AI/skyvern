@@ -74,3 +74,12 @@ class TimeoutGetTOTPVerificationCodeError(SkyvernDefinedError):
 class TOTPExpiredError(SkyvernDefinedError):
     error_code: str = "OTP_EXPIRED"
     reasoning: str = "TOTP verification code has expired during multi-field input sequence."
+
+
+class MissingTOTPSourceError(SkyvernDefinedError):
+    error_code: str = "MISSING_TOTP_SOURCE"
+    reasoning: str = (
+        "MFA was required but no TOTP source is configured. Configure one of: a totp_verification_url or "
+        "totp_identifier on the login block (or run override), or attach a credential parameter whose "
+        "credential stores a TOTP secret."
+    )

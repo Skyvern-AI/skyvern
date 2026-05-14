@@ -55,6 +55,7 @@ from skyvern.exceptions import (
     NoTOTPVerificationCodeFound,
     PDFEmbedBase64DecodeError,
     ScrapingFailed,
+    SkyvernException,
     StepTerminationError,
     StepUnableToExecuteError,
     TaskAlreadyCanceled,
@@ -296,6 +297,22 @@ def _schedule_summary_shadow_check_for_hit(
         schema=None,
         logger=shadow_logger,
     )
+
+
+def _build_totp_timeout_reasoning(task: Task) -> str:
+    # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
+    # source that was actually queried. URL goes through strip_query_params to keep
+    # query-string tokens out of the customer-visible failure_reason.
+    if not (task.totp_verification_url or task.totp_identifier):
+        raise SkyvernException(
+            "_build_totp_timeout_reasoning called with no TOTP source; "
+            "NoTOTPVerificationCodeFound should only fire when poll_otp_value was invoked"
+        )
+    if task.totp_verification_url:
+        polled = f"totp_verification_url={strip_query_params(task.totp_verification_url)}"
+    else:
+        polled = f"totp_identifier={task.totp_identifier}"
+    return f"No TOTP verification code found. Going to terminate. Polled source: {polled}."
 
 
 class ForgeAgent:
@@ -1444,6 +1461,20 @@ class ForgeAgent:
                         if context:
                             context.pop_totp_code(task.task_id)
                     except NoTOTPVerificationCodeFound:
+                        # Surface only the source poll_otp_value actually queried so
+                        # the failure_reason tells the customer which delivery endpoint
+                        # went silent.
+                        timeout_reasoning = _build_totp_timeout_reasoning(task)
+                        LOG.warning(
+                            "TOTP polling timed out — terminating task",
+                            task_id=task.task_id,
+                            workflow_run_id=task.workflow_run_id,
+                            totp_verification_url=strip_query_params(task.totp_verification_url)
+                            if task.totp_verification_url
+                            else None,
+                            totp_identifier=task.totp_identifier,
+                            organization_id=task.organization_id,
+                        )
                         actions = [
                             TerminateAction(
                                 organization_id=task.organization_id,
@@ -1452,8 +1483,8 @@ class ForgeAgent:
                                 step_id=step.step_id,
                                 step_order=step.order,
                                 action_order=0,
-                                reasoning="No TOTP verification code found. Going to terminate.",
-                                intention="No TOTP verification code found. Going to terminate.",
+                                reasoning=timeout_reasoning,
+                                intention=timeout_reasoning,
                                 errors=[TimeoutGetTOTPVerificationCodeError().to_user_defined_error()],
                             )
                         ]
