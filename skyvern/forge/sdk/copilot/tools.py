@@ -3775,10 +3775,11 @@ async def run_blocks_tool(
     The workflow must be saved before running blocks.
     Block labels must match labels in the saved workflow.
 
-    For a diagnostic / observational complaint about the current workflow,
-    this tool is not the first response. Follow the system prompt's
-    inspect-and-clarify path first: inspect current workflow context and
-    existing run evidence before deciding whether a fresh run is needed.
+    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
+    If the complaint has no prior edit goal, inspect current workflow context
+    and existing run evidence before deciding whether a fresh run is needed.
+    If prior context establishes a resolvable edit, use `update_and_run_blocks`
+    instead of rerunning unchanged blocks.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
@@ -3881,10 +3882,10 @@ async def update_and_run_blocks_tool(
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
 
-    For a diagnostic / observational complaint about the current workflow,
-    this tool is not the first response. Follow the system prompt's
-    inspect-and-clarify path first, and only update/run when the user asked
-    for an edit or the inspected evidence makes the correction clear.
+    For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
+    A complaint with no prior edit goal needs context inspection or
+    clarification first. A diagnostic follow-up after an explicit edit goal may
+    update/run once the correction is clear.
 
     Pass runtime values for workflow parameters via the `parameters` dict —
     keys must match the workflow parameter `key` field. When the user has
