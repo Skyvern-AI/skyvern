@@ -24,6 +24,7 @@ from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_INTERMEDIATE_SUCCESS_NUDGE,
@@ -3092,7 +3093,9 @@ async def _get_block_schema_pre_hook(
     block_type = params.get("block_type")
     if not isinstance(block_type, str):
         return None
-    normalized = block_type.strip().lower()
+    normalized = normalize_copilot_block_type_alias(block_type)
+    if normalized != block_type.strip().lower():
+        params["block_type"] = normalized
     if normalized not in _COPILOT_BANNED_BLOCK_TYPES:
         return None
     return {

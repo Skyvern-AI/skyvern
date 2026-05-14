@@ -33,6 +33,7 @@ ClarificationReason = Literal[
     "credential_name_unresolved",
     "credential_invention_requested",
     "ambiguous_loop_edit",
+    "invalid_conditional_container",
     "missing_conditional_condition",
     "missing_target_context",
     "workflow_credential_inputs_unbound",
@@ -41,11 +42,13 @@ _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_arg
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
     "ambiguous_loop_edit",
+    "invalid_conditional_container",
     "missing_conditional_condition",
     "missing_target_context",
 }
 _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "ambiguous_loop_edit",
+    "invalid_conditional_container",
     "missing_conditional_condition",
     "missing_target_context",
 }
@@ -306,6 +309,8 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     )
     if policy.credential_input_kind == "raw_secret":
         policy.clarification_reason = "raw_secret"
+    if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+        policy.requires_user_clarification = True
     return policy
 
 
@@ -445,6 +450,11 @@ def _clarification_question(policy: RequestPolicy) -> str:
         )
     if policy.clarification_reason == "ambiguous_loop_edit":
         return "Which block or blocks should go inside the loop, and what should the loop iterate over or stop on?"
+    if policy.clarification_reason == "invalid_conditional_container":
+        return (
+            "Conditional blocks route to other blocks; they do not contain loop blocks. "
+            "What condition should route into the loop, and should any default branch skip it?"
+        )
     if policy.clarification_reason == "missing_conditional_condition":
         return "What condition should trigger this conditional route?"
     if policy.clarification_reason == "missing_target_context":
