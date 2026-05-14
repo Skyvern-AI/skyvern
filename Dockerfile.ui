@@ -1,28 +1,66 @@
-FROM node:20.12-slim
-
-# Install tini for proper signal handling and zombie reaping
-RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+# Stage 1: Build frontend assets
+FROM node:24.14-slim AS builder
 
 WORKDIR /app
-COPY ./skyvern-frontend /app
-COPY ./entrypoint-skyvernui.sh /app/entrypoint-skyvernui.sh
-RUN npm install
 
-# Placeholders for runtime injection (will be replaced by entrypoint script)
+# Copy dependency files first for better Docker layer caching
+COPY ./skyvern-frontend/package.json ./skyvern-frontend/package-lock.json ./
+RUN npm ci
+
+# Copy source code
+COPY ./skyvern-frontend/ ./
+
+# Placeholders for runtime injection (replaced by entrypoint script at container start).
+# Every VITE_* variable that the frontend reads via import.meta.env must have a
+# placeholder here so Vite bakes the placeholder string into the JS bundle,
+# allowing sed replacement at container start.
 ENV VITE_API_BASE_URL=__VITE_API_BASE_URL_PLACEHOLDER__
 ENV VITE_WSS_BASE_URL=__VITE_WSS_BASE_URL_PLACEHOLDER__
 ENV VITE_ARTIFACT_API_BASE_URL=__VITE_ARTIFACT_API_BASE_URL_PLACEHOLDER__
 ENV VITE_SKYVERN_API_KEY=__SKYVERN_API_KEY_PLACEHOLDER__
 ENV VITE_BROWSER_STREAMING_MODE=__VITE_BROWSER_STREAMING_MODE_PLACEHOLDER__
+ENV VITE_ENABLE_LOG_ARTIFACTS=__VITE_ENABLE_LOG_ARTIFACTS_PLACEHOLDER__
+ENV VITE_ENABLE_CODE_BLOCK=__VITE_ENABLE_CODE_BLOCK_PLACEHOLDER__
+ENV VITE_ENVIRONMENT=__VITE_ENVIRONMENT_PLACEHOLDER__
+ENV VITE_API_PATH_PREFIX=__VITE_API_PATH_PREFIX_PLACEHOLDER__
+ENV VITE_ENABLE_2FA_NOTIFICATIONS=__VITE_ENABLE_2FA_NOTIFICATIONS_PLACEHOLDER__
+ENV VITE_CLERK_PUBLISHABLE_KEY=__VITE_CLERK_PUBLISHABLE_KEY_PLACEHOLDER__
+ENV VITE_PUBLIC_POSTHOG_HOST=__VITE_PUBLIC_POSTHOG_HOST_PLACEHOLDER__
+ENV VITE_PUBLIC_POSTHOG_KEY=__VITE_PUBLIC_POSTHOG_KEY_PLACEHOLDER__
 
 # APP_VERSION is baked into the JS bundle at build time via Vite's define.
 # Pass --build-arg APP_VERSION=$(git rev-parse HEAD) when building the image.
 ARG APP_VERSION=development
 ENV APP_VERSION=$APP_VERSION
 
-# Build at image time
+# Vite's rollup phase needs more than V8's default ~2GB heap.
+ENV NODE_OPTIONS=--max-old-space-size=4096
+
+# Build assets at image build time (with placeholder values baked in)
 RUN npm run build
 
-# Use tini as init for proper signal handling and zombie reaping
+# Stage 2: Runtime image (only built assets + servers)
+FROM node:24.14-slim
+
+# Install tini for proper signal handling and zombie reaping
+RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy built assets and server files from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/localServer.js ./
+COPY --from=builder /app/artifactServer.js ./
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/package-lock.json ./
+
+# Install only production dependencies needed for the servers
+RUN npm ci --omit=dev
+
+COPY ./entrypoint-skyvernui.sh ./entrypoint-skyvernui.sh
+RUN chmod +x ./entrypoint-skyvernui.sh
+
+EXPOSE 8080 9090
+
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/bin/bash", "/app/entrypoint-skyvernui.sh"]
+CMD ["/bin/bash", "./entrypoint-skyvernui.sh"]
