@@ -1,7 +1,5 @@
 """Prompt and tool-description guards for diagnostic copilot turns."""
 
-import re
-
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.tools import run_blocks_tool, update_and_run_blocks_tool
 
@@ -18,88 +16,94 @@ def _render_agent_prompt() -> str:
 
 
 class TestDiagnosticObservationIntent:
-    """Pin SKY-9651: observational complaints inspect first instead of edit/run by default."""
+    """Pin diagnostic complaint routing to the consolidated ASK-vs-EDIT rule."""
 
-    def test_agent_prompt_has_diagnostic_observation_section(self) -> None:
+    def test_agent_prompt_uses_consolidated_ask_vs_edit_rule(self) -> None:
         rendered = _render_agent_prompt()
 
-        assert "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS" in rendered
-        assert "inspect-and-clarify" in rendered
-        assert "Do NOT call `update_and_run_blocks`" in rendered
-        assert "do NOT call `run_blocks_and_collect_debug`" in rendered
+        assert "ASK-vs-EDIT ROUTING:" in rendered
+        assert "Use one decision tree for the latest turn" in rendered
+        assert "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS" not in rendered
+        assert "Explicit edit/debug requests remain edit requests" not in rendered
 
-    def test_agent_prompt_names_failed_repro_shapes(self) -> None:
+    def test_agent_prompt_routes_diagnostic_followups_to_edit_when_context_resolves(self) -> None:
         rendered = _render_agent_prompt()
 
-        for phrase in (
-            "missing newly added workflow block",
-            "not following a configured search step",
-            "whether a named block is present",
-            "runtime error condition did not trigger",
-            "missing or unknown block labels",
-        ):
-            assert phrase in rendered
+        assert (
+            "This includes diagnostic symptom follow-ups on the same workflow after an explicit edit goal" in rendered
+        )
+        assert "diagnostic-after-edit - prior turn asked to consolidate login blocks" in rendered
+        assert "connect the existing block chain and call `update_and_run_blocks` once" in rendered
 
-    def test_agent_prompt_preserves_explicit_edit_requests(self) -> None:
+    def test_agent_prompt_keeps_unresolved_diagnostics_as_clarification(self) -> None:
         rendered = _render_agent_prompt()
 
-        assert "Explicit edit/debug requests remain edit requests" in rendered
-        assert "how can I improve" in rendered
-        assert "what would fix" in rendered
-        assert "call `update_and_run_blocks`" in rendered
+        assert "when a diagnostic complaint has no prior edit goal" in rendered
+        assert "mismatched/anonymized block references cannot be resolved" in rendered
+        assert "latest says to add a conditional to a URL without saying when -> ask for the condition" in rendered
+        assert "ask naming both missing labels and candidate blocks" in rendered
 
-    def test_block_running_tools_defer_diagnostic_complaints(self) -> None:
+    def test_agent_prompt_avoids_debug_tools_before_clear_structural_edit(self) -> None:
+        rendered = _render_agent_prompt()
+
+        assert "When the workflow structure itself is enough to make the edit" in rendered
+        assert (
+            "do not use direct browser tools, `get_run_results`, `run_blocks_and_collect_debug`, `update_workflow`"
+            in rendered
+        )
+        assert (
+            "Do not copy explanatory chat-history prose, example Jinja placeholders, or diagnostic transcripts"
+            in rendered
+        )
+
+    def test_block_running_tools_share_consolidated_diagnostic_routing(self) -> None:
         for tool in (run_blocks_tool, update_and_run_blocks_tool):
             desc = tool.description  # type: ignore[attr-defined]
-            assert "diagnostic / observational complaint" in desc
-            assert "inspect-and-clarify" in desc
-            assert "not the first response" in desc
+            assert "diagnostic complaints" in desc
+            assert "ASK-vs-EDIT routing" in desc
+
+        run_desc = run_blocks_tool.description  # type: ignore[attr-defined]
+        assert "no prior edit goal" in run_desc
+        assert "use `update_and_run_blocks`" in run_desc
+        assert "instead of rerunning unchanged blocks" in run_desc
+
+        update_desc = update_and_run_blocks_tool.description  # type: ignore[attr-defined]
+        assert "diagnostic follow-up after an explicit edit goal" in update_desc
+        assert "update/run once the correction is clear" in update_desc
 
 
 class TestDiagnosticAbsentEntity:
-    """Pin SKY-9756: diagnostic complaints naming an absent workflow entity must not get a workflow-knowledge-base explanation in isolation."""
+    """Pin SKY-9756 absent-entity symptoms to workflow state before docs prose."""
 
-    def test_diagnostic_section_requires_entity_presence_check(self) -> None:
+    def test_ask_vs_edit_routing_requires_entity_presence_check(self) -> None:
         rendered = _render_agent_prompt()
 
         for phrase in (
             "block label, workflow parameter key, or `{{ name.output... }}` Jinja reference",
-            "verify the entity is present in the current workflow YAML",
+            "is present in the current workflow YAML",
             "The current workflow is the source of truth",
-            "Pending build with a plausible block sequence",
-            "Pending build still waiting on user input",
-            "No pending build in chat history",
-            "fall back to the CRITICAL ROLE BOUNDARY docs-inline path",
-            "Do not fabricate a workflow",
+            "chat history contains a plausible pending build/edit",
+            "create or correct the real workflow blocks and call `update_and_run_blocks`",
+            "respond with `ASK_QUESTION` naming both the absent entity and missing requirement",
+            "Only use docs-inline when no pending workflow build/edit remains",
         ):
-            assert phrase in rendered, f"missing diagnostic absent-entity phrase: {phrase!r}"
+            assert phrase in rendered, f"missing absent-entity routing phrase: {phrase!r}"
 
-    def test_step_5_spells_out_knowledge_base_does_not_use_kb_acronym(self) -> None:
-        # The rest of the prompt spells out "WORKFLOW KNOWLEDGE BASE"; the new
-        # step 5 must match that convention so the LLM has no ambiguity about
-        # what "KB" would have meant.
+    def test_ask_vs_edit_spells_out_knowledge_base_does_not_use_kb_acronym(self) -> None:
+        # The rest of the prompt spells out "WORKFLOW KNOWLEDGE BASE"; the
+        # routing rule should not introduce a new "KB" abbreviation.
         rendered = _render_agent_prompt()
-        section_marker = "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS:"
-        end_marker = "Explicit edit/debug requests remain edit requests"
+        section_marker = "ASK-vs-EDIT ROUTING:"
+        end_marker = "WORKFLOW-FIRST EXECUTION PATH"
         start = rendered.index(section_marker)
         end = rendered.index(end_marker, start)
         section = rendered[start:end]
-        assert "workflow-knowledge-base explanation" in section
         assert "workflow-knowledge-base prose" in section
-        assert not re.search(r"\bKB\b", section), "step 5 must spell out 'knowledge base', not abbreviate to 'KB'"
+        assert "KB" not in section
 
-    def test_docs_inline_disambiguator_defers_to_diagnostic_step_5(self) -> None:
+    def test_docs_inline_disambiguator_defers_to_ask_vs_edit_routing(self) -> None:
         rendered = _render_agent_prompt()
 
         assert "Docs-inline does NOT apply to a runtime symptom" in rendered
         assert "a block label, workflow parameter key, or `{{ name.output... }}` Jinja reference" in rendered
-        assert "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS step 5" in rendered
-
-    def test_diagnostic_step_5_is_actually_numbered_in_section(self) -> None:
-        rendered = _render_agent_prompt()
-        section_marker = "DIAGNOSTIC / OBSERVATIONAL COMPLAINTS:"
-        end_marker = "Explicit edit/debug requests remain edit requests"
-        start = rendered.index(section_marker)
-        end = rendered.index(end_marker, start)
-        section = rendered[start:end]
-        assert "\n5. " in section, "step 5 missing from DIAGNOSTIC / OBSERVATIONAL COMPLAINTS numbered list"
+        assert "use the ASK-vs-EDIT routing below" in rendered
