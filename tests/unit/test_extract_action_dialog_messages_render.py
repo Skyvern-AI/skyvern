@@ -19,7 +19,7 @@ _BASE_KWARGS: dict[str, Any] = {
     "complete_criterion": None,
     "terminate_criterion": None,
     "parse_select_feature_enabled": False,
-    "has_magic_link_page": False,
+    "show_close_page_action": False,
     "elements": "<html></html>",
 }
 
