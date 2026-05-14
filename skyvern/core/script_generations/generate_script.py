@@ -21,7 +21,10 @@ from libcst import Attribute, Call, Dict, DictElement, FunctionDef, Name, Param
 
 from skyvern.config import settings
 from skyvern.core.script_generations.constants import SCRIPT_TASK_BLOCKS, SCRIPT_TASK_BLOCKS_WITH_COMPLETE_ACTION
-from skyvern.core.script_generations.deterministic_field_naming import infer_credential_subscript_for_emit
+from skyvern.core.script_generations.deterministic_field_naming import (
+    infer_credential_subscript_for_emit,
+    pick_credential_root_for_block,
+)
 from skyvern.core.script_generations.generate_workflow_parameters import (
     CUSTOM_FIELD_ACTIONS,
     generate_workflow_parameters_schema,
@@ -1032,6 +1035,37 @@ def _action_to_stmt(
                         ),
                     )
                 )
+            elif (
+                not task.get("totp_verification_url")
+                and not (act.get("totp_timing_info") or {}).get("is_totp_sequence")
+                and (
+                    credential_key := pick_credential_root_for_block(
+                        goal_template=goal_template,
+                        credential_param_keys=credential_param_keys,
+                    )
+                )
+            ):
+                # Mirrors BaseTaskBlock.format_potential_template_parameters: emit a
+                # runtime credential lookup so the cached script resolves the
+                # totp_identifier per run instead of hard-coding it. Skipped for
+                # is_totp_sequence — runtime poll would overwrite each single-digit
+                # input with the full code.
+                args.append(
+                    cst.Arg(
+                        keyword=cst.Name("totp_identifier"),
+                        value=cst.Call(
+                            func=cst.Attribute(
+                                value=cst.Name("context"),
+                                attr=cst.Name("credential_totp_identifier"),
+                            ),
+                            args=[cst.Arg(value=_value(credential_key))],
+                        ),
+                        whitespace_after_arg=cst.ParenthesizedWhitespace(
+                            indent=True,
+                            last_line=cst.SimpleWhitespace(INDENT),
+                        ),
+                    )
+                )
             if task.get("totp_verification_url"):
                 args.append(
                     cst.Arg(
@@ -1396,6 +1430,15 @@ def _build_block_fn(
     cache_key = block.get("label") or block.get("title") or f"block_{block.get('workflow_run_block_id')}"
     body_stmts: list[cst.BaseStatement] = []
 
+    # Restrict credentials to those bound to THIS block's parameters — matches
+    # BaseTaskBlock.get_all_parameters (block.py:872-883), which returns the
+    # block's own `self.parameters`. Workflow-wide keys would conflate
+    # credentials from unrelated blocks in multi-login flows.
+    block_parameter_keys: frozenset[str] = frozenset(
+        p["key"] for p in block.get("parameters") or [] if isinstance(p, dict) and isinstance(p.get("key"), str)
+    )
+    block_credential_param_keys = credential_param_keys & block_parameter_keys
+
     # Detect and annotate multi-field TOTP sequences so each fill gets the correct digit index
     actions = _annotate_multi_field_totp_sequence(actions)
 
@@ -1440,7 +1483,7 @@ def _build_block_fn(
                     use_semantic_selectors=use_semantic_selectors,
                     block_type=block_type,
                     goal_template=block.get("navigation_goal") or block.get("data_extraction_goal") or "",
-                    credential_param_keys=credential_param_keys,
+                    credential_param_keys=block_credential_param_keys,
                 )
             )
 
