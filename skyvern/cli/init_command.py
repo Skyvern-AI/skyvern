@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
@@ -206,28 +206,6 @@ def _select_backend_env_scope(*, run_local: bool, env_scope: str | None) -> EnvS
             console.print(f"[red]{exc.message}[/red]")
 
 
-@overload
-def init_env(
-    no_postgres: bool = False,
-    database_string: str = "",
-    skip_browser_install: bool = False,
-    env_scope: str | None = None,
-    env_path: Path | str | None = None,
-    return_result: Literal[False] = False,
-) -> bool: ...
-
-
-@overload
-def init_env(
-    no_postgres: bool = False,
-    database_string: str = "",
-    skip_browser_install: bool = False,
-    env_scope: str | None = None,
-    env_path: Path | str | None = None,
-    return_result: Literal[True] = True,
-) -> InitEnvResult: ...
-
-
 _T = TypeVar("_T")
 _SERVER_EXTRA_INSTALL_ATTEMPTED = False
 _LOCAL_SERVER_DEPENDENCY_HINT = (
@@ -330,6 +308,28 @@ def _run_with_server_dependency_install(action: Callable[[], _T]) -> _T:
             _install_server_extra_for_missing_dependency(exc)
 
 
+@overload
+def init_env(
+    no_postgres: bool = False,
+    database_string: str = "",
+    skip_browser_install: bool = False,
+    env_scope: str | None = None,
+    env_path: Path | str | None = None,
+    return_result: Literal[False] = False,
+) -> bool: ...
+
+
+@overload
+def init_env(
+    no_postgres: bool = False,
+    database_string: str = "",
+    skip_browser_install: bool = False,
+    env_scope: str | None = None,
+    env_path: Path | str | None = None,
+    return_result: Literal[True] = True,
+) -> InitEnvResult: ...
+
+
 def init_env(
     no_postgres: bool = False,
     database_string: str = "",
@@ -391,7 +391,7 @@ def init_env(
 
             return start_forge_app
 
-        def _load_setup_local_organization() -> Callable[[], object]:
+        def _load_setup_local_organization() -> Callable[[], Coroutine[Any, Any, str]]:
             from .mcp import setup_local_organization  # noqa: PLC0415
 
             return setup_local_organization

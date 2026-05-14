@@ -5,8 +5,7 @@ import subprocess
 import pytest
 import typer
 
-from skyvern.cli import init_command
-from skyvern.cli import quickstart
+from skyvern.cli import init_command, quickstart
 
 
 def test_running_skyvern_compose_services_filters_expected_services(monkeypatch: pytest.MonkeyPatch) -> None:
