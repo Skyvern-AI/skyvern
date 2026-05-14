@@ -3575,6 +3575,16 @@ class RunContext:
             return ctx.loop_metadata.get("current_value")
         return None
 
+    def credential_totp_identifier(self, credential_key: str) -> str | None:
+        """Look up the TOTP identifier registered for a workflow credential parameter."""
+        ctx = skyvern_context.current()
+        if not ctx or not ctx.workflow_run_id:
+            return None
+        workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.workflow_run_contexts.get(ctx.workflow_run_id)
+        if workflow_run_context is None:
+            return None
+        return workflow_run_context.credential_totp_identifiers.get(credential_key)
+
     def loop_item_selector(self) -> str | None:
         """Build a CSS selector to click the current loop item's link on the page.
 
