@@ -877,6 +877,8 @@ async def handle_click_action(
                 action,
                 skyvern_element,
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                incremental_scraped=incremental_scraped,
+                skyvern_frame=skyvern_frame,
             )
             if page.url != original_url:
                 return results
@@ -2645,6 +2647,19 @@ def generate_totp_value_with_task(task: Task, parameter: str) -> str:
     return generate_totp_value(task.workflow_run_id, parameter)
 
 
+async def _did_page_respond(
+    incremental_scraped: IncrementalScrapePage,
+    skyvern_frame: SkyvernFrame | None = None,
+) -> bool:
+    try:
+        if skyvern_frame:
+            await skyvern_frame.safe_wait_for_animation_end()
+        return (await incremental_scraped.get_incremental_elements_num()) > 0
+    except Exception:
+        LOG.debug("Failed to check incremental elements after click", exc_info=True)
+        return True
+
+
 async def chain_click(
     task: Task,
     scraped_page: ScrapedPage,
@@ -2653,6 +2668,8 @@ async def chain_click(
     skyvern_element: SkyvernElement,
     pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
+    incremental_scraped: IncrementalScrapePage | None = None,
+    skyvern_frame: SkyvernFrame | None = None,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
     # This automatically dismisses the dialog
@@ -2857,7 +2874,37 @@ async def chain_click(
         except Exception as e:
             action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
-        return action_results
+        # Only attempt JS click when the caller provided an observer to verify
+        # the result.  Without one we can't distinguish success from a no-op,
+        # so preserve the old behavior (return accumulated failures).
+        if incremental_scraped is None:
+            return action_results
+
+        # JS click dispatches directly on the DOM node, bypassing hit-testing.
+        LOG.info(
+            "Chain click: blocker is not parent/sibling, trying JS click on original element",
+            action=action,
+            element=str(skyvern_element),
+            locator=locator,
+        )
+        try:
+            await skyvern_element.click_in_javascript()
+            if await _did_page_respond(incremental_scraped, skyvern_frame):
+                action_results.append(ActionSuccess())
+                return action_results
+            LOG.info(
+                "Chain click: JS click did not trigger a page response",
+                action=action,
+                element=str(skyvern_element),
+            )
+            action_results.append(
+                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
+            )
+            return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+            return action_results
+
     finally:
         # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
