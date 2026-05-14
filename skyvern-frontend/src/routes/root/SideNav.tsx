@@ -9,6 +9,7 @@ import {
   GlobeIcon,
   LightningBoltIcon,
 } from "@radix-ui/react-icons";
+import { BrowserIcon } from "@/components/icons/BrowserIcon.tsx";
 import { KeyIcon } from "@/components/icons/KeyIcon.tsx";
 
 function SideNav() {
@@ -62,6 +63,11 @@ function SideNav() {
             label: "Credentials",
             to: "/credentials",
             icon: <KeyIcon className="size-6" />,
+          },
+          {
+            label: "Browser Profiles",
+            to: "/browser-profiles",
+            icon: <BrowserIcon className="size-6" />,
           },
         ]}
       />
