@@ -398,9 +398,12 @@ function WorkflowRun() {
               </Link>
             )}
             {workflowRun?.browser_profile_id && (
-              <span className="font-mono text-sm text-slate-400">
+              <Link
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                to={`/browser-profiles/${workflowRun.browser_profile_id}`}
+              >
                 Browser Profile: {workflowRun.browser_profile_id}
-              </span>
+              </Link>
             )}
           </div>
 
