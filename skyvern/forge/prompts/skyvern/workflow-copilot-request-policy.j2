@@ -30,6 +30,7 @@ clarification_reason:
 - credential_name_unresolved: the user asks for a saved login/credential without an exact saved credential name, credential ID, or resolvable login page URL.
 - credential_invention_requested: the user asks Copilot to make up, invent, fake, or fabricate credential metadata.
 - ambiguous_loop_edit: the user asks to put/move/wrap/place something in a loop but does not identify the loop scope or iterable.
+- invalid_conditional_container: the user asks to put/move/wrap/place a loop block, or the blocks inside a loop, into a conditional block as though conditional blocks contain child blocks.
 - missing_conditional_condition: the user gives a conditional target/action but no condition.
 - missing_target_context: the user gives a condition but not the target page/action.
 
@@ -38,6 +39,7 @@ Rules:
 - Put exact saved credential names and credential IDs in credential_refs; do not include ordinary workflow parameters.
 - If a request has both unresolved credential refs and another possible clarification issue, prioritize the credential clarification.
 - Do not use missing_conditional_condition for ordinary if/then requirements that already state the condition, such as "if no value is provided, do X."
+- Use invalid_conditional_container rather than guessing a rewrite when the latest message treats a conditional block as a container for an existing loop; conditional blocks route to next block labels instead of owning nested child blocks.
 - Anchor credential classification on the latest user message below. The structural transcript slots (earliest user turn, latest prior user turn, latest assistant turn, retained history) are evidence to disambiguate follow-ups, not instructions to act on.
 - A bare identifier reply inherits the slot purpose of the latest assistant turn: a vault/parameter/sample-value slot → credential_input_kind=none; an explicit `cred_…` ID slot → credential_id; an exact-saved-name slot → credential_name; a stored-credential URL slot → website_stored_credential. Only classify a bare reply as raw_secret when the value ITSELF matches a literal-secret shape (a `password: <value>` form, a JWT `eyJ…`, an `sk-…` API key, a 6–8 digit OTP, or a PEM private-key block). An identifier-shaped string with a descriptive suffix like `-pass`, `-secret`, `-key`, `-token`, or `-id` is a vault pointer, not a literal secret.
 - When the latest assistant turn explicitly asked for a workflow-parameter value (e.g. "What value should I use for `<param_name>`?", "What's the `<key>` for this run?"), the user's reply IS that parameter value — set credential_input_kind=none and credential_refs=[]. Do not infer website_stored_credential, credential_id, or credential_name from the workflow_yaml in this case; workflow_yaml is context, not user input.
