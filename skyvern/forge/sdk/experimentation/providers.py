@@ -99,6 +99,9 @@ def record_feature_flag_resolution(
     resolution_kind: ResolutionKind,
     resolved_value: Any,
 ) -> None:
+    # Callers must skyvern_context.set(...) with the run/task ID set BEFORE evaluating
+    # per-run flags — _record_feature_flag_entry short-circuits on contexts missing
+    # workflow_run_id/task_id/task_v2_id/run_id, and the resolution would be lost.
     context = skyvern_context.current()
     serialized_resolved_value = _serialize_feature_resolution_value(resolution_kind, resolved_value)
     LOG.debug(
