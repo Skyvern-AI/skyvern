@@ -299,6 +299,14 @@ def _schedule_summary_shadow_check_for_hit(
     )
 
 
+def _step_last_action_is_close_page(step: Step) -> bool:
+    return (
+        step.output is not None
+        and bool(step.output.actions_and_results)
+        and step.output.actions_and_results[-1][0].action_type == ActionType.CLOSE_PAGE
+    )
+
+
 def _build_totp_timeout_reasoning(task: Task) -> str:
     # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
     # source that was actually queried. URL goes through strip_query_params to keep
@@ -3213,19 +3221,19 @@ class ForgeAgent:
     @staticmethod
     def _build_extract_action_cache_variant(
         verification_code_check: bool,
-        has_magic_link_page: bool,
+        show_close_page_action: bool,
         complete_criterion: str | None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, magic link flows, complete criteria) do not reuse the
+        differ meaningfully (OTP, multi-tab flows, complete criteria) do not reuse the
         same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
             variant_parts.append("vc")
-        if has_magic_link_page:
-            variant_parts.append("ml")
+        if show_close_page_action:
+            variant_parts.append("cp")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
@@ -3393,6 +3401,7 @@ class ForgeAgent:
         navigation_goal = task.navigation_goal
         starting_url = task.url
         page = await browser_state.get_working_page()
+        show_close_page_action = page is not None and len(page.context.pages) > 1
         current_url = (
             await SkyvernFrame.evaluate(frame=page, expression="() => document.location.href") if page else starting_url
         )
@@ -3519,12 +3528,12 @@ class ForgeAgent:
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "parse_select_feature_enabled": context.enable_parse_select_in_extract,
-                    "has_magic_link_page": context.has_magic_link_page(task.task_id),
+                    "show_close_page_action": show_close_page_action,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
-                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    show_close_page_action=show_close_page_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
@@ -3611,7 +3620,7 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
-            has_magic_link_page=context.has_magic_link_page(task.task_id),
+            show_close_page_action=show_close_page_action,
             recent_dialog_messages_str=recent_dialog_messages_str,
             # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
             # (default html_need_skyvern_attrs=True) — the planner emits
@@ -5281,12 +5290,14 @@ class ForgeAgent:
         # Check if parallel verification should be used
         # Only use it when we have the required data AND when verification would normally happen
         task_completes_on_download = task_block and task_block.complete_on_download and task.workflow_run_id
+        last_action_is_close_page = _step_last_action_is_close_page(step)
         should_verify = (
             complete_verification
             and not step.is_goal_achieved()
             and not step.is_terminated()
             and not isinstance(task_block, ActionBlock)
             and not task_completes_on_download
+            and not last_action_is_close_page
             and (task.navigation_goal or task.complete_criterion)
         )
 
