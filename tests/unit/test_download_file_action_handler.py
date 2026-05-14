@@ -541,3 +541,167 @@ async def test_handle_action_does_not_navigate_back_when_page_url_unchanged() ->
 
     # Page URL is unchanged; no navigation back should occur
     browser_state.navigate_to_url.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_action_saves_download_event_to_active_run_directory() -> None:
+    """A browser launched before a task/run id may still emit downloads in its
+    original directory; the action wrapper should copy the event into the
+    active run directory before reporting success."""
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    page.context.browser = None
+    download_callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    download = MagicMock()
+    download.suggested_filename = "report.pdf"
+
+    async def save_download(target_path: str | os.PathLike[str]) -> None:
+        with open(target_path, "w") as f:
+            f.write("dummy")
+
+    download.save_as = AsyncMock(side_effect=save_download)
+
+    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+        download_callbacks["download"](download)
+        return [ActionSuccess()]
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+        wait_for_downloads = AsyncMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1"),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=wait_for_downloads,
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+    assert results[-1].download_triggered is True
+    assert len(results[-1].downloaded_files) == 1
+    assert results[-1].downloaded_files[0].endswith("-report.pdf")
+    assert action.download_triggered is True
+    assert action.downloaded_files == results[-1].downloaded_files
+    assert wait_for_downloads.await_count == 1
+    download.save_as.assert_awaited_once()
+    saved_path = download.save_as.await_args.args[0]
+    assert os.path.dirname(saved_path) == primary_dir
+    page.off.assert_called_once_with("download", download_callbacks["download"])
+
+
+@pytest.mark.asyncio
+async def test_handle_action_removes_download_listener_when_inner_action_raises() -> None:
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    download_callbacks: dict[str, object] = {}
+    page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=RuntimeError("boom")),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1"),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                await ActionHandler.handle_action(
+                    scraped_page=scraped_page,
+                    task=task,
+                    step=step,
+                    page=page,
+                    action=action,
+                )
+
+    page.off.assert_called_once_with("download", download_callbacks["download"])
