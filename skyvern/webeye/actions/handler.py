@@ -15,7 +15,7 @@ import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -122,6 +122,12 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
+    filename = Path(suggested_filename or "download").name
+    stem, suffix = os.path.splitext(filename)
+    return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
 async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
@@ -456,18 +462,28 @@ class ActionHandler:
                 run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
             )
         )
+        download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
+
+        def _capture_download_event(download: Download) -> None:
+            if not download_event.done():
+                download_event.set_result(download)
+
+        async def _list_observed_download_files() -> list[str]:
+            files = list_files_in_directory(download_dir)
+            if task.browser_session_id:
+                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
+                files = files + files_in_browser_session
+            return files
+
         initial_page_count = 0
         page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
-        list_files_before = list_files_in_directory(download_dir)
-        if task.browser_session_id:
-            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                organization_id=task.organization_id, browser_session_id=task.browser_session_id
-            )
-            list_files_before = list_files_before + files_in_browser_session
+        list_files_before = await _list_observed_download_files()
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
@@ -475,6 +491,7 @@ class ActionHandler:
         )
 
         download_triggered = False
+        page.on("download", _capture_download_event)
         try:
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
@@ -492,6 +509,7 @@ class ActionHandler:
                 apply_context_attrs(_dl_wait_span)
                 _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
                 _poll_iterations = 0
+                download_event_consumed = False
                 try:
                     LOG.info(
                         "Checking if there is any new files after click",
@@ -500,13 +518,29 @@ class ActionHandler:
                     async with asyncio.timeout(_download_timeout):
                         while True:
                             _poll_iterations += 1
-                            list_files_after = list_files_in_directory(download_dir)
-                            if task.browser_session_id:
-                                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=task.organization_id,
-                                    browser_session_id=task.browser_session_id,
-                                )
-                                list_files_after = list_files_after + files_in_browser_session
+                            if download_event.done() and not download_event_consumed:
+                                download_event_consumed = True
+                                try:
+                                    download = download_event.result()
+                                    download_target = _download_target_path(download_dir, download.suggested_filename)
+                                    await download.save_as(download_target)
+                                    list_files_after = await _list_observed_download_files()
+                                    LOG.info(
+                                        "Captured download event and saved file to active run directory",
+                                        download_dir=download_dir,
+                                        download_target=str(download_target),
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                    download_triggered = True
+                                    break
+                                except Exception:
+                                    LOG.warning(
+                                        "Failed to save captured download event to active run directory",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                        exc_info=True,
+                                    )
+                            list_files_after = await _list_observed_download_files()
 
                             if len(list_files_after) > len(list_files_before):
                                 LOG.info(
@@ -615,6 +649,11 @@ class ActionHandler:
                             original_url=page_url_before_download,
                             exc_info=True,
                         )
+
+            try:
+                page.off("download", _capture_download_event)
+            except Exception:
+                LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
 
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
