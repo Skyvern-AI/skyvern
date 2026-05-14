@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import asc, case, select
+from sqlalchemy import asc, case, or_, select
 
 from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -78,6 +78,7 @@ class BrowserSessionsRepository(BaseRepository):
         include_deleted: bool = False,
         page: int = 1,
         page_size: int = 10,
+        search_key: str | None = None,
     ) -> list[BrowserProfile]:
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -86,6 +87,14 @@ class BrowserSessionsRepository(BaseRepository):
             query = select(BrowserProfileModel).filter_by(organization_id=organization_id)
             if not include_deleted:
                 query = query.filter(BrowserProfileModel.deleted_at.is_(None))
+            if search_key:
+                search_like = f"%{search_key}%"
+                query = query.filter(
+                    or_(
+                        BrowserProfileModel.name.ilike(search_like),
+                        BrowserProfileModel.description.ilike(search_like),
+                    )
+                )
             query = query.order_by(asc(BrowserProfileModel.created_at)).limit(page_size).offset(db_page * page_size)
             browser_profiles = await session.scalars(query)
             return [BrowserProfile.model_validate(profile) for profile in browser_profiles.all()]

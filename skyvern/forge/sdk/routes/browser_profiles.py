@@ -138,6 +138,14 @@ async def list_browser_profiles(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1),
     include_deleted: bool = Query(default=False, description="Include deleted browser profiles"),
+    search_key: str | None = Query(
+        None,
+        description=(
+            "Case-insensitive substring search across: browser profile name and description. "
+            "A profile is returned if either field matches."
+        ),
+        examples=["my_profile", "production"],
+    ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[BrowserProfile]:
     """List all browser profiles for the current organization."""
@@ -148,6 +156,7 @@ async def list_browser_profiles(
         include_deleted=include_deleted,
         page=page,
         page_size=page_size,
+        search_key=search_key,
     )
 
     profiles = await app.DATABASE.browser_sessions.list_browser_profiles(
@@ -155,6 +164,7 @@ async def list_browser_profiles(
         include_deleted=include_deleted,
         page=page,
         page_size=page_size,
+        search_key=search_key,
     )
 
     LOG.info(
