@@ -1,5 +1,4 @@
 import {
-  BarChartIcon,
   LightningBoltIcon,
   CodeIcon,
   MixerHorizontalIcon,
@@ -42,8 +41,7 @@ import {
   formatExecutionTime,
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
-import CloudContext from "@/store/CloudContext";
-import React, { useContext, useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -71,11 +69,9 @@ import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { getOrderedRunParameters } from "./utils";
-import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
-  const isCloud = useContext(CloudContext);
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
@@ -156,14 +152,6 @@ function WorkflowPage() {
               onSuccessfullyDeleted={() => navigate("/workflows")}
             />
           )}
-          {isCloud ? (
-            <Button asChild variant="secondary">
-              <Link to={buildWorkflowAnalyticsPath(workflowPermanentId)}>
-                <BarChartIcon className="mr-2 size-4" />
-                Analytics
-              </Link>
-            </Button>
-          ) : null}
           <Button asChild variant="secondary">
             <Link to={`/workflows/${workflowPermanentId}/scripts`}>
               <CodeIcon className="mr-2 size-4" />
