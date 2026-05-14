@@ -70,6 +70,7 @@ def test_list_browser_profiles_default_pagination(monkeypatch: pytest.MonkeyPatc
         include_deleted=False,
         page=1,
         page_size=10,
+        search_key=None,
     )
 
 
@@ -85,6 +86,7 @@ def test_list_browser_profiles_explicit_pagination(monkeypatch: pytest.MonkeyPat
         include_deleted=False,
         page=2,
         page_size=10,
+        search_key=None,
     )
 
 
@@ -118,4 +120,90 @@ def test_list_browser_profiles_alias_trailing_slash(monkeypatch: pytest.MonkeyPa
         include_deleted=False,
         page=3,
         page_size=5,
+        search_key=None,
+    )
+
+
+def test_list_browser_profiles_search_key_hit_on_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, list_browser_profiles = _build_client(monkeypatch)
+    list_browser_profiles.return_value = [_profile("bp_match", name="production_profile")]
+
+    response = client.get("/v1/browser_profiles?search_key=production")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [p["browser_profile_id"] for p in body] == ["bp_match"]
+    list_browser_profiles.assert_awaited_once_with(
+        organization_id=ORG_ID,
+        include_deleted=False,
+        page=1,
+        page_size=10,
+        search_key="production",
+    )
+
+
+def test_list_browser_profiles_search_key_hit_on_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, list_browser_profiles = _build_client(monkeypatch)
+    list_browser_profiles.return_value = [_profile("bp_desc")]
+
+    response = client.get("/v1/browser_profiles?search_key=staging_login")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [p["browser_profile_id"] for p in body] == ["bp_desc"]
+    list_browser_profiles.assert_awaited_once_with(
+        organization_id=ORG_ID,
+        include_deleted=False,
+        page=1,
+        page_size=10,
+        search_key="staging_login",
+    )
+
+
+def test_list_browser_profiles_search_key_miss(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, list_browser_profiles = _build_client(monkeypatch)
+    list_browser_profiles.return_value = []
+
+    response = client.get("/v1/browser_profiles?search_key=no_such_profile")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    list_browser_profiles.assert_awaited_once_with(
+        organization_id=ORG_ID,
+        include_deleted=False,
+        page=1,
+        page_size=10,
+        search_key="no_such_profile",
+    )
+
+
+def test_list_browser_profiles_search_key_with_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, list_browser_profiles = _build_client(monkeypatch)
+    list_browser_profiles.return_value = []
+
+    response = client.get("/v1/browser_profiles?search_key=prod&page=2&page_size=5")
+
+    assert response.status_code == 200
+    list_browser_profiles.assert_awaited_once_with(
+        organization_id=ORG_ID,
+        include_deleted=False,
+        page=2,
+        page_size=5,
+        search_key="prod",
+    )
+
+
+def test_list_browser_profiles_search_key_with_include_deleted(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, list_browser_profiles = _build_client(monkeypatch)
+    list_browser_profiles.return_value = []
+
+    response = client.get("/v1/browser_profiles?search_key=archived&include_deleted=true")
+
+    assert response.status_code == 200
+    list_browser_profiles.assert_awaited_once_with(
+        organization_id=ORG_ID,
+        include_deleted=True,
+        page=1,
+        page_size=10,
+        search_key="archived",
     )
