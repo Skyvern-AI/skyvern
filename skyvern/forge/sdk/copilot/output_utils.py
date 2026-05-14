@@ -9,6 +9,7 @@ import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
+from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
 _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY = "_copilot_internal_run_cancelled_by_watchdog"
+_BASE64_IMAGE_OMITTED_MESSAGE = "[base64 image omitted — screenshot was taken successfully]"
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _JPEG_PREFIX = b"\xff\xd8\xff"
@@ -181,15 +183,24 @@ def _summarize_extracted_data(extracted: Any) -> str:
 
 def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict[str, Any]:
     """Strip large/binary fields from tool results before sending to the LLM."""
-    sanitized = dict(result)
-    for key in ("action", "browser_context", "artifacts", "timing_ms"):
-        sanitized.pop(key, None)
+    sanitized = sanitize_generic_tool_result_for_llm(
+        tool_name,
+        result,
+        drop_top_level_keys=(
+            "action",
+            "browser_context",
+            "artifacts",
+            "timing_ms",
+            "_workflow",
+            _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
+        ),
+        drop_data_keys=("sdk_equivalent",),
+        replacement_fields={"screenshot_base64": _BASE64_IMAGE_OMITTED_MESSAGE},
+    )
 
     data = sanitized.get("data")
     if isinstance(data, dict):
         data = dict(data)
-        if "screenshot_base64" in data:
-            data["screenshot_base64"] = "[base64 image omitted — screenshot was taken successfully]"
         if "schema" in data and isinstance(data["schema"], dict):
             schema_str = json.dumps(data["schema"])
             # 2000 chars ~= 500 LLM tokens — enough for the model to see the
@@ -219,14 +230,12 @@ def sanitize_tool_result_for_llm(tool_name: str, result: dict[str, Any]) -> dict
             blocks = data.get("blocks")
             if isinstance(blocks, list):
                 data["blocks"] = [
-                    {**block, "screenshot_b64": "[base64 image omitted — screenshot was taken successfully]"}
+                    {**block, "screenshot_b64": _BASE64_IMAGE_OMITTED_MESSAGE}
                     if isinstance(block, dict) and "screenshot_b64" in block
                     else block
                     for block in blocks
                 ]
         sanitized["data"] = data
-    sanitized.pop("_workflow", None)
-    sanitized.pop(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY, None)
     return sanitized
 
 
