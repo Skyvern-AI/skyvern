@@ -595,6 +595,33 @@ class ArtifactsRepository(BaseRepository):
                 return [convert_to_artifact(artifact, self.debug_enabled) for artifact in artifacts]
             return None
 
+    @db_operation("get_latest_artifact_per_task_ids")
+    async def get_latest_artifact_per_task_ids(
+        self,
+        task_ids: list[str],
+        artifact_types: list[ArtifactType],
+        organization_id: str | None = None,
+    ) -> list[Artifact]:
+        """One DISTINCT ON (task_id) query returns the latest artifact per task; avoids the N+1 per-task fetch loop."""
+        if not task_ids:
+            return []
+        async with self.Session() as session:
+            query = (
+                select(ArtifactModel)
+                .distinct(ArtifactModel.task_id)
+                .where(
+                    ArtifactModel.task_id.in_(task_ids),
+                    ArtifactModel.artifact_type.in_(artifact_types),
+                )
+                .order_by(ArtifactModel.task_id, ArtifactModel.created_at.desc())
+            )
+            if organization_id is not None:
+                query = query.where(
+                    or_(ArtifactModel.organization_id == organization_id, ArtifactModel.organization_id.is_(None))
+                )
+            artifacts = (await session.scalars(query)).all()
+            return [convert_to_artifact(a, self.debug_enabled) for a in artifacts]
+
     @db_operation("delete_task_artifacts")
     async def delete_task_artifacts(self, organization_id: str, task_id: str) -> None:
         async with self.Session() as session:

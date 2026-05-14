@@ -13,7 +13,7 @@ IDs on every workflow-run-status response.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -127,13 +127,7 @@ async def test_refresh_rebuilds_downloaded_files_from_artifact_ids():
     }
 
     fresh_artifact = _make_artifact("a_1", "s3://skyvern-uploads/downloads/local/o_1/wr_1/stale.pdf", checksum="sha-1")
-    fresh_file_info = FileInfo(
-        url="https://api.skyvern.com/v1/artifacts/a_1/content?expiry=fresh&kid=k&sig=s",
-        checksum="sha-1",
-        filename="stale.pdf",
-        modified_at=fresh_artifact.created_at,
-        artifact_id="a_1",
-    )
+    fresh_url = "https://api.skyvern.com/v1/artifacts/a_1/content?expiry=fresh&kid=k&sig=s"
 
     with (
         patch(
@@ -141,8 +135,12 @@ async def test_refresh_rebuilds_downloaded_files_from_artifact_ids():
             new=AsyncMock(return_value=[fresh_artifact]),
         ),
         patch(
-            "skyvern.forge.sdk.workflow.service._file_infos_from_download_artifacts",
-            return_value=[fresh_file_info],
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=AsyncMock(return_value=3600),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
+            new=Mock(return_value=fresh_url),
         ),
     ):
         service = WorkflowService()
@@ -150,12 +148,128 @@ async def test_refresh_rebuilds_downloaded_files_from_artifact_ids():
             persisted_block_output, organization_id="o_1", workflow_run_id="wr_1"
         )
 
-    assert refreshed["downloaded_files"][0]["url"].startswith("https://api.skyvern.com/v1/artifacts/a_1/content")
-    assert refreshed["downloaded_file_urls"] == [
-        "https://api.skyvern.com/v1/artifacts/a_1/content?expiry=fresh&kid=k&sig=s"
-    ]
+    assert refreshed["downloaded_files"][0]["url"] == fresh_url
+    assert refreshed["downloaded_file_urls"] == [fresh_url]
     # checksum from the artifact row is preserved.
     assert refreshed["downloaded_files"][0]["checksum"] == "sha-1"
+
+
+def test_collect_artifact_ids_multi_block():
+    """_collect_artifact_ids gathers every screenshot and download ID from a
+    nested multi-block output tree in a single sync pass."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    # Simulate two blocks nested under different output parameter keys.
+    tree = {
+        "block_output_1": {
+            "task_screenshot_artifact_ids": ["s_1", "s_2"],
+            "workflow_screenshot_artifact_ids": ["ws_1"],
+            "downloaded_file_artifact_ids": ["d_1"],
+        },
+        "block_output_2": {
+            "task_screenshot_artifact_ids": ["s_3"],
+            "workflow_screenshot_artifact_ids": [],
+            "downloaded_file_artifact_ids": ["d_2", "d_3"],
+        },
+        "extracted_information": ["some", "non-artifact", "data"],
+    }
+
+    screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(tree)
+
+    assert set(screenshot_ids) == {"s_1", "s_2", "ws_1", "s_3"}
+    assert set(download_ids) == {"d_1", "d_2", "d_3"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_issues_one_batch_db_call_for_n_blocks():
+    """For N blocks with artifact IDs, _refresh_output_urls must call
+    get_artifacts_by_ids exactly ONCE (with all IDs combined) rather than
+    once per block — this is the core O(N) → O(1) reduction."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    # Three blocks, each with a screenshot artifact ID.
+    tree = {
+        "out_1": {"task_screenshot_artifact_ids": ["s_1"], "workflow_screenshot_artifact_ids": []},
+        "out_2": {"task_screenshot_artifact_ids": ["s_2"], "workflow_screenshot_artifact_ids": []},
+        "out_3": {"task_screenshot_artifact_ids": ["s_3"], "workflow_screenshot_artifact_ids": []},
+    }
+
+    artifacts = [
+        _make_artifact("s_1", "s3://bucket/s1.png"),
+        _make_artifact("s_2", "s3://bucket/s2.png"),
+        _make_artifact("s_3", "s3://bucket/s3.png"),
+    ]
+    mock_get_artifacts = AsyncMock(return_value=artifacts)
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids",
+            mock_get_artifacts,
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=AsyncMock(return_value=3600),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
+            new=Mock(
+                side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+            ),
+        ),
+    ):
+        service = WorkflowService()
+        await service._refresh_output_urls(tree, organization_id="o_1", workflow_run_id="wr_1")
+
+    # Exactly one DB call, containing all three IDs.
+    mock_get_artifacts.assert_awaited_once()
+    called_ids = set(mock_get_artifacts.call_args.args[0])
+    assert called_ids == {"s_1", "s_2", "s_3"}
+
+
+@pytest.mark.asyncio
+async def test_refresh_substitutes_screenshot_urls_from_map():
+    """Screenshot artifact IDs are replaced with freshly signed URLs built from
+    the pre-fetched artifact batch, not via per-block DB calls."""
+    from skyvern.forge.sdk.workflow.service import WorkflowService
+
+    block_output = {
+        "task_screenshot_artifact_ids": ["s_1", "s_2"],
+        "workflow_screenshot_artifact_ids": ["ws_1"],
+        "downloaded_file_artifact_ids": [],
+    }
+
+    artifacts = [
+        _make_artifact("s_1", "s3://bucket/s1.png"),
+        _make_artifact("s_2", "s3://bucket/s2.png"),
+        _make_artifact("ws_1", "s3://bucket/ws1.png"),
+    ]
+
+    with (
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.DATABASE.artifacts.get_artifacts_by_ids",
+            new=AsyncMock(return_value=artifacts),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds",
+            new=AsyncMock(return_value=3600),
+        ),
+        patch(
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
+            new=Mock(
+                side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+            ),
+        ),
+    ):
+        service = WorkflowService()
+        result = await service._refresh_output_urls(block_output, organization_id="o_1", workflow_run_id="wr_1")
+
+    assert result["task_screenshots"] == [
+        "https://api.skyvern.com/v1/artifacts/s_1/content",
+        "https://api.skyvern.com/v1/artifacts/s_2/content",
+    ]
+    assert result["workflow_screenshots"] == [
+        "https://api.skyvern.com/v1/artifacts/ws_1/content",
+    ]
 
 
 @pytest.mark.asyncio
