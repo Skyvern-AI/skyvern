@@ -481,6 +481,7 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           onChange={(value) => {
                             update({ browserProfileId: value });
                           }}
+                          compact
                         />
                       </div>
                       <div className="space-y-2">

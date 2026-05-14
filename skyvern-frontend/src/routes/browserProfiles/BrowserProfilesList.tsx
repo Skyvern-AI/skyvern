@@ -23,7 +23,11 @@ import { cn } from "@/util/utils";
 
 import { BrowserProfileItem } from "./BrowserProfileItem";
 
-function BrowserProfilesList() {
+type Props = {
+  searchKey?: string;
+};
+
+function BrowserProfilesList({ searchKey }: Props = {}) {
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -55,11 +59,13 @@ function BrowserProfilesList() {
   } = useBrowserProfilesQuery({
     page,
     page_size: itemsPerPage,
+    searchKey,
   });
 
   const { data: nextPageProfiles } = useBrowserProfilesQuery({
     page: page + 1,
     page_size: itemsPerPage,
+    searchKey,
     enabled: (profiles?.length ?? 0) === itemsPerPage,
   });
 
@@ -93,12 +99,20 @@ function BrowserProfilesList() {
   }
 
   const pageItems = profiles ?? [];
+  const hasSearch = Boolean(searchKey && searchKey.length > 0);
 
   if (pageItems.length === 0 && page === 1) {
     return (
       <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
-        No browser profiles yet. Profiles are created via the API/SDK, or when a
-        credential test or workflow run saves its persistent browser session.
+        {hasSearch ? (
+          <>No browser profiles match &ldquo;{searchKey}&rdquo;.</>
+        ) : (
+          <>
+            No browser profiles yet. Profiles are created via the API/SDK, or
+            when a credential test or workflow run saves its persistent browser
+            session.
+          </>
+        )}
       </div>
     );
   }
