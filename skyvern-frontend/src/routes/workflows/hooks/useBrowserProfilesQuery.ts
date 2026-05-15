@@ -11,19 +11,37 @@ type UseQueryOptions = Omit<
 
 type Props = UseQueryOptions & {
   includeDeleted?: boolean;
+  page?: number;
+  page_size?: number;
+  searchKey?: string;
 };
 
 function useBrowserProfilesQuery(props: Props = {}) {
-  const { includeDeleted = false, ...queryOptions } = props;
+  const {
+    includeDeleted = false,
+    page,
+    page_size,
+    searchKey,
+    ...queryOptions
+  } = props;
   const credentialGetter = useCredentialGetter();
 
   return useQuery<QueryReturnType>({
-    queryKey: ["browserProfiles", includeDeleted],
+    queryKey: ["browserProfiles", includeDeleted, page, page_size, searchKey],
     queryFn: async () => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       const params = new URLSearchParams();
       if (includeDeleted) {
         params.set("include_deleted", "true");
+      }
+      if (page !== undefined) {
+        params.set("page", String(page));
+      }
+      if (page_size !== undefined) {
+        params.set("page_size", String(page_size));
+      }
+      if (searchKey) {
+        params.set("search_key", searchKey);
       }
       return client
         .get("/browser_profiles", { params })

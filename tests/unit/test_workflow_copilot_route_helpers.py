@@ -114,6 +114,47 @@ class TestNormalizeCopilotYamlTitleCoercion:
         assert request.title == "My Workflow"
 
 
+class TestNormalizeCopilotYamlBlockTypeAliases:
+    def test_browser_task_alias_is_canonicalized_to_navigation(self) -> None:
+        yaml_str = (
+            "title: Browser Task Alias\n"
+            "workflow_definition:\n"
+            "  parameters: []\n"
+            "  blocks:\n"
+            "    - block_type: browser_task\n"
+            "      label: open_picker\n"
+            "      navigation_goal: Click the picker.\n"
+        )
+
+        request = _normalize_copilot_yaml(yaml_str)
+
+        assert request.workflow_definition.blocks[0].block_type == "navigation"
+
+    def test_nested_browser_task_alias_is_canonicalized_to_navigation(self) -> None:
+        yaml_str = (
+            "title: Nested Browser Task Alias\n"
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "    - parameter_type: workflow\n"
+            "      key: items\n"
+            "      workflow_parameter_type: json\n"
+            "      default_value: '[]'\n"
+            "  blocks:\n"
+            "    - block_type: for_loop\n"
+            "      label: loop_items\n"
+            "      loop_over_parameter_key: items\n"
+            "      loop_blocks:\n"
+            "        - block_type: browser_task\n"
+            "          label: click_item\n"
+            "          navigation_goal: Click the current item.\n"
+        )
+
+        request = _normalize_copilot_yaml(yaml_str)
+
+        loop_block = request.workflow_definition.blocks[0]
+        assert loop_block.loop_blocks[0].block_type == "navigation"
+
+
 class TestNormalizeCopilotYamlProxyLocation:
     def test_missing_proxy_location_is_preserved(self) -> None:
         yaml_str = "title: Proxy Workflow\nworkflow_definition:\n  blocks: []\n  parameters: []\n"

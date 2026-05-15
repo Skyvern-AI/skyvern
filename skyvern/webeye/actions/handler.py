@@ -15,7 +15,7 @@ import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -122,6 +122,14 @@ from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElem
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
+
+
+def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
+    filename = Path(suggested_filename or "download").name
+    stem, suffix = os.path.splitext(filename)
+    return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
 
 
 async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
@@ -456,18 +464,28 @@ class ActionHandler:
                 run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
             )
         )
+        download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
+
+        def _capture_download_event(download: Download) -> None:
+            if not download_event.done():
+                download_event.set_result(download)
+
+        async def _list_observed_download_files() -> list[str]:
+            files = list_files_in_directory(download_dir)
+            if task.browser_session_id:
+                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
+                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
+                )
+                files = files + files_in_browser_session
+            return files
+
         initial_page_count = 0
         page_url_before_download = page.url
         # get the initial page count
         if browser_state:
             initial_page_count = len(await browser_state.list_valid_pages())
 
-        list_files_before = list_files_in_directory(download_dir)
-        if task.browser_session_id:
-            files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                organization_id=task.organization_id, browser_session_id=task.browser_session_id
-            )
-            list_files_before = list_files_before + files_in_browser_session
+        list_files_before = await _list_observed_download_files()
         LOG.info(
             "Number of files in download directory before action",
             num_downloaded_files_before=len(list_files_before),
@@ -475,6 +493,7 @@ class ActionHandler:
         )
 
         download_triggered = False
+        page.on("download", _capture_download_event)
         try:
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
@@ -488,10 +507,17 @@ class ActionHandler:
             if not results:
                 return results
             _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
+            _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
                 apply_context_attrs(_dl_wait_span)
                 _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
+                _dl_wait_span.set_attribute("download_event_grace_seconds", _download_event_grace_seconds)
                 _poll_iterations = 0
+                captured_download: Download | None = None
+                download_event_captured = False
+                download_event_captured_at: float | None = None
+                download_event_fallback_attempted = False
+                download_event_fallback_used = False
                 try:
                     LOG.info(
                         "Checking if there is any new files after click",
@@ -500,13 +526,17 @@ class ActionHandler:
                     async with asyncio.timeout(_download_timeout):
                         while True:
                             _poll_iterations += 1
-                            list_files_after = list_files_in_directory(download_dir)
-                            if task.browser_session_id:
-                                files_in_browser_session = await app.STORAGE.list_downloaded_files_in_browser_session(
-                                    organization_id=task.organization_id,
-                                    browser_session_id=task.browser_session_id,
+                            if download_event.done() and captured_download is None:
+                                captured_download = download_event.result()
+                                download_event_captured = True
+                                download_event_captured_at = time.monotonic()
+                                LOG.info(
+                                    "Captured download event; waiting for active run directory file",
+                                    download_dir=download_dir,
+                                    workflow_run_id=task.workflow_run_id,
                                 )
-                                list_files_after = list_files_after + files_in_browser_session
+
+                            list_files_after = await _list_observed_download_files()
 
                             if len(list_files_after) > len(list_files_before):
                                 LOG.info(
@@ -517,6 +547,48 @@ class ActionHandler:
                                 )
                                 download_triggered = True
                                 break
+
+                            if (
+                                captured_download is not None
+                                and download_event_captured_at is not None
+                                and not download_event_fallback_attempted
+                                and time.monotonic() - download_event_captured_at >= _download_event_grace_seconds
+                            ):
+                                download_event_fallback_attempted = True
+                                download_target = _download_target_path(
+                                    download_dir, captured_download.suggested_filename
+                                )
+                                try:
+                                    await captured_download.save_as(download_target)
+                                    if download_target.exists() and download_target.stat().st_size == 0:
+                                        download_target.unlink(missing_ok=True)
+                                        LOG.warning(
+                                            "Captured download event fallback produced an empty file; marking download triggered without artifact",
+                                            download_dir=download_dir,
+                                            download_target=str(download_target),
+                                            workflow_run_id=task.workflow_run_id,
+                                        )
+                                        list_files_after = await _list_observed_download_files()
+                                        download_triggered = True
+                                        break
+
+                                    list_files_after = await _list_observed_download_files()
+                                    LOG.info(
+                                        "Copied captured download event to active run directory",
+                                        download_dir=download_dir,
+                                        download_target=str(download_target),
+                                        workflow_run_id=task.workflow_run_id,
+                                    )
+                                    download_triggered = True
+                                    download_event_fallback_used = True
+                                    break
+                                except Exception:
+                                    LOG.warning(
+                                        "Failed to copy captured download event to active run directory",
+                                        download_dir=download_dir,
+                                        workflow_run_id=task.workflow_run_id,
+                                        exc_info=True,
+                                    )
                             await asyncio.sleep(1)
 
                 except asyncio.TimeoutError:
@@ -527,6 +599,9 @@ class ActionHandler:
                 finally:
                     _dl_wait_span.set_attribute("download_triggered", download_triggered)
                     _dl_wait_span.set_attribute("poll_iterations", _poll_iterations)
+                    _dl_wait_span.set_attribute("download_event_captured", download_event_captured)
+                    _dl_wait_span.set_attribute("download_event_fallback_attempted", download_event_fallback_attempted)
+                    _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
 
             if not download_triggered:
                 results[-1].download_triggered = False
@@ -615,6 +690,11 @@ class ActionHandler:
                             original_url=page_url_before_download,
                             exc_info=True,
                         )
+
+            try:
+                page.remove_listener("download", _capture_download_event)
+            except Exception:
+                LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
 
             persisted_action = await app.DATABASE.workflow_params.create_action(action=action)
             action.action_id = persisted_action.action_id
@@ -877,6 +957,8 @@ async def handle_click_action(
                 action,
                 skyvern_element,
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
+                incremental_scraped=incremental_scraped,
+                skyvern_frame=skyvern_frame,
             )
             if page.url != original_url:
                 return results
@@ -2645,6 +2727,19 @@ def generate_totp_value_with_task(task: Task, parameter: str) -> str:
     return generate_totp_value(task.workflow_run_id, parameter)
 
 
+async def _did_page_respond(
+    incremental_scraped: IncrementalScrapePage,
+    skyvern_frame: SkyvernFrame | None = None,
+) -> bool:
+    try:
+        if skyvern_frame:
+            await skyvern_frame.safe_wait_for_animation_end()
+        return (await incremental_scraped.get_incremental_elements_num()) > 0
+    except Exception:
+        LOG.debug("Failed to check incremental elements after click", exc_info=True)
+        return True
+
+
 async def chain_click(
     task: Task,
     scraped_page: ScrapedPage,
@@ -2653,6 +2748,8 @@ async def chain_click(
     skyvern_element: SkyvernElement,
     pending_upload_files: list[str] | str | None = None,
     timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
+    incremental_scraped: IncrementalScrapePage | None = None,
+    skyvern_frame: SkyvernFrame | None = None,
 ) -> List[ActionResult]:
     # Add a defensive page handler here in case a click action opens a file chooser.
     # This automatically dismisses the dialog
@@ -2857,7 +2954,37 @@ async def chain_click(
         except Exception as e:
             action_results.append(ActionFailure(FailToClick(action.element_id, anchor="blocking_element", msg=str(e))))
 
-        return action_results
+        # Only attempt JS click when the caller provided an observer to verify
+        # the result.  Without one we can't distinguish success from a no-op,
+        # so preserve the old behavior (return accumulated failures).
+        if incremental_scraped is None:
+            return action_results
+
+        # JS click dispatches directly on the DOM node, bypassing hit-testing.
+        LOG.info(
+            "Chain click: blocker is not parent/sibling, trying JS click on original element",
+            action=action,
+            element=str(skyvern_element),
+            locator=locator,
+        )
+        try:
+            await skyvern_element.click_in_javascript()
+            if await _did_page_respond(incremental_scraped, skyvern_frame):
+                action_results.append(ActionSuccess())
+                return action_results
+            LOG.info(
+                "Chain click: JS click did not trigger a page response",
+                action=action,
+                element=str(skyvern_element),
+            )
+            action_results.append(
+                ActionFailure(FailToClick(action.element_id, anchor="self_js", msg="no page response after click"))
+            )
+            return action_results
+        except Exception as e:
+            action_results.append(ActionFailure(FailToClick(action.element_id, anchor="self_js", msg=str(e))))
+            return action_results
+
     finally:
         # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)

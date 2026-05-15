@@ -38,6 +38,14 @@ async def test_pre_hook_allows_non_banned_types(ctx: MagicMock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_hook_canonicalizes_browser_task_alias(ctx: MagicMock) -> None:
+    params = {"block_type": "browser_task"}
+
+    assert await _get_block_schema_pre_hook(params, ctx) is None
+    assert params["block_type"] == "navigation"
+
+
+@pytest.mark.asyncio
 async def test_pre_hook_allows_list_mode_no_block_type(ctx: MagicMock) -> None:
     assert await _get_block_schema_pre_hook({}, ctx) is None
     assert await _get_block_schema_pre_hook({"block_type": None}, ctx) is None

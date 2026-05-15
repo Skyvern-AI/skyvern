@@ -197,6 +197,7 @@ class CopilotContext(AgentContext):
     # this guards auto-retry WITHIN a turn but not cross-turn "user says
     # retry" requests.
     pending_reconciliation_run_id: str | None = None
+    pending_reconciliation_requires_user_input: bool = False
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck

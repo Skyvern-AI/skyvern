@@ -72,10 +72,14 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
+import { useFeatureFlagEnabled } from "posthog-js/react";
+import { ANALYTICS_DASHBOARD_FLAG } from "@/util/featureFlags";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
   const isCloud = useContext(CloudContext);
+  const analyticsEnabled =
+    useFeatureFlagEnabled(ANALYTICS_DASHBOARD_FLAG) === true;
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const [statusFilters, setStatusFilters] = useState<Array<Status>>([]);
@@ -156,7 +160,7 @@ function WorkflowPage() {
               onSuccessfullyDeleted={() => navigate("/workflows")}
             />
           )}
-          {isCloud ? (
+          {isCloud && analyticsEnabled ? (
             <Button asChild variant="secondary">
               <Link to={buildWorkflowAnalyticsPath(workflowPermanentId)}>
                 <BarChartIcon className="mr-2 size-4" />

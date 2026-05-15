@@ -23,6 +23,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
+from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
@@ -115,6 +116,18 @@ def _canonicalize_copilot_proxy_location(parsed_yaml: dict[str, Any]) -> None:
         return
 
     parsed_yaml["proxy_location"] = canonical
+
+
+def _canonicalize_copilot_block_type_aliases(value: Any) -> None:
+    if isinstance(value, dict):
+        block_type = value.get("block_type")
+        if isinstance(block_type, str):
+            value["block_type"] = normalize_copilot_block_type_alias(block_type)
+        for child in value.values():
+            _canonicalize_copilot_block_type_aliases(child)
+    elif isinstance(value, list):
+        for item in value:
+            _canonicalize_copilot_block_type_aliases(item)
 
 
 async def _resolve_copilot_agent_handler(
@@ -1019,6 +1032,7 @@ def _normalize_copilot_yaml(workflow_yaml: str) -> WorkflowCreateYAMLRequest:
         _canonicalize_copilot_proxy_location(parsed_yaml)
         workflow_definition = parsed_yaml.get("workflow_definition", None)
         if workflow_definition:
+            _canonicalize_copilot_block_type_aliases(workflow_definition)
             blocks = workflow_definition.get("blocks", []) or []
             for block in blocks:
                 block["title"] = block.get("title", "")

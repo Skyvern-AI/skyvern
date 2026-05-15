@@ -336,6 +336,22 @@ def pick_field_names_for_actions(
     return picks
 
 
+def pick_credential_root_for_block(
+    *,
+    goal_template: str,
+    credential_param_keys: frozenset[str],
+) -> str | None:
+    """Return the credential key for this block, or None if ambiguous."""
+    if not credential_param_keys:
+        return None
+    referenced = extract_jinja_root_names(goal_template) & credential_param_keys
+    if len(referenced) == 1:
+        return next(iter(referenced))
+    if not referenced and len(credential_param_keys) == 1:
+        return next(iter(credential_param_keys))
+    return None
+
+
 def infer_credential_subscript_for_emit(
     *,
     action: dict[str, Any],
