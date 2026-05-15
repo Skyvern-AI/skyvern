@@ -14,7 +14,7 @@ from skyvern.core.script_generations.script_block_extractor import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.db.exceptions import NotFoundError
-from skyvern.forge.sdk.db.repositories.scripts import WorkflowScriptWriterIntent
+from skyvern.forge.sdk.db.repositories.scripts import WorkflowScriptUpsertStatus, WorkflowScriptWriterIntent
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.scripts import (
     DeployCachedScriptBlockPlan,
@@ -23,6 +23,7 @@ from skyvern.schemas.scripts import (
     FileEncoding,
     ScriptFileCreate,
     ScriptStatus,
+    WorkflowScript,
 )
 from skyvern.services.workflow_script_service import CacheKeyResolutionError, resolve_cache_key_value
 
@@ -49,6 +50,31 @@ class _CachedScriptDeployPlan:
 class _ValidatedScriptFile:
     file: ScriptFileCreate
     content_bytes: bytes
+
+
+@dataclass
+class _CachedScriptDeployUndoState:
+    script_revision_id: str | None = None
+    workflow_script_created_snapshot: WorkflowScript | None = None
+    workflow_script_written_snapshot: WorkflowScript | None = None
+    workflow_script_restore_snapshot: WorkflowScript | None = None
+    workflow_dispatch_updated: bool = False
+    workflow_dispatch_restore_run_with: str | None = None
+    workflow_dispatch_restore_cache_key: str | None = None
+    workflow_dispatch_restore_code_version: int | None = None
+    workflow_dispatch_written_run_with: str | None = None
+    workflow_dispatch_written_cache_key: str | None = None
+    workflow_dispatch_written_code_version: int | None = None
+
+    @property
+    def has_writes(self) -> bool:
+        return (
+            self.script_revision_id is not None
+            or self.workflow_script_created_snapshot is not None
+            or self.workflow_script_written_snapshot is not None
+            or self.workflow_script_restore_snapshot is not None
+            or self.workflow_dispatch_updated
+        )
 
 
 def _decode_script_file_bytes(file: ScriptFileCreate) -> bytes:
@@ -262,6 +288,107 @@ def _response_from_plan(
     )
 
 
+async def _cleanup_failed_cached_script_deploy(
+    *,
+    organization_id: str,
+    plan: _CachedScriptDeployPlan,
+    undo_state: _CachedScriptDeployUndoState,
+) -> None:
+    cleanup_errors: list[str] = []
+    if undo_state.workflow_dispatch_updated:
+        try:
+            restored_workflow = await app.DATABASE.workflows.restore_workflow_script_dispatch_if_matches(
+                workflow_id=plan.workflow.workflow_id,
+                organization_id=organization_id,
+                run_with=undo_state.workflow_dispatch_restore_run_with,
+                cache_key=undo_state.workflow_dispatch_restore_cache_key,
+                code_version=undo_state.workflow_dispatch_restore_code_version,
+                current_run_with=undo_state.workflow_dispatch_written_run_with,
+                current_cache_key=undo_state.workflow_dispatch_written_cache_key,
+                current_code_version=undo_state.workflow_dispatch_written_code_version,
+            )
+            if restored_workflow is None:
+                LOG.warning(
+                    "Skipped restoring workflow dispatch after cached script deploy failure because it changed",
+                    workflow_id=plan.workflow.workflow_id,
+                    organization_id=organization_id,
+                )
+        except Exception:
+            cleanup_errors.append("workflow_dispatch")
+            LOG.warning(
+                "Failed to restore workflow dispatch state after cached script deploy failure",
+                workflow_id=plan.workflow.workflow_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+
+    if (
+        undo_state.workflow_script_restore_snapshot is not None
+        and undo_state.workflow_script_written_snapshot is not None
+    ):
+        try:
+            restored_workflow_script = await app.DATABASE.scripts.restore_workflow_script_if_matches(
+                current_workflow_script=undo_state.workflow_script_written_snapshot,
+                restore_workflow_script=undo_state.workflow_script_restore_snapshot,
+            )
+            if not restored_workflow_script:
+                LOG.warning(
+                    "Skipped restoring workflow script after cached script deploy failure because it changed",
+                    workflow_script_id=undo_state.workflow_script_written_snapshot.workflow_script_id,
+                    organization_id=organization_id,
+                )
+        except Exception:
+            cleanup_errors.append("workflow_script_restore")
+            LOG.warning(
+                "Failed to restore workflow script after cached script deploy failure",
+                workflow_script_id=undo_state.workflow_script_restore_snapshot.workflow_script_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+    elif undo_state.workflow_script_created_snapshot is not None:
+        try:
+            deleted_workflow_script = await app.DATABASE.scripts.soft_delete_workflow_script_if_matches(
+                workflow_script=undo_state.workflow_script_created_snapshot,
+            )
+            if not deleted_workflow_script:
+                LOG.warning(
+                    "Skipped soft-deleting workflow script after cached script deploy failure because it changed",
+                    workflow_script_id=undo_state.workflow_script_created_snapshot.workflow_script_id,
+                    organization_id=organization_id,
+                )
+        except Exception:
+            cleanup_errors.append("workflow_script")
+            LOG.warning(
+                "Failed to soft-delete workflow script after cached script deploy failure",
+                workflow_script_id=undo_state.workflow_script_created_snapshot.workflow_script_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+
+    if undo_state.script_revision_id is not None:
+        try:
+            await app.DATABASE.scripts.soft_delete_script_by_revision(
+                script_revision_id=undo_state.script_revision_id,
+                organization_id=organization_id,
+            )
+        except Exception:
+            cleanup_errors.append("script_revision")
+            LOG.warning(
+                "Failed to soft-delete script revision after cached script deploy failure",
+                script_revision_id=undo_state.script_revision_id,
+                organization_id=organization_id,
+                exc_info=True,
+            )
+
+    if cleanup_errors:
+        LOG.error(
+            "Cached script deploy failed and cleanup was incomplete",
+            workflow_id=plan.workflow.workflow_id,
+            organization_id=organization_id,
+            cleanup_errors=cleanup_errors,
+        )
+
+
 async def deploy_cached_script(
     *,
     organization_id: str,
@@ -279,11 +406,13 @@ async def deploy_cached_script(
 
     script = None
     commit_stage = "create_script"
+    undo_state = _CachedScriptDeployUndoState()
     try:
         script = await app.DATABASE.scripts.create_script(
             organization_id=organization_id,
             run_id=request.source_workflow_run_id,
         )
+        undo_state.script_revision_id = script.script_revision_id
         commit_stage = "persist_script_files"
         await _persist_script_files(
             files=plan.validated_files,
@@ -317,16 +446,49 @@ async def deploy_cached_script(
             is_pinned=True,
             writer_intent=WorkflowScriptWriterIntent.deploy,
         )
+        if workflow_script_result.status == WorkflowScriptUpsertStatus.created:
+            undo_state.workflow_script_created_snapshot = workflow_script_result.workflow_script
+        elif workflow_script_result.status == WorkflowScriptUpsertStatus.updated:
+            undo_state.workflow_script_written_snapshot = workflow_script_result.workflow_script
+            undo_state.workflow_script_restore_snapshot = workflow_script_result.previous_workflow_script
+            if undo_state.workflow_script_restore_snapshot is None:
+                LOG.warning(
+                    "Cached script deploy updated workflow script without a previous snapshot",
+                    workflow_script_id=workflow_script_result.workflow_script.workflow_script_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    cache_key_value=plan.cache_key_value,
+                )
 
         commit_stage = "update_workflow_dispatch_state"
-        await app.DATABASE.workflows.update_workflow_dispatch_state_if_latest(
+        code_version = _code_version_for_cache_context(request)
+        dispatch_update_result = await app.DATABASE.workflows.update_workflow_dispatch_state_if_latest_with_previous(
             workflow_id=plan.workflow.workflow_id,
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
             expected_version=plan.workflow.version,
             run_with="code",
             cache_key=cache_key,
-            code_version=_code_version_for_cache_context(request),
+            code_version=code_version,
+        )
+        previous_dispatch_state = dispatch_update_result.previous_dispatch_state
+        undo_state.workflow_dispatch_updated = True
+        undo_state.workflow_dispatch_restore_run_with = previous_dispatch_state.run_with
+        undo_state.workflow_dispatch_restore_cache_key = previous_dispatch_state.cache_key
+        undo_state.workflow_dispatch_restore_code_version = previous_dispatch_state.code_version
+        undo_state.workflow_dispatch_written_run_with = "code"
+        undo_state.workflow_dispatch_written_cache_key = cache_key
+        undo_state.workflow_dispatch_written_code_version = code_version
+
+        return _response_from_plan(
+            plan=plan,
+            dry_run=False,
+            script_id=script.script_id,
+            script_revision_id=script.script_revision_id,
+            script_version=script.version,
+            workflow_script_id=workflow_script_result.workflow_script.workflow_script_id,
+            workflow_script_upsert_status=workflow_script_result.status.value,
+            script_was_created=True,
         )
     except NotFoundError as exc:
         LOG.exception(
@@ -339,6 +501,12 @@ async def deploy_cached_script(
             script_id=script.script_id if script else None,
             commit_stage=commit_stage,
         )
+        if undo_state.has_writes:
+            await _cleanup_failed_cached_script_deploy(
+                organization_id=organization_id,
+                plan=plan,
+                undo_state=undo_state,
+            )
         raise HTTPException(
             status_code=409,
             detail=(
@@ -357,15 +525,10 @@ async def deploy_cached_script(
             script_id=script.script_id if script else None,
             commit_stage=commit_stage,
         )
+        if undo_state.has_writes:
+            await _cleanup_failed_cached_script_deploy(
+                organization_id=organization_id,
+                plan=plan,
+                undo_state=undo_state,
+            )
         raise
-
-    return _response_from_plan(
-        plan=plan,
-        dry_run=False,
-        script_id=script.script_id,
-        script_revision_id=script.script_revision_id,
-        script_version=script.version,
-        workflow_script_id=workflow_script_result.workflow_script.workflow_script_id,
-        workflow_script_upsert_status=workflow_script_result.status.value,
-        script_was_created=True,
-    )

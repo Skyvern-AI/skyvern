@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db.utils import (
     convert_to_script,
     convert_to_script_block,
     convert_to_script_file,
+    nullable_column_equals,
 )
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.scripts import (
@@ -39,6 +40,28 @@ from skyvern.schemas.scripts import (
 )
 
 LOG = structlog.get_logger()
+
+
+def _script_status_value(status: ScriptStatus | str) -> str:
+    return status.value if isinstance(status, ScriptStatus) else status
+
+
+def _workflow_script_matches_snapshot(workflow_script: WorkflowScript) -> list[Any]:
+    return [
+        WorkflowScriptModel.organization_id == workflow_script.organization_id,
+        WorkflowScriptModel.workflow_script_id == workflow_script.workflow_script_id,
+        WorkflowScriptModel.workflow_permanent_id == workflow_script.workflow_permanent_id,
+        WorkflowScriptModel.script_id == workflow_script.script_id,
+        nullable_column_equals(WorkflowScriptModel.workflow_id, workflow_script.workflow_id),
+        nullable_column_equals(WorkflowScriptModel.workflow_run_id, workflow_script.workflow_run_id),
+        WorkflowScriptModel.cache_key == workflow_script.cache_key,
+        WorkflowScriptModel.cache_key_value == workflow_script.cache_key_value,
+        WorkflowScriptModel.status == _script_status_value(workflow_script.status),
+        WorkflowScriptModel.is_pinned == workflow_script.is_pinned,
+        nullable_column_equals(WorkflowScriptModel.pinned_at, workflow_script.pinned_at),
+        nullable_column_equals(WorkflowScriptModel.pinned_by, workflow_script.pinned_by),
+        nullable_column_equals(WorkflowScriptModel.modified_at, workflow_script.modified_at),
+    ]
 
 
 class WorkflowScriptWriterIntent(StrEnum):
@@ -57,6 +80,7 @@ class WorkflowScriptUpsertStatus(StrEnum):
 class WorkflowScriptUpsertResult:
     status: WorkflowScriptUpsertStatus
     workflow_script: WorkflowScript
+    previous_workflow_script: WorkflowScript | None = None
 
 
 class ScriptsRepository(BaseRepository):
@@ -715,6 +739,7 @@ class ScriptsRepository(BaseRepository):
                     workflow_script=workflow_script,
                 )
 
+            previous_workflow_script = WorkflowScript.model_validate(existing)
             existing.script_id = script_id
             existing.workflow_id = workflow_id
             existing.workflow_run_id = workflow_run_id
@@ -731,6 +756,7 @@ class ScriptsRepository(BaseRepository):
             return WorkflowScriptUpsertResult(
                 status=WorkflowScriptUpsertStatus.updated,
                 workflow_script=WorkflowScript.model_validate(existing),
+                previous_workflow_script=previous_workflow_script,
             )
 
     @db_operation("get_workflow_script")
@@ -917,6 +943,74 @@ class ScriptsRepository(BaseRepository):
                 .values(deleted_at=datetime.now(timezone.utc))
             )
 
+            result = await session.execute(stmt)
+            await session.commit()
+
+            return result.rowcount > 0
+
+    @db_operation("soft_delete_workflow_script_if_matches")
+    async def soft_delete_workflow_script_if_matches(
+        self,
+        *,
+        workflow_script: WorkflowScript,
+    ) -> bool:
+        """Soft delete one workflow_scripts row if it still matches a snapshot.
+
+        Failed manual deploy cleanup uses this to avoid deleting a row that a
+        concurrent successful deploy already changed.
+        """
+        async with self.Session() as session:
+            stmt = (
+                update(WorkflowScriptModel)
+                .where(
+                    and_(
+                        *_workflow_script_matches_snapshot(workflow_script),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                )
+                .values(deleted_at=datetime.now(timezone.utc))
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+
+            return result.rowcount > 0
+
+    @db_operation("restore_workflow_script_if_matches")
+    async def restore_workflow_script_if_matches(
+        self,
+        *,
+        current_workflow_script: WorkflowScript,
+        restore_workflow_script: WorkflowScript,
+    ) -> bool:
+        """Restore one workflow_scripts row if it still matches a written snapshot.
+
+        The live-row predicate prevents cleanup from resurrecting a row another
+        actor soft-deleted after this deploy's forward write.
+        """
+        async with self.Session() as session:
+            status = _script_status_value(restore_workflow_script.status)
+            stmt = (
+                update(WorkflowScriptModel)
+                .where(
+                    and_(
+                        *_workflow_script_matches_snapshot(current_workflow_script),
+                        WorkflowScriptModel.deleted_at.is_(None),
+                    )
+                )
+                .values(
+                    script_id=restore_workflow_script.script_id,
+                    workflow_id=restore_workflow_script.workflow_id,
+                    workflow_run_id=restore_workflow_script.workflow_run_id,
+                    cache_key=restore_workflow_script.cache_key,
+                    cache_key_value=restore_workflow_script.cache_key_value,
+                    status=status,
+                    is_pinned=restore_workflow_script.is_pinned,
+                    pinned_at=restore_workflow_script.pinned_at,
+                    pinned_by=restore_workflow_script.pinned_by,
+                    modified_at=restore_workflow_script.modified_at,
+                    deleted_at=restore_workflow_script.deleted_at,
+                )
+            )
             result = await session.execute(stmt)
             await session.commit()
 
