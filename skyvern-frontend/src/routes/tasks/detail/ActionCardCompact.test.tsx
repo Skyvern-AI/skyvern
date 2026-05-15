@@ -89,4 +89,49 @@ describe("ActionCardCompact", () => {
     expect(onSelect).toHaveBeenCalledTimes(1);
     expect(onToggleExpanded).not.toHaveBeenCalled();
   });
+
+  it("renders reasoning, input, and confidence in the expanded panel", () => {
+    render(
+      <ActionCardCompact
+        action={buildAction({
+          action_type: "input_text",
+          reasoning: "Type the email address",
+          text: "user@example.com",
+          confidence_float: 0.92,
+        })}
+        index={2}
+        active={false}
+        expanded={true}
+        onSelect={() => {}}
+        onToggleExpanded={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("Reasoning")).toBeDefined();
+    // reasoning appears in both the inline preview and the expanded panel
+    expect(screen.getAllByText("Type the email address").length).toBe(2);
+    expect(screen.getByText("Input")).toBeDefined();
+    expect(screen.getByText("user@example.com")).toBeDefined();
+    expect(screen.getByText("Confidence")).toBeDefined();
+    expect(screen.getByText("92%")).toBeDefined();
+  });
+
+  it("uses response as the input fallback when text is null for input_text", () => {
+    render(
+      <ActionCardCompact
+        action={buildAction({
+          action_type: "input_text",
+          text: null,
+          response: "from-script-value",
+        })}
+        index={4}
+        active={false}
+        expanded={true}
+        onSelect={() => {}}
+        onToggleExpanded={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("from-script-value")).toBeDefined();
+  });
 });
