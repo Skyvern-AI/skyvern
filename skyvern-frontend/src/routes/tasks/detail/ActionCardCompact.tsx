@@ -17,17 +17,27 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   CursorArrowIcon,
+  DoubleArrowDownIcon,
   DownloadIcon,
+  DropdownMenuIcon,
   HandIcon,
   InputIcon,
+  KeyboardIcon,
   LightningBoltIcon,
+  TimerIcon,
+  UploadIcon,
 } from "@radix-ui/react-icons";
 
 const actionIcons: Partial<Record<ActionType, React.ReactNode>> = {
-  click: <CursorArrowIcon className="h-4 w-4" />,
-  hover: <HandIcon className="h-4 w-4" />,
-  input_text: <InputIcon className="h-4 w-4" />,
-  download_file: <DownloadIcon className="h-4 w-4" />,
+  [ActionTypes.Click]: <CursorArrowIcon className="h-4 w-4" />,
+  [ActionTypes.Hover]: <HandIcon className="h-4 w-4" />,
+  [ActionTypes.InputText]: <InputIcon className="h-4 w-4" />,
+  [ActionTypes.DownloadFile]: <DownloadIcon className="h-4 w-4" />,
+  [ActionTypes.UploadFile]: <UploadIcon className="h-4 w-4" />,
+  [ActionTypes.SelectOption]: <DropdownMenuIcon className="h-4 w-4" />,
+  [ActionTypes.wait]: <TimerIcon className="h-4 w-4" />,
+  [ActionTypes.Scroll]: <DoubleArrowDownIcon className="h-4 w-4" />,
+  [ActionTypes.KeyPress]: <KeyboardIcon className="h-4 w-4" />,
 };
 
 type Props = {
@@ -49,8 +59,7 @@ function ActionCardCompact({
   onToggleExpanded,
   cardClassName,
 }: Props) {
-  // Wait actions always succeed — they intentionally return ActionFailure
-  // from the backend but completing a wait is expected, not a failure.
+  // wait actions return ActionFailure despite succeeding
   const success =
     action.action_type === ActionTypes.wait ||
     action.status === Status.Completed ||
@@ -64,6 +73,7 @@ function ActionCardCompact({
     action.confidence_float != null
       ? Math.round(action.confidence_float * 100)
       : null;
+  // script-generated input text lives in action.response, not action.text
   const inputValue =
     action.action_type === ActionTypes.InputText
       ? (action.text ?? action.response)
@@ -76,12 +86,9 @@ function ActionCardCompact({
         data-active={active ? "true" : "false"}
         data-status={success ? "success" : "failure"}
         className={cn(
-          "group rounded-md border-l-2 bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
+          "group rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
           {
-            "border-l-success": success && !active,
-            "border-l-destructive": !success && !active,
-            "border-l-transparent ring-2 ring-white/55 hover:ring-white/55":
-              active,
+            "ring-1 ring-white/40 hover:ring-white/40": active,
             "hover:ring-white/25": !active,
           },
           cardClassName,
@@ -91,7 +98,7 @@ function ActionCardCompact({
           <button
             type="button"
             onClick={onSelect}
-            className="flex min-h-[36px] flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+            className="flex min-h-[40px] flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
           >
             <span
               aria-hidden="true"
@@ -108,30 +115,30 @@ function ActionCardCompact({
                 {icon}
               </span>
             )}
-            <span className="shrink-0 text-xs font-semibold text-slate-200">
-              {label}
+            <span className="shrink-0 text-xs text-slate-300">{label}</span>
+            <span
+              className={cn(
+                "min-w-0 flex-1 truncate text-xs text-slate-200",
+                reasoningPreview.length === 0 && "invisible",
+              )}
+            >
+              {reasoningPreview}
             </span>
-            {reasoningPreview.length > 0 && (
-              <span className="min-w-0 flex-1 truncate text-xs text-slate-400">
-                {reasoningPreview}
-              </span>
-            )}
-            {reasoningPreview.length === 0 && <span className="flex-1" />}
-            {fromScript && (
-              <TooltipProvider>
-                <Tooltip delayDuration={300}>
-                  <TooltipTrigger asChild>
-                    <span className="shrink-0" aria-label="Code Execution">
-                      <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent className="max-w-[250px]">
-                    Code Execution
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
           </button>
+          {fromScript && (
+            <TooltipProvider>
+              <Tooltip delayDuration={300}>
+                <TooltipTrigger asChild>
+                  <span className="shrink-0" aria-label="Code Execution">
+                    <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-[250px]">
+                  Code Execution
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
           <button
             type="button"
             aria-label={expanded ? "Collapse details" : "Expand details"}
@@ -148,7 +155,7 @@ function ActionCardCompact({
         </div>
         <CollapsibleContent className="space-y-2 px-3 pb-3 pt-1 text-xs text-slate-400">
           {action.reasoning && (
-            <div className="rounded bg-slate-elevation3 p-2">
+            <div className="rounded bg-slate-elevation5 p-2">
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Reasoning
               </div>
@@ -158,7 +165,7 @@ function ActionCardCompact({
             </div>
           )}
           {inputValue != null && inputValue.length > 0 && (
-            <div className="rounded bg-slate-elevation3 p-2">
+            <div className="rounded bg-slate-elevation5 p-2">
               <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Input
               </div>
