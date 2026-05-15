@@ -1,6 +1,7 @@
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -462,7 +463,7 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
     )
 
     # _handle_action simulates the page navigating to about:blank during the print download
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         page.url = "about:blank"
         return [ActionSuccess()]
 
@@ -471,8 +472,8 @@ async def test_handle_action_navigates_back_from_blank_page_after_download(
         with open(dummy_file, "w") as f:
             f.write("dummy")
 
-        # list_files_in_directory: empty before action, one file after action
-        list_files_side_effect = [[], [dummy_file]]
+        # list_files_in_directory: empty before action, one file after action, re-scan after wait
+        list_files_side_effect = [[], [dummy_file], [dummy_file]]
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
@@ -542,7 +543,7 @@ async def test_handle_action_does_not_navigate_back_when_page_url_unchanged() ->
     )
 
     # _handle_action does NOT change the page URL (normal case)
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         return [ActionSuccess()]
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -550,7 +551,7 @@ async def test_handle_action_does_not_navigate_back_when_page_url_unchanged() ->
         with open(dummy_file, "w") as f:
             f.write("dummy")
 
-        list_files_side_effect = [[], [dummy_file]]
+        list_files_side_effect = [[], [dummy_file], [dummy_file]]
 
         mock_app = MagicMock()
         mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
@@ -617,7 +618,7 @@ async def test_handle_action_download_no_signal_fails_fast(span_exporter: InMemo
         step_id=step.step_id,
     )
 
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         return [ActionSuccess()]
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -680,7 +681,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
     page = MagicMock()
     page.url = "https://example.com/download"
     page.context.browser = None
-    download_callbacks: dict[str, object] = {}
+    download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
@@ -711,7 +712,7 @@ async def test_handle_action_prefers_observed_file_over_download_event_copy(
         primary_dir = os.path.join(temp_root, "pbs-1")
         os.makedirs(primary_dir)
 
-        async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
             download_callbacks["download"](download)
             with open(os.path.join(primary_dir, "report.pdf"), "w") as f:
                 f.write("dummy")
@@ -777,7 +778,7 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
     page = MagicMock()
     page.url = "https://example.com/download"
     page.context.browser = None
-    download_callbacks: dict[str, object] = {}
+    download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
@@ -809,7 +810,7 @@ async def test_handle_action_copies_download_event_when_no_observed_file_appears
 
     download.save_as = AsyncMock(side_effect=save_download)
 
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         download_callbacks["download"](download)
         return [ActionSuccess()]
 
@@ -881,7 +882,7 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
     page = MagicMock()
     page.url = "https://example.com/download"
     page.context.browser = None
-    download_callbacks: dict[str, object] = {}
+    download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
@@ -912,7 +913,7 @@ async def test_handle_action_ignores_empty_download_event_fallback_file(
 
     download.save_as = AsyncMock(side_effect=save_empty_download)
 
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         download_callbacks["download"](download)
         return [ActionSuccess()]
 
@@ -983,7 +984,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
     page = MagicMock()
     page.url = "https://example.com/download"
     page.context.browser = None
-    download_callbacks: dict[str, object] = {}
+    download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
@@ -1010,7 +1011,7 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
     download.suggested_filename = "report.pdf"
     download.save_as = AsyncMock(side_effect=RuntimeError("copy failed"))
 
-    async def mock_inner_handle_action(*args, **kwargs) -> list[ActionSuccess]:
+    async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
         download_callbacks["download"](download)
         return [ActionSuccess()]
 
@@ -1063,6 +1064,99 @@ async def test_handle_action_stops_after_download_event_fallback_failure(
 
 
 @pytest.mark.asyncio
+async def test_handle_action_removes_late_zero_byte_duplicate_after_download_wait() -> None:
+    """A 0-byte duplicate that appears after the first download signal should be removed.
+
+    The polling loop exits as soon as one new file appears. Browser-native
+    downloads can still surface a second empty duplicate artifact while waiting
+    for ``.crdownload`` files to settle; that junk file must not be left for
+    task cleanup to upload.
+    """
+    now = datetime.now(UTC)
+    organization = make_organization(now)
+    task = make_task(
+        now,
+        organization,
+        workflow_run_id="wr-1",
+        browser_session_id=None,
+    )
+    step = make_step(now, task, step_id="step-1", status=StepStatus.created, order=0, output=None)
+
+    page = MagicMock()
+    page.url = "https://example.com/download"
+    page.context.browser = None
+
+    browser_state = MagicMock()
+    browser_state.list_valid_pages = AsyncMock(return_value=[page])
+
+    scraped_page = ScrapedPage(
+        elements=[],
+        element_tree=[],
+        element_tree_trimmed=[],
+        _browser_state=browser_state,
+        _clean_up_func=AsyncMock(return_value=[]),
+        _scrape_exclude=None,
+    )
+
+    action = ClickAction(
+        element_id="download-link",
+        download=True,
+        organization_id=task.organization_id,
+        task_id=task.task_id,
+        step_id=step.step_id,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_root:
+        primary_dir = os.path.join(temp_root, "pbs-1")
+        os.makedirs(primary_dir)
+        good_file = os.path.join(primary_dir, "report.pdf")
+        empty_file = os.path.join(primary_dir, "report_1.pdf")
+
+        async def mock_inner_handle_action(*args: object, **kwargs: object) -> list[ActionSuccess]:
+            with open(good_file, "wb") as f:
+                f.write(b"valid report")
+            return [ActionSuccess()]
+
+        async def wait_then_create_empty_file(*args: object, **kwargs: object) -> None:
+            with open(empty_file, "wb"):
+                pass
+
+        mock_app = MagicMock()
+        mock_app.BROWSER_MANAGER.get_for_task.return_value = browser_state
+        mock_app.DATABASE.workflow_params.create_action = AsyncMock(return_value=action)
+        mock_app.STORAGE = MagicMock()
+
+        with (
+            patch.object(ActionHandler, "_handle_action", side_effect=mock_inner_handle_action),
+            patch("skyvern.webeye.actions.handler.get_download_dir", return_value=primary_dir),
+            patch(
+                "skyvern.webeye.actions.handler.skyvern_context.current",
+                return_value=MagicMock(run_id="pbs-1"),
+            ),
+            patch(
+                "skyvern.webeye.actions.handler.check_downloading_files_and_wait_for_download_to_complete",
+                new=AsyncMock(side_effect=wait_then_create_empty_file),
+            ),
+            patch("skyvern.webeye.actions.handler.app", mock_app),
+        ):
+            results = await ActionHandler.handle_action(
+                scraped_page=scraped_page,
+                task=task,
+                step=step,
+                page=page,
+                action=action,
+            )
+
+        remaining_files = sorted(os.listdir(primary_dir))
+
+    assert results[-1].download_triggered is True
+    assert results[-1].downloaded_files == ["report.pdf"]
+    assert action.downloaded_files == ["report.pdf"]
+    assert remaining_files == ["report.pdf"]
+    page.off.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_handle_action_removes_download_listener_when_inner_action_raises() -> None:
     now = datetime.now(UTC)
     organization = make_organization(now)
@@ -1076,7 +1170,7 @@ async def test_handle_action_removes_download_listener_when_inner_action_raises(
 
     page = MagicMock()
     page.url = "https://example.com/download"
-    download_callbacks: dict[str, object] = {}
+    download_callbacks: dict[str, Callable[[object], None]] = {}
     page.on.side_effect = lambda event, callback: download_callbacks.__setitem__(event, callback)
 
     browser_state = MagicMock()
