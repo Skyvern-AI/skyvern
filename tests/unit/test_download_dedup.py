@@ -9,8 +9,9 @@ checksum so only one copy is kept.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
-from skyvern.forge.sdk.api.files import calculate_sha256_for_file
+from skyvern.webeye.actions.handler import _deduplicate_new_downloaded_file_paths
 
 
 def _write_file(directory: str, name: str, content: bytes) -> str:
@@ -20,24 +21,19 @@ def _write_file(directory: str, name: str, content: bytes) -> str:
     return path
 
 
-def _deduplicate_new_files(new_file_paths: set[str]) -> list[str]:
-    """Replicate the dedup logic from ActionHandler._handle_action_for_download."""
-    seen_checksums: dict[str, str] = {}
-    deduplicated: list[str] = []
-    for fp in sorted(new_file_paths):
-        if not os.path.isfile(fp):
-            deduplicated.append(fp)
-            continue
-        checksum = calculate_sha256_for_file(fp)
-        if checksum in seen_checksums:
-            os.remove(fp)
-        else:
-            seen_checksums[checksum] = fp
-            deduplicated.append(fp)
-    return deduplicated
+def _deduplicate_new_files(
+    new_file_paths: set[str],
+    observed_file_paths: set[str] | None = None,
+) -> list[str]:
+    """Call the action handler helper with a stable test workflow id."""
+    return _deduplicate_new_downloaded_file_paths(
+        new_file_paths,
+        workflow_run_id="wr_test",
+        observed_file_paths=observed_file_paths,
+    )
 
 
-def test_duplicate_files_are_deduplicated(tmp_path):
+def test_duplicate_files_are_deduplicated(tmp_path: Path) -> None:
     """Two files with identical content should keep only one."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "report.xlsx", b"identical content")
@@ -49,7 +45,7 @@ def test_duplicate_files_are_deduplicated(tmp_path):
     assert len(os.listdir(dir_)) == 1
 
 
-def test_duplicate_file_is_removed_from_disk(tmp_path):
+def test_duplicate_file_is_removed_from_disk(tmp_path: Path) -> None:
     """The duplicate file should be deleted from the local download directory."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "file_a.pdf", b"same bytes")
@@ -60,7 +56,7 @@ def test_duplicate_file_is_removed_from_disk(tmp_path):
     assert len(os.listdir(dir_)) == 1
 
 
-def test_different_files_are_not_deduplicated(tmp_path):
+def test_different_files_are_not_deduplicated(tmp_path: Path) -> None:
     """Files with different content should both be kept."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "invoice_jan.xlsx", b"january data")
@@ -72,7 +68,7 @@ def test_different_files_are_not_deduplicated(tmp_path):
     assert len(os.listdir(dir_)) == 2
 
 
-def test_three_duplicates_keeps_only_one(tmp_path):
+def test_three_duplicates_keeps_only_one(tmp_path: Path) -> None:
     """Three identical files should keep one and delete two."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "doc.pdf", b"triplicate")
@@ -85,7 +81,7 @@ def test_three_duplicates_keeps_only_one(tmp_path):
     assert len(os.listdir(dir_)) == 1
 
 
-def test_mixed_unique_and_duplicate_files(tmp_path):
+def test_mixed_unique_and_duplicate_files(tmp_path: Path) -> None:
     """Mix of unique and duplicate files: only duplicates are removed."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "unique_a.xlsx", b"content A")
@@ -98,7 +94,7 @@ def test_mixed_unique_and_duplicate_files(tmp_path):
     assert len(os.listdir(dir_)) == 2
 
 
-def test_original_filename_kept_over_suffixed_duplicate(tmp_path):
+def test_original_filename_kept_over_suffixed_duplicate(tmp_path: Path) -> None:
     """Sorted order keeps the original name over the _1 suffixed copy."""
     dir_ = str(tmp_path)
     a = _write_file(dir_, "Alignment-Feb-2026.xlsx", b"same content")
@@ -112,7 +108,7 @@ def test_original_filename_kept_over_suffixed_duplicate(tmp_path):
     assert os.listdir(dir_) == ["Alignment-Feb-2026.xlsx"]
 
 
-def test_remote_uris_are_passed_through(tmp_path):
+def test_remote_uris_are_passed_through(tmp_path: Path) -> None:
     """S3/Azure URIs from browser sessions should not be hashed or removed."""
     dir_ = str(tmp_path)
     local = _write_file(dir_, "local.xlsx", b"local content")
@@ -124,3 +120,68 @@ def test_remote_uris_are_passed_through(tmp_path):
     assert remote in result
     assert local in result
     assert len(os.listdir(dir_)) == 1  # only the local file on disk
+
+
+def test_zero_byte_duplicate_placeholder_is_removed_from_disk(tmp_path: Path) -> None:
+    """A blank duplicate-name placeholder should be deleted."""
+    dir_ = str(tmp_path)
+    valid = _write_file(dir_, "report.pdf", b"valid content")
+    empty = _write_file(dir_, "report_1.pdf", b"")
+
+    result = _deduplicate_new_files({empty, valid})
+
+    assert result == [valid]
+    assert os.listdir(dir_) == ["report.pdf"]
+
+
+def test_zero_byte_placeholder_matches_prior_observed_file(tmp_path: Path) -> None:
+    """A new blank duplicate is deleted when the real file predates the action."""
+    dir_ = str(tmp_path)
+    prior_valid = _write_file(dir_, "report.pdf", b"valid content")
+    new_empty = _write_file(dir_, "report_1.pdf", b"")
+
+    result = _deduplicate_new_files(
+        {new_empty},
+        observed_file_paths={prior_valid, new_empty},
+    )
+
+    assert result == []
+    assert os.listdir(dir_) == ["report.pdf"]
+
+
+def test_unsuffixed_zero_byte_file_is_preserved_with_prior_suffixed_file(tmp_path: Path) -> None:
+    """A new empty canonical filename is not deleted beside a prior suffixed file."""
+    dir_ = str(tmp_path)
+    prior_valid = _write_file(dir_, "report_1.pdf", b"valid content")
+    new_empty = _write_file(dir_, "report.pdf", b"")
+
+    result = _deduplicate_new_files(
+        {new_empty},
+        observed_file_paths={prior_valid, new_empty},
+    )
+
+    assert result == [new_empty]
+    assert sorted(os.listdir(dir_)) == ["report.pdf", "report_1.pdf"]
+
+
+def test_single_zero_byte_file_is_preserved_without_alternate(tmp_path: Path) -> None:
+    """A single empty download remains valid when no better artifact exists."""
+    dir_ = str(tmp_path)
+    empty = _write_file(dir_, "empty.csv", b"")
+
+    result = _deduplicate_new_files({empty})
+
+    assert result == [empty]
+    assert os.listdir(dir_) == ["empty.csv"]
+
+
+def test_named_zero_byte_file_is_preserved_with_non_empty_artifact(tmp_path: Path) -> None:
+    """An intentionally empty export should not be removed beside another file."""
+    dir_ = str(tmp_path)
+    empty_export = _write_file(dir_, "empty_rows.csv", b"")
+    manifest = _write_file(dir_, "manifest.csv", b"columns,row_count")
+
+    result = _deduplicate_new_files({empty_export, manifest})
+
+    assert set(result) == {empty_export, manifest}
+    assert sorted(os.listdir(dir_)) == ["empty_rows.csv", "manifest.csv"]

@@ -125,6 +125,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 LOG = structlog.get_logger()
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
+DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 
 
 def _download_target_path(download_dir: Path, suggested_filename: str | None) -> Path:
@@ -145,6 +146,112 @@ def _remove_download_listener(page: Page, callback: Callable[[Download], None]) 
         return
 
     LOG.warning("Page does not support removing download listeners")
+
+
+def _canonical_download_duplicate_stem(stem: str) -> str:
+    """Return a stem with common browser duplicate suffixes removed."""
+    return DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE.sub("", stem)
+
+
+def _has_download_duplicate_suffix(stem: str) -> bool:
+    """Return whether a stem carries a browser duplicate suffix."""
+    return _canonical_download_duplicate_stem(stem) != stem
+
+
+def _is_empty_duplicate_download_placeholder(file_path: str, non_empty_file_paths: set[str]) -> bool:
+    """Return whether a 0-byte local file is a duplicate-name placeholder.
+
+    Empty exports can be valid artifacts, so only remove a 0-byte file when a
+    file carrying a browser duplicate suffix has the same extension and
+    canonical stem as a non-empty local file, such as ``report_1.pdf`` next to
+    ``report.pdf``.
+    """
+    file_dir = os.path.dirname(file_path)
+    file_stem, file_suffix = os.path.splitext(os.path.basename(file_path))
+    if not _has_download_duplicate_suffix(file_stem):
+        return False
+
+    file_canonical_stem = _canonical_download_duplicate_stem(file_stem)
+
+    for non_empty_file_path in non_empty_file_paths:
+        if os.path.dirname(non_empty_file_path) != file_dir:
+            continue
+
+        non_empty_stem, non_empty_suffix = os.path.splitext(os.path.basename(non_empty_file_path))
+        if non_empty_suffix != file_suffix:
+            continue
+
+        non_empty_canonical_stem = _canonical_download_duplicate_stem(non_empty_stem)
+        if file_stem != non_empty_stem and file_canonical_stem == non_empty_canonical_stem:
+            return True
+
+    return False
+
+
+def _deduplicate_new_downloaded_file_paths(
+    new_file_paths: set[str],
+    workflow_run_id: str | None,
+    observed_file_paths: set[str] | None = None,
+) -> list[str]:
+    """Filter junk local downloads and remove checksum duplicates.
+
+    Remote browser-session URIs are returned untouched because the action
+    process cannot hash or delete them locally. Local 0-byte files are removed
+    only when they look like duplicate-name placeholders for a non-empty file
+    observed in the run directory.
+    """
+    non_empty_file_paths: set[str] = set()
+    for fp in observed_file_paths or new_file_paths:
+        if not os.path.isfile(fp):
+            continue
+        try:
+            if os.path.getsize(fp) > 0:
+                non_empty_file_paths.add(fp)
+        except OSError:
+            continue
+
+    seen_checksums: dict[str, str] = {}
+    deduplicated_paths: list[str] = []
+    for fp in sorted(new_file_paths):
+        if not os.path.isfile(fp):
+            deduplicated_paths.append(fp)
+            continue
+
+        try:
+            file_size = os.path.getsize(fp)
+            if file_size == 0:
+                if _is_empty_duplicate_download_placeholder(fp, non_empty_file_paths):
+                    LOG.warning(
+                        "Removing 0-byte duplicate downloaded file placeholder",
+                        file=os.path.basename(fp),
+                        workflow_run_id=workflow_run_id,
+                    )
+                    os.remove(fp)
+                else:
+                    deduplicated_paths.append(fp)
+                continue
+            checksum = calculate_sha256_for_file(fp)
+        except OSError:
+            LOG.warning(
+                "Downloaded file disappeared before deduplication",
+                file=os.path.basename(fp),
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            continue
+
+        if checksum in seen_checksums:
+            LOG.info(
+                "Removing duplicate downloaded file from single action",
+                file=os.path.basename(fp),
+                duplicate_of=os.path.basename(seen_checksums[checksum]),
+                checksum=checksum,
+            )
+            os.remove(fp)
+        else:
+            seen_checksums[checksum] = fp
+            deduplicated_paths.append(fp)
+    return deduplicated_paths
 
 
 async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
@@ -681,30 +788,16 @@ class ActionHandler:
                 timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
             )
 
-            # Calculate newly downloaded file names and deduplicate local files by checksum.
-            # A single click can trigger multiple identical downloads (e.g., when an <a> click
-            # event bubbles to a parent <tr onclick> that opens the same URL).
-            # Only local files are deduplicated — remote URIs (s3://, azure://) from browser
-            # sessions are passed through as-is since we cannot hash or remove them locally.
+            # Re-scan after waiting for .crdownload files to settle. The first
+            # snapshot stops at the earliest download signal, while late browser
+            # artifacts can still appear before task cleanup persists files.
+            list_files_after = await _list_observed_download_files()
             new_file_paths = set(list_files_after) - set(list_files_before)
-            seen_checksums: dict[str, str] = {}
-            deduplicated_paths: list[str] = []
-            for fp in sorted(new_file_paths):
-                if not os.path.isfile(fp):
-                    deduplicated_paths.append(fp)
-                    continue
-                checksum = calculate_sha256_for_file(fp)
-                if checksum in seen_checksums:
-                    LOG.info(
-                        "Removing duplicate downloaded file from single action",
-                        file=os.path.basename(fp),
-                        duplicate_of=os.path.basename(seen_checksums[checksum]),
-                        checksum=checksum,
-                    )
-                    os.remove(fp)
-                else:
-                    seen_checksums[checksum] = fp
-                    deduplicated_paths.append(fp)
+            deduplicated_paths = _deduplicate_new_downloaded_file_paths(
+                new_file_paths,
+                workflow_run_id=task.workflow_run_id,
+                observed_file_paths=set(list_files_after),
+            )
             downloaded_file_names = [os.path.basename(fp) for fp in deduplicated_paths]
             if downloaded_file_names:
                 results[-1].downloaded_files = downloaded_file_names
