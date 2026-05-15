@@ -31,6 +31,8 @@ import {
   type WorkflowParameter,
   type Parameter,
 } from "@/routes/workflows/types/workflowTypes";
+import { getBlockParameterDependencies } from "@/routes/workflows/editor/debugger/getBlockParameterDependencies";
+import { findWorkflowBlockByLabel } from "@/routes/workflows/workflowBlockUtils";
 import { getInitialValues } from "@/routes/workflows/utils";
 import { useDebuggerLastRunValuesStore } from "@/store/DebuggerLastRunValuesStore";
 import { useBlockOutputStore } from "@/store/BlockOutputStore";
@@ -395,7 +397,17 @@ function NodeHeader({
           (parameter) => parameter.parameter_type === "workflow",
         );
 
-      const parameters = getInitialValues(location, workflowParameters ?? []);
+      const lastRunValues = workflowPermanentId
+        ? useDebuggerLastRunValuesStore
+            .getState()
+            .getLastRunValues(workflowPermanentId)
+        : null;
+
+      const parameters = getInitialValues(
+        location,
+        workflowParameters ?? [],
+        lastRunValues,
+      );
 
       // Merge with parameter overrides if provided
       const mergedParameters = opts?.parameterOverrides
@@ -563,8 +575,6 @@ function NodeHeader({
       workflow?.workflow_definition?.parameters ?? []
     ).filter(isWorkflowParameter);
 
-    // If there are any workflow parameters, always prompt the user
-    // The backend requires all params to be specified for each run
     if (workflowParameters.length > 0) {
       const lastRunValues = workflowPermanentId
         ? useDebuggerLastRunValuesStore
@@ -576,13 +586,26 @@ function NodeHeader({
         workflowParameters,
         lastRunValues,
       );
-      setCurrentParamValues(currentValues);
-      setParametersToPrompt(workflowParameters);
-      setShowParamsDialog(true);
+      const block = findWorkflowBlockByLabel(blocks, blockLabel);
+      const parametersToRun = getBlockParameterDependencies(
+        block ?? undefined,
+        workflowParameters,
+      );
+
+      if (parametersToRun.length > 0) {
+        setCurrentParamValues(currentValues);
+        setParametersToPrompt(parametersToRun);
+        setShowParamsDialog(true);
+        return;
+      }
+
+      runBlock.mutate({
+        codeGen: numBlocksInWorkflow === 1,
+        parameterOverrides: currentValues,
+      });
       return;
     }
 
-    // No parameters, run directly
     runBlock.mutate({ codeGen: numBlocksInWorkflow === 1 });
   };
 
