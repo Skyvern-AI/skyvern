@@ -393,8 +393,6 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
     # the dedicated non-retriable branch in _check_enforcement owns this case.
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
         return False
-    if getattr(ctx, "pending_reconciliation_requires_user_input", False) is True:
-        return False
     if getattr(ctx, "last_test_ok", None) is not False:
         return False
     if not getattr(ctx, "test_after_update_done", False):

@@ -428,15 +428,6 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
     was_per_tool_budget = getattr(copilot_ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
     if is_trusted_final or was_per_tool_budget:
         copilot_ctx.pending_reconciliation_run_id = None
-        copilot_ctx.pending_reconciliation_requires_user_input = False
-        return
-    if resolved_status == WorkflowRunStatus.canceled.value:
-        copilot_ctx.pending_reconciliation_requires_user_input = True
-
-
-def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> None:
-    copilot_ctx.pending_reconciliation_run_id = workflow_run_id
-    copilot_ctx.pending_reconciliation_requires_user_input = False
 
 
 def _enum_or_string_name(value: Any) -> str:
@@ -755,13 +746,6 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         # have landed.
         pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
         if isinstance(pending_run_id, str) and pending_run_id:
-            if getattr(ctx, "pending_reconciliation_requires_user_input", False) is True:
-                return (
-                    f"The canceled run {pending_run_id} has already been inspected. "
-                    f"Do NOT run more blocks in this turn; ask the user whether to retry, "
-                    f"accept the unverified draft, or adjust the workflow first. This guard "
-                    f"prevents duplicate side effects on live sites."
-                )
             return (
                 f"The previous block-running tool call for run {pending_run_id} "
                 f"ended without a trustworthy terminal status. "
@@ -1657,16 +1641,11 @@ WatchdogExitReason = Literal["success", "stagnation", "ceiling", "per_tool_budge
 
 # Block types that legitimately execute long silent periods: one DB write on
 # entry, work done without intermediate writes (sleep / LLM call / await human
-# input / browser download wait), one write on finish. The watchdog can't
-# distinguish these from "stuck", so any invocation that includes one disables
-# stagnation for the whole run and relies on the safety ceiling alone.
+# input), one write on finish. The watchdog can't distinguish these from
+# "stuck", so any invocation that includes one disables stagnation for the
+# whole run and relies on the safety ceiling alone.
 _QUIET_BLOCK_TYPES: frozenset[str] = frozenset(
-    {
-        BlockType.WAIT.value,
-        BlockType.TEXT_PROMPT.value,
-        BlockType.HUMAN_INTERACTION.value,
-        BlockType.FILE_DOWNLOAD.value,
-    }
+    {BlockType.WAIT.value, BlockType.TEXT_PROMPT.value, BlockType.HUMAN_INTERACTION.value}
 )
 
 
@@ -2088,7 +2067,7 @@ async def _run_blocks_and_collect_debug(
 
         if exit_reason != "success":
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
-            _mark_pending_reconciliation_run(ctx, workflow_run.workflow_run_id)
+            ctx.pending_reconciliation_run_id = workflow_run.workflow_run_id
             error_msg = await _watchdog_error_message(
                 exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
             )
