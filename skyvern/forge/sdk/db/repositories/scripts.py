@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
+from typing import Any
 
 import structlog
 from sqlalchemy import and_, delete, distinct, func, or_, select, update
@@ -36,6 +39,24 @@ from skyvern.schemas.scripts import (
 )
 
 LOG = structlog.get_logger()
+
+
+class WorkflowScriptWriterIntent(StrEnum):
+    deploy = "deploy"
+    auto_regen = "auto_regen"
+    ensure_static = "ensure_static"
+
+
+class WorkflowScriptUpsertStatus(StrEnum):
+    created = "created"
+    updated = "updated"
+    blocked_by_pin = "blocked_by_pin"
+
+
+@dataclass(frozen=True)
+class WorkflowScriptUpsertResult:
+    status: WorkflowScriptUpsertStatus
+    workflow_script: WorkflowScript
 
 
 class ScriptsRepository(BaseRepository):
@@ -347,6 +368,69 @@ class ScriptsRepository(BaseRepository):
             await session.commit()
             return converted
 
+    @db_operation("upsert_script_block")
+    async def upsert_script_block(
+        self,
+        script_revision_id: str,
+        script_id: str,
+        organization_id: str,
+        script_block_label: str,
+        script_file_id: str | None = None,
+        run_signature: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_run_block_id: str | None = None,
+        input_fields: list[str] | None = None,
+        requires_agent: bool | None = None,
+    ) -> ScriptBlock:
+        """Insert or update a script block for a script revision.
+
+        ``requires_agent=None`` preserves an existing row's value on conflict
+        and inserts False for new rows. Callers that want a deploy-time
+        preserve policy should resolve the prior revision's value before
+        calling this method.
+        """
+        async with self.Session() as session:
+            now = datetime.now(timezone.utc)
+            insert_values = {
+                "script_block_id": generate_script_block_id(),
+                "script_revision_id": script_revision_id,
+                "script_id": script_id,
+                "organization_id": organization_id,
+                "script_block_label": script_block_label,
+                "script_file_id": script_file_id,
+                "run_signature": run_signature,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "input_fields": input_fields,
+                "requires_agent": requires_agent if requires_agent is not None else False,
+                "created_at": now,
+                "modified_at": now,
+            }
+            update_values: dict[str, Any] = {
+                "script_file_id": script_file_id,
+                "run_signature": run_signature,
+                "workflow_run_id": workflow_run_id,
+                "workflow_run_block_id": workflow_run_block_id,
+                "input_fields": input_fields,
+                "modified_at": now,
+            }
+            if requires_agent is not None:
+                update_values["requires_agent"] = requires_agent
+
+            stmt = (
+                insert(ScriptBlockModel)
+                .values(**insert_values)
+                .on_conflict_do_update(
+                    constraint="uc_script_revision_id_script_block_label",
+                    set_=update_values,
+                )
+                .returning(ScriptBlockModel)
+            )
+            script_block = (await session.scalars(stmt)).one()
+            converted = convert_to_script_block(script_block)
+            await session.commit()
+            return converted
+
     @db_operation("update_script_block")
     async def update_script_block(
         self,
@@ -564,6 +648,90 @@ class ScriptsRepository(BaseRepository):
             )
             session.add(record)
             await session.commit()
+
+    @db_operation("upsert_workflow_script")
+    async def upsert_workflow_script(
+        self,
+        *,
+        organization_id: str,
+        script_id: str,
+        workflow_permanent_id: str,
+        cache_key: str,
+        cache_key_value: str,
+        workflow_id: str | None = None,
+        workflow_run_id: str | None = None,
+        status: ScriptStatus = ScriptStatus.published,
+        is_pinned: bool = False,
+        pinned_by: str | None = None,
+        writer_intent: WorkflowScriptWriterIntent = WorkflowScriptWriterIntent.deploy,
+    ) -> WorkflowScriptUpsertResult:
+        """Create/update an active workflow-script mapping with sticky-pin semantics."""
+        async with self.Session() as session:
+            now = datetime.now(timezone.utc)
+            status_value = status.value if isinstance(status, ScriptStatus) else status
+            existing_rows = (
+                await session.scalars(
+                    select(WorkflowScriptModel)
+                    .where(
+                        WorkflowScriptModel.organization_id == organization_id,
+                        WorkflowScriptModel.workflow_permanent_id == workflow_permanent_id,
+                        WorkflowScriptModel.cache_key_value == cache_key_value,
+                        WorkflowScriptModel.deleted_at.is_(None),
+                        WorkflowScriptModel.status == status_value,
+                    )
+                    .order_by(WorkflowScriptModel.created_at.desc())
+                    .with_for_update()
+                )
+            ).all()
+
+            existing = existing_rows[0] if existing_rows else None
+            if existing is None:
+                record = WorkflowScriptModel(
+                    organization_id=organization_id,
+                    script_id=script_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run_id,
+                    cache_key=cache_key,
+                    cache_key_value=cache_key_value,
+                    status=status_value,
+                    is_pinned=is_pinned,
+                    pinned_at=now if is_pinned else None,
+                    pinned_by=pinned_by if is_pinned else None,
+                )
+                session.add(record)
+                await session.commit()
+                await session.refresh(record)
+                return WorkflowScriptUpsertResult(
+                    status=WorkflowScriptUpsertStatus.created,
+                    workflow_script=WorkflowScript.model_validate(record),
+                )
+
+            if existing.is_pinned and not is_pinned and writer_intent != WorkflowScriptWriterIntent.deploy:
+                workflow_script = WorkflowScript.model_validate(existing)
+                await session.commit()
+                return WorkflowScriptUpsertResult(
+                    status=WorkflowScriptUpsertStatus.blocked_by_pin,
+                    workflow_script=workflow_script,
+                )
+
+            existing.script_id = script_id
+            existing.workflow_id = workflow_id
+            existing.workflow_run_id = workflow_run_id
+            existing.cache_key = cache_key
+            existing.status = status_value
+            existing.modified_at = now
+            if is_pinned and not existing.is_pinned:
+                existing.is_pinned = True
+                existing.pinned_at = now
+                existing.pinned_by = pinned_by
+
+            await session.commit()
+            await session.refresh(existing)
+            return WorkflowScriptUpsertResult(
+                status=WorkflowScriptUpsertStatus.updated,
+                workflow_script=WorkflowScript.model_validate(existing),
+            )
 
     @db_operation("get_workflow_script")
     async def get_workflow_script(

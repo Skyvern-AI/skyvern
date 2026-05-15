@@ -34,6 +34,7 @@ class RealBrowserManager(BrowserManager):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> BrowserState:
@@ -52,6 +53,7 @@ class RealBrowserManager(BrowserManager):
             script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             browser_address=browser_address,
             browser_profile_id=browser_profile_id,
         )
@@ -123,6 +125,7 @@ class RealBrowserManager(BrowserManager):
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
+                cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
             )
 
@@ -145,6 +148,7 @@ class RealBrowserManager(BrowserManager):
             workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
+            cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
         )
         return browser_state
@@ -218,6 +222,7 @@ class RealBrowserManager(BrowserManager):
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -245,6 +250,7 @@ class RealBrowserManager(BrowserManager):
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
         )
