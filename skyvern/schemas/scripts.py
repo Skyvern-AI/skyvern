@@ -130,14 +130,15 @@ class DeployCachedScriptRequest(BaseModel):
     source_workflow_run_id: str | None = Field(default=None, description="Optional provenance run id")
     requires_agent_overrides: dict[str, bool] = Field(
         default_factory=dict,
-        description="Explicit per-label requires_agent values for future commit mode",
+        description="Explicit per-label requires_agent values for commit mode",
     )
-    dry_run: bool = Field(default=True, description="Dry-run must be true in the initial internal endpoint")
+    dry_run: bool = Field(default=True, description="When true, validates the deploy without writing state")
 
 
 class DeployCachedScriptBlockPlan(BaseModel):
     label: str
     primitive: str
+    run_signature: str = ""
     block_type: str | None = None
     is_cacheable: bool
     is_compound: bool
@@ -152,6 +153,12 @@ class DeployCachedScriptResponse(BaseModel):
     cache_key_value: str
     dry_run: bool
     would_create_script: bool
+    script_was_created: bool = False
+    script_id: str | None = None
+    script_revision_id: str | None = None
+    script_version: int | None = None
+    workflow_script_id: str | None = None
+    workflow_script_upsert_status: str | None = None
     cacheable_block_count: int
     skipped_block_labels: list[str] = Field(default_factory=list)
     blocks: list[DeployCachedScriptBlockPlan] = Field(default_factory=list)

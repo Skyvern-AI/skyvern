@@ -261,8 +261,8 @@ async def deploy_cached_script(
     workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> DeployCachedScriptResponse:
-    """Validate a cached script deploy plan without writing deployment state."""
-    return await cached_script_deploy_service.dry_run_cached_script_deploy(
+    """Validate or commit a cached script deployment."""
+    return await cached_script_deploy_service.deploy_cached_script(
         organization_id=current_org.organization_id,
         workflow_permanent_id=workflow_permanent_id,
         request=data,
