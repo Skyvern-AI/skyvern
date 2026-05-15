@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_serializer, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -18,6 +18,7 @@ from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputPa
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
 from skyvern.schemas.workflows import WorkflowStatus
+from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 
@@ -32,6 +33,7 @@ class WorkflowRequestBody(BaseModel):
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool | None = None
@@ -112,6 +114,7 @@ class Workflow(BaseModel):
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     run_with: str = "agent"
     ai_fallback: bool = True
     cache_key: str | None = None
@@ -129,6 +132,10 @@ class Workflow(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
     created_at: datetime
     modified_at: datetime
@@ -189,6 +196,7 @@ class WorkflowRun(BaseModel):
     debug_session_id: str | None = None
     status: WorkflowRunStatus
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     proxy_location: ProxyLocationInput = None
     webhook_callback_url: str | None = None
     webhook_failure_reason: str | None = None
@@ -222,6 +230,10 @@ class WorkflowRun(BaseModel):
             return None
         return normalize_run_with(v)
 
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
+
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -229,25 +241,42 @@ class WorkflowRun(BaseModel):
     modified_at: datetime
 
 
-def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-    """Compute effective adaptive caching mode from run-level override or workflow setting.
+def is_adaptive_caching_from_effective_state(
+    *,
+    workflow_run_with: str,
+    run_run_with: str | None,
+    code_version: int | None,
+    adaptive_caching: bool,
+) -> bool:
+    """Compute adaptive caching from explicit workflow/run dispatch state.
 
     Uses code_version >= 2 as the primary check. Falls back to the legacy
     adaptive_caching bool for rows that haven't been backfilled yet
     (code_version is None).
 
-    WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
-    Workflow.run_with is always "code" or "agent" after normalization.
+    ``run_run_with`` is None when the run inherits from the workflow. This
+    helper is shared by runtime and deploy-time cache-key resolution so the
+    ``:v2`` suffix decision stays in one place.
     """
-    run_with = workflow_run.run_with or workflow.run_with
+    run_with = normalize_run_with(run_run_with) if run_run_with is not None else normalize_run_with(workflow_run_with)
     if run_with == "agent":
         return False
     # run_with == "code": check code_version
     if run_with == "code":
-        if workflow.code_version is not None:
-            return workflow.code_version >= 2
-        return workflow.adaptive_caching
+        if code_version is not None:
+            return code_version >= 2
+        return adaptive_caching
     return False
+
+
+def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
+    """Compute effective adaptive caching mode from run-level override or workflow setting."""
+    return is_adaptive_caching_from_effective_state(
+        workflow_run_with=workflow.run_with,
+        run_run_with=workflow_run.run_with,
+        code_version=workflow.code_version,
+        adaptive_caching=workflow.adaptive_caching,
+    )
 
 
 class WorkflowRunParameter(BaseModel):
@@ -276,6 +305,7 @@ class WorkflowRunResponseBase(BaseModel):
     totp_verification_url: str | None = None
     totp_identifier: str | None = None
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     queued_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -304,6 +334,10 @@ class WorkflowRunResponseBase(BaseModel):
     @classmethod
     def _normalize_run_with(cls, v: str | None) -> str:
         return normalize_run_with(v)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
 
 class WorkflowRunWithWorkflowResponse(WorkflowRunResponseBase):

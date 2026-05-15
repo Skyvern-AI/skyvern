@@ -263,6 +263,7 @@ async def run_task(
             model=run_request.model,
             max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             extra_http_headers=run_request.extra_http_headers,
+            cdp_connect_headers=run_request.cdp_connect_headers,
             browser_address=run_request.browser_address,
         )
         task_v1_response = await task_v1_service.run_task(
@@ -330,6 +331,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
+                cdp_connect_headers=run_request.cdp_connect_headers,
                 browser_session_id=run_request.browser_session_id,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
@@ -439,6 +441,7 @@ async def run_workflow(
         browser_profile_id=workflow_run_request.browser_profile_id,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
+        cdp_connect_headers=workflow_run_request.cdp_connect_headers,
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
@@ -745,6 +748,7 @@ async def create_workflow_from_prompt(
             proxy_location=request.proxy_location,
             max_screenshot_scrolling_times=request.max_screenshot_scrolls,
             extra_http_headers=request.extra_http_headers,
+            cdp_connect_headers=request.cdp_connect_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
             status=WorkflowStatus.published if request.publish_workflow else WorkflowStatus.auto_generated,
@@ -3541,6 +3545,7 @@ async def run_task_v2(
             max_screenshot_scrolling_times=data.max_screenshot_scrolls,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
+            cdp_connect_headers=data.cdp_connect_headers,
             browser_address=data.browser_address,
             trigger_type=legacy_v2_trigger_type,
         )

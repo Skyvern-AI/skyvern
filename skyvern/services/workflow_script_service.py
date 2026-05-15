@@ -8,6 +8,7 @@ from typing import Any, NamedTuple
 
 import structlog
 from cachetools import TTLCache
+from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.config import settings
@@ -27,6 +28,7 @@ from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
+strict_jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 
 # Shared regex for parsing @skyvern.cached decorator lines in main.py source.
 _CACHED_DECORATOR_RE = re.compile(
@@ -113,9 +115,19 @@ def _jinja_domain_filter(url: str) -> str:
 
 
 jinja_sandbox_env.filters["domain"] = _jinja_domain_filter
+strict_jinja_sandbox_env.filters["domain"] = _jinja_domain_filter
 
 
-def _resolve_block_url_for_cache_key(url_template: str, parameters: dict[str, Any]) -> str:
+class CacheKeyResolutionError(ValueError):
+    """Raised when deploy-time strict cache-key resolution cannot prove runtime parity."""
+
+
+def _render_cache_template(template: str, parameters: dict[str, Any], *, strict: bool) -> str:
+    env = strict_jinja_sandbox_env if strict else jinja_sandbox_env
+    return env.from_string(template).render(parameters)
+
+
+def _resolve_block_url_for_cache_key(url_template: str, parameters: dict[str, Any], *, strict: bool = False) -> str:
     """Resolve a block ``url`` the same way runtime does: param-key swap,
     Jinja render, prepend-scheme validate. Must stay in sync with
     ``BaseTaskBlock.execute`` / ``format_potential_template_parameters``.
@@ -125,33 +137,98 @@ def _resolve_block_url_for_cache_key(url_template: str, parameters: dict[str, An
         value = parameters[url_template]
         if value:
             candidate = str(value)
-    rendered = jinja_sandbox_env.from_string(candidate).render(parameters)
+    rendered = _render_cache_template(candidate, parameters, strict=strict)
     if not rendered:
         return ""
     return prepend_scheme_and_validate_url(rendered)
 
 
-def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any]) -> str:
+def _extract_first_block_domain(workflow: Workflow, parameters: dict[str, Any], *, strict: bool = False) -> str:
     """Extract the domain from the first block's URL for cache-key enrichment.
 
     Calls ``_resolve_block_url_for_cache_key`` on each block's ``url`` and
     returns the first non-empty domain. The helper mirrors runtime's URL
     resolution — see its docstring for the pipeline.
     """
-    try:
+
+    def _resolve() -> str:
         blocks = get_all_blocks(workflow.workflow_definition.blocks)
         for block in blocks:
             url_template = getattr(block, "url", None)
             if not url_template:
                 continue
-            rendered_url = _resolve_block_url_for_cache_key(str(url_template), parameters)
+            rendered_url = _resolve_block_url_for_cache_key(str(url_template), parameters, strict=strict)
             if rendered_url:
                 domain = _jinja_domain_filter(rendered_url)
                 if domain:
                     return domain
+        return ""
+
+    if strict:
+        return _resolve()
+
+    try:
+        return _resolve()
     except Exception:
         pass
     return ""
+
+
+def resolve_cache_key_value(
+    workflow: Workflow,
+    parameters: dict[str, Any],
+    *,
+    adaptive_caching: bool,
+    strict: bool = False,
+    domain_override: str | None = None,
+) -> str:
+    """Resolve a workflow script cache key without performing the DB lookup.
+
+    Runtime calls this in tolerant mode after loading a workflow run's
+    parameters. Deploy flows call it in strict mode with explicit cache context,
+    so missing template values fail before publishing a script.
+    """
+    cache_key = workflow.cache_key or ""
+
+    try:
+        rendered_cache_key_value = _render_cache_template(cache_key, parameters, strict=strict)
+
+        if rendered_cache_key_value in ("default", ""):
+            domain = domain_override or _extract_first_block_domain(workflow, parameters, strict=strict)
+            if not domain and strict:
+                raise CacheKeyResolutionError(
+                    "Unable to resolve default cache key: provide cache_context.parameters or domain_override"
+                )
+            if domain:
+                ats_platform = app.AGENT_FUNCTION.detect_ats_platform(domain)
+                if ats_platform:
+                    LOG.info(
+                        "Code 2.0: platform detected, using platform-level cache key",
+                        ats_platform=ats_platform,
+                        original_domain=domain,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                    )
+                cache_segment = ats_platform if ats_platform else domain
+                rendered_cache_key_value = (
+                    f"{rendered_cache_key_value}:{cache_segment}" if rendered_cache_key_value else cache_segment
+                )
+
+        if adaptive_caching:
+            rendered_cache_key_value = f"{rendered_cache_key_value}:v2" if rendered_cache_key_value else "v2"
+
+        return rendered_cache_key_value
+    except CacheKeyResolutionError:
+        raise
+    except Exception as exc:
+        if strict:
+            raise CacheKeyResolutionError(str(exc)) from exc
+        LOG.warning(
+            "Failed to resolve workflow script cache key",
+            workflow_id=workflow.workflow_id,
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            exc_info=True,
+        )
+        return ""
 
 
 def workflow_has_conditionals(workflow: Workflow) -> bool:
@@ -327,7 +404,6 @@ async def get_workflow_script(
     Check if there's a related workflow script that should be used instead of running the workflow.
     Returns the tuple of (script, rendered_cache_key_value, is_pinned).
     """
-    cache_key = workflow.cache_key or ""
     rendered_cache_key_value = ""
 
     try:
@@ -336,33 +412,11 @@ async def get_workflow_script(
         )
         parameters = {wf_param.key: run_param.value for wf_param, run_param in parameter_tuples}
 
-        rendered_cache_key_value = jinja_sandbox_env.from_string(cache_key).render(parameters)
-
-        # Auto-enrich with domain when using the default cache key.
-        # This ensures the same workflow running against different sites gets
-        # separate cached scripts. For known platform patterns, a platform-level
-        # key is used instead of the domain so all employers on the same platform
-        # share one cached script.
-        if rendered_cache_key_value in ("default", ""):
-            domain = _extract_first_block_domain(workflow, parameters)
-            if domain:
-                ats_platform = app.AGENT_FUNCTION.detect_ats_platform(domain)
-                if ats_platform:
-                    LOG.info(
-                        "Code 2.0: platform detected, using platform-level cache key",
-                        ats_platform=ats_platform,
-                        original_domain=domain,
-                        workflow_permanent_id=workflow.workflow_permanent_id,
-                    )
-                cache_segment = ats_platform if ats_platform else domain
-                rendered_cache_key_value = (
-                    f"{rendered_cache_key_value}:{cache_segment}" if rendered_cache_key_value else cache_segment
-                )
-
-        # Namespace adaptive caching (Code 2.0) scripts with :v2 suffix so they
-        # don't collide with traditional (Code 1.0) cached scripts.
-        if is_adaptive_caching(workflow, workflow_run):
-            rendered_cache_key_value = f"{rendered_cache_key_value}:v2" if rendered_cache_key_value else "v2"
+        rendered_cache_key_value = resolve_cache_key_value(
+            workflow=workflow,
+            parameters=parameters,
+            adaptive_caching=is_adaptive_caching(workflow, workflow_run),
+        )
 
         LOG.info(
             "Resolved cache key for workflow script lookup",

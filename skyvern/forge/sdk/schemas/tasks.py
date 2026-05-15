@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 
 from fastapi import status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from typing_extensions import Self
 
 from skyvern.exceptions import (
@@ -19,6 +19,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 
@@ -85,6 +86,14 @@ class TaskBase(BaseModel):
     extra_http_headers: dict[str, str] | None = Field(
         None, description="The extra HTTP headers for the requests in browser."
     )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        None,
+        description=(
+            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to "
+            "a remote browser via browser_address. Use this for browser-provider auth. "
+            "Never forwarded to target websites."
+        ),
+    )
     complete_criterion: str | None = Field(
         default=None, description="Criterion to complete", examples=["Complete if 'hello world' shows up on the page"]
     )
@@ -127,6 +136,10 @@ class TaskBase(BaseModel):
         default=True,
         description="If False, omit the scraped page text dump from the extract-information prompt. ExtractionBlock opts out; everything else keeps the default.",
     )
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
 
 class TaskRequest(TaskBase):

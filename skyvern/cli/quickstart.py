@@ -777,6 +777,9 @@ def quickstart(
             return
 
     if not _has_server_quickstart_extra():
+        if not _is_interactive_input():
+            _print_server_guidance()
+            raise typer.Exit(0)
         if not _install_server_extra_for_quickstart() or not _has_server_quickstart_extra():
             raise typer.Exit(1)
 

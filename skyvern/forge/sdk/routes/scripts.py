@@ -19,6 +19,8 @@ from skyvern.schemas.scripts import (
     ClearCacheResponse,
     CreateScriptRequest,
     CreateScriptResponse,
+    DeployCachedScriptRequest,
+    DeployCachedScriptResponse,
     DeployScriptRequest,
     FallbackEpisodeListResponse,
     PinScriptRequest,
@@ -40,7 +42,7 @@ from skyvern.schemas.scripts import (
     WorkflowScriptsListResponse,
     WorkflowScriptSummary,
 )
-from skyvern.services import script_service, workflow_script_service
+from skyvern.services import cached_script_deploy_service, script_service, workflow_script_service
 from skyvern.services.script_reviewer import ScriptReviewer, load_filtered_run_param_values, store_review_artifacts
 from skyvern.services.workflow_script_service import (
     create_script_version_from_review,
@@ -246,6 +248,24 @@ async def create_script(
         workflow_id=data.workflow_id,
         run_id=data.run_id,
         files=data.files,
+    )
+
+
+@base_router.post(
+    "/scripts/{workflow_permanent_id}/deploy_cached/",
+    response_model=DeployCachedScriptResponse,
+    include_in_schema=False,
+)
+async def deploy_cached_script(
+    data: DeployCachedScriptRequest,
+    workflow_permanent_id: str = Path(..., description="The workflow permanent ID"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> DeployCachedScriptResponse:
+    """Validate a cached script deploy plan without writing deployment state."""
+    return await cached_script_deploy_service.dry_run_cached_script_deploy(
+        organization_id=current_org.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        request=data,
     )
 
 

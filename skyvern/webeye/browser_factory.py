@@ -517,6 +517,7 @@ async def _create_headless_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocation | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -524,6 +525,7 @@ async def _create_headless_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -606,6 +608,7 @@ async def _create_headful_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocation | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -613,6 +616,7 @@ async def _create_headful_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -723,6 +727,7 @@ async def _create_cdp_connection_browser(
     playwright: Playwright,
     proxy_location: ProxyLocation | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -730,6 +735,7 @@ async def _create_cdp_connection_browser(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -787,6 +793,7 @@ async def _connect_to_cdp_browser(
     playwright: Playwright,
     remote_browser_url: str,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
@@ -800,10 +807,20 @@ async def _connect_to_cdp_browser(
     )
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    cdp_headers = build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER) or {}
+    if cdp_connect_headers:
+        # HTTP header names are case-insensitive, so a plain ``{**user, **server}``
+        # would still leak a user-supplied ``host`` alongside our managed ``Host``.
+        # Drop any user key that collides with a server key on a lowercased compare.
+        reserved_keys = {key.lower() for key in cdp_headers}
+        filtered_user_headers = {
+            key: value for key, value in cdp_connect_headers.items() if key.lower() not in reserved_keys
+        }
+        cdp_headers = {**filtered_user_headers, **cdp_headers}
     browser = await _connect_over_cdp_with_diagnostics(
         playwright,
         remote_browser_url,
-        headers=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER),
+        headers=cdp_headers or None,
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
     )
 

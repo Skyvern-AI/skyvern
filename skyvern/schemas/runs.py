@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -45,6 +45,7 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunStatus,
     RunType,
 )
+from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 # Type checkers need string Literal values, while pydantic's discriminated
@@ -128,6 +129,15 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="The extra HTTP headers for the requests in browser.",
     )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to "
+            "a remote browser via browser_address. Use this for browser-provider auth "
+            "(e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers "
+            "are NEVER forwarded to target websites."
+        ),
+    )
     publish_workflow: bool = Field(
         default=False,
         description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
@@ -173,6 +183,10 @@ class TaskRunRequest(BaseModel):
             return url
 
         return validate_url(url)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
     @model_validator(mode="after")
     def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
@@ -222,6 +236,15 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="The extra HTTP headers for the requests in browser.",
     )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to "
+            "a remote browser via browser_address. Use this for browser-provider auth "
+            "(e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers "
+            "are NEVER forwarded to target websites."
+        ),
+    )
     browser_address: str | None = Field(
         default=None,
         description="The CDP address for the workflow run.",
@@ -259,6 +282,10 @@ class WorkflowRunRequest(BaseModel):
         if not url:
             return url
         return validate_url(url)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
 
 class BlockRunRequest(WorkflowRunRequest):

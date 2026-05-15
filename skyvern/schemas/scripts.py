@@ -102,6 +102,62 @@ class DeployScriptRequest(BaseModel):
     )
 
 
+class DeployCachedScriptCacheContext(BaseModel):
+    parameters: dict[str, str | int | float | bool | dict | list | None] = Field(
+        default_factory=dict,
+        description="Workflow-run parameter values used to resolve cache key and block URLs in strict deploy mode",
+    )
+    adaptive_caching: bool = Field(..., description="Whether deploy should apply Code 2.0 :v2 cache suffix")
+    domain_override: str | None = Field(
+        default=None,
+        description="Explicit domain for default/empty cache keys when it cannot be derived from workflow block URLs",
+    )
+
+
+class DeployCachedScriptRequest(BaseModel):
+    workflow_id: str = Field(..., description="Expected latest workflow version id")
+    workflow_version: int = Field(..., description="Expected latest workflow version number")
+    cache_key: str | None = Field(
+        default=None,
+        description="Optional cache key template override; omitted uses the workflow cache_key",
+    )
+    cache_context: DeployCachedScriptCacheContext
+    resolved_cache_key_value: str | None = Field(
+        default=None,
+        description="Optional operator assertion for the exact runtime cache key value",
+    )
+    files: list[ScriptFileCreate] = Field(..., description="Script files to validate; must include main.py")
+    source_workflow_run_id: str | None = Field(default=None, description="Optional provenance run id")
+    requires_agent_overrides: dict[str, bool] = Field(
+        default_factory=dict,
+        description="Explicit per-label requires_agent values for future commit mode",
+    )
+    dry_run: bool = Field(default=True, description="Dry-run must be true in the initial internal endpoint")
+
+
+class DeployCachedScriptBlockPlan(BaseModel):
+    label: str
+    primitive: str
+    block_type: str | None = None
+    is_cacheable: bool
+    is_compound: bool
+    missing_globals: list[str] = Field(default_factory=list)
+    requires_agent: bool = False
+
+
+class DeployCachedScriptResponse(BaseModel):
+    workflow_id: str
+    workflow_version: int
+    cache_key: str | None = None
+    cache_key_value: str
+    dry_run: bool
+    would_create_script: bool
+    cacheable_block_count: int
+    skipped_block_labels: list[str] = Field(default_factory=list)
+    blocks: list[DeployCachedScriptBlockPlan] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class CreateScriptResponse(BaseModel):
     script_id: str = Field(..., description="Unique script identifier", examples=["s_abc123"])
     version: int = Field(..., description="Script version number", examples=[1])
