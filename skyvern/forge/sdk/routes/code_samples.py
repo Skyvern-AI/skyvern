@@ -829,14 +829,26 @@ console.log(credentials);
 CREATE_BROWSER_SESSION_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")
-browser_session = await skyvern.create_browser_session(timeout=60)
+browser_session = await skyvern.create_browser_session(
+    timeout=60,
+    proxy_config={
+        "server": "http://proxy.example.com:8080",
+        "username": "user",
+        "password": "password",
+    },
+)
 print(browser_session)
 """
 CREATE_BROWSER_SESSION_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 const browserSession = await skyvern.createBrowserSession({
-    timeout: 60
+    timeout: 60,
+    proxy_config: {
+        server: "http://proxy.example.com:8080",
+        username: "user",
+        password: "password"
+    }
 });
 console.log(browserSession);
 """

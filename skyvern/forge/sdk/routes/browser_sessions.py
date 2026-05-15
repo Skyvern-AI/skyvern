@@ -106,6 +106,7 @@ async def create_browser_session(
         organization_id=current_org.organization_id,
         timeout_minutes=browser_session_request.timeout,
         proxy_location=browser_session_request.proxy_location,
+        proxy_config=browser_session_request.proxy_config,
         extensions=browser_session_request.extensions,
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,

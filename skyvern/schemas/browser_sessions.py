@@ -4,6 +4,7 @@ from skyvern.client.types.workflow_definition_yaml_blocks_item import WorkflowDe
 from skyvern.client.types.workflow_definition_yaml_parameters_item import WorkflowDefinitionYamlParametersItem_Workflow
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
 
 MIN_TIMEOUT = 5
@@ -21,6 +22,10 @@ class CreateBrowserSessionRequest(BaseModel):
     proxy_location: ProxyLocationInput = Field(
         default=None,
         description=PROXY_LOCATION_DOC_STRING,
+    )
+    proxy_config: BrowserSessionProxyConfig | None = Field(
+        default=None,
+        description="Request-scoped Playwright proxy configuration for this browser session. Overrides the configured HOSTED_PROXY_POOL for this session only and is not returned in session responses.",
     )
 
     @field_validator("proxy_location", mode="before")

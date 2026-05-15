@@ -1,4 +1,3 @@
-
 import { chromium } from "playwright";
 import type * as SkyvernApi from "../api/index.js";
 import type { BaseClientOptions } from "../BaseClient.js";
@@ -92,10 +91,10 @@ export class Skyvern extends SkyvernClient {
         const response = await super.runTask(taskRequest, requestOptions).withRawResponse();
 
         if (waitForCompletion) {
-            const completedRun = await this._waitForRunCompletion(
+            const completedRun = (await this._waitForRunCompletion(
                 response.data.run_id,
                 timeout ?? 1800,
-            ) as SkyvernApi.TaskRunResponse;
+            )) as SkyvernApi.TaskRunResponse;
             return { data: completedRun, rawResponse: response.rawResponse };
         }
 
@@ -118,10 +117,10 @@ export class Skyvern extends SkyvernClient {
         const response = await super.runWorkflow(workflowRequest, requestOptions).withRawResponse();
 
         if (waitForCompletion) {
-            const completedRun = await this._waitForRunCompletion(
+            const completedRun = (await this._waitForRunCompletion(
                 response.data.run_id,
                 timeout ?? 1800,
-            ) as SkyvernApi.WorkflowRunResponse;
+            )) as SkyvernApi.WorkflowRunResponse;
             return { data: completedRun, rawResponse: response.rawResponse };
         }
 
@@ -144,10 +143,10 @@ export class Skyvern extends SkyvernClient {
         const response = await super.login(loginRequest, requestOptions).withRawResponse();
 
         if (waitForCompletion) {
-            const completedRun = await this._waitForRunCompletion(
+            const completedRun = (await this._waitForRunCompletion(
                 response.data.run_id,
                 timeout ?? 1800,
-            ) as SkyvernApi.WorkflowRunResponse;
+            )) as SkyvernApi.WorkflowRunResponse;
             return { data: completedRun, rawResponse: response.rawResponse };
         }
 
@@ -170,10 +169,10 @@ export class Skyvern extends SkyvernClient {
         const response = await super.downloadFiles(downloadFilesRequest, requestOptions).withRawResponse();
 
         if (waitForCompletion) {
-            const completedRun = await this._waitForRunCompletion(
+            const completedRun = (await this._waitForRunCompletion(
                 response.data.run_id,
                 timeout ?? 1800,
-            ) as SkyvernApi.WorkflowRunResponse;
+            )) as SkyvernApi.WorkflowRunResponse;
             return { data: completedRun, rawResponse: response.rawResponse };
         }
 
@@ -190,22 +189,27 @@ export class Skyvern extends SkyvernClient {
      *        Must be between 5 and 1440. Defaults to 60.
      * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
      *        This is only available in Skyvern Cloud.
+     * @param options.proxyConfig - Request-scoped proxy server configuration for this session.
      *
      * @returns SkyvernBrowser instance connected to the new cloud session.
      */
     async launchCloudBrowser(options?: {
         timeout?: number;
         proxyLocation?: SkyvernApi.ProxyLocation;
+        proxyConfig?: SkyvernApi.CreateBrowserSessionRequest["proxy_config"];
     }): Promise<SkyvernBrowser> {
         this._ensureCloudEnvironment();
 
         const browserSession = await this.createBrowserSession({
             timeout: options?.timeout,
             proxy_location: options?.proxyLocation,
+            proxy_config: options?.proxyConfig,
         });
 
         if (this._environment === SkyvernEnvironment.Cloud) {
-            LOG.info("Launched new cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+            LOG.info("Launched new cloud browser session", {
+                url: _getBrowserSessionUrl(browserSession.browser_session_id),
+            });
         } else {
             LOG.info("Launched new cloud browser session", { browser_session_id: browserSession.browser_session_id });
         }
@@ -226,9 +230,13 @@ export class Skyvern extends SkyvernClient {
         const browserSession = await this.getBrowserSession(browserSessionId);
 
         if (this._environment === SkyvernEnvironment.Cloud) {
-            LOG.info("Connecting to existing cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+            LOG.info("Connecting to existing cloud browser session", {
+                url: _getBrowserSessionUrl(browserSession.browser_session_id),
+            });
         } else {
-            LOG.info("Connecting to existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+            LOG.info("Connecting to existing cloud browser session", {
+                browser_session_id: browserSession.browser_session_id,
+            });
         }
 
         return this._connectToCloudBrowserSession(browserSession);
@@ -246,10 +254,15 @@ export class Skyvern extends SkyvernClient {
      *        Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
      * @param options.proxyLocation - Geographic proxy location to route the browser traffic through.
      *        This is only available in Skyvern Cloud. Only used when creating a new session.
+     * @param options.proxyConfig - Request-scoped proxy server configuration. Only used when creating a new session.
      *
      * @returns SkyvernBrowser instance connected to an existing or new cloud session.
      */
-    async useCloudBrowser(options?: { timeout?: number; proxyLocation?: ProxyLocation }): Promise<SkyvernBrowser> {
+    async useCloudBrowser(options?: {
+        timeout?: number;
+        proxyLocation?: ProxyLocation;
+        proxyConfig?: SkyvernApi.CreateBrowserSessionRequest["proxy_config"];
+    }): Promise<SkyvernBrowser> {
         this._ensureCloudEnvironment();
 
         const browserSessions = await this.getBrowserSessions();
@@ -268,9 +281,13 @@ export class Skyvern extends SkyvernClient {
         }
 
         if (this._environment === SkyvernEnvironment.Cloud) {
-            LOG.info("Reusing existing cloud browser session", { url: _getBrowserSessionUrl(browserSession.browser_session_id) });
+            LOG.info("Reusing existing cloud browser session", {
+                url: _getBrowserSessionUrl(browserSession.browser_session_id),
+            });
         } else {
-            LOG.info("Reusing existing cloud browser session", { browser_session_id: browserSession.browser_session_id });
+            LOG.info("Reusing existing cloud browser session", {
+                browser_session_id: browserSession.browser_session_id,
+            });
         }
 
         return this._connectToCloudBrowserSession(browserSession);

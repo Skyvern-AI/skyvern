@@ -42,6 +42,13 @@ export interface CreateBrowserSessionRequest {
      * - NONE: No proxy
      */
     proxy_location?: Skyvern.ProxyLocation;
+    /** Request-scoped proxy config for this browser session. Overrides the configured proxy pool. */
+    proxy_config?: {
+        server: string;
+        username?: string;
+        password?: string;
+        bypass?: string;
+    };
     /** A list of extensions to install in the browser session. */
     extensions?: Skyvern.Extensions[];
     /** The type of browser to use for the session. */
