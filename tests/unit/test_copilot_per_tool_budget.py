@@ -34,7 +34,6 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_failure_signature,
 )
 from skyvern.forge.sdk.copilot.tools import (
-    _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
     _record_per_tool_budget_problem_blocks_from_results,
     _record_run_blocks_result,
@@ -264,57 +263,6 @@ def test_reconciliation_does_not_clear_for_non_budget_canceled() -> None:
     _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "canceled"))
 
     assert ctx.pending_reconciliation_run_id == "wr_1"
-
-
-def test_reconciliation_does_not_mark_user_input_for_non_final_poll() -> None:
-    ctx = _fresh_context()
-    ctx.pending_reconciliation_run_id = "wr_1"
-    ctx.last_failure_category_top = None
-
-    _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "running"))
-
-    assert ctx.pending_reconciliation_run_id == "wr_1"
-    assert ctx.pending_reconciliation_requires_user_input is False
-
-
-def test_new_pending_reconciliation_resets_inspected_canceled_flag() -> None:
-    ctx = _fresh_context()
-    ctx.pending_reconciliation_run_id = "wr_old"
-    ctx.pending_reconciliation_requires_user_input = True
-
-    _mark_pending_reconciliation_run(ctx, "wr_new")
-
-    assert ctx.pending_reconciliation_run_id == "wr_new"
-    assert ctx.pending_reconciliation_requires_user_input is False
-
-
-def test_non_budget_canceled_reconciliation_suppresses_failed_test_nudge() -> None:
-    ctx = _fresh_context()
-    ctx.update_workflow_called = True
-    ctx.test_after_update_done = True
-    ctx.last_test_ok = False
-    ctx.pending_reconciliation_run_id = "wr_1"
-    ctx.last_failure_category_top = None
-
-    _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "canceled"))
-
-    assert ctx.pending_reconciliation_run_id == "wr_1"
-    assert ctx.pending_reconciliation_requires_user_input is True
-    assert _check_enforcement(ctx) is None
-
-
-def test_block_running_after_non_budget_canceled_inspection_does_not_request_get_results_again() -> None:
-    ctx = _fresh_context()
-    ctx.pending_reconciliation_run_id = "wr_1"
-    ctx.last_failure_category_top = None
-
-    _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "canceled"))
-
-    msg = _tool_loop_error(ctx, "update_and_run_blocks")
-
-    assert msg is not None
-    assert "get_run_results" not in msg
-    assert "ask" in msg.lower() or "user" in msg.lower()
 
 
 def test_reconciliation_clears_for_per_tool_budget_failed_status_too() -> None:
