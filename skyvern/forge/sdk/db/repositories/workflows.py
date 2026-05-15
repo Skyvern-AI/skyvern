@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -29,7 +30,7 @@ from skyvern.forge.sdk.db.models import (
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
-from skyvern.forge.sdk.db.utils import convert_to_workflow, serialize_proxy_location
+from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
@@ -37,6 +38,19 @@ from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
 
 LOG = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class WorkflowDispatchState:
+    run_with: str | None
+    cache_key: str | None
+    code_version: int | None
+
+
+@dataclass(frozen=True)
+class WorkflowDispatchUpdateResult:
+    workflow: Workflow
+    previous_dispatch_state: WorkflowDispatchState
 
 
 def _align_block_output_parameters(workflow_definition: WorkflowDefinition) -> None:
@@ -715,6 +729,151 @@ class WorkflowsRepository(BaseRepository):
             updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
             if updated_workflow_id is None:
                 raise NotFoundError("Workflow not found or no longer latest")
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel).filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                        ),
+                        WorkflowModel,
+                    )
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return convert_to_workflow(
+                workflow,
+                self.debug_enabled,
+                is_template=is_template,
+            )
+
+    @db_operation("update_workflow_dispatch_state_if_latest_with_previous")
+    async def update_workflow_dispatch_state_if_latest_with_previous(
+        self,
+        *,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        expected_version: int,
+        run_with: str,
+        cache_key: str,
+        code_version: int,
+    ) -> WorkflowDispatchUpdateResult:
+        async with self.Session() as session:
+            previous_workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel)
+                        .filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                            workflow_permanent_id=workflow_permanent_id,
+                            version=expected_version,
+                        )
+                        .with_for_update(),
+                        WorkflowModel,
+                    )
+                )
+            ).first()
+            if previous_workflow is None:
+                raise NotFoundError("Workflow not found")
+            previous_dispatch_state = WorkflowDispatchState(
+                run_with=previous_workflow.run_with,
+                cache_key=previous_workflow.cache_key,
+                code_version=previous_workflow.code_version,
+            )
+
+            newer_version_exists = (
+                select(WorkflowModel.workflow_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.version > expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .exists()
+            )
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.version == expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(~newer_version_exists)
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                raise NotFoundError("Workflow not found or no longer latest")
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(
+                        select(WorkflowModel).filter_by(
+                            workflow_id=workflow_id,
+                            organization_id=organization_id,
+                        ),
+                        WorkflowModel,
+                    )
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return WorkflowDispatchUpdateResult(
+                workflow=convert_to_workflow(
+                    workflow,
+                    self.debug_enabled,
+                    is_template=is_template,
+                ),
+                previous_dispatch_state=previous_dispatch_state,
+            )
+
+    @db_operation("restore_workflow_script_dispatch_if_matches")
+    async def restore_workflow_script_dispatch_if_matches(
+        self,
+        *,
+        workflow_id: str,
+        organization_id: str,
+        run_with: str | None,
+        cache_key: str | None,
+        code_version: int | None,
+        current_run_with: str | None,
+        current_cache_key: str | None,
+        current_code_version: int | None,
+    ) -> Workflow | None:
+        """Restore script dispatch only if it still matches the deploy write."""
+        async with self.Session() as session:
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(nullable_column_equals(WorkflowModel.run_with, current_run_with))
+                .where(nullable_column_equals(WorkflowModel.cache_key, current_cache_key))
+                .where(nullable_column_equals(WorkflowModel.code_version, current_code_version))
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                await session.commit()
+                return None
 
             await session.commit()
             workflow = (
