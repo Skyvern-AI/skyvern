@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import time
@@ -89,7 +90,13 @@ def create_database_and_user() -> None:
         console.print("✅ [green]Role 'skyvern' already exists.[/green]")
     else:
         console.print("  Creating role 'skyvern'...")
-        result = subprocess.run(["createuser", "skyvern"], check=False, capture_output=True, text=True)
+        result = subprocess.run(
+            ["createuser", "skyvern"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "LC_MESSAGES": "C"},
+        )
         if result.returncode == 0:
             console.print("  ✅ [green]Role 'skyvern' created.[/green]")
         elif _already_exists(result):
@@ -111,6 +118,7 @@ def create_database_and_user() -> None:
             check=False,
             capture_output=True,
             text=True,
+            env={**os.environ, "LC_MESSAGES": "C"},
         )
         if result.returncode == 0:
             console.print("  ✅ [green]Database 'skyvern' created.[/green]")

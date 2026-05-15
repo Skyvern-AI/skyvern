@@ -399,7 +399,9 @@ def init_env(
         start_forge_app = _run_with_server_dependency_install(_load_start_forge_app)
         setup_local_organization = _run_with_server_dependency_install(_load_setup_local_organization)
         _run_with_server_dependency_install(start_forge_app)
-        api_key = asyncio.run(setup_local_organization())
+        api_key = _run_with_server_dependency_install(
+            lambda: asyncio.run(setup_local_organization())
+        )
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")
         else:

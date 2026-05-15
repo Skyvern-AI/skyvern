@@ -10,8 +10,11 @@ from skyvern.cli import database
 def test_create_database_and_user_treats_already_exists_as_success(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
 
-    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(args)
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert env["LC_MESSAGES"] == "C"
         if args[0] == "createuser":
             return subprocess.CompletedProcess(
                 args,
