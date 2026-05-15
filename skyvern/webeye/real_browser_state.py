@@ -82,6 +82,7 @@ class RealBrowserState(BrowserState):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> None:
@@ -101,6 +102,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -274,6 +276,7 @@ class RealBrowserState(BrowserState):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> Page:
@@ -291,6 +294,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -312,6 +316,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -330,6 +335,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
