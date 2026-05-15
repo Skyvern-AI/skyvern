@@ -590,6 +590,7 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        code_version: int | None = None,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
@@ -625,6 +626,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_with = run_with
                 if cache_key is not None:
                     workflow.cache_key = cache_key
+                if code_version is not None:
+                    workflow.code_version = code_version
                 if status is not None:
                     workflow.status = status
                 if import_error is not None:
@@ -672,6 +675,62 @@ class WorkflowsRepository(BaseRepository):
                 )
             else:
                 raise NotFoundError("Workflow not found")
+
+    @db_operation("update_workflow_dispatch_state_if_latest")
+    async def update_workflow_dispatch_state_if_latest(
+        self,
+        *,
+        workflow_id: str,
+        workflow_permanent_id: str,
+        organization_id: str,
+        expected_version: int,
+        run_with: str,
+        cache_key: str,
+        code_version: int,
+    ) -> Workflow:
+        async with self.Session() as session:
+            newer_version_exists = (
+                select(WorkflowModel.workflow_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.version > expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .exists()
+            )
+            update_workflow_query = (
+                update(WorkflowModel)
+                .where(WorkflowModel.workflow_id == workflow_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id == workflow_permanent_id)
+                .where(WorkflowModel.version == expected_version)
+                .where(WorkflowModel.deleted_at.is_(None))
+                .where(~newer_version_exists)
+                .values(
+                    run_with=run_with,
+                    cache_key=cache_key,
+                    code_version=code_version,
+                )
+                .returning(WorkflowModel.workflow_id)
+            )
+            updated_workflow_id = (await session.execute(update_workflow_query)).scalar_one_or_none()
+            if updated_workflow_id is None:
+                raise NotFoundError("Workflow not found or no longer latest")
+
+            await session.commit()
+            workflow = (
+                await session.scalars(
+                    exclude_deleted(select(WorkflowModel).filter_by(workflow_id=workflow_id), WorkflowModel)
+                )
+            ).one()
+            is_template = await self.is_workflow_template(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+            )
+            return convert_to_workflow(
+                workflow,
+                self.debug_enabled,
+                is_template=is_template,
+            )
 
     @db_operation("update_workflow_and_reconcile_definition_params")
     async def update_workflow_and_reconcile_definition_params(
