@@ -22,6 +22,7 @@ from skyvern.config import settings
 from skyvern.constants import (
     AUTO_COMPLETION_POTENTIAL_VALUES_COUNT,
     BROWSER_DOWNLOAD_MAX_WAIT_TIME,
+    BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME,
     BROWSER_DOWNLOAD_TIMEOUT,
     DROPDOWN_MENU_MAX_DISTANCE,
     SKYVERN_ID_ATTR,
@@ -128,6 +129,20 @@ def _download_target_path(download_dir: Path, suggested_filename: str | None) ->
     filename = Path(suggested_filename or "download").name
     stem, suffix = os.path.splitext(filename)
     return download_dir / f"{uuid.uuid4()}-{stem or 'download'}{suffix}"
+
+
+def _remove_download_listener(page: Page, callback: Callable[[Download], None]) -> None:
+    off = getattr(page, "off", None)
+    if callable(off):
+        off("download", callback)
+        return
+
+    remove_listener = getattr(page, "remove_listener", None)
+    if callable(remove_listener):
+        remove_listener("download", callback)
+        return
+
+    raise AttributeError("Page does not support removing download listeners")
 
 
 async def _screenshot_without_cursor(page: Page, **kwargs: Any) -> bytes:
@@ -508,8 +523,29 @@ class ActionHandler:
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
                 apply_context_attrs(_dl_wait_span)
                 _dl_wait_span.set_attribute("timeout_seconds", _download_timeout)
+                no_signal_grace_seconds = min(_download_timeout, BROWSER_DOWNLOAD_NO_SIGNAL_GRACE_TIME)
+                _dl_wait_span.set_attribute("no_signal_grace_seconds", no_signal_grace_seconds)
                 _poll_iterations = 0
                 download_event_consumed = False
+                download_signal_observed = False
+                download_signal_source: str | None = None
+                download_signal_elapsed_seconds: float | None = None
+                download_signal_poll_iterations: int | None = None
+                download_wait_started_at = time.monotonic()
+
+                def _record_download_signal(source: str) -> None:
+                    nonlocal download_signal_observed
+                    nonlocal download_signal_source
+                    nonlocal download_signal_elapsed_seconds
+                    nonlocal download_signal_poll_iterations
+
+                    if download_signal_elapsed_seconds is not None:
+                        return
+                    download_signal_observed = True
+                    download_signal_source = source
+                    download_signal_elapsed_seconds = time.monotonic() - download_wait_started_at
+                    download_signal_poll_iterations = _poll_iterations
+
                 try:
                     LOG.info(
                         "Checking if there is any new files after click",
@@ -520,6 +556,7 @@ class ActionHandler:
                             _poll_iterations += 1
                             if download_event.done() and not download_event_consumed:
                                 download_event_consumed = True
+                                _record_download_signal("browser_download_event")
                                 try:
                                     download = download_event.result()
                                     download_target = _download_target_path(download_dir, download.suggested_filename)
@@ -530,6 +567,8 @@ class ActionHandler:
                                         download_dir=download_dir,
                                         download_target=str(download_target),
                                         workflow_run_id=task.workflow_run_id,
+                                        download_signal_elapsed_seconds=download_signal_elapsed_seconds,
+                                        download_signal_poll_iterations=download_signal_poll_iterations,
                                     )
                                     download_triggered = True
                                     break
@@ -543,15 +582,29 @@ class ActionHandler:
                             list_files_after = await _list_observed_download_files()
 
                             if len(list_files_after) > len(list_files_before):
+                                _record_download_signal("download_file_detected")
                                 LOG.info(
                                     "Found new files in download directory after action",
                                     num_downloaded_files_after=len(list_files_after),
                                     download_dir=download_dir,
                                     workflow_run_id=task.workflow_run_id,
+                                    download_signal_elapsed_seconds=download_signal_elapsed_seconds,
+                                    download_signal_poll_iterations=download_signal_poll_iterations,
                                 )
                                 download_triggered = True
                                 break
-                            await asyncio.sleep(1)
+                            elapsed_since_action = time.monotonic() - download_wait_started_at
+                            if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
+                                LOG.warning(
+                                    "No download signal observed after action",
+                                    workflow_run_id=task.workflow_run_id,
+                                    no_signal_grace_seconds=no_signal_grace_seconds,
+                                )
+                                break
+                            sleep_seconds: float = 1.0
+                            if not download_signal_observed:
+                                sleep_seconds = min(1, max(0.0, no_signal_grace_seconds - elapsed_since_action))
+                            await asyncio.sleep(sleep_seconds)
 
                 except asyncio.TimeoutError:
                     LOG.warning(
@@ -559,6 +612,13 @@ class ActionHandler:
                         workflow_run_id=task.workflow_run_id,
                     )
                 finally:
+                    _dl_wait_span.set_attribute("download_signal_observed", download_signal_observed)
+                    if download_signal_source:
+                        _dl_wait_span.set_attribute("download_signal_source", download_signal_source)
+                    if download_signal_elapsed_seconds is not None:
+                        _dl_wait_span.set_attribute("download_signal_elapsed_seconds", download_signal_elapsed_seconds)
+                    if download_signal_poll_iterations is not None:
+                        _dl_wait_span.set_attribute("download_signal_poll_iterations", download_signal_poll_iterations)
                     _dl_wait_span.set_attribute("download_triggered", download_triggered)
                     _dl_wait_span.set_attribute("poll_iterations", _poll_iterations)
 
@@ -651,7 +711,7 @@ class ActionHandler:
                         )
 
             try:
-                page.off("download", _capture_download_event)
+                _remove_download_listener(page, _capture_download_event)
             except Exception:
                 LOG.warning("Failed to remove one-shot download event listener", exc_info=True)
 
