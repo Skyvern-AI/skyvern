@@ -864,6 +864,7 @@ class ActionHandler:
         page: Page,
         action: Action,
     ) -> list[ActionResult]:
+        await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
         LOG.info(
             "Handling action",
             action_type=action.action_type,
@@ -894,6 +895,7 @@ class ActionHandler:
                 handler = ActionHandler._handled_action_types[action.action_type]
                 results = await handler(action, page, scraped_page, task, step)
                 actions_result.extend(results)
+                await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
                 # do the teardown
                 teardown = ActionHandler._teardown_action_types.get(action.action_type)
                 if teardown:

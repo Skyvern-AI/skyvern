@@ -673,6 +673,14 @@ class AgentFunction:
         """
         return None
 
+    async def wait_for_challenge_solver(self, page: Page) -> None:
+        """Wait for a cloud-managed challenge solver if one is attached to the page.
+
+        OSS no-op. Cloud overrides this so OSS-synced browser/action code can
+        wait at navigation/action boundaries without importing cloud modules.
+        """
+        return None
+
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
         """Cloud-overridable sample gate for extract-information shadow mode. OSS no-op."""
         return False
