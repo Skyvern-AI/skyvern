@@ -92,7 +92,6 @@ function PasswordCredentialContent({
     }
   }, [totp_type]);
   const prevUsernameRef = useRef(username);
-  const prevTotpMethodRef = useRef<typeof totpMethod>(totpMethod);
   const totpIdentifierLabel =
     totpMethod === "text"
       ? "TOTP Identifier (Phone)"
@@ -117,46 +116,58 @@ function PasswordCredentialContent({
     [name, onChange, password, totp, totp_identifier, totp_type, username],
   );
 
+  // Keep totp_identifier in sync ONLY when the user renames their username
+  // and the identifier was previously auto-filled to match that username.
+  // Method-change auto-fill lives in handleTotpMethodChange — that path is
+  // the only place we know the change came from the user (not from data
+  // hydration, which would silently overwrite a saved identifier).
   useEffect(() => {
     const prevUsername = prevUsernameRef.current;
-    const prevMethod = prevTotpMethodRef.current;
 
     if (totpMethod === "email") {
+      // prevUsername !== "" guards against an empty-string false-positive
+      // during initial hydration (where prev and identifier are both "").
       const usernameChanged = username !== prevUsername;
-      const identifierBlank = totp_identifier.trim() === "";
-      const identifierMatchedPrevUsername = totp_identifier === prevUsername;
-      const methodChanged = prevMethod !== "email";
-
-      if (
-        identifierBlank ||
-        methodChanged ||
-        (usernameChanged && identifierMatchedPrevUsername)
-      ) {
+      const identifierMatchedPrevUsername =
+        prevUsername !== "" && totp_identifier === prevUsername;
+      if (usernameChanged && identifierMatchedPrevUsername) {
         updateValues({ totp_identifier: username });
       }
     }
 
-    if (totpMethod === "text" && prevMethod !== "text") {
-      const wasAutoFilled = totp_identifier === prevUsername;
-      if (wasAutoFilled || totp_identifier.trim() === "") {
-        updateValues({ totp_identifier: "" });
-      }
-    }
-
     prevUsernameRef.current = username;
-    prevTotpMethodRef.current = totpMethod;
   }, [totpMethod, totp_identifier, updateValues, username]);
 
-  // Update totp_type when totpMethod changes; also enter edit mode for values
+  // User explicitly switched the 2FA method. Apply method-specific identifier
+  // defaults here (rather than in a useEffect) so data-hydration setTotpMethod
+  // calls don't accidentally trigger them.
   const handleTotpMethodChange = (
     method: "authenticator" | "email" | "text",
   ) => {
     onEnableEditValues?.();
+    const prevMethod = totpMethod;
     setTotpMethod(method);
-    updateValues({
+
+    const updates: Partial<Props["values"]> = {
       totp: method === "authenticator" ? totp : "",
       totp_type: method,
-    });
+    };
+
+    if (method === "email" && prevMethod !== "email") {
+      // Always reseed to username — whatever the previous method left in
+      // the field (a phone number from text, or nothing) is unlikely to be
+      // a valid email identifier.
+      updates.totp_identifier = username;
+    }
+
+    if (method === "text" && prevMethod !== "text") {
+      // Always clear — an email or username-shaped value from the previous
+      // method isn't a valid phone identifier, and we can't infer the user's
+      // phone number from email-mode data.
+      updates.totp_identifier = "";
+    }
+
+    updateValues(updates);
   };
 
   return (
