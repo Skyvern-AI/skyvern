@@ -69,6 +69,8 @@ def test_scripts_repository_instantiation():
     assert repo.Session is mock_session
     assert hasattr(repo, "create_script")
     assert hasattr(repo, "get_scripts")
+    assert hasattr(repo, "soft_delete_workflow_script_if_matches")
+    assert hasattr(repo, "restore_workflow_script_if_matches")
 
 
 def test_workflow_parameters_repository_instantiation():
@@ -101,6 +103,8 @@ def test_workflows_repository_instantiation():
     assert hasattr(repo, "get_workflow")
     assert hasattr(repo, "create_workflow")
     assert hasattr(repo, "get_workflow_by_permanent_id")
+    assert hasattr(repo, "update_workflow_dispatch_state_if_latest_with_previous")
+    assert hasattr(repo, "restore_workflow_script_dispatch_if_matches")
 
 
 def test_browser_sessions_repository_instantiation():
