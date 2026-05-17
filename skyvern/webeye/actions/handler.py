@@ -4575,7 +4575,7 @@ async def normal_select(
         step=step,
         skyvern_element=skyvern_element,
     )
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )
@@ -5301,7 +5301,7 @@ async def _get_input_or_select_context(
 
     json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )

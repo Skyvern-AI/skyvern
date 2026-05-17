@@ -155,7 +155,6 @@ class WorkflowRunsRepository(BaseRepository):
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         sequential_key: str | None = None,
         run_with: str | None = None,
@@ -186,7 +185,6 @@ class WorkflowRunsRepository(BaseRepository):
                 parent_workflow_run_id=parent_workflow_run_id,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 sequential_key=sequential_key,
                 run_with=run_with,
@@ -226,7 +224,6 @@ class WorkflowRunsRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
         started_at: datetime | None | object = _UNSET,
         queued_at: datetime | None | object = _UNSET,
@@ -272,8 +269,6 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_address = browser_address
                 if extra_http_headers is not None:
                     workflow_run.extra_http_headers = extra_http_headers
-                if cdp_connect_headers is not None:
-                    workflow_run.cdp_connect_headers = cdp_connect_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code

@@ -138,38 +138,6 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         }
       }
 
-      let cdpConnectHeaders: Record<string, string> | null = null;
-      if (saveData.settings.cdpConnectHeaders) {
-        try {
-          const parsedCdpHeaders = JSON.parse(
-            saveData.settings.cdpConnectHeaders,
-          );
-          if (
-            parsedCdpHeaders &&
-            typeof parsedCdpHeaders === "object" &&
-            !Array.isArray(parsedCdpHeaders)
-          ) {
-            // Send the dict as-is, including any mask sentinels for unedited
-            // entries. The backend resolves entries key-by-key so a newly added
-            // key alongside a masked one is preserved (not wiped).
-            const sanitized: Record<string, string> = {};
-            for (const [key, value] of Object.entries(parsedCdpHeaders)) {
-              if (key && typeof key === "string") {
-                sanitized[key] = String(value);
-              }
-            }
-            cdpConnectHeaders = sanitized;
-          }
-        } catch (error) {
-          toast({
-            title: "Error",
-            description: "Invalid JSON format in cdp connect headers",
-            variant: "destructive",
-          });
-          return;
-        }
-      }
-
       const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
       const normalizedKey =
         scriptCacheKey === "" ? "default" : saveData.settings.scriptCacheKey;
@@ -185,7 +153,6 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
-        cdp_connect_headers: cdpConnectHeaders,
         run_with: saveData.settings.runWith,
         cache_key: normalizedKey,
         ai_fallback: saveData.settings.aiFallback ?? true,

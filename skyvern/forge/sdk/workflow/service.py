@@ -131,7 +131,6 @@ from skyvern.schemas.workflows import (
 from skyvern.services import script_service, workflow_script_service
 from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
-from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
@@ -904,13 +903,6 @@ class WorkflowService:
                 and workflow.browser_profile_id is not None
             ):
                 workflow_request.browser_profile_id = workflow.browser_profile_id
-            if workflow_request.cdp_connect_headers is None:
-                if workflow.cdp_connect_headers is not None:
-                    workflow_request.cdp_connect_headers = workflow.cdp_connect_headers
-            else:
-                workflow_request.cdp_connect_headers = merge_masked_headers(
-                    workflow_request.cdp_connect_headers, workflow.cdp_connect_headers
-                )
             if workflow_request.run_with is None:
                 workflow_request.run_with = workflow.run_with
 
@@ -1032,6 +1024,21 @@ class WorkflowService:
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+                if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
+                    new_context.disable_llm_screenshots = True
+                else:
+                    try:
+                        new_context.disable_llm_screenshots = (
+                            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                                "DISABLE_LLM_SCREENSHOTS",
+                                workflow_run.workflow_run_id,
+                                properties={"organization_id": organization.organization_id},
+                            )
+                        )
+                    except Exception:
+                        LOG.warning("Failed to check DISABLE_LLM_SCREENSHOTS flag for workflow", exc_info=True)
+                        new_context.disable_llm_screenshots = False
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
@@ -3491,7 +3498,6 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
@@ -3523,7 +3529,6 @@ class WorkflowService:
                 is_saved_task=is_saved_task,
                 status=status,
                 extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 cache_key=cache_key,
                 ai_fallback=True if ai_fallback is None else ai_fallback,
@@ -3551,7 +3556,6 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
         status: WorkflowStatus = WorkflowStatus.auto_generated,
@@ -3692,7 +3696,6 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
             status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
@@ -3905,7 +3908,6 @@ class WorkflowService:
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
-        cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
@@ -3928,7 +3930,6 @@ class WorkflowService:
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
@@ -3952,7 +3953,6 @@ class WorkflowService:
             model=model,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
             ai_fallback=ai_fallback,
             cache_key=cache_key,
@@ -4302,7 +4302,6 @@ class WorkflowService:
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
-            cdp_connect_headers=workflow_request.cdp_connect_headers,
             browser_address=workflow_request.browser_address,
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
@@ -5201,7 +5200,6 @@ class WorkflowService:
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
-            cdp_connect_headers=workflow_run.cdp_connect_headers,
             queued_at=workflow_run.queued_at,
             started_at=workflow_run.started_at,
             finished_at=workflow_run.finished_at,
@@ -5692,17 +5690,6 @@ class WorkflowService:
             if existing_latest_workflow:
                 existing_version = existing_latest_workflow.version
 
-                # Missing field inherits the stored dict; an explicit dict (possibly
-                # with mask sentinels for unedited keys) is resolved entry-by-entry
-                # against the stored value so newly-added keys aren't dropped.
-                if request.cdp_connect_headers is None:
-                    effective_cdp_connect_headers = existing_latest_workflow.cdp_connect_headers
-                else:
-                    effective_cdp_connect_headers = merge_masked_headers(
-                        request.cdp_connect_headers,
-                        existing_latest_workflow.cdp_connect_headers,
-                    )
-
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5718,7 +5705,6 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
-                    cdp_connect_headers=effective_cdp_connect_headers,
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -5738,10 +5724,6 @@ class WorkflowService:
                     edited_by=edited_by,
                 )
             else:
-                # No existing workflow to inherit from; merge_masked_headers drops
-                # any keys whose value is the mask sentinel so we never persist the
-                # literal "***" placeholder from a misbehaving client.
-                new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5757,7 +5739,6 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
-                    cdp_connect_headers=new_cdp_connect_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
@@ -5835,7 +5816,6 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
@@ -5853,7 +5833,6 @@ class WorkflowService:
             status=status,
             max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(

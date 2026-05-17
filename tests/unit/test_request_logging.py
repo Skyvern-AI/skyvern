@@ -9,12 +9,34 @@ from skyvern.forge.request_logging import (
     _BINARY_PLACEHOLDER,
     _MAX_BODY_LENGTH,
     _REDACTED,
+    _client_ip_from_headers,
     _is_loggable_content_type,
     _is_sensitive_key,
     _sanitize_body,
     _sanitize_response_body,
     redact_sensitive_fields,
 )
+
+# ---------------------------------------------------------------------------
+# _client_ip_from_headers
+# ---------------------------------------------------------------------------
+
+
+class TestClientIpFromHeaders:
+    def test_extracts_first_hop_from_x_forwarded_for(self) -> None:
+        headers = {"x-forwarded-for": "203.0.113.10, 10.0.0.1"}
+        assert _client_ip_from_headers(headers) == "203.0.113.10"
+
+    def test_extracts_single_ip_without_proxy_chain(self) -> None:
+        headers = {"x-forwarded-for": "198.51.100.2"}
+        assert _client_ip_from_headers(headers) == "198.51.100.2"
+
+    def test_missing_header_returns_none(self) -> None:
+        assert _client_ip_from_headers({}) is None
+
+    def test_empty_header_returns_none(self) -> None:
+        assert _client_ip_from_headers({"x-forwarded-for": ""}) is None
+
 
 # ---------------------------------------------------------------------------
 # _is_sensitive_key — documents exactly which field names are redacted

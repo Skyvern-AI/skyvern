@@ -1174,7 +1174,6 @@ class WorkflowCreateYAMLRequest(BaseModel):
     is_saved_task: bool = False
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
-    cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     run_with: str = "agent"
     ai_fallback: bool = True
