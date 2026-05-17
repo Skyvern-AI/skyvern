@@ -77,7 +77,6 @@ def _make_workflow_stub(browser_profile_id: str | None) -> SimpleNamespace:
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
-        cdp_connect_headers=None,
         browser_profile_id=browser_profile_id,
         run_with="agent",
         code_version=None,
