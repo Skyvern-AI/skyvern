@@ -173,7 +173,7 @@ This turns email-based 2FA into something nearly as automated as an authenticato
 
 Instead of pushing codes to Skyvern, you can have Skyvern pull them from your server. Pass `totp_url` when running a [task](/cloud/getting-started/run-from-code) or [workflow](/cloud/building-workflows/build-a-workflow), and Skyvern will call your endpoint when it needs a verification code.
 
-Your endpoint must accept POST requests from Skyvern. For workflow runs, use the `workflow_run_id` in the signed request body to find the matching code, ignore any additional metadata fields, then return:
+Your endpoint must accept a POST request with `task_id`, `workflow_run_id`, and `workflow_permanent_id` in the body, and return:
 
 ```json
 {
