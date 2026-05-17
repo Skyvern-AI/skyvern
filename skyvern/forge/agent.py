@@ -456,7 +456,6 @@ class ForgeAgent:
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
-            cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
             download_timeout=task_block.download_timeout,
@@ -528,7 +527,6 @@ class ForgeAgent:
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
-            cdp_connect_headers=task_request.cdp_connect_headers,
             browser_session_id=task_request.browser_session_id,
             browser_address=task_request.browser_address,
             include_extracted_text=task_request.include_extracted_text,
@@ -1267,6 +1265,25 @@ class ForgeAgent:
             context = skyvern_context.current()
             if context:
                 context.step_id = step.step_id
+                if not task.workflow_run_id and step.order == 0 and step.retry_index == 0:
+                    if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
+                        context.disable_llm_screenshots = True
+                    else:
+                        try:
+                            context.disable_llm_screenshots = (
+                                await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                                    "DISABLE_LLM_SCREENSHOTS",
+                                    task.task_id,
+                                    properties={"organization_id": task.organization_id},
+                                )
+                            )
+                        except Exception:
+                            LOG.warning(
+                                "Failed to check DISABLE_LLM_SCREENSHOTS feature flag",
+                                exc_info=True,
+                                task_id=task.task_id,
+                            )
+                            context.disable_llm_screenshots = False
 
             step = await self.update_step(step=step, status=StepStatus.running)
             injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
@@ -2493,7 +2510,7 @@ class ForgeAgent:
     async def complete_verify(
         self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
     ) -> CompleteVerifyResult:
-        LOG.info(
+        LOG.debug(
             "Checking if user goal is achieved after re-scraping the page",
             workflow_run_id=task.workflow_run_id,
         )
@@ -3266,7 +3283,7 @@ class ForgeAgent:
         cache_variant = prompt_variant or "std"
 
         try:
-            LOG.info(
+            LOG.debug(
                 "Attempting Vertex AI cache creation",
                 task_id=task.task_id,
                 llm_key=resolved_llm_key,
@@ -3363,7 +3380,7 @@ class ForgeAgent:
             context.vertex_cache_key = cache_key
             context.vertex_cache_variant = cache_variant
 
-            LOG.info(
+            LOG.debug(
                 "Created Vertex AI cache for task",
                 task_id=task.task_id,
                 cache_key=cache_key,

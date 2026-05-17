@@ -202,7 +202,6 @@ class ObserverRepository(BaseRepository):
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         run_with: str | None = None,
     ) -> TaskV2:
@@ -226,7 +225,6 @@ class ObserverRepository(BaseRepository):
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 run_with=run_with,
             )

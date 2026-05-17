@@ -36,7 +36,6 @@ class LLMConfigRegistry:
 
         cls.validate_config(llm_key, config)
 
-        LOG.debug("Registering LLM config", llm_key=llm_key)
         cls._configs[llm_key] = config
 
     @classmethod

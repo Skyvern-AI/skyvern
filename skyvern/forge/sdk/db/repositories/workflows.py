@@ -96,7 +96,6 @@ class WorkflowsRepository(BaseRepository):
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
-        cdp_connect_headers: dict[str, str] | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
         persist_browser_session: bool = False,
@@ -130,7 +129,6 @@ class WorkflowsRepository(BaseRepository):
                 totp_identifier=totp_identifier,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
-                cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
                 model=model,
@@ -614,7 +612,6 @@ class WorkflowsRepository(BaseRepository):
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
-        cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
@@ -660,8 +657,6 @@ class WorkflowsRepository(BaseRepository):
                     workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
                 if extra_http_headers is not _UNSET:
                     workflow.extra_http_headers = extra_http_headers
-                if cdp_connect_headers is not _UNSET:
-                    workflow.cdp_connect_headers = cdp_connect_headers
                 if ai_fallback is not None:
                     workflow.ai_fallback = ai_fallback
                 if run_sequentially is not None:
@@ -911,7 +906,6 @@ class WorkflowsRepository(BaseRepository):
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
-        cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
@@ -991,8 +985,6 @@ class WorkflowsRepository(BaseRepository):
                 workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
             if extra_http_headers is not _UNSET:
                 workflow.extra_http_headers = extra_http_headers
-            if cdp_connect_headers is not _UNSET:
-                workflow.cdp_connect_headers = cdp_connect_headers
             if ai_fallback is not None:
                 workflow.ai_fallback = ai_fallback
             if run_sequentially is not None:

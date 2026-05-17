@@ -31,13 +31,6 @@ class BaseRunBlockRequest(BaseModel):
     extra_http_headers: dict[str, str] | None = Field(
         default=None, description="Additional HTTP headers to include in requests"
     )
-    cdp_connect_headers: dict[str, str] | None = Field(
-        default=None,
-        description=(
-            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting "
-            "to a remote browser via browser_address. Never forwarded to target websites."
-        ),
-    )
     max_screenshot_scrolling_times: int | None = Field(
         default=None, description="Maximum number of times to scroll for screenshots"
     )
