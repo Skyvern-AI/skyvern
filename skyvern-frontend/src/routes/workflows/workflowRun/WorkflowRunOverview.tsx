@@ -23,7 +23,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { browserStreamingMode } from "@/util/env";
+import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -42,6 +42,7 @@ function WorkflowRunOverview() {
   const active = searchParams.get("active");
   const queryClient = useQueryClient();
   const [vncFailed, setVncFailed] = useState(false);
+  const { browserStreamingMode } = useBrowserStreamingMode();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunWithWorkflowQuery();
 

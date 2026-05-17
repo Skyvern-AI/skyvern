@@ -25,14 +25,16 @@ import { SaveSessionAsBrowserProfileDialog } from "@/routes/browserProfiles/Save
 import { useBackgroundBrowserProfileCreate } from "@/routes/browserProfiles/hooks/useBackgroundBrowserProfileCreate";
 import { CopyText } from "@/routes/workflows/editor/Workspace";
 import { type BrowserSession as BrowserSessionType } from "@/routes/workflows/types/browserSessionTypes";
-import { browserStreamingMode } from "@/util/env";
+import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import {
+  StreamModeBadge,
+  type StreamMode,
+} from "@/routes/streaming/StreamDiagnostics";
 
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
 import { BrowserSessionWorkflowRuns } from "./BrowserSessionWorkflowRuns";
-
-const isCdpMode = browserStreamingMode === "cdp";
 
 type TabName = "stream" | "recordings" | "downloads" | "runs";
 
@@ -49,6 +51,8 @@ function BrowserSession() {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isSaveProfileDialogOpen, setIsSaveProfileDialogOpen] = useState(false);
   const [vncFailed, setVncFailed] = useState(false);
+  const { browserStreamingMode } = useBrowserStreamingMode();
+  const isCdpMode = browserStreamingMode === "cdp";
 
   useEffect(() => {
     setVncFailed(false);
@@ -71,6 +75,13 @@ function BrowserSession() {
   });
 
   const browserSession = query.data;
+  const streamMode: StreamMode = browserSession?.vnc_streaming_supported
+    ? vncFailed
+      ? "fallback"
+      : "vnc"
+    : isCdpMode
+      ? "cdp"
+      : "unavailable";
 
   const closeBrowserSessionMutation = useCloseBrowserSessionMutation({
     browserSessionId,
@@ -108,6 +119,7 @@ function BrowserSession() {
           <div className="flex w-full flex-row items-center justify-start gap-2">
             <LogoMinimized />
             <div className="text-xl">Browser Session</div>
+            {activeTab === "stream" && <StreamModeBadge mode={streamMode} />}
             {browserSession && (
               <div className="ml-auto flex flex-col items-end justify-end overflow-hidden">
                 <div className="flex items-center justify-end gap-2">

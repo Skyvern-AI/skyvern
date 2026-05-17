@@ -41,7 +41,8 @@ import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit"
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
-import { browserStreamingMode } from "@/util/env";
+import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -280,6 +281,7 @@ function Workspace({
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const { browserStreamingMode } = useBrowserStreamingMode();
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -1868,6 +1870,7 @@ function Workspace({
                       />
                       <div className="flex items-center gap-2">
                         <GlobeIcon /> Live Browser
+                        <StreamModeBadge mode="vnc" />
                       </div>
                       {showBreakoutButton && (
                         <BreakoutButton onClick={() => breakout()} />
@@ -1893,7 +1896,7 @@ function Workspace({
                   </div>
                 )}
 
-                {/* CDP screencast: only in local mode when VNC is not supported */}
+                {/* Local browser stream: only in local mode when VNC is not supported */}
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported &&
                   browserStreamingMode === "cdp" && (
@@ -1919,6 +1922,7 @@ function Workspace({
                         />
                         <div className="flex items-center gap-2">
                           <GlobeIcon /> Live Browser
+                          <StreamModeBadge mode="cdp" />
                         </div>
                         <div
                           className={cn("ml-auto flex items-center gap-2", {

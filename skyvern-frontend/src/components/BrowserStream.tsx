@@ -40,6 +40,10 @@ import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
+import {
+  StreamStatusPanel,
+  type StreamDiagnostic,
+} from "@/routes/streaming/StreamDiagnostics";
 
 import { RotateThrough } from "./RotateThrough";
 import "./browser-stream.css";
@@ -779,6 +783,34 @@ function BrowserStream({
 
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
+  const streamDiagnostic: StreamDiagnostic =
+    entity === "browserSession" && browserSessionId && !hasBrowserSession
+      ? {
+          title: "Browser session is no longer live",
+          detail: "This live browser session is no longer streaming.",
+          hint: "Refresh the page or create a new browser session.",
+        }
+      : !isBrowserSessionBackendReady
+        ? {
+            title: "Waiting for browser session",
+            detail:
+              "The session exists, but the backend has not marked the browser as ready yet.",
+          }
+        : !isVncConnected
+          ? {
+              title: "Connecting to VNC stream",
+              detail: "Opening the browser stream and message WebSockets.",
+              hint: "If this stays here, check VNC support for the session or use local browser streaming.",
+            }
+          : !isCanvasReady
+            ? {
+                title: "Preparing browser display",
+                detail:
+                  "The VNC connection is open and the UI is waiting for the browser canvas.",
+              }
+            : {
+                title: "Connecting to browser stream",
+              };
 
   return (
     <>
@@ -914,25 +946,18 @@ function BrowserStream({
         )}
         {!isReady && (
           <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
-            {entity === "browserSession" &&
-            browserSessionId &&
-            !hasBrowserSession ? (
-              <div>This live browser session is no longer streaming.</div>
-            ) : (
-              <>
-                <RotateThrough interval={7 * 1000}>
-                  <span>Hm, working on the connection...</span>
-                  <span>Hang tight, we're almost there...</span>
-                  <span>Just a moment...</span>
-                  <span>Backpropagating...</span>
-                  <span>Attention is all I need...</span>
-                  <span>Consulting the manual...</span>
-                  <span>Looking for the bat phone...</span>
-                  <span>Where's Shu?...</span>
-                </RotateThrough>
-                <AnimatedWave text=".‧₊˚ ⋅ ? ✨ ?★ ‧₊˚ ⋅" />
-              </>
-            )}
+            <StreamStatusPanel diagnostic={streamDiagnostic}>
+              {isBrowserSessionBackendReady && (
+                <>
+                  <RotateThrough interval={7 * 1000}>
+                    <span>Checking browser stream readiness...</span>
+                    <span>Waiting for the browser display...</span>
+                    <span>Verifying the stream connection...</span>
+                  </RotateThrough>
+                  <AnimatedWave text=". . ." />
+                </>
+              )}
+            </StreamStatusPanel>
           </div>
         )}
       </div>
