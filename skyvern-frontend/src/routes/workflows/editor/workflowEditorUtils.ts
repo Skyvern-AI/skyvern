@@ -1678,7 +1678,6 @@ function getElements(
       model: settings.model,
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
       extraHttpHeaders: settings.extraHttpHeaders,
-      cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
       runWith: settings.runWith,
       codeVersion: settings.codeVersion,
@@ -3026,7 +3025,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     model: null,
     maxScreenshotScrolls: null,
     extraHttpHeaders: null,
-    cdpConnectHeaders: null,
     runWith: "code",
     codeVersion: 2,
     scriptCacheKey: null,
@@ -3056,10 +3054,6 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
         data.extraHttpHeaders && typeof data.extraHttpHeaders === "object"
           ? JSON.stringify(data.extraHttpHeaders)
           : data.extraHttpHeaders,
-      cdpConnectHeaders:
-        data.cdpConnectHeaders && typeof data.cdpConnectHeaders === "object"
-          ? JSON.stringify(data.cdpConnectHeaders)
-          : data.cdpConnectHeaders,
       runWith: data.runWith,
       codeVersion: data.codeVersion,
       scriptCacheKey: data.scriptCacheKey,

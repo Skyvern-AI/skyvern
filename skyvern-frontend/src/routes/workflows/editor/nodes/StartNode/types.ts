@@ -12,7 +12,6 @@ export type WorkflowStartNodeData = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
-  cdpConnectHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string;
   codeVersion: number | null;

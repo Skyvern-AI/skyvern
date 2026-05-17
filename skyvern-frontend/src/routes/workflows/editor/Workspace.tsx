@@ -1247,9 +1247,6 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
-      cdpConnectHeaders: workflowData.cdp_connect_headers
-        ? JSON.stringify(workflowData.cdp_connect_headers)
-        : null,
       runWith: workflowData.run_with ?? "agent",
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
@@ -1310,9 +1307,6 @@ function Workspace({
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
-        : null,
-      cdpConnectHeaders: selectedVersion.cdp_connect_headers
-        ? JSON.stringify(selectedVersion.cdp_connect_headers)
         : null,
       runWith: selectedVersion.run_with ?? "agent",
       codeVersion: selectedVersion.code_version ?? null,
@@ -2117,9 +2111,6 @@ function Workspace({
               webhook_callback_url: saveData.settings.webhookCallbackUrl,
               extra_http_headers: saveData.settings.extraHttpHeaders
                 ? JSON.parse(saveData.settings.extraHttpHeaders)
-                : null,
-              cdp_connect_headers: saveData.settings.cdpConnectHeaders
-                ? JSON.parse(saveData.settings.cdpConnectHeaders)
                 : null,
               persist_browser_session: saveData.settings.persistBrowserSession,
               model: saveData.settings.model,
