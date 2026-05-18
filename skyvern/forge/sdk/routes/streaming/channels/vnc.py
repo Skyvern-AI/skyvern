@@ -210,7 +210,7 @@ class VncChannel:
         return True
 
     async def close(self, code: int = 1000, reason: str | None = None) -> t.Self:
-        LOG.info(f"{self.class_name} closing.", reason=reason, code=code, **self.identity)
+        LOG.debug(f"{self.class_name} closing.", reason=reason, code=code, **self.identity)
 
         self.browser_session = None
         self.task = None
@@ -352,7 +352,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         host = parsed_browser_address.hostname
         vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
 
-    LOG.info(
+    LOG.debug(
         f"{class_name} Connecting to vnc url.",
         vnc_url=vnc_url,
         **vnc_channel.identity,
@@ -368,7 +368,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         async def frontend_to_browser() -> None:
             nonlocal class_name
 
-            LOG.info(f"{class_name} Starting frontend-to-browser data transfer.", **vnc_channel.identity)
+            LOG.debug(f"{class_name} Starting frontend-to-browser data transfer.", **vnc_channel.identity)
             data: Data | None = None
 
             while vnc_channel.is_open:
@@ -403,13 +403,13 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                             continue
 
                 except WebSocketDisconnect:
-                    LOG.info(f"{class_name} Frontend disconnected.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Frontend disconnected.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedError:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Frontend closed the vnc channel.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedOK:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Frontend closed the vnc channel cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
@@ -423,13 +423,13 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 try:
                     await novnc_ws.send(data)
                 except WebSocketDisconnect:
-                    LOG.info(f"{class_name} Browser disconnected from vnc.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Browser disconnected from vnc.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedError:
-                    LOG.info(f"{class_name} Browser closed vnc.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Browser closed vnc.", **vnc_channel.identity)
                     raise
                 except ConnectionClosedOK:
-                    LOG.info(f"{class_name} Browser closed vnc cleanly.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Browser closed vnc cleanly.", **vnc_channel.identity)
                     raise
                 except asyncio.CancelledError:
                     pass
@@ -443,7 +443,7 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         async def browser_to_frontend() -> None:
             nonlocal class_name
 
-            LOG.info(f"{class_name} Starting browser-to-frontend data transfer.", **vnc_channel.identity)
+            LOG.debug(f"{class_name} Starting browser-to-frontend data transfer.", **vnc_channel.identity)
             data: Data | None = None
 
             while vnc_channel.is_open:
@@ -451,13 +451,15 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                     data = await novnc_ws.recv()
 
                 except WebSocketDisconnect:
-                    LOG.info(f"{class_name} Browser disconnected from the vnc channel session.", **vnc_channel.identity)
+                    LOG.debug(
+                        f"{class_name} Browser disconnected from the vnc channel session.", **vnc_channel.identity
+                    )
                     await vnc_channel.close(reason="browser-disconnected")
                 except ConnectionClosedError:
-                    LOG.info(f"{class_name} Browser closed the vnc channel session.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Browser closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed")
                 except ConnectionClosedOK:
-                    LOG.info(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Browser closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="browser-closed-ok")
                 except asyncio.CancelledError:
                     pass
@@ -476,15 +478,15 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                         continue
                     await vnc_channel.websocket.send_bytes(data)
                 except WebSocketDisconnect:
-                    LOG.info(
+                    LOG.debug(
                         f"{class_name} Frontend disconnected from the vnc channel session.", **vnc_channel.identity
                     )
                     await vnc_channel.close(reason="frontend-disconnected")
                 except ConnectionClosedError:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed")
                 except ConnectionClosedOK:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
+                    LOG.debug(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
                     await vnc_channel.close(reason="frontend-closed-ok")
                 except asyncio.CancelledError:
                     pass
@@ -502,11 +504,11 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
         except WebSocketDisconnect:
             pass
         except ConnectionClosedOK:
-            LOG.info(f"{class_name} Connection closed cleanly in loop stream.", **vnc_channel.identity)
+            LOG.debug(f"{class_name} Connection closed cleanly in loop stream.", **vnc_channel.identity)
         except Exception:
             LOG.exception(f"{class_name} An exception occurred in loop stream.", **vnc_channel.identity)
         finally:
-            LOG.info(f"{class_name} Closing the loop stream.", **vnc_channel.identity)
+            LOG.debug(f"{class_name} Closing the loop stream.", **vnc_channel.identity)
             await vnc_channel.close(reason="loop-stream-vnc-closed")
 
 
@@ -544,7 +546,7 @@ async def get_vnc_channel_for_browser_session(
         LOG.exception("Failed to create VncChannel.", error=str(e))
         return None
 
-    LOG.info("Got vnc context for browser session.", vnc_channel=vnc_channel)
+    LOG.debug("Got vnc context for browser session.", vnc_channel=vnc_channel)
 
     loops = [
         asyncio.create_task(loop_verify_browser_session(vnc_channel)),
@@ -567,7 +569,7 @@ async def get_vnc_channel_for_task(
     task, browser_session = await verify_task(task_id=task_id, organization_id=organization_id)
 
     if not task:
-        LOG.info("No initial task found.", task_id=task_id, organization_id=organization_id)
+        LOG.debug("No initial task found.", task_id=task_id, organization_id=organization_id)
         return None
 
     if not browser_session:
@@ -604,7 +606,7 @@ async def get_vnc_channel_for_workflow_run(
     Return a vnc channel for a workflow run, with a list of loops to run concurrently.
     """
 
-    LOG.info("Getting vnc channel for workflow run.", workflow_run_id=workflow_run_id)
+    LOG.debug("Getting vnc channel for workflow run.", workflow_run_id=workflow_run_id)
 
     workflow_run, browser_session = await verify_workflow_run(
         workflow_run_id=workflow_run_id,
@@ -612,7 +614,7 @@ async def get_vnc_channel_for_workflow_run(
     )
 
     if not workflow_run:
-        LOG.info("No initial workflow run found.", workflow_run_id=workflow_run_id, organization_id=organization_id)
+        LOG.debug("No initial workflow run found.", workflow_run_id=workflow_run_id, organization_id=organization_id)
         return None
 
     if not browser_session:
@@ -631,7 +633,7 @@ async def get_vnc_channel_for_workflow_run(
         websocket=websocket,
     )
 
-    LOG.info("Got vnc channel context for workflow run.", vnc_channel=vnc_channel)
+    LOG.debug("Got vnc channel context for workflow run.", vnc_channel=vnc_channel)
 
     loops = [
         asyncio.create_task(loop_verify_workflow_run(vnc_channel)),
