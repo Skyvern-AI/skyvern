@@ -5,6 +5,10 @@ import {
 } from "@radix-ui/react-icons";
 import { Link, useMatch, useSearchParams } from "react-router-dom";
 import { NavigationHamburgerMenu } from "./NavigationHamburgerMenu";
+import {
+  starCountFormatter,
+  useGithubStarCount,
+} from "@/hooks/useGithubStarCount";
 
 function Header() {
   const [searchParams] = useSearchParams();
@@ -14,6 +18,8 @@ function Header() {
     location.pathname.includes("build") ||
     location.pathname.includes("debug") ||
     embed === "true";
+
+  const { data: starCount } = useGithubStarCount({ enabled: !match });
 
   if (match) {
     return null;
@@ -40,6 +46,11 @@ function Header() {
           >
             <GitHubLogoIcon className="h-7 w-7" />
             <StarIcon className="h-5 w-5" />
+            {typeof starCount === "number" ? (
+              <span className="text-sm tabular-nums">
+                {starCountFormatter.format(starCount)}
+              </span>
+            ) : null}
           </Link>
         </div>
       </div>
