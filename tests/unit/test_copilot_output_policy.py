@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
+    normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
@@ -86,6 +87,90 @@ def test_rejects_raw_secret_echo_in_user_response() -> None:
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("response_type", "user_response", "expected_type", "expected_response"),
+    [
+        ("REPLY", "ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "  ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ASK_QUESTION Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ask_question\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "Ask_Question Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "REPLY\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "reply\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "REPLACE_WORKFLOW\nI updated the workflow.", "REPLY", "I updated the workflow."),
+        ("REPLY", "REPLACE_WORKFLOW I updated the workflow.", "REPLY", "I updated the workflow."),
+        (
+            "REPLACE_WORKFLOW",
+            "REPLACE_WORKFLOW\nI updated the workflow.",
+            "REPLACE_WORKFLOW",
+            "I updated the workflow.",
+        ),
+    ],
+)
+def test_normalizes_plain_internal_response_label_scaffolding(
+    response_type: str,
+    user_response: str,
+    expected_type: str,
+    expected_response: str,
+) -> None:
+    normalized = normalize_response_scaffolding(response_type, user_response)
+
+    assert normalized.changed
+    assert normalized.response_type == expected_type
+    assert normalized.user_response == expected_response
+
+
+def test_normalize_scaffolding_preserves_ordinary_reply_sentence() -> None:
+    text = "Reply with the invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> None:
+    text = "Reply with\nthe invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Next step: call get_run_results with this workflow_run_id.",
+        'Call `get_run_results(workflow_run_id="wr_123")` first, then await user input.',
+        "Then call update_and_run_blocks with a smaller chain.",
+        "Do NOT retry this tool call; wait for the current run result.",
+        "Do NOT re-invoke the tool until the user responds.",
+    ],
+)
+def test_rejects_internal_tool_instruction_leak_in_user_response(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
+
+
+def test_allows_benign_do_not_retry_user_guidance() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response="Do not retry until the account lockout clears.",
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK not in verdict.reason_codes
 
 
 @pytest.mark.parametrize(
