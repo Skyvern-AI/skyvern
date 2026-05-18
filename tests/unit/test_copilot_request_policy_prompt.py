@@ -4,6 +4,8 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     _raw_secret_detected,
+    contains_email_password_pair,
+    redact_raw_secrets_for_prompt,
 )
 
 
@@ -52,24 +54,64 @@ class TestRequestPolicyPromptStructure:
         assert "customer-<uuid>-pass" in rendered
         assert "do NOT classify them as raw_secret" in rendered
 
+    def test_raw_secret_definition_includes_bulk_email_password_rows(self) -> None:
+        rendered = _render()
+        assert "bulk `email@example.test:<password>` account rows" in rendered
 
-class TestRawSecretRegexBackstop:
-    def test_keyvault_handle_does_not_trip_regex(self) -> None:
+
+class TestRawSecretBackstop:
+    def test_keyvault_handle_does_not_trip_backstop(self) -> None:
         assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-pass") is False
         assert _raw_secret_detected("customer-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-user") is False
 
-    def test_azure_keyvault_url_does_not_trip_regex(self) -> None:
+    def test_azure_keyvault_url_does_not_trip_backstop(self) -> None:
         assert _raw_secret_detected("https://example-vault.vault.azure.net/secrets/my-secret") is False
 
-    def test_workflow_behavior_question_does_not_trip_regex(self) -> None:
+    def test_workflow_behavior_question_does_not_trip_backstop(self) -> None:
         message = (
             "trigger_login appears to have worked as anticipated but next_step "
             "is not receiving an active browser session to work with."
         )
         assert _raw_secret_detected(message) is False
 
-    def test_actual_raw_password_still_trips_regex(self) -> None:
+    def test_actual_raw_password_still_trips_backstop(self) -> None:
         assert _raw_secret_detected("Use this password: hunter2 to sign in.") is True
 
-    def test_actual_api_key_still_trips_regex(self) -> None:
+    def test_colon_delimited_email_password_pair_trips_backstop(self) -> None:
+        assert _raw_secret_detected("Use qa.user@example.test:FakePass123! to sign in.") is True
+        assert contains_email_password_pair("Use qa.user@example.test:FakePass123! to sign in.") is True
+
+    def test_bulk_colon_delimited_email_password_pairs_trip_backstop(self) -> None:
+        message = """
+        Use these accounts:
+        alpha@example.test:FakePass123!
+        beta@example.test:AnotherFakePass456!
+        gamma@example.test:ThirdFakePass789!
+        """
+        assert _raw_secret_detected(message) is True
+        assert contains_email_password_pair(message) is True
+
+    def test_bulk_colon_delimited_email_password_pairs_are_redacted(self) -> None:
+        redacted = redact_raw_secrets_for_prompt(
+            "Use these accounts:\nalpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"
+        )
+
+        assert "FakePass123" not in redacted
+        assert "AnotherFakePass456" not in redacted
+        assert redacted.count("[REDACTED_SECRET]") == 2
+
+    def test_plain_email_label_does_not_trip_backstop(self) -> None:
+        assert _raw_secret_detected("Email: qa.user@example.test") is False
+
+    def test_scp_style_repository_path_does_not_trip_backstop(self) -> None:
+        assert _raw_secret_detected("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
+        assert (
+            contains_email_password_pair("Clone git@github.com:skyvern-ai/skyvern.git before running tests.") is False
+        )
+
+    def test_url_port_with_query_does_not_trip_backstop(self) -> None:
+        assert _raw_secret_detected("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
+        assert contains_email_password_pair("Use https://qa.user@example.test:8080?org=1 for local testing.") is False
+
+    def test_actual_api_key_still_trips_backstop(self) -> None:
         assert _raw_secret_detected("The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.") is True

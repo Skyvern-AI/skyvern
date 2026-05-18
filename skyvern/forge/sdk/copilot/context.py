@@ -12,7 +12,7 @@ from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
-COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
+COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
