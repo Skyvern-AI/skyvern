@@ -1384,6 +1384,10 @@ class TestRequestPolicyCredentialResolution:
         prior_clarification_context = (
             '{"decisions_made":["request-policy clarification required: credential_name/credential_name_unresolved"]}'
         )
+        saved_credential_question = (
+            "Which saved credential should I use? "
+            "Please provide the exact credential name or a credential ID beginning with cred_."
+        )
         history_refs_from_context = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
             workflow_yaml="",
@@ -1426,6 +1430,75 @@ class TestRequestPolicyCredentialResolution:
         assert follow_up_missing_name_policy.user_response_policy == "ask_clarification"
         assert not follow_up_missing_name_policy.allow_update_workflow
         assert not follow_up_missing_name_policy.allow_run_blocks
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        prior_clarification_follow_up_policy = await build_request_policy(
+            user_message="let me help logging in",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert prior_clarification_follow_up_policy.user_response_policy == "proceed"
+        assert prior_clarification_follow_up_policy.allow_update_workflow
+        assert not prior_clarification_follow_up_policy.allow_run_blocks
+        assert prior_clarification_follow_up_policy.allow_missing_credentials_in_draft
+        assert prior_clarification_follow_up_policy.clarification_question is None
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "credential_name",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        prior_clarification_name_policy = await build_request_policy(
+            user_message="let me help logging in",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert prior_clarification_name_policy.user_response_policy == "proceed"
+        assert prior_clarification_name_policy.allow_update_workflow
+        assert not prior_clarification_name_policy.allow_run_blocks
+        assert prior_clarification_name_policy.allow_missing_credentials_in_draft
+        assert prior_clarification_name_policy.clarification_question is None
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        stale_clarification_policy = await build_request_policy(
+            user_message="log into this other site",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+                ("user", "never mind"),
+                ("ai", "Which page or URL should the workflow go to?"),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert stale_clarification_policy.user_response_policy == "ask_clarification"
+        assert not stale_clarification_policy.allow_update_workflow
+        assert not stale_clarification_policy.allow_run_blocks
 
         handler.response = {
             "testing_intent": "skip_test",

@@ -180,22 +180,6 @@ class ScriptSkyvernPage(SkyvernPage):
         and screenshot artifacts after action execution.
         """
 
-        # Emoji mapping for different action types
-        ACTION_EMOJIS = {
-            ActionType.CLICK: "👆",
-            ActionType.INPUT_TEXT: "⌨️",
-            ActionType.UPLOAD_FILE: "📤",
-            ActionType.DOWNLOAD_FILE: "📥",
-            ActionType.HOVER: "🖱️",
-            ActionType.SELECT_OPTION: "🎯",
-            ActionType.WAIT: "⏳",
-            ActionType.SOLVE_CAPTCHA: "🔓",
-            ActionType.VERIFICATION_CODE: "🔐",
-            ActionType.SCROLL: "📜",
-            ActionType.COMPLETE: "✅",
-            ActionType.TERMINATE: "🛑",
-        }
-
         prompt = kwargs.get("prompt", "")
 
         # Backward compatibility: use intention if provided and prompt is empty
@@ -209,16 +193,10 @@ class ScriptSkyvernPage(SkyvernPage):
 
         action_status = ActionStatus.completed
 
-        # Print action in script mode
         context = skyvern_context.current()
         if context and context.script_mode:
-            emoji = ACTION_EMOJIS.get(action, "🔧")
             action_name = action.value if hasattr(action, "value") else str(action)
-            print(f"{emoji} {action_name.replace('_', ' ').title()}", end="")
-            if prompt:
-                print(f": {prompt}")
-            else:
-                print()
+            LOG.debug("Script action", action=action_name, prompt=prompt)
 
         # Download detection for click actions
         download_triggered: bool | None = None
@@ -256,9 +234,8 @@ class ScriptSkyvernPage(SkyvernPage):
 
             # Note: Action status would be updated to completed here if update method existed
 
-            # Print success in script mode
             if context and context.script_mode:
-                print("  ✓ Completed")
+                LOG.debug("Action completed")
 
             return call.result
         except Exception as e:
@@ -966,7 +943,7 @@ class ScriptSkyvernPage(SkyvernPage):
         context = skyvern_context.current()
         is_script_mode = context and context.script_mode
         if is_script_mode:
-            print(f"🌐 Navigating to: {url}")
+            LOG.debug("Navigating to URL", url=url)
 
         timeout = kwargs.pop("timeout", settings.BROWSER_LOADING_TIMEOUT_MS)
         max_retries = kwargs.pop("max_retries", NAVIGATION_MAX_RETRY_TIME)
@@ -977,7 +954,7 @@ class ScriptSkyvernPage(SkyvernPage):
             try:
                 await self.page.goto(url, timeout=timeout, **kwargs)
                 if is_script_mode:
-                    print("  ✓ Page loaded")
+                    LOG.debug("Page loaded")
                 return
             except Exception as e:
                 last_error = e
@@ -1037,7 +1014,7 @@ class ScriptSkyvernPage(SkyvernPage):
             return
         if context.skip_complete_verification:
             if context.script_mode:
-                print("  ⏭ Skipping complete() verification (--no-verify)")
+                LOG.debug("Skipping complete() verification (--no-verify)")
             return
 
         # In script mode, add a settle delay before verification. Scripts execute

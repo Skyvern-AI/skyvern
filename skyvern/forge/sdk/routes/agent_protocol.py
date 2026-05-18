@@ -2069,6 +2069,14 @@ async def heartbeat() -> Response:
     include_in_schema=False,
 )
 @legacy_base_router.get("/version/", include_in_schema=False)
+@base_router.get(
+    "/version",
+    tags=["server"],
+    summary="Get server version",
+    description="Returns the current Skyvern server version (git SHA for official builds).",
+    responses={200: {"description": "Current server version"}},
+)
+@base_router.get("/version/", include_in_schema=False)
 async def get_version() -> dict[str, str]:
     """
     Get the current server version.

@@ -18,6 +18,7 @@ from skyvern.exceptions import (
     FailedToStopLoadingPage,
     MissingBrowserStatePage,
 )
+from skyvern.forge import app
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
@@ -147,6 +148,10 @@ class RealBrowserState(BrowserState):
             settle=self._wait_for_settle,
             wait_until=wait_until,
         )
+        await self._wait_for_challenge_solver(page=page)
+
+    async def _wait_for_challenge_solver(self, page: Page) -> None:
+        await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
 
     async def get_working_page(self) -> Page | None:
         # HACK: currently, assuming the last page is always the working page.
@@ -375,6 +380,7 @@ class RealBrowserState(BrowserState):
                 loading_time=end_time - start_time,
             )
             await self._wait_for_settle()
+            await self._wait_for_challenge_solver(page=page)
         except Exception as e:
             LOG.exception(f"Error while reload url: {repr(e)}")
             raise FailedToReloadPage(url=page.url, error_message=repr(e))
@@ -394,6 +400,10 @@ class RealBrowserState(BrowserState):
         wait_seconds: float = 0,
         must_included_tags: list[str] | None = None,
     ) -> ScrapedPage:
+        page = await self.get_working_page()
+        if page is not None:
+            await self._wait_for_challenge_solver(page=page)
+
         return await scraper.scrape_website(
             browser_state=self,
             url=url,

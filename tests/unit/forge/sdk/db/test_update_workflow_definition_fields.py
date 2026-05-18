@@ -28,6 +28,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from skyvern.forge.sdk.db.agent_db import AgentDB
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import Base
 from skyvern.schemas.runs import ProxyLocation
 
@@ -87,6 +88,118 @@ async def _get(agent_db: AgentDB, ids: dict[str, str]) -> Any:
     )
     assert workflow is not None
     return workflow
+
+
+async def test_update_workflow_dispatch_state_if_latest_updates_current_version(agent_db: AgentDB) -> None:
+    org = await agent_db.organizations.create_organization(
+        organization_name="Dispatch Update Org",
+        domain="dispatch-update.test",
+    )
+    workflow = await agent_db.workflows.create_workflow(
+        title="dispatch-v1",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id="wpid_dispatch_update",
+        version=1,
+        run_with="agent",
+        cache_key="default",
+        code_version=1,
+    )
+
+    updated = await agent_db.workflows.update_workflow_dispatch_state_if_latest(
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=org.organization_id,
+        expected_version=1,
+        run_with="code",
+        cache_key="custom",
+        code_version=2,
+    )
+
+    assert updated.run_with == "code"
+    assert updated.cache_key == "custom"
+    assert updated.code_version == 2
+
+
+async def test_update_workflow_dispatch_state_with_previous_returns_pre_update_state(agent_db: AgentDB) -> None:
+    org = await agent_db.organizations.create_organization(
+        organization_name="Dispatch Previous Org",
+        domain="dispatch-previous.test",
+    )
+    workflow = await agent_db.workflows.create_workflow(
+        title="dispatch-v1",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id="wpid_dispatch_previous",
+        version=1,
+        run_with="agent",
+        cache_key="default",
+        code_version=1,
+    )
+
+    result = await agent_db.workflows.update_workflow_dispatch_state_if_latest_with_previous(
+        workflow_id=workflow.workflow_id,
+        workflow_permanent_id=workflow.workflow_permanent_id,
+        organization_id=org.organization_id,
+        expected_version=1,
+        run_with="code",
+        cache_key="custom",
+        code_version=2,
+    )
+
+    assert result.previous_dispatch_state.run_with == "agent"
+    assert result.previous_dispatch_state.cache_key == "default"
+    assert result.previous_dispatch_state.code_version == 1
+    assert result.workflow.run_with == "code"
+    assert result.workflow.cache_key == "custom"
+    assert result.workflow.code_version == 2
+
+
+async def test_update_workflow_dispatch_state_if_latest_rejects_stale_version(agent_db: AgentDB) -> None:
+    org = await agent_db.organizations.create_organization(
+        organization_name="Dispatch Stale Org",
+        domain="dispatch-stale.test",
+    )
+    first = await agent_db.workflows.create_workflow(
+        title="dispatch-v1",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id="wpid_dispatch_stale",
+        version=1,
+        run_with="agent",
+        cache_key="default",
+        code_version=1,
+    )
+    await agent_db.workflows.create_workflow(
+        title="dispatch-v2",
+        workflow_definition={"parameters": [], "blocks": []},
+        organization_id=org.organization_id,
+        workflow_permanent_id="wpid_dispatch_stale",
+        version=2,
+        run_with="agent",
+        cache_key="default",
+        code_version=1,
+    )
+
+    with pytest.raises(NotFoundError):
+        await agent_db.workflows.update_workflow_dispatch_state_if_latest(
+            workflow_id=first.workflow_id,
+            workflow_permanent_id=first.workflow_permanent_id,
+            organization_id=org.organization_id,
+            expected_version=1,
+            run_with="code",
+            cache_key="custom",
+            code_version=2,
+        )
+
+    unchanged = await agent_db.workflows.get_workflow(
+        workflow_id=first.workflow_id,
+        organization_id=org.organization_id,
+    )
+    assert unchanged is not None
+    assert unchanged.run_with == "agent"
+    assert unchanged.cache_key == "default"
+    assert unchanged.code_version == 1
 
 
 async def test_omitting_all_workflow_level_fields_preserves_seed(

@@ -160,6 +160,20 @@ def _consume_prompt_breakdown(context: SkyvernContext | None) -> dict[str, Any]:
     }
 
 
+def _llm_screenshots_for_call(
+    screenshots: list[bytes] | None,
+    llm_config: LLMConfig | LLMRouterConfig,
+    context: SkyvernContext | None,
+) -> list[bytes] | None:
+    if not llm_config.supports_vision or (context and context.disable_llm_screenshots):
+        return None
+    return screenshots
+
+
+def _llm_screenshots_enabled_metric(llm_config: LLMConfig | LLMRouterConfig, context: SkyvernContext | None) -> bool:
+    return llm_config.supports_vision and not bool(context and context.disable_llm_screenshots)
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -431,7 +445,7 @@ class LLMAPIHandlerFactory:
                 model_label_lower = model_label.lower()
                 if "gemini" in model_label_lower and "fallback" in model_label_lower:
                     supports_reasoning = True
-                    LOG.info(
+                    LOG.debug(
                         "Forcing reasoning support for Gemini fallback model",
                         prompt_name=prompt_name,
                         budget=new_budget,
@@ -439,7 +453,7 @@ class LLMAPIHandlerFactory:
                     )
 
             if check_model and not supports_reasoning:
-                LOG.info(
+                LOG.debug(
                     "Thinking budget optimization not supported for model",
                     prompt_name=prompt_name,
                     budget=new_budget,
@@ -889,6 +903,9 @@ class LLMAPIHandlerFactory:
                                     **artifact_targets,
                                 )
                             )
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
+
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
 
@@ -1280,6 +1297,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    llm_screenshots_enabled=llm_screenshots_enabled,
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -1491,8 +1509,8 @@ class LLMAPIHandlerFactory:
                                 )
                             )
 
-                if not llm_config.supports_vision:
-                    screenshots = None
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
 
                 model_name = llm_config.model_name
 
@@ -1817,6 +1835,7 @@ class LLMAPIHandlerFactory:
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
+                    llm_screenshots_enabled=llm_screenshots_enabled,
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2124,8 +2143,8 @@ class LLMCaller:
                             )
                         )
 
-            if not self.llm_config.supports_vision:
-                screenshots = None
+            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context)
+            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2288,6 +2307,7 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                llm_screenshots_enabled=llm_screenshots_enabled,
                 **_consume_prompt_breakdown(context),
             )
 

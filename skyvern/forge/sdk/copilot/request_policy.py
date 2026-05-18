@@ -498,6 +498,15 @@ def _previous_credential_clarification_was_asked(global_llm_context: str) -> boo
     )
 
 
+def _last_assistant_message_was_saved_credential_question(
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+) -> bool:
+    for message in reversed(chat_history):
+        if message.sender == WorkflowCopilotChatSender.AI:
+            return _SAVED_CREDENTIAL_NAME_QUESTION in message.content
+    return False
+
+
 def _can_defer_unresolved_credential_name_for_draft(
     policy: RequestPolicy,
     *,
@@ -510,6 +519,19 @@ def _can_defer_unresolved_credential_name_for_draft(
     if _previous_credential_clarification_was_asked(global_llm_context):
         return True
     return False
+
+
+def _should_defer_repeated_unresolved_credential_question(
+    policy: RequestPolicy,
+    *,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+) -> bool:
+    return (
+        policy.credential_input_kind in ("none", "credential_name")
+        and policy.clarification_reason == "credential_name_unresolved"
+        and not _has_resolvable_credential_scope(policy)
+        and _last_assistant_message_was_saved_credential_question(chat_history)
+    )
 
 
 async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> None:
@@ -534,7 +556,7 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
         return
 
     if policy.credential_input_kind == "credential_name" and not policy.credential_refs:
-        if policy.testing_intent == "skip_test" and policy.allow_missing_credentials_in_draft:
+        if policy.allow_missing_credentials_in_draft:
             policy.allow_run_blocks = False
             return
         _block(
@@ -733,6 +755,14 @@ async def build_request_policy(
             else:
                 policy.requires_user_clarification = False
                 policy.allow_missing_credentials_in_draft = True
+
+    if _should_defer_repeated_unresolved_credential_question(
+        policy,
+        chat_history=chat_history,
+    ):
+        policy.requires_user_clarification = False
+        policy.allow_run_blocks = False
+        policy.allow_missing_credentials_in_draft = True
 
     if policy.raw_secret_detected:
         _block(

@@ -450,3 +450,5 @@ def setup_logger() -> None:
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("websockets.server").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
+    logging.getLogger("websockets.legacy").setLevel(logging.WARNING)
+    logging.getLogger("websockets.legacy.server").setLevel(logging.WARNING)

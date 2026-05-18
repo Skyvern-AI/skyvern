@@ -363,6 +363,13 @@ def test_any_quiet_block_requested_human_interaction() -> None:
     assert _any_quiet_block_requested(ctx, ["wait_for_user"]) is True
 
 
+def test_any_quiet_block_requested_file_download() -> None:
+    """File-download blocks can legitimately wait longer than the stagnation
+    window while the browser is waiting for the download to finish."""
+    ctx = SimpleNamespace(last_workflow=_workflow_with_block_types(("file_download", "download_file")))
+    assert _any_quiet_block_requested(ctx, ["download_file"]) is True
+
+
 def test_any_quiet_block_requested_mixed_requested_labels_match_quiet_one() -> None:
     """When multiple blocks are requested, having any one quiet type is
     enough to disable stagnation for the whole invocation."""

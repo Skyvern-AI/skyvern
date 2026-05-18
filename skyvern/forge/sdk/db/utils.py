@@ -1,5 +1,6 @@
 import json
 import typing
+from typing import Any
 
 import pydantic
 import pydantic.json
@@ -96,6 +97,10 @@ from skyvern.webeye.actions.actions import (
 )
 
 LOG = structlog.get_logger()
+
+
+def nullable_column_equals(column: Any, value: Any) -> Any:
+    return column.is_(None) if value is None else column == value
 
 
 def _safe_trigger_type(raw: str | None) -> WorkflowRunTriggerType | None:

@@ -23,6 +23,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useWorkflowRunViewingV2 } from "@/hooks/useWorkflowRunViewingV2";
+import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
@@ -350,6 +352,8 @@ function WorkflowRunTimelineBlockItem({
   finallyBlockLabel,
   workflowRunIsFinalized = false,
 }: Props) {
+  const isViewingV2 = useWorkflowRunViewingV2();
+  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
   const actions = block.actions ?? [];
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
 
@@ -713,15 +717,39 @@ function WorkflowRunTimelineBlockItem({
           )}
 
           {actions.map((action, index) => {
+            const isActive =
+              isAction(activeItem) && activeItem.action_id === action.action_id;
+            const displayIndex = actions.length - index;
+            if (isViewingV2) {
+              return (
+                <div
+                  key={action.action_id}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <ActionCardCompact
+                    action={action}
+                    active={isActive}
+                    index={displayIndex}
+                    expanded={expandedActionId === action.action_id}
+                    onToggleExpanded={() => {
+                      setExpandedActionId((prev) =>
+                        prev === action.action_id ? null : action.action_id,
+                      );
+                    }}
+                    onSelect={() => {
+                      onActionClick({ block, action });
+                    }}
+                    cardClassName={getCardElevation(depth)}
+                  />
+                </div>
+              );
+            }
             return (
               <ActionCard
                 key={action.action_id}
                 action={action}
-                active={
-                  isAction(activeItem) &&
-                  activeItem.action_id === action.action_id
-                }
-                index={actions.length - index}
+                active={isActive}
+                index={displayIndex}
                 onClick={(event) => {
                   event.stopPropagation();
                   const actionItem: ActionItem = {

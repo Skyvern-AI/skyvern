@@ -469,10 +469,19 @@ def test_quickstart_explicit_local_choice_without_local_extra_prints_install_ste
 
 
 def test_quickstart_server_flags_select_server_path_without_server_extra(monkeypatch) -> None:
+    install_calls = []
+    server_calls = []
+
     monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
     monkeypatch.setattr(quickstart_module, "_has_local_quickstart_extra", lambda: True)
     monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: False)
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: False)
+    monkeypatch.setattr(
+        quickstart_module,
+        "_install_server_extra_for_quickstart",
+        lambda: install_calls.append("install") or True,
+    )
+    monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
     result = CliRunner().invoke(
         quickstart_module.quickstart_app,
@@ -483,7 +492,8 @@ def test_quickstart_server_flags_select_server_path_without_server_extra(monkeyp
     assert "Embedded local Python SDK" not in result.output
     assert "Cloud/API SDK usage" not in result.output
     assert 'Install: pip install "skyvern[server]"' in result.output
-    assert "Next: python -m skyvern quickstart" in result.output
+    assert install_calls == []
+    assert server_calls == []
 
 
 def test_quickstart_explicit_install_type_overrides_server_flags(monkeypatch) -> None:
@@ -514,14 +524,45 @@ def test_quickstart_interactive_server_choice_without_server_extra_prints_instal
     monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: False)
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
 
-    result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\n")
+    result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\nn\n")
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "Choose a quickstart path" in result.output
+    assert "Install the missing server dependencies now?" in result.output
     assert 'Install: pip install "skyvern[server]"' in result.output
     assert "Next: python -m skyvern quickstart" in result.output
     assert "local server, database, local API key, and MCP" in result.output
     assert "Wheel installs run the backend only" in result.output
+
+
+def test_quickstart_interactive_server_choice_can_install_server_extra(monkeypatch) -> None:
+    install_calls = []
+    server_calls = []
+    server_extra_checks = iter([False, False, True])
+
+    monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
+    monkeypatch.setattr(quickstart_module, "_has_local_quickstart_extra", lambda: False)
+    monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: next(server_extra_checks))
+    monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
+    monkeypatch.setattr(
+        quickstart_module,
+        "_install_server_extra_for_quickstart",
+        lambda: install_calls.append("install") or True,
+    )
+    monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
+
+    result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\n")
+
+    assert result.exit_code == 0
+    assert install_calls == ["install"]
+    assert server_calls == [
+        {
+            "no_postgres": False,
+            "database_string": "",
+            "skip_browser_install": False,
+            "server_only": False,
+        }
+    ]
 
 
 def test_quickstart_interactive_choice_accepts_alias(monkeypatch) -> None:
@@ -543,11 +584,12 @@ def test_quickstart_interactive_choice_reprompts_invalid_alias(monkeypatch) -> N
     monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: False)
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
 
-    result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="wat\nserver\n")
+    result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="wat\nserver\nn\n")
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in result.output
     assert "Please select a valid option:" not in result.output
+    assert "Install the missing server dependencies now?" in result.output
     assert 'Install: pip install "skyvern[server]"' in result.output
 
 
@@ -571,6 +613,8 @@ def test_quickstart_interactive_eof_falls_back_to_default(monkeypatch) -> None:
 
 def test_quickstart_server_flags_skip_docker_compose_offer_without_server_extra(monkeypatch) -> None:
     calls = []
+    install_calls = []
+    server_calls = []
 
     monkeypatch.setattr(quickstart_module, "check_docker", lambda: True)
     monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: True)
@@ -578,12 +622,20 @@ def test_quickstart_server_flags_skip_docker_compose_offer_without_server_extra(
     monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: False)
     monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: False)
     monkeypatch.setattr(quickstart_module, "run_docker_compose_setup", lambda: calls.append("docker"))
+    monkeypatch.setattr(
+        quickstart_module,
+        "_install_server_extra_for_quickstart",
+        lambda: install_calls.append("install") or True,
+    )
+    monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
     result = CliRunner().invoke(quickstart_module.quickstart_app, ["--server-only"])
 
     assert result.exit_code == 0
     assert "Docker Compose file detected" not in result.output
     assert 'Install: pip install "skyvern[server]"' in result.output
+    assert install_calls == []
+    assert server_calls == []
     assert calls == []
 
 

@@ -10,6 +10,7 @@ _DEFAULT_CLI_LOG_LEVEL = "WARNING"
 
 _QUIET_CLI_LOGGERS = ("skyvern", "httpx", "litellm", "playwright", "httpcore")
 _RUNTIME_LOGGING_CONFIGURED = False
+_SILENCED_CLI_LOGGERS = ("posthog",)
 
 
 def raise_unless_missing_optional_dependency(exc: ImportError, expected_modules: set[str]) -> None:
@@ -32,6 +33,10 @@ def configure_cli_bootstrap_logging() -> None:
     logging.getLogger().setLevel(log_level)
     for logger_name in _QUIET_CLI_LOGGERS:
         logging.getLogger(logger_name).setLevel(log_level)
+    for logger_name in _SILENCED_CLI_LOGGERS:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.CRITICAL + 1)
+        logger.propagate = False
 
 
 def configure_cli_runtime_logging() -> None:

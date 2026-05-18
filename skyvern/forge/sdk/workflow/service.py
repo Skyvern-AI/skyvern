@@ -633,68 +633,113 @@ class WorkflowService:
                 seen.add(basename)
         return await _file_infos_from_download_artifacts(matched)
 
+    @staticmethod
+    def _collect_artifact_ids(value: Any) -> tuple[list[str], list[str]]:
+        """Sync scan of the block-output tree → (screenshot_ids, download_ids). No DB calls."""
+        screenshot_ids: list[str] = []
+        download_ids: list[str] = []
+        if isinstance(value, dict):
+            has_artifact_ids = "task_screenshot_artifact_ids" in value or "workflow_screenshot_artifact_ids" in value
+            if has_artifact_ids:
+                screenshot_ids.extend(value.get("task_screenshot_artifact_ids") or [])
+                screenshot_ids.extend(value.get("workflow_screenshot_artifact_ids") or [])
+                download_ids.extend(value.get("downloaded_file_artifact_ids") or [])
+            else:
+                for v in value.values():
+                    s, d = WorkflowService._collect_artifact_ids(v)
+                    screenshot_ids.extend(s)
+                    download_ids.extend(d)
+        elif isinstance(value, list):
+            for item in value:
+                s, d = WorkflowService._collect_artifact_ids(item)
+                screenshot_ids.extend(s)
+                download_ids.extend(d)
+        return screenshot_ids, download_ids
+
     async def _refresh_output_urls(
         self,
         value: Any,
         organization_id: str | None,
         workflow_run_id: str,
     ) -> Any:
-        """Recursively refresh URL fields inside persisted block-output snapshots.
+        """Two-pass batch URL refresh: scan artifact IDs (sync), fetch all in 2 parallel DB calls, substitute in-place."""
+        if not organization_id:
+            return value
 
-        ``TaskOutput`` dicts stored in ``workflow_run_output_parameters`` carry
-        URLs that were minted at execution time and may now be stale: legacy
-        S3 presigned URLs whose signature has expired, or short signed
-        ``/v1/artifacts/{id}/content`` URLs whose ``expiry`` has passed. This
-        method finds any TaskOutput-like dict and rebuilds:
+        screenshot_ids, download_ids = WorkflowService._collect_artifact_ids(value)
+        all_ids = list(dict.fromkeys(screenshot_ids + download_ids))
 
-        - ``task_screenshots`` / ``workflow_screenshots`` from the stored
-          screenshot artifact IDs (or ``task_id`` lookup for legacy snapshots
-          that pre-date the artifact-ID format).
-        - ``downloaded_files`` / ``downloaded_file_urls`` from
-          ``downloaded_file_artifact_ids``, or — when those IDs are missing
-          (race with ``save_downloaded_files`` at block completion) — by
-          looking up the run's DOWNLOAD artifact rows and matching by
-          basename.
+        url_map: dict[str, str] = {}
+        fileinfo_map: dict[str, FileInfo] = {}
 
-        End result: every URL in the response is a freshly minted short
-        signed ``/v1/artifacts/{id}/content`` URL, regardless of what was
-        captured at execution time.
+        if all_ids:
+            artifacts, expiry_seconds = await asyncio.gather(
+                app.DATABASE.artifacts.get_artifacts_by_ids(all_ids, organization_id),
+                app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id),
+            )
+            download_id_set = set(download_ids)
+            for artifact in artifacts:
+                url = app.ARTIFACT_MANAGER.build_signed_content_url(
+                    artifact_id=artifact.artifact_id,
+                    artifact_name=artifact.bundle_key,
+                    artifact_type=artifact.artifact_type,
+                    expiry_seconds=expiry_seconds,
+                )
+                url_map[artifact.artifact_id] = url
+                if artifact.artifact_id in download_id_set:
+                    filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
+                    fileinfo_map[artifact.artifact_id] = FileInfo(
+                        url=app.ARTIFACT_MANAGER.build_signed_content_url(
+                            artifact_id=artifact.artifact_id,
+                            artifact_name=filename,
+                            artifact_type=artifact.artifact_type,
+                            expiry_seconds=expiry_seconds,
+                        ),
+                        checksum=artifact.checksum,
+                        filename=filename,
+                        file_size=artifact.file_size,
+                        modified_at=artifact.created_at,
+                        artifact_id=artifact.artifact_id,
+                    )
+
+        return await self._substitute_artifact_urls(value, url_map, fileinfo_map, workflow_run_id, organization_id)
+
+    async def _substitute_artifact_urls(
+        self,
+        value: Any,
+        url_map: dict[str, str],
+        fileinfo_map: dict[str, FileInfo],
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> Any:
+        """Substitute artifact IDs with pre-built URLs and FileInfos (no DB in the common path).
+
+        Mirrors the structure of the old _refresh_output_urls recursive walk but reads
+        from the pre-fetched maps instead of issuing per-block DB queries.
         """
         if isinstance(value, dict):
-            # Check if this looks like a TaskOutput with screenshot artifact IDs (new format)
             has_artifact_ids = "task_screenshot_artifact_ids" in value or "workflow_screenshot_artifact_ids" in value
-            # Also check for old format (URLs stored directly) for backwards compat
             has_old_format = "task_id" in value and ("task_screenshots" in value or "workflow_screenshots" in value)
 
             if has_artifact_ids:
-                # New format: generate URLs from artifact IDs
                 if value.get("task_screenshot_artifact_ids"):
-                    value["task_screenshots"] = await self._generate_urls_from_artifact_ids(
-                        value["task_screenshot_artifact_ids"],
-                        organization_id,
-                    )
+                    value["task_screenshots"] = [
+                        url_map[aid] for aid in value["task_screenshot_artifact_ids"] if aid in url_map
+                    ]
                 if value.get("workflow_screenshot_artifact_ids"):
-                    value["workflow_screenshots"] = await self._generate_urls_from_artifact_ids(
-                        value["workflow_screenshot_artifact_ids"],
-                        organization_id,
-                    )
+                    value["workflow_screenshots"] = [
+                        url_map[aid] for aid in value["workflow_screenshot_artifact_ids"] if aid in url_map
+                    ]
                 if value.get("downloaded_file_artifact_ids"):
-                    refreshed = await self._file_infos_from_download_artifact_ids(
-                        value["downloaded_file_artifact_ids"],
-                        organization_id,
-                    )
+                    refreshed = [
+                        fileinfo_map[aid] for aid in value["downloaded_file_artifact_ids"] if aid in fileinfo_map
+                    ]
                     if refreshed:
                         value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
                         value["downloaded_file_urls"] = [fi.url for fi in refreshed]
                 elif value.get("downloaded_files") and organization_id:
-                    # Backwards compatibility / race fallback: the snapshot has
-                    # ``downloaded_files`` but no ``downloaded_file_artifact_ids``.
-                    # This happens when the block ran the artifact-first read in
-                    # ``get_downloaded_files`` BEFORE save_downloaded_files
-                    # finished creating the artifact rows (or before this PR
-                    # was deployed). Re-query the run's current DOWNLOAD rows
-                    # and match by filename so we don't pick up downloads from
-                    # sibling blocks in a multi-block run.
+                    # Fallback for snapshots persisted without downloaded_file_artifact_ids:
+                    # one query for the whole run, filtered by filename.
                     stored_filenames: set[str] = set()
                     for fi in value["downloaded_files"]:
                         if isinstance(fi, dict):
@@ -711,7 +756,7 @@ class WorkflowService:
                             value["downloaded_files"] = [fi.model_dump(mode="json") for fi in refreshed]
                             value["downloaded_file_urls"] = [fi.url for fi in refreshed]
             elif has_old_format:
-                # Old format (backwards compat): regenerate URLs using task_id lookup
+                # Legacy snapshots without artifact IDs — one query per run (not per block), already O(1).
                 task_id = value.get("task_id")
                 if value.get("task_screenshots"):
                     value["task_screenshots"] = await self.get_recent_task_screenshot_urls(
@@ -724,13 +769,15 @@ class WorkflowService:
                         organization_id=organization_id,
                     )
             else:
-                # Recurse into nested dicts
                 for k, v in value.items():
-                    value[k] = await self._refresh_output_urls(v, organization_id, workflow_run_id)
+                    value[k] = await self._substitute_artifact_urls(
+                        v, url_map, fileinfo_map, workflow_run_id, organization_id
+                    )
         elif isinstance(value, list):
-            # Recurse into list items
             for i, item in enumerate(value):
-                value[i] = await self._refresh_output_urls(item, organization_id, workflow_run_id)
+                value[i] = await self._substitute_artifact_urls(
+                    item, url_map, fileinfo_map, workflow_run_id, organization_id
+                )
         return value
 
     async def _validate_credential_ids(self, credential_ids: list[str], organization: Organization) -> None:
@@ -977,6 +1024,21 @@ class WorkflowService:
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+                if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
+                    new_context.disable_llm_screenshots = True
+                else:
+                    try:
+                        new_context.disable_llm_screenshots = (
+                            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                                "DISABLE_LLM_SCREENSHOTS",
+                                workflow_run.workflow_run_id,
+                                properties={"organization_id": organization.organization_id},
+                            )
+                        )
+                    except Exception:
+                        LOG.warning("Failed to check DISABLE_LLM_SCREENSHOTS flag for workflow", exc_info=True)
+                        new_context.disable_llm_screenshots = False
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
@@ -4799,23 +4861,24 @@ class WorkflowService:
     ) -> list[Artifact]:
         """Return latest screenshot artifacts across recent tasks in a workflow run."""
 
-        screenshot_artifacts: list[Artifact] = []
-        seen_artifact_ids: set[str] = set()
-
         if workflow_run_tasks is None:
             workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
 
-        for task in workflow_run_tasks[::-1]:
-            artifact = await app.DATABASE.artifacts.get_latest_artifact(
-                task_id=task.task_id,
+        screenshot_artifacts: list[Artifact] = []
+        seen_artifact_ids: set[str] = set()
+
+        task_ids = [task.task_id for task in workflow_run_tasks]
+        if task_ids:
+            per_task = await app.DATABASE.artifacts.get_latest_artifact_per_task_ids(
+                task_ids=task_ids,
                 artifact_types=[ArtifactType.SCREENSHOT_ACTION, ArtifactType.SCREENSHOT_FINAL],
                 organization_id=organization_id,
             )
-            if artifact:
-                screenshot_artifacts.append(artifact)
-                seen_artifact_ids.add(artifact.artifact_id)
-            if len(screenshot_artifacts) >= limit:
-                break
+            # Re-order newest-task-first to match the original [::-1] loop semantics
+            task_order = {task_id: i for i, task_id in enumerate(reversed(task_ids))}
+            per_task.sort(key=lambda a: task_order.get(a.task_id or "", len(task_ids)))
+            screenshot_artifacts = per_task[:limit]
+            seen_artifact_ids = {a.artifact_id for a in screenshot_artifacts}
 
         if len(screenshot_artifacts) < limit:
             action_artifacts = await app.DATABASE.artifacts.get_artifacts_by_entity_id(
@@ -4921,45 +4984,14 @@ class WorkflowService:
             include_step_count=include_step_count,
         )
 
-    async def build_workflow_run_status_response(
+    async def _fetch_recording_urls(
         self,
-        workflow_permanent_id: str,
-        workflow_run_id: str,
-        organization_id: str | None = None,
-        include_cost: bool = False,
-        include_step_count: bool = False,
-        allow_deleted: bool = False,
-    ) -> WorkflowRunResponseBase:
-        # ``allow_deleted=True`` is used by the cleanup/webhook path after a
-        # long-running run completes: the workflow row may have been
-        # soft-deleted (e.g. eval harness teardown fired while the orphan
-        # workflow was still executing). We still need to build a status
-        # response so the webhook gets delivered with whatever state exists.
-        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-            workflow_permanent_id,
-            organization_id=organization_id,
-            filter_deleted=not allow_deleted,
-        )
-        if workflow is None:
-            LOG.error(f"Workflow {workflow_permanent_id} not found")
-            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
-
-        workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-
-        task_v2 = await app.DATABASE.observer.get_task_v2_by_workflow_run_id(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-        )
-        workflow_run_tasks = await app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
-        screenshot_urls: list[str] | None = await self.get_recent_workflow_screenshot_urls(
-            workflow_run_id=workflow_run_id,
-            organization_id=organization_id,
-            workflow_run_tasks=workflow_run_tasks,
-        )
-        screenshot_urls = screenshot_urls or None
-
+        workflow_run: WorkflowRun,
+        task_v2: Any | None,
+        organization_id: str | None,
+    ) -> list[str]:
+        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback."""
         recording_urls: list[str] = []
-        # Prefer browser-session recordings; fall back to artifact store.
         if workflow_run.browser_session_id:
             if workflow_run.started_at is None:
                 LOG.warning(
@@ -4974,7 +5006,6 @@ class WorkflowService:
                             organization_id=workflow_run.organization_id,
                             browser_session_id=workflow_run.browser_session_id,
                         )
-                        # started_at excludes prior-run uploads on reused sessions.
                         lower_bound = _as_utc(workflow_run.started_at)
                         run_end = _as_utc(workflow_run.finished_at) if workflow_run.finished_at else datetime.now(UTC)
                         upper_bound = run_end + RECORDING_WINDOW_END_BUFFER
@@ -4984,7 +5015,7 @@ class WorkflowService:
 
         if not recording_urls:
             recording_artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
-                run_id=task_v2.observer_cruise_id if task_v2 else workflow_run_id,
+                run_id=task_v2.observer_cruise_id if task_v2 else workflow_run.workflow_run_id,
                 artifact_type=ArtifactType.RECORDING,
                 organization_id=workflow_run.organization_id,
             )
@@ -4992,9 +5023,14 @@ class WorkflowService:
                 urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
                 recording_urls = [u for u in urls if u is not None]
 
-        # Preserve legacy singular contract: last element is the newest (old code returned recordings[0] of newest-first list).
-        recording_url = recording_urls[-1] if recording_urls else None
+        return recording_urls
 
+    async def _fetch_downloaded_files(
+        self,
+        workflow_run: WorkflowRun,
+        task_v2: Any | None,
+    ) -> tuple[list[FileInfo], list[str] | None]:
+        """Fetch downloaded files for a workflow run, including task_v2 files when present."""
         downloaded_files: list[FileInfo] = []
         downloaded_file_urls: list[str] | None = None
         try:
@@ -5024,16 +5060,74 @@ class WorkflowService:
                 exc_info=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+        return downloaded_files, downloaded_file_urls
 
-        workflow_parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
-            workflow_run_id=workflow_run_id
+    async def build_workflow_run_status_response(
+        self,
+        workflow_permanent_id: str,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        include_cost: bool = False,
+        include_step_count: bool = False,
+        allow_deleted: bool = False,
+    ) -> WorkflowRunResponseBase:
+        # ``allow_deleted=True`` is used by the cleanup/webhook path after a
+        # long-running run completes: the workflow row may have been
+        # soft-deleted (e.g. eval harness teardown fired while the orphan
+        # workflow was still executing). We still need to build a status
+        # response so the webhook gets delivered with whatever state exists.
+
+        # Batch 1: all independent DB fetches run concurrently.
+        (
+            workflow,
+            workflow_run,
+            task_v2,
+            workflow_run_tasks,
+            workflow_parameter_tuples,
+            block_errors,
+        ) = await asyncio.gather(
+            app.DATABASE.workflows.get_workflow_by_permanent_id(
+                workflow_permanent_id,
+                organization_id=organization_id,
+                filter_deleted=not allow_deleted,
+            ),
+            self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id),
+            app.DATABASE.observer.get_task_v2_by_workflow_run_id(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ),
+            app.DATABASE.tasks.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id),
+            app.DATABASE.workflow_runs.get_workflow_run_parameters(workflow_run_id=workflow_run_id),
+            app.DATABASE.workflow_runs.get_workflow_run_block_errors(
+                workflow_run_id=workflow_run_id, organization_id=organization_id
+            ),
         )
-        parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
-        output_parameter_tuples: list[
-            tuple[OutputParameter, WorkflowRunOutputParameter]
-        ] = await self.get_output_parameter_workflow_run_output_parameter_tuples(
-            workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+
+        if workflow is None:
+            LOG.error(f"Workflow {workflow_permanent_id} not found")
+            raise WorkflowNotFound(workflow_permanent_id=workflow_permanent_id)
+
+        # Batch 2: fetches that depend on batch 1 results, all run concurrently.
+        (
+            screenshot_urls_raw,
+            output_parameter_tuples,
+            recording_urls,
+            (downloaded_files, downloaded_file_urls),
+        ) = await asyncio.gather(
+            self.get_recent_workflow_screenshot_urls(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run_tasks=workflow_run_tasks,
+            ),
+            self.get_output_parameter_workflow_run_output_parameter_tuples(
+                workflow_id=workflow_run.workflow_id, workflow_run_id=workflow_run_id
+            ),
+            self._fetch_recording_urls(workflow_run, task_v2, organization_id),
+            self._fetch_downloaded_files(workflow_run, task_v2),
         )
+        screenshot_urls: list[str] | None = screenshot_urls_raw or None
+        # Preserve legacy singular contract: last element is the newest.
+        recording_url = recording_urls[-1] if recording_urls else None
 
         outputs = None
         EXTRACTED_INFORMATION_KEY = "extracted_information"
@@ -5058,9 +5152,6 @@ class WorkflowService:
         # matching the task-level error format. Uses a lightweight query that only
         # fetches blocks with non-null error_codes to avoid a full block load on
         # every status poll.
-        block_errors = await app.DATABASE.workflow_runs.get_workflow_run_block_errors(
-            workflow_run_id=workflow_run_id, organization_id=organization_id
-        )
         for error_codes, failure_reason in block_errors:
             for code in error_codes:
                 errors.append(
@@ -5071,23 +5162,32 @@ class WorkflowService:
                     }
                 )
 
+        parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
+
         total_steps = None
         total_cost = None
         if include_step_count or include_cost:
-            step_count, completed_step_count = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-            )
-            total_steps = step_count
-
             if include_cost:
-                workflow_run_blocks = await app.DATABASE.observer.get_workflow_run_blocks(
-                    workflow_run_id=workflow_run_id, organization_id=organization_id
+                # step counts and block list are independent — fetch in parallel.
+                (step_count, completed_step_count), workflow_run_blocks = await asyncio.gather(
+                    app.DATABASE.tasks.get_step_counts_by_task_ids(
+                        task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+                    ),
+                    app.DATABASE.observer.get_workflow_run_blocks(
+                        workflow_run_id=workflow_run_id, organization_id=organization_id
+                    ),
                 )
                 text_prompt_blocks = [
                     block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
                 ]
                 # This is a temporary cost calculation.
                 total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
+            else:
+                step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                    task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+                )
+            total_steps = step_count
+
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,

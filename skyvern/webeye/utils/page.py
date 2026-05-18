@@ -195,7 +195,7 @@ async def _scrolling_screenshots_helper(
             # check if the scroll height changed, if so, rebuild the element tree
             _, scroll_height = await skyvern_page.get_scroll_width_and_height()
             if scroll_height != initial_scroll_height:
-                LOG.warning(
+                LOG.debug(
                     "Scroll height changed, rebuild the element tree",
                     scroll_height=scroll_height,
                     initial_scroll_height=initial_scroll_height,

@@ -67,6 +67,15 @@ def _sanitize_headers(headers: typing.Mapping[str, str]) -> dict[str, str]:
     return sanitized
 
 
+def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
+    # First hop may be client-supplied (spoofable); acceptable for Datadog alert grouping.
+    value = headers.get("x-forwarded-for")
+    if not value:
+        return None
+    first_hop = value.split(",")[0].strip()
+    return first_hop or None
+
+
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
     if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
         return _REDACTED
@@ -169,7 +178,9 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     url_path = request.url.path
     http_method = request.method
-    sanitized_headers = _sanitize_headers(dict(request.headers))
+    request_headers = dict(request.headers)
+    sanitized_headers = _sanitize_headers(request_headers)
+    client_ip = _client_ip_from_headers(request_headers)
     body_text = _sanitize_body(request, body_bytes, request.headers.get("content-type"))
 
     try:
@@ -194,6 +205,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
             method=http_method,
             path=url_path,
             status_code=response.status_code,
+            client_ip=client_ip,
             body=body_text,
             headers=sanitized_headers,
             response_body=response_body,
@@ -207,6 +219,7 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
             "api.raw_request",
             method=http_method,
             path=url_path,
+            client_ip=client_ip,
             body=body_text,
             headers=sanitized_headers,
             exc_info=True,

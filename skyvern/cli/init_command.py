@@ -1,12 +1,16 @@
 import asyncio
+import importlib.metadata
 import os
 import subprocess
+import sys
 import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal, TypeVar, overload
 
 import typer
+from rich.markup import escape
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -202,6 +206,108 @@ def _select_backend_env_scope(*, run_local: bool, env_scope: str | None) -> EnvS
             console.print(f"[red]{exc.message}[/red]")
 
 
+_T = TypeVar("_T")
+_SERVER_EXTRA_INSTALL_ATTEMPTED = False
+_LOCAL_SERVER_DEPENDENCY_HINT = (
+    "Local Skyvern needs the server dependencies, but this Python environment is missing "
+    "[cyan]{module}[/cyan].\n\n"
+    "Run [cyan]{install_command}[/cyan] and then rerun [cyan]skyvern quickstart[/cyan].\n\n"
+    "For the full UI + API + Postgres stack, clone the Skyvern repository and use Docker Compose."
+)
+
+
+def _missing_local_server_dependency(exc: ImportError) -> str | None:
+    missing_module = getattr(exc, "name", None)
+    if not missing_module:
+        return None
+
+    server_only_modules = {
+        "alembic",
+        "fastapi",
+        "fuzzysearch",
+        "playwright",
+        "psycopg",
+        "sqlalchemy",
+        "uvicorn",
+    }
+    root_module = missing_module.split(".", maxsplit=1)[0]
+    if root_module in server_only_modules:
+        return root_module
+    return None
+
+
+def _server_extra_install_target() -> str:
+    cwd = Path.cwd()
+    if (cwd / "pyproject.toml").is_file() and (cwd / "skyvern").is_dir():
+        return ".[server]"
+
+    try:
+        version = importlib.metadata.version("skyvern")
+    except importlib.metadata.PackageNotFoundError:
+        return "skyvern[server]"
+    return f"skyvern[server]=={version}"
+
+
+def _server_extra_install_command(target: str) -> str:
+    return f"{sys.executable} -m pip install {target!r}"
+
+
+def _print_local_server_dependency_hint(module: str, target: str | None = None) -> None:
+    target = target or _server_extra_install_target()
+    console.print(
+        Panel(
+            _LOCAL_SERVER_DEPENDENCY_HINT.format(
+                module=escape(module),
+                install_command=escape(_server_extra_install_command(target)),
+            ),
+            title="Missing Local Server Dependency",
+            border_style="red",
+        )
+    )
+
+
+def _install_server_extra_for_missing_dependency(exc: ImportError) -> None:
+    missing_module = _missing_local_server_dependency(exc)
+    if missing_module is None:
+        raise exc
+
+    global _SERVER_EXTRA_INSTALL_ATTEMPTED
+    target = _server_extra_install_target()
+    if _SERVER_EXTRA_INSTALL_ATTEMPTED:
+        _print_local_server_dependency_hint(missing_module, target)
+        raise typer.Exit(1) from exc
+
+    console.print(
+        Panel(
+            "Local quickstart needs the server dependencies, but this environment is missing "
+            f"[cyan]{escape(missing_module)}[/cyan].\n\n"
+            f"Install [cyan]{escape(target)}[/cyan] into the current Python environment now?",
+            title="Missing Local Server Dependency",
+            border_style="yellow",
+        )
+    )
+    if not Confirm.ask("Install the missing server dependencies now?", default=True):
+        _print_local_server_dependency_hint(missing_module, target)
+        raise typer.Exit(1) from exc
+
+    _SERVER_EXTRA_INSTALL_ATTEMPTED = True
+    console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", target], check=True)
+    except subprocess.CalledProcessError as install_error:
+        console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
+        _print_local_server_dependency_hint(missing_module, target)
+        raise typer.Exit(1) from install_error
+
+
+def _run_with_server_dependency_install(action: Callable[[], _T]) -> _T:
+    while True:
+        try:
+            return action()
+        except ImportError as exc:
+            _install_server_extra_for_missing_dependency(exc)
+
+
 @overload
 def init_env(
     no_postgres: bool = False,
@@ -275,16 +381,25 @@ def init_env(
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
         from skyvern.utils import migrate_db  # noqa: PLC0415
 
-        migrate_db()
+        _run_with_server_dependency_install(migrate_db)
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
-        from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
 
-        from .mcp import setup_local_organization  # noqa: PLC0415
+        def _load_start_forge_app() -> Callable[[], object]:
+            from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
 
-        start_forge_app()
-        api_key = asyncio.run(setup_local_organization())
+            return start_forge_app
+
+        def _load_setup_local_organization() -> Callable[[], Coroutine[Any, Any, str]]:
+            from .mcp import setup_local_organization  # noqa: PLC0415
+
+            return setup_local_organization
+
+        start_forge_app = _run_with_server_dependency_install(_load_start_forge_app)
+        setup_local_organization = _run_with_server_dependency_install(_load_setup_local_organization)
+        _run_with_server_dependency_install(start_forge_app)
+        api_key = _run_with_server_dependency_install(lambda: asyncio.run(setup_local_organization()))
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")
         else:

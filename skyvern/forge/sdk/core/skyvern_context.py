@@ -93,6 +93,7 @@ class SkyvernContext:
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
+    disable_llm_screenshots: bool = False
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it

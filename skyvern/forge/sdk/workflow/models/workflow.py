@@ -229,25 +229,42 @@ class WorkflowRun(BaseModel):
     modified_at: datetime
 
 
-def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
-    """Compute effective adaptive caching mode from run-level override or workflow setting.
+def is_adaptive_caching_from_effective_state(
+    *,
+    workflow_run_with: str,
+    run_run_with: str | None,
+    code_version: int | None,
+    adaptive_caching: bool,
+) -> bool:
+    """Compute adaptive caching from explicit workflow/run dispatch state.
 
     Uses code_version >= 2 as the primary check. Falls back to the legacy
     adaptive_caching bool for rows that haven't been backfilled yet
     (code_version is None).
 
-    WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
-    Workflow.run_with is always "code" or "agent" after normalization.
+    ``run_run_with`` is None when the run inherits from the workflow. This
+    helper is shared by runtime and deploy-time cache-key resolution so the
+    ``:v2`` suffix decision stays in one place.
     """
-    run_with = workflow_run.run_with or workflow.run_with
+    run_with = normalize_run_with(run_run_with) if run_run_with is not None else normalize_run_with(workflow_run_with)
     if run_with == "agent":
         return False
     # run_with == "code": check code_version
     if run_with == "code":
-        if workflow.code_version is not None:
-            return workflow.code_version >= 2
-        return workflow.adaptive_caching
+        if code_version is not None:
+            return code_version >= 2
+        return adaptive_caching
     return False
+
+
+def is_adaptive_caching(workflow: Workflow, workflow_run: WorkflowRun) -> bool:
+    """Compute effective adaptive caching mode from run-level override or workflow setting."""
+    return is_adaptive_caching_from_effective_state(
+        workflow_run_with=workflow.run_with,
+        run_run_with=workflow_run.run_with,
+        code_version=workflow.code_version,
+        adaptive_caching=workflow.adaptive_caching,
+    )
 
 
 class WorkflowRunParameter(BaseModel):
