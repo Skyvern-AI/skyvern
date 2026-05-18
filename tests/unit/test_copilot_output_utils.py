@@ -674,9 +674,35 @@ class TestParseFinalResponse:
         assert parsed["type"] == "ASK_QUESTION"
         assert parsed["user_response"] == "what date?"
 
+    def test_plain_leading_label_falls_through_for_output_policy(self) -> None:
+        text = "ASK_QUESTION\nWhich account should I use?"
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_sentence_starting_with_reply_is_not_stripped(self) -> None:
+        text = "Reply with the invoice number from the page."
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
     def test_strips_leading_replace_workflow_label(self) -> None:
         envelope = (
             'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
+        )
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLACE_WORKFLOW"
+        assert parsed["workflow_yaml"] == "title: x"
+
+    def test_strips_mixed_case_leading_structured_label(self) -> None:
+        envelope = 'ask_question {"type": "ASK_QUESTION", "user_response": "which account?"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "which account?"
+
+    def test_strips_leading_label_before_json_code_fence(self) -> None:
+        envelope = (
+            "REPLACE_WORKFLOW\n```json\n"
+            '{"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}\n'
+            "```"
         )
         parsed = parse_final_response(envelope)
         assert parsed["type"] == "REPLACE_WORKFLOW"

@@ -624,6 +624,22 @@ class TestEnforcement:
         ask.new_items = []
         assert _check_enforcement(ctx, ask) is None
 
+    def test_plain_labeled_ask_question_passes_even_with_coverage_gap(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _check_enforcement
+
+        ctx = self._make_ctx(
+            update_workflow_called=True,
+            test_after_update_done=True,
+            last_test_ok=True,
+            last_update_block_count=1,
+            user_message="Go to france.fr and then download all french regulations",
+            coverage_nudge_count=0,
+        )
+        ask = MagicMock()
+        ask.final_output = "ASK_QUESTION\nWhich source?"
+        ask.new_items = []
+        assert _check_enforcement(ctx, ask) is None
+
     def test_explore_without_workflow_nudge(self) -> None:
         from skyvern.forge.sdk.copilot.enforcement import POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE, _check_enforcement
 
