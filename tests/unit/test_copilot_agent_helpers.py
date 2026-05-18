@@ -605,6 +605,17 @@ class TestBlockGoalMainGoal:
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
 
+    def test_plain_internal_ask_question_label_is_normalized_by_output_policy(self) -> None:
+        ctx = _ctx()
+        result = SimpleNamespace(final_output="ASK_QUESTION\nWhich account should I use?", new_items=[])
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.user_response == "Which account should I use?"
+
     def test_inline_replace_workflow_resets_test_ok_after_prior_pass(self, monkeypatch) -> None:
         # A prior run_blocks test passed for the old workflow (ctx.last_test_ok=True,
         # ctx.last_workflow=old_wf). The agent then emits inline REPLACE_WORKFLOW
@@ -619,7 +630,11 @@ class TestTranslateToAgentResultGating:
 
         ctx = _ctx(last_workflow=old_wf, last_workflow_yaml="old: yaml", last_test_ok=True)
         result = _fake_run_result(
-            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "new: yaml"}
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": "new: yaml",
+            }
         )
         agent_result = agent_module._translate_to_agent_result(
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
