@@ -174,6 +174,30 @@ def _llm_screenshots_enabled_metric(llm_config: LLMConfig | LLMRouterConfig, con
     return llm_config.supports_vision and not bool(context and context.disable_llm_screenshots)
 
 
+def _workflow_run_id_for_llm_metrics_log(
+    context: SkyvernContext | None,
+    *,
+    step: Step | None = None,
+    thought: Thought | None = None,
+    task_v2: TaskV2 | None = None,
+) -> str | None:
+    if context and context.workflow_run_id:
+        return context.workflow_run_id
+    if thought and thought.workflow_run_id:
+        return thought.workflow_run_id
+    if task_v2 and task_v2.workflow_run_id:
+        return task_v2.workflow_run_id
+    return None
+
+
+def _task_id_for_llm_metrics_log(context: SkyvernContext | None, *, step: Step | None = None) -> str | None:
+    if context and context.task_id:
+        return context.task_id
+    if step:
+        return step.task_id
+    return None
+
+
 @runtime_checkable
 class RouterWithModelList(Protocol):
     model_list: list[dict[str, Any]]
@@ -1289,8 +1313,10 @@ class LLMAPIHandlerFactory:
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
-                    workflow_run_id=context.workflow_run_id if context else None,
-                    task_id=context.task_id if context else None,
+                    workflow_run_id=_workflow_run_id_for_llm_metrics_log(
+                        context, step=step, thought=thought, task_v2=task_v2
+                    ),
+                    task_id=_task_id_for_llm_metrics_log(context, step=step),
                     input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                     output_tokens=completion_tokens if completion_tokens > 0 else None,
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
@@ -1827,8 +1853,10 @@ class LLMAPIHandlerFactory:
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
-                    workflow_run_id=context.workflow_run_id if context else None,
-                    task_id=context.task_id if context else None,
+                    workflow_run_id=_workflow_run_id_for_llm_metrics_log(
+                        context, step=step, thought=thought, task_v2=task_v2
+                    ),
+                    task_id=_task_id_for_llm_metrics_log(context, step=step),
                     input_tokens=prompt_tokens if prompt_tokens > 0 else None,
                     output_tokens=completion_tokens if completion_tokens > 0 else None,
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
@@ -2298,8 +2326,10 @@ class LLMCaller:
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,
-                workflow_run_id=context.workflow_run_id if context else None,
-                task_id=context.task_id if context else None,
+                workflow_run_id=_workflow_run_id_for_llm_metrics_log(
+                    context, step=step, thought=thought, task_v2=task_v2
+                ),
+                task_id=_task_id_for_llm_metrics_log(context, step=step),
                 input_tokens=call_stats.input_tokens if call_stats and call_stats.input_tokens is not None else None,
                 output_tokens=call_stats.output_tokens if call_stats and call_stats.output_tokens is not None else None,
                 reasoning_tokens=call_stats.reasoning_tokens

@@ -1297,6 +1297,8 @@ class BaseTaskBlock(Block):
             try:
                 current_context = skyvern_context.ensure_context()
                 current_context.task_id = task.task_id
+                if task.workflow_run_id and not current_context.workflow_run_id:
+                    current_context.workflow_run_id = task.workflow_run_id
                 close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
                 await app.agent.execute_step(
                     organization=organization,

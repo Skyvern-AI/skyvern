@@ -569,6 +569,8 @@ class ForgeAgent:
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
         context.task_id = task.task_id
+        if task.workflow_run_id and not context.workflow_run_id:
+            context.workflow_run_id = task.workflow_run_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
 
