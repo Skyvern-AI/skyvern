@@ -116,8 +116,13 @@ class RealBrowserManager(BrowserManager):
 
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
+            proxy_location = task.proxy_location
+            if browser_session_id and task.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=task.proxy_location,
+                proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
                 workflow_permanent_id=task.workflow_permanent_id,
@@ -211,8 +216,15 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            proxy_location = workflow_run.proxy_location
+            if browser_session_id and workflow_run.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                    browser_session_id, workflow_run.organization_id
+                )
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=workflow_run.proxy_location,
+                proxy_location=proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
