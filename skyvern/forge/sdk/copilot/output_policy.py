@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
 
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.output_utils import looks_like_workflow_delivery_claim
 from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -27,6 +28,27 @@ UNVALIDATED_DISCLOSURE_PHRASES = (
     "hasn't been verified",
     "unvalidated",
 )
+_INTERNAL_TOOL_INSTRUCTION_MARKERS = (
+    "call get_run_results",
+    "call update_and_run_blocks",
+)
+_INTERNAL_TOOL_RETRY_PHRASES = ("do not retry", "do not re-invoke")
+_INTERNAL_TOOL_RETRY_CONTEXT_MARKERS = (
+    "get_run_results",
+    "update_and_run_blocks",
+    "tool call",
+    "this tool",
+    "the tool",
+    "workflow_run_id",
+)
+_INTERNAL_TOOL_INSTRUCTION_TRANSLATION = str.maketrans({char: " " for char in "`'\"()[]{}.,:;"})
+
+
+@dataclass(frozen=True)
+class ResponseScaffoldingNormalization:
+    response_type: str
+    user_response: str | None
+    changed: bool = False
 
 
 class CopilotOutputKind(StrEnum):
@@ -47,6 +69,7 @@ class OutputPolicyReason(StrEnum):
     MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE = "missing_unvalidated_proposal_affordance"
     MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
+    INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
 
 
@@ -78,6 +101,7 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
+        OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
     }
 )
@@ -116,6 +140,42 @@ def derive_output_kind(
     if workflow_attempted:
         return CopilotOutputKind.WORKFLOW_RUN_RESULT
     return CopilotOutputKind.INFORMATIONAL_ANSWER
+
+
+def normalize_response_scaffolding(response_type: str, user_response: str | None) -> ResponseScaffoldingNormalization:
+    label, stripped = _split_leading_response_label(user_response)
+    if label is None:
+        return ResponseScaffoldingNormalization(response_type=response_type, user_response=user_response)
+    if label == "REPLACE_WORKFLOW":
+        normalized_type = "REPLACE_WORKFLOW" if response_type == "REPLACE_WORKFLOW" else "REPLY"
+    else:
+        normalized_type = label
+    return ResponseScaffoldingNormalization(response_type=normalized_type, user_response=stripped, changed=True)
+
+
+def _split_leading_response_label(text: str | None) -> tuple[str | None, str | None]:
+    if not isinstance(text, str):
+        return None, text
+    candidate = text.lstrip()
+    candidate_upper = candidate.upper()
+    for response_type in sorted(COPILOT_RESPONSE_TYPES, key=len, reverse=True):
+        if not candidate_upper.startswith(response_type):
+            continue
+        remainder = candidate[len(response_type) :]
+        if not remainder:
+            continue
+        stripped = remainder.lstrip()
+        if not stripped:
+            return response_type, ""
+        if stripped[0] in {":", ","}:
+            return response_type, stripped[1:].lstrip()
+        protocol_like_label = "_" in response_type or candidate[: len(response_type)].isupper()
+        leading_whitespace = remainder[: len(remainder) - len(stripped)]
+        if "\n" in leading_whitespace and not stripped.startswith(("{", "```")):
+            return response_type, stripped
+        if remainder[0].isspace() and protocol_like_label and not stripped.startswith(("{", "```")):
+            return response_type, stripped
+    return None, text
 
 
 def output_policy_verdict_to_trace_data(
@@ -191,6 +251,8 @@ def evaluate_output_policy(
     values = [user_response, workflow_yaml, tool_arguments]
     if any(_contains_raw_secret(value) for value in values):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if _contains_internal_tool_instruction(user_response):
+        verdict.add(OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
     if (
         response_type == "REPLY"
         and not has_workflow_proposal
@@ -234,6 +296,17 @@ def _contains_raw_secret(value: Any) -> bool:
             if not any(marker in match.group(0) for marker in _PLACEHOLDER_MARKERS):
                 return True
     return False
+
+
+def _contains_internal_tool_instruction(user_response: str | None) -> bool:
+    if not isinstance(user_response, str):
+        return False
+    normalized = " ".join(user_response.lower().translate(_INTERNAL_TOOL_INSTRUCTION_TRANSLATION).split())
+    if any(marker in normalized for marker in _INTERNAL_TOOL_INSTRUCTION_MARKERS):
+        return True
+    return any(phrase in normalized for phrase in _INTERNAL_TOOL_RETRY_PHRASES) and any(
+        marker in normalized for marker in _INTERNAL_TOOL_RETRY_CONTEXT_MARKERS
+    )
 
 
 def _policy_text(value: Any) -> str:

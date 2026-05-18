@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
+    normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
 )
@@ -723,6 +724,9 @@ def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
+    normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
+    resp_type = normalized_scaffolding.response_type
+    user_response = normalized_scaffolding.user_response or "Done."
 
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
@@ -1078,6 +1082,10 @@ def _evaluate_copilot_final_output_policy(
     response_type = action_data.get("type", "REPLY")
     if response_type not in COPILOT_RESPONSE_TYPES:
         response_type = "REPLY"
+    policy_user_response = str(action_data.get("user_response") or text)
+    normalized_scaffolding = normalize_response_scaffolding(response_type, policy_user_response)
+    response_type = normalized_scaffolding.response_type
+    policy_user_response = normalized_scaffolding.user_response or "Done."
 
     workflow_yaml = None
     if response_type == "REPLACE_WORKFLOW" and isinstance(action_data.get("workflow_yaml"), str):
@@ -1088,7 +1096,6 @@ def _evaluate_copilot_final_output_policy(
     workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
     surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
     policy_response_type = "REPLY" if surface_untested_draft else response_type
-    policy_user_response = str(action_data.get("user_response") or text)
     if surface_untested_draft:
         policy_user_response = _rewrite_failed_test_response(policy_user_response, ctx)
     updated_workflow_for_kind = (
@@ -1229,6 +1236,18 @@ def _build_output_policy_blocked_result(
             "I can't show or save that output because it appears to include raw credentials or secrets. "
             "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
             "credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
+        )
+    elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
+        user_response = (
+            "I need you to confirm which saved credential should be used before I can continue. "
+            "Please reply with the credential name from the Credentials UI, or adjust the workflow to avoid "
+            "using credentials."
+        )
+    elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
+        user_response = (
+            "The selected credential is not approved for one of the URLs in this workflow. "
+            "Please use a saved credential tested for that URL, update the block URL to match the credential's "
+            "tested site, or adjust the workflow to avoid using credentials."
         )
     else:
         user_response = "I could not safely return that Copilot output. Please adjust the request and try again."

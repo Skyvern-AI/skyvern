@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.config import (
 )
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
+from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     looks_like_workflow_delivery_claim,
@@ -575,6 +576,16 @@ def _check_enforcement(
     # Only runs when no state-based nudge fired.
     if result is not None:
         parsed = parse_final_response(extract_final_text(result))
+        normalized_scaffolding = normalize_response_scaffolding(
+            str(parsed.get("type") or "REPLY"),
+            str(parsed.get("user_response") or ""),
+        )
+        if normalized_scaffolding.changed:
+            parsed = {
+                **parsed,
+                "type": normalized_scaffolding.response_type,
+                "user_response": normalized_scaffolding.user_response or "Done.",
+            }
         return _response_coverage_nudge(ctx, parsed, config)
 
     return None
