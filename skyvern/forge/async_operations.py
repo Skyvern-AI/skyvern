@@ -145,7 +145,7 @@ class AsyncOperationPool:
         if operation_type in self._aio_tasks[task_id]:
             aio_task = self._aio_tasks[task_id][operation_type]
             if is_aio_task_running(aio_task):
-                LOG.info(
+                LOG.debug(
                     "aio task already running",
                     task_id=task_id,
                     operation_type=operation_type,
