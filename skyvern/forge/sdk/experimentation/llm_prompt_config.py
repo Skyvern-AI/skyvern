@@ -44,7 +44,7 @@ async def get_llm_config_by_prompt_type(distinct_id: str, organization_id: str |
         )
         return None
 
-    LOG.info(
+    LOG.debug(
         "LLM config by prompt type experiment enabled",
         distinct_id=distinct_id,
         organization_id=organization_id,
