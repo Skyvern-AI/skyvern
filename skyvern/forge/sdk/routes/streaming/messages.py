@@ -118,7 +118,7 @@ async def messages(
     message_channel, loops = result
 
     try:
-        LOG.info(
+        LOG.debug(
             "Starting message channel loops.",
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
@@ -133,7 +133,7 @@ async def messages(
             organization_id=organization_id,
         )
     finally:
-        LOG.info(
+        LOG.debug(
             "Closing the message channel.",
             browser_session_id=browser_session_id,
             workflow_run_id=workflow_run_id,
