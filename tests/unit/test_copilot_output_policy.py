@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
+    normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
@@ -89,6 +90,90 @@ def test_rejects_raw_secret_echo_in_user_response() -> None:
 
 
 @pytest.mark.parametrize(
+    ("response_type", "user_response", "expected_type", "expected_response"),
+    [
+        ("REPLY", "ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "  ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ASK_QUESTION Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ask_question\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "Ask_Question Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "REPLY\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "reply\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "REPLACE_WORKFLOW\nI updated the workflow.", "REPLY", "I updated the workflow."),
+        ("REPLY", "REPLACE_WORKFLOW I updated the workflow.", "REPLY", "I updated the workflow."),
+        (
+            "REPLACE_WORKFLOW",
+            "REPLACE_WORKFLOW\nI updated the workflow.",
+            "REPLACE_WORKFLOW",
+            "I updated the workflow.",
+        ),
+    ],
+)
+def test_normalizes_plain_internal_response_label_scaffolding(
+    response_type: str,
+    user_response: str,
+    expected_type: str,
+    expected_response: str,
+) -> None:
+    normalized = normalize_response_scaffolding(response_type, user_response)
+
+    assert normalized.changed
+    assert normalized.response_type == expected_type
+    assert normalized.user_response == expected_response
+
+
+def test_normalize_scaffolding_preserves_ordinary_reply_sentence() -> None:
+    text = "Reply with the invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> None:
+    text = "Reply with\nthe invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Next step: call get_run_results with this workflow_run_id.",
+        'Call `get_run_results(workflow_run_id="wr_123")` first, then await user input.',
+        "Then call update_and_run_blocks with a smaller chain.",
+        "Do NOT retry this tool call; wait for the current run result.",
+        "Do NOT re-invoke the tool until the user responds.",
+    ],
+)
+def test_rejects_internal_tool_instruction_leak_in_user_response(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
+
+
+def test_allows_benign_do_not_retry_user_guidance() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response="Do not retry until the account lockout clears.",
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK not in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
     "user_response",
     [
         "I used hunter2 as the password.",
@@ -122,6 +207,30 @@ def test_rejects_raw_secret_in_structured_tool_arguments() -> None:
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+def test_rejects_bulk_colon_delimited_credentials_in_tool_arguments() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        tool_arguments={
+            "parameters": {"account_list": "alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"}
+        },
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+def test_allows_scp_style_paths_and_url_ports_in_tool_arguments() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        tool_arguments={
+            "repository": "git@github.com:skyvern-ai/skyvern.git",
+            "local_url": "https://qa.user@example.test:8080?org=1",
+        },
+    )
+
+    assert verdict.allowed
 
 
 def test_does_not_hard_block_on_prior_global_context_secret() -> None:
@@ -460,6 +569,79 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     assert response_type == "REPLY"
     assert not verdict.allowed
     assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_terms"),
+    [
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url")),
+    ],
+)
+def test_output_policy_credential_block_asks_for_credential_confirmation(
+    reason: OutputPolicyReason,
+    expected_terms: tuple[str, str],
+) -> None:
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        OutputPolicyVerdict(
+            reason_codes=[reason],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert result.clear_proposed_workflow is True
+    response = result.user_response.lower()
+    for term in expected_terms:
+        assert term in response
+    assert "I could not safely return" not in result.user_response
+
+
+def test_scheduling_credential_policy_block_does_not_use_safety_refusal() -> None:
+    scheduling_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: planning_credentials
+      default_value: cred_unapproved
+  blocks:
+    - block_type: navigation
+      label: export_current_month_time_clock_csv
+      url: https://scheduler.example.test/zeitstempel
+      navigation_goal: Waehle den aktuellen Monat aus und exportiere die Zeitstempel CSV fuer Team A und Team B.
+      parameter_keys:
+        - planning_credentials
+    - block_type: navigation
+      label: compare_on_call_matrix
+      url: https://scheduler.example.test/matrix
+      navigation_goal: Vergleiche Matrix und Rufbereitschaft mit der CSV und melde Zeitueberschneidungen.
+      parameter_keys:
+        - planning_credentials
+"""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Welche URL des Planungs-Tools soll ich verwenden?",
+        workflow_yaml=scheduling_yaml,
+        has_workflow_proposal=True,
+    )
+
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        hard_block_output_policy_verdict(verdict),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert "credential" in result.user_response.lower()
+    assert "confirm" in result.user_response.lower()
+    assert "I could not safely return" not in result.user_response
 
 
 def test_sdk_output_guardrail_ignores_internal_context_credential_ids() -> None:
