@@ -50,7 +50,7 @@ async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) ->
     if timeout_ms <= 0:
         return
     try:
-        await frame.wait_for_load_state("load", timeout=timeout_ms)
+        await frame.wait_for_load_state("networkidle", timeout=timeout_ms)
     except PlaywrightError:
         return
 
