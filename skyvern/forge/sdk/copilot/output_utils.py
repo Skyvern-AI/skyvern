@@ -46,7 +46,6 @@ def extract_final_text(result: RunResultStreaming) -> str:
 
 
 _TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
-_LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
 _USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
 _WORKFLOW_DELIVERY_CLAIM_PATTERNS = [
@@ -65,6 +64,38 @@ def _try_loads_dict(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    for prefix in ("```json", "```"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+            break
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _strip_structured_response_label(text: str) -> str | None:
+    text_upper = text.upper()
+    for response_type in sorted(COPILOT_RESPONSE_TYPES, key=len, reverse=True):
+        if not text_upper.startswith(response_type):
+            continue
+        remainder = text[len(response_type) :]
+        if not remainder:
+            continue
+        stripped = remainder.lstrip()
+        if not stripped:
+            continue
+        if stripped[0] in {":", ","}:
+            stripped = stripped[1:].lstrip()
+        elif not remainder[0].isspace():
+            continue
+        candidate = _strip_markdown_code_fence(stripped)
+        if candidate.startswith("{"):
+            return candidate
+    return None
 
 
 def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
@@ -97,24 +128,18 @@ def parse_final_response(text: str) -> dict[str, Any]:
     control characters in string values. Falls back to regex-extracting
     ``user_response`` from envelope-shaped text so a malformed envelope never
     reaches the chat bubble."""
-    cleaned = text.strip()
-    for prefix in ("```json", "```"):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix) :]
-            break
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
+    cleaned = _strip_markdown_code_fence(text)
 
     parsed = _try_loads_dict(cleaned)
     if parsed is not None:
         return parsed
 
-    label_stripped = _LEADING_LABEL_RE.sub("", cleaned, count=1)
-    if label_stripped != cleaned:
+    label_stripped = _strip_structured_response_label(cleaned)
+    if label_stripped is not None:
         parsed = _try_loads_dict(label_stripped)
         if parsed is not None:
             return parsed
+        cleaned = label_stripped
 
     first = cleaned.find("{")
     last = cleaned.rfind("}")

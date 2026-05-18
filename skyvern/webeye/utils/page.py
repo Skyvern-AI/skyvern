@@ -789,12 +789,9 @@ class SkyvernFrame:
         This is designed for cached action execution to ensure the page is ready
         before attempting to interact with elements.
         """
-        total_start_time = time.time()
         _tracer = otel_trace.get_tracer("skyvern")
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
-        loading_indicator_duration_ms = 0.0
-        step_start_time = time.time()
         loading_indicator_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
             apply_context_attrs(_li_span)
@@ -808,19 +805,9 @@ class SkyvernFrame:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
             finally:
-                loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
                 _li_span.set_attribute("result", loading_indicator_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="loading_indicators",
-                    result=loading_indicator_result,
-                    duration_ms=loading_indicator_duration_ms,
-                    timeout_ms=loading_indicator_timeout_ms,
-                )
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
-        network_idle_duration_ms = 0.0
-        step_start_time = time.time()
         network_idle_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
             apply_context_attrs(_ni_span)
@@ -831,19 +818,9 @@ class SkyvernFrame:
                 network_idle_result = "timeout"
                 LOG.warning("Network idle timeout - page may have constant activity, proceeding")
             finally:
-                network_idle_duration_ms = (time.time() - step_start_time) * 1000
                 _ni_span.set_attribute("result", network_idle_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="network_idle",
-                    result=network_idle_result,
-                    duration_ms=network_idle_duration_ms,
-                    timeout_ms=network_idle_timeout_ms,
-                )
 
         # 3. Wait for DOM to stabilize
-        dom_stability_duration_ms = 0.0
-        step_start_time = time.time()
         dom_stability_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
             apply_context_attrs(_ds_span)
@@ -858,29 +835,7 @@ class SkyvernFrame:
                 dom_stability_result = "error"
                 LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
             finally:
-                dom_stability_duration_ms = (time.time() - step_start_time) * 1000
                 _ds_span.set_attribute("result", dom_stability_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="dom_stability",
-                    result=dom_stability_result,
-                    duration_ms=dom_stability_duration_ms,
-                    timeout_ms=dom_stability_timeout_ms,
-                    stable_ms=dom_stable_ms,
-                )
-
-        # Log total page readiness check duration
-        total_duration_ms = (time.time() - total_start_time) * 1000
-        LOG.info(
-            "page_readiness_check_complete",
-            total_duration_ms=total_duration_ms,
-            loading_indicator_duration_ms=loading_indicator_duration_ms,
-            network_idle_duration_ms=network_idle_duration_ms,
-            dom_stability_duration_ms=dom_stability_duration_ms,
-            loading_indicator_result=loading_indicator_result,
-            network_idle_result=network_idle_result,
-            dom_stability_result=dom_stability_result,
-        )
 
     async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
         """
