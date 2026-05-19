@@ -2250,6 +2250,19 @@ class ForgeAgent:
             )
             return None
 
+        ctx = skyvern_context.current()
+        if ctx and ctx.script_mode:
+            LOG.debug(
+                "Skipping speculative extract-actions in script_mode workflow",
+                step_id=current_step.step_id,
+                task_id=task.task_id,
+            )
+            return None
+
+        # Brief back-off so verification can short-circuit cheap CompleteAction cases
+        # before we start the speculative scrape.
+        await asyncio.sleep(1.0)
+
         try:
             next_step.is_speculative = True
 
@@ -4576,14 +4589,7 @@ class ForgeAgent:
             organization_id=task.organization_id,
         )
 
-        LOG.debug(
-            "Waiting before launching speculative plan",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-        await asyncio.sleep(1.0)
-
-        speculative_task = asyncio.create_task(
+        speculative_task: asyncio.Task[SpeculativePlan | None] = asyncio.create_task(
             self._speculate_next_step_plan(
                 organization=organization,
                 task=task,
