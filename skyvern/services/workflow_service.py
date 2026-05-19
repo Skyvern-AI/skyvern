@@ -133,6 +133,7 @@ async def get_workflow_run_response(
         workflow_run_id=workflow_run.workflow_run_id,
         organization_id=organization_id,
         include_step_count=True,
+        include_cost=True,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
     return WorkflowRunResponse(
@@ -171,4 +172,5 @@ async def get_workflow_run_response(
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,
+        total_cost=workflow_run_resp.total_cost,
     )

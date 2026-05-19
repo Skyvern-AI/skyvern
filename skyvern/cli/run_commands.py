@@ -128,7 +128,9 @@ def run_server() -> None:
         "skyvern.forge.api_app:create_api_app",
         host=_default_host(),
         port=port,
-        log_level="info",
+        # Omit log_level= so uvicorn.Config.configure_logging() doesn't reset setup_logger()'s uvicorn.error WARNING.
+        access_log=False,
+        log_config={"version": 1, "disable_existing_loggers": False},
         factory=True,
         ws="websockets-sansio",
     )
