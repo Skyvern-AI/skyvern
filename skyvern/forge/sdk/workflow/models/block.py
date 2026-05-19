@@ -5097,6 +5097,41 @@ class FileParserBlock(Block):
             error_codes=error_codes or None,
         )
 
+    @staticmethod
+    def _extract_file_url_from_block_output(value: Any) -> str | None:
+        """Extract a file URL from a block output value.
+
+        When users pass an entire block output (e.g. ``{{ block_8_output }}``) as the
+        ``file_url``, the resolved value may be a dict or a string representation of a
+        dict that contains a ``downloaded_files`` list.  This helper unwraps that
+        structure and returns the URL of the first downloaded file.
+
+        Handles three forms:
+        - dict with a ``downloaded_files`` list
+        - JSON string encoding such a dict
+        - Python dict-repr string produced by Jinja's default ``str()`` rendering
+        """
+        if isinstance(value, dict):
+            downloaded_files = value.get("downloaded_files")
+            if isinstance(downloaded_files, list) and downloaded_files:
+                first_file = downloaded_files[0]
+                if isinstance(first_file, dict):
+                    return first_file.get("url") or None
+            return None
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            try:
+                parsed = ast.literal_eval(value)
+                if isinstance(parsed, dict):
+                    return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (ValueError, SyntaxError):
+                pass
+        return None
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5114,12 +5149,21 @@ class FileParserBlock(Block):
         ):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
-                LOG.info(
-                    "FileParserBlock File URL is parameterized, using parameter value",
-                    file_url_parameter_value=file_url_parameter_value,
-                    file_url_parameter_key=self.file_url,
-                )
-                self.file_url = file_url_parameter_value
+                extracted_url = self._extract_file_url_from_block_output(file_url_parameter_value)
+                if extracted_url:
+                    LOG.info(
+                        "FileParserBlock Extracted file URL from block output parameter",
+                        extracted_url=extracted_url,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = extracted_url
+                else:
+                    LOG.info(
+                        "FileParserBlock File URL is parameterized, using parameter value",
+                        file_url_parameter_value=file_url_parameter_value,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = file_url_parameter_value
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -5131,6 +5175,18 @@ class FileParserBlock(Block):
                 organization_id,
                 f"Failed to format jinja template: {str(e)}",
             )
+
+        # After Jinja rendering, self.file_url may be a stringified block output
+        # (e.g. when the user wrote ``{{ block_8_output }}``). Try to extract the
+        # file URL from it before attempting the download.
+        extracted_url = self._extract_file_url_from_block_output(self.file_url)
+        if extracted_url:
+            LOG.info(
+                "FileParserBlock Extracted file URL from rendered block output",
+                extracted_url=extracted_url,
+                rendered_value=self.file_url,
+            )
+            self.file_url = extracted_url
 
         try:
             # Download the file.

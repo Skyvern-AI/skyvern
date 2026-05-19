@@ -658,12 +658,6 @@ async def run_task_v2_helper(
     context.run_id = current_run_id
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
-    enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-        "ENABLE_PARSE_SELECT_IN_EXTRACT",
-        current_run_id,
-        properties={"organization_id": organization_id, "task_url": task_v2.url},
-    )
-    context.enable_parse_select_in_extract = bool(enable_parse_select_in_extract)
 
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
