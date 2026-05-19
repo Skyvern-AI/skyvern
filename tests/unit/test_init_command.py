@@ -46,4 +46,16 @@ def test_run_with_server_dependency_install_installs_and_retries(monkeypatch: py
 
     assert init_command._run_with_server_dependency_install(action) == "ok"
     assert calls == ["action", "action"]
-    assert install_calls == [["/usr/bin/python", "-m", "pip", "install", "skyvern[server]==1.2.3"]]
+    assert install_calls == [
+        [
+            "/usr/bin/python",
+            "-m",
+            "pip",
+            "install",
+            "--retries",
+            "5",
+            "--timeout",
+            "60",
+            "skyvern[server]==1.2.3",
+        ]
+    ]
