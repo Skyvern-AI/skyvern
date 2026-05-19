@@ -373,6 +373,10 @@ class BaseRunResponse(BaseModel):
         default=None,
         description="Total number of steps executed in this run",
     )
+    total_cost: float | None = Field(
+        default=None,
+        description="Estimated cost of this run",
+    )
 
 
 class TaskRunResponse(BaseRunResponse):

@@ -2058,6 +2058,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         ),
         errors=workflow_run_resp.errors if workflow_run_resp else None,
         step_count=workflow_run_resp.step_count if workflow_run_resp else None,
+        total_cost=workflow_run_resp.total_cost if workflow_run_resp else None,
     )
 
 
