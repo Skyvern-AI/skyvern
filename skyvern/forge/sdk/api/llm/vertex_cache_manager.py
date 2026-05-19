@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 
 import google.auth
-import requests
+import httpx
 import structlog
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -79,7 +79,7 @@ class VertexCacheManager:
             LOG.error("Failed to get access token", error=str(e))
             raise
 
-    def create_cache(
+    async def create_cache(
         self,
         model_name: str,
         static_content: str,
@@ -112,7 +112,7 @@ class VertexCacheManager:
                 LOG.info("Cache expired, creating new one", cache_key=cache_key)
                 # Clean up expired cache
                 try:
-                    self.delete_cache(cache_key)
+                    await self.delete_cache(cache_key)
                 except Exception:
                     pass  # Best effort cleanup
 
@@ -143,18 +143,20 @@ class VertexCacheManager:
         )
 
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
 
-            if response.status_code != 200:
-                LOG.error(
-                    "Failed to create cache",
-                    cache_key=cache_key,
-                    status_code=response.status_code,
-                    response=response.text,
-                )
-                raise Exception(f"Cache creation failed: {response.text}")
+                if response.status_code != 200:
+                    LOG.error(
+                        "Failed to create cache",
+                        cache_key=cache_key,
+                        status_code=response.status_code,
+                        response=response.text,
+                    )
+                    raise Exception(f"Cache creation failed: {response.text}")
 
-            cache_data = response.json()
+                cache_data = response.json()
+
             cache_name = cache_data["name"]
 
             # Store in registry
@@ -169,14 +171,14 @@ class VertexCacheManager:
 
             return cache_data
 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             LOG.error("Cache creation timed out", cache_key=cache_key)
             raise
         except Exception as e:
             LOG.error("Cache creation failed", cache_key=cache_key, error=str(e))
             raise
 
-    def delete_cache(self, cache_key: str) -> bool:
+    async def delete_cache(self, cache_key: str) -> bool:
         """Delete a cache object."""
         cache_data = self._cache_registry.get(cache_key)
         if not cache_data:
@@ -193,21 +195,22 @@ class VertexCacheManager:
         LOG.info("Deleting cache", cache_key=cache_key, cache_name=cache_name)
 
         try:
-            response = requests.delete(url, headers=headers, timeout=10)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.delete(url, headers=headers)
 
-            if response.status_code in (200, 204):
-                # Remove from registry
-                del self._cache_registry[cache_key]
-                LOG.info("Cache deleted successfully", cache_key=cache_key)
-                return True
-            else:
-                LOG.warning(
-                    "Failed to delete cache",
-                    cache_key=cache_key,
-                    status_code=response.status_code,
-                    response=response.text,
-                )
-                return False
+                if response.status_code in (200, 204):
+                    # Remove from registry
+                    del self._cache_registry[cache_key]
+                    LOG.info("Cache deleted successfully", cache_key=cache_key)
+                    return True
+                else:
+                    LOG.warning(
+                        "Failed to delete cache",
+                        cache_key=cache_key,
+                        status_code=response.status_code,
+                        response=response.text,
+                    )
+                    return False
         except Exception as e:
             LOG.error("Cache deletion failed", cache_key=cache_key, error=str(e))
             return False
