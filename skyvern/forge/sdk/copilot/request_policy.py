@@ -53,12 +53,20 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
     "missing_conditional_condition",
     "missing_target_context",
 }
+_CREDENTIALS_UI_DIRECTIONS = (
+    f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
+)
 _RAW_SECRET_QUESTION = (
     "Please do not paste raw login credentials or secrets in chat because they can enter model telemetry and execution traces. "
-    "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
+    "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. "
+    f"{_CREDENTIALS_UI_DIRECTIONS} "
+    "DO NOT PROVIDE RAW LOGIN/PASSWORD."
 )
-_SAVED_CREDENTIAL_NAME_QUESTION = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
-_STORED_CREDENTIAL_URL_QUESTION = "Which website or login page should I use to look up the stored credential?"
+_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
+_SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
+_STORED_CREDENTIAL_URL_QUESTION = (
+    f"Which website or login page should I use to look up the stored credential? {_CREDENTIALS_UI_DIRECTIONS}"
+)
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
@@ -75,7 +83,7 @@ _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
 _LOGIN_CREDENTIAL_REQUIRED_KEY_FIELDS = ("username_key", "password_key")
 _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
     "I couldn't find the required credentials for the existing workflow. "
-    "Please add them via the Credentials UI and I can try again."
+    f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
 )
 _RAW_SECRET_PATTERNS = (
     re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
@@ -491,7 +499,29 @@ def _match_by_url(credentials: list[Credential], urls: list[str]) -> list[Creden
     return []
 
 
-def _clarification_question(policy: RequestPolicy) -> str:
+_CLARIFICATION_DECISION_PREFIX = "request-policy clarification required:"
+_PRIOR_CREDENTIAL_CLARIFICATION_REASONS = frozenset(
+    {
+        "credential_name_unresolved",
+        "credential_invention_requested",
+        "workflow_credential_inputs_unbound",
+        "raw_secret",
+    }
+)
+
+
+def _prior_turn_was_credential_clarification(global_llm_context: str) -> bool:
+    # Walk in reverse so a stale credential clarification followed by later non-credential
+    # work does not keep routing the generic fallback into credential-help text.
+    structured = StructuredContext.from_json_str(global_llm_context)
+    for decision in reversed(structured.decisions_made):
+        if not decision.startswith(_CLARIFICATION_DECISION_PREFIX):
+            continue
+        return any(decision.endswith(f"/{reason}") for reason in _PRIOR_CREDENTIAL_CLARIFICATION_REASONS)
+    return False
+
+
+def _clarification_question(policy: RequestPolicy, global_llm_context: str = "") -> str:
     if policy.clarification_reason == "raw_secret":
         return _RAW_SECRET_QUESTION
     if policy.clarification_reason == "credential_name_unresolved":
@@ -501,7 +531,7 @@ def _clarification_question(policy: RequestPolicy) -> str:
     if policy.clarification_reason == "credential_invention_requested":
         return (
             "I cannot invent a credential ID. Please provide a valid saved credential ID, "
-            "select an existing credential, or create one in the Credentials UI."
+            f"select an existing credential, or create one in the Credentials UI. {_CREDENTIALS_UI_DIRECTIONS}"
         )
     if policy.clarification_reason == "ambiguous_loop_edit":
         return "Which block or blocks should go inside the loop, and what should the loop iterate over or stop on?"
@@ -522,6 +552,8 @@ def _clarification_question(policy: RequestPolicy) -> str:
         return _SAVED_CREDENTIAL_NAME_QUESTION
     if policy.credential_input_kind == "website_stored_credential":
         return _STORED_CREDENTIAL_URL_QUESTION
+    if _prior_turn_was_credential_clarification(global_llm_context):
+        return _SAVED_CREDENTIAL_NAME_QUESTION
     return "I need one more detail before I can build and test this workflow safely."
 
 
@@ -548,7 +580,7 @@ def _prioritize_credential_clarification(policy: RequestPolicy) -> None:
 def _previous_credential_clarification_was_asked(global_llm_context: str) -> bool:
     structured = StructuredContext.from_json_str(global_llm_context)
     return any(
-        decision.startswith("request-policy clarification required:") and "/credential_name_unresolved" in decision
+        decision.startswith(_CLARIFICATION_DECISION_PREFIX) and "/credential_name_unresolved" in decision
         for decision in structured.decisions_made
     )
 
@@ -558,7 +590,7 @@ def _last_assistant_message_was_saved_credential_question(
 ) -> bool:
     for message in reversed(chat_history):
         if message.sender == WorkflowCopilotChatSender.AI:
-            return _SAVED_CREDENTIAL_NAME_QUESTION in message.content
+            return _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX in message.content
     return False
 
 
@@ -826,9 +858,9 @@ async def build_request_policy(
             reason="raw_secret",
         )
     elif policy.requires_user_clarification and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
-        _block(policy, _clarification_question(policy))
+        _block(policy, _clarification_question(policy, global_llm_context))
     elif policy.requires_user_clarification and not _has_resolvable_credential_scope(policy):
-        _block(policy, _clarification_question(policy))
+        _block(policy, _clarification_question(policy, global_llm_context))
     else:
         try:
             # A resolvable credential scope can override the classifier's

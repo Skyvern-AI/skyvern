@@ -327,19 +327,30 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
+        run_with: str | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
         terminal state. Returns the updated row, or ``None`` when the row was
         already terminal (or missing). Implemented as a single conditional
         ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
         finalization write cannot be clobbered by a late cancel.
+
+        Mirrors the timestamp side effects of :meth:`update_workflow_run`:
+        ``finished_at`` is stamped on terminal transitions and ``started_at``
+        is stamped on the first ``running`` transition (preserving any
+        existing value via ``COALESCE``).
         """
         non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        now = datetime.now(timezone.utc)
         values: dict[str, Any] = {"status": status}
         if status.is_final():
-            values["finished_at"] = datetime.now(timezone.utc)
+            values["finished_at"] = now
+        if status == WorkflowRunStatus.running:
+            values["started_at"] = func.coalesce(WorkflowRunModel.started_at, now)
         if failure_reason is not None:
             values["failure_reason"] = failure_reason
+        if run_with is not None:
+            values["run_with"] = run_with
 
         async with self.Session() as session:
             result = await session.execute(
