@@ -34,12 +34,14 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_failure_signature,
 )
 from skyvern.forge.sdk.copilot.tools import (
+    WatchdogExitReason,
     _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
     _record_per_tool_budget_problem_blocks_from_results,
     _record_run_blocks_result,
     _record_workflow_update_result,
     _tool_loop_error,
+    _watchdog_user_failure_reason,
 )
 
 
@@ -59,7 +61,7 @@ def _budget_trip_result(workflow_run_id: str = "wr_1") -> dict:
         "ok": False,
         "error": (
             f"The run exceeded the 240s per-tool-call budget while still making progress. "
-            f"... Run ID: {workflow_run_id}. ..."
+            f"Run ID: {workflow_run_id}. Next step: call get_run_results with this workflow_run_id."
         ),
         "data": {
             "workflow_run_id": workflow_run_id,
@@ -80,6 +82,25 @@ def test_record_sets_top_category_on_per_tool_budget_result() -> None:
     ctx = _fresh_context()
     _record_run_blocks_result(ctx, _budget_trip_result())
     assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+
+def test_record_uses_policy_failure_reason_not_llm_tool_instruction() -> None:
+    ctx = _fresh_context()
+
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_safe"))
+
+    assert ctx.last_test_failure_reason == "per-tool-call budget exceeded (Run ID: wr_safe)"
+    assert "get_run_results" not in ctx.last_test_failure_reason
+
+
+def test_watchdog_user_failure_reason_excludes_next_tool_instruction() -> None:
+    exit_reason: WatchdogExitReason = "per_tool_budget"
+    reason = _watchdog_user_failure_reason(exit_reason, "wr_safe", 240, None)
+
+    assert "per-tool-call budget" in reason
+    assert "Run ID: wr_safe" in reason
+    assert "get_run_results" not in reason
+    assert "update_and_run_blocks" not in reason
 
 
 def test_record_clears_top_category_on_run_with_different_category() -> None:

@@ -133,6 +133,146 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     assert manager.pages["wfr_parent"] is parent_state
 
 
+def make_task(
+    task_id: str,
+    organization_id: str = "org_test",
+    proxy_location: object = None,
+    workflow_run_id: str | None = None,
+) -> MagicMock:
+    task = MagicMock()
+    task.task_id = task_id
+    task.organization_id = organization_id
+    task.proxy_location = proxy_location
+    task.workflow_run_id = workflow_run_id
+    task.url = "https://example.com"
+    task.workflow_permanent_id = None
+    task.extra_http_headers = None
+    task.browser_address = None
+    return task
+
+
+def make_session(proxy_location: object = None) -> MagicMock:
+    session = MagicMock()
+    session.proxy_location = proxy_location
+    return session
+
+
+@pytest.mark.asyncio
+async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> None:
+    """When a task has a browser_session_id and no in-memory browser state, the session's proxy_location is used."""
+    manager = RealBrowserManager()
+    task = make_task("tsk_1", proxy_location="RESIDENTIAL")
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session_proxy = "RESIDENTIAL_DE"
+    session = make_session(proxy_location=session_proxy)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_123")
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_task_browser_uses_task_proxy_when_session_has_no_proxy() -> None:
+    """When the session has no proxy_location, the task's proxy_location is used."""
+    manager = RealBrowserManager()
+    task_proxy = "RESIDENTIAL_US"
+    task = make_task("tsk_2", proxy_location=task_proxy)
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_123")
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == task_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_inherits_session_proxy_when_no_browser_state() -> None:
+    """When a workflow run has a browser_session_id and no in-memory state, the session's proxy is used."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_1")
+    workflow_run.proxy_location = "RESIDENTIAL"
+
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session_proxy = "RESIDENTIAL_FR"
+    session = make_session(proxy_location=session_proxy)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+            )
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_uses_workflow_proxy_when_session_has_no_proxy() -> None:
+    """When the session has no proxy_location, the workflow run's proxy_location is used."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_2")
+    wf_proxy = "RESIDENTIAL_IE"
+    workflow_run.proxy_location = wf_proxy
+
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+            )
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == wf_proxy
+
+
 def _make_browser_state_with_video(video_path: str) -> MagicMock:
     video_artifact = MagicMock()
     video_artifact.video_path = video_path

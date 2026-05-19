@@ -1271,17 +1271,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 LOG.warning("ai_extract cache store failed; ignoring", exc_info=True)
 
         if context and context.script_mode:
-            print(f"\n✨ 📊 Extracted Information:\n{'-' * 50}")
-
-            try:
-                # Pretty print JSON if result is a dict/list
-                if isinstance(result, (dict, list)):
-                    print(json.dumps(result, indent=2, ensure_ascii=False))
-                else:
-                    print(result)
-            except Exception:
-                print(result)
-            print(f"{'-' * 50}\n")
+            LOG.debug("Extracted information", result=result)
         return result
 
     async def ai_validate(

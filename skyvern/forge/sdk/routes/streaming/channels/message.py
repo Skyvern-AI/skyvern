@@ -359,7 +359,7 @@ class MessageChannel:
         return base
 
     async def close(self, code: int = 1000, reason: str | None = None) -> "MessageChannel":
-        LOG.info(f"{self.class_name} closing message stream.", reason=reason, code=code, **self.identity)
+        LOG.debug(f"{self.class_name} closing message stream.", reason=reason, code=code, **self.identity)
 
         self.browser_session = None
         self.workflow_run = None
@@ -817,7 +817,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     async def frontend_to_backend() -> None:
         nonlocal class_name
 
-        LOG.info(f"{class_name} starting frontend-to-backend loop.", **message_channel.identity)
+        LOG.debug(f"{class_name} starting frontend-to-backend loop.", **message_channel.identity)
 
         while message_channel.is_open:
             try:
@@ -834,10 +834,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await handle_data(data)
 
             except WebSocketDisconnect:
-                LOG.info(f"{class_name} frontend disconnected.", **message_channel.identity)
+                LOG.debug(f"{class_name} frontend disconnected.", **message_channel.identity)
                 raise
             except ConnectionClosedError:
-                LOG.info(f"{class_name} frontend closed channel.", **message_channel.identity)
+                LOG.debug(f"{class_name} frontend closed channel.", **message_channel.identity)
                 raise
             except Exception:
                 LOG.exception(f"{class_name} An unexpected exception occurred.", **message_channel.identity)
@@ -852,7 +852,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
     except Exception:
         LOG.exception(f"{class_name} An exception occurred in loop message channel stream.", **message_channel.identity)
     finally:
-        LOG.info(f"{class_name} Closing the message channel stream.", **message_channel.identity)
+        LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
         await message_channel.close(reason="loop-channel-closed")
 
 
@@ -899,7 +899,7 @@ async def get_message_channel_for_workflow_run(
     Return a message channel for a workflow run, with a list of loops to run concurrently.
     """
 
-    LOG.info("Getting message channel for workflow run.", workflow_run_id=workflow_run_id)
+    LOG.debug("Getting message channel for workflow run.", workflow_run_id=workflow_run_id)
 
     workflow_run, browser_session = await verify_workflow_run(
         workflow_run_id=workflow_run_id,
@@ -907,7 +907,7 @@ async def get_message_channel_for_workflow_run(
     )
 
     if not workflow_run:
-        LOG.info(
+        LOG.debug(
             "Message channel: no initial workflow run found.",
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -925,7 +925,7 @@ async def get_message_channel_for_workflow_run(
         workflow_run=workflow_run,
     )
 
-    LOG.info("Got message channel for workflow run.", message_channel=message_channel)
+    LOG.debug("Got message channel for workflow run.", message_channel=message_channel)
 
     loops = [
         asyncio.create_task(loop_verify_workflow_run(message_channel)),

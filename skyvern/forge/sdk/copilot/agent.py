@@ -43,6 +43,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
+    normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
 )
@@ -583,6 +584,11 @@ _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
     "so I can build and test it."
 )
+_INTERNAL_BLOCK_TAXONOMY_REPLY = (
+    "Internal workflow names are not the right interface to use when building with Copilot. "
+    "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
+    "a supported workflow update."
+)
 _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 _UNVALIDATED_PROPOSAL_AFFORDANCE = (
@@ -723,6 +729,9 @@ def _translate_to_agent_result(
     resp_type = action_data.get("type", "REPLY")
     if resp_type not in COPILOT_RESPONSE_TYPES:
         resp_type = "REPLY"
+    normalized_scaffolding = normalize_response_scaffolding(resp_type, str(user_response))
+    resp_type = normalized_scaffolding.response_type
+    user_response = normalized_scaffolding.user_response or "Done."
 
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
@@ -896,21 +905,33 @@ def _translate_to_agent_result(
         unvalidated=unvalidated,
         output_kind=output_kind,
     )
+    soft_rewrite_reasons: list[OutputPolicyReason] = []
+    if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
+        user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
+        soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+        output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    # Preserve the unbacked-proposal correction when both soft rewrites apply:
+    # a reply must not imply a workflow exists when no proposal was produced.
     if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
         user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
+        soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
         output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
     if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
+        soft_rewrite_reasons.append(OutputPolicyReason.MISSING_PROPOSAL_STATE)
         output_policy_verdict.remove(OutputPolicyReason.MISSING_PROPOSAL_STATE)
     if OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in output_policy_verdict.reason_codes:
         user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
+        soft_rewrite_reasons.append(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
         output_policy_verdict.remove(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+    trace_data = output_policy_verdict_to_trace_data(
+        output_policy_verdict,
+        surface="final_translation",
+        response_type=resp_type,
+    )
+    trace_data["soft_rewrite_reason_codes"] = [reason.value for reason in soft_rewrite_reasons]
     LOG.info(
         "copilot output policy final verdict",
-        **output_policy_verdict_to_trace_data(
-            output_policy_verdict,
-            surface="final_translation",
-            response_type=resp_type,
-        ),
+        **trace_data,
     )
     if not output_policy_verdict.allowed:
         return _build_output_policy_blocked_result(
@@ -1078,6 +1099,10 @@ def _evaluate_copilot_final_output_policy(
     response_type = action_data.get("type", "REPLY")
     if response_type not in COPILOT_RESPONSE_TYPES:
         response_type = "REPLY"
+    policy_user_response = str(action_data.get("user_response") or text)
+    normalized_scaffolding = normalize_response_scaffolding(response_type, policy_user_response)
+    response_type = normalized_scaffolding.response_type
+    policy_user_response = normalized_scaffolding.user_response or "Done."
 
     workflow_yaml = None
     if response_type == "REPLACE_WORKFLOW" and isinstance(action_data.get("workflow_yaml"), str):
@@ -1088,7 +1113,6 @@ def _evaluate_copilot_final_output_policy(
     workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
     surface_untested_draft = _should_surface_untested_draft_despite_question(ctx, response_type)
     policy_response_type = "REPLY" if surface_untested_draft else response_type
-    policy_user_response = str(action_data.get("user_response") or text)
     if surface_untested_draft:
         policy_user_response = _rewrite_failed_test_response(policy_user_response, ctx)
     updated_workflow_for_kind = (
@@ -1229,6 +1253,18 @@ def _build_output_policy_blocked_result(
             "I can't show or save that output because it appears to include raw credentials or secrets. "
             "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
             "credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
+        )
+    elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
+        user_response = (
+            "I need you to confirm which saved credential should be used before I can continue. "
+            "Please reply with the credential name from the Credentials UI, or adjust the workflow to avoid "
+            "using credentials."
+        )
+    elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
+        user_response = (
+            "The selected credential is not approved for one of the URLs in this workflow. "
+            "Please use a saved credential tested for that URL, update the block URL to match the credential's "
+            "tested site, or adjust the workflow to avoid using credentials."
         )
     else:
         user_response = "I could not safely return that Copilot output. Please adjust the request and try again."

@@ -1810,6 +1810,24 @@ async def _watchdog_error_message(
     return message
 
 
+def _watchdog_user_failure_reason(
+    exit_reason: WatchdogExitReason,
+    workflow_run_id: str,
+    budget_seconds: int,
+    run: WorkflowRun | None,
+) -> str:
+    if exit_reason == "stagnation":
+        body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    elif exit_reason == "per_tool_budget":
+        body = f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+    elif exit_reason == "ceiling":
+        body = f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
+    else:
+        status = f" Last observed status: {run.status}." if run is not None else ""
+        body = "The run ended before recording a trustworthy terminal status." + status
+    return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -2092,26 +2110,32 @@ async def _run_blocks_and_collect_debug(
             error_msg = await _watchdog_error_message(
                 exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
             )
-            result: dict[str, Any] = {"ok": False, "error": error_msg}
+            user_failure_reason = _watchdog_user_failure_reason(
+                exit_reason, workflow_run.workflow_run_id, budget_seconds, run
+            )
+            result: dict[str, Any] = {
+                "ok": False,
+                "error": error_msg,
+                "data": {
+                    "workflow_run_id": workflow_run.workflow_run_id,
+                    "overall_status": run.status if run is not None else None,
+                    "failure_reason": user_failure_reason,
+                },
+            }
             if exit_reason == "per_tool_budget":
                 # Stable failure_categories entry so consecutive budget trips
                 # hash to the same streak signature; without it the run_id in
                 # ``error_msg`` would make every trip unique.
-                result["data"] = {
-                    "workflow_run_id": workflow_run.workflow_run_id,
-                    "overall_status": run.status if run is not None else None,
-                    "failure_reason": error_msg,
-                    "failure_categories": [
-                        {
-                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
-                            "confidence_float": 1.0,
-                            "reasoning": (
-                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
-                                "the run was making progress but cannot fit in a single tool call."
-                            ),
-                        }
-                    ],
-                }
+                result["data"]["failure_categories"] = [
+                    {
+                        "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+                        "confidence_float": 1.0,
+                        "reasoning": (
+                            f"Per-tool-call budget of {budget_seconds}s exceeded; "
+                            "the run was making progress but cannot fit in a single tool call."
+                        ),
+                    }
+                ]
             if run_cancelled_by_watchdog:
                 result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
             return result
@@ -3685,6 +3709,8 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 if isinstance(block, dict) and block.get("failure_reason"):
                     copilot_ctx.last_test_failure_reason = str(block["failure_reason"])
                     break
+    if copilot_ctx.last_test_failure_reason is None:
+        copilot_ctx.last_test_failure_reason = next(iter_failure_reasons(result), None)
     if result.get("error") and copilot_ctx.last_test_failure_reason is None:
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
