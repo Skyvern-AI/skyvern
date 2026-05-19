@@ -1357,6 +1357,16 @@ class WorkflowService:
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
+        # Short-circuit when the conditional transition was refused (cron beat us
+        # to finalization). Falling through would otherwise hit the finally-block
+        # path below, which writes ``running`` again and emits orphan children.
+        if workflow_run.status.is_final():
+            LOG.info(
+                "execute_workflow aborting — workflow_run already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=workflow_run.status,
+            )
+            return workflow_run
 
         # Get all context parameters from the workflow definition
         context_parameters = [
@@ -2355,20 +2365,11 @@ class WorkflowService:
                 organization_id=organization_id,
             ):
                 workflow_run = refreshed_workflow_run
-                if workflow_run.status == WorkflowRunStatus.canceled:
+                if workflow_run.status.is_final():
                     LOG.info(
-                        "Workflow run is canceled, stopping execution inside workflow execution loop",
+                        "Workflow run is in a final state, stopping execution inside workflow execution loop",
                         workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_type=block.block_type,
-                        block_label=block.label,
-                    )
-                    return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
-
-                if workflow_run.status == WorkflowRunStatus.timed_out:
-                    LOG.info(
-                        "Workflow run is timed out, stopping execution inside workflow execution loop",
-                        workflow_run_id=workflow_run_id,
+                        workflow_run_status=workflow_run.status,
                         block_idx=block_idx,
                         block_type=block.block_type,
                         block_label=block.label,
@@ -4485,11 +4486,35 @@ class WorkflowService:
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
-        workflow_run = await self._update_workflow_run_status(
+        # Conditional UPDATE refuses to resurrect a finalized wr — prevents the
+        # cleanup cron from racing with re-entry paths and stomping timed_out
+        # back to running.
+        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
         )
+        if workflow_run is None:
+            existing = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=None
+            )
+            if existing is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+            LOG.info(
+                "Refusing to mark workflow_run as running — already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=existing.status,
+                run_with=run_with,
+            )
+            return existing
+
+        # Best-effort fire-and-forget write-through to task_runs table, matching
+        # the side effect that _update_workflow_run_status would have triggered.
+        bg = asyncio.create_task(
+            self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, WorkflowRunStatus.running),
+        )
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
         start_time = (
             workflow_run.started_at.replace(tzinfo=UTC)
             if workflow_run.started_at
