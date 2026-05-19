@@ -39,7 +39,7 @@ def test_defaults_injected_when_not_specified() -> None:
     result = _inject_code_v2_defaults(definition, "json")
     parsed = json.loads(result)
     assert parsed["code_version"] == 2
-    assert parsed["run_with"] == "code"
+    assert parsed["run_with"] == "agent"
 
 
 def test_defaults_injected_in_auto_mode() -> None:
@@ -48,16 +48,16 @@ def test_defaults_injected_in_auto_mode() -> None:
     result = _inject_code_v2_defaults(definition, "auto")
     parsed = json.loads(result)
     assert parsed["code_version"] == 2
-    assert parsed["run_with"] == "code"
+    assert parsed["run_with"] == "agent"
 
 
 def test_explicit_values_preserved() -> None:
     """When the user explicitly sets these fields, their values are preserved."""
-    definition = _minimal_workflow_json(code_version=1, run_with="agent")
+    definition = _minimal_workflow_json(code_version=1, run_with="code")
     result = _inject_code_v2_defaults(definition, "json")
     parsed = json.loads(result)
     assert parsed["code_version"] == 1
-    assert parsed["run_with"] == "agent"
+    assert parsed["run_with"] == "code"
 
 
 def test_explicit_null_run_with_preserved() -> None:
