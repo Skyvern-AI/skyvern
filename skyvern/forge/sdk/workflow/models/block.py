@@ -5046,8 +5046,7 @@ class FileParserBlock(Block):
 
         # Convert content to string for AI processing
         if isinstance(content, list):
-            # For CSV/Excel data, convert to a readable format
-            content_str = json.dumps(content, indent=2)
+            content_str = json.dumps(content, separators=(",", ":"))
         else:
             content_str = content
 
