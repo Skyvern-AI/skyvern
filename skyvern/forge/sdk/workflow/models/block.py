@@ -7555,6 +7555,21 @@ async def _evaluate_prompt_branch_conditions_batch(
 
         raw_evaluations = _find_evaluations_array(output_value)
 
+        # LLM sometimes splits compound criteria into per-clause sub-evaluations, emitting
+        # reasoning=None placeholder entries for each. Strip them and recover if the remainder
+        # matches len(branches); otherwise fall through to the existing hard-fail.
+        if len(raw_evaluations) > len(branches):
+            well_formed = [e for e in raw_evaluations if not (isinstance(e, dict) and e.get("reasoning") is None)]
+            if len(well_formed) == len(branches):
+                LOG.warning(
+                    "LLM returned extra placeholder evaluations; using well-formed subset",
+                    block_label=log_label,
+                    total_returned=len(raw_evaluations),
+                    well_formed_count=len(well_formed),
+                    num_branches=len(branches),
+                )
+                raw_evaluations = well_formed
+
         for idx, evaluation in enumerate(raw_evaluations):
             bool_result, rendered_expr = _parse_single_evaluation(
                 evaluation=evaluation,
