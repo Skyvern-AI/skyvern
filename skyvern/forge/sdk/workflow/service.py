@@ -38,7 +38,6 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
-    FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
     ScriptTerminationException,
@@ -129,7 +128,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
@@ -5374,11 +5373,11 @@ class WorkflowService:
 
         await self.execute_workflow_webhook(workflow_run, api_key)
 
-    async def execute_workflow_webhook(
+    async def prepare_workflow_webhook(
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
-    ) -> None:
+    ) -> PreparedWorkflowWebhook | None:
         workflow_id = workflow_run.workflow_id
         # Cleanup path: tolerate soft-deleted workflows. If the workflow row
         # has been deleted between run start and cleanup (common when an eval
@@ -5399,14 +5398,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
             )
-            return
+            return None
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            return
+            return None
 
         # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
         workflow_run.webhook_callback_url = workflow_run.webhook_callback_url.strip()
@@ -5427,7 +5426,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
             )
-            return
+            return None
 
         # build new schema for backward compatible webhook payload
         app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
@@ -5468,53 +5467,115 @@ class WorkflowService:
             api_key=signing_api_key,
         )
         LOG.info(
-            "Sending webhook run status to webhook callback url",
+            "Prepared webhook run status for webhook callback url",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
             payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
+        return PreparedWorkflowWebhook(
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            webhook_callback_url=workflow_run.webhook_callback_url,
+            signed_payload=signed_data.signed_payload,
+            headers=signed_data.headers,
+            payload_for_log=signed_data.payload_for_log,
+        )
+
+    async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
+        LOG.info(
+            "Sending webhook run status to webhook callback url",
+            workflow_id=webhook.workflow_id,
+            workflow_run_id=webhook.workflow_run_id,
+            webhook_callback_url=webhook.webhook_callback_url,
+            payload=webhook.payload_for_log,
+            headers=webhook.headers,
+        )
         try:
             resp = await deliver_webhook_with_retries(
-                url=workflow_run.webhook_callback_url,
-                payload=signed_data.signed_payload,
-                headers=signed_data.headers,
+                url=webhook.webhook_callback_url,
+                payload=webhook.signed_payload,
+                headers=webhook.headers,
                 timeout_seconds=30.0,
-                organization_id=workflow_run.organization_id,
-                run_id=workflow_run.workflow_run_id,
+                organization_id=webhook.organization_id,
+                run_id=webhook.workflow_run_id,
             )
-            if resp.status_code >= 200 and resp.status_code < 300:
-                LOG.info(
-                    "Webhook sent successfully",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
-                )
+        except Exception as e:
+            LOG.warning(
+                "Workflow webhook delivery failed after attempting delivery",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {e}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record workflow webhook delivery error",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+            return
+
+        if resp.status_code >= 200 and resp.status_code < 300:
+            LOG.info(
+                "Webhook sent successfully",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason="",
                 )
-            else:
-                LOG.info(
-                    "Webhook failed",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=signed_data.payload_for_log,
-                    resp=resp,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
+            except Exception:
+                LOG.warning(
+                    "Failed to record successful workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
                 )
+        else:
+            LOG.info(
+                "Webhook failed",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                webhook_data=webhook.payload_for_log,
+                resp=resp,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
-        except Exception as e:
-            raise FailedToSendWebhook(
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-            ) from e
+            except Exception:
+                LOG.warning(
+                    "Failed to record failed workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+
+    async def execute_workflow_webhook(
+        self,
+        workflow_run: WorkflowRun,
+        api_key: str | None = None,
+    ) -> None:
+        webhook = await self.prepare_workflow_webhook(workflow_run, api_key)
+        if webhook is None:
+            return
+        await self.deliver_prepared_workflow_webhook(webhook)
 
     async def persist_video_data(
         self,
