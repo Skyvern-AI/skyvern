@@ -189,7 +189,7 @@ def test_enabled_with_logfire(
 
     assert len(configure_calls) == 1
     assert configure_calls[0]["send_to_logfire"] == "if-token-present"
-    assert configure_calls[0]["service_name"] == "skyvern-copilot"
+    assert configure_calls[0]["service_name"] == settings.OTEL_SERVICE_NAME
     assert configure_calls[0]["environment"] == settings.ENV
     assert instrument_calls == [None]
     assert patch_calls == [None]
@@ -274,7 +274,7 @@ class TestTracingSetup:
         assert configure_calls == [
             {
                 "send_to_logfire": "if-token-present",
-                "service_name": "skyvern-copilot",
+                "service_name": settings.OTEL_SERVICE_NAME,
                 "environment": settings.ENV,
             }
         ]
