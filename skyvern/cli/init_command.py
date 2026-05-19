@@ -315,6 +315,15 @@ def _run_with_server_dependency_install(action: Callable[[], _T]) -> _T:
             _install_server_extra_for_missing_dependency(exc)
 
 
+async def _setup_local_organization_from_database() -> str:
+    """Seed the local org/API key without constructing the full server runtime."""
+    from skyvern.config import settings  # noqa: PLC0415
+
+    from .mcp import setup_local_organization_from_database_string  # noqa: PLC0415
+
+    return await setup_local_organization_from_database_string(settings.DATABASE_STRING)
+
+
 @overload
 def init_env(
     no_postgres: bool = False,
@@ -349,15 +358,6 @@ def init_env(
     env_path: Path | str | None = None,
     return_result: Literal[True] = True,
 ) -> InitEnvResult: ...
-
-
-async def _setup_local_organization_from_database() -> str:
-    """Seed the local org/API key without constructing the full server runtime."""
-    from skyvern.config import settings  # noqa: PLC0415
-
-    from .mcp import setup_local_organization_from_database_string  # noqa: PLC0415
-
-    return await setup_local_organization_from_database_string(settings.DATABASE_STRING)
 
 
 def init_env(
@@ -447,6 +447,9 @@ def init_env(
             setup_llm_providers(env_path=backend_env_path)
 
         console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
+        selected_browser_type: str
+        selected_browser_location: str | None
+        selected_remote_debugging_url: str | None
         if browser_type:
             selected_browser_type = browser_type
             selected_browser_location = browser_location
