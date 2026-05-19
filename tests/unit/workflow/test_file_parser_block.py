@@ -251,3 +251,87 @@ class TestParseDocxFileErrorHandling:
         block = _make_file_parser_block("https://example.com/missing.docx", FileType.DOCX)
         with pytest.raises(InvalidFileType):
             await block._parse_docx_file(str(tmp_path / "nonexistent.docx"))
+
+
+class TestExtractFileUrlFromBlockOutput:
+    """Tests for _extract_file_url_from_block_output – unstructured block output parsing."""
+
+    def _extract(self, value: object) -> str | None:
+        return FileParserBlock._extract_file_url_from_block_output(value)
+
+    # --- dict inputs ---
+
+    def test_dict_with_downloaded_files_returns_first_url(self) -> None:
+        value = {"downloaded_files": [{"url": "https://example.com/file.pdf", "checksum": None}]}
+        assert self._extract(value) == "https://example.com/file.pdf"
+
+    def test_dict_multiple_downloaded_files_returns_first(self) -> None:
+        value = {
+            "downloaded_files": [
+                {"url": "https://example.com/first.pdf"},
+                {"url": "https://example.com/second.pdf"},
+            ]
+        }
+        assert self._extract(value) == "https://example.com/first.pdf"
+
+    def test_dict_with_extra_fields_still_extracts_url(self) -> None:
+        value = {
+            "extracted_information": {"key": "value"},
+            "downloaded_files": [{"url": "https://s3.amazonaws.com/bucket/report.xlsx", "filename": "report.xlsx"}],
+        }
+        assert self._extract(value) == "https://s3.amazonaws.com/bucket/report.xlsx"
+
+    def test_dict_empty_downloaded_files_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": []}) is None
+
+    def test_dict_missing_downloaded_files_returns_none(self) -> None:
+        assert self._extract({"extracted_information": {"foo": "bar"}}) is None
+
+    def test_dict_downloaded_files_item_missing_url_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": [{"filename": "file.pdf"}]}) is None
+
+    def test_dict_downloaded_files_item_empty_url_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": [{"url": ""}]}) is None
+
+    # --- JSON string inputs ---
+
+    def test_json_string_with_downloaded_files_returns_url(self) -> None:
+        import json
+
+        value = json.dumps({"downloaded_files": [{"url": "https://example.com/file.csv"}]})
+        assert self._extract(value) == "https://example.com/file.csv"
+
+    def test_json_string_without_downloaded_files_returns_none(self) -> None:
+        import json
+
+        value = json.dumps({"extracted_information": {"k": "v"}})
+        assert self._extract(value) is None
+
+    # --- Python dict repr strings (produced by Jinja {{ block_output }} rendering) ---
+
+    def test_python_repr_string_with_downloaded_files_returns_url(self) -> None:
+        value = "{'downloaded_files': [{'url': 'https://example.com/report.pdf', 'checksum': None}]}"
+        assert self._extract(value) == "https://example.com/report.pdf"
+
+    def test_python_repr_string_without_downloaded_files_returns_none(self) -> None:
+        value = "{'extracted_information': {'a': 1}}"
+        assert self._extract(value) is None
+
+    # --- Plain URL strings (should not be extracted, returns None) ---
+
+    def test_plain_url_string_returns_none(self) -> None:
+        assert self._extract("https://example.com/file.pdf") is None
+
+    def test_plain_string_returns_none(self) -> None:
+        assert self._extract("not a url or dict") is None
+
+    # --- Other types ---
+
+    def test_none_returns_none(self) -> None:
+        assert self._extract(None) is None
+
+    def test_list_returns_none(self) -> None:
+        assert self._extract([{"url": "https://example.com/file.pdf"}]) is None
+
+    def test_integer_returns_none(self) -> None:
+        assert self._extract(42) is None

@@ -34,7 +34,6 @@ def test_extract_action_ceiling_drops_action_history_on_overshoot() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        parse_select_feature_enabled=False,
         has_magic_link_page=False,
     )
 
@@ -62,7 +61,6 @@ def test_extract_action_small_prompt_passes_through() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        parse_select_feature_enabled=False,
         has_magic_link_page=False,
     )
 
