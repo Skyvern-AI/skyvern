@@ -110,14 +110,22 @@ class TestIsDownloadResponse:
 
     # XHR/Fetch without attachment header should NOT be download (MIME-only false positive)
     def test_xhr_mime_only_not_download(self) -> None:
-        """XHR with download MIME type but no attachment header should NOT be treated as download."""
+        """XHR with download MIME type but no Content-Disposition at all should NOT be treated as download."""
         headers = {"content-type": "application/pdf"}
         assert is_download_response(headers, 200, resource_type="XHR") is False
 
     def test_fetch_mime_only_not_download(self) -> None:
-        """Fetch with download MIME type but no attachment header should NOT be treated as download."""
+        """Fetch with download MIME type but no Content-Disposition at all should NOT be treated as download."""
         headers = {"content-type": "application/octet-stream"}
         assert is_download_response(headers, 200, resource_type="Fetch") is False
+
+    def test_xhr_inline_pdf_with_filename_not_download(self) -> None:
+        """XHR with inline + filename is NOT a CDP download — handled by ScopedXhrDownloadCapture instead."""
+        headers = {
+            "content-disposition": 'inline; filename="Denali 10.pdf"',
+            "content-type": "application/pdf",
+        }
+        assert is_download_response(headers, 200, resource_type="XHR") is False
 
     # XHR/Fetch with attachment but API content-type should still be filtered
     def test_xhr_json_attachment_not_download(self) -> None:

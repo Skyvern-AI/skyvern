@@ -15,7 +15,7 @@ import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -111,6 +111,12 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_MIME_TYPES,
+    MAX_FILE_SIZE_BYTES,
+    extract_filename,
+    is_download_response,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -501,6 +507,105 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
+class ScopedXhrDownloadCapture:
+    """Install on a page before a download action; remove after the polling window.
+
+    Skipped when CDPDownloadInterceptor is active on the browser context
+    (detected via ``_skyvern_cdp_download_active`` flag) because the CDP path
+    already handles downloads at the Fetch domain level.
+
+    Automatically attaches to new pages opened during the action window
+    (e.g. target="_blank" links) so XHR responses on child tabs are captured.
+    """
+
+    def __init__(self, page: Page, download_dir: Path) -> None:
+        self._page = page
+        self._download_dir = download_dir
+        self._saved: set[str] = set()
+        self._extra_pages: list[Page] = []
+        self._active = False
+
+    def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
+        """Check if an XHR response carries a downloadable file body.
+
+        Reuses ``is_download_response`` for attachment cases. For inline
+        responses, additionally accepts download MIME + explicit filename
+        (the case ``is_download_response`` intentionally rejects for the
+        global CDP path to avoid false positives on PDF previews).
+        """
+        if is_download_response(headers, status, resource_type="XHR"):
+            return True
+        if status >= 400:
+            return False
+        content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        content_disposition = headers.get("content-disposition", "")
+        if content_type not in DOWNLOAD_MIME_TYPES:
+            return False
+        return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
+
+    async def _on_response(self, response: Response) -> None:
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            headers = response.headers
+            if not self._is_xhr_download(headers, response.status):
+                return
+            raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+            filename = Path(raw_filename).name if raw_filename else ""
+            if not filename or filename in self._saved:
+                return
+            content_length = headers.get("content-length", "")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_FILE_SIZE_BYTES:
+                        return
+                except ValueError:
+                    pass
+            save_path = self._download_dir / filename
+            body = await response.body()
+            if len(body) > MAX_FILE_SIZE_BYTES:
+                return
+            try:
+                with open(save_path, "xb") as f:
+                    f.write(body)
+            except FileExistsError:
+                pass
+            self._saved.add(filename)
+            LOG.info(
+                "XHR download captured during download action",
+                filename=filename,
+                size=len(body),
+            )
+        except Exception:
+            LOG.warning("Failed to capture XHR download response", exc_info=True)
+
+    def _on_new_page(self, page: Page) -> None:
+        if not self._active:
+            return
+        page.on("response", self._on_response)
+        self._extra_pages.append(page)
+
+    def enable(self) -> None:
+        if getattr(self._page.context, "_skyvern_cdp_download_active", False):
+            return
+        self._page.on("response", self._on_response)
+        self._page.context.on("page", self._on_new_page)
+        self._active = True
+
+    def disable(self) -> None:
+        if not self._active:
+            return
+        self._page.remove_listener("response", self._on_response)
+        self._page.context.remove_listener("page", self._on_new_page)
+        for page in self._extra_pages:
+            try:
+                page.remove_listener("response", self._on_response)
+            except Exception:
+                pass
+        self._extra_pages.clear()
+        self._active = False
+
+
 class ActionHandler:
     _handled_action_types: dict[
         ActionType,
@@ -614,9 +719,11 @@ class ActionHandler:
             download_dir=download_dir,
         )
 
+        xhr_capture = ScopedXhrDownloadCapture(page, download_dir)
         download_triggered = False
         page.on("download", _capture_download_event)
         try:
+            xhr_capture.enable()
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
                 results = await ActionHandler._handle_action(
@@ -810,6 +917,7 @@ class ActionHandler:
 
             return results
         finally:
+            xhr_capture.disable()
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
