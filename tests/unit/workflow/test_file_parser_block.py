@@ -7,8 +7,10 @@ token truncation, and error handling for DOCX files.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import docx
 import pytest
@@ -296,14 +298,10 @@ class TestExtractFileUrlFromBlockOutput:
     # --- JSON string inputs ---
 
     def test_json_string_with_downloaded_files_returns_url(self) -> None:
-        import json
-
         value = json.dumps({"downloaded_files": [{"url": "https://example.com/file.csv"}]})
         assert self._extract(value) == "https://example.com/file.csv"
 
     def test_json_string_without_downloaded_files_returns_none(self) -> None:
-        import json
-
         value = json.dumps({"extracted_information": {"k": "v"}})
         assert self._extract(value) is None
 
@@ -335,3 +333,50 @@ class TestExtractFileUrlFromBlockOutput:
 
     def test_integer_returns_none(self) -> None:
         assert self._extract(42) is None
+
+
+@pytest.mark.asyncio
+class TestExtractWithAiSerialization:
+    """Tests for _extract_with_ai content serialization."""
+
+    async def test_list_content_serialized_as_compact_json(self) -> None:
+        """CSV/Excel data (list[dict]) must use compact JSON to minimize tokens."""
+        block = _make_file_parser_block("https://example.com/data.xlsx", FileType.EXCEL)
+        block.json_schema = {"type": "object"}
+        records = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_handler = AsyncMock(return_value={})
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: mock_handler,
+            )
+            mock_load = MagicMock(return_value="prompt")
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+
+            await block._extract_with_ai(records, MagicMock())
+
+            _, kwargs = mock_load.call_args
+            content_str = kwargs["extracted_text_content"]
+
+            assert content_str == json.dumps(records, separators=(",", ":"))
+            assert json.loads(content_str) == records
+
+    async def test_string_content_passed_unchanged(self) -> None:
+        """Non-list content (PDF/DOCX text) must pass through unchanged."""
+        block = _make_file_parser_block("https://example.com/doc.pdf", FileType.PDF)
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_handler = AsyncMock(return_value={})
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: mock_handler,
+            )
+            mock_load = MagicMock(return_value="prompt")
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+
+            await block._extract_with_ai("Hello\nWorld", MagicMock())
+
+            _, kwargs = mock_load.call_args
+            assert kwargs["extracted_text_content"] == "Hello\nWorld"
