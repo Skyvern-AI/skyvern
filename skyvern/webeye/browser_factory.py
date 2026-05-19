@@ -850,6 +850,7 @@ async def _connect_to_cdp_browser(
                 LOG.warning("Failed to enable CDP intercept on new page", page_url=page.url, exc_info=True)
 
         browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
+        browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,
