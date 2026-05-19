@@ -42,13 +42,6 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         elif run.task_run_type == RunType.ui_tars:
             run_engine = RunEngine.ui_tars
 
-        task_total_cost: float | None = None
-        if run.organization_id and task_v1_response.step_count:
-            _, completed_step_count = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                task_ids=[run.run_id], organization_id=run.organization_id
-            )
-            task_total_cost = 0.05 * completed_step_count
-
         return TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
@@ -79,7 +72,6 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             ),
             errors=task_v1_response.errors,
             step_count=task_v1_response.step_count,
-            total_cost=task_total_cost,
         )
     elif run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
