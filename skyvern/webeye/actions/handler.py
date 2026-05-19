@@ -85,6 +85,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -4065,6 +4066,31 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
+    """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
+
+    A "new root" is a node whose ``id`` is in *new_ids* but whose parent is
+    not.  This avoids including the entire page tree when a new dropdown is
+    injected inside an existing container — only the dropdown subtree (and its
+    children, which may also be new) is returned.
+
+    For portal-style dropdowns (appended as a direct ``<body>`` child), this
+    behaves identically to a top-level filter.
+    """
+    result: list[dict] = []
+    for element in elements:
+        _collect_new_roots(element, new_ids, result)
+    return result
+
+
+def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> None:
+    if element.get("id") in new_ids:
+        out.append(element)
+        return
+    for child in element.get("children", []):
+        _collect_new_roots(child, new_ids, out)
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -4095,16 +4121,35 @@ async def select_from_emerging_elements(
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
-    # SKY-9718 Layer 1: custom-select threads `new_elements_ids` so Skyvern IDs
-    # stay (default html_need_skyvern_attrs=True). Gate lean on the PostHog flag.
-    # `lean_compress_long_href` stays OFF — the LLM reads option hrefs to pick
-    # the right select target.
-    _ctx = skyvern_context.current()
-    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
-    prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page_after_open,
-        prompt_engine=prompt_engine,
-        template_name="custom-select",
+    # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
+    # which gets truncated on large pages, losing portal-rendered dropdown items.
+    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    if new_element_subtrees:
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.enable_lean_element_tree:
+            new_element_subtrees = apply_lean_to_tree(
+                new_element_subtrees,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+            )
+        incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
+    else:
+        LOG.warning(
+            "No subtrees matched new element IDs; falling back to full element tree",
+            current_element_id=current_element_id,
+            new_element_id_count=len(new_element_ids),
+        )
+        incremental_html = scraped_page_after_open.build_element_tree(html_need_skyvern_attrs=True)
+    LOG.debug(
+        "Built HTML for emerging-element custom-select",
+        current_element_id=current_element_id,
+        new_interactable_count=len(new_interactable_element_ids),
+        subtree_count=len(new_element_subtrees),
+        html_length=len(incremental_html),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        "custom-select",
         is_date_related=options.is_date_related,
         field_information=options.field_information,
         required_field=options.required_field,
@@ -4112,10 +4157,8 @@ async def select_from_emerging_elements(
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=incremental_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        lean_compress_long_href=False,
-        lean_compress_image_src=lean_enabled,
-        lean_strip_url_query_strings=lean_enabled,
     )
     LOG.info("Calling LLM to find the match element")
 
@@ -4133,6 +4176,14 @@ async def select_from_emerging_elements(
     element_id: str | None = json_response.get("id", None)
     if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    new_ids_set = set(new_interactable_element_ids)
+    if element_id not in new_ids_set:
+        LOG.warning(
+            "custom-select returned element outside new_interactable_element_ids",
+            selected_element_id=element_id,
+            new_interactable_count=len(new_ids_set),
+        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
