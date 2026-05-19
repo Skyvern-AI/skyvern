@@ -3537,7 +3537,6 @@ class ForgeAgent:
                     "verification_code_check": verification_code_check,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    "parse_select_feature_enabled": context.enable_parse_select_in_extract,
                     "has_magic_link_page": context.has_magic_link_page(task.task_id),
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                 }
@@ -3629,7 +3628,6 @@ class ForgeAgent:
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-            parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
             recent_dialog_messages_str=recent_dialog_messages_str,
             # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs

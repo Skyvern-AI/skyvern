@@ -14,7 +14,7 @@ Reply in JSON format with the following keys:
         "confidence_float": float, // The confidence of the action. Pick a number between 0.0 and 1.0. 0.0 means no confidence, 1.0 means full confidence
         "action_type": str, // It's a string enum: "INPUT_TEXT". "INPUT_TEXT" is an element you'd like to input text into.
         "id": str, // The id of the element to take action on. The id has to be one from the elements list.
-        "text": str, // The text to input.{% if parse_select_feature_enabled %}
+        "text": str, // The text to input.
         "context": { // Extract the following detailed information from the "reasoning", and double-check the information by analysing the HTML elements.
             "thought": str, // A string to describe how you double-check the context information to ensure the accuracy.
             "field": str, // Which field is this action intended to fill out?
@@ -24,7 +24,7 @@ Reply in JSON format with the following keys:
             "is_date_related": bool, // True if the field is related to date input or select, otherwise false.
             "date_format": str, // The format of the date or datetime to be input. For example YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, DD.MM.YYYY, MM/DD/YYYY, etc. If the field is not related to date input or select, this should be null.
             "is_text_captcha": bool, // True if the field is asking for a text captcha, otherwise false. Do not confuse it with the verification code. Text CAPTCHAs are typically displayed alongside an image of distorted letters or numbers.
-        }{% endif %}
+        }
     }]{% if verification_code_check %}
     "verification_code_reasoning": str, // Let's think step by step. Describe what you see and think if there is somewhere on the current page where you must enter the verification code now for login or any verification step. Explain why you believe a verification code needs to be entered somewhere or not. Do not imagine any place to enter the code if the code has not been sent yet.
     "place_to_enter_verification_code": bool, // Whether there is a place on the current page to enter the verification code now.
