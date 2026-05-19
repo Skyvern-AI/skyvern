@@ -97,7 +97,7 @@ def ensure_tracing_initialized() -> None:
 
         logfire.configure(
             send_to_logfire="if-token-present",
-            service_name="skyvern-copilot",
+            service_name=settings.OTEL_SERVICE_NAME,
             environment=settings.ENV,
         )
         try:

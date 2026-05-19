@@ -29,6 +29,7 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -146,6 +147,14 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
 
     LOG.info("Server started")
+
+    # Initialize tracing eagerly so OTel spans (`@traced(...)`) ship from the
+    # first request. Without this, the tracer provider is configured lazily on
+    # first copilot-agent invocation, so any request that hits a non-copilot
+    # path before then (e.g. workflow runs from the caching benchmark) records
+    # no-op spans. Uvicorn's `--reload` resets module-level state on edits, so
+    # the lazy path also fails after every code change in dev.
+    ensure_tracing_initialized()
 
     # Auto-bootstrap SQLite database on first server start.
     # Re-raise on failure — a server with no tables/org/API key is
