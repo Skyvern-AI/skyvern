@@ -2308,3 +2308,306 @@ class TestRequestPolicyPromptRendering:
         assert "Retained recent history" in prompt
         # Empty slots must render the (none) sentinel so no header is silent.
         assert prompt.count("(none)") >= 4
+
+
+class TestCredentialClarificationIncludesUiDirections:
+    """SKY-9934: every credential-context canned clarification names where the Credentials UI lives."""
+
+    _DIRECTIONS_PHRASE = "/credentials"
+
+    @pytest.mark.asyncio
+    async def test_credential_name_unresolved_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "credential_name",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "credential_name_unresolved",
+            }
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_credential_invention_requested_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "credential_invention_requested",
+            }
+
+        policy = await build_request_policy(
+            user_message="use random",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_question_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        policy = await build_request_policy(
+            user_message="email: a@example.com password: hunter2",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=AsyncMock(),
+        )
+
+        assert policy.raw_secret_detected is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_after_prior_credential_turn_routes_to_credential_help(self, monkeypatch) -> None:
+        import json as _json
+
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        prior_context = _json.dumps(
+            {
+                "decisions_made": [
+                    "request-policy clarification required: none/credential_invention_requested",
+                ],
+            }
+        )
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=prior_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+        assert (
+            policy.clarification_question != "I need one more detail before I can build and test this workflow safely."
+        )
+
+    @pytest.mark.asyncio
+    async def test_workflow_credential_inputs_unbound_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        workflow_yaml_with_unbound_creds = (
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "    - parameter_type: workflow\n"
+            "      key: login_user\n"
+            "      default_value: null\n"
+            "  blocks:\n"
+            "    - label: sign_in\n"
+            "      block_type: login\n"
+            "      parameters:\n"
+            "        - parameter_type: credential\n"
+            "          key: signin_creds\n"
+            "          username_key: ''\n"
+            "          password_key: ''\n"
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        policy = await build_request_policy(
+            user_message="run it",
+            workflow_yaml=workflow_yaml_with_unbound_creds,
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.clarification_reason == "workflow_credential_inputs_unbound"
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_stale_credential_clarification_does_not_misroute(self, monkeypatch) -> None:
+        import json as _json
+
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        prior_context = _json.dumps(
+            {
+                "decisions_made": [
+                    "request-policy clarification required: none/credential_invention_requested",
+                    "request-policy clarification required: none/ambiguous_loop_edit",
+                ],
+            }
+        )
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=prior_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert (
+            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_without_prior_credential_turn_unchanged(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert (
+            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
+        )
