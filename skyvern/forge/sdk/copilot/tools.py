@@ -26,6 +26,10 @@ from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_sta
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisRepairContract,
+    build_diagnosis_repair_contract,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_INTERMEDIATE_SUCCESS_NUDGE,
     PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
@@ -3716,6 +3720,36 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     update_repeated_failure_state(copilot_ctx, result)
 
 
+def _record_diagnosis_repair_contract(
+    copilot_ctx: Any,
+    *,
+    source_tool: str,
+    result: dict[str, Any],
+    workflow_updated: bool = False,
+) -> DiagnosisRepairContract:
+    contract = build_diagnosis_repair_contract(
+        source_tool=source_tool,
+        result=result,
+        ctx=copilot_ctx,
+        workflow_updated=workflow_updated,
+    )
+    copilot_ctx.latest_diagnosis_repair_contract = contract
+    trace_data = contract.to_trace_data()
+    LOG.info(
+        "copilot diagnosis repair contract shadow",
+        **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
+    )
+    with copilot_span("diagnosis_repair_contract", data=trace_data):
+        pass
+    return contract
+
+
+def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
+    result = {"ok": False, "error": error}
+    _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
+    return json.dumps(result)
+
+
 @function_tool(
     name_override="update_workflow",
     tool_input_guardrails=[_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL],
@@ -3852,11 +3886,11 @@ async def run_blocks_tool(
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
     policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
     if policy_error:
-        return json.dumps({"ok": False, "error": policy_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", policy_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
 
     labels_to_execute, block_outputs_to_seed, frontier_start_label = await _frontier_plan_for_current_workflow(
         copilot_ctx, block_labels
@@ -3881,6 +3915,11 @@ async def run_blocks_tool(
         )
         _record_run_blocks_result(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
         enqueue_screenshot_from_result(copilot_ctx, result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
@@ -3974,11 +4013,11 @@ async def update_and_run_blocks_tool(
     )
     policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
     if not skip_run_after_update and policy_error:
-        return json.dumps({"ok": False, "error": policy_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", policy_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
 
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
@@ -4004,6 +4043,11 @@ async def update_and_run_blocks_tool(
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=update_result,
+        )
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
@@ -4019,6 +4063,12 @@ async def update_and_run_blocks_tool(
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=result,
+            workflow_updated=True,
+        )
         return json.dumps(result)
 
     if skip_run_after_update:
@@ -4034,6 +4084,12 @@ async def update_and_run_blocks_tool(
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=skip_result,
+            workflow_updated=True,
+        )
         LOG.info(
             "update_and_run_blocks skipped run on unbound credential workflow inputs",
             workflow_permanent_id=copilot_ctx.workflow_permanent_id,
@@ -4087,6 +4143,12 @@ async def update_and_run_blocks_tool(
         )
         _record_run_blocks_result(copilot_ctx, run_result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=run_result,
+            workflow_updated=True,
+        )
         enqueue_screenshot_from_result(copilot_ctx, run_result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
