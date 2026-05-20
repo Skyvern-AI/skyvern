@@ -5018,9 +5018,13 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         task_v2: Any | None,
         organization_id: str | None,
-    ) -> list[str]:
-        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback."""
+    ) -> tuple[list[str], bool]:
+        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback.
+
+        Returns (recording_urls, recording_archived).
+        """
         recording_urls: list[str] = []
+        recording_archived = False
         if workflow_run.browser_session_id:
             if workflow_run.started_at is None:
                 LOG.warning(
@@ -5049,10 +5053,12 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
             )
             if recording_artifacts:
-                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
-                recording_urls = [u for u in urls if u is not None]
+                recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifacts[0])
+                if not recording_archived:
+                    urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
+                    recording_urls = [u for u in urls if u is not None]
 
-        return recording_urls
+        return recording_urls, recording_archived
 
     async def _fetch_downloaded_files(
         self,
@@ -5140,7 +5146,7 @@ class WorkflowService:
         (
             screenshot_urls_raw,
             output_parameter_tuples,
-            recording_urls,
+            (recording_urls, recording_archived),
             (downloaded_files, downloaded_file_urls),
         ) = await asyncio.gather(
             self.get_recent_workflow_screenshot_urls(
@@ -5238,6 +5244,7 @@ class WorkflowService:
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
             recording_urls=recording_urls or None,  # omit field when empty
+            recording_archived=recording_archived,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,

@@ -5,7 +5,7 @@ import time
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import structlog
@@ -28,6 +28,13 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 
 LOG = structlog.get_logger(__name__)
+
+ARCHIVE_AGE_THRESHOLD = timedelta(days=90)
+
+
+def _ensure_aware_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
 
 _SCREENSHOT_PREFIX_MAP: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_LLM: "screenshot_llm",
@@ -1145,6 +1152,44 @@ class ArtifactManager:
         )
 
         return result
+
+    async def mark_archived_artifacts(self, artifacts: list[Artifact]) -> None:
+        """Set ``archived = True`` on artifacts whose S3 objects are in GLACIER or DEEP_ARCHIVE.
+
+        Skips artifacts newer than ARCHIVE_AGE_THRESHOLD (90 days) to avoid unnecessary
+        head_object calls. Deduplicates by URI so bundle members sharing the same ZIP
+        only trigger one check.
+        """
+        now = datetime.now(UTC)
+        candidates: list[Artifact] = [
+            a for a in artifacts if (now - _ensure_aware_utc(a.created_at)) > ARCHIVE_AGE_THRESHOLD
+        ]
+        if not candidates:
+            return
+
+        unique_uris = list({a.uri for a in candidates})
+        try:
+            archived_map = await app.STORAGE.check_archived_uris(unique_uris)
+        except Exception:
+            LOG.warning("check_archived_uris failed; skipping archived marking", exc_info=True)
+            return
+
+        for artifact in candidates:
+            if archived_map.get(artifact.uri, False):
+                artifact.archived = True
+
+    async def is_recording_archived(self, artifact: Artifact | None) -> bool:
+        if artifact is None:
+            return False
+        now = datetime.now(UTC)
+        if (now - _ensure_aware_utc(artifact.created_at)) <= ARCHIVE_AGE_THRESHOLD:
+            return False
+        try:
+            archived_map = await app.STORAGE.check_archived_uris([artifact.uri])
+        except Exception:
+            LOG.warning("is_recording_archived failed; assuming not archived", exc_info=True)
+            return False
+        return archived_map.get(artifact.uri, False)
 
     # ---------------------------------------------------------------------------
     # Step-archive accumulation helpers

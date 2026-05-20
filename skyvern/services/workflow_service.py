@@ -142,6 +142,7 @@ async def get_workflow_run_response(
         output=workflow_run_resp.outputs,
         downloaded_files=workflow_run_resp.downloaded_files,
         recording_url=workflow_run_resp.recording_url,
+        recording_archived=workflow_run_resp.recording_archived,
         screenshot_urls=workflow_run_resp.screenshot_urls,
         failure_reason=workflow_run_resp.failure_reason,
         queued_at=workflow_run.queued_at,

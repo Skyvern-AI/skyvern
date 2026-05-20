@@ -55,6 +55,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             modified_at=task_v1_response.modified_at,
             app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
             recording_url=task_v1_response.recording_url,
+            recording_archived=task_v1_response.recording_archived,
             screenshot_urls=task_v1_response.action_screenshot_urls,
             downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(

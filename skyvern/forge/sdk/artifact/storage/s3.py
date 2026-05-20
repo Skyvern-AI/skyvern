@@ -9,6 +9,7 @@ from typing import BinaryIO
 
 import structlog
 import zstandard as zstd
+from botocore.exceptions import ClientError
 
 from skyvern.config import settings
 from skyvern.constants import BROWSER_DOWNLOADING_SUFFIX, DOWNLOAD_FILE_PREFIX
@@ -181,6 +182,27 @@ class S3Storage(BaseStorage):
                 )
                 return None
         return data
+
+    async def check_archived_uris(self, uris: list[str]) -> dict[str, bool]:
+        if not uris:
+            return {}
+
+        async def _check(uri: str) -> tuple[str, bool]:
+            async with self._head_object_semaphore:
+                try:
+                    info = await self.async_client.get_object_info(uri)
+                except ClientError as exc:
+                    LOG.warning(
+                        "head_object failed; assuming not archived",
+                        uri=uri,
+                        error_code=exc.response.get("Error", {}).get("Code"),
+                    )
+                    return uri, False
+            sc = info.get("StorageClass", S3StorageClass.STANDARD)
+            return uri, sc in (S3StorageClass.GLACIER, S3StorageClass.DEEP_ARCHIVE)
+
+        pairs = await asyncio.gather(*[_check(uri) for uri in uris])
+        return dict(pairs)
 
     async def get_share_link(self, artifact: Artifact) -> str | None:
         share_urls = await self.async_client.create_presigned_urls([artifact.uri])
