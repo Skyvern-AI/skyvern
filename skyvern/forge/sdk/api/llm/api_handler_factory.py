@@ -27,6 +27,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
+    LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
@@ -34,6 +35,7 @@ from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transp
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_image_message,
+    is_truncated_response,
     llm_messages_builder,
     llm_messages_builder_with_history,
     parse_api_response,
@@ -1081,6 +1083,46 @@ class LLMAPIHandlerFactory:
                                 primary_model=main_model_group,
                                 fallback_model=response_model,
                             )
+
+                    if (
+                        is_truncated_response(response)
+                        and fallback_groups
+                        and LLMAPIHandlerFactory._models_equivalent(model_used, main_model_group)
+                    ):
+                        fallback_model = fallback_groups[0]
+                        _usage = response.usage if hasattr(response, "usage") and response.usage else None
+                        LOG.warning(
+                            "LLM output truncated on primary model, retrying with fallback",
+                            llm_key=llm_key,
+                            prompt_name=prompt_name,
+                            primary_model=main_model_group,
+                            fallback_model=fallback_model,
+                            prompt_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
+                            completion_tokens=getattr(_usage, "completion_tokens", 0) if _usage else 0,
+                        )
+                        fallback_params = {
+                            k: v for k, v in parameters.items() if k not in ("max_completion_tokens", "max_tokens")
+                        }
+                        response = await router.acompletion(
+                            model=fallback_model,
+                            messages=messages,
+                            timeout=settings.LLM_CONFIG_TIMEOUT,
+                            drop_params=True,
+                            **fallback_params,
+                        )
+                        model_used = response.model or fallback_model
+                        if is_truncated_response(response):
+                            _fb_usage = response.usage if hasattr(response, "usage") and response.usage else None
+                            _fb_detail = getattr(_fb_usage, "completion_tokens_details", None) if _fb_usage else None
+                            raise LLMOutputTruncatedError(
+                                model=fallback_model,
+                                prompt_tokens=getattr(_fb_usage, "prompt_tokens", 0) if _fb_usage else 0,
+                                completion_tokens=(getattr(_fb_usage, "completion_tokens", 0) if _fb_usage else 0),
+                                reasoning_tokens=(
+                                    (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
+                                ),
+                            )
+
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:

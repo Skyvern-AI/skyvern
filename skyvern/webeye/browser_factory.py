@@ -118,6 +118,37 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
     browser_context.on("console", browser_console_log)
 
 
+def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
+    tracked_paths: set[str] = set()
+
+    async def _on_page(page: Page) -> None:
+        try:
+            if not page.video:
+                return
+            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
+                raw_path = await page.video.path()
+            if raw_path is None:
+                return
+            video_path = str(raw_path)
+            # After the await, another handler may have already registered this path
+            if video_path in tracked_paths:
+                return
+            for va in browser_artifacts.video_artifacts:
+                if va.video_path == video_path:
+                    tracked_paths.add(video_path)
+                    return
+            tracked_paths.add(video_path)
+            browser_artifacts.video_artifacts.append(VideoArtifact(video_path=video_path))
+        except Exception:
+            LOG.warning("Failed to register popup page video", exc_info=True)
+
+    browser_context.on("page", _on_page)
+
+    # Register pages that already exist (e.g. the initial page from launch_persistent_context)
+    for page in browser_context.pages:
+        asyncio.ensure_future(_on_page(page))
+
+
 def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
@@ -355,6 +386,7 @@ class BrowserContextFactory:
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
 
