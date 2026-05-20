@@ -9,6 +9,10 @@ import { toast } from "@/components/ui/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import {
+  StreamStatusPanel,
+  type StreamDiagnostic,
+} from "@/routes/streaming/StreamDiagnostics";
 
 type StreamMessage = {
   task_id?: string;
@@ -19,6 +23,56 @@ type StreamMessage = {
   viewport_width?: number;
   viewport_height?: number;
 };
+
+const STARTING_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Starting browser stream",
+  detail:
+    "Opening the stream WebSocket and waiting for the first browser frame.",
+};
+
+function diagnosticForStatus(status: string): StreamDiagnostic {
+  switch (status) {
+    case "not_found":
+      return {
+        title: "Workflow run not found",
+        detail:
+          "The backend could not find this workflow run for the current organization.",
+      };
+    case "timeout":
+      return {
+        title: "Timed out waiting for browser state",
+        detail:
+          "The run started, but the backend did not find an active page to stream.",
+        hint: "Check backend logs for browser launch errors or a streaming-mode mismatch.",
+      };
+    case "completed":
+    case "failed":
+    case "terminated":
+      return {
+        title: "Workflow run is no longer live",
+        detail: `The workflow run status is ${status}.`,
+      };
+    default:
+      return {
+        title: "Waiting for browser frames",
+        detail: `The stream is connected and the run status is ${status}.`,
+      };
+  }
+}
+
+function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
+  if (event.code === 1006) {
+    return {
+      title: "Stream connection dropped",
+      detail: "The browser stream WebSocket closed before sending a frame.",
+      hint: "Check that the API server is running and reachable from the UI.",
+    };
+  }
+  return {
+    title: "Stream connection closed",
+    detail: `WebSocket closed with code ${event.code}${event.reason ? ` (${event.reason})` : ""}.`,
+  };
+}
 
 interface Props {
   alwaysShowStream?: boolean;
@@ -39,6 +93,8 @@ function WorkflowRunStream({
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
+  const [diagnostic, setDiagnostic] =
+    useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const showStream =
     alwaysShowStream || (workflowRun && statusIsNotFinalized(workflowRun));
   const credentialGetter = useCredentialGetter();
@@ -47,6 +103,7 @@ function WorkflowRunStream({
   const queryClient = useQueryClient();
 
   const socketRef = useRef<WebSocket | null>(null);
+  const hasFrameRef = useRef(false);
 
   const inputWsUrl =
     interactive && workflowRunId
@@ -70,9 +127,15 @@ function WorkflowRunStream({
     if (!showStream) {
       return;
     }
+    setDiagnostic(STARTING_DIAGNOSTIC);
+    hasFrameRef.current = false;
+    let cancelled = false;
 
     async function run() {
       const credentialParam = await getCredentialParam(credentialGetter);
+      if (cancelled) {
+        return;
+      }
 
       if (socketRef.current) {
         socketRef.current.close();
@@ -81,10 +144,18 @@ function WorkflowRunStream({
         `${wssBaseUrl}/stream/workflow_runs/${workflowRunId}?${credentialParam}`,
       );
 
+      socketRef.current.addEventListener("open", () => {
+        setDiagnostic({
+          title: "Connected to stream",
+          detail: "Waiting for the backend to attach to the browser page.",
+        });
+      });
+
       socketRef.current.addEventListener("message", (event) => {
         try {
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
+            hasFrameRef.current = true;
             setStreamImgSrc(message.screenshot);
           }
           if (message.format) {
@@ -95,6 +166,9 @@ function WorkflowRunStream({
           }
           if (message.viewport_height) {
             setViewportHeight(message.viewport_height);
+          }
+          if (!message.screenshot && message.status) {
+            setDiagnostic(diagnosticForStatus(message.status));
           }
           if (
             message.status === "completed" ||
@@ -139,16 +213,32 @@ function WorkflowRunStream({
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          setDiagnostic({
+            title: "Unexpected stream message",
+            detail: "The browser stream sent a message the UI could not parse.",
+          });
         }
       });
 
-      socketRef.current.addEventListener("close", () => {
+      socketRef.current.addEventListener("error", () => {
+        setDiagnostic({
+          title: "Stream WebSocket error",
+          detail:
+            "The browser stream connection hit a network or server error.",
+        });
+      });
+
+      socketRef.current.addEventListener("close", (event) => {
+        if (!cancelled && !hasFrameRef.current) {
+          setDiagnostic(diagnosticForClose(event));
+        }
         socketRef.current = null;
       });
     }
     run();
 
     return () => {
+      cancelled = true;
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
@@ -184,11 +274,7 @@ function WorkflowRunStream({
   }
 
   if (isRunningOrPaused && streamImgSrc.length === 0) {
-    return (
-      <div className="flex h-full w-full items-center justify-center rounded-md bg-slate-900 py-8 text-lg">
-        Starting the stream...
-      </div>
-    );
+    return <StreamStatusPanel diagnostic={diagnostic} />;
   }
 
   const hasStream =
@@ -211,11 +297,7 @@ function WorkflowRunStream({
   }
 
   if (alwaysShowStream) {
-    return (
-      <div className="flex h-full w-full items-center justify-center">
-        Waiting for stream...
-      </div>
-    );
+    return <StreamStatusPanel diagnostic={diagnostic} />;
   }
 
   return null;
