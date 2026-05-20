@@ -12,6 +12,8 @@ import pytest
 from skyvern.errors.errors import ReachMaxRetriesError, UserDefinedError
 from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.schemas.tasks import TaskStatus
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.utils.prompt_engine import MaxStepsReasonResponse
 from tests.unit.helpers import make_organization, make_step, make_task
 
@@ -107,6 +109,137 @@ async def test_navigate_failure_with_error_detection(agent, mock_browser_state):
                         call_kwargs = mock_app.DATABASE.tasks.update_task.call_args[1]
                         assert len(call_kwargs["errors"]) == 1
                         assert call_kwargs["errors"][0]["error_code"] == "page_not_found"
+
+
+@pytest.mark.asyncio
+async def test_failed_step_with_user_defined_error_does_not_retry(agent):
+    now = datetime.now()
+    organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
+    task = make_task(
+        now,
+        organization,
+        error_code_mapping={"data_not_downloadable": "Download error displayed"},
+    )
+    detected_error = UserDefinedError(
+        error_code="data_not_downloadable",
+        reasoning="Observed transient text during download wait: Download error displayed",
+        confidence_float=1.0,
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-user-error",
+        status=StepStatus.failed,
+        order=1,
+        retry_index=0,
+        output=AgentStepOutput(
+            action_results=[],
+            actions_and_results=[],
+            errors=[detected_error],
+            terminal_user_errors=True,
+        ),
+    )
+
+    with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+        mock_update_task.return_value = task
+
+        result = await agent.handle_failed_step(organization, task, step)
+
+        assert result is None
+        mock_update_task.assert_awaited_once()
+        call_task, call_status = mock_update_task.call_args.args
+        assert call_task == task
+        assert call_status == TaskStatus.failed
+        call_kwargs = mock_update_task.call_args.kwargs
+        assert call_kwargs["failure_reason"] == detected_error.reasoning
+        assert call_kwargs["errors"][0]["error_code"] == "data_not_downloadable"
+
+
+@pytest.mark.asyncio
+async def test_failed_step_with_duplicate_user_defined_error_preserves_empty_update(agent):
+    now = datetime.now()
+    organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
+    detected_error = UserDefinedError(
+        error_code="data_not_downloadable",
+        reasoning="Observed transient text during download wait: Download error displayed",
+        confidence_float=0.9,
+    )
+    task = make_task(
+        now,
+        organization,
+        error_code_mapping={"data_not_downloadable": "Download error displayed"},
+        errors=[detected_error.model_dump()],
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-user-error",
+        status=StepStatus.failed,
+        order=1,
+        retry_index=0,
+        output=AgentStepOutput(
+            action_results=[],
+            actions_and_results=[],
+            errors=[detected_error],
+            terminal_user_errors=True,
+        ),
+    )
+
+    with patch.object(agent, "update_task", new_callable=AsyncMock) as mock_update_task:
+        mock_update_task.return_value = task
+
+        result = await agent.handle_failed_step(organization, task, step)
+
+        assert result is None
+        mock_update_task.assert_awaited_once()
+        assert mock_update_task.call_args.kwargs["errors"] == []
+
+
+@pytest.mark.asyncio
+async def test_failed_step_with_non_terminal_output_errors_uses_retry_budget(agent):
+    now = datetime.now()
+    organization = make_organization(now).model_copy(update={"max_retries_per_step": 3})
+    task = make_task(
+        now,
+        organization,
+        error_code_mapping={"inline_form_error": "Inline form error"},
+    )
+    detected_error = UserDefinedError(
+        error_code="inline_form_error",
+        reasoning="Inline validation text was visible",
+        confidence_float=0.9,
+    )
+    step = make_step(
+        now,
+        task,
+        step_id="step-non-terminal-error",
+        status=StepStatus.failed,
+        order=1,
+        retry_index=0,
+        output=AgentStepOutput(action_results=[], actions_and_results=[], errors=[detected_error]),
+    )
+    next_step = make_step(
+        now,
+        task,
+        step_id="step-retry",
+        status=StepStatus.created,
+        order=step.order,
+        retry_index=step.retry_index + 1,
+        output=None,
+    )
+
+    with patch("skyvern.forge.agent.app") as mock_app:
+        mock_app.DATABASE.tasks.create_step = AsyncMock(return_value=next_step)
+
+        result = await agent.handle_failed_step(organization, task, step)
+
+        assert result == next_step
+        mock_app.DATABASE.tasks.create_step.assert_awaited_once_with(
+            task_id=task.task_id,
+            organization_id=task.organization_id,
+            order=step.order,
+            retry_index=step.retry_index + 1,
+        )
 
 
 @pytest.mark.asyncio

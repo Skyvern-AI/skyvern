@@ -131,6 +131,8 @@ class Action(BaseModel):
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
+    # Explicit signal that this action's user-defined errors should bypass step retry.
+    terminal_user_errors: bool = False
     data_extraction_goal: str | None = None
 
     # WebAction fields

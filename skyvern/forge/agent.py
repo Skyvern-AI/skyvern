@@ -4683,6 +4683,7 @@ class ForgeAgent:
             step.output.actions_and_results.append((persisted_action, action_results))
             if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
                 step.output.errors.extend(persisted_action.errors)
+                step.output.terminal_user_errors = True
 
             if isinstance(persisted_action, TerminateAction):
                 LOG.warning(
@@ -4871,6 +4872,39 @@ class ForgeAgent:
             if organization.max_retries_per_step is not None
             else settings.MAX_RETRIES_PER_STEP
         )
+        step_errors = (
+            step.output.errors if step.output and step.output.errors and step.output.terminal_user_errors else []
+        )
+        if step_errors:
+            failure_reason = "; ".join(error.reasoning for error in step_errors)
+            failure_category = classify_from_failure_reason(failure_reason, fallback_to_unknown=True)
+            existing_errors = {
+                (error.get("error_code"), error.get("reasoning"))
+                for error in (task.errors or [])
+                if isinstance(error, dict)
+            }
+            new_step_errors = [
+                error.model_dump()
+                for error in step_errors
+                if (error.error_code, error.reasoning) not in existing_errors
+            ]
+            LOG.warning(
+                "Step failed with user-defined errors, marking task as failed without retry",
+                task_id=task.task_id,
+                step_id=step.step_id,
+                step_order=step.order,
+                step_retry=step.retry_index,
+                error_codes=[error.error_code for error in step_errors],
+            )
+            await self.update_task(
+                task,
+                TaskStatus.failed,
+                failure_reason=failure_reason,
+                errors=new_step_errors,
+                failure_category=failure_category,
+            )
+            return None
+
         if step.retry_index >= max_retries_per_step:
             LOG.warning(
                 "Step failed after max retries, marking task as failed",

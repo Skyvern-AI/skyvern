@@ -126,6 +126,10 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
+from skyvern.webeye.transient_page_observer import (
+    TransientPageTextObserver,
+    match_user_defined_errors_from_transient_text,
+)
 from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -722,8 +726,15 @@ class ActionHandler:
 
         xhr_capture = ScopedXhrDownloadCapture(page, download_dir)
         download_triggered = False
+        transient_text_observer = TransientPageTextObserver(
+            page,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
         page.on("download", _capture_download_event)
         try:
+            await transient_text_observer.start()
             xhr_capture.enable()
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
@@ -736,6 +747,7 @@ class ActionHandler:
                 )
             if not results:
                 return results
+            await transient_text_observer.start()
             _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
             _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
@@ -755,6 +767,7 @@ class ActionHandler:
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
                 download_signal_poll_iterations: int | None = None
+                download_wait_matched_errors: list[UserDefinedError] = []
                 download_wait_started_at = time.monotonic()
 
                 def _record_download_signal(source: str) -> None:
@@ -850,6 +863,24 @@ class ActionHandler:
                                     download_event_fallback_failed = True
                                     break
                             elapsed_since_action = time.monotonic() - download_wait_started_at
+                            if not download_signal_observed:
+                                download_wait_matched_errors = match_user_defined_errors_from_transient_text(
+                                    task,
+                                    step,
+                                    transient_text_observer.events,
+                                )
+                                if download_wait_matched_errors:
+                                    action.errors = (action.errors or []) + download_wait_matched_errors
+                                    action.terminal_user_errors = True
+                                    LOG.warning(
+                                        "Stopping download wait after transient user-defined error text",
+                                        task_id=task.task_id,
+                                        step_id=step.step_id,
+                                        workflow_run_id=task.workflow_run_id,
+                                        error_codes=[error.error_code for error in download_wait_matched_errors],
+                                    )
+                                    break
+
                             if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
                                 LOG.warning(
                                     "No download signal observed after action",
@@ -881,9 +912,28 @@ class ActionHandler:
                     _dl_wait_span.set_attribute("download_event_fallback_attempted", download_event_fallback_attempted)
                     _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
                     _dl_wait_span.set_attribute("download_event_fallback_failed", download_event_fallback_failed)
+                    _dl_wait_span.set_attribute(
+                        "download_wait_observed_text_count",
+                        len(transient_text_observer.events),
+                    )
+                    _dl_wait_span.set_attribute(
+                        "download_wait_user_error_detected",
+                        bool(download_wait_matched_errors),
+                    )
+                    if download_wait_matched_errors:
+                        _dl_wait_span.set_attribute(
+                            "download_wait_user_error_codes",
+                            ",".join(error.error_code for error in download_wait_matched_errors),
+                        )
 
             if not download_triggered:
-                results[-1].download_triggered = False
+                if action.errors:
+                    results[-1] = ActionFailure(
+                        Exception("; ".join(error.reasoning for error in action.errors)),
+                        download_triggered=False,
+                    )
+                else:
+                    results[-1].download_triggered = False
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -918,6 +968,7 @@ class ActionHandler:
 
             return results
         finally:
+            await transient_text_observer.stop()
             xhr_capture.disable()
             if browser_state is not None and download_triggered:
                 # get the page count after download

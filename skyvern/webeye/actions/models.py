@@ -41,8 +41,8 @@ class DetailedAgentStepOutput(BaseModel):
     def extract_errors(self) -> list[UserDefinedError]:
         errors = []
         if self.actions_and_results:
-            for action, action_results in self.actions_and_results:
-                if isinstance(action, DecisiveAction):
+            for action, _action_results in self.actions_and_results:
+                if action.errors and (isinstance(action, DecisiveAction) or action.terminal_user_errors):
                     errors.extend(action.errors)
         return errors
 
@@ -62,6 +62,7 @@ class DetailedAgentStepOutput(BaseModel):
 
     def to_agent_step_output(self) -> AgentStepOutput:
         clean_output = self.get_clean_detailed_output()
+        errors = clean_output.extract_errors()
 
         browser_metadata: BrowserMetadata | None = None
         if clean_output.scraped_page and clean_output.scraped_page.url:
@@ -70,7 +71,8 @@ class DetailedAgentStepOutput(BaseModel):
         return AgentStepOutput(
             action_results=clean_output.action_results if clean_output.action_results else [],
             actions_and_results=(clean_output.actions_and_results if clean_output.actions_and_results else []),
-            errors=clean_output.extract_errors(),
+            errors=errors,
+            terminal_user_errors=bool(errors),
             browser_metadata=browser_metadata,
             step_exception=clean_output.step_exception,
         )
