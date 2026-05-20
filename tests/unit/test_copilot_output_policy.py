@@ -652,7 +652,7 @@ async def test_sdk_request_policy_guardrail_trips_on_required_clarification() ->
 
 
 def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         _ctx(),
         {"type": "REPLY", "user_response": "I used password: hunter2."},
     )
@@ -660,6 +660,15 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     assert response_type == "REPLY"
     assert not verdict.allowed
     assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
+    assert diagnostics == {
+        "raw_output_kind": "informational_answer",
+        "final_output_kind": "refusal",
+        "hard_block_reason_codes": ["raw_secret_leak"],
+        "soft_rewrite_reason_codes": [],
+        "raw_would_have_failed": True,
+        "contained_failure": True,
+        "final_output_policy_allowed": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -759,7 +768,7 @@ workflow_definition:
         - azure_credentials
 """
 
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         ctx,
         {
             "type": "REPLY",
@@ -771,6 +780,8 @@ workflow_definition:
     assert response_type == "REPLY"
     assert verdict.allowed
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+    assert diagnostics["raw_would_have_failed"] is False
+    assert diagnostics["contained_failure"] is False
 
 
 def test_sdk_output_guardrail_defers_raw_question_after_untested_draft() -> None:
@@ -801,7 +812,7 @@ workflow_definition:
         - azure_credentials
 """
 
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         ctx,
         {
             "type": "ASK_QUESTION",
@@ -812,6 +823,8 @@ workflow_definition:
     assert response_type == "ASK_QUESTION"
     assert verdict.allowed
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+    assert diagnostics["raw_output_kind"] == "workflow_draft_proposal"
+    assert diagnostics["final_output_kind"] == "workflow_draft_proposal"
 
 
 def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
@@ -1026,7 +1039,21 @@ def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
     final_log = next(call for call in log_info.call_args_list if call.args[0] == "copilot output policy final verdict")
     assert final_log.kwargs["allowed"] is True
     assert final_log.kwargs["reason_codes"] == []
+    assert final_log.kwargs["raw_output_kind"] == "informational_answer"
+    assert final_log.kwargs["final_output_kind"] == "informational_answer"
+    assert final_log.kwargs["hard_block_reason_codes"] == []
     assert final_log.kwargs["soft_rewrite_reason_codes"] == ["internal_block_taxonomy_leak"]
+    assert final_log.kwargs["raw_would_have_failed"] is True
+    assert final_log.kwargs["contained_failure"] is True
+    assert agent_result.output_policy_diagnostics == {
+        "raw_output_kind": "informational_answer",
+        "final_output_kind": "informational_answer",
+        "hard_block_reason_codes": [],
+        "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
+        "raw_would_have_failed": True,
+        "contained_failure": True,
+        "final_output_policy_allowed": True,
+    }
 
 
 def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:
