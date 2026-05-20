@@ -57,6 +57,19 @@ class LLMProviderErrorRetryableTask(LLMProviderError):
         SkyvernException.__init__(self, f"Retryable error while using LLMProvider {llm_key}{detail}")
 
 
+class LLMOutputTruncatedError(InvalidLLMResponseFormat):
+    def __init__(self, model: str, prompt_tokens: int, completion_tokens: int, reasoning_tokens: int) -> None:
+        super().__init__(
+            f"LLM output truncated (finish_reason=length, content=None). "
+            f"model={model}, prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}, "
+            f"reasoning_tokens={reasoning_tokens}"
+        )
+        self.model = model
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.reasoning_tokens = reasoning_tokens
+
+
 class NoProviderEnabledError(BaseLLMError):
     def __init__(self) -> None:
         super().__init__(
