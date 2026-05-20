@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
+    RAW_SECRET_REFUSAL_SENTINEL,
     RequestPolicy,
     build_request_policy,
     redact_raw_secrets_for_prompt,
@@ -672,6 +673,12 @@ _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
 )
 _UNEXPECTED_ERROR_REPLY_TESTED = (
     "I hit an unexpected issue, but I have a tested draft for you. Accept it to save, or discard."
+)
+# Ends with RAW_SECRET_REFUSAL_SENTINEL so transcript redaction recognizes this refusal in history.
+_RAW_SECRET_LEAK_REFUSAL = (
+    "I can't show or save that output because it appears to include raw credentials or secrets. "
+    "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
+    f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _CANCEL_REPLY_DEFAULT = "Cancelled by user."
 _CANCEL_REPLY_UNVALIDATED = (
@@ -1421,11 +1428,7 @@ def _build_output_policy_blocked_result(
     ):
         user_response = request_policy.clarification_question
     elif OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
-        user_response = (
-            "I can't show or save that output because it appears to include raw credentials or secrets. "
-            "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
-            "credential ID beginning with cred_. DO NOT PROVIDE RAW LOGIN/PASSWORD."
-        )
+        user_response = _RAW_SECRET_LEAK_REFUSAL
     elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
         user_response = (
             "I need you to confirm which saved credential should be used before I can continue. "
