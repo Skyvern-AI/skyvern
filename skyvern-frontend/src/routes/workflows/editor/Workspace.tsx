@@ -119,6 +119,7 @@ import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
+import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
@@ -1109,21 +1110,9 @@ function Workspace({
     }
 
     const editedEdges = previous
-      ? edges.filter((edge) => {
-          // Don't remove edges from the previous node
-          if (edge.source !== previous) {
-            return true;
-          }
-          // If we're in a branch, only remove the edge for this branch
-          if (branch) {
-            const edgeData = edge.data as
-              | { conditionalBranchId?: string }
-              | undefined;
-            return edgeData?.conditionalBranchId !== branch.branchId;
-          }
-          // Otherwise remove all edges from previous
-          return false;
-        })
+      ? edges.filter((edge) =>
+          shouldKeepExistingEdgeForInsertion(edge, { branch, next, previous }),
+        )
       : edges;
 
     const previousNode = nodes.find((node) => node.id === previous);
