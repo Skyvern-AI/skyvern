@@ -1165,6 +1165,45 @@ class TestCredentialRefusalReachesAgent:
             assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
 
 
+class TestNativeToolSurface:
+    @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
+    def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            testing_intent="skip_test",
+            clarification_reason=reason,
+            allow_update_workflow=True,
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+        )
+        tools = [
+            SimpleNamespace(name="update_workflow"),
+            SimpleNamespace(name="list_credentials"),
+            SimpleNamespace(name="update_and_run_blocks"),
+        ]
+
+        filtered = agent_module._native_tools_for_turn(tools, turn_intent=None, request_policy=policy)
+
+        assert [tool.name for tool in filtered] == ["list_credentials", "update_and_run_blocks"]
+
+    def test_non_deferred_policy_keeps_update_workflow_tool(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        tools = [
+            SimpleNamespace(name="update_workflow"),
+            SimpleNamespace(name="update_and_run_blocks"),
+        ]
+
+        filtered = agent_module._native_tools_for_turn(
+            tools,
+            turn_intent=None,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+
+        assert [tool.name for tool in filtered] == ["update_workflow", "update_and_run_blocks"]
+
+
 class TestRequestPolicyCredentialResolution:
     @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
@@ -1502,6 +1541,49 @@ class TestRequestPolicyCredentialResolution:
         assert not prior_clarification_follow_up_policy.allow_run_blocks
         assert prior_clarification_follow_up_policy.allow_missing_credentials_in_draft
         assert prior_clarification_follow_up_policy.clarification_question is None
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        deferred_after_question_policy = await build_request_policy(
+            user_message="i will do them later",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert deferred_after_question_policy.user_response_policy == "proceed"
+        assert deferred_after_question_policy.testing_intent == "skip_test"
+        assert deferred_after_question_policy.clarification_reason == "credential_name_unresolved"
+        assert deferred_after_question_policy.allow_update_workflow
+        assert not deferred_after_question_policy.allow_run_blocks
+        assert deferred_after_question_policy.allow_missing_credentials_in_draft
+
+        stored_credential_site_question = "Which website or login page should I use to look up the stored credential?"
+        deferred_after_site_question_policy = await build_request_policy(
+            user_message="i will do them later",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
+                ("ai", stored_credential_site_question),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert deferred_after_site_question_policy.user_response_policy == "proceed"
+        assert deferred_after_site_question_policy.testing_intent == "skip_test"
+        assert deferred_after_site_question_policy.clarification_reason == "credential_name_unresolved"
+        assert deferred_after_site_question_policy.allow_update_workflow
+        assert not deferred_after_site_question_policy.allow_run_blocks
+        assert deferred_after_site_question_policy.allow_missing_credentials_in_draft
 
         handler.response = {
             "testing_intent": "require_test",

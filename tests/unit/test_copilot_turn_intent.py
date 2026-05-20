@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.agent import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.turn_intent import (
+    UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
     RequiredContextKey,
     TurnIntent,
     TurnIntentAuthority,
@@ -217,6 +218,50 @@ def test_build_turn_intent_keeps_explicit_fix_as_edit() -> None:
 
     assert intent.mode == TurnIntentMode.EDIT
     assert intent.authority.may_update_workflow is True
+    assert intent.target_entities["workflow"] == ["current_workflow"]
+
+
+def test_build_turn_intent_records_unresolved_explicit_block_refs() -> None:
+    intent = build_turn_intent(
+        user_message="WF_trigger_SSO_login worked but update_card is not receiving browser state.",
+        workflow_yaml="""
+title: Public SSO login cleanup
+workflow_definition:
+  blocks:
+    - block_type: goto_url
+      label: navigate_to_SSO
+    - block_type: navigation
+      label: block_placeholder
+""",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+    assert intent.target_entities[UNRESOLVED_BLOCK_REF_TARGET_ENTITY] == [
+        "WF_trigger_SSO_login",
+        "update_card",
+    ]
+
+
+def test_build_turn_intent_does_not_treat_snake_case_fields_as_unresolved_block_refs() -> None:
+    intent = build_turn_intent(
+        user_message="Update the workflow so the last_name field is required.",
+        workflow_yaml="""
+title: Existing
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: update_form
+""",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+    assert UNRESOLVED_BLOCK_REF_TARGET_ENTITY not in intent.target_entities
 
 
 def test_store_request_policy_attaches_turn_intent_to_context() -> None:

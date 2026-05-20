@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, redact_raw_secrets_for_prompt
@@ -10,6 +12,9 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.yaml_loader import safe_load_no_dates
+
+UNRESOLVED_BLOCK_REF_TARGET_ENTITY = "unresolved_block_ref"
 
 
 class TurnIntentMode(StrEnum):
@@ -158,6 +163,14 @@ _DOCS_TERMS = (
     " versus ",
     "difference between",
 )
+_IDENTIFIER_REF_RE = r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"
+_CODE_IDENTIFIER_REF_RE = re.compile(rf"`(?P<ref>{_IDENTIFIER_REF_RE})`")
+_BLOCK_IDENTIFIER_REF_RE = re.compile(
+    rf"\b(?:(?:block|step)\s+(?P<after>{_IDENTIFIER_REF_RE})|(?P<before>{_IDENTIFIER_REF_RE})\s+(?:block|step))\b",
+    re.I,
+)
+_WF_IDENTIFIER_REF_RE = re.compile(r"\bWF_[A-Za-z0-9_]+\b")
+_ANY_IDENTIFIER_REF_RE = re.compile(rf"\b{_IDENTIFIER_REF_RE}\b")
 
 
 def _normalize_user_goal(user_message: str) -> str:
@@ -176,6 +189,89 @@ def _has_latest_assistant_turn(chat_history: list[WorkflowCopilotChatHistoryMess
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     normalized = text.lower()
     return any(term in normalized for term in terms)
+
+
+def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
+    if not workflow_yaml:
+        return set()
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return set()
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return set()
+    labels: set[str] = set()
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        label = block.get("label")
+        if isinstance(label, str) and label:
+            labels.add(label)
+    return labels
+
+
+def _workflow_parameter_keys(workflow_yaml: str | None) -> set[str]:
+    if not workflow_yaml:
+        return set()
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return set()
+    parameters = workflow_definition.get("parameters")
+    if not isinstance(parameters, list):
+        return set()
+    keys: set[str] = set()
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        key = parameter.get("key")
+        if isinstance(key, str) and key:
+            keys.add(key)
+    return keys
+
+
+def _explicit_identifier_refs(user_message: str) -> set[str]:
+    refs = {match.group("ref") for match in _CODE_IDENTIFIER_REF_RE.finditer(user_message or "")}
+    refs.update(
+        match.group("after") or match.group("before")
+        for match in _BLOCK_IDENTIFIER_REF_RE.finditer(user_message or "")
+        if match.group("after") or match.group("before")
+    )
+    wf_refs = set(_WF_IDENTIFIER_REF_RE.findall(user_message or ""))
+    refs.update(wf_refs)
+    if wf_refs:
+        # If the turn already contains a generated workflow-style ref, include the other
+        # identifier-shaped tokens as companion refs. This catches "WF_x worked but y failed"
+        # without treating every snake_case field name as a workflow block target.
+        refs.update(_ANY_IDENTIFIER_REF_RE.findall(user_message or ""))
+    return refs
+
+
+def _unresolved_explicit_block_refs(user_message: str, workflow_yaml: str | None) -> list[str]:
+    explicit_refs = _explicit_identifier_refs(user_message)
+    if not explicit_refs:
+        return []
+    known_labels = {label.lower() for label in _workflow_block_labels(workflow_yaml)}
+    parameter_keys = {key.lower() for key in _workflow_parameter_keys(workflow_yaml)}
+    known_non_block_refs = {"workflow_run_id", "browser_session_id"}
+    unresolved: list[str] = []
+    for ref in sorted(explicit_refs):
+        normalized = ref.lower()
+        if normalized in known_labels or normalized in parameter_keys or normalized in known_non_block_refs:
+            continue
+        unresolved.append(ref)
+    return unresolved
 
 
 def _mode_from_keywords(
@@ -213,7 +309,8 @@ def build_turn_intent(
     reason_codes: list[TurnIntentReasonCode] = [TurnIntentReasonCode.REQUEST_POLICY_DERIVED]
 
     if workflow_id or workflow_permanent_id or has_workflow:
-        target_entities["workflow"] = [value for value in (workflow_permanent_id, workflow_id) if value]
+        workflow_targets = [value for value in (workflow_permanent_id, workflow_id) if value]
+        target_entities["workflow"] = workflow_targets or ["current_workflow"]
     if workflow_run_id:
         target_entities["run"] = [workflow_run_id]
     if request_policy.credential_refs:
@@ -267,6 +364,11 @@ def build_turn_intent(
         mode, expected_output = keyword_mode
         confidence = 0.35
         reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
+
+    if mode == TurnIntentMode.EDIT:
+        unresolved_block_refs = _unresolved_explicit_block_refs(user_message, workflow_yaml)
+        if unresolved_block_refs:
+            target_entities[UNRESOLVED_BLOCK_REF_TARGET_ENTITY] = unresolved_block_refs
 
     if mode == TurnIntentMode.DOCS_ANSWER:
         authority.may_update_workflow = False
