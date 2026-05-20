@@ -99,6 +99,14 @@ _RAW_SECRET_PATTERNS = (
 RAW_SECRET_PATTERNS = _RAW_SECRET_PATTERNS
 _COLON_DELIMITED_SECRET_SEGMENT_SEPARATORS = (",", ";", "|")
 _COLON_DELIMITED_SECRET_EDGE_CHARS = "\"'`()[]{}<>"
+_INVALID_CONDITIONAL_CONTAINER_MARKERS = (
+    "into the conditional",
+    "inside the conditional",
+    "within the conditional",
+    "into conditional",
+    "inside conditional",
+    "within conditional",
+)
 
 
 @dataclass
@@ -377,6 +385,14 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     return policy
 
 
+def _structural_clarification_reason(user_message: str) -> ClarificationReason:
+    normalized = " ".join((user_message or "").lower().split())
+    if "loop" in normalized and "conditional" in normalized:
+        if any(marker in normalized for marker in _INVALID_CONDITIONAL_CONTAINER_MARKERS):
+            return "invalid_conditional_container"
+    return "none"
+
+
 def _ground_completion_contract(user_message: str, value: str | None) -> str | None:
     if not value or not value.strip():
         return None
@@ -403,6 +419,14 @@ async def _classify_request(
             credential_refs=ids,
             raw_secret_detected=True,
             clarification_reason="raw_secret",
+        )
+    structural_reason = _structural_clarification_reason(user_message)
+    if structural_reason != "none":
+        return RequestPolicy(
+            credential_input_kind="credential_id" if ids else "none",
+            credential_refs=ids,
+            requires_user_clarification=True,
+            clarification_reason=structural_reason,
         )
     if handler is None:
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
