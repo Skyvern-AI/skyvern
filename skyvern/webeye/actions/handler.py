@@ -117,6 +117,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     MAX_FILE_SIZE_BYTES,
     extract_filename,
     is_download_response,
+    normalize_download_filename,
 )
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
@@ -556,7 +557,7 @@ class ScopedXhrDownloadCapture:
             if not self._is_xhr_download(headers, response.status):
                 return
             raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
-            filename = Path(raw_filename).name if raw_filename else ""
+            filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
             if not filename or filename in self._saved:
                 return
             content_length = headers.get("content-length", "")
