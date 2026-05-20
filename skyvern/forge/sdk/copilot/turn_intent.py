@@ -23,6 +23,16 @@ class TurnIntentMode(StrEnum):
     UNKNOWN = "unknown"
 
 
+NO_MUTATION_TURN_INTENT_MODES = frozenset(
+    {
+        TurnIntentMode.DOCS_ANSWER,
+        TurnIntentMode.DIAGNOSE,
+        TurnIntentMode.CLARIFY,
+        TurnIntentMode.REFUSE,
+    }
+)
+
+
 class RequiredContextKey(StrEnum):
     CURRENT_WORKFLOW = "current_workflow"
     PROPOSED_WORKFLOW = "proposed_workflow"
@@ -52,6 +62,7 @@ class TurnIntentReasonCode(StrEnum):
     RUN_CONTEXT_PRESENT = "run_context_present"
     BROWSER_CONTEXT_PRESENT = "browser_context_present"
     KEYWORD_HEURISTIC = "keyword_heuristic"
+    RAW_SECRET_REFUSAL = "raw_secret_refusal"
 
 
 class TurnIntentAuthority(BaseModel):
@@ -131,9 +142,22 @@ class TurnIntent(BaseModel):
 
 _GOAL_MAX_CHARS = 240
 _BUILD_TERMS = ("build", "create", "make", "generate")
+_NEW_BROWSER_TASK_TERMS = ("go to", "navigate to", "open", "visit", "search for")
 _EDIT_TERMS = ("edit", "update", "change", "modify", "replace", "fix")
 _DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error", "result")
-_DOCS_TERMS = ("explain", "how do", "how does", "what is", "what are", "why", "docs", "documentation")
+_DOCS_TERMS = (
+    "explain",
+    "how do",
+    "how does",
+    "what is",
+    "what are",
+    "why",
+    "docs",
+    "documentation",
+    " vs ",
+    " versus ",
+    "difference between",
+)
 
 
 def _normalize_user_goal(user_message: str) -> str:
@@ -157,13 +181,15 @@ def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
 def _mode_from_keywords(
     user_message: str, *, has_workflow: bool
 ) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
+    if has_workflow and _contains_any(user_message, _EDIT_TERMS):
+        return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
     if _contains_any(user_message, _DIAGNOSE_TERMS):
         return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
     if _contains_any(user_message, _DOCS_TERMS):
         return TurnIntentMode.DOCS_ANSWER, TurnIntentExpectedOutput.EXPLANATION
-    if has_workflow and _contains_any(user_message, _EDIT_TERMS):
-        return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
     if _contains_any(user_message, _BUILD_TERMS):
+        return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
+    if not has_workflow and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS):
         return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
     return None
 
@@ -219,7 +245,14 @@ def build_turn_intent(
     confidence = 0.2 if (has_workflow or has_prior_context or chat_history) else 0.0
     missing_context_question = None
 
-    if request_policy.user_response_policy == "ask_clarification":
+    if request_policy.raw_secret_detected:
+        mode = TurnIntentMode.REFUSE
+        expected_output = TurnIntentExpectedOutput.REFUSAL
+        confidence = 0.9
+        missing_context_question = request_policy.clarification_question
+        authority.requires_user_input = True
+        reason_codes.append(TurnIntentReasonCode.RAW_SECRET_REFUSAL)
+    elif request_policy.user_response_policy == "ask_clarification":
         mode = TurnIntentMode.CLARIFY
         expected_output = TurnIntentExpectedOutput.CLARIFICATION
         confidence = 0.8
@@ -236,9 +269,16 @@ def build_turn_intent(
         reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
 
     if mode == TurnIntentMode.DOCS_ANSWER:
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
         required_context.append(RequiredContextKey.DOCS_CONTEXT)
     elif mode == TurnIntentMode.DIAGNOSE and RequiredContextKey.LATEST_RUN_RESULT not in required_context:
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
         required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
+    elif mode == TurnIntentMode.DIAGNOSE:
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
 
     return TurnIntent(
         mode=mode,
