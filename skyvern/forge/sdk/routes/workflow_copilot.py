@@ -332,6 +332,7 @@ async def _persist_cancel_turn(
         total_tokens = None
         response_type = "REPLY"
         unvalidated = False
+        output_policy_diagnostics = None
         if chat.proposed_workflow is not None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -348,6 +349,7 @@ async def _persist_cancel_turn(
         total_tokens = getattr(agent_result, "total_tokens", None)
         response_type = getattr(agent_result, "response_type", "REPLY")
         unvalidated = bool(getattr(agent_result, "unvalidated", False))
+        output_policy_diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
 
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -379,6 +381,7 @@ async def _persist_cancel_turn(
                     response_type=response_type,
                     unvalidated=unvalidated,
                     cancelled=True,
+                    output_policy_diagnostics=output_policy_diagnostics,
                 )
             )
         )
@@ -451,6 +454,7 @@ async def _finalise_normal_turn(
             total_tokens=getattr(agent_result, "total_tokens", None),
             response_type=getattr(agent_result, "response_type", "REPLY"),
             unvalidated=bool(getattr(agent_result, "unvalidated", False)),
+            output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
         )
     )
 

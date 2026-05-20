@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -124,6 +125,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
+    )
+    output_policy_diagnostics: dict[str, Any] | None = Field(
+        None,
+        description="Diagnostic output-policy labels for raw-vs-final quality reporting.",
     )
 
 

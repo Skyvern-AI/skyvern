@@ -408,6 +408,14 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         unvalidated=True,
         total_tokens=42,
         response_type="REPLY",
+        output_policy_diagnostics={
+            "raw_output_kind": "informational_answer",
+            "final_output_kind": "informational_answer",
+            "hard_block_reason_codes": [],
+            "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
+            "raw_would_have_failed": True,
+            "contained_failure": True,
+        },
     )
 
     restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -448,6 +456,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
     )
     assert response_frame is not None
     assert getattr(response_frame, "unvalidated", False) is True
+    assert response_frame.output_policy_diagnostics == agent_result.output_policy_diagnostics
     assert not [f for f in sent_frames if isinstance(f, WorkflowCopilotStreamErrorUpdate)]
 
 
