@@ -5,8 +5,11 @@ export type ValidationNodeData = NodeBaseData & {
   completeCriterion: string;
   terminateCriterion: string;
   errorCodeMapping: string;
+  navigationGoal: string;
   parameterKeys: Array<string>;
   disableCache: boolean;
+  dataExtractionGoal: string;
+  dataSchema: string;
 };
 
 export type ValidationNode = Node<ValidationNodeData, "validation">;
@@ -17,11 +20,14 @@ export const validationNodeDefaultData: ValidationNodeData = {
   completeCriterion: "",
   terminateCriterion: "",
   errorCodeMapping: "null",
+  navigationGoal: "",
   continueOnFailure: false,
   editable: true,
   parameterKeys: [],
   disableCache: false,
   model: null,
+  dataExtractionGoal: "",
+  dataSchema: "null",
 };
 
 export function isValidationNode(node: Node): node is ValidationNode {

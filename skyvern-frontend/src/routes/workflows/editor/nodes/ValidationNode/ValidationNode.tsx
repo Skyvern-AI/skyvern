@@ -11,12 +11,13 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
+import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
 import { ErrorCodeMappingEditor } from "@/routes/workflows/editor/ErrorCodeMappingEditor";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { helpTooltips } from "../../helpContent";
-import { errorMappingExampleValue } from "../types";
+import { helpTooltips, placeholders } from "../../helpContent";
+import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
 import type { ValidationNode } from "./types";
 import { AppNode } from "..";
 import {
@@ -131,11 +132,101 @@ function ValidationNode({ id, data, type }: NodeProps<ValidationNode>) {
             />
           </div>
           <Separator />
-          <Accordion
-            type="single"
-            collapsible
-            onValueChange={() => rerender.bump()}
-          >
+          <Accordion type="multiple" onValueChange={() => rerender.bump()}>
+            <AccordionItem value="extraction">
+              <AccordionTrigger className="py-0">Extraction</AccordionTrigger>
+              <AccordionContent className="pl-[1.5rem] pr-1 pt-4">
+                <div key={`${rerender.key}-extraction`} className="space-y-4">
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Navigation Goal
+                      </Label>
+                      <HelpTooltip
+                        content={helpTooltips["validation"]["navigationGoal"]}
+                      />
+                    </div>
+                    <WorkflowBlockInputTextarea
+                      aiImprove={{
+                        useCase:
+                          AI_IMPROVE_CONFIGS.validation.navigationGoal.useCase,
+                        context: {
+                          ...AI_IMPROVE_CONFIGS.validation.navigationGoal
+                            .context,
+                          data_extraction_goal:
+                            data.dataExtractionGoal || undefined,
+                          complete_criterion:
+                            data.completeCriterion || undefined,
+                          terminate_criterion:
+                            data.terminateCriterion || undefined,
+                        },
+                      }}
+                      nodeId={id}
+                      onChange={(value) => {
+                        update({ navigationGoal: value });
+                      }}
+                      value={data.navigationGoal}
+                      placeholder={placeholders["validation"]["navigationGoal"]}
+                      className="nopan text-xs"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex gap-2">
+                      <Label className="text-xs text-slate-300">
+                        Data Extraction Goal
+                      </Label>
+                      <HelpTooltip
+                        content={
+                          helpTooltips["validation"]["dataExtractionGoal"]
+                        }
+                      />
+                    </div>
+                    <WorkflowBlockInputTextarea
+                      aiImprove={{
+                        useCase:
+                          AI_IMPROVE_CONFIGS.validation.dataExtractionGoal
+                            .useCase,
+                        context: {
+                          ...AI_IMPROVE_CONFIGS.validation.dataExtractionGoal
+                            .context,
+                          navigation_goal: data.navigationGoal || undefined,
+                          data_schema:
+                            data.dataSchema && data.dataSchema !== "null"
+                              ? data.dataSchema
+                              : undefined,
+                          complete_criterion:
+                            data.completeCriterion || undefined,
+                          terminate_criterion:
+                            data.terminateCriterion || undefined,
+                        },
+                      }}
+                      nodeId={id}
+                      onChange={(value) => {
+                        update({ dataExtractionGoal: value });
+                      }}
+                      value={data.dataExtractionGoal}
+                      placeholder={
+                        placeholders["validation"]["dataExtractionGoal"]
+                      }
+                      className="nopan text-xs"
+                    />
+                  </div>
+                  <WorkflowDataSchemaInputGroup
+                    exampleValue={dataSchemaExampleValue}
+                    onChange={(value) => {
+                      update({ dataSchema: value });
+                    }}
+                    value={data.dataSchema}
+                    suggestionContext={{
+                      data_extraction_goal: data.dataExtractionGoal,
+                      current_schema: data.dataSchema,
+                      complete_criterion: data.completeCriterion,
+                      terminate_criterion: data.terminateCriterion,
+                    }}
+                  />
+                </div>
+              </AccordionContent>
+            </AccordionItem>
             <AccordionItem value="advanced" className="border-b-0">
               <AccordionTrigger className="py-0">
                 Advanced Settings

@@ -194,10 +194,14 @@ export type Taskv2BlockYAML = BlockYAMLBase & {
 
 export type ValidationBlockYAML = BlockYAMLBase & {
   block_type: "validation";
+  navigation_goal?: string | null;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameter_keys?: Array<string> | null;
+  data_extraction_goal?: string | null;
+  data_schema?: Record<string, unknown> | string | null;
+  disable_cache?: boolean;
 };
 
 export type HumanInteractionBlockYAML = BlockYAMLBase & {
