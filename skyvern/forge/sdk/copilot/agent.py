@@ -40,6 +40,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
+    build_output_policy_diagnostics,
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
@@ -952,7 +953,7 @@ def _translate_to_agent_result(
         unvalidated=unvalidated,
     )
 
-    output_policy_verdict = evaluate_output_policy(
+    raw_output_policy_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type=resp_type,
         user_response=str(user_response),
@@ -964,6 +965,7 @@ def _translate_to_agent_result(
         unvalidated=unvalidated,
         output_kind=output_kind,
     )
+    output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
     if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
         user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
@@ -982,12 +984,24 @@ def _translate_to_agent_result(
         user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
         soft_rewrite_reasons.append(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
         output_policy_verdict.remove(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+    final_output_kind = (
+        _blocked_final_output_kind(output_policy_verdict)
+        if not output_policy_verdict.allowed
+        else output_policy_verdict.output_kind
+    )
+    output_policy_diagnostics = build_output_policy_diagnostics(
+        raw_verdict=raw_output_policy_verdict,
+        final_verdict=output_policy_verdict,
+        final_output_kind=final_output_kind,
+        hard_block_reason_codes=list(output_policy_verdict.reason_codes),
+        soft_rewrite_reason_codes=soft_rewrite_reasons,
+    )
     trace_data = output_policy_verdict_to_trace_data(
         output_policy_verdict,
         surface="final_translation",
         response_type=resp_type,
     )
-    trace_data["soft_rewrite_reason_codes"] = [reason.value for reason in soft_rewrite_reasons]
+    trace_data.update(output_policy_diagnostics)
     LOG.info(
         "copilot output policy final verdict",
         **trace_data,
@@ -998,6 +1012,7 @@ def _translate_to_agent_result(
             output_policy_verdict,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
+            output_policy_diagnostics=output_policy_diagnostics,
         )
 
     return AgentResult(
@@ -1010,6 +1025,7 @@ def _translate_to_agent_result(
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
         unvalidated=unvalidated,
+        output_policy_diagnostics=output_policy_diagnostics,
     )
 
 
@@ -1149,10 +1165,29 @@ def _should_surface_untested_draft_despite_question(ctx: CopilotContext, respons
     )
 
 
+def _copy_output_policy_verdict(verdict: OutputPolicyVerdict) -> OutputPolicyVerdict:
+    return OutputPolicyVerdict(
+        allowed=verdict.allowed,
+        output_kind=verdict.output_kind,
+        reason_codes=list(verdict.reason_codes),
+    )
+
+
+def _blocked_final_output_kind(verdict: OutputPolicyVerdict) -> CopilotOutputKind:
+    clarification_reasons = {
+        OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS,
+        OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
+        OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
+    }
+    if any(reason in clarification_reasons for reason in verdict.reason_codes):
+        return CopilotOutputKind.CLARIFICATION_REQUEST
+    return CopilotOutputKind.REFUSAL
+
+
 def _evaluate_copilot_final_output_policy(
     ctx: CopilotContext,
     agent_output: Any,
-) -> tuple[OutputPolicyVerdict, str]:
+) -> tuple[OutputPolicyVerdict, str, dict[str, Any]]:
     text = _agent_output_to_text(agent_output)
     action_data = parse_final_response(text)
     response_type = action_data.get("type", "REPLY")
@@ -1192,7 +1227,7 @@ def _evaluate_copilot_final_output_policy(
             workflow_attempted=workflow_attempted,
             unvalidated=False,
         )
-    verdict = evaluate_output_policy(
+    raw_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type=policy_response_type,
         user_response=policy_user_response,
@@ -1204,7 +1239,17 @@ def _evaluate_copilot_final_output_policy(
         workflow_attempted=workflow_attempted,
         output_kind=output_kind,
     )
-    return hard_block_output_policy_verdict(verdict), response_type
+    hard_verdict = hard_block_output_policy_verdict(raw_verdict)
+    diagnostics = build_output_policy_diagnostics(
+        raw_verdict=raw_verdict,
+        final_verdict=hard_verdict,
+        final_output_kind=_blocked_final_output_kind(hard_verdict)
+        if not hard_verdict.allowed
+        else hard_verdict.output_kind,
+        hard_block_reason_codes=list(hard_verdict.reason_codes),
+        soft_rewrite_reason_codes=[],
+    )
+    return hard_verdict, response_type, diagnostics
 
 
 def _build_copilot_input_guardrails(
@@ -1268,13 +1313,21 @@ def _build_copilot_output_guardrails(
                 reason_codes=[OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING],
             )
             response_type = "REPLY"
+            diagnostics = build_output_policy_diagnostics(
+                raw_verdict=verdict,
+                final_verdict=verdict,
+                final_output_kind=_blocked_final_output_kind(verdict),
+                hard_block_reason_codes=list(verdict.reason_codes),
+                soft_rewrite_reason_codes=[],
+            )
         else:
-            verdict, response_type = _evaluate_copilot_final_output_policy(ctx, agent_output)
+            verdict, response_type, diagnostics = _evaluate_copilot_final_output_policy(ctx, agent_output)
         trace_data = output_policy_verdict_to_trace_data(
             verdict,
             surface="agent_output",
             response_type=response_type,
         )
+        trace_data.update(diagnostics)
         LOG.info("copilot output policy guardrail verdict", **trace_data)
         return GuardrailFunctionOutputCls(output_info=trace_data, tripwire_triggered=not verdict.allowed)
 
@@ -1292,11 +1345,30 @@ def _output_policy_verdict_from_guardrail_exception(exc: BaseException) -> Outpu
     return output_policy_verdict_from_trace_data(getattr(guardrail_output, "output_info", None))
 
 
+def _output_policy_diagnostics_from_guardrail_exception(exc: BaseException) -> dict[str, Any] | None:
+    guardrail_result = getattr(exc, "guardrail_result", None)
+    guardrail_output = getattr(guardrail_result, "output", None)
+    data = getattr(guardrail_output, "output_info", None)
+    if not isinstance(data, dict):
+        return None
+    keys = {
+        "raw_output_kind",
+        "final_output_kind",
+        "hard_block_reason_codes",
+        "soft_rewrite_reason_codes",
+        "raw_would_have_failed",
+        "contained_failure",
+        "final_output_policy_allowed",
+    }
+    return {key: data[key] for key in keys if key in data}
+
+
 def _build_output_policy_blocked_result(
     ctx: CopilotContext,
     verdict: OutputPolicyVerdict,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
+    output_policy_diagnostics: dict[str, Any] | None = None,
 ) -> AgentResult:
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
@@ -1340,6 +1412,14 @@ def _build_output_policy_blocked_result(
         # Policy blocks invalidate any currently staged proposal. The prior
         # YAML is retained for context, but the accept UI should not stay armed.
         clear_proposed_workflow=True,
+        output_policy_diagnostics=output_policy_diagnostics
+        or build_output_policy_diagnostics(
+            raw_verdict=verdict,
+            final_verdict=verdict,
+            final_output_kind=_blocked_final_output_kind(verdict),
+            hard_block_reason_codes=list(verdict.reason_codes),
+            soft_rewrite_reason_codes=[],
+        ),
     )
 
 
@@ -1690,6 +1770,7 @@ async def _run_copilot_turn_impl(
                     _output_policy_verdict_from_guardrail_exception(exc),
                     prior_global_llm_context=global_llm_context,
                     prior_workflow_yaml=chat_request.workflow_yaml,
+                    output_policy_diagnostics=_output_policy_diagnostics_from_guardrail_exception(exc),
                 )
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)

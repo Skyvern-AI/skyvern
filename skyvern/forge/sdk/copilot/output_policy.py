@@ -233,6 +233,27 @@ def output_policy_verdict_to_trace_data(
     return data
 
 
+def build_output_policy_diagnostics(
+    *,
+    raw_verdict: OutputPolicyVerdict,
+    final_verdict: OutputPolicyVerdict,
+    final_output_kind: CopilotOutputKind,
+    hard_block_reason_codes: list[OutputPolicyReason],
+    soft_rewrite_reason_codes: list[OutputPolicyReason],
+) -> dict[str, Any]:
+    raw_would_have_failed = bool(raw_verdict.reason_codes)
+    contained_failure = bool(hard_block_reason_codes or soft_rewrite_reason_codes)
+    return {
+        "raw_output_kind": raw_verdict.output_kind.value,
+        "final_output_kind": final_output_kind.value,
+        "hard_block_reason_codes": [reason.value for reason in hard_block_reason_codes],
+        "soft_rewrite_reason_codes": [reason.value for reason in soft_rewrite_reason_codes],
+        "raw_would_have_failed": raw_would_have_failed,
+        "contained_failure": raw_would_have_failed and contained_failure,
+        "final_output_policy_allowed": final_verdict.allowed,
+    }
+
+
 def output_policy_verdict_from_trace_data(data: Any) -> OutputPolicyVerdict:
     if not isinstance(data, dict):
         return OutputPolicyVerdict(

@@ -133,6 +133,7 @@ class AgentResult:
     cancelled: bool = False
     # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
     unvalidated: bool = False
+    output_policy_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass
