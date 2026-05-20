@@ -5,7 +5,7 @@ from fastapi import Depends, HTTPException, status
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
 from skyvern.core.script_generations.script_skyvern_page import ScriptSkyvernPage
-from skyvern.exceptions import ScrapingFailed
+from skyvern.exceptions import ScrapingFailed, SkyvernActionFailed
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import validate_download_url
 from skyvern.forge.sdk.core import skyvern_context
@@ -242,6 +242,19 @@ async def run_sdk_action(
             error=str(e),
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.reason or str(e))
+    except SkyvernActionFailed as e:
+        await app.DATABASE.tasks.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.failed,
+            failure_reason=e.reason,
+        )
+        LOG.warning(
+            "SDK action failed",
+            action_type=action.type,
+            error=e.reason,
+        )
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=e.reason)
     except Exception as e:
         await app.DATABASE.tasks.update_task(
             task_id=task.task_id,

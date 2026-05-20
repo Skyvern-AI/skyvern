@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from skyvern.core.script_generations.real_skyvern_page_ai import RealSkyvernPageAi
+from skyvern.exceptions import SkyvernActionFailed
 
 
 @pytest.fixture
@@ -84,26 +85,26 @@ class TestAiClickEmptyActions:
                 return_value="mock_prompt",
             ),
         ):
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(SkyvernActionFailed) as exc_info:
                 await real_skyvern_page_ai.ai_click(
-                    selector=None,  # No fallback selector
+                    selector=None,
                     intention="Click the download button",
                 )
 
-            # Should raise because no actions and no fallback
             assert "AI click failed" in str(exc_info.value) or "AI could not find" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_ai_click_raises_when_llm_call_fails_no_selector(
+    async def test_ai_click_propagates_unknown_exception_when_no_selector(
         self, mock_page, mock_scraped_page, mock_context, mock_app
     ):
         """
-        When AI fails (exception) and there's no selector to fall back to,
-        ai_click should raise an exception.
+        When the AI path raises a non-operational exception (LLM down, etc.) and
+        there's no selector to fall back to, the original exception should
+        propagate so the caller surfaces it as a 500, not a 422.
         """
         real_skyvern_page_ai = RealSkyvernPageAi(mock_scraped_page, mock_page)
 
-        mock_app.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(side_effect=Exception("LLM error"))
+        mock_app.SINGLE_CLICK_AGENT_LLM_API_HANDLER = AsyncMock(side_effect=RuntimeError("LLM provider down"))
 
         with (
             patch.object(real_skyvern_page_ai, "_refresh_scraped_page", new_callable=AsyncMock),
@@ -117,13 +118,14 @@ class TestAiClickEmptyActions:
                 return_value="mock_prompt",
             ),
         ):
-            with pytest.raises(Exception) as exc_info:
+            with pytest.raises(RuntimeError) as exc_info:
                 await real_skyvern_page_ai.ai_click(
-                    selector=None,  # No fallback selector
+                    selector=None,
                     intention="Click the download button",
                 )
 
-            assert "AI click failed" in str(exc_info.value)
+            assert "LLM provider down" in str(exc_info.value)
+            assert not isinstance(exc_info.value, SkyvernActionFailed)
 
     @pytest.mark.asyncio
     async def test_ai_click_falls_back_to_selector_when_llm_returns_empty(
