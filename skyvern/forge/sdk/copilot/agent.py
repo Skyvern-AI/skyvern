@@ -53,6 +53,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, build_turn_intent
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -130,6 +131,10 @@ class RequestPolicyGuardrailInputs:
     organization_id: str
     handler: Any
     previous_user_message: str | None = None
+    workflow_id: str | None = None
+    workflow_permanent_id: str | None = None
+    workflow_run_id: str | None = None
+    browser_session_id: str | None = None
 
 
 _BLOCK_GOAL_CONTEXT_PREAMBLE = (
@@ -272,6 +277,27 @@ def _store_request_policy_on_context(
         chat_history_text=policy_chat_history_text,
         global_llm_context=policy_inputs.global_llm_context,
     )
+    ctx.turn_intent = build_turn_intent(
+        user_message=policy_inputs.user_message,
+        workflow_yaml=policy_inputs.workflow_yaml,
+        chat_history=policy_inputs.chat_history_messages,
+        global_llm_context=policy_inputs.global_llm_context,
+        request_policy=policy,
+        workflow_id=policy_inputs.workflow_id,
+        workflow_permanent_id=policy_inputs.workflow_permanent_id,
+        workflow_run_id=policy_inputs.workflow_run_id,
+        browser_session_id=policy_inputs.browser_session_id,
+    )
+
+
+def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
+    if not isinstance(intent, TurnIntent):
+        return {}
+    return {f"turn_intent_{key}": value for key, value in intent.to_trace_data().items()}
+
+
+def _turn_intent_trace_fields(intent: TurnIntent | None) -> dict[str, str]:
+    return {key: str(value) for key, value in _turn_intent_log_fields(intent).items()}
 
 
 def _build_system_prompt(
@@ -1172,12 +1198,14 @@ def _build_copilot_input_guardrails(
                 _store_request_policy_on_context(ctx, policy, policy_inputs)
         blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
         if isinstance(policy, RequestPolicy):
+            turn_intent = ctx.turn_intent if isinstance(ctx, CopilotContext) else None
             trace_data = {
                 "surface": "agent_input",
                 "policy_present": True,
                 "blocked": blocked,
                 "user_response_policy": policy.user_response_policy,
                 **policy.to_trace_data(),
+                **_turn_intent_log_fields(turn_intent),
             }
         else:
             trace_data = {"surface": "agent_input", "blocked": False, "policy_present": False}
@@ -1386,6 +1414,10 @@ async def _run_copilot_turn_impl(
         organization_id=organization_id,
         handler=_resolve_request_policy_handler(llm_api_handler),
         previous_user_message=previous_user_message,
+        workflow_id=chat_request.workflow_id,
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        workflow_run_id=getattr(chat_request, "workflow_run_id", None),
+        browser_session_id=getattr(chat_request, "browser_session_id", None),
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
         InputGuardrail,
@@ -1502,6 +1534,7 @@ async def _run_copilot_turn_impl(
                 "llm_key": llm_key,
                 "user_message_len": str(len(user_message)),
                 **{f"request_policy_{key}": str(value) for key, value in request_policy.to_trace_data().items()},
+                **_turn_intent_trace_fields(ctx.turn_intent),
             },
         )
 
