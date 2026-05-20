@@ -348,6 +348,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
+    if tool_name == "update_and_run_blocks" and data.get("skipped_run"):
+        return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
     if tool_name == "list_credentials":
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "get_block_schema":

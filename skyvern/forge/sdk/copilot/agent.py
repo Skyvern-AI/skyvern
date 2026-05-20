@@ -52,7 +52,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     parse_final_response,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.request_policy import (
+    CREDENTIAL_DEFERRED_DRAFT_REASONS,
+    RequestPolicy,
+    build_request_policy,
+    redact_raw_secrets_for_prompt,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent, build_turn_intent
@@ -365,6 +370,10 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "\n\nREQUEST POLICY:\n```yaml\n"
             + policy_summary
             + "\n```\nFollow this policy. If `allow_run_blocks` is false, do not call block-running tools. "
+            + "Exception: when `clarification_reason` is `workflow_credential_inputs_unbound` or "
+            + "`credential_name_unresolved` and "
+            + "`allow_missing_credentials_in_draft` is true, call `update_and_run_blocks`; it will save the draft "
+            + "workflow and skip the browser run with a credential setup message. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
 
@@ -501,9 +510,25 @@ def _turn_intent_disables_tools(turn_intent: TurnIntent | None) -> bool:
     return not authority.may_update_workflow and not authority.may_run_blocks
 
 
-def _native_tools_for_turn(native_tools: list[Any], turn_intent: TurnIntent | None) -> list[Any]:
+def _request_policy_requires_update_and_run_skip_path(request_policy: RequestPolicy | None) -> bool:
+    return (
+        isinstance(request_policy, RequestPolicy)
+        and request_policy.allow_update_workflow
+        and not request_policy.allow_run_blocks
+        and request_policy.allow_missing_credentials_in_draft
+        and request_policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
+    )
+
+
+def _native_tools_for_turn(
+    native_tools: list[Any],
+    turn_intent: TurnIntent | None,
+    request_policy: RequestPolicy | None = None,
+) -> list[Any]:
     if _turn_intent_disables_tools(turn_intent):
         return []
+    if _request_policy_requires_update_and_run_skip_path(request_policy):
+        return [tool for tool in native_tools if getattr(tool, "name", None) != "update_workflow"]
     return list(native_tools)
 
 
@@ -1637,7 +1662,7 @@ async def _run_copilot_turn_impl(
         alias_map = {}
         overlays = {}
 
-    native_tools = _native_tools_for_turn(NATIVE_TOOLS, ctx.turn_intent)
+    native_tools = _native_tools_for_turn(list(NATIVE_TOOLS), ctx.turn_intent, ctx.request_policy)
     tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
 

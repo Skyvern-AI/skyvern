@@ -64,11 +64,16 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent
+from skyvern.forge.sdk.copilot.turn_intent import (
+    NO_MUTATION_TURN_INTENT_MODES,
+    UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
+    TurnIntent,
+    TurnIntentMode,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -822,64 +827,181 @@ def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):
         return None
+    error: str | None = None
     if tool_name == "update_workflow" and not policy.allow_update_workflow:
-        return (
+        error = (
             "Request policy blocks workflow updates for the latest user message. "
             "Ask the user for safe stored credential metadata instead."
         )
-    if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
+    elif tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
         if policy.testing_intent == "skip_test":
-            return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
-        if policy.clarification_reason == "workflow_credential_inputs_unbound":
-            return (
+            error = "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        elif policy.clarification_reason == "workflow_credential_inputs_unbound":
+            error = (
                 "Skipped test run: the existing workflow references credential parameters "
                 "whose keys point to workflow inputs that are not configured. REPLY to the user "
                 "with: 'I applied your requested change. I couldn't test the modified workflow "
                 "because I couldn't find the required credentials — please add them via the "
                 "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
             )
-        return (
-            "Request policy blocks block-running tools for the latest user message. "
-            "Ask the user for the required safe credential or clarification before testing."
+        else:
+            error = (
+                "Request policy blocks block-running tools for the latest user message. "
+                "Ask the user for the required safe credential or clarification before testing."
+            )
+    if error is not None:
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="request_policy",
+            blocked_tool=tool_name,
+            request_policy_allow_update_workflow=policy.allow_update_workflow,
+            request_policy_allow_run_blocks=policy.allow_run_blocks,
+            request_policy_testing_intent=policy.testing_intent,
+            request_policy_clarification_reason=policy.clarification_reason,
         )
+        return error
     return None
+
+
+def _request_policy_allows_credential_deferred_draft(ctx: AgentContext) -> bool:
+    policy = getattr(ctx, "request_policy", None)
+    return (
+        isinstance(policy, RequestPolicy)
+        and policy.allow_update_workflow
+        and not policy.allow_run_blocks
+        and policy.allow_missing_credentials_in_draft
+        and policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
+    )
+
+
+def _request_policy_allows_update_and_skip_run(ctx: AgentContext, tool_name: str) -> bool:
+    return tool_name == "update_and_run_blocks" and _request_policy_allows_credential_deferred_draft(ctx)
+
+
+def _turn_intent_has_edit_target(intent: TurnIntent) -> bool:
+    # Keep this aligned with TurnIntent target kinds that make an edit specific enough to mutate safely.
+    return any(
+        intent.target_entities.get(entity_type)
+        for entity_type in (
+            "workflow",
+            "block",
+            "run",
+            "proposed_workflow",
+            "latest_assistant_proposal",
+        )
+    )
 
 
 def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     intent = getattr(ctx, "turn_intent", None)
-    if not isinstance(intent, TurnIntent) or intent.mode not in NO_MUTATION_TURN_INTENT_MODES:
+    if not isinstance(intent, TurnIntent):
         return None
 
     authority = intent.authority
-    if authority.may_update_workflow or authority.may_run_blocks:
-        return None
+    unresolved_refs = intent.target_entities.get(UNRESOLVED_BLOCK_REF_TARGET_ENTITY, [])
+    if intent.mode == TurnIntentMode.EDIT and tool_name in WORKFLOW_MUTATION_TOOLS and unresolved_refs:
+        reason_code = "turn_intent_unresolved_edit_target"
+        labels = sorted(_workflow_yaml_blocks_by_label(getattr(ctx, "workflow_yaml", None)))
+        label_hint = ", ".join(labels[:8]) if labels else "no labeled blocks"
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="turn_intent",
+            turn_intent_mode=intent.mode.value,
+            turn_intent_target_entity_types=sorted(intent.target_entities),
+            turn_intent_unresolved_refs=unresolved_refs,
+            blocked_tool=tool_name,
+            safe_reason_code=reason_code,
+        )
+        return (
+            f"TurnIntent classified this turn as `edit`, but the latest user message references workflow/block "
+            f"identifier(s) that are not present in the current workflow: {', '.join(unresolved_refs)}. "
+            f"Current workflow labels include: {label_hint}. Ask the user which current block should change before "
+            f"mutating or running blocks. safe_reason_code={reason_code}."
+        )
+
+    if (
+        intent.mode == TurnIntentMode.EDIT
+        and tool_name in WORKFLOW_MUTATION_TOOLS
+        and not _turn_intent_has_edit_target(intent)
+    ):
+        reason_code = "turn_intent_missing_edit_target"
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="turn_intent",
+            turn_intent_mode=intent.mode.value,
+            turn_intent_target_entity_types=sorted(intent.target_entities),
+            blocked_tool=tool_name,
+            safe_reason_code=reason_code,
+        )
+        return (
+            f"TurnIntent classified this turn as `edit`, but could not identify a specific workflow edit target, "
+            f"so `{tool_name}` is not allowed. Ask the user which workflow/block should change before mutating. "
+            f"safe_reason_code={reason_code}."
+        )
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
     blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
     blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS
+    if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
+        return None
     if not blocks_update and not blocks_run and not blocks_context_read:
         return None
 
-    if blocks_run:
+    if intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_run:
+        reason_code = "turn_intent_no_mutation_run_blocked"
+    elif intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_update:
+        reason_code = "turn_intent_no_mutation_update_blocked"
+    elif blocks_update and blocks_run:
         reason_code = "turn_intent_no_mutation_run_blocked"
     elif blocks_update:
-        reason_code = "turn_intent_no_mutation_update_blocked"
-    else:
+        reason_code = "turn_intent_update_blocked"
+    elif blocks_context_read:
         reason_code = "turn_intent_no_mutation_context_read_blocked"
+    else:
+        reason_code = "turn_intent_run_blocked"
     LOG.info(
-        "copilot turn intent no-mutation gate blocked tool",
+        "copilot authority gate blocked tool",
+        authority_gate_layer="turn_intent",
         turn_intent_mode=intent.mode.value,
+        turn_intent_target_entity_types=sorted(intent.target_entities),
+        turn_intent_may_update_workflow=authority.may_update_workflow,
+        turn_intent_may_run_blocks=authority.may_run_blocks,
         blocked_tool=tool_name,
         safe_reason_code=reason_code,
     )
     action = "ask the user" if authority.requires_user_input else "answer the user"
     detail = f" Ask: {intent.missing_context_question}" if intent.missing_context_question else ""
+    if blocks_run and not blocks_update and authority.may_update_workflow:
+        return (
+            f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
+            f"to run browser blocks for the latest user message. Use `update_workflow` only and keep the draft "
+            f"unvalidated. safe_reason_code={reason_code}.{detail}"
+        )
     return (
         f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
         "for the latest user message. Do not update workflow YAML or run browser blocks, and do not "
         f"fetch additional run context with tools; {action} using the available context instead. "
         f"safe_reason_code={reason_code}.{detail}"
     )
+
+
+def _authority_tool_error(
+    ctx: AgentContext,
+    tool_name: str,
+    *,
+    ignore_request_policy_error: bool = False,
+) -> str | None:
+    turn_intent_error = _turn_intent_tool_error(ctx, tool_name)
+    request_policy_error = _request_policy_tool_error(ctx, tool_name)
+    if turn_intent_error is not None and request_policy_error is not None:
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="both",
+            blocked_tool=tool_name,
+        )
+    if request_policy_error is not None and not ignore_request_policy_error:
+        return request_policy_error
+    return turn_intent_error
 
 
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
@@ -963,13 +1085,9 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
-    turn_intent_error = _turn_intent_tool_error(ctx, "update_workflow")
-    if turn_intent_error is not None:
-        return {"ok": False, "error": turn_intent_error}
-
-    policy_error = _request_policy_tool_error(ctx, "update_workflow")
-    if policy_error is not None:
-        return {"ok": False, "error": policy_error}
+    authority_error = _authority_tool_error(ctx, "update_workflow")
+    if authority_error is not None:
+        return {"ok": False, "error": authority_error}
 
     workflow_yaml = params["workflow_yaml"]
     if allow_missing_credentials is None:
@@ -3824,6 +3942,16 @@ async def update_workflow_tool(
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    if _request_policy_allows_credential_deferred_draft(copilot_ctx):
+        result = {
+            "ok": False,
+            "error": (
+                "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
+                "and skip the browser run with the required credential setup message."
+            ),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        return json.dumps(result)
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
@@ -3928,13 +4056,9 @@ async def run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
-    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
-    if turn_intent_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", turn_intent_error)
-
-    policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
-    if policy_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", policy_error)
+    authority_error = _authority_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
@@ -4055,20 +4179,14 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
-    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "update_and_run_blocks")
-    if turn_intent_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", turn_intent_error)
-
-    policy = getattr(copilot_ctx, "request_policy", None)
-    skip_run_after_update = (
-        isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.clarification_reason == "workflow_credential_inputs_unbound"
+    skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    authority_error = _authority_tool_error(
+        copilot_ctx,
+        "update_and_run_blocks",
+        ignore_request_policy_error=skip_run_after_update,
     )
-    policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
-    if not skip_run_after_update and policy_error:
-        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", policy_error)
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", authority_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
@@ -4092,7 +4210,7 @@ async def update_and_run_blocks_tool(
         update_result = await _update_workflow(
             {"workflow_yaml": workflow_yaml},
             copilot_ctx,
-            allow_missing_credentials=False,
+            allow_missing_credentials=skip_run_after_update,
         )
         _record_workflow_update_result(copilot_ctx, update_result)
 
@@ -4127,10 +4245,10 @@ async def update_and_run_blocks_tool(
         return json.dumps(result)
 
     if skip_run_after_update:
-        skip_message = policy_error or "Skipped test run: required credentials are not configured."
+        skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
-            "ok": False,
-            "error": skip_message,
+            "ok": True,
+            "message": skip_message,
             "data": {
                 "block_count": copilot_ctx.last_update_block_count,
                 "workflow_updated": True,

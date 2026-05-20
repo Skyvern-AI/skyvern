@@ -40,6 +40,9 @@ ClarificationReason = Literal[
     "workflow_credential_inputs_unbound",
 ]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
+CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
+    {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
+)
 _PRE_RESOLUTION_CLARIFICATION_REASONS = {
     "credential_invention_requested",
     "ambiguous_loop_edit",
@@ -64,9 +67,10 @@ _RAW_SECRET_QUESTION = (
 )
 _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
-_STORED_CREDENTIAL_URL_QUESTION = (
-    f"Which website or login page should I use to look up the stored credential? {_CREDENTIALS_UI_DIRECTIONS}"
+_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
+    "Which website or login page should I use to look up the stored credential?"
 )
+_STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
@@ -614,7 +618,10 @@ def _last_assistant_message_was_saved_credential_question(
 ) -> bool:
     for message in reversed(chat_history):
         if message.sender == WorkflowCopilotChatSender.AI:
-            return _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX in message.content
+            return (
+                _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX in message.content
+                or _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX in message.content
+            )
     return False
 
 
@@ -637,11 +644,12 @@ def _should_defer_repeated_unresolved_credential_question(
     *,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
 ) -> bool:
+    if not _last_assistant_message_was_saved_credential_question(chat_history):
+        return False
     return (
         policy.credential_input_kind in ("none", "credential_name")
         and policy.clarification_reason == "credential_name_unresolved"
         and not _has_resolvable_credential_scope(policy)
-        and _last_assistant_message_was_saved_credential_question(chat_history)
     )
 
 
@@ -872,6 +880,7 @@ async def build_request_policy(
         chat_history=chat_history,
     ):
         policy.requires_user_clarification = False
+        policy.allow_update_workflow = True
         policy.allow_run_blocks = False
         policy.allow_missing_credentials_in_draft = True
 
