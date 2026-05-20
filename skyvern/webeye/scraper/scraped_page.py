@@ -308,9 +308,24 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             return element_str[: int(len(element_str) * percent_to_keep)]
 
         if fmt == ElementTreeFormat.HTML:
+            elements_to_render = self.economy_element_tree
+            if percent_to_keep < 1:
+                # Portals (popper menus, dialogs) are appended near the end of
+                # <body> and appear last in the root-level list. A naïve front
+                # slice drops them disproportionately. Move overlay root elements
+                # to the front so they survive character-level truncation.
+                overlay_roots = [e for e in self.economy_element_tree if self._element_subtree_has_overlay(e)]
+                if overlay_roots:
+                    regular_roots = [e for e in self.economy_element_tree if not self._element_subtree_has_overlay(e)]
+                    elements_to_render = overlay_roots + regular_roots
+                    LOG.info(
+                        "economy_tree_portal_priority: moved overlay roots to front before truncation",
+                        overlay_count=len(overlay_roots),
+                        regular_count=len(regular_roots),
+                        percent_to_keep=percent_to_keep,
+                    )
             element_str = "".join(
-                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
-                for element in self.economy_element_tree
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in elements_to_render
             )
             result = element_str[: int(len(element_str) * percent_to_keep)]
             self.last_used_element_tree_html = result
@@ -336,6 +351,22 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
                     new_children.append(processed_child)
             element["children"] = new_children
         return element
+
+    @staticmethod
+    def _element_subtree_has_overlay(element: dict, _depth: int = 0) -> bool:
+        """Return True if this element or any descendant carries role=listbox/option.
+
+        These roles are preserved by `_trimmed_attributes` and are reliable
+        indicators of popper/dialog portal content.  Recursion is limited to
+        avoid spending time walking deep table trees — portals are typically
+        shallow (1-3 levels).
+        """
+        if _depth > 4:
+            return False
+        role = (element.get("attributes") or {}).get("role", "")
+        if role in ("listbox", "option"):
+            return True
+        return any(ScrapedPage._element_subtree_has_overlay(child, _depth + 1) for child in element.get("children", []))
 
     def build_lean_elements_tree(
         self,
