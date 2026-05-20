@@ -299,6 +299,35 @@ def _schedule_summary_shadow_check_for_hit(
     )
 
 
+async def _build_open_tabs_context(
+    browser_state: BrowserState,
+    working_page: Page | None,
+) -> str | None:
+    if working_page is None:
+        return None
+    pages = await browser_state.list_valid_pages()
+    if len(pages) <= 1:
+        return None
+    lines: list[str] = []
+    for i, p in enumerate(pages):
+        marker = " [current]" if p == working_page else ""
+        url = p.url
+        try:
+            title = await asyncio.wait_for(p.title(), timeout=1.0)
+        except Exception:
+            LOG.debug("tab_title_fetch_failed", url=url)
+            title = ""
+        if len(url) > 120:
+            url = url[:117] + "..."
+        if len(title) > 80:
+            title = title[:77] + "..."
+        entry = f"Tab {i}{marker}: {url}"
+        if title:
+            entry += f" ({title})"
+        lines.append(entry)
+    return "\n".join(lines)
+
+
 def _build_totp_timeout_reasoning(task: Task) -> str:
     # Mirror poll_otp_value's URL-then-identifier precedence so we only report the
     # source that was actually queried. URL goes through strip_query_params to keep
@@ -3245,19 +3274,19 @@ class ForgeAgent:
     @staticmethod
     def _build_extract_action_cache_variant(
         verification_code_check: bool,
-        has_magic_link_page: bool,
+        show_close_page_action: bool,
         complete_criterion: str | None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, magic link flows, complete criteria) do not reuse the
-        same Vertex cache object.
+        differ meaningfully (OTP, close-page availability, complete criteria) do not reuse
+        the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
             variant_parts.append("vc")
-        if has_magic_link_page:
-            variant_parts.append("ml")
+        if show_close_page_action:
+            variant_parts.append("cp")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
@@ -3527,6 +3556,9 @@ class ForgeAgent:
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
+        open_tabs_context = await _build_open_tabs_context(browser_state, page)
+        show_close_page_action = open_tabs_context is not None
+
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
         recent_dialog_messages_str = (
@@ -3550,12 +3582,13 @@ class ForgeAgent:
                     "verification_code_check": verification_code_check,
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
-                    "has_magic_link_page": context.has_magic_link_page(task.task_id),
+                    "show_close_page_action": show_close_page_action,
+                    "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
-                    has_magic_link_page=context.has_magic_link_page(task.task_id),
+                    show_close_page_action=show_close_page_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
@@ -3641,7 +3674,8 @@ class ForgeAgent:
             verification_code_check=verification_code_check,
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
-            has_magic_link_page=context.has_magic_link_page(task.task_id),
+            show_close_page_action=show_close_page_action,
+            open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
             # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
             # (default html_need_skyvern_attrs=True) — the planner emits

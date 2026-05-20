@@ -34,6 +34,12 @@ User details:
 {{ navigation_payload_str }}
 ```
 
+{% if open_tabs_context %}
+Open browser tabs (CLOSE_PAGE always closes the tab marked [current] — other tabs are shown for context only):
+```
+{{ open_tabs_context }}
+```
+{% endif %}
 Clickable elements from `{{ current_url }}`:
 ```
 {{ elements }}
