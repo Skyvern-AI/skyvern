@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
+    RAW_SECRET_REFUSAL_SENTINEL,
     _raw_secret_detected,
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
@@ -115,3 +118,26 @@ class TestRawSecretBackstop:
 
     def test_actual_api_key_still_trips_backstop(self) -> None:
         assert _raw_secret_detected("The api_key = sk-abcdefghijklmnopqrstuvwxyz1234567890.") is True
+
+
+class TestRawSecretRefusalSentinelConsistency:
+    """Transcript redaction recognizes a prior raw-secret refusal by the sentinel
+    substring; every path that emits such a refusal must keep the phrase verbatim
+    or the redaction silently stops triggering."""
+
+    def test_request_policy_refusal_carries_sentinel(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import _RAW_SECRET_QUESTION
+
+        assert RAW_SECRET_REFUSAL_SENTINEL in _RAW_SECRET_QUESTION
+
+    def test_output_policy_raw_secret_leak_refusal_carries_sentinel(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _RAW_SECRET_LEAK_REFUSAL
+
+        assert RAW_SECRET_REFUSAL_SENTINEL in _RAW_SECRET_LEAK_REFUSAL
+
+    def test_agent_prompt_templates_carry_sentinel(self) -> None:
+        import skyvern
+
+        prompts_dir = Path(skyvern.__file__).parent / "forge" / "prompts" / "skyvern"
+        for template in ("workflow-copilot-system.j2", "workflow-copilot-agent.j2"):
+            assert RAW_SECRET_REFUSAL_SENTINEL in (prompts_dir / template).read_text()
