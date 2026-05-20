@@ -59,11 +59,13 @@ _REASONS_OVERRIDDEN_BY_CREDENTIAL_REFS = {
 _CREDENTIALS_UI_DIRECTIONS = (
     f"You can find or add saved credentials at {settings.SKYVERN_APP_URL.rstrip('/')}/credentials."
 )
+# Stable tail of every raw-secret refusal; transcript redaction keys off it, so all refusal emitters must keep it verbatim.
+RAW_SECRET_REFUSAL_SENTINEL = "DO NOT PROVIDE RAW LOGIN/PASSWORD"
 _RAW_SECRET_QUESTION = (
     "Please do not paste raw login credentials or secrets in chat because they can enter model telemetry and execution traces. "
     "Store the credential in the Skyvern Credentials UI and reply with its exact saved credential name or a credential ID beginning with cred_. "
     f"{_CREDENTIALS_UI_DIRECTIONS} "
-    "DO NOT PROVIDE RAW LOGIN/PASSWORD."
+    f"{RAW_SECRET_REFUSAL_SENTINEL}."
 )
 _SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX = "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_."
 _SAVED_CREDENTIAL_NAME_QUESTION = f"{_SAVED_CREDENTIAL_NAME_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
@@ -170,6 +172,7 @@ TRANSCRIPT_ANCHOR_CHAR_CAP = 512
 _TRANSCRIPT_RETAINED_MIN_CHARS = 512
 _TRANSCRIPT_MARKER_RESERVE = 32
 _EMPTY_SLOT_SENTINEL = "(none)"
+_REDACTED_REFUSED_SECRET_TURN = "[raw credentials redacted — this turn was refused]"
 
 
 @dataclass(frozen=True)
@@ -202,6 +205,27 @@ def _safe_slot(text: str | None, cap: int) -> str:
     return _middle_truncate(escape_code_fences(redact_raw_secrets_for_prompt(bounded)), cap)
 
 
+def _redact_refused_secret_turns(
+    messages: list[WorkflowCopilotChatHistoryMessage],
+) -> list[WorkflowCopilotChatHistoryMessage]:
+    """Replace the content of any user turn answered with the raw-secret refusal.
+
+    A confirmed raw-credential paste is redacted by conversation position — the
+    refusal is a deterministic marker — so a leaked secret cannot bias a later
+    turn's classification regardless of the syntax the user pasted it in.
+    """
+    redacted = list(messages)
+    for i in range(len(redacted) - 1):
+        current, following = redacted[i], redacted[i + 1]
+        if (
+            current.sender == WorkflowCopilotChatSender.USER
+            and following.sender == WorkflowCopilotChatSender.AI
+            and RAW_SECRET_REFUSAL_SENTINEL in (following.content or "")
+        ):
+            redacted[i] = current.model_copy(update={"content": _REDACTED_REFUSED_SECRET_TURN})
+    return redacted
+
+
 def build_transcript_context(
     messages: list[WorkflowCopilotChatHistoryMessage],
     current_user_message: str,
@@ -226,6 +250,8 @@ def build_transcript_context(
         and current_stripped
     ):
         filtered = filtered[:-1]
+
+    filtered = _redact_refused_secret_turns(filtered)
 
     user_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.USER]
     ai_indices = [i for i, m in enumerate(filtered) if m.sender == WorkflowCopilotChatSender.AI]

@@ -12,6 +12,7 @@ import pytest
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import (
+    _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     _classify_request,
     build_transcript_context,
@@ -1337,6 +1338,57 @@ class TestRequestPolicyCredentialResolution:
         get_credentials_by_ids.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_prior_turn_raw_password_does_not_leak_into_classifier_prompt(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[]))),
+        )
+
+        captured: dict[str, str] = {}
+
+        async def handler(*, prompt: str, prompt_name: str) -> str:
+            captured["prompt"] = prompt
+            return json.dumps(
+                {
+                    "testing_intent": "unspecified",
+                    "credential_input_kind": "credential_name",
+                    "credential_refs": [],
+                    "login_page_urls": [],
+                    "requires_user_clarification": True,
+                    "clarification_reason": "credential_name_unresolved",
+                    "completion_contract": None,
+                }
+            )
+
+        chat_history = _history(
+            ("user", "wait."),
+            ("ai", "What is the URL of the web browser game?"),
+            ("user", "https://example.com/"),
+            ("ai", "The URL redirected to https://www.poki.com/. Confirm?"),
+            ("user", "Now, log in to account demo, password ac3O4/30"),
+            ("ai", "DO NOT PROVIDE RAW LOGIN/PASSWORD."),
+        )
+
+        policy = await build_request_policy(
+            user_message="Navigate to https://example.com and login with the given credentials.",
+            workflow_yaml="",
+            chat_history=chat_history,
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert "ac3O4/30" not in captured["prompt"]
+        assert policy.raw_secret_detected is False
+        assert policy.credential_input_kind == "credential_name"
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" not in (policy.clarification_question or "")
+        assert policy.clarification_question and "Which saved credential" in policy.clarification_question
+
+    @pytest.mark.asyncio
     async def test_bulk_colon_delimited_credentials_refuse_before_model_classification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
@@ -2274,6 +2326,39 @@ class TestRequestPolicyTranscriptContext:
             transcript.retained_history,
         ):
             assert "hunter2" not in slot
+
+    def test_refused_raw_secret_turn_is_redacted_by_position(self) -> None:
+        # The space-separated form is not matched by the raw-secret regex; the
+        # turn is still redacted because the next turn is the raw-secret refusal.
+        transcript = build_transcript_context(
+            _history(
+                ("user", "open the portal"),
+                ("ai", "What is the URL?"),
+                ("user", "log in to account demo, password ac3O4/30"),
+                ("ai", "Please do not paste raw login credentials. DO NOT PROVIDE RAW LOGIN/PASSWORD."),
+            ),
+            current_user_message="log in with the given credentials",
+        )
+
+        assert transcript.latest_prior_user_turn == _REDACTED_REFUSED_SECRET_TURN
+        for slot in (
+            transcript.earliest_user_turn,
+            transcript.latest_prior_user_turn,
+            transcript.latest_assistant_turn,
+            transcript.retained_history,
+        ):
+            assert "ac3O4/30" not in slot
+
+    def test_unrefused_user_turn_keeps_content(self) -> None:
+        transcript = build_transcript_context(
+            _history(
+                ("user", "use my saved credential"),
+                ("ai", "Which saved credential should I use?"),
+            ),
+            current_user_message="the bank one",
+        )
+
+        assert transcript.latest_prior_user_turn == "use my saved credential"
 
     def test_fence_breakout_is_neutralized(self) -> None:
         transcript = build_transcript_context(
