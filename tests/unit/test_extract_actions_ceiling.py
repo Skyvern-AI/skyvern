@@ -34,7 +34,8 @@ def test_extract_action_ceiling_drops_action_history_on_overshoot() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        has_magic_link_page=False,
+        show_close_page_action=False,
+        open_tabs_context=None,
     )
 
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
@@ -61,7 +62,8 @@ def test_extract_action_small_prompt_passes_through() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        has_magic_link_page=False,
+        show_close_page_action=False,
+        open_tabs_context=None,
     )
 
     assert "small history" in rendered
