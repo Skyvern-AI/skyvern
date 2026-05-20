@@ -37,6 +37,33 @@ from skyvern.webeye.scraper.scraped_page import (
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+async def build_scraping_failed_reason(browser_state: BrowserState, requested_url: str) -> str:
+    """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
+
+    Query strings are stripped because OAuth/SSO URLs commonly carry secrets in query params.
+    """
+    safe_requested = strip_query_params(requested_url)
+    safe_landed: str | None = None
+    try:
+        page = await browser_state.get_working_page()
+        if page is not None and page.url:
+            safe_landed = strip_query_params(page.url)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("Could not resolve landed URL for ScrapingFailed reason", exc_info=True)
+
+    base = (
+        "Skyvern failed to load the website. "
+        "The page may have navigated unexpectedly or become unresponsive during analysis."
+    )
+    if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
+        return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
+    return f"{base} URL: {safe_requested}."
+
+
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
@@ -204,7 +231,7 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise ScrapingFailed() from e
+                raise ScrapingFailed(reason=await build_scraping_failed_reason(browser_state, url)) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
         return await scrape_website(
