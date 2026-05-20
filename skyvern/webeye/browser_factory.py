@@ -389,6 +389,7 @@ class BrowserContextFactory:
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
+            await app.AGENT_FUNCTION.setup_browser_context_extensions(browser_context=browser_context, **kwargs)
 
             proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
             if proxy_location is not None:

@@ -535,6 +535,9 @@ class AgentFunction:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
 
+    async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
+        """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
+
     async def validate_step_execution(
         self,
         task: Task,
