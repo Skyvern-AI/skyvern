@@ -256,6 +256,13 @@ class TestResolveSavePath:
         assert len(filename) > len("download_")
         assert save_path == tmp_path / filename
 
+    def test_empty_filename_gets_pdf_uuid_fallback(self, tmp_path: Path) -> None:
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("", "application/pdf")
+        assert filename.startswith("download_")
+        assert filename.endswith(".pdf")
+        assert save_path == tmp_path / filename
+
     def test_default_param_empty_string(self, tmp_path: Path) -> None:
         """Calling without arguments should also trigger fallback."""
         interceptor = self._make_interceptor(tmp_path)
@@ -268,6 +275,25 @@ class TestResolveSavePath:
         save_path, filename = interceptor._resolve_save_path("../../etc/cron.d/evil")
         assert filename == "evil"
         assert save_path == tmp_path / "evil"
+
+    def test_header_date_separators_are_filename_chars(self, tmp_path: Path) -> None:
+        """Invoice-style slashes in Content-Disposition should not collapse to the last date segment."""
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("invoice_5/19/2026", "application/pdf")
+        assert filename == "invoice_5_19_2026.pdf"
+        assert save_path == tmp_path / "invoice_5_19_2026.pdf"
+
+    def test_missing_extension_uses_pdf_content_type(self, tmp_path: Path) -> None:
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("2026", "application/pdf; charset=utf-8")
+        assert filename == "2026.pdf"
+        assert save_path == tmp_path / "2026.pdf"
+
+    def test_existing_pdf_extension_not_duplicated(self, tmp_path: Path) -> None:
+        interceptor = self._make_interceptor(tmp_path)
+        save_path, filename = interceptor._resolve_save_path("invoice_5/19/2026.pdf", "application/pdf")
+        assert filename == "invoice_5_19_2026.pdf"
+        assert save_path == tmp_path / "invoice_5_19_2026.pdf"
 
     def test_increments_download_index(self, tmp_path: Path) -> None:
         interceptor = self._make_interceptor(tmp_path)
