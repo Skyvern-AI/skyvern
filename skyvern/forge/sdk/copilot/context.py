@@ -15,6 +15,7 @@ ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
@@ -171,6 +172,7 @@ class CopilotContext(AgentContext):
     request_policy: RequestPolicy | None = None
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
+    latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)

@@ -516,13 +516,13 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
         credential_id = getattr(credential, "credential_id", None)
         tested_url = getattr(credential, "tested_url", None)
         if isinstance(credential_id, str) and isinstance(tested_url, str):
-            origin = _origin(tested_url)
+            origin = url_origin(tested_url)
             if origin:
                 origins.setdefault(credential_id, set()).add(origin)
     return origins
 
 
-def _origin(url: str) -> str | None:
+def url_origin(url: str) -> str | None:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     if not parsed.netloc:
         return None
@@ -586,7 +586,7 @@ def _block_broadens_credential_scope(
     block_url = block.get("url")
     if not isinstance(block_url, str) or not block_url.strip():
         return False
-    origin = _origin(block_url)
+    origin = url_origin(block_url)
     if not origin:
         return True
 
