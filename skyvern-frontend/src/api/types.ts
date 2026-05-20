@@ -89,6 +89,7 @@ export type ArtifactApiResponse = {
   artifact_type: ArtifactType;
   uri: string;
   signed_url?: string | null;
+  archived?: boolean;
   organization_id: string;
 };
 
@@ -162,6 +163,7 @@ export type TaskApiResponse = {
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
+  recording_archived?: boolean;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
@@ -584,6 +586,7 @@ export type WorkflowRunStatusApiResponse = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   recording_urls: Array<string> | null;
+  recording_archived?: boolean;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
@@ -617,6 +620,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   recording_urls: Array<string> | null;
+  recording_archived?: boolean;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
