@@ -932,6 +932,11 @@ class WorkflowService:
                 if copilot_session_id is not None
                 else (ambient_context.copilot_session_id if ambient_context else None)
             )
+            resolved_trigger_type = trigger_type
+            if resolved_trigger_type is None and ambient_context:
+                resolved_trigger_type = ambient_context.trigger_type
+            if resolved_trigger_type is None:
+                resolved_trigger_type = WorkflowRunTriggerType.api
 
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
@@ -944,7 +949,7 @@ class WorkflowService:
                 debug_session_id=debug_session_id,
                 code_gen=code_gen,
                 workflow_run_id=workflow_run_id,
-                trigger_type=trigger_type,
+                trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
@@ -989,7 +994,7 @@ class WorkflowService:
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                 )
             )
 
@@ -1018,7 +1023,7 @@ class WorkflowService:
                 # through the same AgentFunction hook so the cloud side is the single
                 # owner of the flag name and property shape.
                 new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                     organization_id=organization.organization_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,

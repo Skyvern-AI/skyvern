@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from skyvern.exceptions import InvalidCredentialId, MissingValueForParameter, WorkflowRunParameterPersistenceError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameter, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody
 from skyvern.forge.sdk.workflow.service import WorkflowService
@@ -353,6 +354,104 @@ async def test_setup_workflow_run_dedupes_repeated_credential_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_workflow_run_defaults_missing_trigger_type_to_api() -> None:
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    service.create_workflow_run.assert_awaited_once()
+    assert service.create_workflow_run.await_args.kwargs["trigger_type"] == WorkflowRunTriggerType.api
+    mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.assert_awaited_once()
+    assert (
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.await_args.kwargs["trigger_type"]
+        == WorkflowRunTriggerType.api
+    )
+    current_context = skyvern_context.current()
+    assert current_context is not None
+    assert current_context.trigger_type == WorkflowRunTriggerType.api
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_inherits_missing_trigger_type_from_parent_context() -> None:
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    skyvern_context.set(
+        SkyvernContext(
+            organization_id="org_test",
+            organization_name="Test Org",
+            workflow_run_id="wr_parent",
+            root_workflow_run_id="wr_root",
+            run_id="wr_parent",
+            trigger_type=WorkflowRunTriggerType.webhook,
+        )
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+        )
+
+    assert service.create_workflow_run.await_args.kwargs["trigger_type"] == WorkflowRunTriggerType.webhook
+    assert (
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.await_args.kwargs["trigger_type"]
+        == WorkflowRunTriggerType.webhook
+    )
+    current_context = skyvern_context.current()
+    assert current_context is not None
+    assert current_context.trigger_type == WorkflowRunTriggerType.webhook
+
+
+@pytest.mark.asyncio
+async def test_setup_workflow_run_explicit_trigger_type_overrides_parent_context() -> None:
+    service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
+    skyvern_context.set(
+        SkyvernContext(
+            organization_id="org_test",
+            organization_name="Test Org",
+            workflow_run_id="wr_parent",
+            root_workflow_run_id="wr_root",
+            run_id="wr_parent",
+            trigger_type=WorkflowRunTriggerType.webhook,
+        )
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached = AsyncMock(return_value=False)
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing = AsyncMock(return_value=False)
+
+        await service.setup_workflow_run(
+            request_id="req_test",
+            workflow_request=WorkflowRequestBody(data={}),
+            workflow_permanent_id="wpid_test",
+            organization=organization,
+            trigger_type=WorkflowRunTriggerType.scheduled,
+        )
+
+    assert service.create_workflow_run.await_args.kwargs["trigger_type"] == WorkflowRunTriggerType.scheduled
+    assert (
+        mock_app.AGENT_FUNCTION.should_use_flex_llm_routing.await_args.kwargs["trigger_type"]
+        == WorkflowRunTriggerType.scheduled
+    )
+    current_context = skyvern_context.current()
+    assert current_context is not None
+    assert current_context.trigger_type == WorkflowRunTriggerType.scheduled
+
+
+@pytest.mark.asyncio
 async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_context() -> None:
     service, organization, _ = _make_service_with_mocks(workflow_parameters=[])
 
@@ -384,6 +483,7 @@ async def test_setup_workflow_run_preserves_parent_loop_state_when_replacing_con
     assert current_context.workflow_run_id == "wr_test"
     assert current_context.run_id == "wr_parent"
     assert current_context.root_workflow_run_id == "wr_root"
+    assert current_context.trigger_type == WorkflowRunTriggerType.api
     assert current_context.loop_internal_state == loop_state
     assert current_context.loop_internal_state is not loop_state
 
