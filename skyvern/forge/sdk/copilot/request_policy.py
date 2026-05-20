@@ -190,7 +190,7 @@ def _safe_slot(text: str | None, cap: int) -> str:
     return _middle_truncate(escape_code_fences(redact_raw_secrets_for_prompt(bounded)), cap)
 
 
-def _build_transcript_context(
+def build_transcript_context(
     messages: list[WorkflowCopilotChatHistoryMessage],
     current_user_message: str,
     *,
@@ -407,7 +407,7 @@ async def _classify_request(
     if handler is None:
         return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
 
-    transcript = _build_transcript_context(chat_history, user_message)
+    transcript = build_transcript_context(chat_history, user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
         user_message=escape_code_fences(user_message),

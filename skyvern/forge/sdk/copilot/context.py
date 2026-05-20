@@ -17,6 +17,7 @@ COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
 
 
@@ -169,6 +170,7 @@ class CopilotContext(AgentContext):
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     turn_intent: TurnIntent | None = None
+    turn_context_packet: TurnContextPacket | None = None
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
