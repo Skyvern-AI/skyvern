@@ -95,6 +95,7 @@ export const AI_IMPROVE_CONFIGS = {
     dataSchema: createAiImproveConfig("extraction", "data_schema"),
   },
   validation: {
+    navigationGoal: createAiImproveConfig("validation", "navigation_goal"),
     completeCriterion: createAiImproveConfig(
       "validation",
       "complete_criterion",
@@ -103,6 +104,11 @@ export const AI_IMPROVE_CONFIGS = {
       "validation",
       "terminate_criterion",
     ),
+    dataExtractionGoal: createAiImproveConfig(
+      "validation",
+      "data_extraction_goal",
+    ),
+    dataSchema: createAiImproveConfig("validation", "data_schema"),
   },
   login: {
     navigationGoal: createAiImproveConfig("login", "navigation_goal"),
