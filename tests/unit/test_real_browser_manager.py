@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 def make_workflow_run(
@@ -312,3 +315,110 @@ async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None
 
     m.assert_not_awaited()
     assert artifacts[0].video_data == b"partial-webm-bytes"
+
+
+def _make_page_mock(video_path: str | None) -> MagicMock:
+    page = MagicMock()
+    if video_path is None:
+        page.video = None
+    else:
+        page.video = MagicMock()
+        page.video.path = AsyncMock(return_value=video_path)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_picks_up_popup_page() -> None:
+    """set_popup_video_listener registers popup video paths on the page event."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    popup = _make_page_mock("/tmp/videos/popup.webm")
+    await handler(popup)
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == ["/tmp/videos/main.webm", "/tmp/videos/popup.webm"]
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_deduplicates() -> None:
+    """Already-tracked pages are not added twice."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = _make_page_mock("/tmp/videos/main.webm")
+    await handler(page)
+
+    assert len(artifacts.video_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_skips_pages_without_video() -> None:
+    """Pages with no video (e.g. about:blank) are silently skipped."""
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    await handler(_make_page_mock(None))
+
+    assert len(artifacts.video_artifacts) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_multiple_popups() -> None:
+    """Multiple popup pages from loop iterations are all captured."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    for name in ["popup1", "popup2", "popup3"]:
+        await handler(_make_page_mock(f"/tmp/videos/{name}.webm"))
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == [
+        "/tmp/videos/main.webm",
+        "/tmp/videos/popup1.webm",
+        "/tmp/videos/popup2.webm",
+        "/tmp/videos/popup3.webm",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_working_page_does_not_touch_video_artifacts() -> None:
+    """set_working_page only sets the working page; video tracking is handled by the listener."""
+
+    artifacts = BrowserArtifacts()
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(), browser_artifacts=artifacts)
+
+    page = _make_page_mock("/tmp/v/page.webm")
+    await state.set_working_page(page, index=0)
+
+    assert len(artifacts.video_artifacts) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_registers_pre_existing_pages() -> None:
+    """Pages that already exist when the listener is registered are captured."""
+    import asyncio
+
+    artifacts = BrowserArtifacts()
+    initial_page = _make_page_mock("/tmp/videos/initial.webm")
+    browser_context = MagicMock()
+    browser_context.pages = [initial_page]
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    # Let the ensure_future tasks run
+    await asyncio.sleep(0)
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == ["/tmp/videos/initial.webm"]

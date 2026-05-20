@@ -21,7 +21,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
@@ -241,33 +241,6 @@ class RealBrowserState(BrowserState):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
-        if page is None:
-            return
-        if len(self.browser_artifacts.video_artifacts) > index:
-            if self.browser_artifacts.video_artifacts[index].video_path is None:
-                try:
-                    async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                        if page.video:
-                            self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-                except asyncio.TimeoutError:
-                    LOG.info("Timeout to get the page video, skip the exception")
-                except Exception:
-                    LOG.exception("Error while getting the page video", exc_info=True)
-            return
-
-        target_length = index + 1
-        self.browser_artifacts.video_artifacts.extend(
-            [VideoArtifact()] * (target_length - len(self.browser_artifacts.video_artifacts))
-        )
-        try:
-            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                if page.video:
-                    self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-        except asyncio.TimeoutError:
-            LOG.info("Timeout to get the page video, skip the exception")
-        except Exception:
-            LOG.exception("Error while getting the page video", exc_info=True)
-        return
 
     async def get_or_create_page(
         self,
