@@ -12059,6 +12059,11 @@
             "title": "Next Loop On Failure",
             "default": false
           },
+          "navigation_goal": {
+            "type": "string",
+            "nullable": true,
+            "title": "Navigation Goal"
+          },
           "complete_criterion": {
             "type": "string",
             "nullable": true,
@@ -12089,6 +12094,28 @@
             "type": "boolean",
             "title": "Disable Cache",
             "default": false
+          },
+          "data_extraction_goal": {
+            "type": "string",
+            "nullable": true,
+            "title": "Data Extraction Goal"
+          },
+          "data_schema": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {},
+                "type": "array"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Data Schema",
+            "nullable": true
           }
         },
         "type": "object",
