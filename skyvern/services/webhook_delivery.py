@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -26,6 +27,23 @@ NON_5XX_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
 WEBHOOK_DELIVERY_MAX_ATTEMPTS = 3
 WEBHOOK_DELIVERY_RETRY_BASE_DELAY_SECONDS = 1.0
 WEBHOOK_DELIVERY_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class PreparedWorkflowWebhook:
+    """Process-local signed workflow webhook request.
+
+    Do not return this object from Temporal activities or workflows; signed_payload
+    can be large and must not be persisted in Temporal history.
+    """
+
+    workflow_id: str
+    workflow_run_id: str
+    organization_id: str
+    webhook_callback_url: str
+    signed_payload: str
+    headers: dict[str, str]
+    payload_for_log: str
 
 
 def is_retryable_status(status_code: int) -> bool:

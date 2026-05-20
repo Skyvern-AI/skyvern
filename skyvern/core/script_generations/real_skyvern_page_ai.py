@@ -12,7 +12,7 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
-from skyvern.exceptions import WorkflowRunContextNotInitialized
+from skyvern.exceptions import SkyvernActionFailed, WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -207,9 +207,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
             actions_json = json_response.get("actions", [])
             if not actions_json:
-                # LLM returned no actions - the element likely doesn't exist on the page.
-                # Raise an exception so the caller knows the action failed.
-                raise Exception(
+                raise SkyvernActionFailed(
                     f"AI could not find an element to click for intention: {intention}. "
                     "The element may not exist on the current page."
                 )
@@ -222,7 +220,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 action = cast(ClickAction, actions[0])
                 result = await handle_click_action(action, self.page, self.scraped_page, task, step)
                 if result and result[-1].success is False:
-                    raise Exception(result[-1].exception_message)
+                    raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
                 xpath = action.get_xpath()
                 selector = f"xpath={xpath}" if xpath else selector
 
@@ -241,7 +239,17 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 )
 
                 return selector
+        except SkyvernActionFailed:
+            if selector is None:
+                raise
+            LOG.warning(
+                "AI click failed, falling back to original selector",
+                selector=selector,
+                intention=intention,
+            )
         except Exception:
+            if selector is None:
+                raise
             LOG.exception(
                 f"Failed to do ai click. Falling back to original selector={selector}, intention={intention}, data={data}"
             )
@@ -251,8 +259,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             await locator.click(timeout=timeout)
             return selector
 
-        # If we reach here with no selector, the AI failed and there's no fallback - raise an error
-        raise Exception(f"AI click failed and no fallback selector available for intention: {intention}")
+        raise SkyvernActionFailed(f"AI click failed and no fallback selector available for intention: {intention}")
 
     async def ai_input_text(
         self,

@@ -337,7 +337,7 @@ async def test_deploy_script_via_mcp(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Scenario 6: Workflow create shows caching defaults
+# Scenario 6: Workflow create surfaces caching fields when caller opts in
 # ---------------------------------------------------------------------------
 
 
@@ -366,6 +366,7 @@ async def test_workflow_create_surfaces_caching_fields_via_mcp(monkeypatch):
     definition = json.dumps(
         {
             "title": "Test",
+            "run_with": "code",
             "workflow_definition": {
                 "parameters": [],
                 "blocks": [
