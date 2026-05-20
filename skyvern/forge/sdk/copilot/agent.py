@@ -55,7 +55,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, build_turn_intent
+from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent, build_turn_intent
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -491,6 +491,20 @@ def _build_tool_usage_guide(tool_names_and_descriptions: list[tuple[str, str]]) 
         f"- **{name}** — {description or 'No description provided.'}"
         for name, description in tool_names_and_descriptions
     )
+
+
+def _turn_intent_disables_tools(turn_intent: TurnIntent | None) -> bool:
+    if not isinstance(turn_intent, TurnIntent) or turn_intent.mode not in NO_MUTATION_TURN_INTENT_MODES:
+        return False
+
+    authority = turn_intent.authority
+    return not authority.may_update_workflow and not authority.may_run_blocks
+
+
+def _native_tools_for_turn(native_tools: list[Any], turn_intent: TurnIntent | None) -> list[Any]:
+    if _turn_intent_disables_tools(turn_intent):
+        return []
+    return list(native_tools)
 
 
 def _is_explicit_false(value: Any) -> bool:
@@ -1619,8 +1633,12 @@ async def _run_copilot_turn_impl(
 
     alias_map = get_skyvern_mcp_alias_map()
     overlays = _build_skyvern_mcp_overlays()
+    if _turn_intent_disables_tools(ctx.turn_intent):
+        alias_map = {}
+        overlays = {}
 
-    tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in NATIVE_TOOLS]
+    native_tools = _native_tools_for_turn(NATIVE_TOOLS, ctx.turn_intent)
+    tool_info: list[tuple[str, str]] = [(tool.name, tool.description or "") for tool in native_tools]
     tool_info.extend((name, overlay.description or "") for name, overlay in overlays.items())
 
     tool_usage_guide = _build_tool_usage_guide(tool_info)
@@ -1677,7 +1695,7 @@ async def _run_copilot_turn_impl(
         agent = Agent(
             name="workflow-copilot",
             instructions=system_prompt,
-            tools=list(NATIVE_TOOLS),
+            tools=native_tools,
             mcp_servers=[mcp_server],
             model=attempt_model_name,
             output_guardrails=output_guardrails,

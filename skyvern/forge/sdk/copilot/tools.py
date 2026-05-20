@@ -68,6 +68,7 @@ from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -677,6 +678,8 @@ async def _attach_failed_block_screenshots(
 
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
 
 
 def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
@@ -842,6 +845,43 @@ def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     return None
 
 
+def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+    intent = getattr(ctx, "turn_intent", None)
+    if not isinstance(intent, TurnIntent) or intent.mode not in NO_MUTATION_TURN_INTENT_MODES:
+        return None
+
+    authority = intent.authority
+    if authority.may_update_workflow or authority.may_run_blocks:
+        return None
+
+    blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
+    blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
+    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS
+    if not blocks_update and not blocks_run and not blocks_context_read:
+        return None
+
+    if blocks_run:
+        reason_code = "turn_intent_no_mutation_run_blocked"
+    elif blocks_update:
+        reason_code = "turn_intent_no_mutation_update_blocked"
+    else:
+        reason_code = "turn_intent_no_mutation_context_read_blocked"
+    LOG.info(
+        "copilot turn intent no-mutation gate blocked tool",
+        turn_intent_mode=intent.mode.value,
+        blocked_tool=tool_name,
+        safe_reason_code=reason_code,
+    )
+    action = "ask the user" if authority.requires_user_input else "answer the user"
+    detail = f" Ask: {intent.missing_context_question}" if intent.missing_context_question else ""
+    return (
+        f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
+        "for the latest user message. Do not update workflow YAML or run browser blocks, and do not "
+        f"fetch additional run context with tools; {action} using the available context instead. "
+        f"safe_reason_code={reason_code}.{detail}"
+    )
+
+
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
     WorkflowParameterType.STRING: "",
     WorkflowParameterType.INTEGER: 0,
@@ -923,6 +963,10 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
+    turn_intent_error = _turn_intent_tool_error(ctx, "update_workflow")
+    if turn_intent_error is not None:
+        return {"ok": False, "error": turn_intent_error}
+
     policy_error = _request_policy_tool_error(ctx, "update_workflow")
     if policy_error is not None:
         return {"ok": False, "error": policy_error}
@@ -3884,6 +3928,10 @@ async def run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
+    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if turn_intent_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", turn_intent_error)
+
     policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
     if policy_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", policy_error)
@@ -3945,6 +3993,9 @@ async def get_run_results_tool(
     loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "get_run_results")
+    if turn_intent_error:
+        return json.dumps({"ok": False, "error": turn_intent_error})
 
     result = await _get_run_results(params, copilot_ctx)
     _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)
@@ -4004,6 +4055,10 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "update_and_run_blocks")
+    if turn_intent_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", turn_intent_error)
+
     policy = getattr(copilot_ctx, "request_policy", None)
     skip_run_after_update = (
         isinstance(policy, RequestPolicy)
