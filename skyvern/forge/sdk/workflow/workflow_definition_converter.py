@@ -580,23 +580,13 @@ def block_yaml_to_block(
                 f"Validation block '{block_yaml.label}' requires at least one of complete_criterion or terminate_criterion"
             )
 
-        if block_yaml.data_extraction_goal and not block_yaml.navigation_goal:
-            raise InvalidWorkflowDefinition(
-                f"Validation block '{block_yaml.label}' has data_extraction_goal but no navigation_goal; "
-                "extraction requires both fields to be set"
-            )
-
         return ValidationBlock(
             **base_kwargs,
             task_type=TaskType.validation,
             parameters=validation_block_parameters,
-            navigation_goal=block_yaml.navigation_goal,
             complete_criterion=block_yaml.complete_criterion,
             terminate_criterion=block_yaml.terminate_criterion,
             error_code_mapping=block_yaml.error_code_mapping,
-            data_extraction_goal=block_yaml.data_extraction_goal,
-            data_schema=block_yaml.data_schema,
-            disable_cache=block_yaml.disable_cache,
             # Should only need one step for validation block, but we allow 2 in case the LLM has an unexpected failure and we need to retry.
             max_steps_per_run=2,
         )

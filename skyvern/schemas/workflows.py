@@ -879,14 +879,11 @@ class PDFParserBlockYAML(BlockYAML):
 class ValidationBlockYAML(BlockYAML):
     block_type: Literal[BlockType.VALIDATION] = BlockType.VALIDATION  # type: ignore
 
-    navigation_goal: str | None = None
     complete_criterion: str | None = None
     terminate_criterion: str | None = None
     error_code_mapping: dict[str, str] | None = None
     parameter_keys: list[str] | None = None
     disable_cache: bool = False
-    data_extraction_goal: str | None = None
-    data_schema: dict[str, Any] | list | str | None = None
 
 
 class ActionBlockYAML(BlockYAML):

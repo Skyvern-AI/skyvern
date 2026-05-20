@@ -459,7 +459,6 @@ if typing.TYPE_CHECKING:
         ValidationBlockParametersItem_Workflow,
     )
     from .validation_block_yaml import ValidationBlockYaml
-    from .validation_block_yaml_data_schema import ValidationBlockYamlDataSchema
     from .validation_error import ValidationError
     from .validation_error_loc_item import ValidationErrorLocItem
     from .wait_block import WaitBlock
@@ -1085,7 +1084,6 @@ _dynamic_imports: typing.Dict[str, str] = {
     "ValidationBlockParametersItem_Output": ".validation_block_parameters_item",
     "ValidationBlockParametersItem_Workflow": ".validation_block_parameters_item",
     "ValidationBlockYaml": ".validation_block_yaml",
-    "ValidationBlockYamlDataSchema": ".validation_block_yaml_data_schema",
     "ValidationError": ".validation_error",
     "ValidationErrorLocItem": ".validation_error_loc_item",
     "WaitBlock": ".wait_block",
@@ -1717,7 +1715,6 @@ __all__ = [
     "ValidationBlockParametersItem_Output",
     "ValidationBlockParametersItem_Workflow",
     "ValidationBlockYaml",
-    "ValidationBlockYamlDataSchema",
     "ValidationError",
     "ValidationErrorLocItem",
     "WaitBlock",
