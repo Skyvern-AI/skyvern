@@ -53,6 +53,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, build_request_policy, redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
+from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, build_turn_intent
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -298,6 +299,38 @@ def _turn_intent_log_fields(intent: TurnIntent | None) -> dict[str, Any]:
 
 def _turn_intent_trace_fields(intent: TurnIntent | None) -> dict[str, str]:
     return {key: str(value) for key, value in _turn_intent_log_fields(intent).items()}
+
+
+def _turn_context_log_fields(packet: TurnContextPacket | None) -> dict[str, Any]:
+    if not isinstance(packet, TurnContextPacket):
+        return {}
+    return {f"turn_context_{key}": value for key, value in packet.to_trace_data().items()}
+
+
+def _turn_context_trace_fields(packet: TurnContextPacket | None) -> dict[str, str]:
+    return {key: str(value) for key, value in _turn_context_log_fields(packet).items()}
+
+
+def _store_turn_context_packet_on_context(
+    ctx: CopilotContext,
+    *,
+    request_policy: RequestPolicy,
+    chat_request: WorkflowCopilotChatRequest,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    debug_run_info_text: str,
+) -> None:
+    if not isinstance(ctx.turn_intent, TurnIntent):
+        return
+    ctx.turn_context_packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=ctx.turn_intent,
+            request_policy=request_policy,
+            user_message=chat_request.message,
+            workflow_yaml=chat_request.workflow_yaml or "",
+            chat_history=chat_history,
+            debug_run_info_text=debug_run_info_text,
+        )
+    )
 
 
 def _build_system_prompt(
@@ -1434,6 +1467,14 @@ async def _run_copilot_turn_impl(
         RunContextWrapper(context=ctx),
     )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if request_policy is not None:
+        _store_turn_context_packet_on_context(
+            ctx,
+            request_policy=request_policy,
+            chat_request=chat_request,
+            chat_history=chat_history,
+            debug_run_info_text=debug_run_info_text,
+        )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         return _build_request_policy_clarification_result(
             request_policy,
@@ -1535,6 +1576,7 @@ async def _run_copilot_turn_impl(
                 "user_message_len": str(len(user_message)),
                 **{f"request_policy_{key}": str(value) for key, value in request_policy.to_trace_data().items()},
                 **_turn_intent_trace_fields(ctx.turn_intent),
+                **_turn_context_trace_fields(ctx.turn_context_packet),
             },
         )
 

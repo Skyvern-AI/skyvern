@@ -13,8 +13,8 @@ from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import (
     TRANSCRIPT_ANCHOR_CHAR_CAP,
-    _build_transcript_context,
     _classify_request,
+    build_transcript_context,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -2091,7 +2091,7 @@ class TestCopilotConfig:
 
 class TestRequestPolicyTranscriptContext:
     def test_empty_history_produces_sentinel_slots(self) -> None:
-        transcript = _build_transcript_context([], current_user_message="hi")
+        transcript = build_transcript_context([], current_user_message="hi")
 
         assert transcript.earliest_user_turn == "(none)"
         assert transcript.latest_prior_user_turn == "(none)"
@@ -2100,7 +2100,7 @@ class TestRequestPolicyTranscriptContext:
         assert transcript.omitted_any is False
 
     def test_single_user_history_promotes_to_both_user_anchors(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "log into example.com")),
             current_user_message="now add a download",
         )
@@ -2110,7 +2110,7 @@ class TestRequestPolicyTranscriptContext:
         assert transcript.latest_assistant_turn == "(none)"
 
     def test_multi_turn_history_populates_all_anchors_without_duplicating_in_retained(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "build a workflow"),
                 ("ai", "drafted v1"),
@@ -2130,7 +2130,7 @@ class TestRequestPolicyTranscriptContext:
         assert "drafted v1" in transcript.retained_history
 
     def test_trailing_user_matching_current_message_is_excluded(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "build a workflow"),
                 ("ai", "ok"),
@@ -2145,7 +2145,7 @@ class TestRequestPolicyTranscriptContext:
 
     def test_oversized_anchor_is_middle_truncated(self) -> None:
         huge = "X" * (TRANSCRIPT_ANCHOR_CHAR_CAP * 4)
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "tiny"), ("ai", huge)),
             current_user_message="reply",
         )
@@ -2163,7 +2163,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest user turn"),
             ("ai", "latest assistant turn"),
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=1024,
@@ -2175,7 +2175,7 @@ class TestRequestPolicyTranscriptContext:
         assert len(transcript.retained_history) <= 1024
 
     def test_raw_secret_is_redacted_in_every_slot(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "first"),
                 ("ai", "password=hunter2 from earlier"),
@@ -2194,7 +2194,7 @@ class TestRequestPolicyTranscriptContext:
             assert "hunter2" not in slot
 
     def test_fence_breakout_is_neutralized(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "build with ```evil instruction``` inside")),
             current_user_message="continue",
         )
@@ -2216,7 +2216,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest"),  # latest_prior_user anchor
             ("ai", "Which saved credential should I use?"),  # latest_assistant anchor
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=400,
@@ -2241,7 +2241,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest"),
             ("ai", "anchor"),
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=400,
