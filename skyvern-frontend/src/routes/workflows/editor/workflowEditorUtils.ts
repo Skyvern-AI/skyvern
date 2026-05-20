@@ -708,18 +708,10 @@ function convertToNode(
         data: {
           ...commonData,
           errorCodeMapping: JSON.stringify(block.error_code_mapping, null, 2),
-          navigationGoal: block.navigation_goal ?? "",
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
           disableCache: block.disable_cache ?? false,
-          dataExtractionGoal: block.data_extraction_goal ?? "",
-          dataSchema:
-            block.data_schema == null
-              ? "null"
-              : typeof block.data_schema === "string"
-                ? block.data_schema
-                : JSON.stringify(block.data_schema, null, 2),
         },
       };
     }
@@ -2491,7 +2483,6 @@ function getWorkflowBlock(
       return {
         ...base,
         block_type: "validation",
-        navigation_goal: node.data.navigationGoal || null,
         complete_criterion: node.data.completeCriterion,
         terminate_criterion: node.data.terminateCriterion,
         error_code_mapping: JSONParseSafe(node.data.errorCodeMapping) as Record<
@@ -2499,9 +2490,6 @@ function getWorkflowBlock(
           string
         > | null,
         parameter_keys: node.data.parameterKeys,
-        data_extraction_goal: node.data.dataExtractionGoal || null,
-        data_schema: JSONSafeOrString(node.data.dataSchema),
-        disable_cache: node.data.disableCache ?? false,
       };
     }
     case "human_interaction": {
@@ -3976,14 +3964,10 @@ function convertBlocksToBlockYAML(
         const blockYaml: ValidationBlockYAML = {
           ...base,
           block_type: "validation",
-          navigation_goal: block.navigation_goal ?? null,
           complete_criterion: block.complete_criterion,
           terminate_criterion: block.terminate_criterion,
           error_code_mapping: block.error_code_mapping,
           parameter_keys: block.parameters.map((p) => p.key),
-          data_extraction_goal: block.data_extraction_goal ?? null,
-          data_schema: block.data_schema ?? null,
-          disable_cache: block.disable_cache ?? false,
         };
         return blockYaml;
       }
@@ -4436,23 +4420,6 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
       errors.push(
         `${node.data.label}: At least one of completion or termination criteria must be provided`,
       );
-    }
-    if (
-      node.data.dataExtractionGoal.trim().length > 0 &&
-      node.data.navigationGoal.trim().length === 0
-    ) {
-      errors.push(
-        `${node.data.label}: Navigation Goal is required when Data Extraction Goal is set`,
-      );
-    }
-    if (node.data.dataSchema && node.data.dataSchema !== "null") {
-      const result = TSON.parse(node.data.dataSchema);
-
-      if (!result.success) {
-        errors.push(
-          `${node.data.label}: Data schema has invalid templated JSON: ${result.error ?? "-"}`,
-        );
-      }
     }
   });
 

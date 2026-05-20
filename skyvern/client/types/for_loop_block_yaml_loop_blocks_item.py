@@ -17,7 +17,6 @@ from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
 from .pdf_format import PdfFormat
 from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
-from .validation_block_yaml_data_schema import ValidationBlockYamlDataSchema
 
 
 class ForLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
@@ -246,14 +245,11 @@ class ForLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    navigation_goal: typing.Optional[str] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
     error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     parameter_keys: typing.Optional[typing.List[str]] = None
     disable_cache: typing.Optional[bool] = None
-    data_extraction_goal: typing.Optional[str] = None
-    data_schema: typing.Optional[ValidationBlockYamlDataSchema] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

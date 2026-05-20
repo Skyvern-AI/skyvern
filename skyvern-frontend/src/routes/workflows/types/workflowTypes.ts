@@ -436,14 +436,11 @@ export type FileURLParserBlock = WorkflowBlockBase & {
 
 export type ValidationBlock = WorkflowBlockBase & {
   block_type: "validation";
-  navigation_goal?: string | null;
   complete_criterion: string | null;
   terminate_criterion: string | null;
   error_code_mapping: Record<string, string> | null;
   parameters: Array<WorkflowParameter>;
   disable_cache?: boolean;
-  data_extraction_goal?: string | null;
-  data_schema?: Record<string, unknown> | string | null;
 };
 
 export type HumanInteractionBlock = WorkflowBlockBase & {
