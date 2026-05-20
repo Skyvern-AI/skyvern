@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
 
-from skyvern.forge.sdk.copilot.agent import RequestPolicyGuardrailInputs, _store_request_policy_on_context
+from skyvern.forge.sdk.copilot.agent import (
+    RequestPolicyGuardrailInputs,
+    _native_tools_for_turn,
+    _store_request_policy_on_context,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.turn_intent import (
@@ -103,6 +108,32 @@ def test_build_turn_intent_uses_request_policy_clarification_without_changing_po
     assert TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION in intent.reason_codes
 
 
+def test_build_turn_intent_routes_raw_secret_to_refuse_mode() -> None:
+    policy = RequestPolicy(
+        credential_input_kind="raw_secret",
+        raw_secret_detected=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+        clarification_question="Store the credential in the Credentials UI.",
+    )
+
+    intent = build_turn_intent(
+        user_message="Use this password: hunter2 to sign in.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=policy,
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.requires_user_input is True
+    assert intent.missing_context_question == "Store the credential in the Credentials UI."
+    assert TurnIntentReasonCode.RAW_SECRET_REFUSAL in intent.reason_codes
+
+
 def test_build_turn_intent_redacts_user_goal() -> None:
     intent = build_turn_intent(
         user_message="Use password: hunter2 and build the workflow",
@@ -126,7 +157,38 @@ def test_build_turn_intent_marks_docs_context_for_docs_answer() -> None:
     )
 
     assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
     assert RequiredContextKey.DOCS_CONTEXT in intent.required_context
+
+
+def test_build_turn_intent_marks_platform_comparison_as_docs_answer() -> None:
+    intent = build_turn_intent(
+        user_message="I meant run with code vs run with agent",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert RequiredContextKey.DOCS_CONTEXT in intent.required_context
+
+
+def test_build_turn_intent_marks_blank_workflow_browser_task_as_build() -> None:
+    intent = build_turn_intent(
+        user_message="Go to https://en.wikipedia.org and search for Bauhaus.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
 
 
 def test_build_turn_intent_marks_run_context_for_diagnose() -> None:
@@ -139,7 +201,22 @@ def test_build_turn_intent_marks_run_context_for_diagnose() -> None:
     )
 
     assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
     assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
+
+
+def test_build_turn_intent_keeps_explicit_fix_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="Fix the error after login.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+    assert intent.authority.may_update_workflow is True
 
 
 def test_store_request_policy_attaches_turn_intent_to_context() -> None:
@@ -166,5 +243,21 @@ def test_store_request_policy_attaches_turn_intent_to_context() -> None:
     _store_request_policy_on_context(ctx, policy, inputs)
 
     assert ctx.turn_intent is not None
-    assert ctx.turn_intent.authority.may_update_workflow is True
+    assert ctx.turn_intent.authority.may_update_workflow is False
     assert ctx.turn_intent.authority.may_run_blocks is False
+
+
+def test_answer_only_turn_intent_hides_get_run_results_tool() -> None:
+    tools = [
+        SimpleNamespace(name="update_workflow"),
+        SimpleNamespace(name="get_run_results"),
+        SimpleNamespace(name="list_credentials"),
+    ]
+    intent = TurnIntent(
+        mode=TurnIntentMode.DIAGNOSE,
+        authority=TurnIntentAuthority(may_update_workflow=False, may_run_blocks=False),
+    )
+
+    filtered = _native_tools_for_turn(tools, intent)
+
+    assert filtered == []
