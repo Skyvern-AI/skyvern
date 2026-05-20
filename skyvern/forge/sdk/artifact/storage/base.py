@@ -152,6 +152,14 @@ class BaseStorage(ABC):
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         pass
 
+    async def check_archived_uris(self, uris: list[str]) -> dict[str, bool]:
+        """Check whether each URI points to an archived (non-retrievable) S3 object.
+
+        Returns a mapping of URI -> True if the object is in GLACIER or DEEP_ARCHIVE.
+        Default implementation returns False for all URIs (local/Azure storage is never archived).
+        """
+        return {uri: False for uri in uris}
+
     @abstractmethod
     async def get_share_link(self, artifact: Artifact) -> str | None:
         pass

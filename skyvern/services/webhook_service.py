@@ -424,6 +424,7 @@ async def _build_workflow_payload(
         output=status_response.outputs,
         downloaded_files=status_response.downloaded_files,
         recording_url=status_response.recording_url,
+        recording_archived=status_response.recording_archived,
         screenshot_urls=status_response.screenshot_urls,
         failure_reason=status_response.failure_reason,
         app_url=app_url,

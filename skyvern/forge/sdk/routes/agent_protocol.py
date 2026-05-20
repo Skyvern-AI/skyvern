@@ -1495,6 +1495,7 @@ async def get_artifact(
         )
     signed_url = await app.ARTIFACT_MANAGER.get_share_link(artifact)
     artifact.signed_url = signed_url
+    await app.ARTIFACT_MANAGER.mark_archived_artifacts([artifact])
     return artifact
 
 
@@ -1805,6 +1806,7 @@ async def get_run_artifacts(
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts_list)
     for i, artifact in enumerate(artifacts_list):
         artifact.signed_url = signed_urls[i]
+    await app.ARTIFACT_MANAGER.mark_archived_artifacts(artifacts_list)
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts_list])
 
@@ -2529,6 +2531,7 @@ async def get_artifacts(
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
         artifact.signed_url = signed_urls[i]
+    await app.ARTIFACT_MANAGER.mark_archived_artifacts(artifacts)
 
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
@@ -2566,6 +2569,7 @@ async def get_step_artifacts(
     signed_urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(artifacts)
     for i, artifact in enumerate(artifacts):
         artifact.signed_url = signed_urls[i]
+    await app.ARTIFACT_MANAGER.mark_archived_artifacts(artifacts)
     return ORJSONResponse([artifact.model_dump() for artifact in artifacts])
 
 

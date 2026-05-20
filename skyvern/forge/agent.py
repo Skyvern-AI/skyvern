@@ -4270,6 +4270,7 @@ class ForgeAgent:
 
         screenshot_url = None
         recording_url = None
+        recording_archived = False
         browser_console_log_url: str | None = None
         latest_action_screenshot_urls: list[str] | None = None
         downloaded_files: list[FileInfo] | None = None
@@ -4286,6 +4287,7 @@ class ForgeAgent:
 
         # Get recording url from browser session first,
         # if not found, get the recording url from the first step
+        recording_artifact = None
         if task.browser_session_id:
             try:
                 async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
@@ -4310,7 +4312,9 @@ class ForgeAgent:
                     organization_id=task.organization_id,
                 )
                 if recording_artifact:
-                    recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
+                    recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifact)
+                    if not recording_archived:
+                        recording_url = await app.ARTIFACT_MANAGER.get_share_link(recording_artifact)
 
         # get the artifact of the last TASK_RESPONSE_ACTION_SCREENSHOT_COUNT screenshots and get the screenshot_url
         latest_action_screenshot_artifacts = await app.DATABASE.artifacts.get_latest_n_artifacts(
@@ -4368,6 +4372,7 @@ class ForgeAgent:
             action_screenshot_urls=latest_action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
+            recording_archived=recording_archived,
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             failure_reason=failure_reason,

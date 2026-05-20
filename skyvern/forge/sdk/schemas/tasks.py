@@ -346,6 +346,7 @@ class Task(TaskBase):
         action_screenshot_urls: list[str] | None = None,
         screenshot_url: str | None = None,
         recording_url: str | None = None,
+        recording_archived: bool = False,
         browser_console_log_url: str | None = None,
         downloaded_files: list[FileInfo] | None = None,
         failure_reason: str | None = None,
@@ -367,6 +368,7 @@ class Task(TaskBase):
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
+            recording_archived=recording_archived,
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
@@ -389,6 +391,7 @@ class TaskResponse(BaseModel):
     action_screenshot_urls: list[str] | None = None
     screenshot_url: str | None = None
     recording_url: str | None = None
+    recording_archived: bool = False
     browser_console_log_url: str | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
