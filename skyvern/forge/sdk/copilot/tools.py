@@ -224,21 +224,35 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _credential_parameter_slot_field(parameter: Any) -> str | None:
+    """Return the field name that legitimately carries a `cred_xxx` value for
+    this parameter dict, or None if the parameter is not a credential-binding
+    slot. Two shapes resolve a credential at runtime: a top-level or block-level
+    `parameter_type: credential` with the ID in `credential_id`, and a
+    `parameter_type: workflow` + `workflow_parameter_type: credential_id` with
+    the ID in `default_value`.
+    """
+    if not isinstance(parameter, dict):
+        return None
+    parameter_type = str(parameter.get("parameter_type") or "").lower()
+    if parameter_type == "credential":
+        return "credential_id"
+    workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+    if parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
+        return "default_value"
+    return None
+
+
 def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[str]:
     if not isinstance(parameters, list):
         return []
 
     found: list[str] = []
     for parameter in parameters:
-        if not isinstance(parameter, dict):
+        slot_field = _credential_parameter_slot_field(parameter)
+        if slot_field is None:
             continue
-
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type == "credential":
-            found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_id")))
-        elif parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
-            found.extend(_extract_credential_ids_from_tool_value(parameter.get("default_value")))
+        found.extend(_extract_credential_ids_from_tool_value(parameter.get(slot_field)))
 
     return list(dict.fromkeys(found))
 
@@ -262,19 +276,103 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     return _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
 
 
-def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
     if not workflow_yaml:
-        return []
+        return None
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
-        return []
+        return None
     if not isinstance(parsed, dict):
-        return []
+        return None
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
+        return None
+    return workflow_definition
+
+
+def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+    workflow_definition = _parsed_workflow_definition(workflow_yaml)
+    if workflow_definition is None:
         return []
     return _extract_credential_ids_from_workflow_parameters(workflow_definition.get("parameters"))
+
+
+_MISBINDING_WORKFLOW_LOCATION = "workflow"
+
+
+def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[str, str]]:
+    workflow_definition = _parsed_workflow_definition(workflow_yaml)
+    if workflow_definition is None:
+        return []
+
+    findings: list[dict[str, str]] = []
+
+    def _scan_value(value: Any, location: str, field: str) -> None:
+        if isinstance(value, str):
+            for credential_id in _CREDENTIAL_ID_RE.findall(value):
+                findings.append({"location": location, "field": field, "credential_id": credential_id})
+        elif isinstance(value, list):
+            for item in value:
+                _scan_value(item, location, field)
+        elif isinstance(value, dict):
+            for nested_field, nested_value in value.items():
+                _scan_value(nested_value, location, str(nested_field))
+
+    def _scan_parameter(parameter: Any, location: str) -> None:
+        if not isinstance(parameter, dict):
+            return
+        legal_slot_field = _credential_parameter_slot_field(parameter)
+        for field_name, field_value in parameter.items():
+            if field_name == legal_slot_field:
+                continue
+            _scan_value(field_value, location, str(field_name))
+
+    for parameter in workflow_definition.get("parameters") or []:
+        _scan_parameter(parameter, _MISBINDING_WORKFLOW_LOCATION)
+
+    for block in _iter_yaml_blocks(workflow_definition.get("blocks")):
+        label = str(block.get("label") or "<unlabeled>")
+        for field_name, field_value in block.items():
+            if field_name == "parameters":
+                if isinstance(field_value, list):
+                    for parameter in field_value:
+                        _scan_parameter(parameter, label)
+                continue
+            if field_name == "loop_blocks":
+                continue
+            _scan_value(field_value, label, str(field_name))
+
+    return findings
+
+
+def _credential_id_misbinding_error_message(findings: list[dict[str, str]]) -> str:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for finding in findings:
+        key = (finding["location"], finding["credential_id"])
+        grouped.setdefault(key, []).append(finding["field"])
+
+    location_lines: list[str] = []
+    for (location, credential_id), fields in grouped.items():
+        unique_fields = list(dict.fromkeys(fields))
+        joined = ", ".join(f"`{field}`" for field in unique_fields)
+        scope = "workflow parameter" if location == _MISBINDING_WORKFLOW_LOCATION else f"block `{location}`"
+        location_lines.append(f"- `{credential_id}` in {scope} field(s): {joined}")
+    body = "\n".join(location_lines)
+
+    return (
+        "A credential ID is sitting in workflow fields that do not resolve it, so at runtime the agent types "
+        "the literal ID into the page instead of the stored username/password:\n"
+        f"{body}\n"
+        "Fix BOTH halves before retrying:\n"
+        "1. Bind the credential once: add a `credential` parameter (or a `workflow` parameter with "
+        "`workflow_parameter_type: credential_id` and the ID in `default_value`) and reference its key from the "
+        "login block's `parameter_keys`.\n"
+        "2. Delete the credential ID string from every field listed above. `navigation_goal`, "
+        "`complete_criterion`, `terminate_criterion` and similar fields are plain-language instructions — they "
+        "must describe the outcome without naming the credential ID. Do NOT relocate the literal ID into another "
+        "prose or list field; only the credential parameter slot may hold it."
+    )
 
 
 def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
@@ -1096,6 +1194,16 @@ async def _update_workflow(
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
             return {"ok": False, "error": credential_error}
+
+    misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
+    if misbinding_findings:
+        LOG.info(
+            "copilot credential id misbinding rejected",
+            organization_id=ctx.organization_id,
+            workflow_id=ctx.workflow_id,
+            findings=misbinding_findings,
+        )
+        return {"ok": False, "error": _credential_id_misbinding_error_message(misbinding_findings)}
 
     output_policy_verdict = evaluate_output_policy(
         request_policy=getattr(ctx, "request_policy", None),
