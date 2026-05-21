@@ -61,7 +61,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent, build_turn_intent
+from skyvern.forge.sdk.copilot.turn_intent import (
+    NO_MUTATION_TURN_INTENT_MODES,
+    TurnIntent,
+    TurnIntentMode,
+    build_turn_intent,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -366,7 +371,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
-        return (
+        prompt = (
             base_system_prompt
             + "\n\nREQUEST POLICY:\n```yaml\n"
             + policy_summary
@@ -377,8 +382,22 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow and skip the browser run with a credential setup message. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
+        return prompt + _docs_answer_turn_directive(getattr(ctx, "turn_intent", None))
 
     return instructions
+
+
+def _docs_answer_turn_directive(turn_intent: TurnIntent | None) -> str:
+    """Prompt-side complement to the no-mutation tool gate — keeps a docs-answer
+    turn from substituting a routing question or build offer for the inline answer."""
+    if not isinstance(turn_intent, TurnIntent) or turn_intent.mode != TurnIntentMode.DOCS_ANSWER:
+        return ""
+    return (
+        "\n\nTURN INTENT: docs_answer\n"
+        "This turn is a documentation or explanation question. Answer it inline in the user's language. "
+        "Do not ask whether the user wants a workflow change instead, do not re-ask a confirmation the "
+        "prior turn already covered, and do not offer to build an example workflow in place of answering."
+    )
 
 
 def _build_user_context(
