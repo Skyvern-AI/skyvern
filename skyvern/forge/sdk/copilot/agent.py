@@ -704,6 +704,13 @@ _RAW_SECRET_LEAK_REFUSAL = (
     "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
+_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = " I only blocked the chat reply; the workflow draft is still saved."
+
+
+def _with_saved_draft_output_policy_copy(user_response: str) -> str:
+    return f"{user_response}{_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+
+
 _CANCEL_REPLY_DEFAULT = "Cancelled by user."
 _CANCEL_REPLY_UNVALIDATED = (
     "Cancelled. I have a draft workflow you can keep — accept it to save "
@@ -1541,44 +1548,63 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
 ) -> AgentResult:
+    preserved_workflow = ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml else None
+    preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
         "output-policy blocked final output: " + ", ".join(reason.value for reason in verdict.reason_codes)
     )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    add_saved_draft_copy = False
     if (
         request_policy is not None
         and request_policy.clarification_question
         and OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
     ):
         user_response = request_policy.clarification_question
+        add_saved_draft_copy = True
     elif OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
         user_response = _RAW_SECRET_LEAK_REFUSAL
+        add_saved_draft_copy = True
     elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
         user_response = (
             "I need you to confirm which saved credential should be used before I can continue. "
             "Please reply with the credential name from the Credentials UI, or adjust the workflow to avoid "
             "using credentials."
         )
+        add_saved_draft_copy = True
     elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
         user_response = (
             "The selected credential is not approved for one of the URLs in this workflow. "
             "Please use a saved credential tested for that URL, update the block URL to match the credential's "
             "tested site, or adjust the workflow to avoid using credentials."
         )
+        add_saved_draft_copy = True
+    elif preserved_workflow is not None:
+        user_response = (
+            "I could not safely return that chat reply, but the workflow draft is still saved. "
+            "Please review the draft or adjust the request and try again."
+        )
     else:
-        user_response = "I could not safely return that Copilot output. Please adjust the request and try again."
+        user_response = "I could not safely return that chat reply. Please adjust the request and try again."
+    if preserved_workflow is not None and add_saved_draft_copy:
+        user_response = _with_saved_draft_output_policy_copy(user_response)
     return AgentResult(
         user_response=user_response,
-        updated_workflow=None,
+        updated_workflow=preserved_workflow,
         global_llm_context=structured.to_json_str(),
         response_type="ASK_QUESTION",
-        workflow_yaml=prior_workflow_yaml or None,
+        workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
-        # Policy blocks invalidate any currently staged proposal. The prior
-        # YAML is retained for context, but the accept UI should not stay armed.
-        clear_proposed_workflow=True,
+        clear_proposed_workflow=False,
+        proposal_disposition=(
+            "no_proposal"
+            if preserved_workflow is None
+            else "review_untested"
+            if ctx.last_test_ok is not True
+            else "review_tested"
+        ),
         output_policy_diagnostics=output_policy_diagnostics
         or build_output_policy_diagnostics(
             raw_verdict=verdict,
