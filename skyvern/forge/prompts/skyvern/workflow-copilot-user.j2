@@ -20,6 +20,14 @@ Workflow block summary:
 Use this summary as a block-label index, then inspect the full workflow definition above for exact block details.
 {% endif %}
 
+{% if user_workflow_change_summary is defined and user_workflow_change_summary %}
+USER WORKFLOW CHANGES SINCE LAST COPILOT TURN:
+
+```
+{{ user_workflow_change_summary }}
+```
+{% endif %}
+
 PREVIOUS CONTEXT:
 
 {% if chat_history %}

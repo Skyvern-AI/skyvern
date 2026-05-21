@@ -43,6 +43,7 @@ class RequiredContextKey(StrEnum):
     CURRENT_WORKFLOW = "current_workflow"
     PROPOSED_WORKFLOW = "proposed_workflow"
     LATEST_ASSISTANT_PROPOSAL = "latest_assistant_proposal"
+    WORKFLOW_CHANGE = "workflow_change"
     LATEST_RUN_RESULT = "latest_run_result"
     CREDENTIAL_METADATA = "credential_metadata"
     DOCS_CONTEXT = "docs_context"
@@ -382,6 +383,7 @@ def build_turn_intent(
         reason_codes.append(TurnIntentReasonCode.WORKFLOW_CONTEXT_PRESENT)
     if _has_latest_assistant_turn(chat_history):
         required_context.append(RequiredContextKey.LATEST_ASSISTANT_PROPOSAL)
+        required_context.append(RequiredContextKey.WORKFLOW_CHANGE)
         reason_codes.append(TurnIntentReasonCode.CHAT_HISTORY_PRESENT)
     if workflow_run_id:
         required_context.append(RequiredContextKey.LATEST_RUN_RESULT)

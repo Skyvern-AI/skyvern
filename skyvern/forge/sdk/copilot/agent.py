@@ -330,6 +330,7 @@ def _store_turn_context_packet_on_context(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     debug_run_info_text: str,
+    prior_copilot_workflow_yaml: str | None,
 ) -> None:
     if not isinstance(ctx.turn_intent, TurnIntent):
         return
@@ -339,6 +340,7 @@ def _store_turn_context_packet_on_context(
             request_policy=request_policy,
             user_message=chat_request.message,
             workflow_yaml=chat_request.workflow_yaml or "",
+            prior_workflow_yaml=prior_copilot_workflow_yaml or "",
             chat_history=chat_history,
             debug_run_info_text=debug_run_info_text,
         )
@@ -407,6 +409,7 @@ def _build_user_context(
     debug_run_info_text: str,
     user_message: str,
     request_policy_summary: str = "",
+    user_workflow_change_summary: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -428,6 +431,7 @@ def _build_user_context(
         debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
+        user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
     )
 
 
@@ -745,10 +749,8 @@ def _build_wip_exit_result(
     cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
-    # When an unverified edit/run has overwritten ``last_workflow`` since the
-    # last verified shape, prefer the verified shape. ``unvalidated=True``
-    # triggers the route's rollback so auto-accept does not silently keep the
-    # failed/in-flight shape.
+    # When an unverified edit/run has overwritten ``last_workflow``, prefer the
+    # verified shape while still forcing explicit review.
     if (
         ctx.last_good_workflow is not None
         and ctx.last_good_workflow_yaml
@@ -762,7 +764,7 @@ def _build_wip_exit_result(
             workflow_yaml=ctx.last_good_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=True,
+            proposal_disposition="review_tested",
             cancelled=cancelled,
         )
     if (
@@ -780,7 +782,7 @@ def _build_wip_exit_result(
             workflow_yaml=ctx.last_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=unvalidated,
+            proposal_disposition="review_untested" if unvalidated else "auto_applicable",
             cancelled=cancelled,
         )
     return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
@@ -1089,7 +1091,7 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        unvalidated=unvalidated,
+        proposal_disposition="review_untested" if unvalidated else "auto_applicable",
         output_policy_diagnostics=output_policy_diagnostics,
     )
 
@@ -1496,6 +1498,7 @@ async def run_copilot_agent(
     security_rules: str = "",
     config: CopilotConfig | None = None,
     turn_index: int | None = None,
+    prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
     # Initialize tracing before opening the turn span so Logfire's OTel provider
     # is installed; otherwise the very first turn lands the parent span on
@@ -1517,6 +1520,7 @@ async def run_copilot_agent(
             api_key=api_key,
             security_rules=security_rules,
             config=config,
+            prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
 
 
@@ -1532,6 +1536,7 @@ async def _run_copilot_turn_impl(
     api_key: str | None,
     security_rules: str,
     config: CopilotConfig | None,
+    prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -1615,6 +1620,7 @@ async def _run_copilot_turn_impl(
             chat_request=chat_request,
             chat_history=chat_history,
             debug_run_info_text=debug_run_info_text,
+            prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         return _build_request_policy_clarification_result(
@@ -1694,12 +1700,20 @@ async def _run_copilot_turn_impl(
         config=copilot_config,
     )
 
+    user_workflow_change_summary = ""
+    if (
+        isinstance(ctx.turn_context_packet, TurnContextPacket)
+        and ctx.turn_context_packet.workflow_change_context is not None
+    ):
+        user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
         global_llm_context=safe_global_llm_context,
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
+        user_workflow_change_summary=user_workflow_change_summary,
     )
 
     LOG.info(
