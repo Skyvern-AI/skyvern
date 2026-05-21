@@ -294,6 +294,42 @@ async def test_tool_result_sse_summary_translates_loop_detected_failure() -> Non
 
 
 @pytest.mark.asyncio
+async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError
+
+    error_text = "Browser session pbs_123 not found while taking screenshot (404)."
+    events = []
+    for call_id in ("c1", "c2"):
+        call_item = MagicMock(spec=RunItem)
+        call_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot", "arguments": "{}"}
+        events.append(RunItemStreamEvent(name="tool_called", item=call_item))
+
+        output_item = MagicMock(spec=RunItem)
+        output_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot"}
+        output_item.output = [{"type": "text", "text": f'{{"ok": false, "error": "{error_text}"}}'}]
+        events.append(RunItemStreamEvent(name="tool_output", item=output_item))
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = AsyncMock(return_value=True)
+    ctx = SimpleNamespace()
+
+    with pytest.raises(CopilotUnrecoverableToolError):
+        await stream_to_sse(result, stream, ctx)
+
+    result.cancel.assert_called_once()
+    assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == "stop"
+    assert "pbs_" not in ctx.latest_diagnosis_repair_contract.verification_result.remaining_blocker
+
+
+@pytest.mark.asyncio
 async def test_tool_result_sse_summary_drops_click_selector_on_success() -> None:
     """A successful click emits an empty SSE summary; the call_id → tool_name
     lookup must resolve to 'click' for the success-redaction branch to fire."""
