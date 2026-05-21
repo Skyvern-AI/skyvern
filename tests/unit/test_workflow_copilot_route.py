@@ -378,6 +378,63 @@ async def test_proposed_workflow_cleared_on_restore(
 
 
 @pytest.mark.asyncio
+async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_auto_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "staged", "_copilot_unvalidated": True},
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="I could not safely return that chat reply.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+        output_policy_diagnostics={
+            "final_output_policy_allowed": False,
+            "hard_block_reason_codes": ["internal_tool_instruction_leak"],
+        },
+    )
+
+    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert not clear_calls, f"did not expect a clear call, got {update_calls!r}"
+
+
+@pytest.mark.asyncio
 async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
 
