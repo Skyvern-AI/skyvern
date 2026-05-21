@@ -246,7 +246,8 @@ def parse_action(
             keys = [key]
         else:
             keys = action.get("keys", ["Enter"])
-        return KeypressAction(**base_action_dict, keys=keys)
+        repeat = max(1, int(action.get("repeat", 1) or 1))
+        return KeypressAction(**base_action_dict, keys=keys, repeat=repeat)
 
     if action_type == ActionType.SCROLL:
         # SCROLL from extract-action prompt provides a direction and optionally an element_id
