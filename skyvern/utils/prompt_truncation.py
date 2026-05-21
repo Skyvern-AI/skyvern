@@ -18,6 +18,7 @@ LOG = structlog.get_logger()
 
 PREVIOUS_EXTRACTED_INFO_MAX_TOKENS = 20_000
 EXTRACTION_SCHEMA_MAX_TOKENS = 10_000
+EXTRACTION_GOAL_MAX_TOKENS = 150_000
 
 
 def _crop_string(value: str, max_tokens: int) -> str:
