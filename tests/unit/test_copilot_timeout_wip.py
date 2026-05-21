@@ -321,3 +321,72 @@ class TestBuildCancelExitResult:
         assert result.workflow_yaml is None
         assert result.unvalidated is False
         assert result.user_response == _CANCEL_REPLY_DEFAULT
+
+
+class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
+    """Mid-flight overwrite branch offers ``last_good_workflow`` with ``force_review=True, unvalidated=False``."""
+
+    def _overwrite_ctx(self, *, last_test_ok: bool | None) -> MagicMock:
+        good = MagicMock(name="wf-good")
+        in_flight = MagicMock(name="wf-in-flight")
+        return _ctx(
+            last_workflow=in_flight,
+            last_workflow_yaml="version: in-flight",
+            last_test_ok=last_test_ok,
+            last_good_workflow=good,
+            last_good_workflow_yaml="version: good",
+        )
+
+    def test_cancel_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
+        ctx = self._overwrite_ctx(last_test_ok=None)
+
+        result = _build_cancel_exit_result(ctx, global_llm_context=None)
+
+        assert result.cancelled is True
+        assert result.updated_workflow is ctx.last_good_workflow
+        assert result.workflow_yaml == "version: good"
+        assert result.unvalidated is False
+        assert result.force_review is True
+        assert result.user_response == _CANCEL_REPLY_TESTED
+
+    def test_timeout_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
+        ctx = self._overwrite_ctx(last_test_ok=False)
+
+        result = _build_timeout_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_good_workflow
+        assert result.unvalidated is False
+        assert result.force_review is True
+        assert result.user_response == _TIMEOUT_REPLY_TESTED
+
+    def test_max_turns_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
+        ctx = self._overwrite_ctx(last_test_ok=None)
+
+        result = _build_max_turns_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_good_workflow
+        assert result.unvalidated is False
+        assert result.force_review is True
+        assert result.user_response == _MAX_TURNS_REPLY_TESTED
+
+    def test_unexpected_error_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
+        ctx = self._overwrite_ctx(last_test_ok=None)
+
+        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_good_workflow
+        assert result.unvalidated is False
+        assert result.force_review is True
+        assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
+
+    def test_cancelled_total_timeout_latch_uses_force_review_not_unvalidated(self) -> None:
+        ctx = self._overwrite_ctx(last_test_ok=None)
+        ctx.copilot_total_timeout_exceeded = True
+
+        result = _build_cancelled_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is ctx.last_good_workflow
+        assert result.unvalidated is False
+        assert result.force_review is True
+        assert result.cancelled is False
+        assert result.user_response == _TIMEOUT_REPLY_TESTED
