@@ -718,6 +718,10 @@ _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
     "a supported workflow update."
 )
+_BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL = (
+    "I drafted a change to the workflow but haven't applied it yet. Want me to update the workflow now?"
+)
+_BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL = "I made the change you described to the workflow."
 _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 _UNVALIDATED_PROPOSAL_AFFORDANCE = (
@@ -1038,6 +1042,14 @@ def _translate_to_agent_result(
         user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
         soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
         output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
+        user_response = (
+            _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
+            if last_workflow is not None
+            else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
+        )
+        soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
+        output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
     # Preserve the unbacked-proposal correction when both soft rewrites apply:
     # a reply must not imply a workflow exists when no proposal was produced.
     if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
