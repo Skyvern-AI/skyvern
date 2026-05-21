@@ -745,10 +745,8 @@ def _build_wip_exit_result(
     cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
-    # When an unverified edit/run has overwritten ``last_workflow`` since the
-    # last verified shape, prefer the verified shape. ``unvalidated=True``
-    # triggers the route's rollback so auto-accept does not silently keep the
-    # failed/in-flight shape.
+    # When an unverified edit/run has overwritten ``last_workflow``, prefer the
+    # verified shape while still forcing explicit review.
     if (
         ctx.last_good_workflow is not None
         and ctx.last_good_workflow_yaml
@@ -762,7 +760,7 @@ def _build_wip_exit_result(
             workflow_yaml=ctx.last_good_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=True,
+            proposal_disposition="review_tested",
             cancelled=cancelled,
         )
     if (
@@ -780,7 +778,7 @@ def _build_wip_exit_result(
             workflow_yaml=ctx.last_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=unvalidated,
+            proposal_disposition="review_untested" if unvalidated else "auto_applicable",
             cancelled=cancelled,
         )
     return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
@@ -1089,7 +1087,7 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        unvalidated=unvalidated,
+        proposal_disposition="review_untested" if unvalidated else "auto_applicable",
         output_policy_diagnostics=output_policy_diagnostics,
     )
 

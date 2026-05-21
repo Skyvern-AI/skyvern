@@ -134,7 +134,8 @@ def test_build_timeout_exit_result_surfaces_last_good_after_failure() -> None:
     result = _build_timeout_exit_result(ctx, global_llm_context=None)
     assert result.updated_workflow is ctx.last_good_workflow
     assert result.workflow_yaml == "yaml-good"
-    assert result.unvalidated is True
+    assert result.unvalidated is False
+    assert result.force_review is True
     assert result.user_response == _TIMEOUT_REPLY_TESTED
 
 
@@ -150,7 +151,8 @@ def test_build_timeout_exit_result_surfaces_last_good_on_mid_flight_cancellation
     ctx.last_good_workflow_yaml = "yaml-good"
     result = _build_timeout_exit_result(ctx, global_llm_context=None)
     assert result.updated_workflow is ctx.last_good_workflow
-    assert result.unvalidated is True
+    assert result.unvalidated is False
+    assert result.force_review is True
 
 
 def test_build_timeout_exit_result_falls_through_when_no_last_good() -> None:
