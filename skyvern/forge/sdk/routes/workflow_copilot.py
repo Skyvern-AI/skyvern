@@ -25,7 +25,7 @@ from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import AgentResult
+from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
@@ -253,9 +253,28 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
         pass
 
 
+def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
+    disposition = getattr(agent_result, "proposal_disposition", None)
+    if disposition in ("auto_applicable", "review_untested", "review_tested"):
+        return disposition
+    if getattr(agent_result, "unvalidated", False) is True:
+        return "review_untested"
+    if getattr(agent_result, "force_review", False) is True:
+        return "review_tested"
+    return "auto_applicable"
+
+
+def _legacy_unvalidated(proposal_disposition: ProposalDisposition) -> bool:
+    return proposal_disposition == "review_untested"
+
+
+def _legacy_force_review(proposal_disposition: ProposalDisposition) -> bool:
+    return proposal_disposition == "review_tested"
+
+
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """``unvalidated`` and ``cancelled`` override ``auto_accept=True`` to force explicit Accept/Reject."""
-    if bool(getattr(agent_result, "unvalidated", False)) or bool(getattr(agent_result, "cancelled", False)):
+    """Only auto-applicable proposals may honor ``auto_accept=True``."""
+    if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
     return auto_accept is True
 
@@ -281,7 +300,7 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
         proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
-    if agent_result.unvalidated:
+    if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
     return proposed_data
 
@@ -331,7 +350,6 @@ async def _persist_cancel_turn(
         updated_global_llm_context = None
         total_tokens = None
         response_type = "REPLY"
-        unvalidated = False
         output_policy_diagnostics = None
         if chat.proposed_workflow is not None:
             await asyncio.shield(_clear_proposed_workflow(chat))
@@ -348,7 +366,6 @@ async def _persist_cancel_turn(
         updated_global_llm_context = agent_result.global_llm_context
         total_tokens = getattr(agent_result, "total_tokens", None)
         response_type = getattr(agent_result, "response_type", "REPLY")
-        unvalidated = bool(getattr(agent_result, "unvalidated", False))
         output_policy_diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
 
     await asyncio.shield(
@@ -368,6 +385,7 @@ async def _persist_cancel_turn(
             global_llm_context=updated_global_llm_context,
         )
     )
+    proposal_disposition = _proposal_disposition(agent_result)
     try:
         await asyncio.shield(
             stream.send(
@@ -379,9 +397,11 @@ async def _persist_cancel_turn(
                     response_time=assistant_message.created_at,
                     total_tokens=total_tokens,
                     response_type=response_type,
-                    unvalidated=unvalidated,
+                    proposal_disposition=proposal_disposition,
+                    unvalidated=_legacy_unvalidated(proposal_disposition),
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
+                    force_review=_legacy_force_review(proposal_disposition),
                 )
             )
         )
@@ -444,6 +464,7 @@ async def _finalise_normal_turn(
         global_llm_context=updated_global_llm_context,
     )
 
+    proposal_disposition = _proposal_disposition(agent_result)
     await stream.send(
         WorkflowCopilotStreamResponseUpdate(
             type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -453,8 +474,10 @@ async def _finalise_normal_turn(
             response_time=assistant_message.created_at,
             total_tokens=getattr(agent_result, "total_tokens", None),
             response_type=getattr(agent_result, "response_type", "REPLY"),
-            unvalidated=bool(getattr(agent_result, "unvalidated", False)),
+            proposal_disposition=proposal_disposition,
+            unvalidated=_legacy_unvalidated(proposal_disposition),
             output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
+            force_review=_legacy_force_review(proposal_disposition),
         )
     )
 
@@ -1097,6 +1120,41 @@ def _process_workflow_yaml(
     )
 
 
+def _blockless_submission_fallback(
+    *,
+    proposed_workflow: dict[str, Any] | None,
+    submitted_workflow_yaml: str | None,
+) -> str | None:
+    """Return a hydration YAML when the frontend submitted nothing usable. Only
+    fires for truly empty submissions (``None`` or empty string); a non-empty
+    YAML with ``blocks: []`` is treated as an explicit user deletion."""
+    if submitted_workflow_yaml is not None and submitted_workflow_yaml.strip() != "":
+        return None
+    if not isinstance(proposed_workflow, dict):
+        return None
+    candidate = proposed_workflow.get("_copilot_yaml")
+    if not isinstance(candidate, str) or _workflow_yaml_block_count(candidate) == 0:
+        return None
+    return candidate
+
+
+def _prior_copilot_workflow_yaml(
+    *,
+    proposed_workflow: dict[str, Any] | None,
+    persisted_workflow_yaml: str | None,
+) -> str | None:
+    """Return the YAML the copilot last saw — the basis for the user-modified
+    diff. Preference: the persisted proposal (`_copilot_yaml`) → the on-disk
+    workflow. Returns ``None`` only when neither carries usable blocks."""
+    if isinstance(proposed_workflow, dict):
+        candidate = proposed_workflow.get("_copilot_yaml")
+        if isinstance(candidate, str) and _workflow_yaml_block_count(candidate) > 0:
+            return candidate
+    if persisted_workflow_yaml and _workflow_yaml_block_count(persisted_workflow_yaml) > 0:
+        return persisted_workflow_yaml
+    return None
+
+
 def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
     if not workflow_yaml:
         return 0
@@ -1187,14 +1245,20 @@ def _workflow_to_copilot_yaml(workflow: Workflow) -> str:
     return yaml.safe_dump(yaml_data, sort_keys=False)
 
 
-def _ensure_copilot_workflow_yaml(chat_request: WorkflowCopilotChatRequest, original_workflow: Workflow) -> None:
+def _ensure_copilot_workflow_yaml(
+    chat_request: WorkflowCopilotChatRequest,
+    original_workflow: Workflow,
+    *,
+    persisted_workflow_yaml: str | None = None,
+) -> None:
     if _workflow_yaml_block_count(chat_request.workflow_yaml) > 0:
         return
     workflow_definition = original_workflow.workflow_definition
     if workflow_definition is None or not workflow_definition.blocks:
         return
 
-    persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+    if persisted_workflow_yaml is None:
+        persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
     if not persisted_workflow_yaml:
         return
 
@@ -1281,8 +1345,12 @@ async def _new_copilot_chat_post(
                     global_llm_context = message.global_llm_context
                     break
 
-            if chat.proposed_workflow and chat.proposed_workflow.get("_copilot_yaml"):
-                chat_request.workflow_yaml = chat.proposed_workflow["_copilot_yaml"]
+            blockless_fallback = _blockless_submission_fallback(
+                proposed_workflow=chat.proposed_workflow,
+                submitted_workflow_yaml=chat_request.workflow_yaml,
+            )
+            if blockless_fallback is not None:
+                chat_request.workflow_yaml = blockless_fallback
 
             block_infos, debug_html = await _get_new_copilot_block_infos(
                 organization.organization_id, chat_request.workflow_run_id
@@ -1323,7 +1391,21 @@ async def _new_copilot_chat_post(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
             chat_request.workflow_id = original_workflow.workflow_id
-            _ensure_copilot_workflow_yaml(chat_request, original_workflow)
+            persisted_workflow_yaml: str | None = None
+            persisted_definition = original_workflow.workflow_definition
+            if persisted_definition is not None and persisted_definition.blocks:
+                persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+
+            _ensure_copilot_workflow_yaml(
+                chat_request,
+                original_workflow,
+                persisted_workflow_yaml=persisted_workflow_yaml,
+            )
+
+            prior_copilot_workflow_yaml = _prior_copilot_workflow_yaml(
+                proposed_workflow=chat.proposed_workflow,
+                persisted_workflow_yaml=persisted_workflow_yaml,
+            )
 
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id
@@ -1385,6 +1467,7 @@ async def _new_copilot_chat_post(
                     api_key=api_key,
                     config=copilot_config,
                     turn_index=turn_index,
+                    prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                 )
 
             if getattr(agent_result, "cancelled", False):

@@ -7,7 +7,10 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
-from skyvern.forge.sdk.copilot.output_utils import looks_like_workflow_delivery_claim
+from skyvern.forge.sdk.copilot.output_utils import (
+    looks_like_workflow_delivery_claim,
+    looks_like_workflow_yaml_in_chat,
+)
 from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy, contains_email_password_pair
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
@@ -102,6 +105,7 @@ class OutputPolicyReason(StrEnum):
     INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
     INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
+    WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
 
 
 @dataclass
@@ -326,6 +330,8 @@ def evaluate_output_policy(
         verdict.add(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
     if _contains_internal_block_taxonomy_leak(user_response, output_kind):
         verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    if response_type in ("REPLY", "ASK_QUESTION") and looks_like_workflow_yaml_in_chat(user_response):
+        verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
         if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
