@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 from enum import StrEnum
 from typing import Any
@@ -67,6 +68,7 @@ class TurnIntentReasonCode(StrEnum):
     RUN_CONTEXT_PRESENT = "run_context_present"
     BROWSER_CONTEXT_PRESENT = "browser_context_present"
     KEYWORD_HEURISTIC = "keyword_heuristic"
+    CONFIRMATION_CARRYOVER = "confirmation_carryover"
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
 
 
@@ -186,9 +188,18 @@ def _has_latest_assistant_turn(chat_history: list[WorkflowCopilotChatHistoryMess
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _word_boundary_pattern(terms: tuple[str, ...]) -> re.Pattern[str]:
+    alternation = "|".join(re.escape(term.strip()) for term in terms)
+    # Boundaries are alphanumeric-only so `_` separates words: the edit
+    # term `update` matches a block label like `update_card`. Optional
+    # trailing `s` matches plurals (`errors`) but deliberately not `-ed`
+    # forms (`fixed` must not match `fix`).
+    return re.compile(rf"(?<![a-z0-9])(?:{alternation})s?(?![a-z0-9])")
+
+
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
-    normalized = text.lower()
-    return any(term in normalized for term in terms)
+    return _word_boundary_pattern(terms).search(text.lower()) is not None
 
 
 def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
@@ -290,6 +301,56 @@ def _mode_from_keywords(
     return None
 
 
+_AFFIRMATIVE_REPLIES = frozenset(
+    {
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "ok",
+        "okay",
+        "confirm",
+        "confirmed",
+        "i confirm",
+        "correct",
+        "right",
+        "thats right",
+        "that's right",
+        "go ahead",
+        "do it",
+        "please do",
+        "sounds good",
+        "affirmative",
+    }
+)
+
+
+def _is_bare_affirmative(user_message: str) -> bool:
+    """True when the message is only a confirmation token (no new instruction)."""
+    normalized = (user_message or "").strip().lower().rstrip(".!,;: ")
+    return normalized in _AFFIRMATIVE_REPLIES
+
+
+def _carryover_mode_from_prior_turn(
+    chat_history: list[WorkflowCopilotChatHistoryMessage], *, has_workflow: bool
+) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
+    """Mode of the most recent prior user turn that keyword-classifies. A bare
+    confirmation carries no keywords of its own, so it inherits the turn it confirms."""
+    for message in reversed(chat_history):
+        if message.sender != WorkflowCopilotChatSender.USER:
+            continue
+        content = (message.content or "").strip()
+        # Skip earlier confirmations so a chain of "yes"/"confirm" turns walks
+        # back to the substantive request, not to the nearest confirmation.
+        if not content or _is_bare_affirmative(content):
+            continue
+        if carried := _mode_from_keywords(content, has_workflow=has_workflow):
+            return carried
+    return None
+
+
 def build_turn_intent(
     *,
     user_message: str,
@@ -364,6 +425,12 @@ def build_turn_intent(
         mode, expected_output = keyword_mode
         confidence = 0.35
         reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
+    elif _is_bare_affirmative(user_message) and (
+        carried_mode := _carryover_mode_from_prior_turn(chat_history, has_workflow=has_workflow)
+    ):
+        mode, expected_output = carried_mode
+        confidence = 0.3
+        reason_codes.append(TurnIntentReasonCode.CONFIRMATION_CARRYOVER)
 
     if mode == TurnIntentMode.EDIT:
         unresolved_block_refs = _unresolved_explicit_block_refs(user_message, workflow_yaml)
