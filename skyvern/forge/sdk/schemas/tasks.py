@@ -19,6 +19,8 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
+from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import validate_url
 
 
@@ -159,6 +161,19 @@ class TaskRequest(TaskBase):
 
         self.url = url_validation_result
         return self
+
+    @field_validator("data_extraction_goal")
+    @classmethod
+    def validate_data_extraction_goal_size(cls, goal: str | None) -> str | None:
+        if goal is None:
+            return goal
+        token_count = count_tokens(goal)
+        if token_count > EXTRACTION_GOAL_MAX_TOKENS:
+            raise SkyvernHTTPException(
+                message=f"data_extraction_goal is too large ({token_count:,} tokens). Maximum is {EXTRACTION_GOAL_MAX_TOKENS:,} tokens.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return goal
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
