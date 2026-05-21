@@ -54,7 +54,19 @@ https://github.com/user-attachments/assets/70cfe310-24dc-431a-adde-e72691f198a7
 - Cursor
 - Windsurf
 - Claude Desktop
+- OpenCode (`skyvern setup opencode` — uses API key auth; avoids OAuth callback timeouts)
 - Your custom MCP App?
+
+### OpenCode (remote MCP)
+
+If `opencode mcp auth Skyvern` fails with **OAuth callback timeout**, use API key auth instead:
+
+```bash
+skyvern login
+skyvern setup opencode
+```
+
+This writes `~/.config/opencode/opencode.json` with `"oauth": false` and your `x-api-key` header. Do not run `opencode mcp auth` afterward.
 
 Use the following config if you want to set up Skyvern for any other MCP-enabled application
 ```json

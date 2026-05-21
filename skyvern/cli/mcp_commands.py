@@ -33,11 +33,13 @@ from .setup_commands import (
     _get_env_credentials,
     _load_mcp_config,
     _load_openclaw_config,
+    _load_opencode_config,
     _load_yaml_config,
     _mask_key,
     _mask_secrets,
     _normalize_openclaw_remote_entry,
     _openclaw_config_path,
+    _opencode_config_path,
     _save_yaml_config,
     _walk_nested_path,
     _warn_openclaw_json_normalization,
@@ -58,6 +60,7 @@ _CONFIG_FORMAT_JSON = "json"
 _CONFIG_FORMAT_JSON5 = "json5"
 _CONFIG_FORMAT_CODEX = "codex_toml"
 _CONFIG_FORMAT_YAML = "yaml"
+_CONFIG_FORMAT_OPENCODE = "opencode"
 
 
 @dataclass(frozen=True)
@@ -298,6 +301,8 @@ def _load_switch_config(config_path: Path, config_format: str) -> tuple[dict | N
         return _load_codex_config(config_path)
     if config_format == _CONFIG_FORMAT_JSON5:
         return _load_openclaw_config(config_path)
+    if config_format == _CONFIG_FORMAT_OPENCODE:
+        return _load_opencode_config(config_path)
     if config_format == _CONFIG_FORMAT_YAML:
         data = _load_yaml_config(config_path)
         if data is None:
@@ -356,6 +361,12 @@ def _switch_target_specs() -> list[SwitchTargetSpec]:
             config_format=_CONFIG_FORMAT_JSON5,
             entry_path=["mcp", "servers"],
         ),
+        SwitchTargetSpec(
+            "OpenCode",
+            _opencode_config_path,
+            config_format=_CONFIG_FORMAT_OPENCODE,
+            entry_path=["mcp"],
+        ),
         SwitchTargetSpec("Hermes", _hermes_config_path, config_format=_CONFIG_FORMAT_YAML),
     ]
     # Discover per-profile Hermes configs alongside the global one
@@ -388,10 +399,13 @@ def _entry_kind(entry: dict | None) -> str:
     if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
         return "mcp-remote bridge"
 
-    if isinstance(entry.get("env"), dict):
+    if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
         return "local stdio"
 
-    if entry.get("type") == "http" or "url" in entry or isinstance(entry.get("http_headers"), dict):
+    if entry.get("type") in {"local"}:
+        return "local stdio"
+
+    if entry.get("type") in {"http", "remote"} or "url" in entry or isinstance(entry.get("http_headers"), dict):
         return "remote http"
 
     return "unsupported"
@@ -410,7 +424,7 @@ def _extract_entry_api_key(entry: dict) -> str:
         if isinstance(api_key, str):
             return api_key
 
-    env = entry.get("env", {})
+    env = entry.get("environment") or entry.get("env", {})
     if isinstance(env, dict):
         api_key = env.get("SKYVERN_API_KEY")
         if isinstance(api_key, str):
@@ -729,14 +743,28 @@ def _patch_entry_with_profile(
     kind = _entry_kind(entry)
 
     if kind == "local stdio":
-        env = dict(patched.get("env") or {})
+        env = dict(patched.get("environment") or patched.get("env") or {})
         env["SKYVERN_API_KEY"] = profile.api_key
         env["SKYVERN_BASE_URL"] = profile.base_url
-        patched["env"] = env
+        if "environment" in patched or config_format == _CONFIG_FORMAT_OPENCODE:
+            patched["environment"] = env
+            patched.pop("env", None)
+            if config_format == _CONFIG_FORMAT_OPENCODE:
+                patched["type"] = "local"
+        else:
+            patched["env"] = env
         return patched
 
     if kind == "remote http":
         target_url = _profile_to_mcp_url(profile.base_url)
+        if config_format == _CONFIG_FORMAT_OPENCODE:
+            headers = dict(patched.get("headers") or {})
+            headers["x-api-key"] = profile.api_key
+            patched["headers"] = headers
+            patched["url"] = target_url
+            patched["type"] = "remote"
+            patched["oauth"] = False
+            return patched
         if config_format == _CONFIG_FORMAT_JSON5:
             return _normalize_openclaw_remote_entry(patched, api_key=profile.api_key, url=target_url)
         if config_format == _CONFIG_FORMAT_CODEX or "http_headers" in patched:
