@@ -7,6 +7,10 @@ mode: custom
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-of-may-18%2C-2026" className="cl-sidebar-link">Week of May 18, 2026</a>
+    <a href="#week-of-may-11%2C-2026" className="cl-sidebar-link">Week of May 11, 2026</a>
+    <a href="#week-of-may-4%2C-2026" className="cl-sidebar-link">Week of May 4, 2026</a>
+    <a href="#week-of-april-27%2C-2026" className="cl-sidebar-link">Week of Apr 27, 2026</a>
     <a href="#week-of-april-21%2C-2026" className="cl-sidebar-link">Week of Apr 21, 2026</a>
     <a href="#week-of-april-14%2C-2026" className="cl-sidebar-link">Week of Apr 14, 2026</a>
     <a href="#week-of-march-30%2C-2026" className="cl-sidebar-link">Week of Mar 30, 2026</a>
@@ -21,6 +25,106 @@ mode: custom
   <div className="cl-content">
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
+
+<Update label="Week of May 18, 2026" description="Guided browser profile setup, archived artifact status, webhook retry, download fixes">
+
+## New features
+
+- **Guided Browser Profile Setup** — A new step-by-step flow walks you through creating a saved browser profile, making it easier to set up persistent login sessions. ([#6043](https://github.com/Skyvern-AI/skyvern/pull/6043))
+- **MCP Setup in Cloud Settings** — Added a dedicated MCP setup section to cloud account settings for easier MCP client configuration.
+
+## Improvements
+
+- **Archived Artifact Status** — Workflow runs now show when their artifacts have been archived, with a clear status indicator in the UI. ([#6075](https://github.com/Skyvern-AI/skyvern/pull/6075))
+- **Automatic Webhook Retry on Infrastructure Failures** — Workflow webhooks are now retried automatically after transient infrastructure failures, reducing missed notifications. ([#6062](https://github.com/Skyvern-AI/skyvern/pull/6062))
+- **Faster Script-Mode Runs** — Speculative extract-action steps are skipped in script-mode workflows, cutting unnecessary LLM calls. ([#6057](https://github.com/Skyvern-AI/skyvern/pull/6057))
+- **LLM Router Length-Truncation Fallback** — When a model response is cut off by a length limit, the router now automatically retries with a fallback model instead of returning a partial response. ([#6079](https://github.com/Skyvern-AI/skyvern/pull/6079))
+
+## Bug fixes
+
+- Fixed popup pages opened during a run not being included in session recordings. ([#6078](https://github.com/Skyvern-AI/skyvern/pull/6078))
+- Fixed XHR-triggered file downloads not being captured when using download action blocks. ([#6054](https://github.com/Skyvern-AI/skyvern/pull/6054))
+- Fixed transient download-error popups incorrectly causing run failures. ([#6080](https://github.com/Skyvern-AI/skyvern/pull/6080))
+- Fixed child tasks not being terminated and workflow runs getting resurrected after a cleanup cron timeout. ([#6047](https://github.com/Skyvern-AI/skyvern/pull/6047))
+- Fixed copilot feasibility check stalling when given diagnostic input for an existing workflow. ([#6061](https://github.com/Skyvern-AI/skyvern/pull/6061))
+- Fixed reCAPTCHA v2 invisible variant being misidentified as v3, causing solve failures.
+
+</Update>
+
+<Update label="Week of May 11, 2026" description="Analytics dashboard, browser profile pages, scheduled run badges, faster API">
+
+## New features
+
+- **Analytics Dashboard** — A new /analytics page provides a breakdown of workflow run activity and performance over time. ([#5980](https://github.com/Skyvern-AI/skyvern/pull/5980))
+- **Browser Profile Management Page** — A dedicated browser profiles page lets you view, search, and rename your saved browser profiles. ([#5990](https://github.com/Skyvern-AI/skyvern/pull/5990))
+- **Smarter Element Targeting** — The agent now uses deterministic HTML element-tree compression, improving selector reliability on complex pages. ([#5970](https://github.com/Skyvern-AI/skyvern/pull/5970))
+- **Block-Scoped Parameter Prompts in Debugger** — The workflow debugger now prompts for parameters scoped to the specific block being tested, making per-block runs easier to set up.
+
+## Improvements
+
+- **Scheduled Trigger Badge on Runs Page** — The global Runs page now shows a badge on runs triggered by a schedule, making scheduled runs easy to identify. ([#5948](https://github.com/Skyvern-AI/skyvern/pull/5948))
+- **Signed Artifact Content URLs** — Artifact content URLs are now always signed with configurable expiry for secure access control. ([#5940](https://github.com/Skyvern-AI/skyvern/pull/5940))
+- **Faster Workflow Run API** — The GET workflow run endpoint has been significantly optimized for speed. ([#5993](https://github.com/Skyvern-AI/skyvern/pull/5993))
+- **Copilot Diff View Detects Nested Changes** — The Copilot diff panel now correctly highlights changes inside nested conditional and loop blocks. ([#5945](https://github.com/Skyvern-AI/skyvern/pull/5945))
+- **Output Parameter Size Protection** — Workflow output parameter values are now capped to prevent oversized JSON payloads from causing downstream failures. ([#5974](https://github.com/Skyvern-AI/skyvern/pull/5974))
+
+## Bug fixes
+
+- Fixed scheduled workflow runs not appearing on the global Runs page. ([#5949](https://github.com/Skyvern-AI/skyvern/pull/5949))
+- Fixed webhook delivery silently failing on transient 403, 5xx, or network errors. ([#5952](https://github.com/Skyvern-AI/skyvern/pull/5952))
+- Fixed artifact downloads failing for clients that send HTTP Range request headers. ([#5982](https://github.com/Skyvern-AI/skyvern/pull/5982))
+- Fixed FileParserBlock failures not appearing in workflow run outputs. ([#5964](https://github.com/Skyvern-AI/skyvern/pull/5964))
+
+</Update>
+
+<Update label="Week of May 4, 2026" description="While Loop block, multiple schedules per workflow, Google Sheets connector, browser session runs tab">
+
+## New features
+
+- **While Loop Block** — A new workflow block type that repeats a sub-workflow until a condition is met, enabling dynamic iteration without a fixed loop count. ([#5809](https://github.com/Skyvern-AI/skyvern/pull/5809))
+- **Multiple Schedules per Workflow** — Workflows can now have multiple independent schedules (e.g., run at 9am on weekdays and noon on weekends). ([#5799](https://github.com/Skyvern-AI/skyvern/pull/5799))
+- **Google Sheets Connector (Open Source)** — The Google Sheets connector authentication flow is now part of the open source package. ([#5815](https://github.com/Skyvern-AI/skyvern/pull/5815))
+- **Runs Tab on Browser Session Page** — The browser session detail page now includes a Runs tab listing all workflow runs associated with that session. ([#5830](https://github.com/Skyvern-AI/skyvern/pull/5830))
+- **Per-Workflow Total Step Cap** — A new workflow-run step cap lets you limit the maximum number of agent steps across all blocks in a single run. ([#5834](https://github.com/Skyvern-AI/skyvern/pull/5834))
+
+## Improvements
+
+- **TOTP Scoped to Active Credential** — Credential-derived TOTP values are now scoped to the active credential, preventing stale tokens from being used mid-run. ([#5805](https://github.com/Skyvern-AI/skyvern/pull/5805))
+- **Browser Dialogs Surfaced to Agent** — JavaScript dialogs (alerts, confirms, prompts) that the browser blocks are now surfaced to the agent so it can adapt its next action. ([#5810](https://github.com/Skyvern-AI/skyvern/pull/5810))
+
+## Bug fixes
+
+- Fixed the workflow-deleted banner not appearing on the run detail page when the parent workflow has been deleted. ([#5800](https://github.com/Skyvern-AI/skyvern/pull/5800))
+
+</Update>
+
+<Update label="Week of April 27, 2026" description="MCP CLI for schedules and config, copilot hard-cancel, cursor in recordings, artifact URL improvements">
+
+## New features
+
+- **Workflow Schedule Management via MCP** — Manage workflow schedules from MCP clients (e.g., Claude Code) using the new `skyvern schedule` CLI commands. ([#5713](https://github.com/Skyvern-AI/skyvern/pull/5713))
+- **Org Settings via MCP** — Configure organization settings from MCP clients using the new `skyvern config` CLI tool. ([#5694](https://github.com/Skyvern-AI/skyvern/pull/5694))
+- **MCP OAuth Org Selection** — Multi-org users can now choose which organization to connect to during MCP OAuth authentication. ([#5699](https://github.com/Skyvern-AI/skyvern/pull/5699))
+- **Platform-Level JS Dialog Handler** — The agent now handles JavaScript dialogs at the browser level using LLM-guided decision logic, improving reliability on dialog-heavy pages. ([#5679](https://github.com/Skyvern-AI/skyvern/pull/5679))
+- **Print-to-PDF in Downloaded Files** — Workflow blocks that trigger a browser print-to-PDF now expose the resulting file in the block's downloaded files list. ([#5784](https://github.com/Skyvern-AI/skyvern/pull/5784))
+
+## Improvements
+
+- **Cursor Visualization in Run Recordings** — Playwright recordings now overlay a visible cursor, making it easy to follow the agent's actions when reviewing a recording. ([#5683](https://github.com/Skyvern-AI/skyvern/pull/5683))
+- **Short Signed Recording URLs** — Browser session recording links are now compact signed URLs instead of full S3 paths. ([#5686](https://github.com/Skyvern-AI/skyvern/pull/5686))
+- **Configurable Artifact URL Expiry** — A settings field lets you control how long artifact content URLs stay valid before expiring. ([#5690](https://github.com/Skyvern-AI/skyvern/pull/5690))
+- **Copilot Hard-Cancel** — A hard-cancel button immediately stops an in-progress copilot run without waiting for the current step to finish. ([#5726](https://github.com/Skyvern-AI/skyvern/pull/5726))
+- **Copilot Reuses Live Debug Browser Session** — When testing a workflow from the debugger, the copilot now reuses the open browser session instead of starting a new one. ([#5709](https://github.com/Skyvern-AI/skyvern/pull/5709))
+- **Copilot Surfaces WIP Workflow on Timeout** — If the copilot times out or a test fails, it now offers the in-progress workflow so you can review and continue. ([#5755](https://github.com/Skyvern-AI/skyvern/pull/5755))
+- **Pre-Filled Debugger Run Dialog** — The Run dialog in the workflow debugger now pre-fills with values from your last run. ([#5724](https://github.com/Skyvern-AI/skyvern/pull/5724))
+- **Copilot Atomic Workflow Accept** — Accepting a copilot workflow proposal now applies all block changes atomically, preventing partial updates. ([#5695](https://github.com/Skyvern-AI/skyvern/pull/5695))
+- **Loop Block Failure-Handling Clarity** — The loop block UI has clearer controls and labels for configuring how failures inside the loop are handled. ([#5731](https://github.com/Skyvern-AI/skyvern/pull/5731))
+
+## Bug fixes
+
+- Fixed the in-progress workflow not being preserved when closing the copilot mid-run. ([#5787](https://github.com/Skyvern-AI/skyvern/pull/5787))
+
+</Update>
 
 <Update label="Week of April 21, 2026" description="Copilot reliability, run recordings, 2FA improvements, and more">
 
