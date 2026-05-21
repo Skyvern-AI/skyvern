@@ -2290,7 +2290,7 @@ class ForgeAgent:
 
         # Brief back-off so verification can short-circuit cheap CompleteAction cases
         # before we start the speculative scrape.
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.3)
 
         try:
             next_step.is_speculative = True
