@@ -3204,34 +3204,62 @@ class ForgeAgent:
                 element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
             )
         else:
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+            scrape_artifact_types = [
+                ArtifactType.HTML_SCRAPE,
+                ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                ArtifactType.VISIBLE_ELEMENTS_TREE,
+                ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            ]
+            results = await asyncio.gather(
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                    data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                    data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+                    data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                    data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+                    data=element_tree_in_prompt.encode("utf-8"),
+                ),
+                return_exceptions=True,
             )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-                data=element_tree_in_prompt.encode("utf-8"),
-            )
+            failures = [
+                (artifact_type, result)
+                for artifact_type, result in zip(scrape_artifact_types, results, strict=True)
+                if isinstance(result, BaseException)
+            ]
+            for artifact_type, exc in failures:
+                LOG.error(
+                    "Failed to persist scrape artifact",
+                    artifact_type=artifact_type,
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    error=str(exc),
+                )
+            if failures:
+                raise failures[0][1]
 
     def _build_element_tree_for_prompt(
         self,
