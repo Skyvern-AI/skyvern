@@ -2618,9 +2618,13 @@ async def _fallback_page_info(ctx: AgentContext) -> tuple[str, str]:
     if not ctx.browser_session_id:
         return "", ""
     try:
-        from skyvern.cli.core.session_manager import get_page
-
-        page, _ = await get_page(session_id=ctx.browser_session_id)
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        if not browser_state:
+            return "", ""
+        page = await browser_state.get_or_create_page()
         if page:
             return page.url, await page.title()
     except Exception:
