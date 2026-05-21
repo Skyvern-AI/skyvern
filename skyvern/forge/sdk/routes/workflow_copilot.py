@@ -1120,6 +1120,41 @@ def _process_workflow_yaml(
     )
 
 
+def _blockless_submission_fallback(
+    *,
+    proposed_workflow: dict[str, Any] | None,
+    submitted_workflow_yaml: str | None,
+) -> str | None:
+    """Return a hydration YAML when the frontend submitted nothing usable. Only
+    fires for truly empty submissions (``None`` or empty string); a non-empty
+    YAML with ``blocks: []`` is treated as an explicit user deletion."""
+    if submitted_workflow_yaml is not None and submitted_workflow_yaml.strip() != "":
+        return None
+    if not isinstance(proposed_workflow, dict):
+        return None
+    candidate = proposed_workflow.get("_copilot_yaml")
+    if not isinstance(candidate, str) or _workflow_yaml_block_count(candidate) == 0:
+        return None
+    return candidate
+
+
+def _prior_copilot_workflow_yaml(
+    *,
+    proposed_workflow: dict[str, Any] | None,
+    persisted_workflow_yaml: str | None,
+) -> str | None:
+    """Return the YAML the copilot last saw — the basis for the user-modified
+    diff. Preference: the persisted proposal (`_copilot_yaml`) → the on-disk
+    workflow. Returns ``None`` only when neither carries usable blocks."""
+    if isinstance(proposed_workflow, dict):
+        candidate = proposed_workflow.get("_copilot_yaml")
+        if isinstance(candidate, str) and _workflow_yaml_block_count(candidate) > 0:
+            return candidate
+    if persisted_workflow_yaml and _workflow_yaml_block_count(persisted_workflow_yaml) > 0:
+        return persisted_workflow_yaml
+    return None
+
+
 def _workflow_yaml_block_count(workflow_yaml: str | None) -> int:
     if not workflow_yaml:
         return 0
@@ -1210,14 +1245,20 @@ def _workflow_to_copilot_yaml(workflow: Workflow) -> str:
     return yaml.safe_dump(yaml_data, sort_keys=False)
 
 
-def _ensure_copilot_workflow_yaml(chat_request: WorkflowCopilotChatRequest, original_workflow: Workflow) -> None:
+def _ensure_copilot_workflow_yaml(
+    chat_request: WorkflowCopilotChatRequest,
+    original_workflow: Workflow,
+    *,
+    persisted_workflow_yaml: str | None = None,
+) -> None:
     if _workflow_yaml_block_count(chat_request.workflow_yaml) > 0:
         return
     workflow_definition = original_workflow.workflow_definition
     if workflow_definition is None or not workflow_definition.blocks:
         return
 
-    persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+    if persisted_workflow_yaml is None:
+        persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
     if not persisted_workflow_yaml:
         return
 
@@ -1304,8 +1345,12 @@ async def _new_copilot_chat_post(
                     global_llm_context = message.global_llm_context
                     break
 
-            if chat.proposed_workflow and chat.proposed_workflow.get("_copilot_yaml"):
-                chat_request.workflow_yaml = chat.proposed_workflow["_copilot_yaml"]
+            blockless_fallback = _blockless_submission_fallback(
+                proposed_workflow=chat.proposed_workflow,
+                submitted_workflow_yaml=chat_request.workflow_yaml,
+            )
+            if blockless_fallback is not None:
+                chat_request.workflow_yaml = blockless_fallback
 
             block_infos, debug_html = await _get_new_copilot_block_infos(
                 organization.organization_id, chat_request.workflow_run_id
@@ -1346,7 +1391,21 @@ async def _new_copilot_chat_post(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
 
             chat_request.workflow_id = original_workflow.workflow_id
-            _ensure_copilot_workflow_yaml(chat_request, original_workflow)
+            persisted_workflow_yaml: str | None = None
+            persisted_definition = original_workflow.workflow_definition
+            if persisted_definition is not None and persisted_definition.blocks:
+                persisted_workflow_yaml = _workflow_to_copilot_yaml(original_workflow)
+
+            _ensure_copilot_workflow_yaml(
+                chat_request,
+                original_workflow,
+                persisted_workflow_yaml=persisted_workflow_yaml,
+            )
+
+            prior_copilot_workflow_yaml = _prior_copilot_workflow_yaml(
+                proposed_workflow=chat.proposed_workflow,
+                persisted_workflow_yaml=persisted_workflow_yaml,
+            )
 
             llm_api_handler = await _resolve_copilot_agent_handler(
                 chat_request.workflow_permanent_id, organization.organization_id
@@ -1408,6 +1467,7 @@ async def _new_copilot_chat_post(
                     api_key=api_key,
                     config=copilot_config,
                     turn_index=turn_index,
+                    prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                 )
 
             if getattr(agent_result, "cancelled", False):

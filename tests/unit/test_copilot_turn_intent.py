@@ -379,6 +379,35 @@ def test_docs_answer_turn_directive_renders_only_for_docs_answer_mode() -> None:
     assert _docs_answer_turn_directive(None) == ""
 
 
+def test_build_turn_intent_requests_workflow_change_when_prior_assistant_turn_exists() -> None:
+    ai_turn = WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content="Drafted v1",
+        created_at=datetime.now(timezone.utc),
+    )
+    intent = build_turn_intent(
+        user_message="I did it myself, does this look right?",
+        workflow_yaml="blocks: []",
+        chat_history=[_user_message("Build a workflow"), ai_turn],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert RequiredContextKey.WORKFLOW_CHANGE in intent.required_context
+
+
+def test_build_turn_intent_omits_workflow_change_on_first_turn() -> None:
+    intent = build_turn_intent(
+        user_message="Build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert RequiredContextKey.WORKFLOW_CHANGE not in intent.required_context
+
+
 def test_store_request_policy_attaches_turn_intent_to_context() -> None:
     ctx = CopilotContext(
         organization_id="org-1",
