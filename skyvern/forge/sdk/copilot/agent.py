@@ -47,6 +47,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
+    url_origin,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -728,6 +729,93 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
+_RECORDED_FAILURE_URL_RE = re.compile(r"https?://[^\s)>,]+")
+
+
+def _workflow_block_count(ctx: CopilotContext) -> int | None:
+    count = getattr(ctx, "last_update_block_count", None)
+    if isinstance(count, int) and count > 0:
+        return count
+    workflow = getattr(ctx, "last_workflow", None)
+    definition = getattr(workflow, "workflow_definition", None)
+    blocks = getattr(definition, "blocks", None)
+    return len(blocks) if isinstance(blocks, list) and blocks else None
+
+
+def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
+    from skyvern.forge.sdk.copilot.enforcement import redact_browser_session_references
+
+    if not isinstance(value, str):
+        return ""
+    text = redact_raw_secrets_for_prompt(" ".join(value.split()))
+    text = redact_browser_session_references(text)
+    text = _RECORDED_FAILURE_URL_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", text)
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text.rstrip(".")
+
+
+def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    verification = getattr(contract, "verification_result", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    remaining_blocker = _clean_recorded_failure_text(getattr(verification, "remaining_blocker", None))
+    root_cause = _clean_recorded_failure_text(getattr(diagnosis, "root_cause_summary", None))
+    fallback_reason = _clean_recorded_failure_text(getattr(ctx, "last_test_failure_reason", None))
+    reason = remaining_blocker or root_cause or fallback_reason
+    run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80)
+    status_sentence = f" Last run status: {run_status}." if run_status else ""
+    return reason, status_sentence
+
+
+def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if not reason:
+        return tested_reply
+    return f"{tested_reply} The latest attempted change did not verify: {reason}.{status_sentence}"
+
+
+def _recorded_failure_reply(ctx: CopilotContext, *, cancelled: bool = False) -> str | None:
+    if cancelled or ctx.last_test_ok is True:
+        return None
+
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    verification = getattr(contract, "verification_result", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    repair_decision = getattr(contract, "repair_decision", None)
+    diagnosis_input = getattr(contract, "diagnosis_input", None)
+    failure_type = getattr(getattr(diagnosis, "suspected_failure_type", None), "value", None) or getattr(
+        diagnosis,
+        "suspected_failure_type",
+        None,
+    )
+    next_action = getattr(getattr(repair_decision, "next_action", None), "value", None) or getattr(
+        repair_decision,
+        "next_action",
+        None,
+    )
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if not reason:
+        return None
+
+    run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80).lower()
+    block_count = _workflow_block_count(ctx)
+    block_phrase = f"a {block_count}-block draft" if block_count else "a draft"
+    test_attempted = bool(
+        getattr(ctx, "test_after_update_done", False)
+        or getattr(ctx, "last_test_ok", None) is not None
+        or getattr(diagnosis_input, "workflow_run_id", None)
+    )
+    test_failed = ctx.last_test_ok is False or run_status == "failed"
+    unrecoverable_stop = next_action == "stop" or failure_type == "unrecoverable_tool_error"
+
+    if getattr(ctx, "last_workflow", None) is not None:
+        if test_attempted and test_failed and not unrecoverable_stop:
+            return f"I built {block_phrase} and tested it, but the test failed: {reason}.{status_sentence}"
+        if test_attempted:
+            return f"I built {block_phrase} and tested it, but the test couldn't finish: {reason}.{status_sentence}"
+        return f"I built {block_phrase}, but I couldn't verify it: {reason}.{status_sentence}"
+    return f"I couldn't finish the Copilot turn: {reason}.{status_sentence}"
 
 
 def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
@@ -753,6 +841,7 @@ def _build_wip_exit_result(
     cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
+    recorded_failure_reply = _recorded_failure_reply(ctx, cancelled=cancelled)
     # When an unverified edit/run has overwritten ``last_workflow``, prefer the
     # verified shape while still forcing explicit review.
     if (
@@ -762,7 +851,7 @@ def _build_wip_exit_result(
         and not ctx.last_test_suspicious_success
     ):
         return AgentResult(
-            user_response=tested_reply,
+            user_response=_last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply,
             updated_workflow=ctx.last_good_workflow,
             global_llm_context=global_llm_context,
             workflow_yaml=ctx.last_good_workflow_yaml,
@@ -778,7 +867,10 @@ def _build_wip_exit_result(
         and not ctx.last_test_suspicious_success
     ):
         unvalidated = ctx.last_test_ok is not True
-        reply = unvalidated_reply if unvalidated else tested_reply
+        if unvalidated and recorded_failure_reply:
+            reply = recorded_failure_reply
+        else:
+            reply = unvalidated_reply if unvalidated else tested_reply
         return AgentResult(
             user_response=reply,
             updated_workflow=ctx.last_workflow,
@@ -789,7 +881,7 @@ def _build_wip_exit_result(
             proposal_disposition="review_untested" if unvalidated else "auto_applicable",
             cancelled=cancelled,
         )
-    return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
+    return _build_exit_result(ctx, recorded_failure_reply or default_reply, global_llm_context, cancelled=cancelled)
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -1674,6 +1766,7 @@ async def _run_copilot_turn_impl(
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
+        CopilotUnrecoverableToolError,
         run_with_enforcement,
     )
     from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
@@ -1867,6 +1960,14 @@ async def _run_copilot_turn_impl(
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
                 return _build_timeout_exit_result(ctx, global_llm_context)
+            except CopilotUnrecoverableToolError as exc:
+                LOG.warning(
+                    "Copilot run halted on unrecoverable tool error",
+                    tool_name=exc.tool_name,
+                    error_message=exc.error_message,
+                    organization_id=organization_id,
+                )
+                return _build_unexpected_error_exit_result(ctx, global_llm_context)
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
                     "Copilot run halted on non-retriable navigation error",
