@@ -33,6 +33,16 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     },
   );
 
+  it("does not auto-apply no_proposal responses", () => {
+    expect(
+      shouldAutoApplyWorkflowResponse(
+        response({ proposal_disposition: "no_proposal" }),
+        true,
+        false,
+      ),
+    ).toBe(false);
+  });
+
   it("uses the enum over legacy booleans when both are present", () => {
     expect(
       shouldAutoApplyWorkflowResponse(

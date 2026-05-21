@@ -5,6 +5,7 @@ import {
 
 export type WorkflowCopilotChatSender = "user" | "ai";
 export type ProposalDisposition =
+  | "no_proposal"
   | "auto_applicable"
   | "review_untested"
   | "review_tested";
