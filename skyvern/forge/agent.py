@@ -2828,7 +2828,8 @@ class ForgeAgent:
             )
 
         try:
-            skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
+            if skyvern_frame is None:
+                skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
             html = await skyvern_frame.get_content()
             _ctx = skyvern_context.current()
             # Encode once to fix the html_bytes char-vs-byte mismatch and avoid a
