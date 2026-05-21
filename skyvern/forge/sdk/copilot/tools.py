@@ -4036,6 +4036,11 @@ async def update_workflow_tool(
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
 
+    Top-level workflow parameter keys appear in the run-input UI. When you
+    add runtime inputs in `workflow_definition.parameters`, name keys for the
+    reusable domain value the user supplies, not the page widget or action used
+    to enter it.
+
     If a `goto_url` URL encodes dynamic page state, do not wire it
     directly to extraction. Add a `code`, `validation`, or `navigation` block
     first that verifies the live page state from active chips, checked controls,
@@ -4257,6 +4262,11 @@ async def update_and_run_blocks_tool(
     """Update the workflow YAML and immediately run the specified blocks in one step.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+
+    Top-level workflow parameter keys appear in the run-input UI. When you
+    add runtime inputs in `workflow_definition.parameters`, name keys for the
+    reusable domain value the user supplies, not the page widget or action used
+    to enter it.
 
     For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
     A complaint with no prior edit goal needs context inspection or
