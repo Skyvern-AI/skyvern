@@ -810,7 +810,11 @@ def trim_element(element: dict) -> dict:
                 del queue_ele["attributes"]
 
         if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
-            new_attributes = _trimmed_attributes(queue_ele["attributes"])
+            has_pseudo = bool(queue_ele.get("beforePseudoText") or queue_ele.get("afterPseudoText"))
+            is_icon_only = (
+                queue_ele.get("interactable", False) and not str(queue_ele.get("text", "")).strip() and has_pseudo
+            )
+            new_attributes = _trimmed_attributes(queue_ele["attributes"], keep_class=is_icon_only)
             if new_attributes:
                 queue_ele["attributes"] = new_attributes
             else:
@@ -861,7 +865,7 @@ def _trimmed_base64_data(attributes: dict) -> dict:
     return new_attributes
 
 
-def _trimmed_attributes(attributes: dict) -> dict:
+def _trimmed_attributes(attributes: dict, *, keep_class: bool = False) -> dict:
     new_attributes: dict = {}
 
     for key in attributes:
@@ -869,6 +873,13 @@ def _trimmed_attributes(attributes: dict) -> dict:
             new_attributes[key] = attributes[key]
         if key in RESERVED_ATTRIBUTES:
             new_attributes[key] = attributes[key]
+
+    if keep_class and "class" in attributes:
+        cls = str(attributes["class"])
+        if len(cls) > 100:
+            last_space = cls.rfind(" ", 0, 100)
+            cls = cls[: last_space if last_space > 0 else 100]
+        new_attributes["class"] = cls
 
     return new_attributes
 

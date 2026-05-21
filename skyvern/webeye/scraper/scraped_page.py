@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import typing
 from abc import ABC, abstractmethod
 from enum import StrEnum
@@ -24,6 +25,14 @@ ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
 }
+
+_PUA_PATTERN = re.compile(r"[\uE000-\uF8FF\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]+")
+
+
+def _replace_pua_with_marker(text: str | None) -> str:
+    if not text:
+        return ""
+    return _PUA_PATTERN.sub("[icon]", text)
 
 
 def build_attribute(key: str, value: Any) -> str:
@@ -89,8 +98,8 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("purgeable", False):
         return children_html + option_html
 
-    before_pseudo_text = element.get("beforePseudoText") or ""
-    after_pseudo_text = element.get("afterPseudoText") or ""
+    before_pseudo_text = _replace_pua_with_marker(element.get("beforePseudoText"))
+    after_pseudo_text = _replace_pua_with_marker(element.get("afterPseudoText"))
 
     # Check if the element is self-closing
     if (
