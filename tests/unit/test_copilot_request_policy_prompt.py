@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
+    _classify_request,
     _raw_secret_detected,
     contains_email_password_pair,
     redact_raw_secrets_for_prompt,
+)
+from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotChatHistoryMessage,
+    WorkflowCopilotChatSender,
 )
 
 
@@ -60,6 +68,12 @@ class TestRequestPolicyPromptStructure:
     def test_raw_secret_definition_includes_bulk_email_password_rows(self) -> None:
         rendered = _render()
         assert "bulk `email@example.test:<password>` account rows" in rendered
+
+    def test_raw_secret_evidence_field_requires_current_message_substring(self) -> None:
+        rendered = _render()
+        assert "raw_secret_evidence" in rendered
+        assert "verbatim substring of the LATEST user message" in rendered
+        assert "Do not cite a token that appears only in prior turns" in rendered
 
 
 class TestRawSecretBackstop:
@@ -141,3 +155,114 @@ class TestRawSecretRefusalSentinelConsistency:
         prompts_dir = Path(skyvern.__file__).parent / "forge" / "prompts" / "skyvern"
         for template in ("workflow-copilot-system.j2", "workflow-copilot-agent.j2"):
             assert RAW_SECRET_REFUSAL_SENTINEL in (prompts_dir / template).read_text()
+
+
+def _stub_handler(*, kind: str, evidence: str | None = None, reason: str = "none", refs: list[str] | None = None):
+    async def stub(prompt: str, prompt_name: str) -> dict[str, object]:
+        body: dict[str, object] = {
+            "credential_input_kind": kind,
+            "testing_intent": "unspecified",
+            "requires_user_clarification": True,
+            "clarification_reason": reason,
+        }
+        if evidence is not None:
+            body["raw_secret_evidence"] = evidence
+        if refs is not None:
+            body["credential_refs"] = refs
+        return body
+
+    return stub
+
+
+def _user_msg(content: str) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.USER,
+        content=content,
+        created_at=datetime(2026, 5, 17, tzinfo=timezone.utc),
+    )
+
+
+async def _classify(
+    user_message: str, *, chat_history: list[WorkflowCopilotChatHistoryMessage] | None = None, **stub_kwargs
+):
+    return await _classify_request(
+        user_message=user_message,
+        workflow_yaml="",
+        chat_history=chat_history or [],
+        global_llm_context="",
+        handler=_stub_handler(**stub_kwargs),
+    )
+
+
+class TestRawSecretEvidenceContract:
+    @pytest.mark.asyncio
+    async def test_raw_secret_with_evidence_from_prior_turn_is_cleared(self) -> None:
+        policy = await _classify(
+            "Navigate to https://example.com and login with the given credentials.",
+            chat_history=[_user_msg("Now, log in to account demo_user, password ac3O4/30")],
+            kind="raw_secret",
+            evidence="ac3O4/30",
+            reason="raw_secret",
+        )
+        assert policy.credential_input_kind == "none"
+        assert policy.clarification_reason == "none"
+        assert policy.requires_user_clarification is False
+        assert policy.raw_secret_evidence is None
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_without_any_evidence_is_cleared(self) -> None:
+        policy = await _classify(
+            "login with the given credentials",
+            kind="raw_secret",
+            reason="raw_secret",
+        )
+        assert policy.credential_input_kind == "none"
+        assert policy.clarification_reason == "none"
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_with_too_short_evidence_is_cleared(self) -> None:
+        policy = await _classify("abc1", kind="raw_secret", evidence="ab", reason="raw_secret")
+        assert policy.credential_input_kind != "raw_secret"
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_with_dictionary_word_evidence_is_cleared(self) -> None:
+        for benign in ("login", "credentials", "navigate", "givencreds"):
+            policy = await _classify(
+                f"Navigate to https://example.com and {benign} with the given credentials.",
+                kind="raw_secret",
+                evidence=benign,
+                reason="raw_secret",
+            )
+            assert policy.credential_input_kind != "raw_secret", f"bypass via evidence={benign!r}"
+
+    @pytest.mark.asyncio
+    async def test_regex_fast_path_raw_secret_bypasses_evidence_gate(self) -> None:
+        policy = await _classify(
+            "Use this password: Hunter99! to sign in.",
+            kind="raw_secret",
+            reason="raw_secret",
+        )
+        assert policy.credential_input_kind == "raw_secret"
+        assert policy.clarification_reason == "raw_secret"
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_via_llm_only_path_with_digit_evidence_is_preserved(self) -> None:
+        policy = await _classify(
+            "login with my password hunterpass99",
+            kind="raw_secret",
+            evidence="hunterpass99",
+            reason="raw_secret",
+        )
+        assert policy.credential_input_kind == "raw_secret"
+        assert policy.clarification_reason == "raw_secret"
+
+    @pytest.mark.asyncio
+    async def test_cleared_raw_secret_promotes_to_credential_id_when_user_supplied_ids(self) -> None:
+        policy = await _classify(
+            "use cred_payroll_42 for the login step",
+            kind="raw_secret",
+            evidence="payroll",
+            reason="raw_secret",
+        )
+        assert policy.credential_input_kind == "credential_id"
+        assert policy.credential_refs == ["cred_payroll_42"]

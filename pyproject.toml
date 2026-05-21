@@ -214,6 +214,7 @@ dev = [
     "openpyxl>=3.1.0",
     "gspread>=6",
     "python-pptx>=1.0.2",
+    "pyinstrument>=5.1.2",
 ]
 
 [tool.hatch.build]
@@ -254,6 +255,7 @@ constraint-dependencies = [
     "authlib>=1.7.1",
     "flask>=3.1.3",
     "joserfc>=1.6.3",
+    "mako>=1.3.12",
     "pyasn1>=0.6.3",
     "tornado>=6.5.5",
     "werkzeug>=3.1.6",
