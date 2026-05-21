@@ -25,7 +25,7 @@ from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import AgentResult
+from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
@@ -253,9 +253,28 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
         pass
 
 
+def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
+    disposition = getattr(agent_result, "proposal_disposition", None)
+    if disposition in ("auto_applicable", "review_untested", "review_tested"):
+        return disposition
+    if getattr(agent_result, "unvalidated", False) is True:
+        return "review_untested"
+    if getattr(agent_result, "force_review", False) is True:
+        return "review_tested"
+    return "auto_applicable"
+
+
+def _legacy_unvalidated(proposal_disposition: ProposalDisposition) -> bool:
+    return proposal_disposition == "review_untested"
+
+
+def _legacy_force_review(proposal_disposition: ProposalDisposition) -> bool:
+    return proposal_disposition == "review_tested"
+
+
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
-    """``unvalidated`` and ``cancelled`` override ``auto_accept=True`` to force explicit Accept/Reject."""
-    if bool(getattr(agent_result, "unvalidated", False)) or bool(getattr(agent_result, "cancelled", False)):
+    """Only auto-applicable proposals may honor ``auto_accept=True``."""
+    if getattr(agent_result, "cancelled", False) is True or _proposal_disposition(agent_result) != "auto_applicable":
         return False
     return auto_accept is True
 
@@ -281,7 +300,7 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
         proposed_data["_copilot_yaml"] = agent_result.workflow_yaml
-    if agent_result.unvalidated:
+    if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
     return proposed_data
 
@@ -331,7 +350,6 @@ async def _persist_cancel_turn(
         updated_global_llm_context = None
         total_tokens = None
         response_type = "REPLY"
-        unvalidated = False
         output_policy_diagnostics = None
         if chat.proposed_workflow is not None:
             await asyncio.shield(_clear_proposed_workflow(chat))
@@ -348,7 +366,6 @@ async def _persist_cancel_turn(
         updated_global_llm_context = agent_result.global_llm_context
         total_tokens = getattr(agent_result, "total_tokens", None)
         response_type = getattr(agent_result, "response_type", "REPLY")
-        unvalidated = bool(getattr(agent_result, "unvalidated", False))
         output_policy_diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
 
     await asyncio.shield(
@@ -368,6 +385,7 @@ async def _persist_cancel_turn(
             global_llm_context=updated_global_llm_context,
         )
     )
+    proposal_disposition = _proposal_disposition(agent_result)
     try:
         await asyncio.shield(
             stream.send(
@@ -379,9 +397,11 @@ async def _persist_cancel_turn(
                     response_time=assistant_message.created_at,
                     total_tokens=total_tokens,
                     response_type=response_type,
-                    unvalidated=unvalidated,
+                    proposal_disposition=proposal_disposition,
+                    unvalidated=_legacy_unvalidated(proposal_disposition),
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
+                    force_review=_legacy_force_review(proposal_disposition),
                 )
             )
         )
@@ -444,6 +464,7 @@ async def _finalise_normal_turn(
         global_llm_context=updated_global_llm_context,
     )
 
+    proposal_disposition = _proposal_disposition(agent_result)
     await stream.send(
         WorkflowCopilotStreamResponseUpdate(
             type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -453,8 +474,10 @@ async def _finalise_normal_turn(
             response_time=assistant_message.created_at,
             total_tokens=getattr(agent_result, "total_tokens", None),
             response_type=getattr(agent_result, "response_type", "REPLY"),
-            unvalidated=bool(getattr(agent_result, "unvalidated", False)),
+            proposal_disposition=proposal_disposition,
+            unvalidated=_legacy_unvalidated(proposal_disposition),
             output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
+            force_review=_legacy_force_review(proposal_disposition),
         )
     )
 
