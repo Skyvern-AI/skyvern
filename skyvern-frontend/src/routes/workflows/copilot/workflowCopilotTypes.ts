@@ -4,6 +4,10 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai";
+export type ProposalDisposition =
+  | "auto_applicable"
+  | "review_untested"
+  | "review_tested";
 
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
@@ -83,10 +87,13 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
-  // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
+  proposal_disposition?: ProposalDisposition;
+  // Legacy mirror for proposal_disposition === "review_untested".
   unvalidated?: boolean;
-  // Same auto-apply guard as unvalidated; cancel forces explicit review.
+  // Cancel forces explicit review.
   cancelled?: boolean;
+  // Legacy mirror for proposal_disposition === "review_tested".
+  force_review?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
