@@ -181,6 +181,53 @@ def _build_openclaw_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> d
     return entry
 
 
+def _build_opencode_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_URL) -> dict:
+    """Build an OpenCode remote MCP entry using API key auth instead of OAuth.
+
+    OpenCode auto-discovers OAuth when the field is omitted, which can fail with
+    callback timeouts (see https://github.com/Skyvern-AI/skyvern/issues/6044).
+    """
+    entry: dict = {
+        "type": "remote",
+        "url": url,
+        "oauth": False,
+    }
+    if api_key:
+        entry["headers"] = {"x-api-key": api_key}
+    return entry
+
+
+def _build_opencode_local_mcp_entry(
+    api_key: str,
+    base_url: str,
+    use_python_path: bool = False,
+    command: str | None = None,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
+) -> dict:
+    """Build an OpenCode local stdio MCP entry."""
+    local_entry = _build_local_mcp_entry(
+        api_key,
+        base_url,
+        use_python_path=use_python_path,
+        command=command,
+        browser_type=browser_type,
+        browser_remote_debugging_url=browser_remote_debugging_url,
+    )
+    command_name = str(local_entry.get("command") or sys.executable)
+    args = local_entry.get("args", [])
+    if not isinstance(args, list):
+        args = []
+    entry: dict = {
+        "type": "local",
+        "command": [command_name, *[str(arg) for arg in args]],
+    }
+    env_block = local_entry.get("env")
+    if isinstance(env_block, dict) and env_block:
+        entry["environment"] = env_block
+    return entry
+
+
 def _normalize_openclaw_remote_entry(entry: dict, *, api_key: str, url: str) -> dict:
     """Normalize an OpenClaw remote entry to `{url, transport, headers}` shape.
 
@@ -226,7 +273,8 @@ def _has_api_key(entry: dict | None) -> bool:
     """Check whether an MCP config entry carries an API key (remote, local, or mcp-remote bridge format)."""
     if not entry:
         return False
-    if entry.get("headers", {}).get("x-api-key"):
+    headers = entry.get("headers")
+    if isinstance(headers, dict) and headers.get("x-api-key"):
         return True
     if entry.get("http_headers", {}).get("x-api-key"):
         return True
@@ -319,6 +367,26 @@ def _load_mcp_config(config_path: Path) -> tuple[dict | None, str | None]:
     servers = existing.get("mcpServers")
     if servers is not None and not isinstance(servers, dict):
         return None, f"{config_path} has invalid `mcpServers`; expected a JSON object."
+
+    return existing, None
+
+
+def _load_opencode_config(config_path: Path) -> tuple[dict | None, str | None]:
+    """Load an OpenCode config file."""
+    if not config_path.exists():
+        return {}, None
+
+    try:
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None, f"Cannot parse {config_path}. Fix the JSON and re-run."
+
+    if not isinstance(existing, dict):
+        return None, f"{config_path} must contain a top-level JSON object."
+
+    servers = existing.get("mcp")
+    if servers is not None and not isinstance(servers, dict):
+        return None, f"{config_path} has invalid `mcp`; expected a JSON object."
 
     return existing, None
 
@@ -565,6 +633,15 @@ def _is_claude_desktop_installed() -> bool:
         return False
 
 
+def _is_opencode_installed() -> bool:
+    if shutil.which("opencode") is not None:
+        return True
+    try:
+        return _opencode_config_path().parent.is_dir()
+    except typer.Exit:
+        return False
+
+
 def _get_known_tools() -> list[DetectedTool]:
     """Return all known AI coding tools in detection order.
 
@@ -594,6 +671,11 @@ def _get_known_tools() -> list[DetectedTool]:
             config_path_fn=_claude_desktop_config_path,
             is_installed_fn=_is_claude_desktop_installed,
             use_mcp_remote_bridge=True,
+        ),
+        DetectedTool(
+            name="OpenCode",
+            config_path_fn=_opencode_config_path,
+            is_installed_fn=_is_opencode_installed,
         ),
     ]
 
@@ -736,6 +818,13 @@ def _openclaw_config_path() -> Path:
     # config from the current runtime's home directory so `skyvern setup
     # openclaw` targets the same file `openclaw` reads in that environment.
     return Path.home() / ".openclaw" / "openclaw.json"
+
+
+def _opencode_config_path() -> Path:
+    config_override = os.environ.get("OPENCODE_CONFIG")
+    if config_override:
+        return Path(config_override).expanduser()
+    return Path.home() / ".config" / "opencode" / "opencode.json"
 
 
 _PROJECT_MARKERS = (
@@ -955,7 +1044,8 @@ def setup_guided(
             "  skyvern setup claude-code\n"
             "  skyvern setup cursor\n"
             "  skyvern setup windsurf\n"
-            "  skyvern setup claude"
+            "  skyvern setup claude\n"
+            "  skyvern setup opencode"
         )
         capture_setup_event("quickstart-no-tools", success=True)
         return
@@ -986,17 +1076,30 @@ def setup_guided(
             # Pass browser config from env for local mode
             env_browser_type = os.environ.get("BROWSER_TYPE") if local else None
             env_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if local else None
-            entry = _build_entry(
-                resolved_key,
-                env_url,
-                local=local,
-                use_python_path=use_python_path,
-                url=url,
-                use_mcp_remote_bridge=use_bridge,
-                browser_type=env_browser_type,
-                browser_remote_debugging_url=env_browser_url,
-            )
-            _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
+            if tool.name == "OpenCode":
+                if local:
+                    entry = _build_opencode_local_mcp_entry(
+                        resolved_key,
+                        env_url,
+                        use_python_path=use_python_path,
+                        browser_type=env_browser_type,
+                        browser_remote_debugging_url=env_browser_url,
+                    )
+                else:
+                    entry = _build_opencode_remote_mcp_entry(resolved_key, url=url or _DEFAULT_REMOTE_URL)
+                _upsert_opencode_config(config_path, entry, dry_run=dry_run, yes=True, tool_name=tool.name)
+            else:
+                entry = _build_entry(
+                    resolved_key,
+                    env_url,
+                    local=local,
+                    use_python_path=use_python_path,
+                    url=url,
+                    use_mcp_remote_bridge=use_bridge,
+                    browser_type=env_browser_type,
+                    browser_remote_debugging_url=env_browser_url,
+                )
+                _upsert_mcp_config(config_path, tool.name, entry, dry_run=dry_run, yes=True)
             if tool.name == "Claude Code":
                 _, install_skills = _claude_code_config_target()
                 if install_skills:
@@ -1269,6 +1372,95 @@ def setup_openclaw(
         console.print(f"[dim]Backup saved to {backup_path}[/dim]")
 
 
+def _upsert_opencode_config(
+    config_path: Path,
+    skyvern_entry: dict,
+    *,
+    dry_run: bool = False,
+    yes: bool = False,
+    tool_name: str = "OpenCode",
+) -> None:
+    """Read OpenCode config, diff, prompt, and write. Idempotent."""
+    existing, error = _load_opencode_config(config_path)
+    if error:
+        console.print(f"[red]{error}[/red]")
+        raise typer.Exit(code=1)
+
+    config = existing or {}
+    servers = config.setdefault("mcp", {})
+    if not isinstance(servers, dict):
+        console.print(f"[red]Invalid existing OpenCode `mcp` section in {config_path}; expected a JSON object.[/red]")
+        raise typer.Exit(code=1)
+
+    server_key = _find_server_key(servers, preferred="skyvern") or "skyvern"
+    current = servers.get(server_key)
+    if current is not None and not isinstance(current, dict):
+        console.print(f"[red]Invalid existing OpenCode MCP entry for '{server_key}'; expected a JSON object.[/red]")
+        raise typer.Exit(code=1)
+
+    if not _preview_upsert_change(current, skyvern_entry, tool_name):
+        return
+
+    if dry_run:
+        console.print(f"\n[yellow]Dry run -- no changes written to {config_path}[/yellow]")
+        return
+
+    if not yes and not typer.confirm("\nApply changes?"):
+        raise typer.Abort()
+
+    servers[server_key] = skyvern_entry
+    backup_path = _write_mcp_config(config_path, config)
+    console.print(f"[green]Configured {tool_name} at {config_path}[/green]")
+    if backup_path is not None:
+        console.print(f"[dim]Backup saved to {backup_path}[/dim]")
+
+
+def _opencode_setup_success_message(*, local: bool) -> str:
+    if local:
+        return "OpenCode is configured for local Skyvern MCP (stdio)."
+    return (
+        "OpenCode is configured with API key auth (`oauth: false`).\n"
+        "Do not run `opencode mcp auth Skyvern` — that triggers OAuth and can time out.\n"
+        "See https://github.com/Skyvern-AI/skyvern/issues/6044"
+    )
+
+
+@setup_app.command("opencode")
+def setup_opencode(
+    api_key: str | None = _api_key_opt,
+    dry_run: bool = _dry_run_opt,
+    yes: bool = _yes_opt,
+    local: bool = _local_opt,
+    use_python_path: bool = _python_path_opt,
+    url: str | None = _url_opt,
+    browser_type: str | None = None,
+    browser_remote_debugging_url: str | None = None,
+) -> None:
+    """Register Skyvern MCP with OpenCode using API key auth (avoids OAuth callback timeouts)."""
+    resolved_key, env_url = _resolve_setup_credentials(api_key_flag=api_key, yes=yes, local=local)
+    if local:
+        entry = _build_opencode_local_mcp_entry(
+            resolved_key,
+            env_url,
+            use_python_path=use_python_path,
+            browser_type=browser_type,
+            browser_remote_debugging_url=browser_remote_debugging_url,
+        )
+    else:
+        remote_url = url or _DEFAULT_REMOTE_URL
+        parsed = urlparse(remote_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            console.print(
+                f"[red]Invalid URL: {remote_url} (must be a full URL like https://api.skyvern.com/mcp/)[/red]"
+            )
+            raise typer.Exit(code=1)
+        entry = _build_opencode_remote_mcp_entry(resolved_key, url=remote_url)
+
+    config_path = _opencode_config_path()
+    _upsert_opencode_config(config_path, entry, dry_run=dry_run, yes=yes)
+    console.print(f"[dim]{_opencode_setup_success_message(local=local)}[/dim]")
+
+
 @setup_app.command("hermes")
 def setup_hermes(
     api_key: str | None = _api_key_opt,
@@ -1419,6 +1611,7 @@ def setup_mcporter() -> None:
         ("Claude Code (project)", "skyvern setup claude-code --project", _claude_code_project_config_path()),
         ("Cursor", "skyvern setup cursor", _cursor_config_path()),
         ("Windsurf", "skyvern setup windsurf", _windsurf_config_path()),
+        ("OpenCode", "skyvern setup opencode", _opencode_config_path()),
     ]
 
     found: list[str] = []
@@ -1444,5 +1637,6 @@ def setup_mcporter() -> None:
             "Set up at least one tool first:\n"
             "  skyvern setup cursor\n"
             "  skyvern setup claude-code\n"
-            "  skyvern setup claude"
+            "  skyvern setup claude\n"
+            "  skyvern setup opencode"
         )
