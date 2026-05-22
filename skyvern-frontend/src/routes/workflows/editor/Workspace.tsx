@@ -89,6 +89,7 @@ import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
 import { isMacPlatform } from "@/util/platform";
+import { parseHeaderJson } from "@/util/secretHeaders";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -1232,6 +1233,9 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
+      cdpConnectHeaders: workflowData.cdp_connect_headers
+        ? JSON.stringify(workflowData.cdp_connect_headers)
+        : null,
       runWith: workflowData.run_with ?? "agent",
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
@@ -1292,6 +1296,9 @@ function Workspace({
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
+        : null,
+      cdpConnectHeaders: selectedVersion.cdp_connect_headers
+        ? JSON.stringify(selectedVersion.cdp_connect_headers)
         : null,
       runWith: selectedVersion.run_with ?? "agent",
       codeVersion: selectedVersion.code_version ?? null,
@@ -2081,6 +2088,38 @@ function Workspace({
                 },
               );
 
+            let extraHttpHeaders: Record<string, string> | null = null;
+            if (saveData.settings.extraHttpHeaders) {
+              try {
+                extraHttpHeaders = parseHeaderJson(
+                  saveData.settings.extraHttpHeaders,
+                );
+              } catch (error) {
+                toast({
+                  title: "Error",
+                  description: "Invalid JSON format in extra http headers",
+                  variant: "destructive",
+                });
+                return;
+              }
+            }
+
+            let cdpConnectHeaders: Record<string, string> | null = null;
+            if (saveData.settings.cdpConnectHeaders) {
+              try {
+                cdpConnectHeaders = parseHeaderJson(
+                  saveData.settings.cdpConnectHeaders,
+                );
+              } catch (error) {
+                toast({
+                  title: "Error",
+                  description: "Invalid JSON format in cdp connect headers",
+                  variant: "destructive",
+                });
+                return;
+              }
+            }
+
             // Construct WorkflowVersion for current state with converted blocks
             const currentVersion: WorkflowVersion = {
               workflow_id: saveData.workflow.workflow_id,
@@ -2095,9 +2134,8 @@ function Workspace({
                 currentConversionResponse.data.workflow_definition,
               proxy_location: saveData.settings.proxyLocation,
               webhook_callback_url: saveData.settings.webhookCallbackUrl,
-              extra_http_headers: saveData.settings.extraHttpHeaders
-                ? JSON.parse(saveData.settings.extraHttpHeaders)
-                : null,
+              extra_http_headers: extraHttpHeaders,
+              cdp_connect_headers: cdpConnectHeaders,
               persist_browser_session: saveData.settings.persistBrowserSession,
               model: saveData.settings.model,
               totp_verification_url: saveData.workflow.totp_verification_url,

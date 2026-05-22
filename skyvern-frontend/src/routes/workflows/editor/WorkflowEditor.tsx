@@ -75,6 +75,9 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    cdpConnectHeaders: workflow.cdp_connect_headers
+      ? JSON.stringify(workflow.cdp_connect_headers)
+      : null,
     runWith: workflow.run_with ?? "agent",
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
