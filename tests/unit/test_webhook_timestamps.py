@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunResponseBase, WorkflowRunStatus
 from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.services.webhook_service import build_sample_workflow_run_payload
 
 
 def _make_status_response() -> WorkflowRunResponseBase:
@@ -113,3 +114,11 @@ def test_webhook_replay_payload_includes_timestamps() -> None:
     assert payload_dict["queued_at"] is not None, "queued_at should not be null in webhook replay payload"
     assert payload_dict["started_at"] is not None, "started_at should not be null in webhook replay payload"
     assert payload_dict["finished_at"] is not None, "finished_at should not be null in webhook replay payload"
+
+
+def test_sample_workflow_webhook_payload_uses_public_credit_fields() -> None:
+    payload = build_sample_workflow_run_payload("wr_sample_test")
+
+    assert payload["total_cost"] is None
+    assert payload["credits_used"] == 5
+    assert payload["cached_credits_used"] == 2

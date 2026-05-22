@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -313,7 +313,13 @@ class WorkflowRunResponseBase(BaseModel):
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
-    total_cost: float | None = None
+    total_cost: float | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated. Public workflow-run responses no longer expose cost; use credits_used fields instead.",
+    )
+    credits_used: int = 0
+    cached_credits_used: int = 0
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
     browser_session_id: str | None = None
