@@ -130,7 +130,6 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "title": "Search and Open Result",
         "navigation_goal": "Search for {{ query }} and click the first result",
         "parameter_keys": ["query"],
-        "max_retries": 2,
     },
     "extraction": {
         "block_type": "extraction",
@@ -212,14 +211,12 @@ BLOCK_EXAMPLES: dict[str, dict[str, Any]] = {
         "url": "https://portal.example.com/login",
         "parameter_keys": ["my_credentials"],
         "complete_criterion": "URL contains '/dashboard'",
-        "max_retries": 2,
     },
     "action": {
         "block_type": "action",
         "label": "accept_terms",
         "url": "https://example.com/checkout",
         "navigation_goal": "Check the terms checkbox",
-        "max_retries": 1,
     },
     "wait": {
         "block_type": "wait",
