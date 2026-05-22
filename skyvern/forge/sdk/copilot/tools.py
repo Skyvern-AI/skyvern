@@ -23,7 +23,7 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
+from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -2102,6 +2102,14 @@ def _watchdog_user_failure_reason(
     return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
 
 
+def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:
+    block_goal_main_goal = ctx.block_goal_main_goal or ctx.user_message or ""
+    if not block_goal_main_goal:
+        LOG.warning("run_blocks invoked without block-goal context; using persisted workflow goals unchanged")
+        return workflow
+    return wrap_workflow_block_goals(workflow, block_goal_main_goal)
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -2160,6 +2168,7 @@ async def _run_blocks_and_collect_debug(
         return {"ok": False, "error": "Organization not found"}
 
     organization = Organization.model_validate(org)
+    runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
 
     user_params: dict[str, Any] = params.get("parameters") or {}
     all_workflow_params, all_output_params = await asyncio.gather(
@@ -2251,6 +2260,7 @@ async def _run_blocks_and_collect_debug(
             browser_session_id=ctx.browser_session_id,
             block_labels=labels_to_execute,
             block_outputs=block_outputs_to_seed or None,
+            workflow_override=runtime_workflow,
         )
     )
 
@@ -4317,15 +4327,6 @@ async def update_and_run_blocks_tool(
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-
-    # Wrap each block's navigation_goal / complete_criterion / terminate_criterion
-    # with the effective "big goal" context so downstream LLMs (verifier,
-    # validation-block prompt) have user-intent framing — mirrors TaskV2.
-    block_goal_main_goal = copilot_ctx.block_goal_main_goal or copilot_ctx.user_message
-    if block_goal_main_goal:
-        workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
-    else:
-        LOG.warning("update_and_run_blocks invoked without block-goal context; skipping block-goal wrap")
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):

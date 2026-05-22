@@ -221,6 +221,12 @@ function WorkflowComparisonRenderer({
   );
   const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
 
+  // useNodesState only reads its initial argument; re-sync when colored nodes
+  // change so "modified" highlights show up after blockColors settles.
+  useEffect(() => {
+    setNodes(coloredNodes as AppNode[]);
+  }, [coloredNodes, setNodes]);
+
   const handleNodesChange = useCallback(
     (changes: NodeChange<AppNode>[]) => {
       onNodesChange(changes);
