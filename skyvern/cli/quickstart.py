@@ -7,7 +7,7 @@ import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import typer
 from rich.markup import escape
@@ -36,7 +36,7 @@ def _server_extra_install_target() -> str:
     return f"skyvern[server]=={version}"
 
 
-def _install_server_extra_for_quickstart(*, assume_yes: bool = False) -> bool:
+def _install_server_extra_for_quickstart() -> bool:
     target = _server_extra_install_target()
     console.print(
         Panel(
@@ -46,16 +46,13 @@ def _install_server_extra_for_quickstart(*, assume_yes: bool = False) -> bool:
             border_style="yellow",
         )
     )
-    if not assume_yes and not Confirm.ask("Install the missing server dependencies now?", default=True):
+    if not Confirm.ask("Install the missing server dependencies now?", default=True):
         _print_server_guidance()
         return False
 
     console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
     try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--retries", "5", "--timeout", "60", target],
-            check=True,
-        )
+        subprocess.run([sys.executable, "-m", "pip", "install", target], check=True)
     except subprocess.CalledProcessError as install_error:
         console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
         _print_server_guidance()
@@ -288,13 +285,6 @@ def _run_server_quickstart(
     database_string: str,
     skip_browser_install: bool,
     server_only: bool,
-    skip_llm_setup: bool = False,
-    configure_mcp: bool | None = None,
-    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
-    browser_location: str | None = None,
-    remote_debugging_url: str | None = None,
-    analytics_id: str | None = None,
-    start_services_now: bool | None = None,
 ) -> None:
     try:
         from skyvern.cli.init_command import init_env  # noqa: PLC0415
@@ -306,13 +296,6 @@ def _run_server_quickstart(
             no_postgres=no_postgres,
             database_string=database_string,
             skip_browser_install=skip_browser_install,
-            mode="local",
-            skip_llm_setup=skip_llm_setup,
-            configure_mcp=configure_mcp,
-            browser_type=browser_type,
-            browser_location=browser_location,
-            remote_debugging_url=remote_debugging_url,
-            analytics_id=analytics_id,
             return_result=True,
         )
         run_local = bool(init_result)
@@ -338,11 +321,7 @@ def _run_server_quickstart(
                 )
                 return
 
-            start_now = (
-                start_services_now
-                if start_services_now is not None
-                else typer.confirm("\nDo you want to start Skyvern services now?", default=True)
-            )
+            start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
             if start_now:
                 console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
                 asyncio.run(start_services(server_only=server_only))
@@ -689,78 +668,12 @@ def quickstart(
         "--env-scope",
         help="Backend env location for setup writes: legacy/current, project, or global.",
     ),
-    yes: bool = typer.Option(
-        False,
-        "--yes",
-        "-y",
-        help="Automatically approve installing missing Skyvern server dependencies.",
-    ),
-    non_interactive: bool = typer.Option(
-        False,
-        "--non-interactive",
-        help=(
-            "Run the self-hosted server quickstart path without prompts. Installs missing server dependencies, "
-            "skips LLM/MCP prompts, uses headless Chromium, anonymous analytics, and does not start services."
-        ),
-    ),
-    skip_llm_setup: bool = typer.Option(
-        False,
-        "--skip-llm-setup",
-        help="Skip interactive LLM provider setup and keep/default environment values.",
-    ),
-    skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Skip interactive MCP server configuration."),
-    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = typer.Option(
-        None,
-        "--browser-type",
-        help="Browser type to write without prompting.",
-    ),
-    browser_location: str | None = typer.Option(
-        None,
-        "--browser-location",
-        help="Chrome executable path to write when using a custom browser location.",
-    ),
-    remote_debugging_url: str | None = typer.Option(
-        None,
-        "--remote-debugging-url",
-        help="CDP URL to write when using --browser-type cdp-connect.",
-    ),
-    analytics_id: str | None = typer.Option(
-        None,
-        "--analytics-id",
-        help="Analytics identifier to write without prompting. Use 'anonymous' for agent tests.",
-    ),
-    start_services_now: bool | None = typer.Option(
-        None,
-        "--start/--no-start",
-        help="Start Skyvern services after setup. Omit to prompt.",
-    ),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
     install_type_value = install_type if isinstance(install_type, str) else None
     env_scope_value = env_scope if isinstance(env_scope, str) else None
-    if non_interactive:
-        install_type_value = install_type_value or QuickstartPath.SERVER.value
-        yes = True
-        skip_llm_setup = True
-        skip_mcp = True
-        browser_type = browser_type or "chromium-headless"
-        analytics_id = analytics_id or "anonymous"
-        if start_services_now is None:
-            start_services_now = False
-        if not database_string:
-            no_postgres = True
-            console.print(
-                Panel(
-                    "[bold yellow]Non-interactive quickstart will not prompt to start PostgreSQL.[/bold yellow]\n\n"
-                    "No [cyan]--database-string[/cyan] was provided, so Skyvern will use any existing "
-                    "[cyan]DATABASE_STRING[/cyan] from your environment or .env file.\n\n"
-                    "For unattended agent tests, pass "
-                    "[cyan]--database-string postgresql+psycopg://user:pass@host:5432/dbname[/cyan].",
-                    border_style="yellow",
-                )
-            )
 
     has_server_extra = _has_server_quickstart_extra()
     # The server extra is a superset of the local embedded runtime dependencies.
@@ -772,16 +685,6 @@ def quickstart(
         server_only=server_only,
     )
     if docker_compose:
-        if non_interactive:
-            console.print(
-                Panel(
-                    "[bold red]Non-interactive Docker Compose quickstart is not supported yet.[/bold red]\n"
-                    "Use [cyan]--install-type server --database-string postgresql+psycopg://...[/cyan] "
-                    "for unattended agent tests.",
-                    border_style="red",
-                )
-            )
-            raise typer.Exit(1)
         selected_path = (
             QuickstartPath.SERVER if install_type_value is None else _parse_quickstart_path(install_type_value)
         )
@@ -858,7 +761,7 @@ def quickstart(
         return
 
     # If Docker Compose file exists, offer the choice
-    if not non_interactive and docker_compose_available and check_docker() and not server_flags_requested:
+    if docker_compose_available and check_docker() and not server_flags_requested:
         console.print("\n[bold blue]Setup Method[/bold blue]")
         console.print("Docker Compose file detected. Choose your setup method:\n")
         console.print("  [cyan]1.[/cyan] [green]Docker Compose (Recommended)[/green] - Full containerized setup")
@@ -874,10 +777,10 @@ def quickstart(
             return
 
     if not _has_server_quickstart_extra():
-        if not yes and not _is_interactive_input():
+        if not _is_interactive_input():
             _print_server_guidance()
             raise typer.Exit(0)
-        if not _install_server_extra_for_quickstart(assume_yes=yes) or not _has_server_quickstart_extra():
+        if not _install_server_extra_for_quickstart() or not _has_server_quickstart_extra():
             raise typer.Exit(1)
 
     _run_server_quickstart(
@@ -885,11 +788,4 @@ def quickstart(
         database_string=database_string,
         skip_browser_install=skip_browser_install,
         server_only=server_only,
-        skip_llm_setup=skip_llm_setup,
-        configure_mcp=False if skip_mcp else None,
-        browser_type=browser_type,
-        browser_location=browser_location,
-        remote_debugging_url=remote_debugging_url,
-        analytics_id=analytics_id,
-        start_services_now=start_services_now,
     )

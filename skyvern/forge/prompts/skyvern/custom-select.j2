@@ -7,9 +7,10 @@ You can identify the matching element based on the following guidelines:
   - If a field is required, do not leave it blank.
   - If a field is required, do not select a placeholder value, such as "Please select", "-", or "Select...".
   - Exclude loading indicators like "loading more results" as valid options.{% if new_elements_ids %}
-  - The matching element can only be in the emerging elements.{% endif %}{% if select_history %}
-  - The selection history displays the previously selected values for the multi-level selection. Continue to complete the entire selection process.{% if is_date_related %}
-  - Date picker might be triggered, you goal is to set the correct start date and end date.{% endif %}{% endif %}
+  - The matching element can only be in the emerging elements.{% endif %}{% if is_date_related %}
+  - A date picker might be triggered. Use the target value when provided, the user goal, and visible date controls to set the requested date range.
+  - Do not choose "Today" unless the target date is today.{% endif %}{% if select_history %}
+  - The selection history displays the previously selected values for the multi-level selection. Continue to complete the entire selection process.{% endif %}
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 Each interactable element is tagged with an ID.
