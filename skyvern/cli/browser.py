@@ -4,10 +4,16 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlparse
 
+import requests  # type: ignore
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
 from .console import console
+from .core.browser_launcher import (
+    SKYVERN_DATA_DIR,
+    clone_local_chrome_profile,
+    get_local_chrome_profile_dir,
+)
 
 # Ports to scan when auto-discovering a CDP debugging server
 _CDP_SCAN_PORTS = [9222, 9223, 9224, 9225, 9226, 9229]
@@ -66,8 +72,6 @@ def _discover_cdp_server() -> Optional[tuple[str, dict | None]]:
     - "ws://127.0.0.1:{port}/devtools/browser" if only WS is available
     version_info is cached to avoid a redundant probe in _print_cdp_info.
     """
-    import requests  # type: ignore
-
     for port in _CDP_SCAN_PORTS:
         http_url = f"http://127.0.0.1:{port}"
         # Try HTTP first (standard --remote-debugging-port)
@@ -104,8 +108,6 @@ def _print_cdp_info(url: str, cached_info: dict | None = None) -> None:
         return
 
     # Standard HTTP CDP server
-    import requests  # type: ignore
-
     info = cached_info
     if not info:
         try:
@@ -169,12 +171,6 @@ def _print_classic_cdp_instructions() -> None:
 
 def _setup_local_browser_clone() -> tuple[str, Optional[str], Optional[str]]:
     """Set up a new browser with the user's Chrome profile cloned."""
-    from .core.browser_launcher import (  # noqa: PLC0415
-        SKYVERN_DATA_DIR,
-        clone_local_chrome_profile,
-        get_local_chrome_profile_dir,
-    )
-
     chrome_profile_dir = get_local_chrome_profile_dir()
     if not chrome_profile_dir.is_dir():
         console.print(
@@ -299,8 +295,6 @@ def _setup_local_browser_actual() -> tuple[str, Optional[str], Optional[str]]:
     )
 
     # Verify the manual URL
-    import requests  # type: ignore
-
     try:
         response = requests.get(f"{manual_url}/json/version", timeout=2)
         if response.status_code == 200:
