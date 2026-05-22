@@ -260,6 +260,7 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
@@ -278,6 +279,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        cdp_connect_headers=cdp_connect_headers,
         browser_address=browser_address,
         run_with=run_with,
     )
@@ -299,6 +301,7 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
@@ -307,6 +310,7 @@ async def initialize_task_v2(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 run_with=run_with,
             ),
