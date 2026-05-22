@@ -29,6 +29,7 @@ class BrowserState(Protocol):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> None: ...
@@ -57,6 +58,7 @@ class BrowserState(Protocol):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> Page: ...
