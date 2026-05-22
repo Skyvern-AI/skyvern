@@ -3,10 +3,11 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, ProxyLocationInput
+from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -53,6 +54,7 @@ class TaskV2(BaseModel):
     finished_at: datetime | None = None
     max_screenshot_scrolls: int | None = Field(default=None, alias="max_screenshot_scrolling_times")
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
     failure_category: list[dict[str, Any]] | None = None
@@ -116,6 +118,10 @@ class TaskV2(BaseModel):
     @classmethod
     def deserialize_proxy_location(cls, proxy_location: ProxyLocationInput | str) -> ProxyLocationInput:
         return cls._parse_proxy_location(proxy_location)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
 
 class ThoughtType(StrEnum):
@@ -207,6 +213,7 @@ class TaskV2Request(BaseModel):
     workflow_system_prompt: str | None = None
     max_screenshot_scrolls: int | None = None
     extra_http_headers: dict[str, str] | None = None
+    cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool = False
