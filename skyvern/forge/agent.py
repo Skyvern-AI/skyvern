@@ -737,6 +737,7 @@ class ForgeAgent:
                 and not task.data_extraction_goal
                 and not task.complete_criterion
                 and not task.terminate_criterion
+                and not task.use_current_page
             ):
                 # most likely a GOTO_URL task block
                 page = await browser_state.must_get_working_page()

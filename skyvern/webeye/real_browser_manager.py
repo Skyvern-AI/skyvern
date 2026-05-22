@@ -121,7 +121,7 @@ class RealBrowserManager(BrowserManager):
                 else:
                     LOG.warning("Organization ID is not set for task", task_id=task.task_id)
                 page = await browser_state.get_working_page()
-                if page:
+                if page and not getattr(task, "use_current_page", False):
                     await browser_state.navigate_to_url(page=page, url=task.url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=task.workflow_run_id)
@@ -163,6 +163,7 @@ class RealBrowserManager(BrowserManager):
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
             browser_address=task.browser_address,
+            use_current_page=getattr(task, "use_current_page", False),
         )
         return browser_state
 

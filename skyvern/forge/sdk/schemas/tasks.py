@@ -129,6 +129,10 @@ class TaskBase(BaseModel):
         default=True,
         description="If False, omit the scraped page text dump from the extract-information prompt. ExtractionBlock opts out; everything else keeps the default.",
     )
+    use_current_page: bool = Field(
+        default=False,
+        description="If True, skip the initial page navigation and LLM URL generation, starting exactly where the browser already is.",
+    )
 
 
 class TaskRequest(TaskBase):

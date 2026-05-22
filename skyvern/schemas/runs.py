@@ -149,6 +149,10 @@ class TaskRunRequest(BaseModel):
         description="Whether to run the task with agent or code. Null means use the default.",
         examples=["agent", "code"],
     )
+    use_current_page: bool = Field(
+        default=False,
+        description="If True, skip the initial page navigation and LLM URL generation, starting exactly where the browser already is.",
+    )
 
     @field_validator("run_with", mode="before")
     @classmethod

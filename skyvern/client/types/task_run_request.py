@@ -147,6 +147,11 @@ class TaskRunRequest(UniversalBaseModel):
     Whether to run the task with agent or code. Null means use the default.
     """
 
+    use_current_page: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    If True, skip the initial page navigation and LLM URL generation, starting exactly where the browser already is.
+    """
+
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
     else:
