@@ -5200,27 +5200,12 @@ class WorkflowService:
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
         total_steps = None
-        total_cost = None
         if include_step_count or include_cost:
-            if include_cost:
-                # step counts and block list are independent — fetch in parallel.
-                (step_count, completed_step_count), workflow_run_blocks = await asyncio.gather(
-                    app.DATABASE.tasks.get_step_counts_by_task_ids(
-                        task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                    ),
-                    app.DATABASE.observer.get_workflow_run_blocks(
-                        workflow_run_id=workflow_run_id, organization_id=organization_id
-                    ),
-                )
-                text_prompt_blocks = [
-                    block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
-                ]
-                # This is a temporary cost calculation.
-                total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
-            else:
-                step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                    task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                )
+            # `include_cost` is retained as a legacy alias for callers that
+            # previously received `total_steps` alongside deprecated cost data.
+            step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+            )
             total_steps = step_count
 
         return WorkflowRunResponseBase(
@@ -5249,7 +5234,9 @@ class WorkflowService:
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
-            total_cost=total_cost,
+            total_cost=None,
+            credits_used=workflow_run.credits_used,
+            cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
