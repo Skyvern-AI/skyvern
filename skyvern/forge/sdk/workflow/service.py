@@ -1323,6 +1323,7 @@ class WorkflowService:
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
+        workflow_override: Workflow | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -1344,7 +1345,9 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        workflow = workflow_override or await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_run.workflow_permanent_id
+        )
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
