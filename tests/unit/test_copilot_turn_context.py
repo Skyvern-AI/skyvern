@@ -212,6 +212,87 @@ def test_credential_context_contains_safe_metadata_only() -> None:
     assert "Click SSO" not in dumped
 
 
+_WORKFLOW_V1 = (
+    "title: t\nworkflow_definition:\n  parameters: []\n  blocks:\n"
+    "    - block_type: goto_url\n      label: open_site\n      url: https://example.com\n"
+)
+_WORKFLOW_V2 = _WORKFLOW_V1 + (
+    "    - block_type: text_prompt\n      label: summarize_result\n      llm_key: x\n      prompt: ok\n"
+)
+
+
+def _change_intent() -> TurnIntent:
+    return TurnIntent(
+        mode=TurnIntentMode.EDIT,
+        required_context=[RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.WORKFLOW_CHANGE],
+        authority=TurnIntentAuthority(may_update_workflow=True),
+    )
+
+
+def test_workflow_change_context_reports_user_edit() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=_change_intent(),
+            request_policy=RequestPolicy(),
+            user_message="I added a block, does this look right?",
+            workflow_yaml=_WORKFLOW_V2,
+            prior_workflow_yaml=_WORKFLOW_V1,
+        )
+    )
+
+    assert packet.workflow_change_context is not None
+    assert packet.workflow_change_context.kind == "user_modified_since_last_turn"
+    assert "summarize_result" in packet.workflow_change_context.rendered_summary
+    assert packet.to_trace_data()["workflow_change_kind"] == "user_modified_since_last_turn"
+
+
+def test_workflow_change_context_omitted_when_unchanged() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=_change_intent(),
+            request_policy=RequestPolicy(),
+            user_message="Still broken, fix it",
+            workflow_yaml=_WORKFLOW_V1,
+            prior_workflow_yaml=_WORKFLOW_V1,
+        )
+    )
+
+    assert packet.workflow_change_context is None
+    assert packet.to_trace_data()["workflow_change_kind"] is None
+
+
+def test_workflow_change_context_omitted_on_first_turn() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=_change_intent(),
+            request_policy=RequestPolicy(),
+            user_message="Build me a workflow",
+            workflow_yaml=_WORKFLOW_V1,
+            prior_workflow_yaml="",
+        )
+    )
+
+    assert packet.workflow_change_context is None
+    assert packet.to_trace_data()["workflow_change_kind"] is None
+
+
+def test_workflow_change_context_skipped_when_not_required() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.EDIT,
+                required_context=[RequiredContextKey.CURRENT_WORKFLOW],
+            ),
+            request_policy=RequestPolicy(),
+            user_message="Update it",
+            workflow_yaml=_WORKFLOW_V2,
+            prior_workflow_yaml=_WORKFLOW_V1,
+        )
+    )
+
+    assert packet.workflow_change_context is None
+
+
 def test_shadow_attachment_stores_packet_on_copilot_context() -> None:
     ctx = CopilotContext(
         organization_id="org-1",
@@ -235,6 +316,7 @@ def test_shadow_attachment_stores_packet_on_copilot_context() -> None:
         ),
         chat_history=[],
         debug_run_info_text="",
+        prior_copilot_workflow_yaml=None,
     )
 
     assert ctx.turn_context_packet is not None

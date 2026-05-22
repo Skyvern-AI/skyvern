@@ -23,6 +23,7 @@ class BrowserManager(Protocol):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        allow_content_blocking_extensions: bool = True,
     ) -> BrowserState: ...
 
     async def cleanup_for_task(

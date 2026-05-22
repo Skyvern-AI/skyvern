@@ -221,11 +221,27 @@ ACTION_TYPE_TO_CLASS = {
 }
 
 
+def _scrub_nul_chars(obj: typing.Any) -> typing.Any:
+    # PG text/jsonb cannot store NUL; strip it pre-serialization so strings that
+    # spell out the escape sequence (\u0000) are not affected.
+    if isinstance(obj, str):
+        return obj.replace("\x00", "") if "\x00" in obj else obj
+    if isinstance(obj, dict):
+        return {_scrub_nul_chars(k): _scrub_nul_chars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_nul_chars(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_nul_chars(item) for item in obj)
+    return obj
+
+
 @typing.no_type_check
 def _custom_json_serializer(*args, **kwargs) -> str:
     """
     Encodes json in the same way that pydantic does.
     """
+    if args:
+        args = (_scrub_nul_chars(args[0]),) + args[1:]
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
@@ -294,6 +310,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         proxy_location=deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
+        cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
@@ -491,6 +508,7 @@ def convert_to_workflow(
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
+        cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
@@ -539,6 +557,7 @@ def convert_to_workflow_run(
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,

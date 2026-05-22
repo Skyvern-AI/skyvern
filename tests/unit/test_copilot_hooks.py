@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -226,6 +228,184 @@ class TestSchemaOverlay:
 
 
 class TestMCPFailedStepLoopDetection:
+    @pytest.mark.asyncio
+    async def test_browser_tool_call_is_created_inside_copilot_browser_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import mcp_adapter
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class FakeRawResult:
+            structured_content = {"ok": True, "data": {}}
+            is_error = False
+            content: list[Any] = []
+
+        in_context = False
+        calls: list[tuple[str, dict[str, Any], bool]] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                calls.append((name, args, in_context))
+                return FakeRawResult()
+
+        async def fake_ensure_browser_session(ctx: Any) -> None:
+            ctx.browser_session_id = "pbs_copilot"
+            return None
+
+        @asynccontextmanager
+        async def fake_mcp_browser_context(ctx: Any) -> Any:
+            nonlocal in_context
+            in_context = True
+            try:
+                yield
+            finally:
+                in_context = False
+
+        monkeypatch.setattr(mcp_adapter, "ensure_browser_session", fake_ensure_browser_session)
+        monkeypatch.setattr(mcp_adapter, "mcp_browser_context", fake_mcp_browser_context)
+
+        ctx = MagicMock()
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"get_browser_screenshot": SchemaOverlay(requires_browser=True)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("get_browser_screenshot", {})
+
+        assert result.isError is False
+        assert calls == [("get_browser_screenshot", {"session_id": "pbs_copilot"}, True)]
+
+    @pytest.mark.asyncio
+    async def test_browser_overlay_reaches_fastmcp_tool_with_registered_copilot_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.cli.core import client as client_mod
+        from skyvern.cli.core import session_manager
+        from skyvern.cli.mcp_tools import browser as browser_tools
+        from skyvern.cli.mcp_tools import mcp
+        from skyvern.forge.sdk.copilot import runtime
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+        from skyvern.forge.sdk.copilot.runtime import AgentContext
+        from skyvern.forge.sdk.copilot.tools import _screenshot_post_hook
+
+        client_mod._skyvern_instance.set(None)
+        client_mod._api_key_override.set(None)
+        client_mod._global_skyvern_instance = None
+        client_mod._api_key_clients.clear()
+        session_manager._current_session.set(None)
+        session_manager._global_session = None
+        session_manager._copilot_sessions.clear()
+        session_manager.set_stateless_http_mode(False)
+
+        raw_page = MagicMock()
+        raw_page.is_closed.return_value = False
+        raw_page.on = MagicMock()
+        raw_page.url = "https://example.com"
+        browser_context = SimpleNamespace(
+            pages=[raw_page],
+            on=MagicMock(),
+        )
+        browser_state = SimpleNamespace(browser_context=browser_context)
+        persistent_session_manager = SimpleNamespace(
+            get_browser_state=AsyncMock(return_value=browser_state),
+        )
+        monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", persistent_session_manager)
+
+        runtime_skyvern = MagicMock()
+        monkeypatch.setattr(runtime, "get_skyvern", lambda: runtime_skyvern)
+
+        class FakeSkyvernBrowser:
+            def __init__(
+                self,
+                skyvern: Any,
+                browser_context: Any,
+                *,
+                browser_session_id: str | None = None,
+                browser_address: str | None = None,
+            ) -> None:
+                del skyvern, browser_address
+                self._browser_context = browser_context
+                self._browser_session_id = browser_session_id
+
+            async def get_working_page(self) -> Any:
+                return SimpleNamespace(is_closed=lambda: False)
+
+        monkeypatch.setattr(runtime, "SkyvernBrowser", FakeSkyvernBrowser)
+
+        fallback_skyvern = MagicMock()
+        fallback_skyvern.connect_to_cloud_browser_session = AsyncMock(
+            side_effect=AssertionError("unexpected SDK reconnect")
+        )
+        monkeypatch.setattr(session_manager, "get_skyvern", lambda: fallback_skyvern)
+
+        observed_session_ids: list[str | None] = []
+
+        async def fake_do_screenshot(page: Any, full_page: bool = False, selector: str | None = None) -> Any:
+            del page, full_page, selector
+            current = session_manager.get_current_session()
+            observed_session_ids.append(current.context.session_id if current.context else None)
+            assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
+            return SimpleNamespace(data=b"fake-png")
+
+        monkeypatch.setattr(browser_tools, "do_screenshot", fake_do_screenshot)
+
+        ctx = AgentContext(
+            organization_id="org-1",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_yaml="",
+            browser_session_id="pbs_copilot",
+            stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+            api_key="sk-copilot-org",
+        )
+
+        server = SkyvernOverlayMCPServer(
+            transport=mcp,
+            overlays={
+                "get_browser_screenshot": SchemaOverlay(
+                    requires_browser=True,
+                    forced_args={"inline": True},
+                    post_hook=_screenshot_post_hook,
+                )
+            },
+            alias_map={"get_browser_screenshot": "skyvern_screenshot"},
+            allowlist=frozenset({"skyvern_screenshot"}),
+            context_provider=lambda: ctx,
+        )
+
+        await server.connect()
+        try:
+            result = await server.call_tool("get_browser_screenshot", {})
+        finally:
+            await server.cleanup()
+            session_manager._copilot_sessions.clear()
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is False
+        assert parsed["ok"] is True
+        assert parsed["data"]["screenshot_base64"]
+        assert observed_session_ids == ["pbs_copilot"]
+        fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
+        persistent_session_manager.get_browser_state.assert_any_await(
+            session_id="pbs_copilot",
+            organization_id="org-1",
+        )
+        assert persistent_session_manager.get_browser_state.await_args_list[0] == call(
+            session_id="pbs_copilot",
+            organization_id="org-1",
+        )
+
     @pytest.mark.asyncio
     async def test_interleaved_same_step_failures_short_circuit_third_dispatch(self) -> None:
         from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer

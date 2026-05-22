@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
+    _docs_answer_turn_directive,
     _native_tools_for_turn,
     _store_request_policy_on_context,
 )
@@ -32,6 +33,14 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 def _user_message(content: str) -> WorkflowCopilotChatHistoryMessage:
     return WorkflowCopilotChatHistoryMessage(
         sender=WorkflowCopilotChatSender.USER,
+        content=content,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def _ai_message(content: str) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
         content=content,
         created_at=datetime.now(timezone.utc),
     )
@@ -262,6 +271,141 @@ workflow_definition:
 
     assert intent.mode == TurnIntentMode.EDIT
     assert UNRESOLVED_BLOCK_REF_TARGET_ENTITY not in intent.target_entities
+
+
+def test_build_turn_intent_carries_docs_mode_onto_bare_confirmation() -> None:
+    intent = build_turn_intent(
+        user_message="I confirm.",
+        workflow_yaml="blocks: []",
+        chat_history=[
+            _user_message("Explain how workflow parameters and webhooks work."),
+            _ai_message("Do you want me to explain parameters, or modify the workflow?"),
+        ],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+    assert RequiredContextKey.DOCS_CONTEXT in intent.required_context
+    assert TurnIntentReasonCode.CONFIRMATION_CARRYOVER in intent.reason_codes
+
+
+def test_build_turn_intent_carries_mode_from_most_recent_classifiable_prior_turn() -> None:
+    intent = build_turn_intent(
+        user_message="yes",
+        workflow_yaml="blocks: []",
+        chat_history=[
+            _user_message("Explain how I can call this workflow from an external tool."),
+            _ai_message("Is your goal to modify the workflow, or do you want information?"),
+            _user_message("I just want to know whether the parameters are fixed."),
+            _ai_message("Do you confirm you want an explanation of parameters and webhooks?"),
+        ],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert TurnIntentReasonCode.CONFIRMATION_CARRYOVER in intent.reason_codes
+
+
+def test_build_turn_intent_carries_build_mode_onto_confirmation() -> None:
+    intent = build_turn_intent(
+        user_message="go ahead",
+        workflow_yaml="",
+        chat_history=[_user_message("Build a workflow that downloads my invoices.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+    assert TurnIntentReasonCode.CONFIRMATION_CARRYOVER in intent.reason_codes
+
+
+def test_build_turn_intent_does_not_carry_over_when_message_is_not_bare_affirmative() -> None:
+    intent = build_turn_intent(
+        user_message="yes, but change the target URL first",
+        workflow_yaml="blocks: []",
+        chat_history=[_user_message("Explain how parameters work.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode != TurnIntentMode.DOCS_ANSWER
+    assert TurnIntentReasonCode.CONFIRMATION_CARRYOVER not in intent.reason_codes
+
+
+def test_build_turn_intent_confirmation_without_classifiable_prior_stays_unknown() -> None:
+    intent = build_turn_intent(
+        user_message="I confirm.",
+        workflow_yaml="blocks: []",
+        chat_history=[_user_message("I confirm.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.UNKNOWN
+    assert TurnIntentReasonCode.CONFIRMATION_CARRYOVER not in intent.reason_codes
+
+
+def test_build_turn_intent_raw_secret_outranks_confirmation_carryover() -> None:
+    policy = RequestPolicy(
+        credential_input_kind="raw_secret",
+        raw_secret_detected=True,
+        user_response_policy="ask_clarification",
+        allow_update_workflow=False,
+        allow_run_blocks=False,
+    )
+    intent = build_turn_intent(
+        user_message="yes",
+        workflow_yaml="blocks: []",
+        chat_history=[_user_message("Build a workflow that downloads invoices.")],
+        global_llm_context="",
+        request_policy=policy,
+    )
+
+    assert intent.mode == TurnIntentMode.REFUSE
+
+
+def test_docs_answer_turn_directive_renders_only_for_docs_answer_mode() -> None:
+    docs_directive = _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.DOCS_ANSWER))
+    assert "TURN INTENT: docs_answer" in docs_directive
+    assert "Answer it inline in the user's language" in docs_directive
+    assert "do not offer to build an example workflow" in docs_directive
+
+    assert _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.BUILD)) == ""
+    assert _docs_answer_turn_directive(TurnIntent(mode=TurnIntentMode.EDIT)) == ""
+    assert _docs_answer_turn_directive(None) == ""
+
+
+def test_build_turn_intent_requests_workflow_change_when_prior_assistant_turn_exists() -> None:
+    ai_turn = WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content="Drafted v1",
+        created_at=datetime.now(timezone.utc),
+    )
+    intent = build_turn_intent(
+        user_message="I did it myself, does this look right?",
+        workflow_yaml="blocks: []",
+        chat_history=[_user_message("Build a workflow"), ai_turn],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert RequiredContextKey.WORKFLOW_CHANGE in intent.required_context
+
+
+def test_build_turn_intent_omits_workflow_change_on_first_turn() -> None:
+    intent = build_turn_intent(
+        user_message="Build a workflow",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert RequiredContextKey.WORKFLOW_CHANGE not in intent.required_context
 
 
 def test_store_request_policy_attaches_turn_intent_to_context() -> None:

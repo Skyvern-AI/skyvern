@@ -13,6 +13,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
+ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
@@ -131,9 +132,17 @@ class AgentResult:
     # persistence path (rollback + ``Cancelled by user.`` chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
-    # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
-    unvalidated: bool = False
+    # Controls whether the route may auto-apply the proposal or must force explicit review.
+    proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
+
+    @property
+    def unvalidated(self) -> bool:
+        return self.proposal_disposition == "review_untested"
+
+    @property
+    def force_review(self) -> bool:
+        return self.proposal_disposition == "review_tested"
 
 
 @dataclass

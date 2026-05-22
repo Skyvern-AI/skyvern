@@ -26,6 +26,7 @@ class DiagnosisFailureType(StrEnum):
     SUSPICIOUS_SUCCESS = "suspicious_success"
     MISSING_CREDENTIAL_OR_INIT = "missing_credential_or_init"
     REPAIRABLE_BLOCK_FAILURE = "repairable_block_failure"
+    UNRECOVERABLE_TOOL_ERROR = "unrecoverable_tool_error"
     UNKNOWN = "unknown"
 
 
@@ -299,6 +300,14 @@ def _failure_type(
         if value
     )
     if (
+        "UNRECOVERABLE_TOOL_ERROR" in categories
+        or "browser session not found" in error_text
+        or "no browser context" in error_text
+        or ("session not found" in error_text and "browser" in error_text)
+        or ("404" in error_text and "browser session" in error_text)
+    ):
+        return DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    if (
         data.get("skip_reason") == "workflow_credential_inputs_unbound"
         or "credential" in error_text
         or "organization not found" in error_text
@@ -320,6 +329,8 @@ def _next_action(failure_type: DiagnosisFailureType, ctx: Any, data: dict[str, A
         or failure_type == DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     ):
         return RepairNextAction.ASK
+    if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
+        return RepairNextAction.STOP
     if getattr(ctx, "last_test_non_retriable_nav_error", None):
         return RepairNextAction.STOP
     authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
