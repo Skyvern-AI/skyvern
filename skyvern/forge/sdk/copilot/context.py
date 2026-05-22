@@ -13,7 +13,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
-ProposalDisposition = Literal["auto_applicable", "review_untested", "review_tested"]
+ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract

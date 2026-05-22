@@ -120,6 +120,22 @@ class TestEffectiveAutoAccept:
         assert _effective_auto_accept(True, result) is False
         assert _effective_auto_accept(False, result) is False
 
+    def test_no_proposal_disposition_overrides_auto_accept(self) -> None:
+        result = MagicMock()
+        result.proposal_disposition = "no_proposal"
+        result.cancelled = False
+
+        assert _effective_auto_accept(True, result) is False
+        assert _effective_auto_accept(False, result) is False
+
+    def test_missing_proposal_disposition_is_no_proposal_without_updated_workflow(self) -> None:
+        result = MagicMock(spec=["unvalidated", "force_review", "updated_workflow"])
+        result.unvalidated = False
+        result.force_review = False
+        result.updated_workflow = None
+
+        assert _proposal_disposition(result) == "no_proposal"
+
     def test_legacy_flag_fallback_for_stacked_deploy(self) -> None:
         result = MagicMock(spec=["unvalidated", "force_review"])
         result.unvalidated = False
@@ -137,8 +153,9 @@ class TestEffectiveAutoAccept:
         assert _effective_auto_accept(False, validated) is False
         assert _effective_auto_accept(None, validated) is False
 
-    def test_no_agent_result_falls_back_to_user_setting(self) -> None:
-        assert _effective_auto_accept(True, None) is True
+    def test_no_agent_result_is_not_auto_applicable(self) -> None:
+        assert _proposal_disposition(None) == "no_proposal"
+        assert _effective_auto_accept(True, None) is False
         assert _effective_auto_accept(False, None) is False
 
 

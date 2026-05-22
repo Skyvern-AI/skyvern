@@ -53,6 +53,10 @@ class AgentContext:
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     failed_tool_step_tracker: dict[str, int] = field(default_factory=dict)
+    unrecoverable_tool_error_streak_count: int = 0
+    unrecoverable_tool_error_signature: str | None = None
+    unrecoverable_tool_error_reason: str | None = None
+    unrecoverable_tool_error_tool_name: str | None = None
 
     # Cross-turn agent state accumulated by tools.py as the agent runs.
     # Read back by failure_tracking / loop_detection to detect stuck loops,

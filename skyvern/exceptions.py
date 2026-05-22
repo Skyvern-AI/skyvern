@@ -8,10 +8,13 @@ from typing import NoReturn
 # the heavy modules users commonly have partially installed.
 _LOCAL_EXTRA_SENTINELS = (
     "fastapi",
+    "fuzzysearch",
     "jinja2",
     "libcst",
     "litellm",
+    "openai",
     "playwright",
+    "psycopg",
     "sqlalchemy",
     "starlette",
     "starlette_context",
@@ -22,7 +25,7 @@ _LOCAL_EXTRA_SENTINELS = (
 # server sentinels local-compatible so those imports continue to work in
 # skyvern[local]. Full server entrypoints pass server-only module_names such as
 # "uvicorn" when they need to fail for local-only installs.
-_SERVER_EXTRA_SENTINELS = tuple(_LOCAL_EXTRA_SENTINELS)
+_SERVER_EXTRA_SENTINELS = tuple(dict.fromkeys((*_LOCAL_EXTRA_SENTINELS, "alembic", "anthropic")))
 
 _EXTRA_SUPPORT_LABELS = {
     "local": "local embedded/browser support",

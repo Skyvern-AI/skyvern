@@ -254,13 +254,17 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
 
 
 def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
+    if agent_result is None:
+        return "no_proposal"
     disposition = getattr(agent_result, "proposal_disposition", None)
-    if disposition in ("auto_applicable", "review_untested", "review_tested"):
+    if disposition in ("no_proposal", "auto_applicable", "review_untested", "review_tested"):
         return disposition
     if getattr(agent_result, "unvalidated", False) is True:
         return "review_untested"
     if getattr(agent_result, "force_review", False) is True:
         return "review_tested"
+    if getattr(agent_result, "updated_workflow", None) is None:
+        return "no_proposal"
     return "auto_applicable"
 
 
@@ -305,6 +309,11 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     return proposed_data
 
 
+def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
+    diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
+    return isinstance(diagnostics, dict) and diagnostics.get("final_output_policy_allowed") is False
+
+
 async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult, restored: bool) -> None:
     updated_workflow = agent_result.updated_workflow
     auto_accept_effective = _effective_auto_accept(chat.auto_accept, agent_result)
@@ -321,9 +330,14 @@ async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult,
         # auto-accept toggle.
         await _clear_proposed_workflow(chat)
     elif (
-        auto_accept_effective
+        # This intentionally checks the raw setting, not
+        # ``auto_accept_effective``: no-proposal OutputPolicy blocks are not
+        # auto-applicable, but ordinary auto-accept turns still need to clear a
+        # stale unvalidated card because the UI has no review panel for it.
+        chat.auto_accept is True
         and chat.proposed_workflow is not None
         and chat.proposed_workflow.get("_copilot_unvalidated") is True
+        and not _output_policy_blocked_final_response(agent_result)
     ):
         # The leftover unvalidated proposal is no longer attached to the chat
         # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.

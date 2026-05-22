@@ -97,6 +97,11 @@ def get_active_api_key() -> str | None:
     return _api_key_override.get() or _resolve_api_key()
 
 
+def has_api_key_override() -> bool:
+    """Return whether the current context carries a request-scoped API key."""
+    return _api_key_override.get() is not None
+
+
 def set_api_key_override(api_key: str | None) -> Token[str | None]:
     """Set request-scoped API key override for MCP HTTP requests."""
     _skyvern_instance.set(None)

@@ -737,11 +737,61 @@ def test_output_policy_credential_block_asks_for_credential_confirmation(
     )
 
     assert result.response_type == "ASK_QUESTION"
-    assert result.clear_proposed_workflow is True
+    assert result.clear_proposed_workflow is False
     response = result.user_response.lower()
     for term in expected_terms:
         assert term in response
     assert "I could not safely return" not in result.user_response
+
+
+def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+    ctx.workflow_persisted = True
+    ctx.last_test_ok = True
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.workflow_yaml == "title: Draft"
+    assert result.workflow_was_persisted is True
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_tested"
+    response = result.user_response.lower()
+    assert "chat reply" in response
+    assert "workflow draft" in response
+    assert "saved" in response
+
+
+def test_output_policy_specific_refusal_preserves_saved_draft_copy() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_untested"
+    assert "raw credentials or secrets" in result.user_response
+    assert "chat reply" in result.user_response
+    assert "workflow draft is still saved" in result.user_response
 
 
 def test_scheduling_credential_policy_block_does_not_use_safety_refusal() -> None:
@@ -1018,7 +1068,8 @@ workflow_definition:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     process_mock.assert_not_called()
 
 
@@ -1035,7 +1086,8 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     assert "hunter2" not in agent_result.user_response
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
 
