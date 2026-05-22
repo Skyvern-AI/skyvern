@@ -80,7 +80,6 @@ class SkyvernContext:
 
     # feature flags
     enable_page_ready_wait: bool = False
-    enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
     vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
@@ -93,6 +92,7 @@ class SkyvernContext:
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
+    disable_llm_screenshots: bool = False
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it

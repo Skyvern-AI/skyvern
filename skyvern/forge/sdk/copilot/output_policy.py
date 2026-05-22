@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
-from skyvern.forge.sdk.copilot.output_utils import looks_like_workflow_delivery_claim
-from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy
+from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
+from skyvern.forge.sdk.copilot.output_utils import (
+    looks_like_workflow_delivery_claim,
+    looks_like_workflow_yaml_in_chat,
+)
+from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy, contains_email_password_pair
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_PRESENT_SENTINEL = object()
@@ -27,6 +30,58 @@ UNVALIDATED_DISCLOSURE_PHRASES = (
     "hasn't been verified",
     "unvalidated",
 )
+_INTERNAL_TOOL_INSTRUCTION_MARKERS = (
+    "call get_run_results",
+    "call update_and_run_blocks",
+)
+_INTERNAL_TOOL_RETRY_PHRASES = ("do not retry", "do not re-invoke")
+_INTERNAL_TOOL_RETRY_CONTEXT_MARKERS = (
+    "get_run_results",
+    "update_and_run_blocks",
+    "tool call",
+    "this tool",
+    "the tool",
+    "workflow_run_id",
+)
+_INTERNAL_TOOL_INSTRUCTION_TRANSLATION = str.maketrans({char: " " for char in "`'\"()[]{}.,:;"})
+_INTERNAL_BLOCK_TYPE_TERMS = frozenset(
+    {
+        "navigation",
+        "extraction",
+        "validation",
+        "login",
+        "goto_url",
+        "file_download",
+        "file_upload",
+        "text_prompt",
+        "for_loop",
+        "conditional",
+        "action",
+        "wait",
+    }
+)
+_INTERNAL_BLOCK_TYPE_CONTEXT_MARKERS = (
+    "block type",
+    "block types",
+    "internal block",
+    "internal blocks",
+    "workflow block",
+    "workflow blocks",
+    "supported block",
+    "supported blocks",
+)
+# Three distinct internal names in an informational reply implies taxonomy
+# enumeration, while one or two may be incidental product-language prose.
+_INFORMATIONAL_TAXONOMY_TERM_THRESHOLD = 3
+_IDENTIFIER_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_IDENTIFIER_DELIMITERS = frozenset({"`", '"', "'"})
+
+
+@dataclass(frozen=True)
+class ResponseScaffoldingNormalization:
+    response_type: ResponseType
+    user_response: str | None
+    changed: bool = False
 
 
 class CopilotOutputKind(StrEnum):
@@ -47,7 +102,10 @@ class OutputPolicyReason(StrEnum):
     MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE = "missing_unvalidated_proposal_affordance"
     MISSING_PROPOSAL_STATE = "missing_proposal_state"
     PERSISTENCE_STATE_MISMATCH = "persistence_state_mismatch"
+    INTERNAL_TOOL_INSTRUCTION_LEAK = "internal_tool_instruction_leak"
     OUTPUT_POLICY_CONTEXT_MISSING = "output_policy_context_missing"
+    INTERNAL_BLOCK_TAXONOMY_LEAK = "internal_block_taxonomy_leak"
+    WORKFLOW_YAML_IN_REPLY = "workflow_yaml_in_reply"
 
 
 @dataclass
@@ -78,6 +136,7 @@ _FINAL_OUTPUT_HARD_BLOCK_REASONS: frozenset[OutputPolicyReason] = frozenset(
         OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE,
         OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED,
         OutputPolicyReason.PERSISTENCE_STATE_MISMATCH,
+        OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK,
         OutputPolicyReason.OUTPUT_POLICY_CONTEXT_MISSING,
     }
 )
@@ -118,6 +177,46 @@ def derive_output_kind(
     return CopilotOutputKind.INFORMATIONAL_ANSWER
 
 
+def normalize_response_scaffolding(response_type: str, user_response: str | None) -> ResponseScaffoldingNormalization:
+    typed_response_type: ResponseType = (
+        cast(ResponseType, response_type) if response_type in COPILOT_RESPONSE_TYPES else "REPLY"
+    )
+    label, stripped = _split_leading_response_label(user_response)
+    if label is None:
+        return ResponseScaffoldingNormalization(response_type=typed_response_type, user_response=user_response)
+    normalized_type: ResponseType
+    if label == "REPLACE_WORKFLOW":
+        normalized_type = "REPLACE_WORKFLOW" if typed_response_type == "REPLACE_WORKFLOW" else "REPLY"
+    else:
+        normalized_type = label
+    return ResponseScaffoldingNormalization(response_type=normalized_type, user_response=stripped, changed=True)
+
+
+def _split_leading_response_label(text: str | None) -> tuple[ResponseType | None, str | None]:
+    if not isinstance(text, str):
+        return None, text
+    candidate = text.lstrip()
+    candidate_upper = candidate.upper()
+    for response_type in sorted(COPILOT_RESPONSE_TYPES, key=len, reverse=True):
+        if not candidate_upper.startswith(response_type):
+            continue
+        remainder = candidate[len(response_type) :]
+        if not remainder:
+            continue
+        stripped = remainder.lstrip()
+        if not stripped:
+            return response_type, ""
+        if stripped[0] in {":", ","}:
+            return response_type, stripped[1:].lstrip()
+        protocol_like_label = "_" in response_type or candidate[: len(response_type)].isupper()
+        leading_whitespace = remainder[: len(remainder) - len(stripped)]
+        if "\n" in leading_whitespace and not stripped.startswith(("{", "```")):
+            return response_type, stripped
+        if remainder[0].isspace() and protocol_like_label and not stripped.startswith(("{", "```")):
+            return response_type, stripped
+    return None, text
+
+
 def output_policy_verdict_to_trace_data(
     verdict: OutputPolicyVerdict,
     *,
@@ -136,6 +235,27 @@ def output_policy_verdict_to_trace_data(
     if tool_name is not None:
         data["tool_name"] = tool_name
     return data
+
+
+def build_output_policy_diagnostics(
+    *,
+    raw_verdict: OutputPolicyVerdict,
+    final_verdict: OutputPolicyVerdict,
+    final_output_kind: CopilotOutputKind,
+    hard_block_reason_codes: list[OutputPolicyReason],
+    soft_rewrite_reason_codes: list[OutputPolicyReason],
+) -> dict[str, Any]:
+    raw_would_have_failed = bool(raw_verdict.reason_codes)
+    contained_failure = bool(hard_block_reason_codes or soft_rewrite_reason_codes)
+    return {
+        "raw_output_kind": raw_verdict.output_kind.value,
+        "final_output_kind": final_output_kind.value,
+        "hard_block_reason_codes": [reason.value for reason in hard_block_reason_codes],
+        "soft_rewrite_reason_codes": [reason.value for reason in soft_rewrite_reason_codes],
+        "raw_would_have_failed": raw_would_have_failed,
+        "contained_failure": raw_would_have_failed and contained_failure,
+        "final_output_policy_allowed": final_verdict.allowed,
+    }
 
 
 def output_policy_verdict_from_trace_data(data: Any) -> OutputPolicyVerdict:
@@ -191,6 +311,8 @@ def evaluate_output_policy(
     values = [user_response, workflow_yaml, tool_arguments]
     if any(_contains_raw_secret(value) for value in values):
         verdict.add(OutputPolicyReason.RAW_SECRET_LEAK)
+    if _contains_internal_tool_instruction(user_response):
+        verdict.add(OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK)
     if (
         response_type == "REPLY"
         and not has_workflow_proposal
@@ -206,6 +328,10 @@ def evaluate_output_policy(
         and not _has_unvalidated_affordance(user_response)
     ):
         verdict.add(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+    if _contains_internal_block_taxonomy_leak(user_response, output_kind):
+        verdict.add(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    if response_type in ("REPLY", "ASK_QUESTION") and looks_like_workflow_yaml_in_chat(user_response):
+        verdict.add(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
 
     if isinstance(request_policy, RequestPolicy):
         if request_policy.user_response_policy == "ask_clarification" and response_type != "ASK_QUESTION":
@@ -226,23 +352,44 @@ def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
 
 
 def _contains_raw_secret(value: Any) -> bool:
-    if value is None:
-        return False
-    text = _policy_text(value)
-    for pattern in RAW_SECRET_PATTERNS:
-        for match in pattern.finditer(text):
-            if not any(marker in match.group(0) for marker in _PLACEHOLDER_MARKERS):
-                return True
+    for text in _policy_text_values(value):
+        if contains_email_password_pair(text):
+            return True
+        for pattern in RAW_SECRET_PATTERNS:
+            for match in pattern.finditer(text):
+                if not any(marker in match.group(0) for marker in _PLACEHOLDER_MARKERS):
+                    return True
     return False
 
 
-def _policy_text(value: Any) -> str:
+def _contains_internal_tool_instruction(user_response: str | None) -> bool:
+    if not isinstance(user_response, str):
+        return False
+    normalized = " ".join(user_response.lower().translate(_INTERNAL_TOOL_INSTRUCTION_TRANSLATION).split())
+    if any(marker in normalized for marker in _INTERNAL_TOOL_INSTRUCTION_MARKERS):
+        return True
+    return any(phrase in normalized for phrase in _INTERNAL_TOOL_RETRY_PHRASES) and any(
+        marker in normalized for marker in _INTERNAL_TOOL_RETRY_CONTEXT_MARKERS
+    )
+
+
+def _policy_text_values(value: Any) -> list[str]:
+    if value is None:
+        return []
     if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, default=str, sort_keys=True)
-    except TypeError:
-        return str(value)
+        return [value]
+    if isinstance(value, dict):
+        values: list[str] = []
+        for key, item in value.items():
+            values.extend(_policy_text_values(key))
+            values.extend(_policy_text_values(item))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            values.extend(_policy_text_values(item))
+        return values
+    return [str(value)]
 
 
 def _has_unvalidated_affordance(user_response: str | None) -> bool:
@@ -251,6 +398,63 @@ def _has_unvalidated_affordance(user_response: str | None) -> bool:
     lower = user_response.lower()
     has_disclosure = any(phrase in lower for phrase in UNVALIDATED_DISCLOSURE_PHRASES)
     return bool(_UNVALIDATED_PROPOSAL_AFFORDANCE_RE.search(user_response) and has_disclosure)
+
+
+def _contains_internal_block_taxonomy_leak(
+    user_response: str | None,
+    output_kind: CopilotOutputKind,
+) -> bool:
+    if not user_response:
+        return False
+    if _contains_deprecated_block_identifier(user_response):
+        return True
+    if output_kind != CopilotOutputKind.INFORMATIONAL_ANSWER:
+        return False
+    taxonomy_terms = _internal_block_taxonomy_terms(user_response)
+    return len(taxonomy_terms) >= _INFORMATIONAL_TAXONOMY_TERM_THRESHOLD
+
+
+def _contains_deprecated_block_identifier(text: str) -> bool:
+    tokens = [_compact_identifier_token(match.group(0)) for match in _IDENTIFIER_TOKEN_RE.finditer(text)]
+    if "taskv2" in tokens:
+        return True
+    return any(left == "task" and right == "v2" for left, right in zip(tokens, tokens[1:]))
+
+
+def _internal_block_taxonomy_terms(text: str) -> set[str]:
+    lower = text.lower()
+    has_taxonomy_context = any(marker in lower for marker in _INTERNAL_BLOCK_TYPE_CONTEXT_MARKERS)
+    matches = list(_IDENTIFIER_TOKEN_RE.finditer(text))
+    terms: set[str] = set()
+    for index, match in enumerate(matches):
+        term = _normalized_internal_block_term(match.group(0))
+        if term is None:
+            continue
+        if has_taxonomy_context or _is_delimited_identifier(text, match.start(), match.end()):
+            terms.add(term)
+            continue
+        next_token = _compact_identifier_token(matches[index + 1].group(0)) if index + 1 < len(matches) else None
+        if next_token in {"block", "blocks", "for"}:
+            terms.add(term)
+    return terms
+
+
+def _normalized_internal_block_term(raw: str) -> str | None:
+    term = raw.lower()
+    if term in _INTERNAL_BLOCK_TYPE_TERMS:
+        return term
+    return None
+
+
+def _compact_identifier_token(raw: str) -> str:
+    return raw.lower().replace("_", "")
+
+
+def _is_delimited_identifier(text: str, start: int, end: int) -> bool:
+    if start == 0 or end >= len(text):
+        return False
+    left = text[start - 1]
+    return left == text[end] and left in _IDENTIFIER_DELIMITERS
 
 
 def _apply_credential_policy(
@@ -294,7 +498,10 @@ def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str
 def _credential_ids(value: Any) -> set[str]:
     if value is None:
         return set()
-    return set(_CREDENTIAL_ID_RE.findall(_policy_text(value)))
+    found: set[str] = set()
+    for text in _policy_text_values(value):
+        found.update(_CREDENTIAL_ID_RE.findall(text))
+    return found
 
 
 def _workflow_broadens_credential_scope(workflow_yaml: str, request_policy: RequestPolicy) -> bool:
@@ -336,13 +543,13 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
         credential_id = getattr(credential, "credential_id", None)
         tested_url = getattr(credential, "tested_url", None)
         if isinstance(credential_id, str) and isinstance(tested_url, str):
-            origin = _origin(tested_url)
+            origin = url_origin(tested_url)
             if origin:
                 origins.setdefault(credential_id, set()).add(origin)
     return origins
 
 
-def _origin(url: str) -> str | None:
+def url_origin(url: str) -> str | None:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     if not parsed.netloc:
         return None
@@ -406,7 +613,7 @@ def _block_broadens_credential_scope(
     block_url = block.get("url")
     if not isinstance(block_url, str) or not block_url.strip():
         return False
-    origin = _origin(block_url)
+    origin = url_origin(block_url)
     if not origin:
         return True
 

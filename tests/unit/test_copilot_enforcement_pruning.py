@@ -9,6 +9,7 @@ These cover three regressions observed in trace 019d7b5c884dff0ff648680b9f31f715
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -110,6 +111,70 @@ def test_meaningful_data_empty_string() -> None:
 
 def test_meaningful_data_string() -> None:
     assert _is_meaningful_extracted_data("$260.48") is True
+
+
+def test_unrecoverable_browser_session_error_stops_after_second_failure() -> None:
+    from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotUnrecoverableToolError,
+        _maybe_raise_unrecoverable_tool_error,
+    )
+
+    ctx = SimpleNamespace()
+    output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
+
+    _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
+    assert ctx.unrecoverable_tool_error_streak_count == 1
+
+    with pytest.raises(CopilotUnrecoverableToolError) as exc_info:
+        _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
+
+    assert "Browser session not found" in str(exc_info.value)
+    assert ctx.unrecoverable_tool_error_streak_count == 2
+    contract = ctx.latest_diagnosis_repair_contract
+    assert contract.repair_decision.next_action == "stop"
+    assert contract.verification_result.remaining_blocker == "Browser session not found while taking screenshot (404)."
+
+
+def test_unrecoverable_tool_error_ignores_regular_website_404() -> None:
+    from skyvern.forge.sdk.copilot.enforcement import _maybe_raise_unrecoverable_tool_error
+
+    ctx = SimpleNamespace()
+
+    _maybe_raise_unrecoverable_tool_error(
+        ctx,
+        "navigate_browser",
+        {"ok": False, "error": "The page returned HTTP 404 page not found."},
+    )
+
+    assert getattr(ctx, "unrecoverable_tool_error_streak_count", 0) == 0
+    assert getattr(ctx, "latest_diagnosis_repair_contract", None) is None
+
+
+def test_unrecoverable_contract_stop_preempts_failed_test_nudge() -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
+    from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError, _check_enforcement
+
+    ctx = _Ctx()
+    ctx.last_test_ok = False
+    reason = "Browser session not found while running blocks (404)."
+    ctx.latest_diagnosis_repair_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": reason,
+            "data": {
+                "overall_status": "aborted",
+                "failure_reason": reason,
+                "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+            },
+        },
+        ctx=ctx,
+    )
+
+    with pytest.raises(CopilotUnrecoverableToolError):
+        _check_enforcement(ctx)
+
+    assert ctx.failed_test_nudge_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +686,22 @@ class TestEnforcement:
         )
         ask = MagicMock()
         ask.final_output = json.dumps({"type": "ASK_QUESTION", "user_response": "Which source?"})
+        ask.new_items = []
+        assert _check_enforcement(ctx, ask) is None
+
+    def test_plain_labeled_ask_question_passes_even_with_coverage_gap(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _check_enforcement
+
+        ctx = self._make_ctx(
+            update_workflow_called=True,
+            test_after_update_done=True,
+            last_test_ok=True,
+            last_update_block_count=1,
+            user_message="Go to france.fr and then download all french regulations",
+            coverage_nudge_count=0,
+        )
+        ask = MagicMock()
+        ask.final_output = "ASK_QUESTION\nWhich source?"
         ask.new_items = []
         assert _check_enforcement(ctx, ask) is None
 

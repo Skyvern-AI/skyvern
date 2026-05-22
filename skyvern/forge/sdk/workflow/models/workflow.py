@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -17,7 +17,7 @@ from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, 
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
-from skyvern.schemas.workflows import WorkflowStatus
+from skyvern.schemas.workflows import BlockType, WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
@@ -65,6 +65,9 @@ class WorkflowDefinition(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
+
+    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
+        return all(block.block_type != BlockType.LOGIN for block in get_all_blocks(self.blocks))
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -152,6 +155,9 @@ class Workflow(BaseModel):
             if parameter.key == key:
                 return parameter
         return None
+
+    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
+        return self.workflow_definition.allow_content_blocking_extensions_for_browser_launch()
 
 
 class WorkflowRunStatus(StrEnum):
@@ -315,11 +321,18 @@ class WorkflowRunResponseBase(BaseModel):
     screenshot_urls: list[str] | None = None
     recording_url: str | None = None
     recording_urls: list[str] | None = None
+    recording_archived: bool = False
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None
     outputs: dict[str, Any] | None = None
     total_steps: int | None = None
-    total_cost: float | None = None
+    total_cost: float | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated. Public workflow-run responses no longer expose cost; use credits_used fields instead.",
+    )
+    credits_used: int = 0
+    cached_credits_used: int = 0
     task_v2: TaskV2 | None = None
     workflow_title: str | None = None
     browser_session_id: str | None = None

@@ -420,7 +420,7 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
 
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
-    "run_with": "code",
+    "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
 
@@ -558,7 +558,7 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
 
 
 def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults (code_version=2, run_with=code) when not explicitly set.
+    """Inject Code 2.0 defaults (code_version=2, run_with=agent) when not explicitly set.
 
     Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
     """
@@ -907,7 +907,16 @@ async def skyvern_workflow_create(
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
-    Defaults to Code 2.0 (run_with="code"). Blocks share a browser session automatically.
+    Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
+    injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
+    Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
+
+    Leave optional toggles and overrides unset unless the user explicitly asks for them. This
+    applies to workflow-level fields (persist_browser_session, extra_http_headers,
+    totp_verification_url, totp_identifier, etc.) AND block-level overrides (max_retries,
+    max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
+    continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently
+    flipping them changes behavior the user did not request.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(

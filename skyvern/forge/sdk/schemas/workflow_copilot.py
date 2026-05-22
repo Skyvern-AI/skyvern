@@ -1,9 +1,10 @@
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.context import ResponseType
+from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -117,13 +118,25 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         description="Total tokens consumed by the agent during this turn; None when no provider reported usage",
     )
     response_type: ResponseType = Field("REPLY", description="Agent response classification")
+    proposal_disposition: ProposalDisposition = Field(
+        "auto_applicable",
+        description="Whether this proposal may auto-apply or must be reviewed explicitly.",
+    )
     unvalidated: bool = Field(
         False,
-        description="When true, clients must not auto-apply; render Accept/Reject explicitly.",
+        description="Legacy mirror for proposal_disposition=review_untested.",
     )
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
+    )
+    output_policy_diagnostics: dict[str, Any] | None = Field(
+        None,
+        description="Diagnostic output-policy labels for raw-vs-final quality reporting.",
+    )
+    force_review: bool = Field(
+        False,
+        description="Legacy mirror for proposal_disposition=review_tested.",
     )
 
 

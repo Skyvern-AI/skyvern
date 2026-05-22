@@ -311,10 +311,12 @@ BAD: One giant block trying to do everything at once.
 - When in doubt, split into multiple 1.0 blocks (cheaper, more observable)
 
 ### Caching
-MCP-created workflows default to run_with="code". First run uses AI agent; subsequent runs replay \
-a cached script (10-100x faster, no LLM calls). Set run_with="agent" for first-time testing, \
-debugging, or when the target site redesigned. Use script tools to inspect: \
-script_list_for_workflow -> script_get_code -> script_versions -> script_fallback_episodes.
+MCP-created workflows default to run_with="agent". Set run_with="code" to opt into cached script \
+execution: the first run still uses the AI agent (recording a script), but subsequent runs replay \
+the cached script (10-100x faster, no LLM calls). For JSON definitions, code_version=2 is also \
+injected by default; YAML definitions use the backend schema (currently leaves code_version unset). \
+Use script tools to inspect: script_list_for_workflow -> script_get_code -> script_versions -> \
+script_fallback_episodes.
 
 ### Block Types
 navigation (most common), extraction, for_loop, conditional, code, text_prompt, action, goto_url, \

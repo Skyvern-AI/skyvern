@@ -102,6 +102,14 @@ DOWNLOAD_MIME_TYPES = frozenset(
     }
 )
 
+DOWNLOAD_EXTENSION_BY_MIME_TYPE = {
+    "application/pdf": ".pdf",
+}
+
+_FILENAME_PATH_SEPARATOR_RE = re.compile(r"[\\/]+")
+_FILENAME_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
 
 def _parse_headers(raw_headers: list[dict[str, str]]) -> dict[str, str]:
     """Convert CDP header list [{name, value}] to a lowercase-keyed dict (last value wins)."""
@@ -120,6 +128,42 @@ def _parse_content_length(headers: dict[str, str]) -> int | None:
         return int(val)
     except ValueError:
         return None
+
+
+def _normalized_content_type(content_type: str) -> str:
+    return content_type.split(";")[0].strip().lower()
+
+
+def _download_extension_for_content_type(content_type: str) -> str:
+    return DOWNLOAD_EXTENSION_BY_MIME_TYPE.get(_normalized_content_type(content_type), "")
+
+
+def normalize_download_filename(filename: str, content_type: str = "") -> str:
+    """Sanitize a server-provided filename and add a trusted extension when missing."""
+    filename = unquote(filename).strip()
+    filename = _FILENAME_CONTROL_CHAR_RE.sub("", filename)
+    if not filename:
+        return ""
+
+    path_segments = [segment for segment in _FILENAME_PATH_SEPARATOR_RE.split(filename) if segment]
+    has_path_traversal = (
+        filename.startswith(("/", "\\"))
+        or bool(_WINDOWS_DRIVE_RE.match(filename))
+        or any(segment == ".." for segment in path_segments)
+    )
+    if has_path_traversal:
+        filename = next((segment for segment in reversed(path_segments) if segment not in {".", ".."}), "")
+    else:
+        filename = _FILENAME_PATH_SEPARATOR_RE.sub("_", filename)
+
+    filename = filename.strip(" .")
+    if not filename or Path(filename).suffix:
+        return filename
+
+    extension = _download_extension_for_content_type(content_type)
+    if extension:
+        return f"{filename}{extension}"
+    return filename
 
 
 def is_download_response(headers: dict[str, str], status_code: int, resource_type: str = "") -> bool:
@@ -142,7 +186,7 @@ def is_download_response(headers: dict[str, str], status_code: int, resource_typ
         return False
 
     content_disposition = headers.get("content-disposition", "")
-    content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+    content_type = _normalized_content_type(headers.get("content-type", ""))
 
     if content_type in NON_DOWNLOAD_CONTENT_TYPES:
         return False
@@ -237,7 +281,7 @@ class CDPDownloadInterceptor:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         LOG.info("CDP download interceptor download dir set", download_dir=download_dir)
 
-    def _resolve_save_path(self, filename: str = "") -> tuple[Path, str]:
+    def _resolve_save_path(self, filename: str = "", content_type: str = "") -> tuple[Path, str]:
         """Generate a unique save path under _output_dir.
 
         Sanitizes the filename (path traversal prevention), falls back to a UUID-based
@@ -250,10 +294,9 @@ class CDPDownloadInterceptor:
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
         self._download_index += 1
-        # Sanitize to prevent path traversal (e.g. "../../etc/evil")
-        filename = Path(filename).name
+        filename = normalize_download_filename(filename, content_type)
         if not filename:
-            filename = f"download_{uuid.uuid4().hex[:8]}"
+            filename = f"download_{uuid.uuid4().hex[:8]}{_download_extension_for_content_type(content_type)}"
 
         save_path = self._output_dir / filename
         # TODO: implement proper filename dedup (e.g., content hash or UUID suffix)
@@ -389,11 +432,10 @@ class CDPDownloadInterceptor:
             LOG.warning("No output_dir set, skipping direct download", url=url)
             return
 
-        save_path, filename = self._resolve_save_path(suggested_filename)
-
         t0 = time.monotonic()
         data: bytes | None = None
         method = ""
+        content_type = ""
 
         # Try Playwright's APIRequestContext which shares the BrowserContext's cookies.
         # We use the BrowserContext (not a Page) so this survives individual page closes.
@@ -402,6 +444,7 @@ class CDPDownloadInterceptor:
                 response = await self._browser_context.request.get(url)
                 if response.ok:
                     data = await response.body()
+                    content_type = response.headers.get("content-type", "")
                     method = "playwright_api"
                 else:
                     LOG.debug(
@@ -418,11 +461,11 @@ class CDPDownloadInterceptor:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 ssl_ctx = ssl.create_default_context()
 
-                def _fetch() -> bytes:
+                def _fetch() -> tuple[bytes, str]:
                     with urllib.request.urlopen(req, context=ssl_ctx) as resp:
-                        return resp.read()
+                        return resp.read(), resp.headers.get("content-type", "")
 
-                data = await asyncio.to_thread(_fetch)
+                data, content_type = await asyncio.to_thread(_fetch)
                 method = "urllib"
             except Exception as e:
                 LOG.error("Direct HTTP download failed", url=url, error=str(e), exc_info=True)
@@ -440,6 +483,8 @@ class CDPDownloadInterceptor:
                 max_size=MAX_FILE_SIZE_BYTES,
             )
             return
+
+        save_path, filename = self._resolve_save_path(suggested_filename, content_type)
 
         with open(save_path, "wb") as f:
             f.write(data)
@@ -640,9 +685,9 @@ class CDPDownloadInterceptor:
             return
 
         content_length = _parse_content_length(headers)
-        content_type = headers.get("content-type", "").split(";")[0].strip()
+        content_type = _normalized_content_type(headers.get("content-type", ""))
         raw_filename = extract_filename(headers, url)
-        save_path, filename = self._resolve_save_path(raw_filename)
+        save_path, filename = self._resolve_save_path(raw_filename, content_type)
 
         LOG.info(
             "CDP download detected",

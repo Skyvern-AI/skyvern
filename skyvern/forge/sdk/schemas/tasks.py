@@ -19,7 +19,9 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import ProxyLocationInput
+from skyvern.utils.prompt_truncation import EXTRACTION_GOAL_MAX_TOKENS
 from skyvern.utils.secret_headers import mask_header_values
+from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import validate_url
 
 
@@ -172,6 +174,19 @@ class TaskRequest(TaskBase):
 
         self.url = url_validation_result
         return self
+
+    @field_validator("data_extraction_goal")
+    @classmethod
+    def validate_data_extraction_goal_size(cls, goal: str | None) -> str | None:
+        if goal is None:
+            return goal
+        token_count = count_tokens(goal)
+        if token_count > EXTRACTION_GOAL_MAX_TOKENS:
+            raise SkyvernHTTPException(
+                message=f"data_extraction_goal is too large ({token_count:,} tokens). Maximum is {EXTRACTION_GOAL_MAX_TOKENS:,} tokens.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return goal
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -359,6 +374,7 @@ class Task(TaskBase):
         action_screenshot_urls: list[str] | None = None,
         screenshot_url: str | None = None,
         recording_url: str | None = None,
+        recording_archived: bool = False,
         browser_console_log_url: str | None = None,
         downloaded_files: list[FileInfo] | None = None,
         failure_reason: str | None = None,
@@ -380,6 +396,7 @@ class Task(TaskBase):
             action_screenshot_urls=action_screenshot_urls,
             screenshot_url=screenshot_url,
             recording_url=recording_url,
+            recording_archived=recording_archived,
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             downloaded_file_urls=[file.url for file in downloaded_files] if downloaded_files else None,
@@ -402,6 +419,7 @@ class TaskResponse(BaseModel):
     action_screenshot_urls: list[str] | None = None
     screenshot_url: str | None = None
     recording_url: str | None = None
+    recording_archived: bool = False
     browser_console_log_url: str | None = None
     downloaded_files: list[FileInfo] | None = None
     downloaded_file_urls: list[str] | None = None

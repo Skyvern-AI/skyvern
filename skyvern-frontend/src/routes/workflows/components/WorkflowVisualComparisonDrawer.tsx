@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Cross1Icon } from "@radix-ui/react-icons";
@@ -109,9 +109,6 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
-    cdpConnectHeaders: version.cdp_connect_headers
-      ? JSON.stringify(version.cdp_connect_headers)
-      : null,
     runWith: version.run_with ?? "agent",
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
@@ -184,6 +181,12 @@ function WorkflowComparisonRenderer({
   );
   const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
 
+  // useNodesState only reads its initial argument; re-sync when colored nodes
+  // change so "modified" highlights show up after blockColors settles.
+  useEffect(() => {
+    setNodes(coloredNodes as AppNode[]);
+  }, [coloredNodes, setNodes]);
+
   const handleNodesChange = useCallback(
     (changes: NodeChange<AppNode>[]) => {
       onNodesChange(changes);
@@ -239,11 +242,11 @@ function WorkflowVisualComparisonDrawer({
   isOpen,
   onClose,
 }: Props) {
-  if (!isOpen) return null;
-
-  const blocks1 = version1.workflow_definition?.blocks || [];
-  const blocks2 = version2.workflow_definition?.blocks || [];
-  const comparisons = compareWorkflowBlocks(blocks1, blocks2);
+  const comparisons = useMemo(() => {
+    const blocks1 = version1.workflow_definition?.blocks || [];
+    const blocks2 = version2.workflow_definition?.blocks || [];
+    return compareWorkflowBlocks(blocks1, blocks2);
+  }, [version1.workflow_definition, version2.workflow_definition]);
 
   // Statistics
   const stats = {
@@ -270,23 +273,23 @@ function WorkflowVisualComparisonDrawer({
     }
   };
 
-  // Create maps for each version's block colors
-  const version1BlockColors = new Map<string, string>();
-  const version2BlockColors = new Map<string, string>();
+  // Memoize so the child's setNodes effect doesn't re-fire every render.
+  const { version1BlockColors, version2BlockColors } = useMemo(() => {
+    const v1 = new Map<string, string>();
+    const v2 = new Map<string, string>();
+    comparisons.forEach((comparison) => {
+      const color = getComparisonColor(comparison.status);
+      if (comparison.leftBlock) {
+        v1.set(comparison.identifier, color);
+      }
+      if (comparison.rightBlock) {
+        v2.set(comparison.identifier, color);
+      }
+    });
+    return { version1BlockColors: v1, version2BlockColors: v2 };
+  }, [comparisons]);
 
-  comparisons.forEach((comparison) => {
-    const color = getComparisonColor(comparison.status);
-
-    // For version1 blocks
-    if (comparison.leftBlock) {
-      version1BlockColors.set(comparison.identifier, color);
-    }
-
-    // For version2 blocks
-    if (comparison.rightBlock) {
-      version2BlockColors.set(comparison.identifier, color);
-    }
-  });
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex bg-black bg-opacity-50">

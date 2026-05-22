@@ -378,6 +378,32 @@ class TestBuildUserContext:
         # must be escaped by escape_code_fences().
         assert "``` injected ```" not in rendered
 
+    def test_workflow_change_summary_slot_renders_when_present(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            user_workflow_change_summary=(
+                "user_modified_since_last_turn: the user changed the workflow YAML between turns.\n"
+                "added blocks: summarize_result"
+            ),
+        )
+        assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" in rendered
+        assert "user_modified_since_last_turn" in rendered
+        assert "added blocks: summarize_result" in rendered
+
+    def test_workflow_change_summary_slot_omitted_when_empty(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+        )
+        assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" not in rendered
+
     def test_workflow_summary_indexes_block_labels_and_error_mappings(self) -> None:
         workflow_yaml = """
 title: Invoice workflow

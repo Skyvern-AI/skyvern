@@ -38,7 +38,6 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
-    FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
     ScriptTerminationException,
@@ -129,7 +128,7 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
@@ -941,6 +940,11 @@ class WorkflowService:
                 if copilot_session_id is not None
                 else (ambient_context.copilot_session_id if ambient_context else None)
             )
+            resolved_trigger_type = trigger_type
+            if resolved_trigger_type is None and ambient_context:
+                resolved_trigger_type = ambient_context.trigger_type
+            if resolved_trigger_type is None:
+                resolved_trigger_type = WorkflowRunTriggerType.api
 
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
@@ -953,7 +957,7 @@ class WorkflowService:
                 debug_session_id=debug_session_id,
                 code_gen=code_gen,
                 workflow_run_id=workflow_run_id,
-                trigger_type=trigger_type,
+                trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
@@ -998,7 +1002,7 @@ class WorkflowService:
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                 )
             )
 
@@ -1027,11 +1031,26 @@ class WorkflowService:
                 # through the same AgentFunction hook so the cloud side is the single
                 # owner of the flag name and property shape.
                 new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                     organization_id=organization.organization_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
+
+                if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
+                    new_context.disable_llm_screenshots = True
+                else:
+                    try:
+                        new_context.disable_llm_screenshots = (
+                            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                                "DISABLE_LLM_SCREENSHOTS",
+                                workflow_run.workflow_run_id,
+                                properties={"organization_id": organization.organization_id},
+                            )
+                        )
+                    except Exception:
+                        LOG.warning("Failed to check DISABLE_LLM_SCREENSHOTS flag for workflow", exc_info=True)
+                        new_context.disable_llm_screenshots = False
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
@@ -1312,6 +1331,7 @@ class WorkflowService:
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
+        workflow_override: Workflow | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -1333,7 +1353,9 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        workflow = workflow_override or await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_run.workflow_permanent_id
+        )
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
@@ -1350,6 +1372,16 @@ class WorkflowService:
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
+        # Short-circuit when the conditional transition was refused (cron beat us
+        # to finalization). Falling through would otherwise hit the finally-block
+        # path below, which writes ``running`` again and emits orphan children.
+        if workflow_run.status.is_final():
+            LOG.info(
+                "execute_workflow aborting — workflow_run already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=workflow_run.status,
+            )
+            return workflow_run
 
         # Get all context parameters from the workflow definition
         context_parameters = [
@@ -2348,20 +2380,11 @@ class WorkflowService:
                 organization_id=organization_id,
             ):
                 workflow_run = refreshed_workflow_run
-                if workflow_run.status == WorkflowRunStatus.canceled:
+                if workflow_run.status.is_final():
                     LOG.info(
-                        "Workflow run is canceled, stopping execution inside workflow execution loop",
+                        "Workflow run is in a final state, stopping execution inside workflow execution loop",
                         workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_type=block.block_type,
-                        block_label=block.label,
-                    )
-                    return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
-
-                if workflow_run.status == WorkflowRunStatus.timed_out:
-                    LOG.info(
-                        "Workflow run is timed out, stopping execution inside workflow execution loop",
-                        workflow_run_id=workflow_run_id,
+                        workflow_run_status=workflow_run.status,
                         block_idx=block_idx,
                         block_type=block.block_type,
                         block_label=block.label,
@@ -4486,11 +4509,35 @@ class WorkflowService:
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
-        workflow_run = await self._update_workflow_run_status(
+        # Conditional UPDATE refuses to resurrect a finalized wr — prevents the
+        # cleanup cron from racing with re-entry paths and stomping timed_out
+        # back to running.
+        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
         )
+        if workflow_run is None:
+            existing = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=None
+            )
+            if existing is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+            LOG.info(
+                "Refusing to mark workflow_run as running — already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=existing.status,
+                run_with=run_with,
+            )
+            return existing
+
+        # Best-effort fire-and-forget write-through to task_runs table, matching
+        # the side effect that _update_workflow_run_status would have triggered.
+        bg = asyncio.create_task(
+            self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, WorkflowRunStatus.running),
+        )
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
         start_time = (
             workflow_run.started_at.replace(tzinfo=UTC)
             if workflow_run.started_at
@@ -4990,9 +5037,13 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         task_v2: Any | None,
         organization_id: str | None,
-    ) -> list[str]:
-        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback."""
+    ) -> tuple[list[str], bool]:
+        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback.
+
+        Returns (recording_urls, recording_archived).
+        """
         recording_urls: list[str] = []
+        recording_archived = False
         if workflow_run.browser_session_id:
             if workflow_run.started_at is None:
                 LOG.warning(
@@ -5021,10 +5072,12 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
             )
             if recording_artifacts:
-                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
-                recording_urls = [u for u in urls if u is not None]
+                recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifacts[0])
+                if not recording_archived:
+                    urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
+                    recording_urls = [u for u in urls if u is not None]
 
-        return recording_urls
+        return recording_urls, recording_archived
 
     async def _fetch_downloaded_files(
         self,
@@ -5112,7 +5165,7 @@ class WorkflowService:
         (
             screenshot_urls_raw,
             output_parameter_tuples,
-            recording_urls,
+            (recording_urls, recording_archived),
             (downloaded_files, downloaded_file_urls),
         ) = await asyncio.gather(
             self.get_recent_workflow_screenshot_urls(
@@ -5166,27 +5219,12 @@ class WorkflowService:
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
         total_steps = None
-        total_cost = None
         if include_step_count or include_cost:
-            if include_cost:
-                # step counts and block list are independent — fetch in parallel.
-                (step_count, completed_step_count), workflow_run_blocks = await asyncio.gather(
-                    app.DATABASE.tasks.get_step_counts_by_task_ids(
-                        task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                    ),
-                    app.DATABASE.observer.get_workflow_run_blocks(
-                        workflow_run_id=workflow_run_id, organization_id=organization_id
-                    ),
-                )
-                text_prompt_blocks = [
-                    block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
-                ]
-                # This is a temporary cost calculation.
-                total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
-            else:
-                step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                    task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                )
+            # `include_cost` is retained as a legacy alias for callers that
+            # previously received `total_steps` alongside deprecated cost data.
+            step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+            )
             total_steps = step_count
 
         return WorkflowRunResponseBase(
@@ -5211,11 +5249,14 @@ class WorkflowService:
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
             recording_urls=recording_urls or None,  # omit field when empty
+            recording_archived=recording_archived,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
-            total_cost=total_cost,
+            total_cost=None,
+            credits_used=workflow_run.credits_used,
+            cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
@@ -5351,11 +5392,11 @@ class WorkflowService:
 
         await self.execute_workflow_webhook(workflow_run, api_key)
 
-    async def execute_workflow_webhook(
+    async def prepare_workflow_webhook(
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
-    ) -> None:
+    ) -> PreparedWorkflowWebhook | None:
         workflow_id = workflow_run.workflow_id
         # Cleanup path: tolerate soft-deleted workflows. If the workflow row
         # has been deleted between run start and cleanup (common when an eval
@@ -5376,14 +5417,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
             )
-            return
+            return None
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            return
+            return None
 
         # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
         workflow_run.webhook_callback_url = workflow_run.webhook_callback_url.strip()
@@ -5404,7 +5445,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
             )
-            return
+            return None
 
         # build new schema for backward compatible webhook payload
         app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
@@ -5445,53 +5486,115 @@ class WorkflowService:
             api_key=signing_api_key,
         )
         LOG.info(
-            "Sending webhook run status to webhook callback url",
+            "Prepared webhook run status for webhook callback url",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
             payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
+        return PreparedWorkflowWebhook(
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            webhook_callback_url=workflow_run.webhook_callback_url,
+            signed_payload=signed_data.signed_payload,
+            headers=signed_data.headers,
+            payload_for_log=signed_data.payload_for_log,
+        )
+
+    async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
+        LOG.info(
+            "Sending webhook run status to webhook callback url",
+            workflow_id=webhook.workflow_id,
+            workflow_run_id=webhook.workflow_run_id,
+            webhook_callback_url=webhook.webhook_callback_url,
+            payload=webhook.payload_for_log,
+            headers=webhook.headers,
+        )
         try:
             resp = await deliver_webhook_with_retries(
-                url=workflow_run.webhook_callback_url,
-                payload=signed_data.signed_payload,
-                headers=signed_data.headers,
+                url=webhook.webhook_callback_url,
+                payload=webhook.signed_payload,
+                headers=webhook.headers,
                 timeout_seconds=30.0,
-                organization_id=workflow_run.organization_id,
-                run_id=workflow_run.workflow_run_id,
+                organization_id=webhook.organization_id,
+                run_id=webhook.workflow_run_id,
             )
-            if resp.status_code >= 200 and resp.status_code < 300:
-                LOG.info(
-                    "Webhook sent successfully",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
-                )
+        except Exception as e:
+            LOG.warning(
+                "Workflow webhook delivery failed after attempting delivery",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {e}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record workflow webhook delivery error",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+            return
+
+        if resp.status_code >= 200 and resp.status_code < 300:
+            LOG.info(
+                "Webhook sent successfully",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason="",
                 )
-            else:
-                LOG.info(
-                    "Webhook failed",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=signed_data.payload_for_log,
-                    resp=resp,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
+            except Exception:
+                LOG.warning(
+                    "Failed to record successful workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
                 )
+        else:
+            LOG.info(
+                "Webhook failed",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                webhook_data=webhook.payload_for_log,
+                resp=resp,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
-        except Exception as e:
-            raise FailedToSendWebhook(
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-            ) from e
+            except Exception:
+                LOG.warning(
+                    "Failed to record failed workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+
+    async def execute_workflow_webhook(
+        self,
+        workflow_run: WorkflowRun,
+        api_key: str | None = None,
+    ) -> None:
+        webhook = await self.prepare_workflow_webhook(workflow_run, api_key)
+        if webhook is None:
+            return
+        await self.deliver_prepared_workflow_webhook(webhook)
 
     async def persist_video_data(
         self,

@@ -359,6 +359,10 @@ class BaseRunResponse(BaseModel):
     )
     downloaded_files: list[FileInfo] | None = Field(default=None, description="List of files downloaded during the run")
     recording_url: str | None = Field(default=None, description="URL to the recording of the run")
+    recording_archived: bool = Field(
+        default=False,
+        description="True when the recording exists but has been archived to cold storage and is not currently accessible.",
+    )
     screenshot_urls: list[str] | None = Field(
         default=None,
         description="List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot.",

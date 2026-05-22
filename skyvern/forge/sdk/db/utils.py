@@ -221,11 +221,27 @@ ACTION_TYPE_TO_CLASS = {
 }
 
 
+def _scrub_nul_chars(obj: typing.Any) -> typing.Any:
+    # PG text/jsonb cannot store NUL; strip it pre-serialization so strings that
+    # spell out the escape sequence (\u0000) are not affected.
+    if isinstance(obj, str):
+        return obj.replace("\x00", "") if "\x00" in obj else obj
+    if isinstance(obj, dict):
+        return {_scrub_nul_chars(k): _scrub_nul_chars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_nul_chars(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_nul_chars(item) for item in obj)
+    return obj
+
+
 @typing.no_type_check
 def _custom_json_serializer(*args, **kwargs) -> str:
     """
     Encodes json in the same way that pydantic does.
     """
+    if args:
+        args = (_scrub_nul_chars(args[0]),) + args[1:]
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 

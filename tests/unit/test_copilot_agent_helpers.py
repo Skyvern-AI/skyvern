@@ -12,9 +12,10 @@ import pytest
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.request_policy import (
+    _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
-    _build_transcript_context,
     _classify_request,
+    build_transcript_context,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -476,6 +477,7 @@ class TestShouldRestorePersistedWorkflow:
         r.updated_workflow = updated_workflow
         r.unvalidated = False
         r.cancelled = False
+        r.force_review = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
@@ -540,7 +542,7 @@ class TestBlockGoalMainGoal:
 
         assert goal == "Use ` ` `this` ` ` safely."
 
-    def test_structured_user_goal_added_as_prior_high_level_goal(self) -> None:
+    def test_correction_message_wins_over_structured_user_goal(self) -> None:
         global_context = json.dumps(
             {"user_goal": "Locate research about gravitational waves this week.", "workflow_state": "draft"}
         )
@@ -551,43 +553,48 @@ class TestBlockGoalMainGoal:
             global_llm_context=global_context,
         )
 
-        assert "Prior high-level goal:\nLocate research about gravitational waves this week." in goal
-        assert "Latest user message:\nI meant black holes" in goal
-        assert "Recent chat history" not in goal
+        assert goal == "I meant black holes"
 
-    def test_plain_global_context_becomes_prior_high_level_goal(self) -> None:
+    def test_bare_confirmation_does_not_infer_structured_user_goal(self) -> None:
+        global_context = json.dumps({"user_goal": "Locate research about gravitational waves this week."})
+
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="Yes, please.",
+            chat_history_text="user: Locate research about gravitational waves this week.",
+            global_llm_context=global_context,
+        )
+
+        assert goal == "Yes, please."
+
+    def test_current_message_wins_over_plain_global_context(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant black holes",
             chat_history_text="",
             global_llm_context="Legacy goal with ```fenced``` context.",
         )
 
-        assert "Prior high-level goal:\nLegacy goal with ` ` `fenced` ` ` context." in goal
-        assert "Latest user message:\nI meant black holes" in goal
+        assert goal == "I meant black holes"
 
-    def test_chat_history_added_when_present(self) -> None:
+    def test_chat_history_is_not_denormalized_into_goal(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant black holes",
             chat_history_text="user: Search arXiv for recent papers.\nai: Drafted workflow.",
             global_llm_context=None,
         )
 
-        assert "Recent chat history:\nuser: Search arXiv for recent papers." in goal
-        assert "ai: Drafted workflow." in goal
-        assert "Latest user message:\nI meant black holes" in goal
+        assert goal == "I meant black holes"
 
-    def test_chat_history_and_latest_message_escape_code_fences(self) -> None:
+    def test_latest_message_escapes_code_fences_without_chat_history(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant ```black holes```",
             chat_history_text="user: Search ```arXiv``` for recent papers.",
             global_llm_context=None,
         )
 
-        assert "user: Search ` ` `arXiv` ` ` for recent papers." in goal
-        assert "Latest user message:\nI meant ` ` `black holes` ` `" in goal
+        assert goal == "I meant ` ` `black holes` ` `"
         assert "```" not in goal
 
-    def test_includes_both_structured_goal_and_chat_history(self) -> None:
+    def test_current_message_wins_over_chat_history_and_structured_goal(self) -> None:
         global_context = json.dumps({"user_goal": "Find papers about gravitational waves."})
 
         goal = agent_module._build_block_goal_main_goal(
@@ -596,14 +603,85 @@ class TestBlockGoalMainGoal:
             global_llm_context=global_context,
         )
 
-        assert "Prior high-level goal:\nFind papers about gravitational waves." in goal
-        assert "Recent chat history:" in goal
-        assert "Latest user message:\nI meant neutron stars" in goal
-        assert goal.find("Prior high-level goal") < goal.find("Recent chat history") < goal.find("Latest user message")
+        assert goal == "I meant neutron stars"
+
+
+class TestRuntimeBlockGoalPersistenceBoundary:
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+        from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+
+        clean_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: navigation
+      label: submit
+      navigation_goal: Submit the contact form.
+"""
+        captured: dict[str, str] = {}
+
+        async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
+            captured["workflow_yaml"] = payload["workflow_yaml"]
+            ctx.workflow_yaml = payload["workflow_yaml"]
+            workflow = _process_workflow_yaml(
+                workflow_id=ctx.workflow_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+                workflow_yaml=payload["workflow_yaml"],
+            )
+            return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
+
+        async def fake_run_blocks(params, ctx, **kwargs):
+            return {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr-1",
+                    "overall_status": "completed",
+                    "blocks": [],
+                },
+            }
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit"))
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        ctx = _ctx(
+            user_message="Submit a contact form.",
+            block_goal_main_goal="Submit a contact form.",
+        )
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": clean_yaml, "block_labels": ["submit"], "parameters": {}}),
+        )
+
+        assert json.loads(result)["ok"] is True
+        assert captured["workflow_yaml"] == clean_yaml
+        assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
 class TestTranslateToAgentResultGating:
     """Covers the three SKY-9143 invariants that live in _translate_to_agent_result."""
+
+    def test_plain_internal_ask_question_label_is_normalized_by_output_policy(self) -> None:
+        ctx = _ctx()
+        result = SimpleNamespace(final_output="ASK_QUESTION\nWhich account should I use?", new_items=[])
+
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.user_response == "Which account should I use?"
 
     def test_inline_replace_workflow_resets_test_ok_after_prior_pass(self, monkeypatch) -> None:
         # A prior run_blocks test passed for the old workflow (ctx.last_test_ok=True,
@@ -619,7 +697,11 @@ class TestTranslateToAgentResultGating:
 
         ctx = _ctx(last_workflow=old_wf, last_workflow_yaml="old: yaml", last_test_ok=True)
         result = _fake_run_result(
-            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "new: yaml"}
+            {
+                "type": "REPLACE_WORKFLOW",
+                "user_response": "REPLACE_WORKFLOW\nHere you go.",
+                "workflow_yaml": "new: yaml",
+            }
         )
         agent_result = agent_module._translate_to_agent_result(
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
@@ -1013,23 +1095,14 @@ workflow_definition:
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
-    def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
-        # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with
-        # the user's chat message as big-goal context. The REPLACE_WORKFLOW
-        # inline path must do the same, otherwise the untested yaml latches
-        # onto ctx without user-intent framing and any downstream block run
-        # hits the verifier-on-confirmation-surface bug this PR fixes.
+    def test_inline_replace_workflow_persists_clean_agent_yaml(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
-        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
-            return f"WRAPPED::{user_message}::{workflow_yaml}"
-
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
 
         ctx = _ctx(user_message="Submit a contact form on example.com.")
         result = _fake_run_result(
@@ -1039,21 +1112,17 @@ workflow_definition:
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
         )
 
-        assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
-        assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+        assert captured["yaml"] == "raw: yaml"
+        assert ctx.last_workflow_yaml == "raw: yaml"
 
-    def test_inline_replace_workflow_prefers_resolved_block_goal_main_goal(self, monkeypatch) -> None:
+    def test_inline_replace_workflow_does_not_denormalize_resolved_goal(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
-        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
-            return f"WRAPPED::{user_message}::{workflow_yaml}"
-
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
 
         ctx = _ctx(
             user_message="I meant black holes",
@@ -1066,7 +1135,7 @@ workflow_definition:
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
         )
 
-        assert captured["yaml"] == "WRAPPED::Go to arXiv and find research about black holes.::raw: yaml"
+        assert captured["yaml"] == "raw: yaml"
 
     def test_ask_question_with_verified_workflow_suppresses_and_clears(self) -> None:
         # A verified-but-non-terminal workflow built this turn must not surface
@@ -1148,6 +1217,45 @@ class TestCredentialRefusalReachesAgent:
             assert "redacted from" not in desc, f"{tool.name} still claims redaction"
             assert "you may pass it via" not in desc, f"{tool.name} still permits inline secrets"
             assert cross_ref.search(desc), f"{tool.name} missing refusal cross-reference"
+
+
+class TestNativeToolSurface:
+    @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
+    def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        policy = RequestPolicy(
+            testing_intent="skip_test",
+            clarification_reason=reason,
+            allow_update_workflow=True,
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+        )
+        tools = [
+            SimpleNamespace(name="update_workflow"),
+            SimpleNamespace(name="list_credentials"),
+            SimpleNamespace(name="update_and_run_blocks"),
+        ]
+
+        filtered = agent_module._native_tools_for_turn(tools, turn_intent=None, request_policy=policy)
+
+        assert [tool.name for tool in filtered] == ["list_credentials", "update_and_run_blocks"]
+
+    def test_non_deferred_policy_keeps_update_workflow_tool(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        tools = [
+            SimpleNamespace(name="update_workflow"),
+            SimpleNamespace(name="update_and_run_blocks"),
+        ]
+
+        filtered = agent_module._native_tools_for_turn(
+            tools,
+            turn_intent=None,
+            request_policy=RequestPolicy(allow_update_workflow=True, allow_run_blocks=True),
+        )
+
+        assert [tool.name for tool in filtered] == ["update_workflow", "update_and_run_blocks"]
 
 
 class TestRequestPolicyCredentialResolution:
@@ -1283,6 +1391,91 @@ class TestRequestPolicyCredentialResolution:
         get_credentials_by_ids.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_prior_turn_raw_password_does_not_leak_into_classifier_prompt(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=[]))),
+        )
+
+        captured: dict[str, str] = {}
+
+        async def handler(*, prompt: str, prompt_name: str) -> str:
+            captured["prompt"] = prompt
+            return json.dumps(
+                {
+                    "testing_intent": "unspecified",
+                    "credential_input_kind": "credential_name",
+                    "credential_refs": [],
+                    "login_page_urls": [],
+                    "requires_user_clarification": True,
+                    "clarification_reason": "credential_name_unresolved",
+                    "completion_contract": None,
+                }
+            )
+
+        chat_history = _history(
+            ("user", "wait."),
+            ("ai", "What is the URL of the web browser game?"),
+            ("user", "https://example.com/"),
+            ("ai", "The URL redirected to https://www.poki.com/. Confirm?"),
+            ("user", "Now, log in to account demo, password ac3O4/30"),
+            ("ai", "DO NOT PROVIDE RAW LOGIN/PASSWORD."),
+        )
+
+        policy = await build_request_policy(
+            user_message="Navigate to https://example.com and login with the given credentials.",
+            workflow_yaml="",
+            chat_history=chat_history,
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert "ac3O4/30" not in captured["prompt"]
+        assert policy.raw_secret_detected is False
+        assert policy.credential_input_kind == "credential_name"
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" not in (policy.clarification_question or "")
+        assert policy.clarification_question and "Which saved credential" in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_bulk_colon_delimited_credentials_refuse_before_model_classification(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock()
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+        handler = AsyncMock()
+
+        policy = await build_request_policy(
+            user_message=(
+                "Use these accounts:\nalpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.raw_secret_detected is True
+        assert policy.credential_input_kind == "raw_secret"
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
+        assert "FakePass123" not in repr(policy.to_trace_data())
+        handler.assert_not_awaited()
+        get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
@@ -1384,6 +1577,10 @@ class TestRequestPolicyCredentialResolution:
         prior_clarification_context = (
             '{"decisions_made":["request-policy clarification required: credential_name/credential_name_unresolved"]}'
         )
+        saved_credential_question = (
+            "Which saved credential should I use? "
+            "Please provide the exact credential name or a credential ID beginning with cred_."
+        )
         history_refs_from_context = await build_request_policy(
             user_message="Just draft a workflow without testing it.",
             workflow_yaml="",
@@ -1426,6 +1623,118 @@ class TestRequestPolicyCredentialResolution:
         assert follow_up_missing_name_policy.user_response_policy == "ask_clarification"
         assert not follow_up_missing_name_policy.allow_update_workflow
         assert not follow_up_missing_name_policy.allow_run_blocks
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        prior_clarification_follow_up_policy = await build_request_policy(
+            user_message="let me help logging in",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert prior_clarification_follow_up_policy.user_response_policy == "proceed"
+        assert prior_clarification_follow_up_policy.allow_update_workflow
+        assert not prior_clarification_follow_up_policy.allow_run_blocks
+        assert prior_clarification_follow_up_policy.allow_missing_credentials_in_draft
+        assert prior_clarification_follow_up_policy.clarification_question is None
+
+        handler.response = {
+            "testing_intent": "skip_test",
+            "credential_input_kind": "credential_name",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        deferred_after_question_policy = await build_request_policy(
+            user_message="i will do them later",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert deferred_after_question_policy.user_response_policy == "proceed"
+        assert deferred_after_question_policy.testing_intent == "skip_test"
+        assert deferred_after_question_policy.clarification_reason == "credential_name_unresolved"
+        assert deferred_after_question_policy.allow_update_workflow
+        assert not deferred_after_question_policy.allow_run_blocks
+        assert deferred_after_question_policy.allow_missing_credentials_in_draft
+
+        stored_credential_site_question = "Which website or login page should I use to look up the stored credential?"
+        deferred_after_site_question_policy = await build_request_policy(
+            user_message="i will do them later",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "login using the 'azure_credentials' and get the code from the 'mfa_email'"),
+                ("ai", stored_credential_site_question),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert deferred_after_site_question_policy.user_response_policy == "proceed"
+        assert deferred_after_site_question_policy.testing_intent == "skip_test"
+        assert deferred_after_site_question_policy.clarification_reason == "credential_name_unresolved"
+        assert deferred_after_site_question_policy.allow_update_workflow
+        assert not deferred_after_site_question_policy.allow_run_blocks
+        assert deferred_after_site_question_policy.allow_missing_credentials_in_draft
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "credential_name",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        prior_clarification_name_policy = await build_request_policy(
+            user_message="let me help logging in",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert prior_clarification_name_policy.user_response_policy == "proceed"
+        assert prior_clarification_name_policy.allow_update_workflow
+        assert not prior_clarification_name_policy.allow_run_blocks
+        assert prior_clarification_name_policy.allow_missing_credentials_in_draft
+        assert prior_clarification_name_policy.clarification_question is None
+
+        handler.response = {
+            "testing_intent": "require_test",
+            "credential_input_kind": "none",
+            "requires_user_clarification": True,
+            "clarification_reason": "credential_name_unresolved",
+        }
+        stale_clarification_policy = await build_request_policy(
+            user_message="log into this other site",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "log in via eduID"),
+                ("ai", saved_credential_question),
+                ("user", "never mind"),
+                ("ai", "Which page or URL should the workflow go to?"),
+            ),
+            global_llm_context=prior_clarification_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+        assert stale_clarification_policy.user_response_policy == "ask_clarification"
+        assert not stale_clarification_policy.allow_update_workflow
+        assert not stale_clarification_policy.allow_run_blocks
 
         handler.response = {
             "testing_intent": "skip_test",
@@ -1969,7 +2278,7 @@ class TestCopilotConfig:
 
 class TestRequestPolicyTranscriptContext:
     def test_empty_history_produces_sentinel_slots(self) -> None:
-        transcript = _build_transcript_context([], current_user_message="hi")
+        transcript = build_transcript_context([], current_user_message="hi")
 
         assert transcript.earliest_user_turn == "(none)"
         assert transcript.latest_prior_user_turn == "(none)"
@@ -1978,7 +2287,7 @@ class TestRequestPolicyTranscriptContext:
         assert transcript.omitted_any is False
 
     def test_single_user_history_promotes_to_both_user_anchors(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "log into example.com")),
             current_user_message="now add a download",
         )
@@ -1988,7 +2297,7 @@ class TestRequestPolicyTranscriptContext:
         assert transcript.latest_assistant_turn == "(none)"
 
     def test_multi_turn_history_populates_all_anchors_without_duplicating_in_retained(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "build a workflow"),
                 ("ai", "drafted v1"),
@@ -2008,7 +2317,7 @@ class TestRequestPolicyTranscriptContext:
         assert "drafted v1" in transcript.retained_history
 
     def test_trailing_user_matching_current_message_is_excluded(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "build a workflow"),
                 ("ai", "ok"),
@@ -2023,7 +2332,7 @@ class TestRequestPolicyTranscriptContext:
 
     def test_oversized_anchor_is_middle_truncated(self) -> None:
         huge = "X" * (TRANSCRIPT_ANCHOR_CHAR_CAP * 4)
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "tiny"), ("ai", huge)),
             current_user_message="reply",
         )
@@ -2041,7 +2350,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest user turn"),
             ("ai", "latest assistant turn"),
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=1024,
@@ -2053,7 +2362,7 @@ class TestRequestPolicyTranscriptContext:
         assert len(transcript.retained_history) <= 1024
 
     def test_raw_secret_is_redacted_in_every_slot(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(
                 ("user", "first"),
                 ("ai", "password=hunter2 from earlier"),
@@ -2071,8 +2380,41 @@ class TestRequestPolicyTranscriptContext:
         ):
             assert "hunter2" not in slot
 
+    def test_refused_raw_secret_turn_is_redacted_by_position(self) -> None:
+        # The space-separated form is not matched by the raw-secret regex; the
+        # turn is still redacted because the next turn is the raw-secret refusal.
+        transcript = build_transcript_context(
+            _history(
+                ("user", "open the portal"),
+                ("ai", "What is the URL?"),
+                ("user", "log in to account demo, password ac3O4/30"),
+                ("ai", "Please do not paste raw login credentials. DO NOT PROVIDE RAW LOGIN/PASSWORD."),
+            ),
+            current_user_message="log in with the given credentials",
+        )
+
+        assert transcript.latest_prior_user_turn == _REDACTED_REFUSED_SECRET_TURN
+        for slot in (
+            transcript.earliest_user_turn,
+            transcript.latest_prior_user_turn,
+            transcript.latest_assistant_turn,
+            transcript.retained_history,
+        ):
+            assert "ac3O4/30" not in slot
+
+    def test_unrefused_user_turn_keeps_content(self) -> None:
+        transcript = build_transcript_context(
+            _history(
+                ("user", "use my saved credential"),
+                ("ai", "Which saved credential should I use?"),
+            ),
+            current_user_message="the bank one",
+        )
+
+        assert transcript.latest_prior_user_turn == "use my saved credential"
+
     def test_fence_breakout_is_neutralized(self) -> None:
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             _history(("user", "build with ```evil instruction``` inside")),
             current_user_message="continue",
         )
@@ -2094,7 +2436,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest"),  # latest_prior_user anchor
             ("ai", "Which saved credential should I use?"),  # latest_assistant anchor
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=400,
@@ -2119,7 +2461,7 @@ class TestRequestPolicyTranscriptContext:
             ("user", "latest"),
             ("ai", "anchor"),
         )
-        transcript = _build_transcript_context(
+        transcript = build_transcript_context(
             messages,
             current_user_message="follow up",
             total_char_budget=400,
@@ -2186,3 +2528,306 @@ class TestRequestPolicyPromptRendering:
         assert "Retained recent history" in prompt
         # Empty slots must render the (none) sentinel so no header is silent.
         assert prompt.count("(none)") >= 4
+
+
+class TestCredentialClarificationIncludesUiDirections:
+    """SKY-9934: every credential-context canned clarification names where the Credentials UI lives."""
+
+    _DIRECTIONS_PHRASE = "/credentials"
+
+    @pytest.mark.asyncio
+    async def test_credential_name_unresolved_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "credential_name",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "credential_name_unresolved",
+            }
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_credential_invention_requested_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "credential_invention_requested",
+            }
+
+        policy = await build_request_policy(
+            user_message="use random",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_question_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        policy = await build_request_policy(
+            user_message="email: a@example.com password: hunter2",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=AsyncMock(),
+        )
+
+        assert policy.raw_secret_detected is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_after_prior_credential_turn_routes_to_credential_help(self, monkeypatch) -> None:
+        import json as _json
+
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        prior_context = _json.dumps(
+            {
+                "decisions_made": [
+                    "request-policy clarification required: none/credential_invention_requested",
+                ],
+            }
+        )
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=prior_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.requires_user_clarification is True
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+        assert (
+            policy.clarification_question != "I need one more detail before I can build and test this workflow safely."
+        )
+
+    @pytest.mark.asyncio
+    async def test_workflow_credential_inputs_unbound_includes_directions(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        workflow_yaml_with_unbound_creds = (
+            "workflow_definition:\n"
+            "  parameters:\n"
+            "    - parameter_type: workflow\n"
+            "      key: login_user\n"
+            "      default_value: null\n"
+            "  blocks:\n"
+            "    - label: sign_in\n"
+            "      block_type: login\n"
+            "      parameters:\n"
+            "        - parameter_type: credential\n"
+            "          key: signin_creds\n"
+            "          username_key: ''\n"
+            "          password_key: ''\n"
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        policy = await build_request_policy(
+            user_message="run it",
+            workflow_yaml=workflow_yaml_with_unbound_creds,
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.clarification_reason == "workflow_credential_inputs_unbound"
+        assert policy.clarification_question is not None
+        assert self._DIRECTIONS_PHRASE in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_stale_credential_clarification_does_not_misroute(self, monkeypatch) -> None:
+        import json as _json
+
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        prior_context = _json.dumps(
+            {
+                "decisions_made": [
+                    "request-policy clarification required: none/credential_invention_requested",
+                    "request-policy clarification required: none/ambiguous_loop_edit",
+                ],
+            }
+        )
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=prior_context,
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert (
+            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_fallback_without_prior_credential_turn_unchanged(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[]),
+                    get_credentials_by_ids=AsyncMock(return_value=[]),
+                )
+            ),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "none",
+                "credential_refs": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "none",
+            }
+
+        policy = await build_request_policy(
+            user_message="where ??",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert (
+            policy.clarification_question == "I need one more detail before I can build and test this workflow safely."
+        )

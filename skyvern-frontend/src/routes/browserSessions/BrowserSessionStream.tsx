@@ -3,6 +3,10 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { useCdpInput } from "@/routes/streaming/useCdpInput";
 import { InteractiveStreamView } from "@/routes/streaming/InteractiveStreamView";
+import {
+  StreamStatusPanel,
+  type StreamDiagnostic,
+} from "@/routes/streaming/StreamDiagnostics";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -13,6 +17,64 @@ type StreamMessage = {
   viewport_height?: number;
   url?: string;
 };
+
+const STARTING_DIAGNOSTIC: StreamDiagnostic = {
+  title: "Starting local browser stream",
+  detail:
+    "Opening the stream WebSocket and waiting for the first browser frame.",
+};
+
+function diagnosticForStatus(status: string): StreamDiagnostic {
+  switch (status) {
+    case "not_found":
+      return {
+        title: "Browser session not found",
+        detail:
+          "The backend could not find this browser session for the current organization.",
+        hint: "Refresh the page or create a new browser session.",
+      };
+    case "timeout":
+      return {
+        title: "Timed out waiting for browser state",
+        detail:
+          "The stream connected, but the backend did not find an active page to screencast.",
+        hint: "Check backend logs for browser launch errors and verify BROWSER_STREAMING_MODE=cdp.",
+      };
+    case "completed":
+    case "failed":
+      return {
+        title: "Browser session is no longer live",
+        detail: `The browser session status is ${status}.`,
+      };
+    default:
+      return {
+        title: "Waiting for browser frames",
+        detail: `The stream is connected and the session status is ${status}.`,
+      };
+  }
+}
+
+function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
+  if (event.code === 4001 || event.reason === "use-vnc-streaming") {
+    return {
+      title: "Backend is using VNC streaming",
+      detail:
+        "The UI tried local browser streaming, but the backend closed the stream with use-vnc-streaming.",
+      hint: "Check BROWSER_STREAMING_MODE on the backend and the runtime config response.",
+    };
+  }
+  if (event.code === 1006) {
+    return {
+      title: "Stream connection dropped",
+      detail: "The browser stream WebSocket closed before sending a frame.",
+      hint: "Check that the API server is running and reachable from the UI.",
+    };
+  }
+  return {
+    title: "Stream connection closed",
+    detail: `WebSocket closed with code ${event.code}${event.reason ? ` (${event.reason})` : ""}.`,
+  };
+}
 
 interface Props {
   browserSessionId: string;
@@ -32,9 +94,12 @@ function BrowserSessionStream({
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
   const [currentUrl, setCurrentUrl] = useState("");
+  const [diagnostic, setDiagnostic] =
+    useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const credentialGetter = useCredentialGetter();
 
   const socketRef = useRef<WebSocket | null>(null);
+  const hasFrameRef = useRef(false);
 
   const inputWsUrl = interactive
     ? `${newWssBaseUrl}/stream/cdp_input/browser_session/${browserSessionId}`
@@ -60,6 +125,8 @@ function BrowserSessionStream({
     setViewportWidth(1280);
     setViewportHeight(720);
     setCurrentUrl("");
+    setDiagnostic(STARTING_DIAGNOSTIC);
+    hasFrameRef.current = false;
 
     async function run() {
       const credentialParam = await getCredentialParam(credentialGetter);
@@ -74,10 +141,18 @@ function BrowserSessionStream({
         `${newWssBaseUrl}/stream/browser_sessions/${browserSessionId}?${credentialParam}`,
       );
 
+      socketRef.current.addEventListener("open", () => {
+        setDiagnostic({
+          title: "Connected to stream",
+          detail: "Waiting for the backend to attach to the browser page.",
+        });
+      });
+
       socketRef.current.addEventListener("message", (event) => {
         try {
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
+            hasFrameRef.current = true;
             setStreamImgSrc(message.screenshot);
           }
           if (message.format) {
@@ -92,6 +167,9 @@ function BrowserSessionStream({
           if (message.url !== undefined) {
             setCurrentUrl(message.url);
           }
+          if (!message.screenshot && message.status) {
+            setDiagnostic(diagnosticForStatus(message.status));
+          }
           if (
             message.status === "completed" ||
             message.status === "failed" ||
@@ -101,10 +179,25 @@ function BrowserSessionStream({
           }
         } catch (e) {
           console.error("Failed to parse message", e);
+          setDiagnostic({
+            title: "Unexpected stream message",
+            detail: "The browser stream sent a message the UI could not parse.",
+          });
         }
       });
 
-      socketRef.current.addEventListener("close", () => {
+      socketRef.current.addEventListener("error", () => {
+        setDiagnostic({
+          title: "Stream WebSocket error",
+          detail:
+            "The browser stream connection hit a network or server error.",
+        });
+      });
+
+      socketRef.current.addEventListener("close", (event) => {
+        if (!cancelled && !hasFrameRef.current) {
+          setDiagnostic(diagnosticForClose(event));
+        }
         socketRef.current = null;
       });
     }
@@ -151,11 +244,7 @@ function BrowserSessionStream({
     );
   }
 
-  return (
-    <div className="flex h-full w-full items-center justify-center text-sm text-slate-400">
-      Starting stream...
-    </div>
-  );
+  return <StreamStatusPanel diagnostic={diagnostic} />;
 }
 
 export { BrowserSessionStream };

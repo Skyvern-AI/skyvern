@@ -536,6 +536,14 @@ class ScrapingFailed(SkyvernException):
         super().__init__("Scraping failed.")
 
 
+class SkyvernActionFailed(SkyvernException):
+    """Operationally-expected failure during an SDK action execution."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class ScrapingFailedBlankPage(ScrapingFailed):
     def __init__(self) -> None:
         super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")

@@ -17,7 +17,7 @@ from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -133,6 +133,9 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 
 
 # SKY-8818: observability threshold for under-configured file_download blocks.
@@ -428,6 +431,13 @@ class Block(BaseModel, abc.ABC):
             is_synthetic_loop_failure=is_synthetic_loop_failure,
         )
 
+    def allow_content_blocking_extensions_for_browser_launch(
+        self, workflow: Workflow | WorkflowDefinition | None = None
+    ) -> bool:
+        if workflow is not None:
+            return workflow.allow_content_blocking_extensions_for_browser_launch()
+        return self.block_type != BlockType.LOGIN
+
     async def get_or_create_browser_state(
         self,
         workflow_run_id: str,
@@ -455,11 +465,36 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
             try:
+                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+                workflow = workflow_run_context.workflow
+                if workflow is None:
+                    LOG.warning(
+                        "Workflow missing from context while resolving browser launch extension policy; fetching workflow",
+                        workflow_run_id=workflow_run_id,
+                        workflow_id=workflow_run.workflow_id,
+                        organization_id=workflow_run.organization_id,
+                    )
+                    workflow = await app.WORKFLOW_SERVICE.get_workflow(
+                        workflow_id=workflow_run.workflow_id,
+                        organization_id=workflow_run.organization_id,
+                    )
+                    workflow_run_context.set_workflow(workflow)
+                if workflow is None:
+                    LOG.warning(
+                        "Workflow unavailable while resolving browser launch extension policy; using block-level fallback",
+                        workflow_run_id=workflow_run_id,
+                        workflow_id=workflow_run.workflow_id,
+                        organization_id=workflow_run.organization_id,
+                        block_type=self.block_type,
+                    )
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
                     url=None,
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
+                    allow_content_blocking_extensions=self.allow_content_blocking_extensions_for_browser_launch(
+                        workflow=workflow
+                    ),
                 )
                 await browser_state.check_and_fix_state(
                     url=None,
@@ -1162,6 +1197,9 @@ class BaseTaskBlock(Block):
                         url=_bm_url,
                         browser_session_id=browser_session_id,
                         browser_profile_id=workflow_run.browser_profile_id,
+                        allow_content_blocking_extensions=self.allow_content_blocking_extensions_for_browser_launch(
+                            workflow=workflow
+                        ),
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -5046,8 +5084,7 @@ class FileParserBlock(Block):
 
         # Convert content to string for AI processing
         if isinstance(content, list):
-            # For CSV/Excel data, convert to a readable format
-            content_str = json.dumps(content, indent=2)
+            content_str = json.dumps(content, separators=(",", ":"))
         else:
             content_str = content
 
@@ -5097,6 +5134,41 @@ class FileParserBlock(Block):
             error_codes=error_codes or None,
         )
 
+    @staticmethod
+    def _extract_file_url_from_block_output(value: Any) -> str | None:
+        """Extract a file URL from a block output value.
+
+        When users pass an entire block output (e.g. ``{{ block_8_output }}``) as the
+        ``file_url``, the resolved value may be a dict or a string representation of a
+        dict that contains a ``downloaded_files`` list.  This helper unwraps that
+        structure and returns the URL of the first downloaded file.
+
+        Handles three forms:
+        - dict with a ``downloaded_files`` list
+        - JSON string encoding such a dict
+        - Python dict-repr string produced by Jinja's default ``str()`` rendering
+        """
+        if isinstance(value, dict):
+            downloaded_files = value.get("downloaded_files")
+            if isinstance(downloaded_files, list) and downloaded_files:
+                first_file = downloaded_files[0]
+                if isinstance(first_file, dict):
+                    return first_file.get("url") or None
+            return None
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            try:
+                parsed = ast.literal_eval(value)
+                if isinstance(parsed, dict):
+                    return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (ValueError, SyntaxError):
+                pass
+        return None
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5114,12 +5186,21 @@ class FileParserBlock(Block):
         ):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
-                LOG.info(
-                    "FileParserBlock File URL is parameterized, using parameter value",
-                    file_url_parameter_value=file_url_parameter_value,
-                    file_url_parameter_key=self.file_url,
-                )
-                self.file_url = file_url_parameter_value
+                extracted_url = self._extract_file_url_from_block_output(file_url_parameter_value)
+                if extracted_url:
+                    LOG.info(
+                        "FileParserBlock Extracted file URL from block output parameter",
+                        extracted_url=extracted_url,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = extracted_url
+                else:
+                    LOG.info(
+                        "FileParserBlock File URL is parameterized, using parameter value",
+                        file_url_parameter_value=file_url_parameter_value,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = file_url_parameter_value
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -5131,6 +5212,18 @@ class FileParserBlock(Block):
                 organization_id,
                 f"Failed to format jinja template: {str(e)}",
             )
+
+        # After Jinja rendering, self.file_url may be a stringified block output
+        # (e.g. when the user wrote ``{{ block_8_output }}``). Try to extract the
+        # file URL from it before attempting the download.
+        extracted_url = self._extract_file_url_from_block_output(self.file_url)
+        if extracted_url:
+            LOG.info(
+                "FileParserBlock Extracted file URL from rendered block output",
+                extracted_url=extracted_url,
+                rendered_value=self.file_url,
+            )
+            self.file_url = extracted_url
 
         try:
             # Download the file.
@@ -7499,6 +7592,21 @@ async def _evaluate_prompt_branch_conditions_batch(
             raise ValueError(f"Unexpected output format: {type(output_value)}")
 
         raw_evaluations = _find_evaluations_array(output_value)
+
+        # LLM sometimes splits compound criteria into per-clause sub-evaluations, emitting
+        # reasoning=None placeholder entries for each. Strip them and recover if the remainder
+        # matches len(branches); otherwise fall through to the existing hard-fail.
+        if len(raw_evaluations) > len(branches):
+            well_formed = [e for e in raw_evaluations if not (isinstance(e, dict) and e.get("reasoning") is None)]
+            if len(well_formed) == len(branches):
+                LOG.warning(
+                    "LLM returned extra placeholder evaluations; using well-formed subset",
+                    block_label=log_label,
+                    total_returned=len(raw_evaluations),
+                    well_formed_count=len(well_formed),
+                    num_branches=len(branches),
+                )
+                raw_evaluations = well_formed
 
         for idx, evaluation in enumerate(raw_evaluations):
             bool_result, rendered_expr = _parse_single_evaluation(

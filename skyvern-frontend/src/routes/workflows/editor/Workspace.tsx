@@ -41,7 +41,8 @@ import { useBrowserSessionRateLimit } from "../hooks/useBrowserSessionRateLimit"
 import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
-import { browserStreamingMode } from "@/util/env";
+import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
+import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
@@ -118,6 +119,7 @@ import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowSchedulePanel } from "./panels/schedulePanel/WorkflowSchedulePanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
 import { WorkflowSettings } from "../types/workflowTypes";
+import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
@@ -280,6 +282,7 @@ function Workspace({
   const saveWorkflow = useWorkflowSave({ status: "published" });
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
+  const { browserStreamingMode } = useBrowserStreamingMode();
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
@@ -1107,21 +1110,9 @@ function Workspace({
     }
 
     const editedEdges = previous
-      ? edges.filter((edge) => {
-          // Don't remove edges from the previous node
-          if (edge.source !== previous) {
-            return true;
-          }
-          // If we're in a branch, only remove the edge for this branch
-          if (branch) {
-            const edgeData = edge.data as
-              | { conditionalBranchId?: string }
-              | undefined;
-            return edgeData?.conditionalBranchId !== branch.branchId;
-          }
-          // Otherwise remove all edges from previous
-          return false;
-        })
+      ? edges.filter((edge) =>
+          shouldKeepExistingEdgeForInsertion(edge, { branch, next, previous }),
+        )
       : edges;
 
     const previousNode = nodes.find((node) => node.id === previous);
@@ -1247,9 +1238,6 @@ function Workspace({
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
-      cdpConnectHeaders: workflowData.cdp_connect_headers
-        ? JSON.stringify(workflowData.cdp_connect_headers)
-        : null,
       runWith: workflowData.run_with ?? "agent",
       codeVersion: workflowData.code_version ?? null,
       scriptCacheKey: workflowData.cache_key ?? null,
@@ -1310,9 +1298,6 @@ function Workspace({
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
-        : null,
-      cdpConnectHeaders: selectedVersion.cdp_connect_headers
-        ? JSON.stringify(selectedVersion.cdp_connect_headers)
         : null,
       runWith: selectedVersion.run_with ?? "agent",
       codeVersion: selectedVersion.code_version ?? null,
@@ -1874,6 +1859,7 @@ function Workspace({
                       />
                       <div className="flex items-center gap-2">
                         <GlobeIcon /> Live Browser
+                        <StreamModeBadge mode="vnc" />
                       </div>
                       {showBreakoutButton && (
                         <BreakoutButton onClick={() => breakout()} />
@@ -1899,7 +1885,7 @@ function Workspace({
                   </div>
                 )}
 
-                {/* CDP screencast: only in local mode when VNC is not supported */}
+                {/* Local browser stream: only in local mode when VNC is not supported */}
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported &&
                   browserStreamingMode === "cdp" && (
@@ -1925,6 +1911,7 @@ function Workspace({
                         />
                         <div className="flex items-center gap-2">
                           <GlobeIcon /> Live Browser
+                          <StreamModeBadge mode="cdp" />
                         </div>
                         <div
                           className={cn("ml-auto flex items-center gap-2", {
@@ -2117,9 +2104,6 @@ function Workspace({
               webhook_callback_url: saveData.settings.webhookCallbackUrl,
               extra_http_headers: saveData.settings.extraHttpHeaders
                 ? JSON.parse(saveData.settings.extraHttpHeaders)
-                : null,
-              cdp_connect_headers: saveData.settings.cdpConnectHeaders
-                ? JSON.parse(saveData.settings.cdpConnectHeaders)
                 : null,
               persist_browser_session: saveData.settings.persistBrowserSession,
               model: saveData.settings.model,

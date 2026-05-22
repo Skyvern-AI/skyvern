@@ -120,7 +120,6 @@ type Props = {
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
     browserProfileId: string | null;
-    cdpConnectHeaders: Record<string, string> | null;
     runWith: string | null;
   };
 };
@@ -192,7 +191,6 @@ type RunWorkflowRequestBody = {
   browser_profile_id?: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
-  cdp_connect_headers?: Record<string, string> | null;
   browser_address?: string | null;
   run_with?: "agent" | "code";
   ai_fallback?: boolean;
@@ -210,7 +208,6 @@ function getRunWorkflowRequestBody(
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
-    cdpConnectHeaders,
     runWith,
     aiFallback,
     ...parameters
@@ -248,16 +245,6 @@ function getRunWorkflowRequestBody(
     } catch (e) {
       console.error("Invalid extra Header JSON");
       body.extra_http_headers = null;
-    }
-  }
-
-  if (cdpConnectHeaders) {
-    try {
-      body.cdp_connect_headers = JSON.parse(cdpConnectHeaders);
-    } catch {
-      throw new Error(
-        'Invalid CDP Connect Headers: value must be valid JSON (e.g., {"x-api-key": "..."}).',
-      );
     }
   }
 
@@ -304,7 +291,6 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  cdpConnectHeaders: string | null;
   runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
@@ -349,9 +335,6 @@ function RunWorkflowForm({
       maxScreenshotScrolls: initialSettings.maxScreenshotScrolls,
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
-        : null,
-      cdpConnectHeaders: initialSettings.cdpConnectHeaders
-        ? JSON.stringify(initialSettings.cdpConnectHeaders)
         : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
@@ -462,9 +445,6 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
-      cdpConnectHeaders: initialSettings.cdpConnectHeaders
-        ? JSON.stringify(initialSettings.cdpConnectHeaders)
-        : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     });
@@ -497,7 +477,6 @@ function RunWorkflowForm({
       browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
-      cdpConnectHeaders,
       cdpAddress,
       runWith,
       aiFallback,
@@ -516,7 +495,6 @@ function RunWorkflowForm({
       browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
-      cdpConnectHeaders,
       cdpAddress,
       runWith,
       aiFallback,
@@ -531,7 +509,6 @@ function RunWorkflowForm({
       "browserProfileId",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
-      "cdpConnectHeaders",
       "cdpAddress",
       "runWith",
     ]);
@@ -1134,42 +1111,6 @@ function RunWorkflowForm({
                                 <h2 className="text-sm text-slate-400">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
-                                </h2>
-                              </div>
-                            </FormLabel>
-                            <div className="w-full space-y-2">
-                              <FormControl>
-                                <KeyValueInput
-                                  value={field.value ?? ""}
-                                  onChange={(val) => field.onChange(val)}
-                                  addButtonText="Add Header"
-                                />
-                              </FormControl>
-                              <FormMessage />
-                            </div>
-                          </div>
-                        </FormItem>
-                      );
-                    }}
-                  />
-                  <FormField
-                    key="cdpConnectHeaders"
-                    control={form.control}
-                    name="cdpConnectHeaders"
-                    render={({ field }) => {
-                      return (
-                        <FormItem>
-                          <div className="flex gap-16">
-                            <FormLabel>
-                              <div className="w-72">
-                                <div className="flex items-center gap-2 text-lg">
-                                  CDP Connect Headers
-                                </div>
-                                <h2 className="text-sm text-slate-400">
-                                  Headers attached only to the CDP WebSocket
-                                  handshake when connecting to a remote browser
-                                  (e.g. auth for the CDP endpoint). Not
-                                  forwarded to target sites.
                                 </h2>
                               </div>
                             </FormLabel>

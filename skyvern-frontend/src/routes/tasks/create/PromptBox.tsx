@@ -126,13 +126,22 @@ function deriveHandoffTitle(prompt: string): string {
   return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
-function buildBlankWorkflowRequest(title: string): WorkflowCreateYAMLRequest {
+function runWithFromSelector(
+  legacyVersion: "v1" | "v2" | "v2-code",
+): "agent" | "code" {
+  return legacyVersion === "v2-code" ? "code" : "agent";
+}
+
+function buildBlankWorkflowRequest(
+  title: string,
+  runWith: "agent" | "code" = "agent",
+): WorkflowCreateYAMLRequest {
   return {
     title,
     description: "",
     ai_fallback: true,
     code_version: 2,
-    run_with: "code",
+    run_with: runWith,
     workflow_definition: {
       version: 2,
       blocks: [],
@@ -144,9 +153,7 @@ function buildBlankWorkflowRequest(title: string): WorkflowCreateYAMLRequest {
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">(
-    "v2-code",
-  ); // v2-code is the default
+  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">("v2"); // v2 (agent) is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -191,7 +198,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
-        run_with: "code",
+        run_with: version === "v2-code" ? "code" : "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema
           ? (() => {
@@ -267,10 +274,16 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   });
 
   const handoffWorkflowMutation = useMutation({
-    mutationFn: async ({ prompt }: { prompt: string }) => {
+    mutationFn: async ({
+      prompt,
+      runWith,
+    }: {
+      prompt: string;
+      runWith: "agent" | "code";
+    }) => {
       const client = await getClient(credentialGetter);
       const yaml = convertToYAML(
-        buildBlankWorkflowRequest(deriveHandoffTitle(prompt)),
+        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
       );
       const result = await client.post<string, { data: WorkflowApiResponse }>(
         "/workflows",
@@ -316,8 +329,9 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       return;
     }
     submitInFlightRef.current = true;
+    const runWith = runWithFromSelector(legacyVersion);
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt });
+      handoffWorkflowMutation.mutate({ prompt, runWith });
       return;
     }
     generateWorkflowMutation.mutate({ prompt, version: legacyVersion });

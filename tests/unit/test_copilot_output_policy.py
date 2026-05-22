@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
+    normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
@@ -89,6 +90,90 @@ def test_rejects_raw_secret_echo_in_user_response() -> None:
 
 
 @pytest.mark.parametrize(
+    ("response_type", "user_response", "expected_type", "expected_response"),
+    [
+        ("REPLY", "ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "  ASK_QUESTION\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ASK_QUESTION Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "ask_question\nWhich account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "Ask_Question Which account should I use?", "ASK_QUESTION", "Which account should I use?"),
+        ("REPLY", "REPLY\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "reply\nI can help with that.", "REPLY", "I can help with that."),
+        ("REPLY", "REPLACE_WORKFLOW\nI updated the workflow.", "REPLY", "I updated the workflow."),
+        ("REPLY", "REPLACE_WORKFLOW I updated the workflow.", "REPLY", "I updated the workflow."),
+        (
+            "REPLACE_WORKFLOW",
+            "REPLACE_WORKFLOW\nI updated the workflow.",
+            "REPLACE_WORKFLOW",
+            "I updated the workflow.",
+        ),
+    ],
+)
+def test_normalizes_plain_internal_response_label_scaffolding(
+    response_type: str,
+    user_response: str,
+    expected_type: str,
+    expected_response: str,
+) -> None:
+    normalized = normalize_response_scaffolding(response_type, user_response)
+
+    assert normalized.changed
+    assert normalized.response_type == expected_type
+    assert normalized.user_response == expected_response
+
+
+def test_normalize_scaffolding_preserves_ordinary_reply_sentence() -> None:
+    text = "Reply with the invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+def test_normalize_scaffolding_preserves_wrapped_ordinary_reply_sentence() -> None:
+    text = "Reply with\nthe invoice number from the page."
+    normalized = normalize_response_scaffolding("REPLY", text)
+
+    assert not normalized.changed
+    assert normalized.response_type == "REPLY"
+    assert normalized.user_response == text
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Next step: call get_run_results with this workflow_run_id.",
+        'Call `get_run_results(workflow_run_id="wr_123")` first, then await user input.',
+        "Then call update_and_run_blocks with a smaller chain.",
+        "Do NOT retry this tool call; wait for the current run result.",
+        "Do NOT re-invoke the tool until the user responds.",
+    ],
+)
+def test_rejects_internal_tool_instruction_leak_in_user_response(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
+
+
+def test_allows_benign_do_not_retry_user_guidance() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response="Do not retry until the account lockout clears.",
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK not in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
     "user_response",
     [
         "I used hunter2 as the password.",
@@ -122,6 +207,30 @@ def test_rejects_raw_secret_in_structured_tool_arguments() -> None:
 
     assert not verdict.allowed
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+def test_rejects_bulk_colon_delimited_credentials_in_tool_arguments() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        tool_arguments={
+            "parameters": {"account_list": "alpha@example.test:FakePass123!\nbeta@example.test:AnotherFakePass456!"}
+        },
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+
+def test_allows_scp_style_paths_and_url_ports_in_tool_arguments() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        tool_arguments={
+            "repository": "git@github.com:skyvern-ai/skyvern.git",
+            "local_url": "https://qa.user@example.test:8080?org=1",
+        },
+    )
+
+    assert verdict.allowed
 
 
 def test_does_not_hard_block_on_prior_global_context_secret() -> None:
@@ -177,6 +286,51 @@ def test_classifies_unbacked_workflow_delivery_claim() -> None:
     assert not verdict.allowed
     assert OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in verdict.reason_codes
     assert OutputPolicyReason.MISSING_PROPOSAL_STATE in verdict.reason_codes
+
+
+def test_flags_block_yaml_pasted_into_user_response() -> None:
+    user_response = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form using the supplied data.\n"
+        '      url: "{{ form_url }}"\n'
+        "      parameter_keys:\n"
+        "        - name\n"
+        "        - email\n"
+        "        - form_url\n"
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+        has_workflow_proposal=False,
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in verdict.reason_codes
+
+
+def test_block_yaml_in_reply_is_not_hard_blocking() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response=(
+            "Here is the change I'd make:\n\n"
+            "```yaml\n"
+            "block_type: navigation\n"
+            "navigation_goal: Submit the form.\n"
+            "label: submit_form\n"
+            "```\n"
+        ),
+        has_workflow_proposal=False,
+    )
+
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in verdict.reason_codes
+    hard = hard_block_output_policy_verdict(verdict)
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY not in hard.reason_codes
 
 
 def test_allows_workflow_delivery_language_after_failed_workflow_attempt() -> None:
@@ -241,6 +395,97 @@ def test_allows_backend_authored_request_policy_clarification() -> None:
 
     assert verdict.allowed
     assert verdict.output_kind == CopilotOutputKind.CLARIFICATION_REQUEST
+
+
+def test_rejects_deprecated_block_taxonomy_in_final_text() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "`task_v2` is deprecated. Use these newer block types instead: "
+            "`navigation`, `extraction`, `validation`, `login`, `goto_url`, and `file_download`."
+        ),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize("deprecated_identifier", ["task_v2", "Task_V2", "task-v2", "task v2", "taskv2"])
+def test_rejects_deprecated_block_identifier_outside_informational_answer(deprecated_identifier: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+        user_response=f"The draft still contains `{deprecated_identifier}` from the older workflow.",
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+def test_rejects_informational_block_taxonomy_list_without_deprecated_name() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "Use these block types: navigation for page actions, extraction for data, validation for checks, "
+            "and goto_url for direct URLs."
+        ),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+def test_allows_two_internal_block_type_terms_in_informational_answer() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response="Use a navigation block for the page action and an extraction block for the final data.",
+    )
+
+    assert verdict.allowed
+
+
+def test_allows_generic_navigation_validation_extraction_prose() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "After login, the workflow uses navigation to reach the form, validation of the input, and "
+            "extraction of the resulting data."
+        ),
+    )
+
+    assert verdict.allowed
+
+
+def test_allows_taxonomy_terms_outside_informational_answer_without_deprecated_identifier() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+        user_response=(
+            "The draft includes navigation for page actions, extraction for data, validation for checks, "
+            "and goto_url for direct URLs."
+        ),
+    )
+
+    assert verdict.allowed
+
+
+def test_allows_single_task_block_reference_without_deprecated_identifier() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "For that page action, use a navigation step as the task block and describe what the browser should do."
+        ),
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
 
 
 def test_rejects_unapproved_credential_id_in_final_text() -> None:
@@ -452,7 +697,7 @@ async def test_sdk_request_policy_guardrail_trips_on_required_clarification() ->
 
 
 def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         _ctx(),
         {"type": "REPLY", "user_response": "I used password: hunter2."},
     )
@@ -460,6 +705,138 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     assert response_type == "REPLY"
     assert not verdict.allowed
     assert verdict.reason_codes == [OutputPolicyReason.RAW_SECRET_LEAK]
+    assert diagnostics == {
+        "raw_output_kind": "informational_answer",
+        "final_output_kind": "refusal",
+        "hard_block_reason_codes": ["raw_secret_leak"],
+        "soft_rewrite_reason_codes": [],
+        "raw_would_have_failed": True,
+        "contained_failure": True,
+        "final_output_policy_allowed": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_terms"),
+    [
+        (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
+        (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url")),
+    ],
+)
+def test_output_policy_credential_block_asks_for_credential_confirmation(
+    reason: OutputPolicyReason,
+    expected_terms: tuple[str, str],
+) -> None:
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        OutputPolicyVerdict(
+            reason_codes=[reason],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert result.clear_proposed_workflow is False
+    response = result.user_response.lower()
+    for term in expected_terms:
+        assert term in response
+    assert "I could not safely return" not in result.user_response
+
+
+def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+    ctx.workflow_persisted = True
+    ctx.last_test_ok = True
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.workflow_yaml == "title: Draft"
+    assert result.workflow_was_persisted is True
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_tested"
+    response = result.user_response.lower()
+    assert "chat reply" in response
+    assert "workflow draft" in response
+    assert "saved" in response
+
+
+def test_output_policy_specific_refusal_preserves_saved_draft_copy() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_untested"
+    assert "raw credentials or secrets" in result.user_response
+    assert "chat reply" in result.user_response
+    assert "workflow draft is still saved" in result.user_response
+
+
+def test_scheduling_credential_policy_block_does_not_use_safety_refusal() -> None:
+    scheduling_yaml = """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: planning_credentials
+      default_value: cred_unapproved
+  blocks:
+    - block_type: navigation
+      label: export_current_month_time_clock_csv
+      url: https://scheduler.example.test/zeitstempel
+      navigation_goal: Waehle den aktuellen Monat aus und exportiere die Zeitstempel CSV fuer Team A und Team B.
+      parameter_keys:
+        - planning_credentials
+    - block_type: navigation
+      label: compare_on_call_matrix
+      url: https://scheduler.example.test/matrix
+      navigation_goal: Vergleiche Matrix und Rufbereitschaft mit der CSV und melde Zeitueberschneidungen.
+      parameter_keys:
+        - planning_credentials
+"""
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response="Welche URL des Planungs-Tools soll ich verwenden?",
+        workflow_yaml=scheduling_yaml,
+        has_workflow_proposal=True,
+    )
+
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+    result = agent_module._build_output_policy_blocked_result(
+        _ctx(),
+        hard_block_output_policy_verdict(verdict),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert "credential" in result.user_response.lower()
+    assert "confirm" in result.user_response.lower()
+    assert "I could not safely return" not in result.user_response
 
 
 def test_sdk_output_guardrail_ignores_internal_context_credential_ids() -> None:
@@ -486,7 +863,7 @@ workflow_definition:
         - azure_credentials
 """
 
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         ctx,
         {
             "type": "REPLY",
@@ -498,6 +875,8 @@ workflow_definition:
     assert response_type == "REPLY"
     assert verdict.allowed
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+    assert diagnostics["raw_would_have_failed"] is False
+    assert diagnostics["contained_failure"] is False
 
 
 def test_sdk_output_guardrail_defers_raw_question_after_untested_draft() -> None:
@@ -528,7 +907,7 @@ workflow_definition:
         - azure_credentials
 """
 
-    verdict, response_type = agent_module._evaluate_copilot_final_output_policy(
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
         ctx,
         {
             "type": "ASK_QUESTION",
@@ -539,6 +918,8 @@ workflow_definition:
     assert response_type == "ASK_QUESTION"
     assert verdict.allowed
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+    assert diagnostics["raw_output_kind"] == "workflow_draft_proposal"
+    assert diagnostics["final_output_kind"] == "workflow_draft_proposal"
 
 
 def test_translation_surfaces_untested_draft_when_agent_asks_after_drafting() -> None:
@@ -687,7 +1068,8 @@ workflow_definition:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     process_mock.assert_not_called()
 
 
@@ -704,7 +1086,8 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     assert "hunter2" not in agent_result.user_response
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
 
@@ -722,6 +1105,142 @@ def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
 
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
     assert agent_result.updated_workflow is None
+
+
+def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
+    result = _fake_run_result(
+        {
+            "type": "REPLY",
+            "user_response": (
+                "`task_v2` is deprecated. Use these newer block types instead: "
+                "`navigation`, `extraction`, `validation`, `login`, `goto_url`, and `file_download`."
+            ),
+        }
+    )
+
+    with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
+        agent_result = agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+
+    assert "task_v2" not in agent_result.user_response
+    assert "`navigation`" not in agent_result.user_response
+    assert "`extraction`" not in agent_result.user_response
+    assert "Describe the page action" in agent_result.user_response
+    assert agent_result.response_type == "REPLY"
+    assert agent_result.updated_workflow is None
+    final_log = next(call for call in log_info.call_args_list if call.args[0] == "copilot output policy final verdict")
+    assert final_log.kwargs["allowed"] is True
+    assert final_log.kwargs["reason_codes"] == []
+    assert final_log.kwargs["raw_output_kind"] == "informational_answer"
+    assert final_log.kwargs["final_output_kind"] == "informational_answer"
+    assert final_log.kwargs["hard_block_reason_codes"] == []
+    assert final_log.kwargs["soft_rewrite_reason_codes"] == ["internal_block_taxonomy_leak"]
+    assert final_log.kwargs["raw_would_have_failed"] is True
+    assert final_log.kwargs["contained_failure"] is True
+    assert agent_result.output_policy_diagnostics == {
+        "raw_output_kind": "informational_answer",
+        "final_output_kind": "informational_answer",
+        "hard_block_reason_codes": [],
+        "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
+        "raw_would_have_failed": True,
+        "contained_failure": True,
+        "final_output_policy_allowed": True,
+    }
+
+
+def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:
+    result = _fake_run_result(
+        {
+            "type": "REPLY",
+            "user_response": "I've drafted a workflow for you using `task_v2`.",
+        }
+    )
+
+    agent_result = agent_module._translate_to_agent_result(
+        result,
+        _ctx(),
+        global_llm_context=None,
+        chat_request=_chat_request(),
+        organization_id="org-1",
+    )
+
+    assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+    assert "task_v2" not in agent_result.user_response
+    assert agent_result.updated_workflow is None
+
+
+def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None:
+    leak = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form.\n"
+        '      url: "{{ form_url }}"\n'
+        "      parameter_keys:\n"
+        "        - name\n"
+        "        - form_url\n"
+    )
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
+        agent_result = agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+
+    assert "block_type" not in agent_result.user_response
+    assert "navigation_goal" not in agent_result.user_response
+    assert "parameter_keys" not in agent_result.user_response
+    assert "haven't applied it yet" in agent_result.user_response
+    assert agent_result.updated_workflow is None
+    final_log = next(call for call in log_info.call_args_list if call.args[0] == "copilot output policy final verdict")
+    assert final_log.kwargs["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
+    assert final_log.kwargs["contained_failure"] is True
+    assert agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
+    assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is True
+
+
+def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() -> None:
+    leak = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form.\n"
+        "      parameter_keys:\n"
+        "        - form_url\n"
+    )
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    workflow = SimpleNamespace(name="draft")
+    ctx = _ctx()
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = _workflow_yaml()
+    ctx.last_test_ok = True
+
+    agent_result = agent_module._translate_to_agent_result(
+        result,
+        ctx,
+        global_llm_context=None,
+        chat_request=_chat_request(),
+        organization_id="org-1",
+    )
+
+    assert "block_type" not in agent_result.user_response
+    assert "navigation_goal" not in agent_result.user_response
+    assert "parameter_keys" not in agent_result.user_response
+    assert "haven't applied it yet" not in agent_result.user_response
+    assert "made the change" in agent_result.user_response
+    assert agent_result.updated_workflow is workflow
 
 
 def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:

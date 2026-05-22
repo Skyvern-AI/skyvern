@@ -10,7 +10,12 @@ import structlog
 
 from skyvern.constants import MAX_IMAGE_MESSAGES
 from skyvern.forge.sdk.api.llm import commentjson
-from skyvern.forge.sdk.api.llm.exceptions import EmptyLLMResponseError, InvalidLLMResponseFormat, InvalidLLMResponseType
+from skyvern.forge.sdk.api.llm.exceptions import (
+    EmptyLLMResponseError,
+    InvalidLLMResponseFormat,
+    InvalidLLMResponseType,
+    LLMOutputTruncatedError,
+)
 
 LOG = structlog.get_logger()
 
@@ -175,12 +180,41 @@ def _coerce_response_to_dict(response: Any) -> dict[str, Any]:
     raise InvalidLLMResponseType(type(response).__name__)
 
 
+def is_truncated_response(response: litellm.ModelResponse) -> bool:
+    if not response.choices:
+        return False
+    choice = response.choices[0]
+    return (
+        getattr(choice, "finish_reason", None) == "length"
+        and getattr(getattr(choice, "message", None), "content", None) is None
+    )
+
+
 def parse_api_response(
     response: litellm.ModelResponse, add_assistant_prefix: bool = False, force_dict: bool = True
 ) -> dict[str, Any] | Any:
+    if is_truncated_response(response):
+        usage = response.usage if hasattr(response, "usage") and response.usage else None
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+        detail = getattr(usage, "completion_tokens_details", None) if usage else None
+        reasoning_tokens = (getattr(detail, "reasoning_tokens", 0) or 0) if detail else 0
+        raise LLMOutputTruncatedError(
+            model=response.model or "unknown",
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
+
     content = None
     try:
         content = response.choices[0].message.content
+        if content is not None and response.choices and getattr(response.choices[0], "finish_reason", None) == "length":
+            LOG.warning(
+                "LLM response has finish_reason=length with partial content — output may be incomplete",
+                model=response.model,
+            )
+
         # Since we prefilled Anthropic response with "{" we need to add it back to the response to have a valid json object:
         if add_assistant_prefix:
             content = "{" + content

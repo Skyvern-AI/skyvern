@@ -19,7 +19,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
-          ignore-checks: auto-merge
+          ignore-checks: auto-merge, Mintlify Deployment
           allowed-conclusions: success, skipped, neutral
       - name: Set token for author
         id: set-token

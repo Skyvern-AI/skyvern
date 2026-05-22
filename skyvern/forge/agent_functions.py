@@ -245,7 +245,7 @@ async def _convert_svg_to_string(
                 break
             except LLMProviderError:
                 LOG.info(
-                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
                     exc_info=True,
                     element_id=element_id,
                     key=svg_key,
@@ -254,7 +254,8 @@ async def _convert_svg_to_string(
                 if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                await asyncio.sleep(3)
+                else:
+                    await asyncio.sleep(0.5 * (2**retry))
             except asyncio.TimeoutError:
                 LOG.warning(
                     "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
@@ -265,7 +266,7 @@ async def _convert_svg_to_string(
                 return
             except Exception:
                 LOG.info(
-                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
                     exc_info=True,
                     element_id=element_id,
                     retry=retry,
@@ -273,7 +274,8 @@ async def _convert_svg_to_string(
                 if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                await asyncio.sleep(3)
+                else:
+                    await asyncio.sleep(0.5 * (2**retry))
         else:
             LOG.warning(
                 "Reaching the max try to convert svg element, going to drop the svg element.",
@@ -380,7 +382,7 @@ async def _convert_css_shape_to_string(
                     break
                 except LLMProviderError:
                     LOG.info(
-                        "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                        "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt.",
                         exc_info=True,
                         element_id=element_id,
                         retry=retry,
@@ -389,7 +391,6 @@ async def _convert_css_shape_to_string(
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                    await asyncio.sleep(3)
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
@@ -400,7 +401,7 @@ async def _convert_css_shape_to_string(
                     return None
                 except Exception:
                     LOG.info(
-                        "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                        "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt.",
                         exc_info=True,
                         element_id=element_id,
                         retry=retry,
@@ -409,7 +410,6 @@ async def _convert_css_shape_to_string(
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                    await asyncio.sleep(3)
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
@@ -534,6 +534,9 @@ class AgentFunction:
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
+
+    async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
+        """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
     async def validate_step_execution(
         self,
@@ -956,6 +959,7 @@ class AgentFunction:
             queue = []
             element_cnt = 0
             eligible_svgs = []  # List to store eligible SVGs and their frames
+            eligible_css_shapes = []  # List to store eligible CSS shapes for parallel conversion
 
             for element in element_tree:
                 queue.append(element)
@@ -984,18 +988,21 @@ class AgentFunction:
                     eligible_svgs.append((queue_ele, skyvern_frame))
 
                 if not disable_conversion and _should_css_shape_convert(element=queue_ele):
-                    await _convert_css_shape_to_string(
-                        skyvern_frame=skyvern_frame,
-                        element=queue_ele,
-                        task=task,
-                        step=step,
-                    )
+                    eligible_css_shapes.append((queue_ele, skyvern_frame))
 
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
                 # _remove_unique_id(queue_ele)
                 if "children" in queue_ele:
                     queue.extend(queue_ele["children"])
+
+            if eligible_css_shapes and task and step:
+                await asyncio.gather(
+                    *[
+                        _convert_css_shape_to_string(skyvern_frame=sf, element=elem, task=task, step=step)
+                        for elem, sf in eligible_css_shapes
+                    ]
+                )
 
             # SPEED OPTIMIZATION: Skip SVG conversion when using economy tree
             # Economy tree removes SVGs, so no point converting them

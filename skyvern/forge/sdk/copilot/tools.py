@@ -23,9 +23,13 @@ from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
+from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisRepairContract,
+    build_diagnosis_repair_contract,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_INTERMEDIATE_SUCCESS_NUDGE,
     PROBABLE_SITE_BLOCK_STREAK_STOP_AT,
@@ -60,10 +64,16 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     truncate_output,
 )
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_intent import (
+    NO_MUTATION_TURN_INTENT_MODES,
+    UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
+    TurnIntent,
+    TurnIntentMode,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -214,21 +224,35 @@ def _extract_credential_ids_from_tool_value(value: Any) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def _credential_parameter_slot_field(parameter: Any) -> str | None:
+    """Return the field name that legitimately carries a `cred_xxx` value for
+    this parameter dict, or None if the parameter is not a credential-binding
+    slot. Two shapes resolve a credential at runtime: a top-level or block-level
+    `parameter_type: credential` with the ID in `credential_id`, and a
+    `parameter_type: workflow` + `workflow_parameter_type: credential_id` with
+    the ID in `default_value`.
+    """
+    if not isinstance(parameter, dict):
+        return None
+    parameter_type = str(parameter.get("parameter_type") or "").lower()
+    if parameter_type == "credential":
+        return "credential_id"
+    workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+    if parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
+        return "default_value"
+    return None
+
+
 def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[str]:
     if not isinstance(parameters, list):
         return []
 
     found: list[str] = []
     for parameter in parameters:
-        if not isinstance(parameter, dict):
+        slot_field = _credential_parameter_slot_field(parameter)
+        if slot_field is None:
             continue
-
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type == "credential":
-            found.extend(_extract_credential_ids_from_tool_value(parameter.get("credential_id")))
-        elif parameter_type == "workflow" and workflow_parameter_type == WorkflowParameterType.CREDENTIAL_ID.value:
-            found.extend(_extract_credential_ids_from_tool_value(parameter.get("default_value")))
+        found.extend(_extract_credential_ids_from_tool_value(parameter.get(slot_field)))
 
     return list(dict.fromkeys(found))
 
@@ -252,19 +276,103 @@ def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -
     return _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
 
 
-def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
     if not workflow_yaml:
-        return []
+        return None
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
-        return []
+        return None
     if not isinstance(parsed, dict):
-        return []
+        return None
     workflow_definition = parsed.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
+        return None
+    return workflow_definition
+
+
+def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> list[str]:
+    workflow_definition = _parsed_workflow_definition(workflow_yaml)
+    if workflow_definition is None:
         return []
     return _extract_credential_ids_from_workflow_parameters(workflow_definition.get("parameters"))
+
+
+_MISBINDING_WORKFLOW_LOCATION = "workflow"
+
+
+def _credential_id_misbinding_findings(workflow_yaml: str | None) -> list[dict[str, str]]:
+    workflow_definition = _parsed_workflow_definition(workflow_yaml)
+    if workflow_definition is None:
+        return []
+
+    findings: list[dict[str, str]] = []
+
+    def _scan_value(value: Any, location: str, field: str) -> None:
+        if isinstance(value, str):
+            for credential_id in _CREDENTIAL_ID_RE.findall(value):
+                findings.append({"location": location, "field": field, "credential_id": credential_id})
+        elif isinstance(value, list):
+            for item in value:
+                _scan_value(item, location, field)
+        elif isinstance(value, dict):
+            for nested_field, nested_value in value.items():
+                _scan_value(nested_value, location, str(nested_field))
+
+    def _scan_parameter(parameter: Any, location: str) -> None:
+        if not isinstance(parameter, dict):
+            return
+        legal_slot_field = _credential_parameter_slot_field(parameter)
+        for field_name, field_value in parameter.items():
+            if field_name == legal_slot_field:
+                continue
+            _scan_value(field_value, location, str(field_name))
+
+    for parameter in workflow_definition.get("parameters") or []:
+        _scan_parameter(parameter, _MISBINDING_WORKFLOW_LOCATION)
+
+    for block in _iter_yaml_blocks(workflow_definition.get("blocks")):
+        label = str(block.get("label") or "<unlabeled>")
+        for field_name, field_value in block.items():
+            if field_name == "parameters":
+                if isinstance(field_value, list):
+                    for parameter in field_value:
+                        _scan_parameter(parameter, label)
+                continue
+            if field_name == "loop_blocks":
+                continue
+            _scan_value(field_value, label, str(field_name))
+
+    return findings
+
+
+def _credential_id_misbinding_error_message(findings: list[dict[str, str]]) -> str:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for finding in findings:
+        key = (finding["location"], finding["credential_id"])
+        grouped.setdefault(key, []).append(finding["field"])
+
+    location_lines: list[str] = []
+    for (location, credential_id), fields in grouped.items():
+        unique_fields = list(dict.fromkeys(fields))
+        joined = ", ".join(f"`{field}`" for field in unique_fields)
+        scope = "workflow parameter" if location == _MISBINDING_WORKFLOW_LOCATION else f"block `{location}`"
+        location_lines.append(f"- `{credential_id}` in {scope} field(s): {joined}")
+    body = "\n".join(location_lines)
+
+    return (
+        "A credential ID is sitting in workflow fields that do not resolve it, so at runtime the agent types "
+        "the literal ID into the page instead of the stored username/password:\n"
+        f"{body}\n"
+        "Fix BOTH halves before retrying:\n"
+        "1. Bind the credential once: add a `credential` parameter (or a `workflow` parameter with "
+        "`workflow_parameter_type: credential_id` and the ID in `default_value`) and reference its key from the "
+        "login block's `parameter_keys`.\n"
+        "2. Delete the credential ID string from every field listed above. `navigation_goal`, "
+        "`complete_criterion`, `terminate_criterion` and similar fields are plain-language instructions — they "
+        "must describe the outcome without naming the credential ID. Do NOT relocate the literal ID into another "
+        "prose or list field; only the credential parameter slot may hold it."
+    )
 
 
 def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) -> str:
@@ -673,6 +781,8 @@ async def _attach_failed_block_screenshots(
 
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
+WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
+ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
 
 
 def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
@@ -815,27 +925,181 @@ def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):
         return None
+    error: str | None = None
     if tool_name == "update_workflow" and not policy.allow_update_workflow:
-        return (
+        error = (
             "Request policy blocks workflow updates for the latest user message. "
             "Ask the user for safe stored credential metadata instead."
         )
-    if tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
+    elif tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
         if policy.testing_intent == "skip_test":
-            return "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
-        if policy.clarification_reason == "workflow_credential_inputs_unbound":
-            return (
+            error = "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+        elif policy.clarification_reason == "workflow_credential_inputs_unbound":
+            error = (
                 "Skipped test run: the existing workflow references credential parameters "
                 "whose keys point to workflow inputs that are not configured. REPLY to the user "
                 "with: 'I applied your requested change. I couldn't test the modified workflow "
                 "because I couldn't find the required credentials — please add them via the "
                 "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
             )
-        return (
-            "Request policy blocks block-running tools for the latest user message. "
-            "Ask the user for the required safe credential or clarification before testing."
+        else:
+            error = (
+                "Request policy blocks block-running tools for the latest user message. "
+                "Ask the user for the required safe credential or clarification before testing."
+            )
+    if error is not None:
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="request_policy",
+            blocked_tool=tool_name,
+            request_policy_allow_update_workflow=policy.allow_update_workflow,
+            request_policy_allow_run_blocks=policy.allow_run_blocks,
+            request_policy_testing_intent=policy.testing_intent,
+            request_policy_clarification_reason=policy.clarification_reason,
         )
+        return error
     return None
+
+
+def _request_policy_allows_credential_deferred_draft(ctx: AgentContext) -> bool:
+    policy = getattr(ctx, "request_policy", None)
+    return (
+        isinstance(policy, RequestPolicy)
+        and policy.allow_update_workflow
+        and not policy.allow_run_blocks
+        and policy.allow_missing_credentials_in_draft
+        and policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
+    )
+
+
+def _request_policy_allows_update_and_skip_run(ctx: AgentContext, tool_name: str) -> bool:
+    return tool_name == "update_and_run_blocks" and _request_policy_allows_credential_deferred_draft(ctx)
+
+
+def _turn_intent_has_edit_target(intent: TurnIntent) -> bool:
+    # Keep this aligned with TurnIntent target kinds that make an edit specific enough to mutate safely.
+    return any(
+        intent.target_entities.get(entity_type)
+        for entity_type in (
+            "workflow",
+            "block",
+            "run",
+            "proposed_workflow",
+            "latest_assistant_proposal",
+        )
+    )
+
+
+def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+    intent = getattr(ctx, "turn_intent", None)
+    if not isinstance(intent, TurnIntent):
+        return None
+
+    authority = intent.authority
+    unresolved_refs = intent.target_entities.get(UNRESOLVED_BLOCK_REF_TARGET_ENTITY, [])
+    if intent.mode == TurnIntentMode.EDIT and tool_name in WORKFLOW_MUTATION_TOOLS and unresolved_refs:
+        reason_code = "turn_intent_unresolved_edit_target"
+        labels = sorted(_workflow_yaml_blocks_by_label(getattr(ctx, "workflow_yaml", None)))
+        label_hint = ", ".join(labels[:8]) if labels else "no labeled blocks"
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="turn_intent",
+            turn_intent_mode=intent.mode.value,
+            turn_intent_target_entity_types=sorted(intent.target_entities),
+            turn_intent_unresolved_refs=unresolved_refs,
+            blocked_tool=tool_name,
+            safe_reason_code=reason_code,
+        )
+        return (
+            f"TurnIntent classified this turn as `edit`, but the latest user message references workflow/block "
+            f"identifier(s) that are not present in the current workflow: {', '.join(unresolved_refs)}. "
+            f"Current workflow labels include: {label_hint}. Ask the user which current block should change before "
+            f"mutating or running blocks. safe_reason_code={reason_code}."
+        )
+
+    if (
+        intent.mode == TurnIntentMode.EDIT
+        and tool_name in WORKFLOW_MUTATION_TOOLS
+        and not _turn_intent_has_edit_target(intent)
+    ):
+        reason_code = "turn_intent_missing_edit_target"
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="turn_intent",
+            turn_intent_mode=intent.mode.value,
+            turn_intent_target_entity_types=sorted(intent.target_entities),
+            blocked_tool=tool_name,
+            safe_reason_code=reason_code,
+        )
+        return (
+            f"TurnIntent classified this turn as `edit`, but could not identify a specific workflow edit target, "
+            f"so `{tool_name}` is not allowed. Ask the user which workflow/block should change before mutating. "
+            f"safe_reason_code={reason_code}."
+        )
+
+    blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
+    blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
+    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS
+    if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
+        return None
+    if not blocks_update and not blocks_run and not blocks_context_read:
+        return None
+
+    if intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_run:
+        reason_code = "turn_intent_no_mutation_run_blocked"
+    elif intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_update:
+        reason_code = "turn_intent_no_mutation_update_blocked"
+    elif blocks_update and blocks_run:
+        reason_code = "turn_intent_no_mutation_run_blocked"
+    elif blocks_update:
+        reason_code = "turn_intent_update_blocked"
+    elif blocks_context_read:
+        reason_code = "turn_intent_no_mutation_context_read_blocked"
+    else:
+        reason_code = "turn_intent_run_blocked"
+    LOG.info(
+        "copilot authority gate blocked tool",
+        authority_gate_layer="turn_intent",
+        turn_intent_mode=intent.mode.value,
+        turn_intent_target_entity_types=sorted(intent.target_entities),
+        turn_intent_may_update_workflow=authority.may_update_workflow,
+        turn_intent_may_run_blocks=authority.may_run_blocks,
+        blocked_tool=tool_name,
+        safe_reason_code=reason_code,
+    )
+    action = "ask the user" if authority.requires_user_input else "answer the user"
+    detail = f" Ask: {intent.missing_context_question}" if intent.missing_context_question else ""
+    if blocks_run and not blocks_update and authority.may_update_workflow:
+        return (
+            f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
+            f"to run browser blocks for the latest user message. Use `update_workflow` only and keep the draft "
+            f"unvalidated. safe_reason_code={reason_code}.{detail}"
+        )
+    return (
+        f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
+        "for the latest user message. Do not update workflow YAML or run browser blocks, and do not "
+        f"fetch additional run context with tools; {action} using the available context instead. "
+        f"safe_reason_code={reason_code}.{detail}"
+    )
+
+
+def _authority_tool_error(
+    ctx: AgentContext,
+    tool_name: str,
+    *,
+    ignore_request_policy_error: bool = False,
+) -> str | None:
+    turn_intent_error = _turn_intent_tool_error(ctx, tool_name)
+    request_policy_error = _request_policy_tool_error(ctx, tool_name)
+    if turn_intent_error is not None and request_policy_error is not None:
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="both",
+            blocked_tool=tool_name,
+        )
+    if request_policy_error is not None and not ignore_request_policy_error:
+        return request_policy_error
+    return turn_intent_error
 
 
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
@@ -919,9 +1183,9 @@ async def _update_workflow(
     *,
     allow_missing_credentials: bool | None = None,
 ) -> dict[str, Any]:
-    policy_error = _request_policy_tool_error(ctx, "update_workflow")
-    if policy_error is not None:
-        return {"ok": False, "error": policy_error}
+    authority_error = _authority_tool_error(ctx, "update_workflow")
+    if authority_error is not None:
+        return {"ok": False, "error": authority_error}
 
     workflow_yaml = params["workflow_yaml"]
     if allow_missing_credentials is None:
@@ -930,6 +1194,16 @@ async def _update_workflow(
         credential_error = await _credential_reference_validation_error(workflow_yaml, ctx)
         if credential_error is not None:
             return {"ok": False, "error": credential_error}
+
+    misbinding_findings = _credential_id_misbinding_findings(workflow_yaml)
+    if misbinding_findings:
+        LOG.info(
+            "copilot credential id misbinding rejected",
+            organization_id=ctx.organization_id,
+            workflow_id=ctx.workflow_id,
+            findings=misbinding_findings,
+        )
+        return {"ok": False, "error": _credential_id_misbinding_error_message(misbinding_findings)}
 
     output_policy_verdict = evaluate_output_policy(
         request_policy=getattr(ctx, "request_policy", None),
@@ -1810,6 +2084,32 @@ async def _watchdog_error_message(
     return message
 
 
+def _watchdog_user_failure_reason(
+    exit_reason: WatchdogExitReason,
+    workflow_run_id: str,
+    budget_seconds: int,
+    run: WorkflowRun | None,
+) -> str:
+    if exit_reason == "stagnation":
+        body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    elif exit_reason == "per_tool_budget":
+        body = f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+    elif exit_reason == "ceiling":
+        body = f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
+    else:
+        status = f" Last observed status: {run.status}." if run is not None else ""
+        body = "The run ended before recording a trustworthy terminal status." + status
+    return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
+
+
+def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:
+    block_goal_main_goal = ctx.block_goal_main_goal or ctx.user_message or ""
+    if not block_goal_main_goal:
+        LOG.warning("run_blocks invoked without block-goal context; using persisted workflow goals unchanged")
+        return workflow
+    return wrap_workflow_block_goals(workflow, block_goal_main_goal)
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -1868,6 +2168,7 @@ async def _run_blocks_and_collect_debug(
         return {"ok": False, "error": "Organization not found"}
 
     organization = Organization.model_validate(org)
+    runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
 
     user_params: dict[str, Any] = params.get("parameters") or {}
     all_workflow_params, all_output_params = await asyncio.gather(
@@ -1959,6 +2260,7 @@ async def _run_blocks_and_collect_debug(
             browser_session_id=ctx.browser_session_id,
             block_labels=labels_to_execute,
             block_outputs=block_outputs_to_seed or None,
+            workflow_override=runtime_workflow,
         )
     )
 
@@ -2092,26 +2394,32 @@ async def _run_blocks_and_collect_debug(
             error_msg = await _watchdog_error_message(
                 exit_reason, ctx, workflow_run.workflow_run_id, run, budget_seconds
             )
-            result: dict[str, Any] = {"ok": False, "error": error_msg}
+            user_failure_reason = _watchdog_user_failure_reason(
+                exit_reason, workflow_run.workflow_run_id, budget_seconds, run
+            )
+            result: dict[str, Any] = {
+                "ok": False,
+                "error": error_msg,
+                "data": {
+                    "workflow_run_id": workflow_run.workflow_run_id,
+                    "overall_status": run.status if run is not None else None,
+                    "failure_reason": user_failure_reason,
+                },
+            }
             if exit_reason == "per_tool_budget":
                 # Stable failure_categories entry so consecutive budget trips
                 # hash to the same streak signature; without it the run_id in
                 # ``error_msg`` would make every trip unique.
-                result["data"] = {
-                    "workflow_run_id": workflow_run.workflow_run_id,
-                    "overall_status": run.status if run is not None else None,
-                    "failure_reason": error_msg,
-                    "failure_categories": [
-                        {
-                            "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
-                            "confidence_float": 1.0,
-                            "reasoning": (
-                                f"Per-tool-call budget of {budget_seconds}s exceeded; "
-                                "the run was making progress but cannot fit in a single tool call."
-                            ),
-                        }
-                    ],
-                }
+                result["data"]["failure_categories"] = [
+                    {
+                        "category": PER_TOOL_BUDGET_FAILURE_CATEGORY,
+                        "confidence_float": 1.0,
+                        "reasoning": (
+                            f"Per-tool-call budget of {budget_seconds}s exceeded; "
+                            "the run was making progress but cannot fit in a single tool call."
+                        ),
+                    }
+                ]
             if run_cancelled_by_watchdog:
                 result[_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY] = True
             return result
@@ -2320,9 +2628,13 @@ async def _fallback_page_info(ctx: AgentContext) -> tuple[str, str]:
     if not ctx.browser_session_id:
         return "", ""
     try:
-        from skyvern.cli.core.session_manager import get_page
-
-        page, _ = await get_page(session_id=ctx.browser_session_id)
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        if not browser_state:
+            return "", ""
+        page = await browser_state.get_or_create_page()
         if page:
             return page.url, await page.title()
     except Exception:
@@ -3685,9 +3997,41 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 if isinstance(block, dict) and block.get("failure_reason"):
                     copilot_ctx.last_test_failure_reason = str(block["failure_reason"])
                     break
+    if copilot_ctx.last_test_failure_reason is None:
+        copilot_ctx.last_test_failure_reason = next(iter_failure_reasons(result), None)
     if result.get("error") and copilot_ctx.last_test_failure_reason is None:
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
+
+
+def _record_diagnosis_repair_contract(
+    copilot_ctx: Any,
+    *,
+    source_tool: str,
+    result: dict[str, Any],
+    workflow_updated: bool = False,
+) -> DiagnosisRepairContract:
+    contract = build_diagnosis_repair_contract(
+        source_tool=source_tool,
+        result=result,
+        ctx=copilot_ctx,
+        workflow_updated=workflow_updated,
+    )
+    copilot_ctx.latest_diagnosis_repair_contract = contract
+    trace_data = contract.to_trace_data()
+    LOG.info(
+        "copilot diagnosis repair contract shadow",
+        **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
+    )
+    with copilot_span("diagnosis_repair_contract", data=trace_data):
+        pass
+    return contract
+
+
+def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
+    result = {"ok": False, "error": error}
+    _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
+    return json.dumps(result)
 
 
 @function_tool(
@@ -3701,6 +4045,11 @@ async def update_workflow_tool(
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
     Returns the validated workflow or validation errors.
+
+    Top-level workflow parameter keys appear in the run-input UI. When you
+    add runtime inputs in `workflow_definition.parameters`, name keys for the
+    reusable domain value the user supplies, not the page widget or action used
+    to enter it.
 
     If a `goto_url` URL encodes dynamic page state, do not wire it
     directly to extraction. Add a `code`, `validation`, or `navigation` block
@@ -3720,6 +4069,16 @@ async def update_workflow_tool(
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    if _request_policy_allows_credential_deferred_draft(copilot_ctx):
+        result = {
+            "ok": False,
+            "error": (
+                "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
+                "and skip the browser run with the required credential setup message."
+            ),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        return json.dumps(result)
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
@@ -3824,13 +4183,13 @@ async def run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
-    policy_error = _request_policy_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
-    if policy_error:
-        return json.dumps({"ok": False, "error": policy_error})
+    authority_error = _authority_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", authority_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "run_blocks_and_collect_debug", arguments)
     if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
 
     labels_to_execute, block_outputs_to_seed, frontier_start_label = await _frontier_plan_for_current_workflow(
         copilot_ctx, block_labels
@@ -3855,6 +4214,11 @@ async def run_blocks_tool(
         )
         _record_run_blocks_result(copilot_ctx, result)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
         enqueue_screenshot_from_result(copilot_ctx, result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
@@ -3880,6 +4244,9 @@ async def get_run_results_tool(
     loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "get_run_results")
+    if turn_intent_error:
+        return json.dumps({"ok": False, "error": turn_intent_error})
 
     result = await _get_run_results(params, copilot_ctx)
     _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)
@@ -3905,6 +4272,11 @@ async def update_and_run_blocks_tool(
     """Update the workflow YAML and immediately run the specified blocks in one step.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+
+    Top-level workflow parameter keys appear in the run-input UI. When you
+    add runtime inputs in `workflow_definition.parameters`, name keys for the
+    reusable domain value the user supplies, not the page widget or action used
+    to enter it.
 
     For diagnostic complaints, follow the system prompt's ASK-vs-EDIT routing.
     A complaint with no prior edit goal needs context inspection or
@@ -3939,45 +4311,39 @@ async def update_and_run_blocks_tool(
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
-    policy = getattr(copilot_ctx, "request_policy", None)
-    skip_run_after_update = (
-        isinstance(policy, RequestPolicy)
-        and policy.allow_update_workflow
-        and not policy.allow_run_blocks
-        and policy.clarification_reason == "workflow_credential_inputs_unbound"
+    skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
+    authority_error = _authority_tool_error(
+        copilot_ctx,
+        "update_and_run_blocks",
+        ignore_request_policy_error=skip_run_after_update,
     )
-    policy_error = _request_policy_tool_error(copilot_ctx, "update_and_run_blocks")
-    if not skip_run_after_update and policy_error:
-        return json.dumps({"ok": False, "error": policy_error})
+    if authority_error:
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", authority_error)
 
     loop_error = _tool_loop_error(copilot_ctx, "update_and_run_blocks", arguments)
     if loop_error:
-        return json.dumps({"ok": False, "error": loop_error})
+        return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
 
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
-
-    # Wrap each block's navigation_goal / complete_criterion / terminate_criterion
-    # with the effective "big goal" context so downstream LLMs (verifier,
-    # validation-block prompt) have user-intent framing — mirrors TaskV2.
-    block_goal_main_goal = copilot_ctx.block_goal_main_goal or copilot_ctx.user_message
-    if block_goal_main_goal:
-        workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
-    else:
-        LOG.warning("update_and_run_blocks invoked without block-goal context; skipping block-goal wrap")
 
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         update_result = await _update_workflow(
             {"workflow_yaml": workflow_yaml},
             copilot_ctx,
-            allow_missing_credentials=False,
+            allow_missing_credentials=skip_run_after_update,
         )
         _record_workflow_update_result(copilot_ctx, update_result)
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=update_result,
+        )
         sanitized = sanitize_tool_result_for_llm("update_workflow", update_result)
         return json.dumps(sanitized)
 
@@ -3993,13 +4359,19 @@ async def update_and_run_blocks_tool(
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=result,
+            workflow_updated=True,
+        )
         return json.dumps(result)
 
     if skip_run_after_update:
-        skip_message = policy_error or "Skipped test run: required credentials are not configured."
+        skip_message = "Skipped test run: required credentials are not configured."
         skip_result = {
-            "ok": False,
-            "error": skip_message,
+            "ok": True,
+            "message": skip_message,
             "data": {
                 "block_count": copilot_ctx.last_update_block_count,
                 "workflow_updated": True,
@@ -4008,6 +4380,12 @@ async def update_and_run_blocks_tool(
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, skip_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=skip_result,
+            workflow_updated=True,
+        )
         LOG.info(
             "update_and_run_blocks skipped run on unbound credential workflow inputs",
             workflow_permanent_id=copilot_ctx.workflow_permanent_id,
@@ -4061,6 +4439,12 @@ async def update_and_run_blocks_tool(
         )
         _record_run_blocks_result(copilot_ctx, run_result)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=run_result,
+            workflow_updated=True,
+        )
         enqueue_screenshot_from_result(copilot_ctx, run_result)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)

@@ -55,6 +55,20 @@ def test_workflow_create_yaml_request_accepts_browser_profile_id() -> None:
     assert request.browser_profile_id == "bp_abc123"
 
 
+def test_workflow_create_yaml_request_masks_cdp_connect_headers_on_dump() -> None:
+    request = WorkflowCreateYAMLRequest(
+        title="test",
+        workflow_definition=WorkflowDefinitionYAML(parameters=[], blocks=[]),
+        cdp_connect_headers={"x-api-key": "secret", "authorization": "Bearer secret"},
+    )
+
+    assert request.cdp_connect_headers == {"x-api-key": "secret", "authorization": "Bearer secret"}
+    assert request.model_dump()["cdp_connect_headers"] == {
+        "x-api-key": "***",
+        "authorization": "***",
+    }
+
+
 def _make_setup_service(workflow: SimpleNamespace) -> tuple[WorkflowService, SimpleNamespace, SimpleNamespace]:
     service = WorkflowService()
     workflow_run = SimpleNamespace(workflow_run_id="wr_test", workflow_permanent_id="wpid_test")

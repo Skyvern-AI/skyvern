@@ -131,6 +131,8 @@ class Action(BaseModel):
 
     # DecisiveAction (CompleteAction, TerminateAction) fields
     errors: list[UserDefinedError] | None = None
+    # Explicit signal that this action's user-defined errors should bypass step retry.
+    terminal_user_errors: bool = False
     data_extraction_goal: str | None = None
 
     # WebAction fields
@@ -360,6 +362,7 @@ class KeypressAction(Action):
     keys: list[str] = []
     hold: bool = False
     duration: int = 0
+    repeat: int = 1
 
 
 class GotoUrlAction(Action):

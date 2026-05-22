@@ -18,8 +18,8 @@ _BASE_KWARGS: dict[str, Any] = {
     "verification_code_check": False,
     "complete_criterion": None,
     "terminate_criterion": None,
-    "parse_select_feature_enabled": False,
-    "has_magic_link_page": False,
+    "show_close_page_action": False,
+    "open_tabs_context": None,
     "elements": "<html></html>",
 }
 

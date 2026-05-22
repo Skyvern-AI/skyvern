@@ -668,6 +668,40 @@ class TasksRepository(BaseRepository):
                 await session.execute(update_stmt)
                 await session.commit()
 
+    @db_operation("bulk_update_tasks_by_workflow_run_ids")
+    async def bulk_update_tasks_by_workflow_run_ids(
+        self,
+        workflow_run_ids: list[str],
+        new_status: TaskStatus,
+        only_if_status_in: list[TaskStatus],
+        failure_reason: str | None = None,
+    ) -> int:
+        """Cascade-update child tasks of the given workflow_runs.
+
+        The standalone-task cleanup cron skips rows with workflow_run_id set;
+        this method sweeps their children when a parent is finalized. Stamps
+        ``finished_at`` via COALESCE on terminal transitions. Returns row count.
+        """
+        if not workflow_run_ids or not only_if_status_in:
+            return 0
+
+        async with self.Session() as session:
+            update_values: dict[str, Any] = {"status": new_status.value}
+            if new_status.is_final():
+                update_values["finished_at"] = func.coalesce(TaskModel.finished_at, datetime.now(timezone.utc))
+            if failure_reason is not None:
+                update_values["failure_reason"] = failure_reason
+
+            update_stmt = (
+                update(TaskModel)
+                .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+                .where(TaskModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(update_stmt)
+            await session.commit()
+            return result.rowcount or 0
+
     @db_operation("get_tasks")
     async def get_tasks(
         self,

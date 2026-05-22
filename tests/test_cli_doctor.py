@@ -115,7 +115,7 @@ def test_local_streaming_mode_warns_when_frontend_is_vnc(
     result = doctor_module._check_local_streaming_mode()
 
     assert result.status == "warn"
-    assert "VITE_BROWSER_STREAMING_MODE should be cdp" in result.detail
+    assert "VITE_BROWSER_STREAMING_MODE: vnc -> cdp" in result.detail
 
 
 def test_fix_local_streaming_mode_writes_backend_and_frontend(
@@ -133,6 +133,26 @@ def test_fix_local_streaming_mode_writes_backend_and_frontend(
 
     assert "BROWSER_STREAMING_MODE=cdp" in (tmp_path / ".env").read_text()
     assert "VITE_BROWSER_STREAMING_MODE=cdp" in (frontend_dir / ".env").read_text()
+
+
+def test_normalize_api_root_strips_version_prefix() -> None:
+    assert doctor_module._normalize_api_root("http://localhost:8000/api/v1") == "http://localhost:8000"
+    assert doctor_module._normalize_api_root("http://localhost:8000/v1") == "http://localhost:8000"
+
+
+def test_streaming_smoke_test_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SKYVERN_API_KEY", raising=False)
+    monkeypatch.setattr(doctor_module, "_read_generated_credential", lambda: "")
+
+    result = doctor_module._streaming_smoke_test(
+        base_url="http://localhost:8000",
+        api_key=None,
+        browser_session_id=None,
+        timeout_seconds=5,
+    )
+
+    assert result.status == "error"
+    assert "No API key" in result.detail
 
 
 def test_compose_database_connection_can_satisfy_database_check(

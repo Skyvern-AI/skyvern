@@ -72,6 +72,11 @@ async def stream_to_sse(
     """
     from agents.stream_events import RunItemStreamEvent
 
+    from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotUnrecoverableToolError,
+        _maybe_raise_unrecoverable_tool_error,
+    )
+
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
     # raw stream events. Both TOOL_CALL and TOOL_RESULT for the same round
@@ -188,6 +193,12 @@ async def stream_to_sse(
                     schedule_narration(narrator_state, stream, iteration)
                 else:
                     _update_enforcement_from_tool(ctx, tool_name, parsed)
+
+                try:
+                    _maybe_raise_unrecoverable_tool_error(ctx, tool_name, parsed)
+                except CopilotUnrecoverableToolError:
+                    result.cancel()
+                    raise
                 iteration += 1
     except asyncio.CancelledError:
         # Real cancellation (server shutdown, upstream abort). Propagate so

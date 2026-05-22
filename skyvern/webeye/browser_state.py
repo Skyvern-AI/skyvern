@@ -16,6 +16,7 @@ class BrowserState(Protocol):
     browser_context: BrowserContext | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
+    allow_content_blocking_extensions: bool
     pw: Playwright
 
     async def check_and_fix_state(

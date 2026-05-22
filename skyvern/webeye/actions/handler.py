@@ -15,7 +15,7 @@ import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -85,6 +85,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -111,6 +112,13 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_MIME_TYPES,
+    MAX_FILE_SIZE_BYTES,
+    extract_filename,
+    is_download_response,
+    normalize_download_filename,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -119,6 +127,10 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
+from skyvern.webeye.transient_page_observer import (
+    TransientPageTextObserver,
+    match_user_defined_errors_from_transient_text,
+)
 from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -501,6 +513,105 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
+class ScopedXhrDownloadCapture:
+    """Install on a page before a download action; remove after the polling window.
+
+    Skipped when CDPDownloadInterceptor is active on the browser context
+    (detected via ``_skyvern_cdp_download_active`` flag) because the CDP path
+    already handles downloads at the Fetch domain level.
+
+    Automatically attaches to new pages opened during the action window
+    (e.g. target="_blank" links) so XHR responses on child tabs are captured.
+    """
+
+    def __init__(self, page: Page, download_dir: Path) -> None:
+        self._page = page
+        self._download_dir = download_dir
+        self._saved: set[str] = set()
+        self._extra_pages: list[Page] = []
+        self._active = False
+
+    def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
+        """Check if an XHR response carries a downloadable file body.
+
+        Reuses ``is_download_response`` for attachment cases. For inline
+        responses, additionally accepts download MIME + explicit filename
+        (the case ``is_download_response`` intentionally rejects for the
+        global CDP path to avoid false positives on PDF previews).
+        """
+        if is_download_response(headers, status, resource_type="XHR"):
+            return True
+        if status >= 400:
+            return False
+        content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        content_disposition = headers.get("content-disposition", "")
+        if content_type not in DOWNLOAD_MIME_TYPES:
+            return False
+        return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
+
+    async def _on_response(self, response: Response) -> None:
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            headers = response.headers
+            if not self._is_xhr_download(headers, response.status):
+                return
+            raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+            filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
+            if not filename or filename in self._saved:
+                return
+            content_length = headers.get("content-length", "")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_FILE_SIZE_BYTES:
+                        return
+                except ValueError:
+                    pass
+            save_path = self._download_dir / filename
+            body = await response.body()
+            if len(body) > MAX_FILE_SIZE_BYTES:
+                return
+            try:
+                with open(save_path, "xb") as f:
+                    f.write(body)
+            except FileExistsError:
+                pass
+            self._saved.add(filename)
+            LOG.info(
+                "XHR download captured during download action",
+                filename=filename,
+                size=len(body),
+            )
+        except Exception:
+            LOG.warning("Failed to capture XHR download response", exc_info=True)
+
+    def _on_new_page(self, page: Page) -> None:
+        if not self._active:
+            return
+        page.on("response", self._on_response)
+        self._extra_pages.append(page)
+
+    def enable(self) -> None:
+        if getattr(self._page.context, "_skyvern_cdp_download_active", False):
+            return
+        self._page.on("response", self._on_response)
+        self._page.context.on("page", self._on_new_page)
+        self._active = True
+
+    def disable(self) -> None:
+        if not self._active:
+            return
+        self._page.remove_listener("response", self._on_response)
+        self._page.context.remove_listener("page", self._on_new_page)
+        for page in self._extra_pages:
+            try:
+                page.remove_listener("response", self._on_response)
+            except Exception:
+                pass
+        self._extra_pages.clear()
+        self._active = False
+
+
 class ActionHandler:
     _handled_action_types: dict[
         ActionType,
@@ -614,9 +725,18 @@ class ActionHandler:
             download_dir=download_dir,
         )
 
+        xhr_capture = ScopedXhrDownloadCapture(page, download_dir)
         download_triggered = False
+        transient_text_observer = TransientPageTextObserver(
+            page,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
         page.on("download", _capture_download_event)
         try:
+            await transient_text_observer.start()
+            xhr_capture.enable()
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
                 results = await ActionHandler._handle_action(
@@ -628,6 +748,7 @@ class ActionHandler:
                 )
             if not results:
                 return results
+            await transient_text_observer.start()
             _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
             _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
@@ -647,6 +768,7 @@ class ActionHandler:
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
                 download_signal_poll_iterations: int | None = None
+                download_wait_matched_errors: list[UserDefinedError] = []
                 download_wait_started_at = time.monotonic()
 
                 def _record_download_signal(source: str) -> None:
@@ -742,6 +864,24 @@ class ActionHandler:
                                     download_event_fallback_failed = True
                                     break
                             elapsed_since_action = time.monotonic() - download_wait_started_at
+                            if not download_signal_observed:
+                                download_wait_matched_errors = match_user_defined_errors_from_transient_text(
+                                    task,
+                                    step,
+                                    transient_text_observer.events,
+                                )
+                                if download_wait_matched_errors:
+                                    action.errors = (action.errors or []) + download_wait_matched_errors
+                                    action.terminal_user_errors = True
+                                    LOG.warning(
+                                        "Stopping download wait after transient user-defined error text",
+                                        task_id=task.task_id,
+                                        step_id=step.step_id,
+                                        workflow_run_id=task.workflow_run_id,
+                                        error_codes=[error.error_code for error in download_wait_matched_errors],
+                                    )
+                                    break
+
                             if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
                                 LOG.warning(
                                     "No download signal observed after action",
@@ -773,9 +913,28 @@ class ActionHandler:
                     _dl_wait_span.set_attribute("download_event_fallback_attempted", download_event_fallback_attempted)
                     _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
                     _dl_wait_span.set_attribute("download_event_fallback_failed", download_event_fallback_failed)
+                    _dl_wait_span.set_attribute(
+                        "download_wait_observed_text_count",
+                        len(transient_text_observer.events),
+                    )
+                    _dl_wait_span.set_attribute(
+                        "download_wait_user_error_detected",
+                        bool(download_wait_matched_errors),
+                    )
+                    if download_wait_matched_errors:
+                        _dl_wait_span.set_attribute(
+                            "download_wait_user_error_codes",
+                            ",".join(error.error_code for error in download_wait_matched_errors),
+                        )
 
             if not download_triggered:
-                results[-1].download_triggered = False
+                if action.errors:
+                    results[-1] = ActionFailure(
+                        Exception("; ".join(error.reasoning for error in action.errors)),
+                        download_triggered=False,
+                    )
+                else:
+                    results[-1].download_triggered = False
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -810,6 +969,8 @@ class ActionHandler:
 
             return results
         finally:
+            await transient_text_observer.stop()
+            xhr_capture.disable()
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -2739,7 +2900,7 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration)
+    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
     return [ActionSuccess()]
 
 
@@ -3957,6 +4118,31 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
+    """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
+
+    A "new root" is a node whose ``id`` is in *new_ids* but whose parent is
+    not.  This avoids including the entire page tree when a new dropdown is
+    injected inside an existing container — only the dropdown subtree (and its
+    children, which may also be new) is returned.
+
+    For portal-style dropdowns (appended as a direct ``<body>`` child), this
+    behaves identically to a top-level filter.
+    """
+    result: list[dict] = []
+    for element in elements:
+        _collect_new_roots(element, new_ids, result)
+    return result
+
+
+def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> None:
+    if element.get("id") in new_ids:
+        out.append(element)
+        return
+    for child in element.get("children", []):
+        _collect_new_roots(child, new_ids, out)
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -3987,16 +4173,35 @@ async def select_from_emerging_elements(
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
-    # SKY-9718 Layer 1: custom-select threads `new_elements_ids` so Skyvern IDs
-    # stay (default html_need_skyvern_attrs=True). Gate lean on the PostHog flag.
-    # `lean_compress_long_href` stays OFF — the LLM reads option hrefs to pick
-    # the right select target.
-    _ctx = skyvern_context.current()
-    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
-    prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page_after_open,
-        prompt_engine=prompt_engine,
-        template_name="custom-select",
+    # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
+    # which gets truncated on large pages, losing portal-rendered dropdown items.
+    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    if new_element_subtrees:
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.enable_lean_element_tree:
+            new_element_subtrees = apply_lean_to_tree(
+                new_element_subtrees,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+            )
+        incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
+    else:
+        LOG.warning(
+            "No subtrees matched new element IDs; falling back to full element tree",
+            current_element_id=current_element_id,
+            new_element_id_count=len(new_element_ids),
+        )
+        incremental_html = scraped_page_after_open.build_element_tree(html_need_skyvern_attrs=True)
+    LOG.debug(
+        "Built HTML for emerging-element custom-select",
+        current_element_id=current_element_id,
+        new_interactable_count=len(new_interactable_element_ids),
+        subtree_count=len(new_element_subtrees),
+        html_length=len(incremental_html),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        "custom-select",
         is_date_related=options.is_date_related,
         field_information=options.field_information,
         required_field=options.required_field,
@@ -4004,10 +4209,8 @@ async def select_from_emerging_elements(
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=incremental_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        lean_compress_long_href=False,
-        lean_compress_image_src=lean_enabled,
-        lean_strip_url_query_strings=lean_enabled,
     )
     LOG.info("Calling LLM to find the match element")
 
@@ -4025,6 +4228,14 @@ async def select_from_emerging_elements(
     element_id: str | None = json_response.get("id", None)
     if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    new_ids_set = set(new_interactable_element_ids)
+    if element_id not in new_ids_set:
+        LOG.warning(
+            "custom-select returned element outside new_interactable_element_ids",
+            selected_element_id=element_id,
+            new_interactable_count=len(new_ids_set),
+        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
@@ -4575,7 +4786,7 @@ async def normal_select(
         step=step,
         skyvern_element=skyvern_element,
     )
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )
@@ -5301,7 +5512,7 @@ async def _get_input_or_select_context(
 
     json_response["intention"] = action.intention
     input_or_select_context = InputOrSelectContext.model_validate(json_response)
-    LOG.info(
+    LOG.debug(
         "Parsed input/select context",
         context=input_or_select_context,
     )

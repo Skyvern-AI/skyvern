@@ -89,6 +89,7 @@ export type ArtifactApiResponse = {
   artifact_type: ArtifactType;
   uri: string;
   signed_url?: string | null;
+  archived?: boolean;
   organization_id: string;
 };
 
@@ -162,6 +163,7 @@ export type TaskApiResponse = {
   extracted_information: Record<string, unknown> | string | null;
   screenshot_url: string | null;
   recording_url: string | null;
+  recording_archived?: boolean;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
@@ -584,6 +586,7 @@ export type WorkflowRunStatusApiResponse = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   recording_urls: Array<string> | null;
+  recording_archived?: boolean;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
@@ -591,6 +594,8 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
+  credits_used: number;
+  cached_credits_used: number;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
@@ -617,6 +622,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   screenshot_urls: Array<string> | null;
   recording_url: string | null;
   recording_urls: Array<string> | null;
+  recording_archived?: boolean;
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
@@ -624,6 +630,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
+  credits_used: number;
+  cached_credits_used: number;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;

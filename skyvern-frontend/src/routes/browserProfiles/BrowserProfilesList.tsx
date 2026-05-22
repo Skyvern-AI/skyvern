@@ -1,4 +1,4 @@
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { BookmarkIcon, ReloadIcon } from "@radix-ui/react-icons";
 import { useSearchParams } from "react-router-dom";
 
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import { useBrowserProfilesQuery } from "@/routes/workflows/hooks/useBrowserProf
 import { cn } from "@/util/utils";
 
 import { BrowserProfileItem } from "./BrowserProfileItem";
+import { CreateBrowserProfileButton } from "./CreateBrowserProfileButton";
 
 type Props = {
   searchKey?: string;
@@ -103,15 +104,23 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   if (pageItems.length === 0 && page === 1) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-slate-300">
         {hasSearch ? (
           <>No browser profiles match &ldquo;{searchKey}&rdquo;.</>
         ) : (
-          <>
-            No browser profiles yet. Profiles are created via the API/SDK, or
-            when a credential test or workflow run saves its persistent browser
-            session.
-          </>
+          <div className="flex flex-col items-center gap-4 text-center">
+            <BookmarkIcon className="size-10 text-slate-400" />
+            <div className="space-y-1">
+              <p className="text-base font-medium text-slate-100">
+                No browser profiles yet
+              </p>
+              <p className="mx-auto max-w-md text-sm text-slate-400">
+                Start a session, set up the logged-in state you want to capture,
+                then click &ldquo;Save Profile&rdquo; on the session page.
+              </p>
+            </div>
+            <CreateBrowserProfileButton size="lg" />
+          </div>
         )}
       </div>
     );

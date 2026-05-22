@@ -635,7 +635,6 @@ export type WorkflowApiResponse = {
   proxy_location: ProxyLocation | null;
   webhook_callback_url: string | null;
   extra_http_headers: Record<string, string> | null;
-  cdp_connect_headers: Record<string, string> | null;
   persist_browser_session: boolean;
   browser_profile_id?: string | null;
   model: WorkflowModel | null;
@@ -665,7 +664,6 @@ export type WorkflowSettings = {
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
-  cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'
   codeVersion: number | null;
   scriptCacheKey: string | null;

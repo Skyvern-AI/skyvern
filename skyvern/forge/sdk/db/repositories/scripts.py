@@ -822,14 +822,16 @@ class ScriptsRepository(BaseRepository):
         """Get latest script version linked to a workflow by a specific cache_key_value.
 
         Returns:
-            A tuple of (script, is_pinned). The repository implementation does not
-            support pinned queries, so is_pinned is always False.
+            A tuple of (script, is_pinned) where ``is_pinned`` is the
+            ``workflow_scripts.is_pinned`` flag on the row that resolved the
+            lookup. Callers (e.g. the script reviewer's pin check) rely on
+            this flag to decide whether to regenerate.
         """
         async with self.Session() as session:
             # Build the query: join workflow_scripts with scripts
-            # Join on both script_id and organization_id to leverage uc_org_script_version index
+            # Join on both script_id and organization_id to leverage uc_org_script_version index.
             query = (
-                select(ScriptModel)
+                select(ScriptModel, WorkflowScriptModel.is_pinned)
                 .join(
                     WorkflowScriptModel,
                     and_(
@@ -860,10 +862,19 @@ class ScriptsRepository(BaseRepository):
             if statuses is not None and len(statuses) > 0:
                 query = query.where(WorkflowScriptModel.status.in_(statuses))
 
-            query = query.order_by(ScriptModel.created_at.desc(), ScriptModel.version.desc()).limit(1)
+            # Prefer pinned workflow_scripts rows on ties — a stray un-pinned
+            # row for the same cache_key_value must not shadow an explicit pin.
+            query = query.order_by(
+                WorkflowScriptModel.is_pinned.desc(),
+                ScriptModel.created_at.desc(),
+                ScriptModel.version.desc(),
+            ).limit(1)
 
-            script = (await session.scalars(query)).first()
-            return (convert_to_script(script), False) if script else (None, False)
+            row = (await session.execute(query)).first()
+            if row is None:
+                return None, False
+            script_model, is_pinned = row
+            return convert_to_script(script_model), bool(is_pinned)
 
     @db_operation("get_workflow_cache_key_count")
     async def get_workflow_cache_key_count(

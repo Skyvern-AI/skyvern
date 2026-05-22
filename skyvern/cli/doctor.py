@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import traceback
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -711,7 +713,7 @@ def _validate_streaming_mode_value(value: str | None, source: str) -> list[str]:
 
 
 def _check_local_streaming_mode() -> CheckResult:
-    """Check that local self-hosted installs default to CDP livestreaming."""
+    """Check that local self-hosted installs default to local browser streaming."""
     from dotenv import dotenv_values
 
     from skyvern.utils.env_paths import resolve_backend_env_path
@@ -721,19 +723,26 @@ def _check_local_streaming_mode() -> CheckResult:
 
     backend_raw = dotenv_values(backend_env).get(BACKEND_STREAMING_MODE_VAR, "") if backend_env.exists() else ""
     frontend_raw = dotenv_values(frontend_env).get(FRONTEND_STREAMING_MODE_VAR, "") if frontend_env.exists() else ""
+    backend_mode = _normalize_streaming_mode(str(backend_raw or ""))
+    frontend_mode = _normalize_streaming_mode(str(frontend_raw or ""))
 
     problems: list[str] = []
     if backend_env.exists():
         problems.extend(_validate_streaming_mode_value(str(backend_raw or ""), "backend .env"))
-        if _normalize_streaming_mode(str(backend_raw or "")) != LOCAL_STREAMING_MODE:
-            problems.append(f"backend .env {BACKEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}")
+        if backend_mode != LOCAL_STREAMING_MODE:
+            problems.append(
+                f"backend .env {BACKEND_STREAMING_MODE_VAR}: {backend_mode or 'missing'} -> {LOCAL_STREAMING_MODE}"
+            )
     else:
         problems.append("backend .env is missing")
 
     if frontend_env.exists():
         problems.extend(_validate_streaming_mode_value(str(frontend_raw or ""), "skyvern-frontend/.env"))
-        if _normalize_streaming_mode(str(frontend_raw or "")) != LOCAL_STREAMING_MODE:
-            problems.append(f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR} should be {LOCAL_STREAMING_MODE}")
+        if frontend_mode != LOCAL_STREAMING_MODE:
+            problems.append(
+                f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR}: "
+                f"{frontend_mode or 'missing'} -> {LOCAL_STREAMING_MODE}"
+            )
     else:
         problems.append("skyvern-frontend/.env is missing")
 
@@ -742,14 +751,17 @@ def _check_local_streaming_mode() -> CheckResult:
             name="Local Streaming Mode",
             status="warn",
             detail="; ".join(problems),
-            hint="Run `skyvern doctor --fix` to enable CDP livestreaming for backend and UI",
+            hint="Run `skyvern doctor --fix` to enable local browser streaming for backend and UI",
         )
 
     if not _docker_compose_available():
         return CheckResult(
             name="Local Streaming Mode",
             status="ok",
-            detail="backend and frontend env files enable CDP livestreaming",
+            detail=(
+                f"backend .env {BACKEND_STREAMING_MODE_VAR}={backend_mode}; "
+                f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR}={frontend_mode}"
+            ),
         )
 
     container_problems: list[str] = []
@@ -794,13 +806,21 @@ def _check_local_streaming_mode() -> CheckResult:
         return CheckResult(
             name="Local Streaming Mode",
             status="ok",
-            detail="backend and frontend env files enable CDP livestreaming; running containers not checked",
+            detail=(
+                f"backend .env {BACKEND_STREAMING_MODE_VAR}={backend_mode}; "
+                f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR}={frontend_mode}; "
+                "running containers not checked"
+            ),
         )
 
     return CheckResult(
         name="Local Streaming Mode",
         status="ok",
-        detail="CDP livestreaming is enabled for backend, UI, and running containers",
+        detail=(
+            f"backend .env {BACKEND_STREAMING_MODE_VAR}={backend_mode}; "
+            f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR}={frontend_mode}; "
+            "running containers use local browser streaming"
+        ),
     )
 
 
@@ -1445,20 +1465,32 @@ def _ensure_frontend_env_exists() -> Path:
 
 
 def _fix_local_streaming_mode() -> bool:
-    """Enable local CDP livestreaming in backend and frontend env files."""
-    from dotenv import set_key
+    """Enable local browser streaming in backend and frontend env files."""
+    from dotenv import dotenv_values, set_key
 
     from skyvern.utils.env_paths import resolve_backend_env_path
 
     backend_env = resolve_backend_env_path()
+    backend_before = ""
+    if backend_env.exists():
+        backend_before = str(dotenv_values(backend_env).get(BACKEND_STREAMING_MODE_VAR) or "")
     if not backend_env.exists():
         backend_env.touch()
     set_key(str(backend_env), BACKEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
-    console.print(f"  [cyan]Set {BACKEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in backend .env[/cyan]")
+    console.print(
+        "  [cyan]Set "
+        f"backend .env {BACKEND_STREAMING_MODE_VAR}: "
+        f"{_normalize_streaming_mode(backend_before) or 'missing'} -> {LOCAL_STREAMING_MODE}[/cyan]"
+    )
 
     frontend_env = _ensure_frontend_env_exists()
+    frontend_before = str(dotenv_values(frontend_env).get(FRONTEND_STREAMING_MODE_VAR) or "")
     set_key(str(frontend_env), FRONTEND_STREAMING_MODE_VAR, LOCAL_STREAMING_MODE, quote_mode="never")
-    console.print(f"  [cyan]Set {FRONTEND_STREAMING_MODE_VAR}={LOCAL_STREAMING_MODE} in skyvern-frontend/.env[/cyan]")
+    console.print(
+        "  [cyan]Set "
+        f"skyvern-frontend/.env {FRONTEND_STREAMING_MODE_VAR}: "
+        f"{_normalize_streaming_mode(frontend_before) or 'missing'} -> {LOCAL_STREAMING_MODE}[/cyan]"
+    )
 
     if _docker_compose_available():
         return _recreate_docker_services(["skyvern", "skyvern-ui"])
@@ -1600,6 +1632,190 @@ def _recreate_docker_services(services: list[str]) -> bool:
     return False
 
 
+def _normalize_api_root(base_url: str | None) -> str:
+    raw = (base_url or "http://localhost:8000").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid base URL: {raw}")
+
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/v1", "/v1", "/api/v2", "/v2"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+
+
+def _api_v1_url(api_root: str, path: str) -> str:
+    return f"{api_root}/v1{path}"
+
+
+def _ws_v1_url(api_root: str, path: str, query: dict[str, str]) -> str:
+    parsed = urllib.parse.urlsplit(api_root)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    query_string = urllib.parse.urlencode(query)
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/v1{path}", query_string, ""))
+
+
+async def _wait_for_stream_frame(ws_url: str, timeout_seconds: int) -> str:
+    import websockets
+
+    async with websockets.connect(ws_url, open_timeout=min(timeout_seconds, 10)) as websocket:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_status = "connected"
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f"stream connected but no frame arrived; last status={last_status}")
+            raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            if not isinstance(raw, str):
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                last_status = raw[:120]
+                continue
+            if payload.get("screenshot"):
+                return str(payload.get("format") or "unknown")
+            last_status = str(payload.get("status") or payload)
+            if last_status in {"not_found", "timeout", "completed", "failed"}:
+                raise RuntimeError(f"stream ended before a frame arrived: {last_status}")
+
+
+async def _wait_for_cdp_input_ready(ws_url: str, timeout_seconds: int) -> None:
+    import websockets
+
+    async with websockets.connect(ws_url, open_timeout=min(timeout_seconds, 10)) as websocket:
+        raw = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
+        if not isinstance(raw, str):
+            raise RuntimeError("CDP input channel returned a non-text message")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"CDP input channel returned non-JSON: {raw[:120]}") from exc
+        if payload.get("kind") != "ready":
+            raise RuntimeError(f"CDP input channel did not become ready: {payload}")
+
+
+async def _streaming_smoke_test_async(
+    *,
+    base_url: str | None,
+    api_key: str,
+    browser_session_id: str | None,
+    timeout_seconds: int,
+) -> CheckResult:
+    api_root = _normalize_api_root(base_url)
+    headers = {"X-API-Key": api_key}
+    created_session = False
+    session_id = browser_session_id
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        runtime_response = await client.get(_api_v1_url(api_root, "/config/runtime"))
+        runtime_response.raise_for_status()
+        runtime_config = runtime_response.json()
+        streaming_mode = _normalize_streaming_mode(str(runtime_config.get("browser_streaming_mode") or ""))
+        if streaming_mode != LOCAL_STREAMING_MODE:
+            return CheckResult(
+                name="Streaming Smoke Test",
+                status="warn",
+                detail=f"backend reports {BACKEND_STREAMING_MODE_VAR}={streaming_mode or 'missing'}",
+                hint="Set BROWSER_STREAMING_MODE=cdp for local browser streaming smoke tests",
+            )
+
+        if not session_id:
+            create_response = await client.post(
+                _api_v1_url(api_root, "/browser_sessions"),
+                headers=headers,
+                json={"timeout": 5},
+            )
+            create_response.raise_for_status()
+            session_id = str(create_response.json().get("browser_session_id") or "")
+            created_session = True
+            if not session_id:
+                raise RuntimeError("browser session create response did not include browser_session_id")
+
+        try:
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            last_status = "created"
+            while True:
+                session_response = await client.get(
+                    _api_v1_url(api_root, f"/browser_sessions/{session_id}"),
+                    headers=headers,
+                )
+                session_response.raise_for_status()
+                session = session_response.json()
+                last_status = str(session.get("status") or "unknown")
+                if last_status == "running" or session.get("started_at") or session.get("browser_address"):
+                    break
+                if last_status in {"completed", "failed", "terminated"}:
+                    raise RuntimeError(f"browser session finalized before streaming: {last_status}")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(f"browser session did not start; last status={last_status}")
+                await asyncio.sleep(1)
+
+            auth_query = {"apikey": api_key}
+            frame_format = await _wait_for_stream_frame(
+                _ws_v1_url(api_root, f"/stream/browser_sessions/{session_id}", auth_query),
+                timeout_seconds=timeout_seconds,
+            )
+            input_query = {
+                "apikey": api_key,
+                "client_id": f"doctor-smoke-{secrets.token_hex(4)}",
+            }
+            await _wait_for_cdp_input_ready(
+                _ws_v1_url(api_root, f"/stream/cdp_input/browser_session/{session_id}", input_query),
+                timeout_seconds=timeout_seconds,
+            )
+            return CheckResult(
+                name="Streaming Smoke Test",
+                status="ok",
+                detail=f"received {frame_format} frame and CDP input channel became ready for {session_id}",
+            )
+        finally:
+            if created_session and session_id:
+                try:
+                    await client.post(
+                        _api_v1_url(api_root, f"/browser_sessions/{session_id}/close"),
+                        headers=headers,
+                    )
+                except Exception as exc:
+                    console.print(f"  [yellow]Could not close smoke-test browser session {session_id}: {exc}[/yellow]")
+
+
+def _streaming_smoke_test(
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    browser_session_id: str | None,
+    timeout_seconds: int,
+) -> CheckResult:
+    key = (api_key or os.environ.get("SKYVERN_API_KEY") or _read_generated_credential()).strip()
+    if not key:
+        return CheckResult(
+            name="Streaming Smoke Test",
+            status="error",
+            detail="No API key available",
+            hint="Pass --api-key or set SKYVERN_API_KEY",
+        )
+    try:
+        return asyncio.run(
+            _streaming_smoke_test_async(
+                base_url=base_url,
+                api_key=key,
+                browser_session_id=browser_session_id,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    except Exception as exc:
+        return CheckResult(
+            name="Streaming Smoke Test",
+            status="error",
+            detail=str(exc),
+            hint="Check that the backend is running, local browser streaming is enabled, and browser launch succeeds",
+        )
+
+
 def _fix_install_playwright() -> bool:
     console.print("  [cyan]Installing Chromium via Playwright...[/cyan]")
     result = subprocess.run(["playwright", "install", "chromium"], capture_output=True, text=True)
@@ -1608,6 +1824,45 @@ def _fix_install_playwright() -> bool:
         return True
     console.print(f"  [red]Failed: {result.stderr[:200]}[/red]")
     return False
+
+
+@doctor_app.command("streaming")
+def streaming(
+    base_url: str = typer.Option(
+        "http://localhost:8000",
+        "--base-url",
+        help="Skyvern API server root or v1 URL.",
+    ),
+    api_key: str | None = typer.Option(None, "--api-key", help="Skyvern API key. Defaults to SKYVERN_API_KEY."),
+    browser_session_id: str | None = typer.Option(
+        None,
+        "--browser-session-id",
+        help="Existing browser session to test. If omitted, doctor creates and closes one.",
+    ),
+    timeout_seconds: int = typer.Option(45, "--timeout", min=5, max=180, help="Seconds to wait for stream readiness."),
+    json_output: bool = typer.Option(False, "--json", help="Output machine-readable JSON."),
+) -> None:
+    """Create or reuse a browser session and verify local browser streaming."""
+    result = _streaming_smoke_test(
+        base_url=base_url,
+        api_key=api_key,
+        browser_session_id=browser_session_id,
+        timeout_seconds=timeout_seconds,
+    )
+
+    if json_output:
+        console.print(json.dumps(result.__dict__))
+    else:
+        table = Table(show_header=True, header_style="bold", title="Skyvern Streaming Doctor")
+        table.add_column("Check", style="bold")
+        table.add_column("Status")
+        table.add_column("Details")
+        table.add_column("Fix")
+        table.add_row(result.name, _STATUS_STYLE.get(result.status, result.status), result.detail, result.hint)
+        console.print(table)
+
+    if result.status == "error":
+        raise typer.Exit(code=1)
 
 
 @doctor_app.callback(invoke_without_command=True)

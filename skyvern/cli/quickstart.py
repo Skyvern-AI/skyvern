@@ -317,7 +317,7 @@ def _run_server_quickstart(
         )
         run_local = bool(init_result)
         if run_local:
-            _configure_cdp_livestreaming_defaults()
+            _configure_local_browser_streaming_defaults()
 
         # Start services
         if run_local:
@@ -556,8 +556,8 @@ def _handle_postgres_container_conflict() -> None:
     )
 
 
-def _configure_cdp_livestreaming_defaults() -> None:
-    """Enable local CDP livestreaming for self-hosted quickstart paths."""
+def _configure_local_browser_streaming_defaults() -> None:
+    """Enable local browser streaming for self-hosted quickstart paths."""
     from dotenv import set_key
 
     from skyvern.cli.llm_setup import update_or_add_env_var
@@ -590,7 +590,7 @@ def run_docker_compose_setup() -> None:
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
-    _configure_cdp_livestreaming_defaults()
+    _configure_local_browser_streaming_defaults()
 
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")

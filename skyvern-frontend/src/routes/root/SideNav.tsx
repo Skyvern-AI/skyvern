@@ -49,6 +49,11 @@ function SideNav() {
             to: "/browser-sessions",
             icon: <GlobeIcon className="size-6" />,
           },
+          {
+            label: "Browser Profiles",
+            to: "/browser-profiles",
+            icon: <BrowserIcon className="size-6" />,
+          },
         ]}
       />
       <NavLinkGroup
@@ -63,11 +68,6 @@ function SideNav() {
             label: "Credentials",
             to: "/credentials",
             icon: <KeyIcon className="size-6" />,
-          },
-          {
-            label: "Browser Profiles",
-            to: "/browser-profiles",
-            icon: <BrowserIcon className="size-6" />,
           },
         ]}
       />
