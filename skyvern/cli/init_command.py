@@ -422,7 +422,7 @@ def init_env(
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
-        api_key = asyncio.run(_setup_local_organization_from_database())
+        api_key = _run_with_server_dependency_install(lambda: asyncio.run(_setup_local_organization_from_database()))
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")
         else:

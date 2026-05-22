@@ -67,9 +67,37 @@ def test_quickstart_non_interactive_server_options_skip_prompts(monkeypatch) -> 
     assert result.exit_code == 0
     assert calls
     call = calls[0]
+    assert call["no_postgres"] is False
     assert call["mode"] == "local"
     assert call["skip_llm_setup"] is True
     assert call["configure_mcp"] is False
     assert call["browser_type"] == "chromium-headless"
     assert call["analytics_id"] == "anonymous"
     assert call["return_result"] is True
+
+
+def test_quickstart_non_interactive_without_database_string_skips_postgres_prompt(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    monkeypatch.setattr("skyvern.cli.quickstart._has_server_quickstart_extra", lambda: True)
+    monkeypatch.setattr("skyvern.cli.quickstart.check_docker_compose_file", lambda: False)
+    monkeypatch.setattr("skyvern.cli.quickstart._run_server_quickstart", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(
+        "skyvern.cli.quickstart.Confirm.ask",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not prompt")),
+    )
+
+    result = CliRunner().invoke(quickstart_app, ["--non-interactive"])
+
+    assert result.exit_code == 0
+    assert "Non-interactive quickstart will not prompt to start PostgreSQL" in result.output
+    assert "--database-string" in result.output
+    assert calls
+    call = calls[0]
+    assert call["no_postgres"] is True
+    assert call["database_string"] == ""
+    assert call["skip_llm_setup"] is True
+    assert call["configure_mcp"] is False
+    assert call["browser_type"] == "chromium-headless"
+    assert call["analytics_id"] == "anonymous"
+    assert call["start_services_now"] is False

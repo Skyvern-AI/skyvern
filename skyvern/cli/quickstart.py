@@ -749,6 +749,18 @@ def quickstart(
         analytics_id = analytics_id or "anonymous"
         if start_services_now is None:
             start_services_now = False
+        if not database_string:
+            no_postgres = True
+            console.print(
+                Panel(
+                    "[bold yellow]Non-interactive quickstart will not prompt to start PostgreSQL.[/bold yellow]\n\n"
+                    "No [cyan]--database-string[/cyan] was provided, so Skyvern will use any existing "
+                    "[cyan]DATABASE_STRING[/cyan] from your environment or .env file.\n\n"
+                    "For unattended agent tests, pass "
+                    "[cyan]--database-string postgresql+psycopg://user:pass@host:5432/dbname[/cyan].",
+                    border_style="yellow",
+                )
+            )
 
     has_server_extra = _has_server_quickstart_extra()
     # The server extra is a superset of the local embedded runtime dependencies.
