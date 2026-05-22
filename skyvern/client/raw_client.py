@@ -2177,6 +2177,7 @@ class RawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_config: typing.Optional[typing.Mapping[str, str]] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -2226,6 +2227,9 @@ class RawSkyvern:
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
+        proxy_config : typing.Optional[typing.Mapping[str, str]]
+            Request-scoped proxy config for this browser session. Overrides the configured proxy pool.
+
         browser_type : typing.Optional[PersistentBrowserType]
             The type of browser to use for the session.
 
@@ -2246,6 +2250,7 @@ class RawSkyvern:
             json={
                 "timeout": timeout,
                 "proxy_location": proxy_location,
+                "proxy_config": proxy_config,
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,
@@ -5586,6 +5591,7 @@ class AsyncRawSkyvern:
         *,
         timeout: typing.Optional[int] = OMIT,
         proxy_location: typing.Optional[ProxyLocation] = OMIT,
+        proxy_config: typing.Optional[typing.Mapping[str, str]] = OMIT,
         extensions: typing.Optional[typing.Sequence[Extensions]] = OMIT,
         browser_type: typing.Optional[PersistentBrowserType] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
@@ -5635,6 +5641,9 @@ class AsyncRawSkyvern:
         extensions : typing.Optional[typing.Sequence[Extensions]]
             A list of extensions to install in the browser session.
 
+        proxy_config : typing.Optional[typing.Mapping[str, str]]
+            Request-scoped proxy config for this browser session. Overrides the configured proxy pool.
+
         browser_type : typing.Optional[PersistentBrowserType]
             The type of browser to use for the session.
 
@@ -5655,6 +5664,7 @@ class AsyncRawSkyvern:
             json={
                 "timeout": timeout,
                 "proxy_location": proxy_location,
+                "proxy_config": proxy_config,
                 "extensions": extensions,
                 "browser_type": browser_type,
                 "browser_profile_id": browser_profile_id,

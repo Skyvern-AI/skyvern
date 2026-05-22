@@ -20,6 +20,7 @@ from skyvern.exceptions import (
 )
 from skyvern.forge import app
 from skyvern.forge.sdk.trace import traced
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
@@ -79,6 +80,7 @@ class RealBrowserState(BrowserState):
         self,
         url: str | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
@@ -98,6 +100,7 @@ class RealBrowserState(BrowserState):
                 self.pw,
                 url=url,
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -249,6 +252,7 @@ class RealBrowserState(BrowserState):
         self,
         url: str | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
@@ -266,6 +270,7 @@ class RealBrowserState(BrowserState):
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -287,6 +292,7 @@ class RealBrowserState(BrowserState):
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,
@@ -305,6 +311,7 @@ class RealBrowserState(BrowserState):
             await self.check_and_fix_state(
                 url=url,
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
                 workflow_permanent_id=workflow_permanent_id,

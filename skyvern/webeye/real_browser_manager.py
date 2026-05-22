@@ -9,6 +9,7 @@ from skyvern.exceptions import MissingBrowserState
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import VideoArtifact
 from skyvern.webeye.browser_factory import BrowserContextFactory
@@ -27,6 +28,7 @@ class RealBrowserManager(BrowserManager):
     @staticmethod
     async def _create_browser_state(
         proxy_location: ProxyLocationInput = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         url: str | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
@@ -46,6 +48,7 @@ class RealBrowserManager(BrowserManager):
         ) = await BrowserContextFactory.create_browser_context(
             pw,
             proxy_location=proxy_location,
+            proxy_config=proxy_config,
             url=url,
             task_id=task_id,
             workflow_run_id=workflow_run_id,

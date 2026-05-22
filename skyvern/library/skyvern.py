@@ -547,6 +547,7 @@ class Skyvern(AsyncSkyvern):
         *,
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: dict[str, str] | None = None,
         extensions: list[Extensions] | None = None,
     ) -> SkyvernBrowser:
         """Launch a new cloud-hosted browser session.
@@ -558,6 +559,7 @@ class Skyvern(AsyncSkyvern):
                 Must be between 5 and 1440. Defaults to 60.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud.
+            proxy_config: Request-scoped proxy server configuration for this session.
             extensions: Browser extensions to install in the session.
 
         Returns:
@@ -568,6 +570,8 @@ class Skyvern(AsyncSkyvern):
             "timeout": timeout,
             "proxy_location": proxy_location_to_request(proxy_location),
         }
+        if proxy_config is not None:
+            create_kwargs["proxy_config"] = proxy_config
         if extensions is not None:
             create_kwargs["extensions"] = extensions
         browser_session = await self.create_browser_session(**create_kwargs)
@@ -585,6 +589,7 @@ class Skyvern(AsyncSkyvern):
         *,
         timeout: int | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: dict[str, str] | None = None,
     ) -> SkyvernBrowser:
         """Get or create a cloud browser session.
 
@@ -597,6 +602,7 @@ class Skyvern(AsyncSkyvern):
                 Must be between 5 and 1440. Defaults to 60. Only used when creating a new session.
             proxy_location: Geographic proxy location to route the browser traffic through.
                 This is only available in Skyvern Cloud. Only used when creating a new session.
+            proxy_config: Request-scoped proxy server configuration. Only used when creating a new session.
 
         Returns:
             SkyvernBrowser: A browser instance connected to an existing or new cloud session.
@@ -614,6 +620,7 @@ class Skyvern(AsyncSkyvern):
             browser_session = await self.create_browser_session(
                 timeout=timeout,
                 proxy_location=proxy_location_to_request(proxy_location),
+                proxy_config=proxy_config,
             )
             if self._environment == SkyvernEnvironment.CLOUD:
                 LOG.info(

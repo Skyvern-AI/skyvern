@@ -33,6 +33,7 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
 from skyvern.webeye.cdp_connection import build_cdp_connect_headers
@@ -252,7 +253,11 @@ async def _apply_download_behaviour(browser: Browser) -> None:
 
 class BrowserContextCreator(Protocol):
     def __call__(
-        self, playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict[str, Any]
+        self,
+        playwright: Playwright,
+        proxy_location: ProxyLocation | None = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
+        **kwargs: dict[str, Any],
     ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]]: ...
 
 
@@ -292,6 +297,7 @@ class BrowserContextFactory:
     @staticmethod
     def build_browser_args(
         proxy_location: ProxyLocation | None = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         cdp_port: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -343,10 +349,12 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if settings.ENABLE_PROXY:
-            proxy_config = setup_proxy()
-            if proxy_config:
-                args["proxy"] = proxy_config
+        if proxy_config is not None:
+            args["proxy"] = proxy_config.to_playwright_proxy()
+        elif settings.ENABLE_PROXY:
+            configured_proxy = setup_proxy()
+            if configured_proxy:
+                args["proxy"] = configured_proxy
 
         if proxy_location:
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
@@ -549,6 +557,7 @@ def _is_chrome_running() -> bool:
 async def _create_headless_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocation | None = None,
+    proxy_config: BrowserSessionProxyConfig | None = None,
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -596,7 +605,10 @@ async def _create_headless_chromium(
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
     browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+        proxy_location=proxy_location,
+        proxy_config=proxy_config,
+        cdp_port=cdp_port,
+        extra_http_headers=extra_http_headers,
     )
     browser_args.update(
         {
@@ -638,6 +650,7 @@ async def _create_headless_chromium(
 async def _create_headful_chromium(
     playwright: Playwright,
     proxy_location: ProxyLocation | None = None,
+    proxy_config: BrowserSessionProxyConfig | None = None,
     extra_http_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
@@ -685,7 +698,10 @@ async def _create_headful_chromium(
     )
     cdp_port: int | None = _get_cdp_port(kwargs)
     browser_args = BrowserContextFactory.build_browser_args(
-        proxy_location=proxy_location, cdp_port=cdp_port, extra_http_headers=extra_http_headers
+        proxy_location=proxy_location,
+        proxy_config=proxy_config,
+        cdp_port=cdp_port,
+        extra_http_headers=extra_http_headers,
     )
     browser_args.update(
         {

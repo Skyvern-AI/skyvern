@@ -21,6 +21,7 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserType,
     is_final_status,
 )
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
@@ -275,6 +276,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         runnable_id: str | None = None,
         runnable_type: str | None = None,
         timeout_minutes: int | None = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
@@ -301,7 +303,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         if settings.BROWSER_STREAMING_MODE == "cdp" and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
-                self._launch_browser_for_session(session_id, organization_id, proxy_location, url)
+                self._launch_browser_for_session(
+                    session_id,
+                    organization_id,
+                    proxy_location,
+                    url,
+                    proxy_config,
+                )
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -314,16 +322,19 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         organization_id: str,
         proxy_location: ProxyLocationInput | None = None,
         url: str | None = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
     ) -> None:
         try:
             browser_state = await RealBrowserManager._create_browser_state(
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 url=url,
                 organization_id=organization_id,
             )
             await browser_state.get_or_create_page(
                 url=url or "about:blank",
                 proxy_location=proxy_location,
+                proxy_config=proxy_config,
                 organization_id=organization_id,
             )
 

@@ -6,6 +6,7 @@ from playwright.async_api import BrowserContext, Page, Playwright
 
 from skyvern.config import settings
 from skyvern.constants import NAVIGATION_MAX_RETRY_TIME
+from skyvern.schemas.proxy_config import BrowserSessionProxyConfig
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc
@@ -23,6 +24,7 @@ class BrowserState(Protocol):
         self,
         url: str | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
@@ -51,6 +53,7 @@ class BrowserState(Protocol):
         self,
         url: str | None = None,
         proxy_location: ProxyLocationInput = None,
+        proxy_config: BrowserSessionProxyConfig | None = None,
         task_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_permanent_id: str | None = None,
