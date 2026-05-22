@@ -2900,7 +2900,7 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration)
+    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
     return [ActionSuccess()]
 
 

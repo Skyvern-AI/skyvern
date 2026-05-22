@@ -43,6 +43,7 @@ import {
   shouldQueuePromptForLiveBrowser,
   shouldWaitForLiveBrowser,
 } from "./browserReadiness";
+import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 
 interface ChatMessage {
   id: string;
@@ -865,10 +866,11 @@ export function WorkflowCopilotChat({
             cancelInFlightController.current === abortController;
           if (
             response.updated_workflow &&
-            autoAccept &&
-            !response.unvalidated &&
-            !response.cancelled &&
-            !userCancelledThisTurn
+            shouldAutoApplyWorkflowResponse(
+              response,
+              autoAccept,
+              userCancelledThisTurn,
+            )
           ) {
             applyWorkflowUpdate(response.updated_workflow);
           } else {
