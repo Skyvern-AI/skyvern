@@ -1,7 +1,7 @@
-"""Wrap copilot-v2-generated block intent fields (``navigation_goal``,
+"""Wrap runtime block intent fields (``navigation_goal``,
 ``complete_criterion``, ``terminate_criterion``) with the effective
 "big goal" context, mirroring the TaskV2 pattern that applies
-``MINI_GOAL_TEMPLATE`` at every mini-goal construction site.
+``MINI_GOAL_TEMPLATE`` at mini-goal execution sites.
 
 Without this wrap:
   - The Skyvern verifier (``complete_verify``) has no user-intent context
@@ -14,12 +14,17 @@ Without this wrap:
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
 from skyvern.utils.yaml_loader import safe_load_no_dates
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow
+
+WorkflowT = TypeVar("WorkflowT", bound="Workflow")
 
 # Block fields whose value expresses the LLM's "mini goal" — what it should
 # do or what it should check for. Wrapped in MINI_GOAL_TEMPLATE alongside the
@@ -101,22 +106,9 @@ def _wrap_blocks_in_place(blocks: list[Any], user_message: str) -> bool:
             continue
         for field_name in _WRAPPABLE_FIELDS:
             value = block.get(field_name)
-            if not isinstance(value, str) or not value:
-                continue
-            wrapped_parts = _extract_wrapped_goal(value)
-            if wrapped_parts is not None:
-                mini_goal, existing_main_goal = wrapped_parts
-                main_goal = existing_main_goal if existing_main_goal == user_message else user_message
-                next_value = MINI_GOAL_TEMPLATE.format(mini_goal=mini_goal, main_goal=main_goal)
-                if next_value != value:
-                    block[field_name] = next_value
-                    mutated = True
-                continue
-            if _WRAPPED_PREFIX not in value:
-                block[field_name] = MINI_GOAL_TEMPLATE.format(
-                    mini_goal=value,
-                    main_goal=user_message,
-                )
+            next_value = _wrapped_field_value(value, user_message)
+            if next_value is not None:
+                block[field_name] = next_value
                 mutated = True
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
@@ -144,3 +136,60 @@ def _extract_wrapped_goal(value: str) -> tuple[str, str] | None:
         last = (mini_goal, main_goal)
         current = mini_goal
     return last
+
+
+def _wrapped_field_value(value: Any, main_goal: str) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    wrapped_parts = _extract_wrapped_goal(value)
+    if wrapped_parts is not None:
+        mini_goal, _existing_main_goal = wrapped_parts
+        next_value = MINI_GOAL_TEMPLATE.format(mini_goal=mini_goal, main_goal=main_goal)
+        return next_value if next_value != value else None
+    if _WRAPPED_PREFIX not in value:
+        return MINI_GOAL_TEMPLATE.format(mini_goal=value, main_goal=main_goal)
+    return None
+
+
+def wrap_workflow_block_goals(workflow: WorkflowT, main_goal: str) -> WorkflowT:
+    """Return a workflow copy with block intent fields wrapped for one runtime run."""
+    if not main_goal:
+        return workflow
+    workflow_definition = getattr(workflow, "workflow_definition", None)
+    blocks = getattr(workflow_definition, "blocks", None)
+    if not isinstance(blocks, list):
+        return workflow
+    if not _block_models_need_wrapping(blocks, main_goal):
+        return workflow
+
+    wrapped = workflow.model_copy(deep=True)
+    wrapped_blocks = getattr(wrapped.workflow_definition, "blocks", None)
+    if not isinstance(wrapped_blocks, list):
+        return workflow
+    return wrapped if _wrap_block_models_in_place(wrapped_blocks, main_goal) else workflow
+
+
+def _block_models_need_wrapping(blocks: list[Any], main_goal: str) -> bool:
+    for block in blocks:
+        for field_name in _WRAPPABLE_FIELDS:
+            if _wrapped_field_value(getattr(block, field_name, None), main_goal) is not None:
+                return True
+        loop_blocks = getattr(block, "loop_blocks", None)
+        if isinstance(loop_blocks, list) and _block_models_need_wrapping(loop_blocks, main_goal):
+            return True
+    return False
+
+
+def _wrap_block_models_in_place(blocks: list[Any], main_goal: str) -> bool:
+    mutated = False
+    for block in blocks:
+        for field_name in _WRAPPABLE_FIELDS:
+            value = getattr(block, field_name, None)
+            next_value = _wrapped_field_value(value, main_goal)
+            if next_value is not None:
+                setattr(block, field_name, next_value)
+                mutated = True
+        loop_blocks = getattr(block, "loop_blocks", None)
+        if isinstance(loop_blocks, list):
+            mutated = _wrap_block_models_in_place(loop_blocks, main_goal) or mutated
+    return mutated

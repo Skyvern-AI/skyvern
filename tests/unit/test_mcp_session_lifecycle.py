@@ -30,6 +30,7 @@ def _reset_singletons() -> None:
 
     session_manager._current_session.set(None)
     session_manager._global_session = None
+    session_manager._copilot_sessions.clear()
     session_manager.set_stateless_http_mode(False)
 
 
@@ -321,6 +322,33 @@ async def test_resolve_browser_does_not_reuse_session_for_different_api_key(
     assert browser is replacement_browser
     assert ctx.session_id == "pbs_123"
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
+
+
+@pytest.mark.asyncio
+async def test_resolve_browser_does_not_reuse_registered_copilot_session_for_different_api_key_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered_state = session_manager.SessionState(
+        browser=MagicMock(),
+        context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
+        api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
+    )
+    session_manager.register_copilot_session("pbs_copilot", registered_state)
+
+    fallback_browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=fallback_browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    token = client_mod.set_api_key_override("sk_other_org")
+    try:
+        browser, ctx = await session_manager.resolve_browser(session_id="pbs_copilot")
+    finally:
+        client_mod.reset_api_key_override(token)
+
+    assert browser is fallback_browser
+    assert ctx.session_id == "pbs_copilot"
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_copilot")
 
 
 @pytest.mark.asyncio

@@ -31,7 +31,6 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -47,6 +46,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
+    url_origin,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
@@ -61,7 +61,12 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
-from skyvern.forge.sdk.copilot.turn_intent import NO_MUTATION_TURN_INTENT_MODES, TurnIntent, build_turn_intent
+from skyvern.forge.sdk.copilot.turn_intent import (
+    NO_MUTATION_TURN_INTENT_MODES,
+    TurnIntent,
+    TurnIntentMode,
+    build_turn_intent,
+)
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -145,13 +150,6 @@ class RequestPolicyGuardrailInputs:
     browser_session_id: str | None = None
 
 
-_BLOCK_GOAL_CONTEXT_PREAMBLE = (
-    "Interpret the latest user message in the context of the prior conversation. If it is a correction, "
-    "refinement, or continuation, preserve the established website, actions, filters, and output requirements "
-    "except where the latest message changes them."
-)
-
-
 async def _resolve_live_browser_session_id(
     chat_request: WorkflowCopilotChatRequest,
     organization_id: str,
@@ -230,24 +228,7 @@ def _build_block_goal_main_goal(
     raw_current_message = (user_message or "").strip()
     if not raw_current_message:
         return ""
-    current_message = escape_code_fences(raw_current_message)
-    structured_context = StructuredContext.from_json_str(global_llm_context)
-    context_sections: list[str] = []
-    if structured_context.user_goal.strip():
-        prior_goal = escape_code_fences(structured_context.user_goal.strip())
-        context_sections.append(f"Prior high-level goal:\n{prior_goal}")
-    if chat_history_text.strip():
-        escaped_chat_history = escape_code_fences(chat_history_text.strip())
-        context_sections.append(f"Recent chat history:\n{escaped_chat_history}")
-    if not context_sections:
-        return current_message
-
-    return (
-        _BLOCK_GOAL_CONTEXT_PREAMBLE
-        + "\n\n"
-        + "\n\n".join(context_sections)
-        + f"\n\nLatest user message:\n{current_message}"
-    )
+    return escape_code_fences(raw_current_message)
 
 
 def _request_policy_agent_inputs(
@@ -325,6 +306,7 @@ def _store_turn_context_packet_on_context(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     debug_run_info_text: str,
+    prior_copilot_workflow_yaml: str | None,
 ) -> None:
     if not isinstance(ctx.turn_intent, TurnIntent):
         return
@@ -334,6 +316,7 @@ def _store_turn_context_packet_on_context(
             request_policy=request_policy,
             user_message=chat_request.message,
             workflow_yaml=chat_request.workflow_yaml or "",
+            prior_workflow_yaml=prior_copilot_workflow_yaml or "",
             chat_history=chat_history,
             debug_run_info_text=debug_run_info_text,
         )
@@ -366,7 +349,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
-        return (
+        prompt = (
             base_system_prompt
             + "\n\nREQUEST POLICY:\n```yaml\n"
             + policy_summary
@@ -377,8 +360,22 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "workflow and skip the browser run with a credential setup message. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
+        return prompt + _docs_answer_turn_directive(getattr(ctx, "turn_intent", None))
 
     return instructions
+
+
+def _docs_answer_turn_directive(turn_intent: TurnIntent | None) -> str:
+    """Prompt-side complement to the no-mutation tool gate — keeps a docs-answer
+    turn from substituting a routing question or build offer for the inline answer."""
+    if not isinstance(turn_intent, TurnIntent) or turn_intent.mode != TurnIntentMode.DOCS_ANSWER:
+        return ""
+    return (
+        "\n\nTURN INTENT: docs_answer\n"
+        "This turn is a documentation or explanation question. Answer it inline in the user's language. "
+        "Do not ask whether the user wants a workflow change instead, do not re-ask a confirmation the "
+        "prior turn already covered, and do not offer to build an example workflow in place of answering."
+    )
 
 
 def _build_user_context(
@@ -388,6 +385,7 @@ def _build_user_context(
     debug_run_info_text: str,
     user_message: str,
     request_policy_summary: str = "",
+    user_workflow_change_summary: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -409,6 +407,7 @@ def _build_user_context(
         debug_run_info=escape_code_fences(redact_raw_secrets_for_prompt(debug_run_info_text)),
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
+        user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
     )
 
 
@@ -680,6 +679,7 @@ _RAW_SECRET_LEAK_REFUSAL = (
     "Store credentials in the Skyvern Credentials UI and reply with the saved credential name or a "
     f"credential ID beginning with cred_. {RAW_SECRET_REFUSAL_SENTINEL}."
 )
+_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX = "I only blocked the chat reply; the workflow draft is still saved."
 _CANCEL_REPLY_DEFAULT = "Cancelled by user."
 _CANCEL_REPLY_UNVALIDATED = (
     "Cancelled. I have a draft workflow you can keep — accept it to save "
@@ -695,12 +695,103 @@ _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
     "a supported workflow update."
 )
+_BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL = (
+    "I drafted a change to the workflow but haven't applied it yet. Want me to update the workflow now?"
+)
+_BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL = "I made the change you described to the workflow."
 _PROPOSAL_ACCEPT_UI_ACTION_RE = re.compile(r"\b(?:accept|always\s+accept)\b", re.IGNORECASE)
 _PROPOSAL_REJECT_UI_ACTION_RE = re.compile(r"\b(?:reject|discard)\b", re.IGNORECASE)
 _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
+_RECORDED_FAILURE_URL_RE = re.compile(r"https?://[^\s)>,]+")
+
+
+def _workflow_block_count(ctx: CopilotContext) -> int | None:
+    count = getattr(ctx, "last_update_block_count", None)
+    if isinstance(count, int) and count > 0:
+        return count
+    workflow = getattr(ctx, "last_workflow", None)
+    definition = getattr(workflow, "workflow_definition", None)
+    blocks = getattr(definition, "blocks", None)
+    return len(blocks) if isinstance(blocks, list) and blocks else None
+
+
+def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
+    from skyvern.forge.sdk.copilot.enforcement import redact_browser_session_references
+
+    if not isinstance(value, str):
+        return ""
+    text = redact_raw_secrets_for_prompt(" ".join(value.split()))
+    text = redact_browser_session_references(text)
+    text = _RECORDED_FAILURE_URL_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", text)
+    if len(text) > max_chars:
+        text = text[: max_chars - 3].rstrip() + "..."
+    return text.rstrip(".")
+
+
+def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    verification = getattr(contract, "verification_result", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    remaining_blocker = _clean_recorded_failure_text(getattr(verification, "remaining_blocker", None))
+    root_cause = _clean_recorded_failure_text(getattr(diagnosis, "root_cause_summary", None))
+    fallback_reason = _clean_recorded_failure_text(getattr(ctx, "last_test_failure_reason", None))
+    reason = remaining_blocker or root_cause or fallback_reason
+    run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80)
+    status_sentence = f" Last run status: {run_status}." if run_status else ""
+    return reason, status_sentence
+
+
+def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if not reason:
+        return tested_reply
+    return f"{tested_reply} The latest attempted change did not verify: {reason}.{status_sentence}"
+
+
+def _recorded_failure_reply(ctx: CopilotContext, *, cancelled: bool = False) -> str | None:
+    if cancelled or ctx.last_test_ok is True:
+        return None
+
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    verification = getattr(contract, "verification_result", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    repair_decision = getattr(contract, "repair_decision", None)
+    diagnosis_input = getattr(contract, "diagnosis_input", None)
+    failure_type = getattr(getattr(diagnosis, "suspected_failure_type", None), "value", None) or getattr(
+        diagnosis,
+        "suspected_failure_type",
+        None,
+    )
+    next_action = getattr(getattr(repair_decision, "next_action", None), "value", None) or getattr(
+        repair_decision,
+        "next_action",
+        None,
+    )
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if not reason:
+        return None
+
+    run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80).lower()
+    block_count = _workflow_block_count(ctx)
+    block_phrase = f"a {block_count}-block draft" if block_count else "a draft"
+    test_attempted = bool(
+        getattr(ctx, "test_after_update_done", False)
+        or getattr(ctx, "last_test_ok", None) is not None
+        or getattr(diagnosis_input, "workflow_run_id", None)
+    )
+    test_failed = ctx.last_test_ok is False or run_status == "failed"
+    unrecoverable_stop = next_action == "stop" or failure_type == "unrecoverable_tool_error"
+
+    if getattr(ctx, "last_workflow", None) is not None:
+        if test_attempted and test_failed and not unrecoverable_stop:
+            return f"I built {block_phrase} and tested it, but the test failed: {reason}.{status_sentence}"
+        if test_attempted:
+            return f"I built {block_phrase} and tested it, but the test couldn't finish: {reason}.{status_sentence}"
+        return f"I built {block_phrase}, but I couldn't verify it: {reason}.{status_sentence}"
+    return f"I couldn't finish the Copilot turn: {reason}.{status_sentence}"
 
 
 def _ensure_unvalidated_proposal_affordance(user_response: str) -> str:
@@ -726,10 +817,9 @@ def _build_wip_exit_result(
     cancelled: bool = False,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
-    # When an unverified edit/run has overwritten ``last_workflow`` since the
-    # last verified shape, prefer the verified shape. ``unvalidated=True``
-    # triggers the route's rollback so auto-accept does not silently keep the
-    # failed/in-flight shape.
+    recorded_failure_reply = _recorded_failure_reply(ctx, cancelled=cancelled)
+    # When an unverified edit/run has overwritten ``last_workflow``, prefer the
+    # verified shape while still forcing explicit review.
     if (
         ctx.last_good_workflow is not None
         and ctx.last_good_workflow_yaml
@@ -737,13 +827,13 @@ def _build_wip_exit_result(
         and not ctx.last_test_suspicious_success
     ):
         return AgentResult(
-            user_response=tested_reply,
+            user_response=_last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply,
             updated_workflow=ctx.last_good_workflow,
             global_llm_context=global_llm_context,
             workflow_yaml=ctx.last_good_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=True,
+            proposal_disposition="review_tested",
             cancelled=cancelled,
         )
     if (
@@ -753,7 +843,10 @@ def _build_wip_exit_result(
         and not ctx.last_test_suspicious_success
     ):
         unvalidated = ctx.last_test_ok is not True
-        reply = unvalidated_reply if unvalidated else tested_reply
+        if unvalidated and recorded_failure_reply:
+            reply = recorded_failure_reply
+        else:
+            reply = unvalidated_reply if unvalidated else tested_reply
         return AgentResult(
             user_response=reply,
             updated_workflow=ctx.last_workflow,
@@ -761,10 +854,10 @@ def _build_wip_exit_result(
             workflow_yaml=ctx.last_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            unvalidated=unvalidated,
+            proposal_disposition="review_untested" if unvalidated else "auto_applicable",
             cancelled=cancelled,
         )
-    return _build_exit_result(ctx, default_reply, global_llm_context, cancelled=cancelled)
+    return _build_exit_result(ctx, recorded_failure_reply or default_reply, global_llm_context, cancelled=cancelled)
 
 
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -894,11 +987,6 @@ def _translate_to_agent_result(
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
-            block_goal_main_goal = ctx.block_goal_main_goal or ctx.user_message
-            if block_goal_main_goal:
-                workflow_yaml = wrap_block_goals(workflow_yaml, block_goal_main_goal)
-            else:
-                LOG.warning("REPLACE_WORKFLOW inline path missing block-goal context; skipping block-goal wrap")
             try:
                 last_workflow = _process_workflow_yaml(
                     workflow_id=chat_request.workflow_id,
@@ -1017,6 +1105,14 @@ def _translate_to_agent_result(
         user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
         soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
         output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+    if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
+        user_response = (
+            _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
+            if last_workflow is not None
+            else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
+        )
+        soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
+        output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
     # Preserve the unbacked-proposal correction when both soft rewrites apply:
     # a reply must not imply a workflow exists when no proposal was produced.
     if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
@@ -1070,7 +1166,7 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        unvalidated=unvalidated,
+        proposal_disposition="review_untested" if unvalidated else "auto_applicable",
         output_policy_diagnostics=output_policy_diagnostics,
     )
 
@@ -1416,44 +1512,63 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
 ) -> AgentResult:
+    preserved_workflow = ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml else None
+    preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
         "output-policy blocked final output: " + ", ".join(reason.value for reason in verdict.reason_codes)
     )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    add_saved_draft_copy = False
     if (
         request_policy is not None
         and request_policy.clarification_question
         and OutputPolicyReason.REQUEST_POLICY_CLARIFICATION_BYPASS in verdict.reason_codes
     ):
         user_response = request_policy.clarification_question
+        add_saved_draft_copy = True
     elif OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
         user_response = _RAW_SECRET_LEAK_REFUSAL
+        add_saved_draft_copy = True
     elif OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes:
         user_response = (
             "I need you to confirm which saved credential should be used before I can continue. "
             "Please reply with the credential name from the Credentials UI, or adjust the workflow to avoid "
             "using credentials."
         )
+        add_saved_draft_copy = True
     elif OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes:
         user_response = (
             "The selected credential is not approved for one of the URLs in this workflow. "
             "Please use a saved credential tested for that URL, update the block URL to match the credential's "
             "tested site, or adjust the workflow to avoid using credentials."
         )
+        add_saved_draft_copy = True
+    elif preserved_workflow is not None:
+        user_response = (
+            "I could not safely return that chat reply, but the workflow draft is still saved. "
+            "Please review the draft or adjust the request and try again."
+        )
     else:
-        user_response = "I could not safely return that Copilot output. Please adjust the request and try again."
+        user_response = "I could not safely return that chat reply. Please adjust the request and try again."
+    if preserved_workflow is not None and add_saved_draft_copy:
+        user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
     return AgentResult(
         user_response=user_response,
-        updated_workflow=None,
+        updated_workflow=preserved_workflow,
         global_llm_context=structured.to_json_str(),
         response_type="ASK_QUESTION",
-        workflow_yaml=prior_workflow_yaml or None,
+        workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
-        # Policy blocks invalidate any currently staged proposal. The prior
-        # YAML is retained for context, but the accept UI should not stay armed.
-        clear_proposed_workflow=True,
+        clear_proposed_workflow=False,
+        proposal_disposition=(
+            "no_proposal"
+            if preserved_workflow is None
+            else "review_untested"
+            if ctx.last_test_ok is not True
+            else "review_tested"
+        ),
         output_policy_diagnostics=output_policy_diagnostics
         or build_output_policy_diagnostics(
             raw_verdict=verdict,
@@ -1477,6 +1592,7 @@ async def run_copilot_agent(
     security_rules: str = "",
     config: CopilotConfig | None = None,
     turn_index: int | None = None,
+    prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
     # Initialize tracing before opening the turn span so Logfire's OTel provider
     # is installed; otherwise the very first turn lands the parent span on
@@ -1498,6 +1614,7 @@ async def run_copilot_agent(
             api_key=api_key,
             security_rules=security_rules,
             config=config,
+            prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
 
 
@@ -1513,6 +1630,7 @@ async def _run_copilot_turn_impl(
     api_key: str | None,
     security_rules: str,
     config: CopilotConfig | None,
+    prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -1596,6 +1714,7 @@ async def _run_copilot_turn_impl(
             chat_request=chat_request,
             chat_history=chat_history,
             debug_run_info_text=debug_run_info_text,
+            prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         )
     if request_policy is not None and request_policy_guardrail_result.output.tripwire_triggered:
         return _build_request_policy_clarification_result(
@@ -1637,6 +1756,7 @@ async def _run_copilot_turn_impl(
     from skyvern.forge.sdk.copilot.enforcement import (
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
+        CopilotUnrecoverableToolError,
         run_with_enforcement,
     )
     from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
@@ -1675,12 +1795,20 @@ async def _run_copilot_turn_impl(
         config=copilot_config,
     )
 
+    user_workflow_change_summary = ""
+    if (
+        isinstance(ctx.turn_context_packet, TurnContextPacket)
+        and ctx.turn_context_packet.workflow_change_context is not None
+    ):
+        user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
         global_llm_context=safe_global_llm_context,
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
+        user_workflow_change_summary=user_workflow_change_summary,
     )
 
     LOG.info(
@@ -1822,6 +1950,14 @@ async def _run_copilot_turn_impl(
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
                 return _build_timeout_exit_result(ctx, global_llm_context)
+            except CopilotUnrecoverableToolError as exc:
+                LOG.warning(
+                    "Copilot run halted on unrecoverable tool error",
+                    tool_name=exc.tool_name,
+                    error_message=exc.error_message,
+                    organization_id=organization_id,
+                )
+                return _build_unexpected_error_exit_result(ctx, global_llm_context)
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
                     "Copilot run halted on non-retriable navigation error",

@@ -477,6 +477,7 @@ class TestShouldRestorePersistedWorkflow:
         r.updated_workflow = updated_workflow
         r.unvalidated = False
         r.cancelled = False
+        r.force_review = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
@@ -541,7 +542,7 @@ class TestBlockGoalMainGoal:
 
         assert goal == "Use ` ` `this` ` ` safely."
 
-    def test_structured_user_goal_added_as_prior_high_level_goal(self) -> None:
+    def test_correction_message_wins_over_structured_user_goal(self) -> None:
         global_context = json.dumps(
             {"user_goal": "Locate research about gravitational waves this week.", "workflow_state": "draft"}
         )
@@ -552,43 +553,48 @@ class TestBlockGoalMainGoal:
             global_llm_context=global_context,
         )
 
-        assert "Prior high-level goal:\nLocate research about gravitational waves this week." in goal
-        assert "Latest user message:\nI meant black holes" in goal
-        assert "Recent chat history" not in goal
+        assert goal == "I meant black holes"
 
-    def test_plain_global_context_becomes_prior_high_level_goal(self) -> None:
+    def test_bare_confirmation_does_not_infer_structured_user_goal(self) -> None:
+        global_context = json.dumps({"user_goal": "Locate research about gravitational waves this week."})
+
+        goal = agent_module._build_block_goal_main_goal(
+            user_message="Yes, please.",
+            chat_history_text="user: Locate research about gravitational waves this week.",
+            global_llm_context=global_context,
+        )
+
+        assert goal == "Yes, please."
+
+    def test_current_message_wins_over_plain_global_context(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant black holes",
             chat_history_text="",
             global_llm_context="Legacy goal with ```fenced``` context.",
         )
 
-        assert "Prior high-level goal:\nLegacy goal with ` ` `fenced` ` ` context." in goal
-        assert "Latest user message:\nI meant black holes" in goal
+        assert goal == "I meant black holes"
 
-    def test_chat_history_added_when_present(self) -> None:
+    def test_chat_history_is_not_denormalized_into_goal(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant black holes",
             chat_history_text="user: Search arXiv for recent papers.\nai: Drafted workflow.",
             global_llm_context=None,
         )
 
-        assert "Recent chat history:\nuser: Search arXiv for recent papers." in goal
-        assert "ai: Drafted workflow." in goal
-        assert "Latest user message:\nI meant black holes" in goal
+        assert goal == "I meant black holes"
 
-    def test_chat_history_and_latest_message_escape_code_fences(self) -> None:
+    def test_latest_message_escapes_code_fences_without_chat_history(self) -> None:
         goal = agent_module._build_block_goal_main_goal(
             user_message="I meant ```black holes```",
             chat_history_text="user: Search ```arXiv``` for recent papers.",
             global_llm_context=None,
         )
 
-        assert "user: Search ` ` `arXiv` ` ` for recent papers." in goal
-        assert "Latest user message:\nI meant ` ` `black holes` ` `" in goal
+        assert goal == "I meant ` ` `black holes` ` `"
         assert "```" not in goal
 
-    def test_includes_both_structured_goal_and_chat_history(self) -> None:
+    def test_current_message_wins_over_chat_history_and_structured_goal(self) -> None:
         global_context = json.dumps({"user_goal": "Find papers about gravitational waves."})
 
         goal = agent_module._build_block_goal_main_goal(
@@ -597,10 +603,70 @@ class TestBlockGoalMainGoal:
             global_llm_context=global_context,
         )
 
-        assert "Prior high-level goal:\nFind papers about gravitational waves." in goal
-        assert "Recent chat history:" in goal
-        assert "Latest user message:\nI meant neutron stars" in goal
-        assert goal.find("Prior high-level goal") < goal.find("Recent chat history") < goal.find("Latest user message")
+        assert goal == "I meant neutron stars"
+
+
+class TestRuntimeBlockGoalPersistenceBoundary:
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_persists_clean_yaml(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+        from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+
+        clean_yaml = """
+title: Test workflow
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: navigation
+      label: submit
+      navigation_goal: Submit the contact form.
+"""
+        captured: dict[str, str] = {}
+
+        async def fake_update_workflow(payload, ctx, allow_missing_credentials=False):
+            captured["workflow_yaml"] = payload["workflow_yaml"]
+            ctx.workflow_yaml = payload["workflow_yaml"]
+            workflow = _process_workflow_yaml(
+                workflow_id=ctx.workflow_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+                workflow_yaml=payload["workflow_yaml"],
+            )
+            return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
+
+        async def fake_run_blocks(params, ctx, **kwargs):
+            return {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr-1",
+                    "overall_status": "completed",
+                    "blocks": [],
+                },
+            }
+
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["submit"], {}, "submit"))
+        monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        ctx = _ctx(
+            user_message="Submit a contact form.",
+            block_goal_main_goal="Submit a contact form.",
+        )
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+            json.dumps({"workflow_yaml": clean_yaml, "block_labels": ["submit"], "parameters": {}}),
+        )
+
+        assert json.loads(result)["ok"] is True
+        assert captured["workflow_yaml"] == clean_yaml
+        assert "Achieve the following mini goal" not in captured["workflow_yaml"]
 
 
 class TestTranslateToAgentResultGating:
@@ -1029,23 +1095,14 @@ workflow_definition:
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
-    def test_inline_replace_workflow_wraps_block_goals_with_user_message(self, monkeypatch) -> None:
-        # SKY-9174 parity: update_and_run_blocks_tool wraps block goals with
-        # the user's chat message as big-goal context. The REPLACE_WORKFLOW
-        # inline path must do the same, otherwise the untested yaml latches
-        # onto ctx without user-intent framing and any downstream block run
-        # hits the verifier-on-confirmation-surface bug this PR fixes.
+    def test_inline_replace_workflow_persists_clean_agent_yaml(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
-        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
-            return f"WRAPPED::{user_message}::{workflow_yaml}"
-
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
 
         ctx = _ctx(user_message="Submit a contact form on example.com.")
         result = _fake_run_result(
@@ -1055,21 +1112,17 @@ workflow_definition:
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
         )
 
-        assert captured["yaml"] == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
-        assert ctx.last_workflow_yaml == "WRAPPED::Submit a contact form on example.com.::raw: yaml"
+        assert captured["yaml"] == "raw: yaml"
+        assert ctx.last_workflow_yaml == "raw: yaml"
 
-    def test_inline_replace_workflow_prefers_resolved_block_goal_main_goal(self, monkeypatch) -> None:
+    def test_inline_replace_workflow_does_not_denormalize_resolved_goal(self, monkeypatch) -> None:
         captured: dict[str, str] = {}
 
         def fake_process(**kwargs):
             captured["yaml"] = kwargs["workflow_yaml"]
             return SimpleNamespace(name="new-wf")
 
-        def fake_wrap(workflow_yaml: str, user_message: str) -> str:
-            return f"WRAPPED::{user_message}::{workflow_yaml}"
-
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", fake_process)
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.agent.wrap_block_goals", fake_wrap)
 
         ctx = _ctx(
             user_message="I meant black holes",
@@ -1082,7 +1135,7 @@ workflow_definition:
             result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
         )
 
-        assert captured["yaml"] == "WRAPPED::Go to arXiv and find research about black holes.::raw: yaml"
+        assert captured["yaml"] == "raw: yaml"
 
     def test_ask_question_with_verified_workflow_suppresses_and_clears(self) -> None:
         # A verified-but-non-terminal workflow built this turn must not surface

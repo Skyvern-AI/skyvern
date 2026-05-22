@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     format_tool_result_for_user,
+    looks_like_workflow_yaml_in_chat,
     parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
@@ -778,3 +779,82 @@ class TestParseFinalResponse:
         text = "I'm not sure how to help with that."
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
+
+
+class TestLooksLikeWorkflowYamlInChat:
+    def test_detects_block_yaml_with_navigation_goal(self) -> None:
+        text = (
+            "Here's how the block now looks:\n\n"
+            "    - label: fill_form\n"
+            "      block_type: navigation\n"
+            "      navigation_goal: Fill the abuse form.\n"
+            "      url: https://example.test/abuse\n"
+            "      parameter_keys:\n"
+            "        - name\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_detects_block_yaml_inside_fenced_code(self) -> None:
+        text = (
+            "I've drafted the change:\n\n"
+            "```yaml\n"
+            "block_type: extraction\n"
+            "data_extraction_goal: Pull the table.\n"
+            "label: extract_data\n"
+            "```\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_detects_full_workflow_definition_paste(self) -> None:
+        text = (
+            "workflow_definition:\n"
+            "  parameters: []\n"
+            "  blocks:\n"
+            "    - block_type: validation\n"
+            "      complete_criterion: The page shows a thank-you message.\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_does_not_flag_inline_block_type_mention(self) -> None:
+        text = (
+            "I'll use a navigation block to fill the form. The block_type field on a "
+            "navigation block accepts goals like a navigation_goal string — but the user "
+            "doesn't need to see the YAML directly."
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is False
+
+    def test_does_not_flag_short_prose(self) -> None:
+        assert looks_like_workflow_yaml_in_chat("Sure, I can do that.") is False
+
+    def test_does_not_flag_empty_or_non_string(self) -> None:
+        assert looks_like_workflow_yaml_in_chat("") is False
+        assert looks_like_workflow_yaml_in_chat(None) is False
+        assert looks_like_workflow_yaml_in_chat(12345) is False
+
+    def test_detects_bare_block_type_line(self) -> None:
+        text = "Here's a small snippet:\n\n    - block_type: navigation\n      label: open_page\n"
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_unknown_block_type_value_does_not_trip(self) -> None:
+        text = "Diagnostic note:\n\n    block_type: experimental_thing\n    detail: not a real block\n"
+        assert looks_like_workflow_yaml_in_chat(text) is False
+
+    def test_detects_json_shape_block_paste(self) -> None:
+        text = (
+            "Here is the block as JSON:\n\n"
+            "```json\n"
+            "{\n"
+            '  "block_type": "navigation",\n'
+            '  "navigation_goal": "Fill the form.",\n'
+            '  "parameter_keys": ["name"]\n'
+            "}\n"
+            "```\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_inline_field_mention_does_not_trip(self) -> None:
+        text = (
+            "When the navigation_goal field is unset and the block_type is wrong, the block "
+            "will fail validation — those fields need to come from the user."
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is False

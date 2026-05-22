@@ -11,6 +11,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     redact_raw_secrets_for_prompt,
 )
 from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent, TurnIntentMode
+from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
 
@@ -44,6 +45,12 @@ class ProposalContext(BaseModel):
     latest_assistant_proposal: str
     original_chars: int
     truncated: bool = False
+
+
+class WorkflowChangeContext(BaseModel):
+    kind: str
+    rendered_summary: str
+    structural_diff_unavailable: bool = False
 
 
 class TranscriptContext(BaseModel):
@@ -85,6 +92,7 @@ class TurnContextPacket(BaseModel):
     turn_intent_summary: dict[str, Any]
     workflow_context: WorkflowContext | None = None
     proposal_context: ProposalContext | None = None
+    workflow_change_context: WorkflowChangeContext | None = None
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
@@ -92,7 +100,14 @@ class TurnContextPacket(BaseModel):
     omissions: list[TurnContextOmission] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
-        section_fields = ("workflow_context", "proposal_context", "run_context", "credential_context", "docs_context")
+        section_fields = (
+            "workflow_context",
+            "proposal_context",
+            "workflow_change_context",
+            "run_context",
+            "credential_context",
+            "docs_context",
+        )
         return {
             "mode": self.turn_intent_summary.get("mode"),
             "sections": [field for field in section_fields if getattr(self, field) is not None],
@@ -101,6 +116,7 @@ class TurnContextPacket(BaseModel):
             "workflow_truncated": bool(self.workflow_context and self.workflow_context.truncated),
             "proposal_truncated": bool(self.proposal_context and self.proposal_context.truncated),
             "run_truncated": bool(self.run_context and self.run_context.truncated),
+            "workflow_change_kind": self.workflow_change_context.kind if self.workflow_change_context else None,
         }
 
 
@@ -111,6 +127,7 @@ class TurnContextInputs(BaseModel):
     request_policy: RequestPolicy
     user_message: str = ""
     workflow_yaml: str = ""
+    prior_workflow_yaml: str = ""
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list)
     debug_run_info_text: str = ""
 
@@ -176,6 +193,7 @@ class TurnContextAssembler:
 
         workflow_context: WorkflowContext | None = None
         proposal_context: ProposalContext | None = None
+        workflow_change_context: WorkflowChangeContext | None = None
         run_context: RunContext | None = None
         credential_context: CredentialContext | None = None
         docs_context: DocsContext | None = None
@@ -231,6 +249,20 @@ class TurnContextAssembler:
                     )
                 )
 
+        if RequiredContextKey.WORKFLOW_CHANGE in required and inputs.prior_workflow_yaml.strip():
+            change_summary = summarize_user_workflow_change(
+                prior_yaml=inputs.prior_workflow_yaml,
+                current_yaml=inputs.workflow_yaml,
+            )
+            # Only surface the section when the user actually edited the workflow.
+            # An unchanged or first-turn baseline carries no signal the agent acts on.
+            if change_summary.kind is WorkflowChangeKind.USER_MODIFIED_SINCE_LAST_TURN:
+                workflow_change_context = WorkflowChangeContext(
+                    kind=change_summary.kind.value,
+                    rendered_summary=change_summary.render_prompt_block(),
+                    structural_diff_unavailable=change_summary.structural_diff_unavailable,
+                )
+
         if self._should_include_run_context(inputs.turn_intent, required):
             if inputs.debug_run_info_text.strip():
                 summary, original_chars, truncated = _bounded_text(inputs.debug_run_info_text, self.run_char_budget)
@@ -268,6 +300,7 @@ class TurnContextAssembler:
             turn_intent_summary=inputs.turn_intent.to_trace_data(),
             workflow_context=workflow_context,
             proposal_context=proposal_context,
+            workflow_change_context=workflow_change_context,
             transcript_context=transcript_context,
             run_context=run_context,
             credential_context=credential_context,

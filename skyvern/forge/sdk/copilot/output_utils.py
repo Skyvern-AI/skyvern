@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
+from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -168,6 +169,26 @@ def looks_like_workflow_delivery_claim(text: Any) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     return any(pattern.search(text) for pattern in _WORKFLOW_DELIVERY_CLAIM_PATTERNS)
+
+
+# A `block_type:` line whose value is a real BlockType, or a `workflow_definition:`
+# line — both keyed to canonical identifiers and anchored at line start, so inline
+# prose ("the block_type field") cannot trip them. The optional quote group also
+# matches the JSON serialization (`"block_type": "navigation"`).
+_BLOCK_TYPE_LINE_RE = re.compile(
+    r'^\s*-?\s*["\']?block_type["\']?\s*:\s*["\']?(?:' + "|".join(re.escape(bt.value) for bt in BlockType) + r")\b",
+    re.MULTILINE,
+)
+_WORKFLOW_DEFINITION_LINE_RE = re.compile(r'^\s*["\']?workflow_definition["\']?\s*:', re.MULTILINE)
+
+
+def looks_like_workflow_yaml_in_chat(text: Any) -> bool:
+    """Return True when ``text`` contains serialized Skyvern workflow YAML/JSON."""
+    if not isinstance(text, str):
+        return False
+    if "block_type" not in text and "workflow_definition" not in text:
+        return False
+    return bool(_WORKFLOW_DEFINITION_LINE_RE.search(text) or _BLOCK_TYPE_LINE_RE.search(text))
 
 
 def extract_screenshot_b64(result: dict[str, Any]) -> str | None:

@@ -174,3 +174,24 @@ def test_stop_and_no_change_decisions_preserve_current_behavior_shadow_only() ->
     assert no_change.diagnosis_result.suspected_failure_type == DiagnosisFailureType.NO_FAILURE
     assert no_change.repair_decision.next_action == RepairNextAction.NO_CHANGE
     assert no_change.verification_result.completion_contract_satisfied is True
+
+
+def test_unrecoverable_browser_session_contract_stops_with_blocker() -> None:
+    reason = "Browser session not found while taking screenshot (404)."
+    contract = build_diagnosis_repair_contract(
+        source_tool="get_browser_screenshot",
+        result={
+            "ok": False,
+            "error": reason,
+            "data": {
+                "overall_status": "aborted",
+                "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.remaining_blocker == reason

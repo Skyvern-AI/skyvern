@@ -288,6 +288,51 @@ def test_classifies_unbacked_workflow_delivery_claim() -> None:
     assert OutputPolicyReason.MISSING_PROPOSAL_STATE in verdict.reason_codes
 
 
+def test_flags_block_yaml_pasted_into_user_response() -> None:
+    user_response = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form using the supplied data.\n"
+        '      url: "{{ form_url }}"\n'
+        "      parameter_keys:\n"
+        "        - name\n"
+        "        - email\n"
+        "        - form_url\n"
+    )
+
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+        has_workflow_proposal=False,
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in verdict.reason_codes
+
+
+def test_block_yaml_in_reply_is_not_hard_blocking() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response=(
+            "Here is the change I'd make:\n\n"
+            "```yaml\n"
+            "block_type: navigation\n"
+            "navigation_goal: Submit the form.\n"
+            "label: submit_form\n"
+            "```\n"
+        ),
+        has_workflow_proposal=False,
+    )
+
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in verdict.reason_codes
+    hard = hard_block_output_policy_verdict(verdict)
+    assert OutputPolicyReason.WORKFLOW_YAML_IN_REPLY not in hard.reason_codes
+
+
 def test_allows_workflow_delivery_language_after_failed_workflow_attempt() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -692,11 +737,61 @@ def test_output_policy_credential_block_asks_for_credential_confirmation(
     )
 
     assert result.response_type == "ASK_QUESTION"
-    assert result.clear_proposed_workflow is True
+    assert result.clear_proposed_workflow is False
     response = result.user_response.lower()
     for term in expected_terms:
         assert term in response
     assert "I could not safely return" not in result.user_response
+
+
+def test_output_policy_block_preserves_already_gated_workflow_proposal() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+    ctx.workflow_persisted = True
+    ctx.last_test_ok = True
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.response_type == "ASK_QUESTION"
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.workflow_yaml == "title: Draft"
+    assert result.workflow_was_persisted is True
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_tested"
+    response = result.user_response.lower()
+    assert "chat reply" in response
+    assert "workflow draft" in response
+    assert "saved" in response
+
+
+def test_output_policy_specific_refusal_preserves_saved_draft_copy() -> None:
+    ctx = _ctx()
+    ctx.last_workflow = SimpleNamespace(name="draft")
+    ctx.last_workflow_yaml = "title: Draft"
+
+    result = agent_module._build_output_policy_blocked_result(
+        ctx,
+        OutputPolicyVerdict(
+            reason_codes=[OutputPolicyReason.RAW_SECRET_LEAK],
+        ),
+        prior_global_llm_context="{}",
+        prior_workflow_yaml="title: Prior",
+    )
+
+    assert result.updated_workflow is ctx.last_workflow
+    assert result.clear_proposed_workflow is False
+    assert result.proposal_disposition == "review_untested"
+    assert "raw credentials or secrets" in result.user_response
+    assert "chat reply" in result.user_response
+    assert "workflow draft is still saved" in result.user_response
 
 
 def test_scheduling_credential_policy_block_does_not_use_safety_refusal() -> None:
@@ -973,7 +1068,8 @@ workflow_definition:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     process_mock.assert_not_called()
 
 
@@ -990,7 +1086,8 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
 
     assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
-    assert agent_result.clear_proposed_workflow is True
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "no_proposal"
     assert "hunter2" not in agent_result.user_response
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
 
@@ -1075,6 +1172,75 @@ def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxo
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
     assert "task_v2" not in agent_result.user_response
     assert agent_result.updated_workflow is None
+
+
+def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None:
+    leak = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form.\n"
+        '      url: "{{ form_url }}"\n'
+        "      parameter_keys:\n"
+        "        - name\n"
+        "        - form_url\n"
+    )
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
+        agent_result = agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+
+    assert "block_type" not in agent_result.user_response
+    assert "navigation_goal" not in agent_result.user_response
+    assert "parameter_keys" not in agent_result.user_response
+    assert "haven't applied it yet" in agent_result.user_response
+    assert agent_result.updated_workflow is None
+    final_log = next(call for call in log_info.call_args_list if call.args[0] == "copilot output policy final verdict")
+    assert final_log.kwargs["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
+    assert final_log.kwargs["contained_failure"] is True
+    assert agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"] == ["workflow_yaml_in_reply"]
+    assert agent_result.output_policy_diagnostics["final_output_policy_allowed"] is True
+
+
+def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() -> None:
+    leak = (
+        "I've now updated the workflow to also accept the form's URL as a parameter, named `form_url`. "
+        "Here's how the block now looks:\n\n"
+        "    - label: navigate_and_fill_form\n"
+        "      block_type: navigation\n"
+        "      navigation_goal: Fill the abuse form.\n"
+        "      parameter_keys:\n"
+        "        - form_url\n"
+    )
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    workflow = SimpleNamespace(name="draft")
+    ctx = _ctx()
+    ctx.last_workflow = workflow
+    ctx.last_workflow_yaml = _workflow_yaml()
+    ctx.last_test_ok = True
+
+    agent_result = agent_module._translate_to_agent_result(
+        result,
+        ctx,
+        global_llm_context=None,
+        chat_request=_chat_request(),
+        organization_id="org-1",
+    )
+
+    assert "block_type" not in agent_result.user_response
+    assert "navigation_goal" not in agent_result.user_response
+    assert "parameter_keys" not in agent_result.user_response
+    assert "haven't applied it yet" not in agent_result.user_response
+    assert "made the change" in agent_result.user_response
+    assert agent_result.updated_workflow is workflow
 
 
 def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:

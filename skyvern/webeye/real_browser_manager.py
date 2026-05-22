@@ -34,8 +34,10 @@ class RealBrowserManager(BrowserManager):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        allow_content_blocking_extensions: bool = True,
     ) -> BrowserState:
         pw = await async_playwright().start()
         (
@@ -52,8 +54,10 @@ class RealBrowserManager(BrowserManager):
             script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             browser_address=browser_address,
             browser_profile_id=browser_profile_id,
+            allow_content_blocking_extensions=allow_content_blocking_extensions,
         )
         return RealBrowserState(
             pw=pw,
@@ -61,10 +65,20 @@ class RealBrowserManager(BrowserManager):
             page=None,
             browser_artifacts=browser_artifacts,
             browser_cleanup=browser_cleanup,
+            allow_content_blocking_extensions=allow_content_blocking_extensions,
         )
 
     def evict_page(self, page_id: str) -> None:
         self.pages.pop(page_id, None)
+
+    @staticmethod
+    def _browser_state_satisfies_content_blocking_policy(
+        browser_state: BrowserState,
+        allow_content_blocking_extensions: bool,
+    ) -> bool:
+        if allow_content_blocking_extensions:
+            return True
+        return getattr(browser_state, "allow_content_blocking_extensions", True) is False
 
     def get_for_task(self, task_id: str, workflow_run_id: str | None = None) -> BrowserState | None:
         if task_id in self.pages:
@@ -128,6 +142,7 @@ class RealBrowserManager(BrowserManager):
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
+                cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
             )
 
@@ -150,6 +165,7 @@ class RealBrowserManager(BrowserManager):
             workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
+            cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
         )
         return browser_state
@@ -160,19 +176,35 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        allow_content_blocking_extensions: bool = True,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
         if browser_profile_id is None:
             browser_profile_id = workflow_run.browser_profile_id
+        effective_allow_content_blocking_extensions = allow_content_blocking_extensions and not bool(browser_profile_id)
+        sync_parent_browser_state = bool(parent_workflow_run_id and not browser_session_id)
 
         # Check own cache entry first so navigate_to_url is only called on the first step.
         # Don't pass parent_workflow_run_id here — that lookup is deferred to the block
         # below so PBS runs don't accidentally inherit the parent's browser.
         browser_state = self.get_for_workflow_run(workflow_run_id=workflow_run_id)
         if browser_state:
-            LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
-            return browser_state
+            if self._browser_state_satisfies_content_blocking_policy(
+                browser_state,
+                allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+            ):
+                LOG.debug("Returning cached browser state for workflow run", workflow_run_id=workflow_run_id)
+                return browser_state
+            LOG.warning(
+                "Skipping cached browser state because requested extension policy is stricter than launch policy",
+                workflow_run_id=workflow_run_id,
+                requested_allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                cached_allow_content_blocking_extensions=getattr(
+                    browser_state, "allow_content_blocking_extensions", None
+                ),
+            )
+            self.pages.pop(workflow_run_id, None)
 
         # When an explicit browser_session_id is provided (e.g. from a workflow
         # trigger block), skip the parent workflow lookup so the child uses the
@@ -184,11 +216,27 @@ class RealBrowserManager(BrowserManager):
                 workflow_run_id=workflow_run_id, parent_workflow_run_id=parent_workflow_run_id
             )
             if browser_state:
-                # always keep the browser state for the workflow run and the parent workflow run synced
-                self.pages[workflow_run_id] = browser_state
-                if parent_workflow_run_id:
-                    self.pages[parent_workflow_run_id] = browser_state
-                return browser_state
+                if not self._browser_state_satisfies_content_blocking_policy(
+                    browser_state,
+                    allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                ):
+                    LOG.warning(
+                        "Skipping inherited browser state because requested extension policy is stricter than launch policy",
+                        workflow_run_id=workflow_run_id,
+                        parent_workflow_run_id=parent_workflow_run_id,
+                        requested_allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                        inherited_allow_content_blocking_extensions=getattr(
+                            browser_state, "allow_content_blocking_extensions", None
+                        ),
+                    )
+                    browser_state = None
+                    sync_parent_browser_state = False
+                else:
+                    # always keep the browser state for the workflow run and the parent workflow run synced
+                    self.pages[workflow_run_id] = browser_state
+                    if parent_workflow_run_id:
+                        self.pages[parent_workflow_run_id] = browser_state
+                    return browser_state
 
         if browser_session_id:
             LOG.info(
@@ -203,13 +251,28 @@ class RealBrowserManager(BrowserManager):
                     "Browser state not found in persistent sessions manager", browser_session_id=browser_session_id
                 )
             else:
-                LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
-                page = await browser_state.get_working_page()
-                if page:
-                    if url:
-                        await browser_state.navigate_to_url(page=page, url=url)
+                if not self._browser_state_satisfies_content_blocking_policy(
+                    browser_state,
+                    allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                ):
+                    LOG.warning(
+                        "Ignoring browser session state because requested extension policy is stricter than launch policy",
+                        browser_session_id=browser_session_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        requested_allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                        session_allow_content_blocking_extensions=getattr(
+                            browser_state, "allow_content_blocking_extensions", None
+                        ),
+                    )
+                    browser_state = None
                 else:
-                    LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
+                    LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                    page = await browser_state.get_working_page()
+                    if page:
+                        if url:
+                            await browser_state.navigate_to_url(page=page, url=url)
+                    else:
+                        LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
 
         if browser_state is None:
             LOG.info(
@@ -223,6 +286,15 @@ class RealBrowserManager(BrowserManager):
                 )
                 if session and session.proxy_location is not None:
                     proxy_location = session.proxy_location
+            if browser_profile_id:
+                LOG.info(
+                    "Content-blocking extensions disabled for browser profile launch",
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    browser_profile_id=browser_profile_id,
+                    requested_allow_content_blocking_extensions=allow_content_blocking_extensions,
+                    allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
+                )
             browser_state = await self._create_browser_state(
                 proxy_location=proxy_location,
                 url=url,
@@ -230,8 +302,10 @@ class RealBrowserManager(BrowserManager):
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
+                allow_content_blocking_extensions=effective_allow_content_blocking_extensions,
             )
 
             if browser_session_id:
@@ -245,7 +319,7 @@ class RealBrowserManager(BrowserManager):
         # browser.  When an explicit browser_session_id is provided the child
         # has its own browser, and overwriting the parent's entry would break
         # subsequent parent blocks.
-        if parent_workflow_run_id and not browser_session_id:
+        if sync_parent_browser_state and parent_workflow_run_id:
             self.pages[parent_workflow_run_id] = browser_state
 
         # The URL here is only used when creating a new page, and not when using an existing page.
@@ -257,6 +331,7 @@ class RealBrowserManager(BrowserManager):
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
         )

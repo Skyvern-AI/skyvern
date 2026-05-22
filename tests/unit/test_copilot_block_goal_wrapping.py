@@ -7,11 +7,13 @@ Covers wrapping of ``navigation_goal``, ``complete_criterion``, and
 from __future__ import annotations
 
 import textwrap
+from types import SimpleNamespace
 
 import yaml
 
 from skyvern.constants import MINI_GOAL_TEMPLATE
-from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals
+from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_block_goals, wrap_workflow_block_goals
+from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 
 USER_MESSAGE = "Submit a contact form on example.com with my details."
 
@@ -20,7 +22,7 @@ def _yaml_with_blocks(*blocks: dict) -> str:
     return yaml.safe_dump(
         {
             "title": "test workflow",
-            "workflow_definition": {"blocks": list(blocks)},
+            "workflow_definition": {"parameters": [], "blocks": list(blocks)},
         },
         sort_keys=False,
     )
@@ -343,3 +345,104 @@ def test_returns_input_unchanged_when_blocks_not_list() -> None:
     out = wrap_block_goals(src, USER_MESSAGE)
 
     assert out == src
+
+
+def test_wrap_workflow_block_goals_wraps_runtime_copy_only() -> None:
+    workflow = _process_workflow_yaml(
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        workflow_yaml=_yaml_with_blocks(
+            {
+                "block_type": "navigation",
+                "label": "submit",
+                "navigation_goal": "Submit the contact form.",
+                "complete_criterion": "The confirmation page is visible.",
+            }
+        ),
+    )
+
+    wrapped = wrap_workflow_block_goals(workflow, USER_MESSAGE)
+
+    original_block = workflow.workflow_definition.blocks[0]
+    wrapped_block = wrapped.workflow_definition.blocks[0]
+    assert original_block.navigation_goal == "Submit the contact form."
+    assert original_block.complete_criterion == "The confirmation page is visible."
+    assert wrapped_block.navigation_goal == _wrapped("Submit the contact form.")
+    assert wrapped_block.complete_criterion == _wrapped("The confirmation page is visible.")
+    assert wrapped is not workflow
+
+
+def test_wrap_workflow_block_goals_recurses_into_loop_blocks() -> None:
+    workflow = _process_workflow_yaml(
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        workflow_yaml=yaml.safe_dump(
+            {
+                "title": "loop workflow",
+                "workflow_definition": {
+                    "parameters": [
+                        {
+                            "parameter_type": "workflow",
+                            "key": "items",
+                            "workflow_parameter_type": "json",
+                            "default_value": '["alpha"]',
+                        }
+                    ],
+                    "blocks": [
+                        {
+                            "block_type": "for_loop",
+                            "label": "loop",
+                            "loop_over_parameter_key": "items",
+                            "loop_blocks": [
+                                {
+                                    "block_type": "navigation",
+                                    "label": "inner_nav",
+                                    "navigation_goal": "Process each item.",
+                                },
+                                {
+                                    "block_type": "validation",
+                                    "label": "inner_check",
+                                    "complete_criterion": "The item is processed.",
+                                },
+                            ],
+                        }
+                    ],
+                },
+            },
+            sort_keys=False,
+        ),
+    )
+
+    wrapped = wrap_workflow_block_goals(workflow, USER_MESSAGE)
+
+    original_loop_blocks = workflow.workflow_definition.blocks[0].loop_blocks
+    wrapped_loop_blocks = wrapped.workflow_definition.blocks[0].loop_blocks
+    assert original_loop_blocks[0].navigation_goal == "Process each item."
+    assert original_loop_blocks[1].complete_criterion == "The item is processed."
+    assert wrapped_loop_blocks[0].navigation_goal == _wrapped("Process each item.")
+    assert wrapped_loop_blocks[1].complete_criterion == _wrapped("The item is processed.")
+
+
+def test_wrap_workflow_block_goals_skips_copy_when_no_runtime_mutation_needed() -> None:
+    parsed_workflow = _process_workflow_yaml(
+        workflow_id="w_test",
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+        workflow_yaml=_yaml_with_blocks(
+            {
+                "block_type": "navigation",
+                "label": "submit",
+                "navigation_goal": _wrapped("Submit the contact form."),
+                "complete_criterion": _wrapped("The confirmation page is visible."),
+            }
+        ),
+    )
+
+    def fail_model_copy(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("model_copy should not run when block goals do not need wrapping")
+
+    workflow = SimpleNamespace(workflow_definition=parsed_workflow.workflow_definition, model_copy=fail_model_copy)
+
+    assert wrap_workflow_block_goals(workflow, USER_MESSAGE) is workflow
