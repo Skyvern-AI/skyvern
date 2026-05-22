@@ -330,6 +330,10 @@ async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult,
         # auto-accept toggle.
         await _clear_proposed_workflow(chat)
     elif (
+        # This intentionally checks the raw setting, not
+        # ``auto_accept_effective``: no-proposal OutputPolicy blocks are not
+        # auto-applicable, but ordinary auto-accept turns still need to clear a
+        # stale unvalidated card because the UI has no review panel for it.
         chat.auto_accept is True
         and chat.proposed_workflow is not None
         and chat.proposed_workflow.get("_copilot_unvalidated") is True
