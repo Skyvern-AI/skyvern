@@ -1283,6 +1283,19 @@ class ForgeAgent:
             actions_and_results=None,
             cua_response=None,
         )
+        current_artifact_task: asyncio.Task | None = None
+
+        async def await_background_artifact_task() -> None:
+            nonlocal current_artifact_task
+            if current_artifact_task is None:
+                return
+            task = current_artifact_task
+            current_artifact_task = None
+            try:
+                await task
+            except Exception:
+                LOG.warning("Background artifact task failed, continuing", exc_info=True)
+
         try:
             LOG.info(
                 "Starting agent step",
@@ -1623,6 +1636,8 @@ class ForgeAgent:
 
             element_id_to_last_action: dict[str, int] = dict()
             for action_idx, action_node in enumerate(action_linked_list):
+                await await_background_artifact_task()
+
                 context = skyvern_context.ensure_context()
                 if context.refresh_working_page:
                     LOG.warning(
@@ -1646,7 +1661,9 @@ class ForgeAgent:
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
                     action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
-                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    current_artifact_task = asyncio.create_task(
+                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    )
                     break
 
                 action = action_node.action
@@ -1759,7 +1776,9 @@ class ForgeAgent:
                 )
                 await asyncio.sleep(wait_time)
                 if not is_page_level_scroll:
-                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    current_artifact_task = asyncio.create_task(
+                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    )
                 else:
                     LOG.info(
                         "Skipping post-action artifacts for page-level scroll",
@@ -1840,6 +1859,8 @@ class ForgeAgent:
                         output=detailed_agent_step_output.to_agent_step_output(),
                     )
                     return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+
+            await await_background_artifact_task()
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
@@ -1952,6 +1973,8 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+        finally:
+            await await_background_artifact_task()
 
     async def _generate_cua_actions(
         self,
