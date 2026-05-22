@@ -247,12 +247,11 @@ class SkyvernOverlayMCPServer(MCPServer):
             mcp_args["session_id"] = copilot_ctx.browser_session_id
 
         try:
-            call = self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
             if overlay.requires_browser:
                 async with mcp_browser_context(copilot_ctx):
-                    raw_result = await call
+                    raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
             else:
-                raw_result = await call
+                raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
         except Exception as e:
             LOG.warning(
                 "MCP tool call failed",

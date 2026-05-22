@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 import structlog
 
 from .api_key_hash import hash_api_key_for_cache
-from .client import get_active_api_key, get_skyvern
+from .client import get_active_api_key, get_skyvern, has_api_key_override
 from .result import BrowserContext, ErrorCode, make_error
 
 LOG = structlog.get_logger(__name__)
@@ -212,14 +212,12 @@ async def resolve_browser(
     # Check copilot session registry (cross-task fallback when ContextVar
     # does not propagate through FastMCP in-process transport).
     registered = _copilot_sessions.get(session_id) if session_id else None
-    if (
-        registered is not None
-        and registered.browser is not None
-        and registered.context is not None
-        and _hashes_equal(registered.api_key_hash, active_api_key_hash)
-    ):
-        _current_session.set(registered)
-        return registered.browser, registered.context
+    if registered is not None and registered.browser is not None and registered.context is not None:
+        if _hashes_equal(registered.api_key_hash, active_api_key_hash) or not has_api_key_override():
+            # FastMCP in-process tool tasks may miss the parent ContextVar.
+            # Explicit request overrides still win; otherwise use the temporary Copilot registry.
+            _current_session.set(registered)
+            return registered.browser, registered.context
 
     browser: SkyvernBrowser | None = None
     try:

@@ -6,10 +6,11 @@ Covers the three helpers added by the fix:
   - ``_trim_branch_evaluations`` / ``_cap_debug_field`` (Layer 3: DecisionBlock filter)
 """
 
+import json
 from typing import Any
 from unittest.mock import patch
 
-from skyvern.forge.sdk.db.utils import truncate_oversized_jsonb_value
+from skyvern.forge.sdk.db.utils import _custom_json_serializer, truncate_oversized_jsonb_value
 from skyvern.forge.sdk.workflow.models.block import (
     DECISION_BLOCK_FIELD_MAX_BYTES,
     _cap_debug_field,
@@ -205,3 +206,30 @@ def test_trim_branch_evaluations_caps_matched_branch_rendered_expression() -> No
 def test_trim_branch_evaluations_handles_empty_or_none() -> None:
     assert _trim_branch_evaluations(None) is None
     assert _trim_branch_evaluations([]) == []
+
+
+def test_custom_json_serializer_strips_nul_in_default_ascii_mode() -> None:
+    """PG text/jsonb cannot store NUL — default ensure_ascii=True emits the 6-char \\u0000 escape."""
+    serialized = _custom_json_serializer({"key\x00with\x00nul": "value\x00with\x00nul", "nested": ["a\x00b"]})
+    assert "\\u0000" not in serialized
+    assert "\x00" not in serialized
+    assert json.loads(serialized) == {"keywithnul": "valuewithnul", "nested": ["ab"]}
+
+
+def test_custom_json_serializer_strips_nul_in_ensure_ascii_false_mode() -> None:
+    """Same scrub when ensure_ascii=False emits literal NUL bytes instead of escapes."""
+    serialized = _custom_json_serializer({"a": "hi\x00there"}, ensure_ascii=False)
+    assert "\x00" not in serialized
+
+
+def test_custom_json_serializer_passes_clean_payload_unchanged() -> None:
+    serialized = _custom_json_serializer({"a": "clean", "b": [1, 2, 3]})
+    assert serialized == '{"a": "clean", "b": [1, 2, 3]}'
+
+
+def test_custom_json_serializer_preserves_literal_unicode_escape_strings() -> None:
+    """Regression: only actual NUL bytes get stripped, not user strings that literally spell out an escape."""
+    literal_six_chars = "\\u0000"
+    payload = {"x": literal_six_chars, "y": "abc" + literal_six_chars + "def"}
+    serialized = _custom_json_serializer(payload)
+    assert json.loads(serialized) == payload

@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,6 +38,7 @@ from skyvern.forge.sdk.copilot.tools import (
     RUN_BLOCKS_SAFETY_CEILING_SECONDS,
     RUN_BLOCKS_STAGNATION_WINDOW_SECONDS,
     _any_quiet_block_requested,
+    _fallback_page_info,
     _progress_marker,
     _read_progress_sources,
     _tool_loop_error,
@@ -244,6 +246,29 @@ class _ErrorCtx:
 
     organization_id = "o_test"
     browser_session_id = None
+
+
+@pytest.mark.asyncio
+async def test_fallback_page_info_uses_persistent_session_state_without_sdk_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from skyvern.forge import app as forge_app
+
+    page = SimpleNamespace(url="https://example.test/current", title=AsyncMock(return_value="Current page"))
+    browser_state = SimpleNamespace(get_or_create_page=AsyncMock(return_value=page))
+    session_manager = SimpleNamespace(get_browser_state=AsyncMock(return_value=browser_state))
+    monkeypatch.setattr(forge_app, "PERSISTENT_SESSIONS_MANAGER", session_manager)
+
+    ctx = SimpleNamespace(organization_id="o_test", browser_session_id="pbs_copilot")
+
+    current_url, page_title = await _fallback_page_info(ctx)
+
+    assert current_url == "https://example.test/current"
+    assert page_title == "Current page"
+    session_manager.get_browser_state.assert_awaited_once_with(
+        session_id="pbs_copilot",
+        organization_id="o_test",
+    )
 
 
 @pytest.mark.asyncio

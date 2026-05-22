@@ -362,6 +362,7 @@ class KeypressAction(Action):
     keys: list[str] = []
     hold: bool = False
     duration: int = 0
+    repeat: int = 1
 
 
 class GotoUrlAction(Action):

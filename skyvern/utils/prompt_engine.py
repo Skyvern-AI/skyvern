@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
+from skyvern.exceptions import SkyvernContextWindowExceededError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
 from skyvern.utils.token_counter import count_tokens
@@ -224,7 +225,7 @@ def enforce_prompt_ceiling_tracked(
         final_token_count=final_token_count,
         hard_ceiling=PROMPT_HARD_CEILING_TOKENS,
     )
-    return prompt, working_kwargs
+    raise SkyvernContextWindowExceededError(prompt_name=template_name)
 
 
 def enforce_prompt_ceiling(

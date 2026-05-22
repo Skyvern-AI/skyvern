@@ -1,5 +1,5 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract.
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; raw_secret_evidence.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -23,6 +23,10 @@ completion_contract:
 - Set to the user's explicit done/complete/success condition when they provide one.
 - The value must be an exact span copied from the latest user message. Do not paraphrase, summarize, or infer a completion condition.
 - Set to null when the user does not provide an explicit completion condition.
+
+raw_secret_evidence:
+- When credential_input_kind=raw_secret, set this to the verbatim substring of the LATEST user message that is the pasted secret value (e.g. the password string, JWT, API key, OTP digits, or PEM body). Do not paraphrase. Do not cite a token that appears only in prior turns or in the workflow_yaml — the substring must occur in the latest user message.
+- Set to null in every other case, including when prior turns contained pasted credentials but the latest message does not.
 
 clarification_reason:
 - none: no clarification is needed.

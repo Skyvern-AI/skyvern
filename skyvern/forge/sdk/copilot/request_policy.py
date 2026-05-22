@@ -131,6 +131,7 @@ class RequestPolicy:
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
     raw_secret_detected: bool = False
+    raw_secret_evidence: str | None = None
     clarification_reason: ClarificationReason = "none"
 
     def to_trace_data(self) -> dict[str, Any]:
@@ -144,6 +145,7 @@ class RequestPolicy:
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
             "raw_secret_detected": self.raw_secret_detected,
+            "has_raw_secret_evidence": self.raw_secret_evidence is not None,
         }
 
     def prompt_summary(self) -> str:
@@ -375,6 +377,17 @@ def contains_email_password_pair(text: str) -> bool:
     return bool(_email_password_pair_segments(text))
 
 
+_MIN_RAW_SECRET_EVIDENCE_CHARS = 4
+
+
+def _verify_raw_secret_evidence(evidence: str | None, user_message: str) -> bool:
+    if not evidence or len(evidence) < _MIN_RAW_SECRET_EVIDENCE_CHARS:
+        return False
+    if evidence not in (user_message or ""):
+        return False
+    return any(c.isdigit() or (not c.isalnum() and not c.isspace()) for c in evidence)
+
+
 def _coerce_clarification_reason(value: Any) -> ClarificationReason:
     if value in _VALID_CLARIFICATION_REASONS:
         return cast(ClarificationReason, value)
@@ -399,6 +412,8 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
     credential_input_kind = raw.get("credential_input_kind")
     completion_contract_raw = raw.get("completion_contract")
     completion_contract = completion_contract_raw.strip() if isinstance(completion_contract_raw, str) else None
+    evidence_raw = raw.get("raw_secret_evidence")
+    raw_secret_evidence = evidence_raw if isinstance(evidence_raw, str) and evidence_raw.strip() else None
     policy = RequestPolicy(
         testing_intent=testing_intent if testing_intent in _TESTING_INTENTS else "unspecified",
         credential_input_kind=credential_input_kind if credential_input_kind in _KINDS else "none",
@@ -406,6 +421,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
+        raw_secret_evidence=raw_secret_evidence,
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
     )
     if policy.credential_input_kind == "raw_secret":
@@ -491,6 +507,20 @@ async def _classify_request(
         policy.testing_intent = "unspecified"
     if ids and policy.credential_input_kind in ("none", "placeholder"):
         policy.credential_input_kind = "credential_id"
+    if policy.credential_input_kind == "raw_secret" and not _verify_raw_secret_evidence(
+        policy.raw_secret_evidence, user_message
+    ):
+        # The classifier claimed raw_secret but cited no verifiable secret in
+        # the latest message — typically a token carried over from a prior turn.
+        # Clear the claim so the turn classifies on its own merits downstream.
+        LOG.warning(
+            "request-policy raw_secret claim failed evidence verification; clearing",
+            evidence_cited=policy.raw_secret_evidence is not None,
+        )
+        policy.credential_input_kind = "credential_id" if ids else "none"
+        policy.clarification_reason = "none"
+        policy.requires_user_clarification = False
+        policy.raw_secret_evidence = None
     return policy
 
 

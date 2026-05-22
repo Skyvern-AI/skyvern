@@ -113,3 +113,31 @@ def test_parse_keypress_no_key_defaults_to_enter() -> None:
     )
     assert isinstance(action, KeypressAction)
     assert action.keys == ["Enter"]
+
+
+def test_parse_keypress_repeat_field() -> None:
+    action = parse_action(
+        action={"action_type": "KEYPRESS", "key": "ArrowDown", "repeat": 3, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, KeypressAction)
+    assert action.keys == ["ArrowDown"]
+    assert action.repeat == 3
+
+
+def test_parse_keypress_repeat_defaults_to_one() -> None:
+    action = parse_action(
+        action={"action_type": "KEYPRESS", "key": "Enter", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, KeypressAction)
+    assert action.repeat == 1
+
+
+def test_parse_keypress_repeat_clamped_to_minimum_one() -> None:
+    action = parse_action(
+        action={"action_type": "KEYPRESS", "key": "Enter", "repeat": 0, "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, KeypressAction)
+    assert action.repeat == 1
