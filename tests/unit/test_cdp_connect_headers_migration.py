@@ -4,17 +4,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy.exc import DBAPIError
 
-MIGRATION_DIR = Path(__file__).resolve().parents[2] / "alembic/versions"
-
-
-def _find_migration_path() -> Path:
-    paths = [
-        path
-        for path in sorted(MIGRATION_DIR.glob("*_add_cdp_connect_headers.py"))
-        if "_execute_with_retry" in path.read_text()
-    ]
-    assert len(paths) == 1
-    return paths[0]
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2] / "alembic/versions/2026_05_14_1500-6cd1d6f3f734_add_cdp_connect_headers.py"
+)
 
 
 class _OrigLockError(Exception):
@@ -44,7 +36,7 @@ class _FakeOp:
 
 
 def _load_migration_module():
-    spec = importlib.util.spec_from_file_location("cdp_connect_headers_migration", _find_migration_path())
+    spec = importlib.util.spec_from_file_location("cdp_connect_headers_migration", MIGRATION_PATH)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -60,6 +52,7 @@ def test_retry_uses_nowait_lock_and_rolls_back_failed_attempts(monkeypatch: pyte
     monkeypatch.setattr(migration, "op", fake_op)
     monkeypatch.setattr(migration.time, "sleep", sleeps.append)
     monkeypatch.setattr(migration.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(migration.random, "random", lambda: 0.5)
 
     migration._execute_with_retry(
         "tasks",
@@ -67,7 +60,7 @@ def test_retry_uses_nowait_lock_and_rolls_back_failed_attempts(monkeypatch: pyte
         deadline=100.0,
     )
 
-    assert sleeps == [5, 5]
+    assert sleeps == [0.625, 0.625]
     assert fake_op.statements == [
         "BEGIN",
         "SET LOCAL statement_timeout = '5s'",
@@ -93,6 +86,7 @@ def test_retry_stops_when_deadline_is_exhausted(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(migration, "op", fake_op)
     monkeypatch.setattr(migration.time, "sleep", sleeps.append)
     monkeypatch.setattr(migration.time, "monotonic", lambda: 101.0)
+    monkeypatch.setattr(migration.random, "random", lambda: 0.5)
 
     with pytest.raises(DBAPIError):
         migration._execute_with_retry(
@@ -118,6 +112,7 @@ def test_retry_recognizes_pgcode_lock_errors(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(migration, "op", fake_op)
     monkeypatch.setattr(migration.time, "sleep", sleeps.append)
     monkeypatch.setattr(migration.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(migration.random, "random", lambda: 1.0)
 
     migration._execute_with_retry(
         "tasks",
@@ -125,7 +120,7 @@ def test_retry_recognizes_pgcode_lock_errors(monkeypatch: pytest.MonkeyPatch) ->
         deadline=100.0,
     )
 
-    assert sleeps == [5]
+    assert sleeps == [1.0]
     assert fake_op.statements == [
         "BEGIN",
         "SET LOCAL statement_timeout = '5s'",
@@ -147,6 +142,7 @@ def test_retry_aborts_when_rollback_fails(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(migration, "op", fake_op)
     monkeypatch.setattr(migration.time, "sleep", sleeps.append)
     monkeypatch.setattr(migration.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(migration.random, "random", lambda: 0.5)
 
     with pytest.raises(RuntimeError, match="rollback failed"):
         migration._execute_with_retry(
@@ -164,7 +160,27 @@ def test_retry_aborts_when_rollback_fails(monkeypatch: pytest.MonkeyPatch) -> No
     ]
 
 
-def test_retry_budget_stays_under_ten_minutes() -> None:
+def test_retry_budget_is_twenty_minutes() -> None:
     migration = _load_migration_module()
 
-    assert migration._MIGRATION_RETRY_SECONDS == 10 * 60
+    assert migration._MIGRATION_RETRY_SECONDS == 20 * 60
+
+
+def test_retry_backoff_samples_sub_second_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    migration = _load_migration_module()
+    fake_op = _FakeOp(lock_failures=2)
+    sleeps: list[float] = []
+    draws = iter([0.0, 1.0])
+
+    monkeypatch.setattr(migration, "op", fake_op)
+    monkeypatch.setattr(migration.time, "sleep", sleeps.append)
+    monkeypatch.setattr(migration.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(migration.random, "random", lambda: next(draws))
+
+    migration._execute_with_retry(
+        "tasks",
+        'ALTER TABLE "tasks" ADD COLUMN IF NOT EXISTS cdp_connect_headers JSON',
+        deadline=100.0,
+    )
+
+    assert sleeps == [0.25, 1.0]
