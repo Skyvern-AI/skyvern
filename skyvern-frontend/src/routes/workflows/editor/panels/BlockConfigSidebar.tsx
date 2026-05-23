@@ -294,7 +294,7 @@ function BlockConfigSidebar({ onAddNode }: BlockConfigSidebarProps) {
       }}
       style={{
         position: "absolute",
-        top: "2rem",
+        top: mode === "build" ? "7rem" : "2rem",
         right: "1.5rem",
         bottom: "1.5rem",
       }}

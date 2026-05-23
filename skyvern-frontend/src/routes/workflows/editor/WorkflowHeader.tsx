@@ -1,7 +1,7 @@
 import {
+  CalendarIcon,
   ChevronDownIcon,
   ChevronUpIcon,
-  ClockIcon,
   CodeIcon,
   CopyIcon,
   PlayIcon,
@@ -439,7 +439,7 @@ function EditorActionToolbar() {
       <PanelToggleButton
         content="schedules"
         label="Schedule"
-        leadingIcon={<ClockIcon className="h-5 w-5" />}
+        leadingIcon={<CalendarIcon className="h-5 w-5" />}
         iconOnly
       />
       <PanelToggleButton content="parameters" label="Parameters" />
