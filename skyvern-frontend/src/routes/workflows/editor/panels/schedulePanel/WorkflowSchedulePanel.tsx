@@ -17,11 +17,15 @@ import {
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { ScheduleCard } from "./ScheduleCard";
 import { CreateScheduleDialog } from "./CreateScheduleDialog";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import { Cross2Icon, ReloadIcon } from "@radix-ui/react-icons";
 import { useState } from "react";
 import { useParams } from "react-router-dom";
 
-function WorkflowSchedulePanel() {
+type Props = {
+  onClose?: () => void;
+};
+
+function WorkflowSchedulePanel({ onClose }: Props) {
   const {
     data: schedules,
     isLoading,
@@ -82,11 +86,24 @@ function WorkflowSchedulePanel() {
           Schedules
           {schedules && schedules.length > 0 ? ` (${schedules.length})` : ""}
         </h3>
-        <CreateScheduleDialog
-          workflowParameters={workflowParameters}
-          onSubmit={handleCreate}
-          isPending={createSchedule.isPending}
-        />
+        <div className="flex items-center gap-2">
+          <CreateScheduleDialog
+            workflowParameters={workflowParameters}
+            onSubmit={handleCreate}
+            isPending={createSchedule.isPending}
+          />
+          {onClose && (
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Close"
+              className="size-7"
+              onClick={onClose}
+            >
+              <Cross2Icon className="size-4" />
+            </Button>
+          )}
+        </div>
       </div>
 
       <ScrollArea>

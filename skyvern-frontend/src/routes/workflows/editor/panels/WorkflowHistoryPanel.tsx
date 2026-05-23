@@ -1,3 +1,4 @@
+import { Cross2Icon } from "@radix-ui/react-icons";
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -13,6 +14,7 @@ import {
 
 type Props = {
   workflowPermanentId: string;
+  onClose?: () => void;
   onCompare?: (
     version1: WorkflowVersion,
     version2: WorkflowVersion,
@@ -20,7 +22,11 @@ type Props = {
   ) => void;
 };
 
-function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
+function WorkflowHistoryPanel({
+  workflowPermanentId,
+  onClose,
+  onCompare,
+}: Props) {
   const { data: versions, isLoading } = useWorkflowVersionsQuery({
     workflowPermanentId,
   });
@@ -95,8 +101,21 @@ function WorkflowHistoryPanel({ workflowPermanentId, onCompare }: Props) {
       <div className="flex-shrink-0 p-4 pb-3">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Workflow History</h2>
-          <div className="text-sm text-muted-foreground">
-            {selectedVersions.size}/2 selected
+          <div className="flex items-center gap-2">
+            <div className="text-sm text-muted-foreground">
+              {selectedVersions.size}/2 selected
+            </div>
+            {onClose && (
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="Close"
+                className="size-7"
+                onClick={onClose}
+              >
+                <Cross2Icon className="size-4" />
+              </Button>
+            )}
           </div>
         </div>
         <p className="mt-1 text-sm text-muted-foreground">

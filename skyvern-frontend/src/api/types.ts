@@ -595,6 +595,8 @@ export type WorkflowRunStatusApiResponse = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
+  credits_used: number;
+  cached_credits_used: number;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;
@@ -629,6 +631,8 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   downloaded_file_urls: Array<string> | null;
   total_steps: number | null;
   total_cost: number | null;
+  credits_used: number;
+  cached_credits_used: number;
   task_v2: TaskV2 | null;
   workflow_title: string | null;
   browser_session_id: string | null;

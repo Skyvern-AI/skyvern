@@ -6,6 +6,7 @@ from typing import Any, cast
 import pytest
 from playwright.async_api import Playwright
 
+import skyvern.webeye.browser_factory as browser_factory
 import skyvern.webeye.cdp_connection as cdp_connection
 from skyvern.webeye.cdp_connection import (
     build_cdp_connect_headers,
@@ -104,6 +105,37 @@ async def test_connect_over_cdp_retries_resolved_host_with_headers(monkeypatch: 
     assert fake_playwright.chromium.calls == [
         ("http://host.docker.internal:9222/", 120000, headers),
         ("http://192.168.65.254:9222/", 120000, headers),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_cdp_connection_browser_passes_headers_to_configured_cdp_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str] | None, dict[str, str] | None]] = []
+
+    async def fake_connect_to_cdp_browser(
+        playwright: Playwright,
+        remote_browser_url: str,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        apply_download_behaviour: bool = False,
+    ) -> tuple[object, object, object]:
+        calls.append((remote_browser_url, extra_http_headers, cdp_connect_headers))
+        return object(), object(), object()
+
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_TYPE", "chromium-headful")
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_REMOTE_DEBUGGING_URL", "http://browser.example:9222")
+    monkeypatch.setattr(browser_factory, "_connect_to_cdp_browser", fake_connect_to_cdp_browser)
+
+    await browser_factory._create_cdp_connection_browser(
+        cast(Playwright, object()),
+        extra_http_headers={"user-agent": "test"},
+        cdp_connect_headers={"x-api-key": "secret"},
+    )
+
+    assert calls == [
+        ("http://browser.example:9222", {"user-agent": "test"}, {"x-api-key": "secret"}),
     ]
 
 
