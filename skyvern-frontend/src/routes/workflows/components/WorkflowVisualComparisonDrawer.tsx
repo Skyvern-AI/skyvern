@@ -109,6 +109,9 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
+    cdpConnectHeaders: version.cdp_connect_headers
+      ? JSON.stringify(version.cdp_connect_headers)
+      : null,
     runWith: version.run_with ?? "agent",
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
@@ -221,7 +224,7 @@ function WorkflowComparisonRenderer({
       <div className="h-[calc(100%-3rem)] rounded-lg border bg-white">
         <FlowRenderer
           hideBackground={false}
-          hideControls={true}
+          readOnly
           nodes={nodes}
           edges={edges}
           setNodes={setNodes}
@@ -329,23 +332,27 @@ function WorkflowVisualComparisonDrawer({
 
         {/* Content */}
         <div className="flex flex-1 overflow-hidden">
-          <ReactFlowProvider>
-            <div className="grid flex-1 grid-cols-2 gap-4 p-6">
-              {/* Version 1 Column */}
+          <div className="grid flex-1 grid-cols-2 gap-4 p-6">
+            {/* Version 1 Column */}
+            <ReactFlowProvider>
               <WorkflowComparisonRenderer
+                key={`k1-${version1.workflow_id}v${version1.version}`}
                 version={version1}
                 title={`Version ${version1.version}`}
                 blockColors={version1BlockColors}
               />
+            </ReactFlowProvider>
 
-              {/* Version 2 Column */}
+            {/* Version 2 Column */}
+            <ReactFlowProvider>
               <WorkflowComparisonRenderer
+                key={`k2-${version2.workflow_id}v${version2.version}`}
                 version={version2}
                 title={`Version ${version2.version}`}
                 blockColors={version2BlockColors}
               />
-            </div>
-          </ReactFlowProvider>
+            </ReactFlowProvider>
+          </div>
         </div>
       </div>
     </div>
