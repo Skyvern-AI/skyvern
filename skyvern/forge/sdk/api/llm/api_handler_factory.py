@@ -765,13 +765,28 @@ class LLMAPIHandlerFactory:
         else:
             fallback_groups = list(llm_config.fallback_model_group)
 
+        # Emit one fallbacks entry per non-terminal hop so secondary entry points
+        # (e.g. truncation retry that calls router.acompletion(model=fallback_groups[0]))
+        # also benefit from the remaining chain. For the primary entry point
+        # this is equivalent to the legacy single-dict shape because litellm's
+        # run_async_fallback outer loop iterates either form end-to-end. SKY-10200.
+        chain = [llm_config.main_model_group, *fallback_groups]
+        fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
+
         router = litellm.Router(
             model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
-            fallbacks=([{llm_config.main_model_group: fallback_groups}] if fallback_groups else []),
+            fallbacks=fallbacks_payload,
+            # Router-level default timeout. Per litellm router precedence
+            # (litellm/router.py:_get_non_stream_timeout) this is the fallback
+            # used when neither the caller kwarg nor the per-deployment
+            # litellm_params['timeout'] is set. Setting it here (and dropping
+            # the per-call timeout kwarg below) lets per-deployment timeouts
+            # actually apply — previously the call-site value clobbered them.
+            timeout=settings.LLM_CONFIG_TIMEOUT,
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
@@ -1050,10 +1065,12 @@ class LLMAPIHandlerFactory:
                     request_payload_json = await _log_llm_request_artifact(llm_key, False)
                     _llm_call_start = time.perf_counter()
                     try:
+                        # No timeout= kwarg: per-deployment litellm_params['timeout']
+                        # wins, falling through to the Router-level default for
+                        # deployments without an explicit value. See SKY-10200.
                         response = await router.acompletion(
                             model=main_model_group,
                             messages=messages,
-                            timeout=settings.LLM_CONFIG_TIMEOUT,
                             drop_params=True,
                             **parameters,
                         )
@@ -1116,10 +1133,11 @@ class LLMAPIHandlerFactory:
                         }
                         _llm_call_start = time.perf_counter()
                         try:
+                            # No timeout= kwarg here either; see SKY-10200 note on
+                            # the primary call site above.
                             response = await router.acompletion(
                                 model=fallback_model,
                                 messages=messages,
-                                timeout=settings.LLM_CONFIG_TIMEOUT,
                                 drop_params=True,
                                 **fallback_params,
                             )
