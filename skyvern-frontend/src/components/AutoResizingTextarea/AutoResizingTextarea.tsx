@@ -3,6 +3,7 @@ import {
   type ChangeEventHandler,
   type HTMLAttributes,
   forwardRef,
+  useEffect,
   useRef,
   useCallback,
   useLayoutEffect,
@@ -52,26 +53,51 @@ const AutoResizingTextarea = forwardRef<HTMLTextAreaElement, Props>(
       }
     };
 
-    useLayoutEffect(() => {
+    const measureAndSize = useCallback(() => {
       const textareaElement = getTextarea();
-      if (!textareaElement) {
+      if (!textareaElement) return;
+      textareaElement.style.height = "auto";
+      const measured = textareaElement.scrollHeight;
+      // scrollHeight is 0 when the textarea is mounted inside a hidden /
+      // mid-animating parent (e.g., a Radix Collapsible just before its
+      // open keyframe runs). Leave style.height as "auto" so the textarea
+      // stays visible at intrinsic line height; the ResizeObserver below
+      // re-measures once the parent settles.
+      if (measured === 0) {
+        lastHeightRef.current = "";
         return;
       }
-
-      // Temporarily set to auto to measure scrollHeight accurately
-      textareaElement.style.height = "auto";
-      const newHeight = `${textareaElement.scrollHeight + 2}px`;
-
-      // Only apply the final height if it differs from the last applied height
-      // This prevents unnecessary dimension change events in React Flow
+      const newHeight = `${measured + 2}px`;
       if (lastHeightRef.current !== newHeight) {
         lastHeightRef.current = newHeight;
         textareaElement.style.height = newHeight;
       } else {
-        // Restore the previous height since nothing changed
         textareaElement.style.height = lastHeightRef.current;
       }
-    }, [getTextarea, value]);
+    }, [getTextarea]);
+
+    useLayoutEffect(() => {
+      measureAndSize();
+    }, [measureAndSize, value]);
+
+    // Re-measure when the textarea (or its container) actually gains size.
+    // Without this, an initial mount inside an animating Collapsible renders
+    // at scrollHeight=0 and the measureAndSize fallback above leaves height
+    // at "auto"; the observer fires once layout stabilises and locks in
+    // the correct height. ResizeObserver is feature-detected so jsdom-based
+    // tests that don't polyfill it don't crash.
+    useEffect(() => {
+      if (typeof ResizeObserver === "undefined") return;
+      const textareaElement = getTextarea();
+      if (!textareaElement) return;
+      const observer = new ResizeObserver(() => {
+        if (lastHeightRef.current === "" && textareaElement.scrollHeight > 0) {
+          measureAndSize();
+        }
+      });
+      observer.observe(textareaElement);
+      return () => observer.disconnect();
+    }, [getTextarea, measureAndSize]);
 
     return (
       <Textarea

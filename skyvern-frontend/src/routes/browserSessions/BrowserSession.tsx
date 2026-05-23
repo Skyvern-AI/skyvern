@@ -1,4 +1,4 @@
-import { BookmarkIcon, ReloadIcon, StopIcon } from "@radix-ui/react-icons";
+import { ReloadIcon, StopIcon } from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { Outlet, useLocation, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -16,6 +16,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { BrowserStream } from "@/components/BrowserStream";
+import { BrowserIcon } from "@/components/icons/BrowserIcon";
 import { LogoMinimized } from "@/components/LogoMinimized";
 import { SwitchBarNavigation } from "@/components/SwitchBarNavigation";
 import { Toaster } from "@/components/ui/toaster";
@@ -177,7 +178,7 @@ function BrowserSession() {
                 variant="default"
                 onClick={() => setIsSaveProfileDialogOpen(true)}
               >
-                <BookmarkIcon className="mr-2 h-4 w-4" />
+                <BrowserIcon className="mr-2 h-4 w-4" />
                 Save Profile
               </Button>
               <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>

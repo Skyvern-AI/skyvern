@@ -7,6 +7,7 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ProxyLocation } from "@/api/types";
 import { getInitialValues } from "./utils";
+import { isMaskedHeaders } from "@/util/secretHeaders";
 
 function WorkflowRunParameters() {
   const credentialGetter = useCredentialGetter();
@@ -46,6 +47,14 @@ function WorkflowRunParameters() {
   const browserProfileId =
     (location.state?.browserProfileId as string | null | undefined) ?? null;
 
+  const cdpConnectHeaders = location.state
+    ? (location.state.cdpConnectHeaders as Record<string, string>)
+    : null;
+
+  const storedCdpConnectHeaders = isMaskedHeaders(workflow?.cdp_connect_headers)
+    ? null
+    : (workflow?.cdp_connect_headers ?? null);
+
   const runWith = (location.state?.runWith as string) ?? undefined;
 
   const initialValues = getInitialValues(location, workflowParameters ?? []);
@@ -84,6 +93,7 @@ function WorkflowRunParameters() {
           extraHttpHeaders ?? workflow.extra_http_headers ?? null,
         browserProfileId:
           browserProfileId ?? workflow.browser_profile_id ?? null,
+        cdpConnectHeaders: cdpConnectHeaders ?? storedCdpConnectHeaders,
         cdpAddress: null,
         runWith,
       }}

@@ -22,6 +22,7 @@ function IgnoreWorkflowSystemPrompt({
       <div className="w-52 shrink-0">
         <Switch
           checked={ignoreWorkflowSystemPrompt}
+          data-testid="ignore-workflow-system-prompt-switch"
           onCheckedChange={(checked) => {
             if (!editable) {
               return;
