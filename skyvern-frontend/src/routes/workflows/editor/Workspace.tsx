@@ -307,9 +307,12 @@ function Workspace({
       frozenSidebarOpenRef.current = blockSidebarOpen;
     }
   }, [blockSidebarOpen, headerCollapsed]);
-  const headerEffectiveSidebarOpen = headerCollapsed
-    ? frozenSidebarOpenRef.current
-    : blockSidebarOpen;
+  const headerEffectiveSidebarOpen =
+    editorMode === "edit"
+      ? headerCollapsed
+        ? frozenSidebarOpenRef.current
+        : blockSidebarOpen
+      : false;
   const blockSidebarWidth = useBlockSidebarWidthStore((s) => s.width);
   const handleOnSave = useSaveWorkflow();
   const postHog = usePostHog();
@@ -773,6 +776,25 @@ function Workspace({
     // to avoid clearing comparison immediately when it's set
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showBrowser, clearComparisonViewAndShowFreshIfActive]);
+
+  useEffect(() => {
+    // Header-anchored panels (cacheKeyValues, parameters, schedules, history)
+    // sit at top-[8.5rem] and slide off with the header; nodeLibrary lives in
+    // the right sidebar and stays put, so don't auto-dismiss it on collapse.
+    if (
+      headerCollapsed &&
+      workflowPanelState.active &&
+      workflowPanelState.content !== "nodeLibrary"
+    ) {
+      const t = setTimeout(closeWorkflowPanel, 300);
+      return () => clearTimeout(t);
+    }
+  }, [
+    headerCollapsed,
+    workflowPanelState.active,
+    workflowPanelState.content,
+    closeWorkflowPanel,
+  ]);
 
   useMountEffect(() => {
     const closePanelsWhenEscapeIsPressed = (e: KeyboardEvent) => {
@@ -1465,6 +1487,10 @@ function Workspace({
                   workflowPanelState.content === "nodeLibrary"
                     ? "calc(100vh - 14rem)"
                     : "unset",
+                transform: headerCollapsed
+                  ? "translateY(calc(-100% - 8.5rem))"
+                  : "translateY(0)",
+                opacity: headerCollapsed ? 0 : 1,
               }}
             >
               {workflowPanelState.content === "cacheKeyValues" && (
@@ -1495,7 +1521,7 @@ function Workspace({
               )}
               {workflowPanelState.content === "schedules" && (
                 <div className="z-30">
-                  <WorkflowSchedulePanel />
+                  <WorkflowSchedulePanel onClose={closeWorkflowPanel} />
                 </div>
               )}
               {workflowPanelState.content === "history" && (
@@ -1532,60 +1558,72 @@ function Workspace({
 
               {/* sub panels */}
               {workflowPanelState.active && (
-                <div
-                  className={cn(
-                    "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
-                    blockSidebarOpen
-                      ? HEADER_RIGHT_INSET_OPEN
-                      : HEADER_RIGHT_INSET_CLOSED,
-                  )}
-                  style={{
-                    height:
-                      workflowPanelState.content === "nodeLibrary"
-                        ? "calc(100vh - 14rem)"
-                        : "unset",
-                  }}
-                >
-                  {workflowPanelState.content === "cacheKeyValues" && (
-                    <WorkflowCacheKeyValuesPanel
-                      cacheKeyValues={cacheKeyValues}
-                      pending={cacheKeyValuesLoading}
-                      scriptKey={workflow.cache_key ?? "default"}
-                      onDelete={(cacheKeyValue) => {
-                        deleteCacheKeyValue.mutate({
-                          workflowPermanentId: workflowPermanentId!,
-                          cacheKeyValue,
-                        });
-                      }}
-                      onPaginate={(page) => {
-                        setPage(page);
-                      }}
-                      onSelect={(cacheKeyValue) => {
-                        setExplicitCacheKeyValue(cacheKeyValue);
-                        setCacheKeyValueFilter("");
-                        closeWorkflowPanel();
-                      }}
+                <>
+                  {workflowPanelState.content === "schedules" && (
+                    <div
+                      className="absolute inset-0 z-20"
+                      onClick={closeWorkflowPanel}
                     />
                   )}
-                  {workflowPanelState.content === "parameters" && (
-                    <div className="z-30">
-                      <WorkflowParametersPanel />
-                    </div>
-                  )}
-                  {workflowPanelState.content === "schedules" && (
-                    <div className="z-30">
-                      <WorkflowSchedulePanel />
-                    </div>
-                  )}
-                  {workflowPanelState.content === "history" && (
-                    <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
-                      <WorkflowHistoryPanel
-                        workflowPermanentId={workflowPermanentId!}
-                        onCompare={handleCompareVersions}
+                  <div
+                    className={cn(
+                      "absolute top-[8.5rem] z-30 transition-all duration-300 ease-out",
+                      blockSidebarOpen
+                        ? HEADER_RIGHT_INSET_OPEN
+                        : HEADER_RIGHT_INSET_CLOSED,
+                    )}
+                    style={{
+                      height:
+                        workflowPanelState.content === "nodeLibrary"
+                          ? "calc(100vh - 14rem)"
+                          : "unset",
+                      transform: headerCollapsed
+                        ? "translateY(calc(-100% - 8.5rem))"
+                        : "translateY(0)",
+                      opacity: headerCollapsed ? 0 : 1,
+                    }}
+                  >
+                    {workflowPanelState.content === "cacheKeyValues" && (
+                      <WorkflowCacheKeyValuesPanel
+                        cacheKeyValues={cacheKeyValues}
+                        pending={cacheKeyValuesLoading}
+                        scriptKey={workflow.cache_key ?? "default"}
+                        onDelete={(cacheKeyValue) => {
+                          deleteCacheKeyValue.mutate({
+                            workflowPermanentId: workflowPermanentId!,
+                            cacheKeyValue,
+                          });
+                        }}
+                        onPaginate={(page) => {
+                          setPage(page);
+                        }}
+                        onSelect={(cacheKeyValue) => {
+                          setExplicitCacheKeyValue(cacheKeyValue);
+                          setCacheKeyValueFilter("");
+                          closeWorkflowPanel();
+                        }}
                       />
-                    </div>
-                  )}
-                </div>
+                    )}
+                    {workflowPanelState.content === "parameters" && (
+                      <div className="z-30">
+                        <WorkflowParametersPanel />
+                      </div>
+                    )}
+                    {workflowPanelState.content === "schedules" && (
+                      <div className="z-30">
+                        <WorkflowSchedulePanel onClose={closeWorkflowPanel} />
+                      </div>
+                    )}
+                    {workflowPanelState.content === "history" && (
+                      <div className="pointer-events-auto relative right-0 top-[3.5rem] z-30 h-[calc(100vh-14rem)]">
+                        <WorkflowHistoryPanel
+                          workflowPermanentId={workflowPermanentId!}
+                          onCompare={handleCompareVersions}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </>
               )}
             </div>
           )}
@@ -1597,43 +1635,59 @@ function Workspace({
         !workflowPanelState.data?.showComparison &&
         workflowPanelState.active &&
         workflowPanelState.content !== "nodeLibrary" && (
-          <div className="absolute right-6 top-[8.5rem] z-20">
-            {workflowPanelState.content === "cacheKeyValues" && (
-              <WorkflowCacheKeyValuesPanel
-                cacheKeyValues={cacheKeyValues}
-                pending={cacheKeyValuesLoading}
-                scriptKey={workflow.cache_key ?? "default"}
-                onDelete={(cacheKeyValue) => {
-                  deleteCacheKeyValue.mutate({
-                    workflowPermanentId: workflowPermanentId!,
-                    cacheKeyValue,
-                  });
-                }}
-                onPaginate={(page) => {
-                  setPage(page);
-                }}
-                onSelect={(cacheKeyValue) => {
-                  setExplicitCacheKeyValue(cacheKeyValue);
-                  setCacheKeyValueFilter("");
-                  closeWorkflowPanel();
-                }}
+          <>
+            {workflowPanelState.content === "schedules" && (
+              <div
+                className="absolute inset-0 z-[15]"
+                onClick={closeWorkflowPanel}
               />
             )}
-            {workflowPanelState.content === "parameters" && (
-              <WorkflowParametersPanel />
-            )}
-            {workflowPanelState.content === "schedules" && (
-              <WorkflowSchedulePanel />
-            )}
-            {workflowPanelState.content === "history" && (
-              <div className="h-[calc(100vh-14rem)]">
-                <WorkflowHistoryPanel
-                  workflowPermanentId={workflowPermanentId!}
-                  onCompare={handleCompareVersions}
+            <div
+              className="absolute right-6 top-[8.5rem] z-20 transition-all duration-300 ease-out"
+              style={{
+                transform: headerCollapsed
+                  ? "translateY(calc(-100% - 8.5rem))"
+                  : "translateY(0)",
+                opacity: headerCollapsed ? 0 : 1,
+              }}
+            >
+              {workflowPanelState.content === "cacheKeyValues" && (
+                <WorkflowCacheKeyValuesPanel
+                  cacheKeyValues={cacheKeyValues}
+                  pending={cacheKeyValuesLoading}
+                  scriptKey={workflow.cache_key ?? "default"}
+                  onDelete={(cacheKeyValue) => {
+                    deleteCacheKeyValue.mutate({
+                      workflowPermanentId: workflowPermanentId!,
+                      cacheKeyValue,
+                    });
+                  }}
+                  onPaginate={(page) => {
+                    setPage(page);
+                  }}
+                  onSelect={(cacheKeyValue) => {
+                    setExplicitCacheKeyValue(cacheKeyValue);
+                    setCacheKeyValueFilter("");
+                    closeWorkflowPanel();
+                  }}
                 />
-              </div>
-            )}
-          </div>
+              )}
+              {workflowPanelState.content === "parameters" && (
+                <WorkflowParametersPanel />
+              )}
+              {workflowPanelState.content === "schedules" && (
+                <WorkflowSchedulePanel onClose={closeWorkflowPanel} />
+              )}
+              {workflowPanelState.content === "history" && (
+                <div className="h-[calc(100vh-14rem)]">
+                  <WorkflowHistoryPanel
+                    workflowPermanentId={workflowPermanentId!}
+                    onCompare={handleCompareVersions}
+                  />
+                </div>
+              )}
+            </div>
+          </>
         )}
 
       {/* code, infinite canvas, browser, timeline, and node library sub panel when in debug mode */}

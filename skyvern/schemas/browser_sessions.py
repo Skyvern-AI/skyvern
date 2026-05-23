@@ -20,13 +20,19 @@ class CreateBrowserSessionRequest(BaseModel):
     )
     proxy_location: ProxyLocationInput = Field(
         default=None,
-        description=PROXY_LOCATION_DOC_STRING,
+        description=PROXY_LOCATION_DOC_STRING + " Can also be a GeoTarget object for granular city/state targeting: "
+        '{"country": "US", "subdivision": "CA", "city": "San Francisco"}, '
+        "or a custom proxy URL dict for self-hosted deployments: "
+        '{"url": "http://user:password@proxy.example.com:8080"}',
     )
 
     @field_validator("proxy_location", mode="before")
     @classmethod
     def validate_proxy_location_dict(cls, proxy_location: object) -> object:
         if isinstance(proxy_location, dict):
+            # Custom proxy URL dict: {"url": "http://..."} — pass through for self-hosted deployments.
+            if "url" in proxy_location and "country" not in proxy_location:
+                return proxy_location
             return GeoTarget.model_validate(proxy_location)
         return proxy_location
 

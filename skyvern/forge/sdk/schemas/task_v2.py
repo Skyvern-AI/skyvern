@@ -77,6 +77,10 @@ class TaskV2(BaseModel):
                 try:
                     parsed = json.loads(stripped)
                     if isinstance(parsed, dict):
+                        # Custom proxy URL dict: {"url": "http://..."}
+                        if "url" in parsed and "country" not in parsed:
+                            return parsed
+                        # GeoTarget dict: {"country": "US", ...}
                         return GeoTarget.model_validate(parsed)
                 except (json.JSONDecodeError, ValueError):
                     pass
