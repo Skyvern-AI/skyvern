@@ -79,6 +79,52 @@ workflow_definition:
 """
 
 
+def _inline_conditional_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
+    return f"""
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_safe
+  blocks:
+    - block_type: conditional
+      label: route_login
+      branch_conditions:
+        - is_default: true
+          blocks:
+            - block_type: login
+              label: login
+              url: {url}
+              parameter_keys:
+                - login_credentials
+"""
+
+
+def _nested_branch_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
+    return f"""
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_safe
+  blocks:
+    - block_type: conditional
+      label: route_login
+      branch_conditions:
+        - is_default: true
+          branch_conditions:
+            - is_default: true
+              blocks:
+                - block_type: login
+                  label: nested_login
+                  url: {url}
+                  parameter_keys:
+                    - login_credentials
+"""
+
+
 def test_rejects_raw_secret_echo_in_user_response() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -508,6 +554,83 @@ def test_rejects_credential_id_when_request_policy_approved_no_credentials() -> 
     assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
 
 
+def test_allows_existing_workflow_credential_id_on_unrelated_turn() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(navigation_goal="Open the reports page."),
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+
+
+def test_rejects_existing_workflow_credential_id_on_new_origin() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_rejects_existing_workflow_credential_id_on_inline_conditional_branch_new_origin() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_inline_conditional_workflow_yaml(url="https://evil.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_rejects_existing_workflow_credential_id_on_nested_branch_new_origin() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={"cred_safe": ["https://login.example.test"]},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_nested_branch_workflow_yaml(url="https://evil.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
+def test_rejects_existing_workflow_credential_id_without_prior_origin_scope() -> None:
+    # Existing workflow credentials with no tracked URL scope cannot safely
+    # authorize later edits that introduce a credentialed URL.
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            existing_workflow_credential_ids=["cred_safe"],
+            existing_workflow_credential_origins={},
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://login.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes
+
+
 def test_rejects_unapproved_credential_id_in_structured_tool_arguments() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -720,12 +843,12 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     ("reason", "expected_terms"),
     [
         (OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE, ("credential", "confirm")),
-        (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url")),
+        (OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED, ("credential", "url", "re-select")),
     ],
 )
 def test_output_policy_credential_block_asks_for_credential_confirmation(
     reason: OutputPolicyReason,
-    expected_terms: tuple[str, str],
+    expected_terms: tuple[str, ...],
 ) -> None:
     result = agent_module._build_output_policy_blocked_result(
         _ctx(),
