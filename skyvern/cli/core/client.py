@@ -10,6 +10,7 @@ import structlog
 
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
+from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.library.skyvern import Skyvern
 
 from .api_key_hash import hash_api_key_for_cache
@@ -67,6 +68,7 @@ def _build_cloud_client(api_key: str) -> Skyvern:
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
         base_url=base_url,
+        headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
     )
 
 

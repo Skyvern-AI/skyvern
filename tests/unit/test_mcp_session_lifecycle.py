@@ -12,6 +12,7 @@ from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.client.types.extensions import Extensions
+from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
@@ -186,6 +187,23 @@ def test_build_cloud_client_uses_self_url_in_stateless_mode(monkeypatch: pytest.
     base_url = captured_kwargs[0]["base_url"]
     assert isinstance(base_url, str)
     assert "127.0.0.1" in base_url
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
+
+
+def test_build_cloud_client_passes_mcp_user_agent_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeSkyvern:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured_kwargs.append(dict(kwargs))
+
+    monkeypatch.setattr(client_mod, "Skyvern", FakeSkyvern)
+    session_manager.set_stateless_http_mode(False)
+
+    client_mod._build_cloud_client("sk_test")
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
 
 
 def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,6 +222,7 @@ def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest
 
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0]["base_url"] == "https://api-staging.skyvern.com"
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
 
 
 @pytest.mark.asyncio
