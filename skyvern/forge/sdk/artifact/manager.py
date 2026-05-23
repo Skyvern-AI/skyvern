@@ -53,6 +53,16 @@ def _safe_file_size_from_path(path: str | None) -> int | None:
         return None
 
 
+def _bundling_enabled() -> bool:
+    """Bundling and Skyvern-origin URLs are coupled: enabled together when HMAC signing is configured.
+
+    When unset, bundling is skipped at flush time so every artifact has its
+    own storage URI and can be served via a presigned URL — no Skyvern-origin
+    proxying, no HMAC, no API-key requirement.
+    """
+    return bool(settings.ARTIFACT_CONTENT_HMAC_KEYRING)
+
+
 @dataclass
 class ArtifactBatchData:
     """
@@ -1096,37 +1106,50 @@ class ArtifactManager:
             extra["artifact_type"] = artifact_type
         return f"{path}?{urlencode(extra)}" if extra else path
 
-    async def get_share_link(self, artifact: Artifact) -> str | None:
-        """Return a Skyvern-origin signed ``/v1/artifacts/{id}/content`` URL.
+    async def resolve_share_url(
+        self,
+        artifact: Artifact,
+        expiry_seconds: int | None = None,
+    ) -> str | None:
+        """Return the customer-facing URL for an artifact.
 
-        SKY-8861: every customer-visible artifact URL goes through the content
-        endpoint — short, our origin, per-org TTL, no S3/Azure presigned URLs
-        leaking into webhooks or API responses. Bundled and non-bundled
-        artifacts share the same path; the content endpoint already serves
-        either (``retrieve_artifact`` handles bundle extraction transparently).
+        Skyvern-origin signed URL when HMAC signing is configured *or* when the
+        artifact is a bundled member (its URI points at the parent ZIP, so a
+        storage presigned URL would download the wrong bytes — fall through to
+        the endpoint, which knows how to extract the member). Otherwise the
+        storage backend's presigned URL (S3 / Azure SAS / local URI).
+        """
+        if _bundling_enabled() or artifact.bundle_key:
+            return self._bundle_content_url(
+                artifact.artifact_id,
+                artifact_name=artifact.bundle_key,
+                artifact_type=artifact.artifact_type,
+                expiry_seconds=expiry_seconds,
+            )
+        return await app.STORAGE.get_share_link(artifact)
+
+    async def get_share_link(self, artifact: Artifact) -> str | None:
+        """Return a customer-facing URL for one artifact.
+
+        HMAC keyring set: Skyvern signed ``/v1/artifacts/{id}/content`` URL.
+        HMAC keyring unset: storage backend's presigned URL, except for
+        legacy bundled rows which still route through the endpoint.
         """
         expiry_seconds = await self.resolve_artifact_url_expiry_seconds(artifact.organization_id)
-        return self._bundle_content_url(
-            artifact.artifact_id,
-            artifact_name=artifact.bundle_key,
-            artifact_type=artifact.artifact_type,
-            expiry_seconds=expiry_seconds,
-        )
+        return await self.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
 
     async def get_share_links(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Return signed content URLs for a batch of artifacts."""
+        """Return URLs for a batch of artifacts."""
         return await self.get_share_links_with_bundle_support(artifacts)
 
     async def get_share_links_with_bundle_support(self, artifacts: list[Artifact]) -> list[str | None]:
-        """Mint a signed ``/v1/artifacts/{id}/content`` URL for every artifact.
+        """Mint a customer-facing URL for every artifact in the batch.
 
-        Bundled vs non-bundled used to branch here — bundled went through the
-        content endpoint, non-bundled fell through to ``STORAGE.get_share_links``
-        and leaked S3 presigned / Azure SAS URLs into webhooks and customer
-        API responses. SKY-8861: unify on the signed origin URL for both.
-
-        The per-org TTL is resolved once per batch (callers look up by
-        run/workflow scope so all artifacts share an org).
+        HMAC keyring set: every artifact → Skyvern signed URL.
+        HMAC keyring unset: non-bundled artifacts → one batched
+        ``STORAGE.get_share_links`` call (single backend round-trip). Bundled
+        legacy rows → individual Skyvern unsigned URL each (still requires
+        API-key auth on fetch; see safety-net rationale in `resolve_share_url`).
         """
         if not artifacts:
             return []
@@ -1134,23 +1157,46 @@ class ArtifactManager:
         organization_id = artifacts[0].organization_id
         expiry_seconds = await self.resolve_artifact_url_expiry_seconds(organization_id)
 
-        result: list[str | None] = [
-            self._bundle_content_url(
-                artifact.artifact_id,
-                artifact_name=artifact.bundle_key,
-                artifact_type=artifact.artifact_type,
+        if _bundling_enabled():
+            return [
+                self._bundle_content_url(
+                    artifact.artifact_id,
+                    artifact_name=artifact.bundle_key,
+                    artifact_type=artifact.artifact_type,
+                    expiry_seconds=expiry_seconds,
+                )
+                for artifact in artifacts
+            ]
+
+        bundled_indices = [i for i, a in enumerate(artifacts) if a.bundle_key]
+        non_bundled_indices = [i for i, a in enumerate(artifacts) if not a.bundle_key]
+        non_bundled = [artifacts[i] for i in non_bundled_indices]
+
+        presigned: list[str] | None = await app.STORAGE.get_share_links(non_bundled) if non_bundled else []
+
+        result: list[str | None] = [None] * len(artifacts)
+        if presigned is None:
+            for idx in non_bundled_indices:
+                result[idx] = None
+        else:
+            for idx, presigned_url in zip(non_bundled_indices, presigned, strict=True):
+                result[idx] = presigned_url
+        for idx in bundled_indices:
+            a = artifacts[idx]
+            result[idx] = self._bundle_content_url(
+                a.artifact_id,
+                artifact_name=a.bundle_key,
+                artifact_type=a.artifact_type,
                 expiry_seconds=expiry_seconds,
             )
-            for artifact in artifacts
-        ]
 
         LOG.debug(
             "get_share_links_with_bundle_support",
             total=len(artifacts),
-            bundled=sum(1 for a in artifacts if a.bundle_key),
-            non_bundled=sum(1 for a in artifacts if not a.bundle_key),
+            bundled=len(bundled_indices),
+            non_bundled=len(non_bundled_indices),
+            keyring_set=_bundling_enabled(),
         )
-
         return result
 
     async def mark_archived_artifacts(self, artifacts: list[Artifact]) -> None:
@@ -1378,24 +1424,52 @@ class ArtifactManager:
         return buf.getvalue()
 
     async def flush_step_archive(self, step_id: str) -> None:
-        """Build the ZIP, upload as one S3 object, and create DB rows for all member artifacts.
+        """Persist the step's accumulated artifacts.
 
-        Call this as soon as a step finishes executing (before moving on to the next step) to
-        release the in-memory buffer immediately rather than waiting until the end of the task.
-        Safe to call multiple times for the same step_id — subsequent calls are no-ops because
-        the accumulator is popped on the first flush.
+        Bundled mode (HMAC keyring set): one ZIP storage object, one parent
+        STEP_ARCHIVE row, N member rows with ``bundle_key``.
+        Unbundled mode (HMAC keyring unset): one storage object per member,
+        one ArtifactModel per member with no ``bundle_key``, no parent row.
+
+        Call this as soon as a step finishes executing so the in-memory buffer
+        is released. Safe to call multiple times — subsequent calls are
+        no-ops because the accumulator is popped on the first flush.
         """
         accumulator = self._step_archives.pop(step_id, None)
         if not accumulator or not accumulator.entries or not accumulator.member_types:
             return
 
-        step = accumulator.step
         LOG.debug(
             "Flushing step archive",
             step_id=step_id,
             artifact_types=[t.value for t, _, _ in accumulator.member_types],
             entry_count=len(accumulator.entries),
+            bundled=_bundling_enabled(),
         )
+
+        if _bundling_enabled():
+            await self._flush_step_archive_bundled(accumulator)
+        else:
+            await self._flush_step_archive_unbundled(accumulator)
+
+        for organization_id, action_id, artifact_id in accumulator.pending_action_screenshot_updates:
+            try:
+                await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
+                    organization_id=organization_id,
+                    action_id=action_id,
+                    screenshot_artifact_id=artifact_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to update action with screenshot artifact id after archive flush",
+                    action_id=action_id,
+                    artifact_id=artifact_id,
+                    exc_info=True,
+                )
+
+    async def _flush_step_archive_bundled(self, accumulator: StepArchiveAccumulator) -> None:
+        """Bundle all accumulated entries into a single ZIP, one storage PUT, parent + member rows."""
+        step = accumulator.step
         archive_artifact_id = generate_artifact_id()
         archive_uri = app.STORAGE.build_uri(
             organization_id=step.organization_id,
@@ -1452,21 +1526,52 @@ class ArtifactManager:
         ]
         await app.DATABASE.artifacts.bulk_create_artifacts([parent_model, *member_models])
 
-        # Apply deferred action.screenshot_artifact_id updates now that artifact rows exist.
-        for organization_id, action_id, artifact_id in accumulator.pending_action_screenshot_updates:
-            try:
-                await app.DATABASE.artifacts.update_action_screenshot_artifact_id(
-                    organization_id=organization_id,
-                    action_id=action_id,
-                    screenshot_artifact_id=artifact_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to update action with screenshot artifact id after archive flush",
-                    action_id=action_id,
+    async def _flush_step_archive_unbundled(self, accumulator: StepArchiveAccumulator) -> None:
+        """Persist each accumulated entry as its own storage object + ArtifactModel row.
+
+        No STEP_ARCHIVE parent — the ZIP doesn't exist in this mode. Storage
+        PUTs are sequenced; the member count per step is small (typically < 20).
+        """
+        step = accumulator.step
+        now = datetime.now(UTC)
+        member_models: list[ArtifactModel] = []
+        for artifact_type, filename, artifact_id in accumulator.member_types:
+            data = accumulator.entries[filename]
+            uri = app.STORAGE.build_uri(
+                organization_id=step.organization_id,
+                artifact_id=artifact_id,
+                step=step,
+                artifact_type=artifact_type,
+            )
+            artifact = Artifact(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                uri=uri,
+                organization_id=step.organization_id,
+                step_id=step.step_id,
+                task_id=step.task_id,
+                workflow_run_id=accumulator.workflow_run_id,
+                workflow_run_block_id=accumulator.workflow_run_block_id,
+                run_id=accumulator.run_id,
+                created_at=now,
+                modified_at=now,
+            )
+            await app.STORAGE.store_artifact(artifact, data)
+            member_models.append(
+                self._build_artifact_model(
                     artifact_id=artifact_id,
-                    exc_info=True,
+                    artifact_type=artifact_type,
+                    uri=uri,
+                    file_size=len(data),
+                    organization_id=step.organization_id,
+                    step_id=step.step_id,
+                    task_id=step.task_id,
+                    workflow_run_id=accumulator.workflow_run_id,
+                    workflow_run_block_id=accumulator.workflow_run_block_id,
+                    run_id=accumulator.run_id,
                 )
+            )
+        await app.DATABASE.artifacts.bulk_create_artifacts(member_models)
 
     async def create_task_archive(
         self,
