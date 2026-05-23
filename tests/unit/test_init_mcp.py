@@ -40,7 +40,7 @@ def test_init_callback_passes_plain_database_string(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "skyvern.cli.init_command.init_env",
-        lambda no_postgres=False, database_string="", env_scope=None, **kwargs: calls.append(
+        lambda no_postgres=False, database_string="", env_scope=None: calls.append(
             (no_postgres, database_string, env_scope)
         ),
     )

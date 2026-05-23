@@ -1,4 +1,9 @@
-import { CrossCircledIcon, ReloadIcon } from "@radix-ui/react-icons";
+import {
+  Cross2Icon,
+  CrossCircledIcon,
+  ReloadIcon,
+} from "@radix-ui/react-icons";
+import { useEffect, useState } from "react";
 import {
   Pagination,
   PaginationContent,
@@ -7,14 +12,18 @@ import {
   PaginationPrevious,
 } from "@/components/ui/pagination";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { CacheKeyValuesResponse } from "@/routes/workflows/types/scriptTypes";
 import { cn } from "@/util/utils";
 
 interface Props {
   cacheKeyValues: CacheKeyValuesResponse | undefined;
+  filter?: string;
   pending: boolean;
   scriptKey: string;
+  onClose?: () => void;
   onDelete: (cacheKeyValue: string) => void;
+  onFilterChange?: (filter: string) => void;
   onMouseDownCapture?: () => void;
   onPaginate: (page: number) => void;
   onSelect: (cacheKeyValue: string) => void;
@@ -22,13 +31,20 @@ interface Props {
 
 function WorkflowCacheKeyValuesPanel({
   cacheKeyValues,
+  filter,
   pending,
   scriptKey,
+  onClose,
   onDelete,
+  onFilterChange,
   onMouseDownCapture,
   onPaginate,
   onSelect,
 }: Props) {
+  const [draftFilter, setDraftFilter] = useState(filter ?? "");
+  useEffect(() => {
+    setDraftFilter(filter ?? "");
+  }, [filter]);
   const values = cacheKeyValues?.values ?? [];
   const page = cacheKeyValues?.page ?? 0;
   const pageSize = cacheKeyValues?.page_size ?? 0;
@@ -43,30 +59,68 @@ function WorkflowCacheKeyValuesPanel({
       onMouseDownCapture={() => onMouseDownCapture?.()}
     >
       <div className="space-y-4">
-        <header>
-          <h1 className="text-lg">Code Cache</h1>
-          <span className="text-sm text-slate-400">
-            Given your code key,{" "}
-            <code className="font-mono text-xs text-slate-200">
-              {scriptKey}
-            </code>
-            , search for saved code using a code key value. For this code key
-            there {totalCount === 1 ? "is" : "are"}{" "}
-            <span className="font-bold text-slate-200">{totalCount}</span> code
-            key {totalCount === 1 ? "value" : "values"}
-            {filteredCount !== totalCount && (
-              <>
-                {" "}
-                (
-                <span className="font-bold text-slate-200">
-                  {filteredCount}
-                </span>{" "}
-                filtered)
-              </>
-            )}
-            .
-          </span>
+        <header className="flex items-start justify-between gap-3">
+          <div className="flex-1">
+            <h1 className="text-lg">Code Cache</h1>
+            <span className="text-sm text-slate-400">
+              Given your code key,{" "}
+              <code className="font-mono text-xs text-slate-200">
+                {scriptKey}
+              </code>
+              , search for saved code using a code key value. For this code key
+              there {totalCount === 1 ? "is" : "are"}{" "}
+              <span className="font-bold text-slate-200">{totalCount}</span>{" "}
+              code key {totalCount === 1 ? "value" : "values"}
+              {filteredCount !== totalCount && (
+                <>
+                  {" "}
+                  (
+                  <span className="font-bold text-slate-200">
+                    {filteredCount}
+                  </span>{" "}
+                  filtered)
+                </>
+              )}
+              .
+            </span>
+          </div>
+          {onClose && (
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Close"
+              className="size-7 shrink-0"
+              onClick={onClose}
+            >
+              <Cross2Icon className="size-4" />
+            </Button>
+          )}
         </header>
+        {onFilterChange && (
+          <Input
+            placeholder="Search or type a new cache key value, press Enter"
+            value={draftFilter}
+            onChange={(e) => {
+              setDraftFilter(e.target.value);
+              onFilterChange(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") {
+                return;
+              }
+              const typed = draftFilter.trim();
+              if (!typed) {
+                return;
+              }
+              const exact = cacheKeyValues?.values?.find((v) => v === typed);
+              const onlyMatch =
+                cacheKeyValues?.values?.length === 1
+                  ? cacheKeyValues.values[0]
+                  : undefined;
+              onSelect(exact ?? onlyMatch ?? typed);
+            }}
+          />
+        )}
         <div className="h-[10rem] w-full overflow-hidden overflow-y-auto border-b border-slate-700 p-1">
           {values.length ? (
             <div className="grid w-full grid-cols-[3rem_1fr_3rem] text-sm">

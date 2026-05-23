@@ -479,7 +479,7 @@ def test_quickstart_server_flags_select_server_path_without_server_extra(monkeyp
     monkeypatch.setattr(
         quickstart_module,
         "_install_server_extra_for_quickstart",
-        lambda **kwargs: install_calls.append(kwargs) or True,
+        lambda: install_calls.append("install") or True,
     )
     monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
@@ -547,27 +547,20 @@ def test_quickstart_interactive_server_choice_can_install_server_extra(monkeypat
     monkeypatch.setattr(
         quickstart_module,
         "_install_server_extra_for_quickstart",
-        lambda **kwargs: install_calls.append(kwargs) or True,
+        lambda: install_calls.append("install") or True,
     )
     monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
     result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\n")
 
     assert result.exit_code == 0
-    assert install_calls == [{"assume_yes": False}]
+    assert install_calls == ["install"]
     assert server_calls == [
         {
             "no_postgres": False,
             "database_string": "",
             "skip_browser_install": False,
             "server_only": False,
-            "skip_llm_setup": False,
-            "configure_mcp": None,
-            "browser_type": None,
-            "browser_location": None,
-            "remote_debugging_url": None,
-            "analytics_id": None,
-            "start_services_now": None,
         }
     ]
 
@@ -728,13 +721,6 @@ def test_quickstart_with_server_extra_preserves_existing_flow(monkeypatch) -> No
             "database_string": "postgresql+psycopg://user/db",
             "skip_browser_install": True,
             "server_only": True,
-            "skip_llm_setup": False,
-            "configure_mcp": None,
-            "browser_type": None,
-            "browser_location": None,
-            "remote_debugging_url": None,
-            "analytics_id": None,
-            "start_services_now": None,
         }
     ]
 
