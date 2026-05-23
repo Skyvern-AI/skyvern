@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import socket
 from collections.abc import Iterable
@@ -31,6 +32,52 @@ def build_cdp_connect_headers(host_header: str | None) -> dict[str, str] | None:
     if not normalized_host_header:
         return None
     return {"Host": normalized_host_header}
+
+
+def parse_default_cdp_connect_headers(raw_value: str | None) -> dict[str, str]:
+    """Parse a JSON object of string-to-string headers; warn and return {} on malformed input."""
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        LOG.warning(
+            "BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS is not valid JSON; ignoring",
+            error=str(exc),
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        LOG.warning(
+            "BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS must be a JSON object; ignoring",
+            json_type=type(parsed).__name__,
+        )
+        return {}
+    result: dict[str, str] = {}
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            LOG.warning(
+                "BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS contains a non-string entry; skipping",
+                header_name=str(key),
+            )
+            continue
+        result[key] = value
+    return result
+
+
+def merge_cdp_connect_headers(
+    default_headers: dict[str, str],
+    per_row_headers: dict[str, str] | None,
+    managed_host_header: dict[str, str],
+) -> dict[str, str]:
+    """Merge headers with precedence defaults < per_row < managed; managed always wins.
+
+    HTTP header names are case-insensitive, so keys colliding with the managed Host (on a
+    lowercased compare) are dropped to avoid emitting a duplicate ``Host`` on the wire.
+    """
+    reserved_keys = {key.lower() for key in managed_host_header}
+    filtered_defaults = {k: v for k, v in default_headers.items() if k.lower() not in reserved_keys}
+    filtered_per_row = {k: v for k, v in (per_row_headers or {}).items() if k.lower() not in reserved_keys}
+    return {**filtered_defaults, **filtered_per_row, **managed_host_header}
 
 
 def parse_cdp_discovery_error(error: Exception) -> tuple[int, str] | None:
