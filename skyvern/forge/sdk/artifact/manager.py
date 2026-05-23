@@ -1120,9 +1120,17 @@ class ArtifactManager:
         storage backend's presigned URL (S3 / Azure SAS / local URI).
         """
         if _bundling_enabled() or artifact.bundle_key:
+            # Frontend parses ``artifact_name`` out of the URL query for the
+            # download-files display. Bundled members carry the in-ZIP filename
+            # in ``bundle_key``; non-bundled artifacts have it as the URI
+            # basename. Without this fallback the path basename is just
+            # "content" and the UI falls back to a literal "download" label.
+            artifact_name = artifact.bundle_key
+            if artifact_name is None and artifact.uri:
+                artifact_name = artifact.uri.rsplit("/", 1)[-1] or None
             return self._bundle_content_url(
                 artifact.artifact_id,
-                artifact_name=artifact.bundle_key,
+                artifact_name=artifact_name,
                 artifact_type=artifact.artifact_type,
                 expiry_seconds=expiry_seconds,
             )
