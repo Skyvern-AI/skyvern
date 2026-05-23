@@ -45,7 +45,11 @@ function hasMeaningfulContent(blocksInfo: BlockInfo[]): boolean {
 
 const TITLE_GENERATION_DEBOUNCE_MS = 4000;
 
-function useAutoGenerateWorkflowTitle(nodes: AppNode[], edges: Edge[]): void {
+function useAutoGenerateWorkflowTitle(
+  nodes: AppNode[],
+  edges: Edge[],
+  readOnly: boolean = false,
+): void {
   const credentialGetter = useCredentialGetter();
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -102,6 +106,14 @@ function useAutoGenerateWorkflowTitle(nodes: AppNode[], edges: Edge[]): void {
   );
 
   useEffect(() => {
+    // Read-only renderers (compare canvas, copilot preview) share the
+    // WorkflowTitleStore with the live editor; generating here would mutate
+    // the live title and persist it on the next user save.
+    if (readOnly) {
+      debouncedGenerate.cancel();
+      return;
+    }
+
     const state = useWorkflowTitleStore.getState();
 
     // Only auto-generate for new, untouched workflows
@@ -119,7 +131,7 @@ function useAutoGenerateWorkflowTitle(nodes: AppNode[], edges: Edge[]): void {
 
     debouncedGenerate(blocksInfo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contentFingerprint]);
+  }, [contentFingerprint, readOnly]);
 
   // Cleanup on unmount
   useEffect(() => {

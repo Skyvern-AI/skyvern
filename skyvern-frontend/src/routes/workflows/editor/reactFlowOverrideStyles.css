@@ -81,3 +81,31 @@
   background-color: rgb(2 6 23);
   color: white;
 }
+
+/* Restore xyflow's between-button divider when a ControlButton is wrapped in a
+   <TooltipTrigger asChild> div, since the wrapper makes the button :last-child
+   of its parent and xyflow's default `:last-child { border-bottom: none }` zeros
+   the divider. We re-assert the border on every wrapped button, then drop it on
+   the actual last wrapper to preserve the trailing-edge no-border behavior. */
+.react-flow__controls > div .react-flow__controls-button {
+  border-bottom: 1px solid
+    var(
+      --xy-controls-button-border-color,
+      var(--xy-controls-button-border-color-default)
+    );
+}
+
+.react-flow__controls > div:last-child .react-flow__controls-button {
+  border-bottom: none;
+}
+
+/* Map xyflow's hover tokens to the editor's low-emphasis icon-button
+   vocabulary (cf. BlockConfigSidebar/WorkflowComparisonPanel close buttons):
+   muted icon at rest, elevated-but-not-pure-white on hover, with bg shifting
+   to --muted instead of xyflow's near-white default. */
+.react-flow__controls .react-flow__controls-button {
+  --xy-controls-button-background-color: hsl(var(--slate-elevation-3));
+  --xy-controls-button-color: theme("colors.slate.400");
+  --xy-controls-button-background-color-hover: hsl(var(--muted));
+  --xy-controls-button-color-hover: theme("colors.slate.200");
+}
