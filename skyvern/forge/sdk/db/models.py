@@ -5,6 +5,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -50,6 +51,8 @@ from skyvern.forge.sdk.db.id import (
     generate_script_id,
     generate_script_revision_id,
     generate_step_id,
+    generate_tag_event_id,
+    generate_tag_key_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -289,6 +292,115 @@ class FolderModel(Base):
     folder_id = Column(String, primary_key=True, default=generate_folder_id)
     organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
     title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowTagEventModel(Base):
+    """Append-only event log for workflow tags.
+
+    Every state change writes a new row. SET events carry value; DELETE
+    events have value=NULL and carry their own attribution. Supersession
+    sets superseded_at on the previously-current row so the partial unique
+    index keeps exactly one active SET per (org, wpid, key). superseded_at
+    means "no longer current but still historical fact"; deleted_at follows
+    the same soft-delete convention as SoftDeleteMixin (via a manual column)
+    and is separate.
+
+    workflow_permanent_id is intentionally NOT a foreign key: WorkflowModel
+    only has a unique constraint on (organization_id, workflow_permanent_id,
+    version), so the column itself isn't a valid FK target. Mirrors
+    WorkflowScheduleModel; integrity enforced at app level.
+    """
+
+    __tablename__ = "workflow_tag_events"
+    # workflow_permanent_id has no single-column index: it's only ever queried alongside
+    # organization_id, so the (organization_id, workflow_permanent_id, ...) composites below
+    # cover it. Skipping the redundant index saves write throughput on this append-only table.
+    __table_args__ = (
+        Index("workflow_tag_events_org_wpid_set_at_idx", "organization_id", "workflow_permanent_id", "set_at"),
+        Index(
+            "workflow_tag_events_org_wpid_key_set_at_idx",
+            "organization_id",
+            "workflow_permanent_id",
+            "key",
+            "set_at",
+        ),
+        Index(
+            "workflow_tag_events_org_key_value_active_idx",
+            "organization_id",
+            "key",
+            "value",
+            postgresql_include=["workflow_permanent_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        Index(
+            "workflow_tag_events_active_set_unique",
+            "organization_id",
+            "workflow_permanent_id",
+            "key",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
+        CheckConstraint(
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import')",
+            name="ck_workflow_tag_events_source",
+        ),
+        CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
+    )
+
+    tag_event_id = Column(String, primary_key=True, default=generate_tag_event_id)
+    workflow_permanent_id = Column(String, nullable=False)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=True)
+    event_type = Column(String, nullable=False)
+    set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    set_by = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    superseded_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class TagKeyModel(Base):
+    """Org-scoped registry of tag keys and their descriptions.
+
+    Auto-upserted on first use of a new key via INSERT ... ON CONFLICT
+    (organization_id, key) WHERE deleted_at IS NULL DO UPDATE.
+    """
+
+    __tablename__ = "tag_keys"
+    __table_args__ = (
+        Index(
+            "ix_tag_keys_org_key_active",
+            "organization_id",
+            "key",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_key_id = Column(String, primary_key=True, default=generate_tag_key_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
     description = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
