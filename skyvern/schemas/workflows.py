@@ -485,6 +485,30 @@ class FileStorageType(StrEnum):
     AZURE = "azure"
 
 
+class FileUploadDestination(BaseModel):
+    """Customer-storage destination for a single file upload.
+
+    Used by ``AgentFunction.upload_file_to_customer_storage``. The cloud
+    override inspects this to decide whether to compute a presigned/SAS URL
+    and route through the NAT egress proxy or upload directly via the SDK.
+    """
+
+    storage_type: FileStorageType
+    customer_uri: str
+    sdk_uri: str
+
+    s3_bucket: str | None = None
+    s3_key: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_region_name: str | None = None
+
+    azure_storage_account_name: str | None = None
+    azure_storage_account_key: str | None = None
+    azure_blob_container_name: str | None = None
+    azure_blob_name: str | None = None
+
+
 class ParameterYAML(BaseModel, abc.ABC):
     parameter_type: ParameterType
     key: str

@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 
+    # Deferred import: skyvern_context.py sits below the service layer and
+    # must not pull a service module at import time. String annotation below.
+    from skyvern.services.script_reviewer_v3.budget import RunBudget
+
 LOG = structlog.get_logger()
 
 # Cap on entries kept in `recent_dialog_messages` so a chatty page (e.g. validation
@@ -124,6 +128,10 @@ class SkyvernContext:
     last_classify_meta: dict[str, Any] | None = None
     current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
+
+    # v3 agentic reviewer — per-run cumulative budget. Initialized at workflow
+    # run start for v3-cohort workflows; None for v2-cohort runs. SKY-7676.
+    v3_run_budget: RunBudget | None = None
 
     # magic link handling
     # task_id is the key, page is the value

@@ -77,6 +77,7 @@ from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
 from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
 from skyvern.forge.sdk.core.skyvern_context import ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
@@ -1398,7 +1399,11 @@ async def handle_sequential_click_for_dropdown(
         lean_compress_image_src=lean_enabled,
         lean_strip_url_query_strings=lean_enabled,
     )
-    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
+    distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
+    check_user_goal_handler = await resolve_check_user_goal_handler(
+        distinct_id_for_override, task.organization_id, app.CHECK_USER_GOAL_LLM_API_HANDLER
+    )
+    response = await check_user_goal_handler(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal-after-click",
