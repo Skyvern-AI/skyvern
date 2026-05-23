@@ -5,7 +5,8 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[2] / "alembic/versions/2026_05_14_1500-6cd1d6f3f734_add_cdp_connect_headers.py"
+    Path(__file__).resolve().parents[2]
+    / "alembic/versions/2026_05_22_2059-0b0bd1875c6e_add_cdp_connect_headers.py"
 )
 
 
