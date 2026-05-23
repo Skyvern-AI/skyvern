@@ -29,7 +29,6 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
@@ -49,7 +48,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -77,6 +76,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -315,9 +315,7 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
-        v2_trigger_type = (
-            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-        )
+        v2_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
@@ -452,7 +450,7 @@ async def run_workflow(
         run_metadata=workflow_run_request.run_metadata,
     )
 
-    trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
+    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -1960,9 +1958,7 @@ async def run_block(
             block_labels=block_run_request.block_labels,
         )
 
-        block_trigger_type = (
-            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-        )
+        block_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
         workflow_run = await block_service.ensure_workflow_run(
             organization=organization,
             template=template,
@@ -2637,7 +2633,7 @@ async def run_workflow_legacy(
     )
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
-    legacy_trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
+    legacy_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -3542,9 +3538,7 @@ async def run_task_v2(
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
-    legacy_v2_trigger_type = (
-        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-    )
+    legacy_v2_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,

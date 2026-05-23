@@ -1,5 +1,14 @@
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
+export type DownloadedFileInfo = {
+  url: string;
+  filename: string | null;
+  checksum: string | null;
+  file_size: number | null;
+  modified_at: string | null;
+  artifact_id: string | null;
+};
+
 export const ArtifactType = {
   Recording: "recording",
   ActionScreenshot: "screenshot_action",
@@ -593,6 +602,7 @@ export type WorkflowRunStatusApiResponse = {
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
+  downloaded_files: Array<DownloadedFileInfo> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;
@@ -629,6 +639,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   failure_category: Array<FailureCategory> | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
+  downloaded_files: Array<DownloadedFileInfo> | null;
   total_steps: number | null;
   total_cost: number | null;
   credits_used: number;
