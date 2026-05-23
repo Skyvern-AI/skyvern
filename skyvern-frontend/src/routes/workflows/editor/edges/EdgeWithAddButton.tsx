@@ -9,11 +9,11 @@ import {
 import { useRef } from "react";
 import { useParams } from "react-router-dom";
 
-import { Button } from "@/components/ui/button";
 import {
   BranchContext,
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
+import { useWorkflowScopeReadOnly } from "../WorkflowScopeContext";
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
 import { useSopToBlocksMutation } from "@/routes/workflows/hooks/useSopToBlocksMutation";
 import { useDebugStore } from "@/store/useDebugStore";
@@ -23,7 +23,11 @@ import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
 import { toast } from "@/components/ui/use-toast";
 
-import { REACT_FLOW_EDGE_Z_INDEX } from "../constants";
+import {
+  REACT_FLOW_EDGE_Z_INDEX,
+  REACT_FLOW_SELECTED_NODE_Z,
+} from "../constants";
+import { SELECTED_RING_CLASSES } from "../selection/selectedRingClasses";
 import { WorkflowAddMenu } from "../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../WorkflowAdderBusy";
 import { findBranchContextForInsertion } from "../workflowInsertion";
@@ -40,6 +44,7 @@ function EdgeWithAddButton({
   style = {},
   markerEnd,
 }: EdgeProps) {
+  const isReadOnly = useWorkflowScopeReadOnly();
   const { workflowPermanentId } = useParams();
   const nodes = useNodes();
   const [edgePath, labelX, labelY] = getBezierPath({
@@ -175,17 +180,40 @@ function EdgeWithAddButton({
     e.target.value = "";
   };
 
+  // Mirror NodeAdderNode's selection treatment so the two + CTAs feel like one affordance.
+  const isAdding =
+    workflowStatePanel.workflowPanelState.active &&
+    workflowStatePanel.workflowPanelState.content === "nodeLibrary" &&
+    workflowStatePanel.workflowPanelState.data?.previous === source &&
+    workflowStatePanel.workflowPanelState.data?.next === target &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (sourceNode?.parentId || undefined);
+
   const adder = (
-    <Button
-      size="icon"
-      className={cn("h-4 w-4 rounded-full transition-all hover:scale-150", {
-        "cursor-not-allowed bg-[grey] hover:scale-100 hover:bg-[grey] active:bg-[grey]":
-          isDisabled,
-      })}
+    <div
+      className={cn(
+        "flex h-6 w-6 items-center justify-center rounded-full bg-slate-50 transition-colors hover:bg-blue-50 hover:ring-2 hover:ring-blue-500/40",
+        {
+          "cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted hover:ring-0":
+            isDisabled,
+          [SELECTED_RING_CLASSES]: isAdding,
+        },
+      )}
+      role="button"
+      tabIndex={isDisabled ? -1 : 0}
+      aria-label="Add block"
+      aria-disabled={isDisabled}
+      data-testid="edge-add-button"
       onClick={() => onAdd()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onAdd();
+        }
+      }}
     >
-      <PlusIcon />
-    </Button>
+      <PlusIcon className="h-4 w-4 text-slate-950" />
+    </div>
   );
 
   const menu = (
@@ -230,6 +258,10 @@ function EdgeWithAddButton({
     </WorkflowAdderBusy>
   );
 
+  if (isReadOnly) {
+    return <BaseEdge path={edgePath} markerEnd={markerEnd} style={style} />;
+  }
+
   return (
     <>
       <BaseEdge path={edgePath} markerEnd={markerEnd} style={style} />
@@ -243,7 +275,10 @@ function EdgeWithAddButton({
             // everything inside EdgeLabelRenderer has no pointer events by default
             // if you have an interactive element, set pointer-events: all
             pointerEvents: "all",
-            zIndex: REACT_FLOW_EDGE_Z_INDEX + 1, // above the edge
+            // Inside parent nodes (e.g. for-loop), xyflow elevates the edge SVG
+            // via getElevatedEdgeZIndex (= edge.zIndex + sourceNode.internals.z).
+            // Stay above that elevated stack so the line never paints over the +.
+            zIndex: REACT_FLOW_EDGE_Z_INDEX + REACT_FLOW_SELECTED_NODE_Z + 1,
           }}
           className="nodrag nopan"
         >

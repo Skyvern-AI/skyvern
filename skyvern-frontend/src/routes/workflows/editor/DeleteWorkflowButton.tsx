@@ -23,6 +23,8 @@ import { ReloadIcon } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 
+import { useNodeCollapseStore } from "./collapse/useNodeCollapseStore";
+
 type Props = {
   id: string;
 };
@@ -40,6 +42,7 @@ function DeleteWorkflowButton({ id }: Props) {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      useNodeCollapseStore.getState().pruneWorkflow(id);
     },
     onError: (error: AxiosError) => {
       toast({

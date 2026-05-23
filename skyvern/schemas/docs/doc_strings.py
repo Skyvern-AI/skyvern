@@ -42,6 +42,8 @@ Available geotargeting options:
 - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
 - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
 - NONE: No proxy
+
+For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
 """
 
 DATA_EXTRACTION_SCHEMA_DOC_STRING = """

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.artifact.manager import ArtifactManager
 from skyvern.forge.sdk.artifact.signing import (
     ARTIFACT_URL_EXPIRY_SECONDS,
@@ -20,6 +21,8 @@ from skyvern.forge.sdk.artifact.signing import (
 )
 from skyvern.forge.sdk.routes.agent_protocol import _artifact_content_response_headers
 from skyvern.forge.sdk.schemas.organizations import Organization
+
+_DUMMY_KEYRING_JSON = '{"current_kid":"k1","keys":{"k1":{"secret":"deadbeef"}}}'
 
 
 def _make_org(artifact_url_expiry_seconds: int | None) -> Organization:
@@ -306,6 +309,7 @@ class TestGetShareLinkAlwaysUsesSignedContentUrl:
 
         resolve = AsyncMock(return_value=12 * 3600)
         with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
             patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
             patch.object(
                 manager, "_bundle_content_url", return_value="https://api/v1/artifacts/a_42/content?sig=x"
@@ -329,6 +333,7 @@ class TestGetShareLinkAlwaysUsesSignedContentUrl:
 
         resolve = AsyncMock(return_value=12 * 3600)
         with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
             patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
             patch.object(
                 manager, "_bundle_content_url", return_value="https://api/v1/artifacts/a_b/content?sig=x"
@@ -360,6 +365,7 @@ class TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl:
 
         resolve = AsyncMock(return_value=2 * 3600)
         with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
             patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
             patch.object(
                 manager,
@@ -390,6 +396,7 @@ class TestGetShareLinksWithBundleSupportAlwaysUsesSignedContentUrl:
 
         resolve = AsyncMock(return_value=3 * 3600)
         with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
             patch.object(manager, "resolve_artifact_url_expiry_seconds", resolve),
             patch.object(manager, "_bundle_content_url", return_value="https://x") as bundle,
             patch("skyvern.forge.sdk.artifact.manager.app") as app,

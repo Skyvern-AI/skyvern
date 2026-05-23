@@ -75,6 +75,8 @@ WORKFLOW_COPILOT_CHAT_PREFIX = "wcc"
 WORKFLOW_COPILOT_CHAT_MESSAGE_PREFIX = "wccm"
 SCRIPT_FALLBACK_EPISODE_PREFIX = "sfe"
 WORKFLOW_SCHEDULE_PREFIX = "wfs"
+TAG_EVENT_PREFIX = "tge"
+TAG_KEY_PREFIX = "tkey"
 
 
 def generate_workflow_id() -> str:
@@ -245,6 +247,16 @@ def generate_debug_session_id() -> str:
 def generate_folder_id() -> str:
     int_id = generate_id()
     return f"{FOLDER_PREFIX}_{int_id}"
+
+
+def generate_tag_event_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_EVENT_PREFIX}_{int_id}"
+
+
+def generate_tag_key_id() -> str:
+    int_id = generate_id()
+    return f"{TAG_KEY_PREFIX}_{int_id}"
 
 
 def generate_google_oauth_credential_id() -> str:

@@ -94,6 +94,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -2823,15 +2824,15 @@ class ForgeAgent:
             )
 
         if use_check_user_goal_handler:
-            # Use the dedicated check-user-goal handler (new behavior)
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.CHECK_USER_GOAL_LLM_API_HANDLER
-            )
+            default_handler = app.CHECK_USER_GOAL_LLM_API_HANDLER
         else:
-            # Use the primary LLM handler (legacy behavior)
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.LLM_API_HANDLER
-            )
+            default_handler = app.LLM_API_HANDLER
+
+        distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
+        default_handler = await resolve_check_user_goal_handler(
+            distinct_id_for_override, task.organization_id, default_handler
+        )
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key_override, default=default_handler)
 
         verification_result = await llm_api_handler(
             prompt=verification_prompt,

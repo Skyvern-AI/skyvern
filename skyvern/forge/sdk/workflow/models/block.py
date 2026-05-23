@@ -123,7 +123,14 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
 )
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.schemas.workflows import (
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    FileStorageType,
+    FileType,
+    FileUploadDestination,
+)
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -4187,6 +4194,49 @@ class FileUploadBlock(Block):
     def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
         return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
 
+    def _build_s3_destination(
+        self,
+        workflow_run_id: str,
+        file_path: str,
+        aws_access_key_id: str | None,
+        aws_secret_access_key: str | None,
+    ) -> FileUploadDestination:
+        s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+        # ``_get_s3_uri`` returns ``s3://{bucket}/{key}`` — split it back out for
+        # the destination so the cloud override can compute a presigned URL.
+        without_scheme = s3_uri[len("s3://") :]
+        bucket, _, key = without_scheme.partition("/")
+        return FileUploadDestination(
+            storage_type=FileStorageType.S3,
+            customer_uri=s3_uri,
+            sdk_uri=s3_uri,
+            s3_bucket=bucket,
+            s3_key=key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_region_name=self.region_name,
+        )
+
+    def _build_azure_destination(
+        self,
+        workflow_run_id: str,
+        file_path: str,
+        azure_storage_account_name: str,
+        azure_storage_account_key: str,
+    ) -> FileUploadDestination:
+        blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
+        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
+        sdk_uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
+        return FileUploadDestination(
+            storage_type=FileStorageType.AZURE,
+            customer_uri=customer_uri,
+            sdk_uri=sdk_uri,
+            azure_storage_account_name=azure_storage_account_name,
+            azure_storage_account_key=azure_storage_account_key,
+            azure_blob_container_name=self.azure_blob_container_name,
+            azure_blob_name=blob_name,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4283,15 +4333,20 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
                     or self.aws_secret_access_key
                 )
-                aws_client = AsyncAWSClient(
-                    aws_access_key_id=actual_aws_access_key_id,
-                    aws_secret_access_key=actual_aws_secret_access_key,
-                    region_name=self.region_name,
-                )
                 for file_path in files_to_upload:
-                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
-                    uploaded_uris.append(s3_uri)
-                    await aws_client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+                    destination = self._build_s3_destination(
+                        workflow_run_id=workflow_run_id,
+                        file_path=file_path,
+                        aws_access_key_id=actual_aws_access_key_id,
+                        aws_secret_access_key=actual_aws_secret_access_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
             elif self.storage_type == FileStorageType.AZURE:
                 actual_azure_storage_account_name = (
@@ -4305,17 +4360,21 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
-                    storage_account_name=actual_azure_storage_account_name,
-                    storage_account_key=actual_azure_storage_account_key,
-                )
                 for file_path in files_to_upload:
                     LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
-                    blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
-                    azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
-                    uploaded_uris.append(azure_uri)
-                    uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
-                    await azure_client.upload_file_from_path(uri, file_path)
+                    destination = self._build_azure_destination(
+                        workflow_run_id=workflow_run_id,
+                        file_path=file_path,
+                        azure_storage_account_name=actual_azure_storage_account_name,
+                        azure_storage_account_key=actual_azure_storage_account_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation

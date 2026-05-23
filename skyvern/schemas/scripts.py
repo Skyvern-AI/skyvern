@@ -352,6 +352,7 @@ class ScriptFallbackEpisode(BaseModel):
     reviewed: bool = False
     reviewer_output: str | None = None
     new_script_revision_id: str | None = None
+    reviewer_version: str | None = None
     created_at: datetime
     modified_at: datetime
 

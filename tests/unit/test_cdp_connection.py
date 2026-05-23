@@ -12,6 +12,8 @@ from skyvern.webeye.cdp_connection import (
     build_cdp_connect_headers,
     build_cdp_connection_candidates,
     connect_over_cdp_with_diagnostics,
+    merge_cdp_connect_headers,
+    parse_default_cdp_connect_headers,
     resolve_host_docker_internal_url,
 )
 
@@ -23,6 +25,56 @@ def test_build_cdp_connect_headers_uses_host_header() -> None:
 def test_build_cdp_connect_headers_ignores_empty_host_header() -> None:
     assert build_cdp_connect_headers(None) is None
     assert build_cdp_connect_headers(" ") is None
+
+
+def test_parse_default_cdp_connect_headers_empty() -> None:
+    assert parse_default_cdp_connect_headers(None) == {}
+    assert parse_default_cdp_connect_headers("") == {}
+
+
+def test_parse_default_cdp_connect_headers_returns_dict() -> None:
+    assert parse_default_cdp_connect_headers('{"x-api-key": "secret"}') == {"x-api-key": "secret"}
+
+
+def test_parse_default_cdp_connect_headers_ignores_invalid_json() -> None:
+    assert parse_default_cdp_connect_headers("not-json") == {}
+
+
+def test_parse_default_cdp_connect_headers_ignores_non_object_json() -> None:
+    assert parse_default_cdp_connect_headers('["x-api-key"]') == {}
+    assert parse_default_cdp_connect_headers('"raw-string"') == {}
+
+
+def test_parse_default_cdp_connect_headers_skips_non_string_values() -> None:
+    assert parse_default_cdp_connect_headers('{"x-api-key": "secret", "x-bad": 42, "x-null": null}') == {
+        "x-api-key": "secret",
+    }
+
+
+def test_merge_cdp_connect_headers_per_row_overrides_default() -> None:
+    merged = merge_cdp_connect_headers(
+        default_headers={"x-api-key": "env-secret", "x-shared": "env"},
+        per_row_headers={"x-api-key": "row-secret", "x-row-only": "row"},
+        managed_host_header={},
+    )
+    assert merged == {"x-api-key": "row-secret", "x-shared": "env", "x-row-only": "row"}
+
+
+def test_merge_cdp_connect_headers_managed_host_always_wins() -> None:
+    merged = merge_cdp_connect_headers(
+        default_headers={"host": "env-host", "x-api-key": "env"},
+        per_row_headers={"Host": "row-host", "x-api-key": "row"},
+        managed_host_header={"Host": "127.0.0.1:9222"},
+    )
+    assert merged == {"Host": "127.0.0.1:9222", "x-api-key": "row"}
+
+
+def test_merge_cdp_connect_headers_no_inputs() -> None:
+    assert merge_cdp_connect_headers({}, None, {}) == {}
+
+
+def test_merge_cdp_connect_headers_defaults_only() -> None:
+    assert merge_cdp_connect_headers({"x-api-key": "env"}, None, {}) == {"x-api-key": "env"}
 
 
 def test_resolve_host_docker_internal_url_uses_resolved_ipv4(monkeypatch: pytest.MonkeyPatch) -> None:

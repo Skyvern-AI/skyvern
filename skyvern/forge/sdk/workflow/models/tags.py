@@ -1,0 +1,38 @@
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class TagSource(StrEnum):
+    """Provenance source for a tag-event row."""
+
+    MANUAL = "manual"  # set by a person through the UI or API
+    BULK_APPLY = "bulk_apply"  # set as part of a multi-workflow bulk operation
+    BACKFILL = "backfill"  # written by a one-off migration/script over existing rows
+    INHERITED = "inherited"  # copied from a parent (e.g. folder) rather than set directly
+    IMPORT = "import"  # ingested from an external system
+
+
+class TagEventType(StrEnum):
+    """Kind of state change recorded in the event log.
+
+    DELETE events have value=NULL and carry their own attribution
+    (set_by / set_at / source).
+    """
+
+    SET = "set"
+    DELETE = "delete"
+
+
+class CallerType(StrEnum):
+    USER = "user"
+    API_KEY = "api_key"
+    SYSTEM = "system"
+
+
+@dataclass(frozen=True)
+class TagWriteContext:
+    """Attribution carried from a write call into the repository layer."""
+
+    caller_id: str
+    caller_type: CallerType
+    source: TagSource

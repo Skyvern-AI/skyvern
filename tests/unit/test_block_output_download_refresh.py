@@ -13,7 +13,7 @@ IDs on every workflow-run-status response.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -139,8 +139,8 @@ async def test_refresh_rebuilds_downloaded_files_from_artifact_ids():
             new=AsyncMock(return_value=3600),
         ),
         patch(
-            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
-            new=Mock(return_value=fresh_url),
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
+            new=AsyncMock(return_value=fresh_url),
         ),
     ):
         service = WorkflowService()
@@ -211,9 +211,9 @@ async def test_refresh_issues_one_batch_db_call_for_n_blocks():
             new=AsyncMock(return_value=3600),
         ),
         patch(
-            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
-            new=Mock(
-                side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
+            new=AsyncMock(
+                side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
             ),
         ),
     ):
@@ -254,9 +254,9 @@ async def test_refresh_substitutes_screenshot_urls_from_map():
             new=AsyncMock(return_value=3600),
         ),
         patch(
-            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.build_signed_content_url",
-            new=Mock(
-                side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+            "skyvern.forge.sdk.workflow.service.app.ARTIFACT_MANAGER.resolve_share_url",
+            new=AsyncMock(
+                side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
             ),
         ),
     ):
