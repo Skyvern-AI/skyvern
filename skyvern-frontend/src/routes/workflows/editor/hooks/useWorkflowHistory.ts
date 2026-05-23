@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type Dispatch,
@@ -13,6 +14,7 @@ import { usePostHog } from "posthog-js/react";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { captureRecordBrowserUndoAfterRecordingIfRecent } from "@/util/recordBrowserTelemetry";
 import type { AppNode } from "../nodes";
+import { isDndDragInFlight } from "../sortable/dndDragActivity";
 import {
   canRedo as historyCanRedo,
   canUndo as historyCanUndo,
@@ -45,8 +47,30 @@ type UseWorkflowHistoryParams = {
 type UseWorkflowHistoryResult = {
   undo: () => void;
   redo: () => void;
+  /**
+   * Coalesce the next post-commit capture into a single user-edit entry,
+   * bypassing the debounce. Call this from within the same event handler
+   * that issues an atomic multi-step mutation (e.g. a drop reorder that
+   * rewires edges, re-layouts, and flips hasChanges) so the composite
+   * mutation lands as ONE undo step instead of a debounced tail that
+   * could merge with later edits or be preceded by intermediate frames.
+   *
+   * Any edit still sitting in the debounce window is flushed first so a
+   * pre-drop pending edit becomes its own history entry rather than
+   * being coalesced into the reorder snapshot.
+   */
+  captureImmediately: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  /**
+   * Increments every time a snapshot is applied (undo/redo). Consumers
+   * pass this to `FlowRenderer` so the canvas can force a `doLayout` pass
+   * after restoration — without it, expand/collapse state can land at
+   * stale positions (e.g. children rendered against a closed-loop layout)
+   * because the restored `measured` is stripped and the dimension-change
+   * re-layout path can race the new render.
+   */
+  historyApplyTrigger: number;
 };
 
 /**
@@ -55,7 +79,7 @@ type UseWorkflowHistoryResult = {
  * Watches `nodes`/`edges`, captures debounced snapshots onto a bounded
  * history stack, and exposes undo/redo callbacks that restore snapshots
  * via `setNodes`/`setEdges`. Not persisted - a browser refresh clears
- * the stack. See SKY-8869.
+ * the stack.
  */
 export function useWorkflowHistory({
   nodes,
@@ -80,6 +104,10 @@ export function useWorkflowHistory({
   // the internal update can be pushed as its own history entry instead
   // of being merged with the internal-update state.
   const pendingSnapshotRef = useRef<WorkflowSnapshot | null>(null);
+  // Raised by captureImmediately(); consumed on the next capture-effect
+  // fire to force a synchronous user-edit push for atomic composite
+  // mutations like a reorder drop.
+  const immediateCaptureRequestedRef = useRef(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNodesRef = useRef(nodes);
   const latestEdgesRef = useRef(edges);
@@ -88,6 +116,7 @@ export function useWorkflowHistory({
     canUndo: false,
     canRedo: false,
   });
+  const [historyApplyTrigger, setHistoryApplyTrigger] = useState(0);
 
   const internalUpdateCount = useWorkflowHasChangesStore(
     (state) => state.internalUpdateCount,
@@ -163,9 +192,6 @@ export function useWorkflowHistory({
     [refreshFlags],
   );
 
-  // Convenience wrapper: commit the CURRENT nodes/edges (via
-  // latestNodesRef). Used by the normal debounce path and the
-  // internal-update-exit sync flush.
   const captureIfChanged = useCallback(
     (options?: { forceAsUserEdit?: boolean }) => {
       const snapshot = cloneSnapshot(
@@ -232,6 +258,18 @@ export function useWorkflowHistory({
     captureIfChanged();
   }, [captureIfChanged]);
 
+  // Caller contract: invoke this from within the same event handler that
+  // dispatches the atomic mutation (setNodes + setEdges + setHasChanges,
+  // all synchronously enqueued). The pending debounced edit — if any — is
+  // flushed first so it becomes its own history entry rather than being
+  // absorbed into the composite snapshot. The flag is then consumed by the
+  // capture effect on the NEXT commit so the post-mutation state lands as
+  // a single push without waiting on the 300 ms debounce.
+  const captureImmediately = useCallback(() => {
+    flushPendingCapture();
+    immediateCaptureRequestedRef.current = true;
+  }, [flushPendingCapture]);
+
   useEffect(() => {
     if (isApplyingRef.current) {
       isApplyingRef.current = false;
@@ -275,6 +313,22 @@ export function useWorkflowHistory({
       return;
     }
 
+    // Immediate-capture path: a composite mutation committed
+    // atomically from an event handler (e.g. a reorder drop that rewires
+    // edges + re-layouts + flips hasChanges) should land as ONE user-edit
+    // entry without waiting for the debounce to settle. Bypassing the
+    // debounce also prevents the reorder from merging with subsequent
+    // keystrokes that happen to fall inside the 300ms window.
+    if (immediateCaptureRequestedRef.current) {
+      immediateCaptureRequestedRef.current = false;
+      if (debounceTimerRef.current !== null) {
+        clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
+      }
+      captureIfChanged();
+      return;
+    }
+
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);
     }
@@ -309,10 +363,16 @@ export function useWorkflowHistory({
       // when the user undoes back exactly to the last-saved state, but
       // silently losing divergence is the bigger failure.
       //
-      // TODO(SKY-8869): once a "last saved snapshot" is tracked in the
+      // TODO: once a "last saved snapshot" is tracked in the
       // hook, compare against it here and only flip the flag when the
       // applied state actually diverges.
       useWorkflowHasChangesStore.getState().setHasChanges(true);
+      // Bump so FlowRenderer can force a fresh doLayout pass against the
+      // restored nodes. Without this, an undo across a loop/conditional
+      // expand or collapse can land children at the prior container's
+      // position because `measured` is stripped from snapshots and the
+      // dimension-change re-layout path can race the new render.
+      setHistoryApplyTrigger((n) => n + 1);
     },
     [setNodes, setEdges],
   );
@@ -330,6 +390,10 @@ export function useWorkflowHistory({
     // holds a reference to the dragging node, causing a desync between
     // RF's internal drag state and the restored snapshot.
     if (latestNodesRef.current.some((n) => n.dragging)) return;
+    // Same desync risk for dnd-kit's keyboard/pointer drag: the DragOverlay
+    // holds activeDragId until onDragEnd/Cancel; popping history mid-gesture
+    // strands the overlay against a restored graph.
+    if (isDndDragInFlight()) return;
     // Flush first so an edit still pending in the debounce window isn't dropped.
     flushPendingCapture();
     const presentBeforeUndo = historyRef.current.present;
@@ -354,6 +418,7 @@ export function useWorkflowHistory({
   const redo = useCallback(() => {
     if (useWorkflowHasChangesStore.getState().internalUpdateCount > 0) return;
     if (latestNodesRef.current.some((n) => n.dragging)) return;
+    if (isDndDragInFlight()) return;
     flushPendingCapture();
     const result = historyRedo(historyRef.current);
     if (result === null) return;
@@ -369,10 +434,22 @@ export function useWorkflowHistory({
     });
   }, [applySnapshot, flushPendingCapture, refreshFlags, posthog]);
 
-  return {
-    undo,
-    redo,
-    canUndo: flags.canUndo,
-    canRedo: flags.canRedo,
-  };
+  return useMemo(
+    () => ({
+      undo,
+      redo,
+      captureImmediately,
+      canUndo: flags.canUndo,
+      canRedo: flags.canRedo,
+      historyApplyTrigger,
+    }),
+    [
+      undo,
+      redo,
+      captureImmediately,
+      flags.canUndo,
+      flags.canRedo,
+      historyApplyTrigger,
+    ],
+  );
 }

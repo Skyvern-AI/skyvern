@@ -71,7 +71,7 @@ function WorkflowHistoryPanel({
     setSelectedVersions(newSelected);
   };
 
-  const handleCompare = (mode: "visual" | "json" = "visual") => {
+  const handleCompare = () => {
     if (selectedVersions.size === 2 && versions) {
       // Sort ascending so older version (lower number) is first, newer is second
       // This matches standard diff convention: old on left, new on right
@@ -86,7 +86,7 @@ function WorkflowHistoryPanel({
       );
 
       if (version1 && version2) {
-        onCompare?.(version1, version2, mode);
+        onCompare?.(version1, version2);
       }
     }
   };
@@ -126,23 +126,13 @@ function WorkflowHistoryPanel({
 
       {/* Compare Buttons */}
       <div className="flex-shrink-0 px-4 pb-3">
-        <div className="flex gap-2">
-          <Button
-            variant="secondary"
-            className="flex-1"
-            onClick={() => handleCompare("json")}
-            disabled={!canCompare || isLoading}
-          >
-            JSON Diff
-          </Button>
-          <Button
-            className="flex-1"
-            onClick={() => handleCompare("visual")}
-            disabled={!canCompare || isLoading}
-          >
-            Visual Compare
-          </Button>
-        </div>
+        <Button
+          className="w-full"
+          onClick={handleCompare}
+          disabled={!canCompare || isLoading}
+        >
+          Visual Compare
+        </Button>
       </div>
 
       <Separator />
