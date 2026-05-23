@@ -15,11 +15,19 @@ import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
+import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 import { findBranchContextForInsertion } from "../../workflowInsertion";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
@@ -116,8 +124,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const isBlockedByFinally =
     !parentId && Boolean(workflowSettingsStore.finallyBlockLabel);
+  // Read-only canvases (WorkflowComparisonPanel) must not let the `+`
+  // affordance open the node library — selecting a block from there
+  // would route through `addNode` and mutate the underlying workflow.
+  const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isDisabled =
-    isBlockedByFinally || (!isBusy && recordingStore.isRecording);
+    isReadOnlyScope ||
+    isBlockedByFinally ||
+    (!isBusy && recordingStore.isRecording);
+  const disabledReason: string | null = isReadOnlyScope
+    ? "This canvas is read-only"
+    : isBlockedByFinally
+      ? "Finally block must run last - choose a position above it"
+      : !isBusy && recordingStore.isRecording
+        ? "Stop recording to add a block"
+        : null;
 
   const updateWorkflowPanelState = (
     active: boolean,
@@ -186,19 +207,47 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     e.target.value = "";
   };
 
-  const adder = (
+  // Highlight the + CTA the same way withSelectableBlock highlights a selected block,
+  // active while the node library is open targeting this specific NodeAdder.
+  const isAdding =
+    workflowStatePanel.workflowPanelState.active &&
+    workflowStatePanel.workflowPanelState.content === "nodeLibrary" &&
+    workflowStatePanel.workflowPanelState.data?.previous === previous &&
+    workflowStatePanel.workflowPanelState.data?.next === id &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (parentId || undefined);
+
+  const adderInner = (
     <div
       data-testid="node-adder-button"
-      className={cn("rounded-full bg-slate-50 p-2", {
-        "cursor-not-allowed bg-[grey]": isDisabled,
-      })}
+      className={cn(
+        "rounded-full bg-slate-50 p-1 transition-colors hover:bg-blue-50 hover:ring-2 hover:ring-blue-500/40",
+        {
+          "cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted hover:ring-0":
+            isDisabled,
+          [SELECTED_RING_CLASSES]: isAdding,
+        },
+      )}
       onClick={() => {
         onAdd();
       }}
     >
-      <PlusIcon className="h-12 w-12 text-slate-950" />
+      <PlusIcon className="h-8 w-8 text-slate-950" />
     </div>
   );
+  const adder =
+    isDisabled && disabledReason ? (
+      <TooltipProvider delayDuration={150}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>{adderInner}</div>
+          </TooltipTrigger>
+          <TooltipContent>{disabledReason}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    ) : (
+      adderInner
+    );
 
   const busy = (
     <WorkflowAdderBusy
