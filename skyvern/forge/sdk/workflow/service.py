@@ -742,22 +742,14 @@ class WorkflowService:
             )
             download_id_set = set(download_ids)
             for artifact in artifacts:
-                url = app.ARTIFACT_MANAGER.build_signed_content_url(
-                    artifact_id=artifact.artifact_id,
-                    artifact_name=artifact.bundle_key,
-                    artifact_type=artifact.artifact_type,
-                    expiry_seconds=expiry_seconds,
-                )
+                url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
+                if url is None:
+                    continue
                 url_map[artifact.artifact_id] = url
                 if artifact.artifact_id in download_id_set:
                     filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
                     fileinfo_map[artifact.artifact_id] = FileInfo(
-                        url=app.ARTIFACT_MANAGER.build_signed_content_url(
-                            artifact_id=artifact.artifact_id,
-                            artifact_name=filename,
-                            artifact_type=artifact.artifact_type,
-                            expiry_seconds=expiry_seconds,
-                        ),
+                        url=url,
                         checksum=artifact.checksum,
                         filename=filename,
                         file_size=artifact.file_size,
@@ -5328,6 +5320,7 @@ class WorkflowService:
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
+            script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
         )
 

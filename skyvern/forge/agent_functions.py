@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import hashlib
+import os
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -9,11 +10,18 @@ import structlog
 from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteError, TaskAlreadyTimeout
+from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
+from skyvern.exceptions import (
+    AzureConfigurationError,
+    DisabledBlockExecutionError,
+    StepUnableToExecuteError,
+    TaskAlreadyTimeout,
+    UploadFileMaxSizeExceeded,
+)
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -25,6 +33,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -1069,6 +1078,66 @@ class AgentFunction:
                 headers=headers,
                 timeout=httpx.Timeout(timeout_seconds),
             )
+
+    async def upload_file_to_customer_storage(
+        self,
+        file_path: str,
+        destination: FileUploadDestination,
+        organization_id: str | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Upload a single file to customer-specified S3 or Azure storage.
+
+        Returns the customer-facing URI (``destination.customer_uri``).  The
+        cloud override routes NAT-org traffic through the egress proxy so it
+        egresses from a static IP; the OSS base path uploads directly via the
+        AWS / Azure SDK.
+
+        Enforces ``CUSTOMER_STORAGE_UPLOAD_MAX_BYTES`` (1 GB) regardless of
+        route so the proxy pod and the customer's quota are both protected
+        from runaway uploads.
+        """
+        await self._enforce_upload_size_cap(file_path)
+
+        if destination.storage_type == FileStorageType.S3:
+            aws_client = AsyncAWSClient(
+                aws_access_key_id=destination.aws_access_key_id,
+                aws_secret_access_key=destination.aws_secret_access_key,
+                region_name=destination.aws_region_name,
+            )
+            await aws_client.upload_file_from_path(
+                uri=destination.sdk_uri,
+                file_path=file_path,
+                raise_exception=True,
+            )
+            return destination.customer_uri
+
+        if destination.storage_type == FileStorageType.AZURE:
+            if not destination.azure_storage_account_name or not destination.azure_storage_account_key:
+                raise AzureConfigurationError("Azure Storage is not configured")
+            azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
+                storage_account_name=destination.azure_storage_account_name,
+                storage_account_key=destination.azure_storage_account_key,
+            )
+            await azure_client.upload_file_from_path(destination.sdk_uri, file_path)
+            return destination.customer_uri
+
+        raise ValueError(f"Unsupported storage type: {destination.storage_type}")
+
+    @staticmethod
+    async def _enforce_upload_size_cap(file_path: str) -> None:
+        """Reject files larger than CUSTOMER_STORAGE_UPLOAD_MAX_BYTES.
+
+        Centralized so direct and proxied paths share the same cap. Stat the
+        file (fast, no IO of contents) and raise a typed exception so callers
+        translate it into a clean block failure.
+        """
+        try:
+            size = await asyncio.to_thread(os.path.getsize, file_path)
+        except FileNotFoundError:
+            raise
+        if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
+            raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.

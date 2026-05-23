@@ -10,12 +10,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.artifact.manager import ArtifactManager, StepArchiveAccumulator
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.artifact.storage.test_helpers import create_fake_step
 
 TEST_STEP_ID = "step_archive_test_001"
 TEST_STEP_ID_2 = "step_archive_test_002"
+_DUMMY_KEYRING_JSON = '{"current_kid":"k1","keys":{"k1":{"secret":"deadbeef"}}}'
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +535,16 @@ def _make_app_mocks() -> tuple[MagicMock, MagicMock]:
 
 
 class TestFlushStepArchive:
-    """Tests for ArtifactManager.flush_step_archive (per-step early flush)."""
+    """Tests for ArtifactManager.flush_step_archive (per-step early flush).
+
+    These cover the **bundled** path (HMAC keyring set, cloud behavior). The
+    unbundled (self-host) path is covered in test_self_host_artifact_url_fallback.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _force_bundled(self):
+        with patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON):
+            yield
 
     @pytest.mark.asyncio
     async def test_flush_uploads_zip_and_creates_db_rows(self) -> None:
