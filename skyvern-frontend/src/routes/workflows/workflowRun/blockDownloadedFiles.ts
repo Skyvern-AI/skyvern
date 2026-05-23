@@ -46,6 +46,21 @@ function filenameForDownloadedFileUrl(url: string): string {
   }
 }
 
+/**
+ * Pick the filename for a downloaded-file URL, preferring the rich
+ * ``downloaded_files`` map (carries the filename directly from the artifact
+ * row) and falling back to URL parsing when the entry is missing.
+ *
+ * The map should be keyed by URL — callers typically iterate
+ * ``workflowRun.downloaded_files`` once to build it.
+ */
+function pickDownloadedFileFilename(
+  url: string,
+  filenameByUrl: ReadonlyMap<string, string>,
+): string {
+  return filenameByUrl.get(url) ?? filenameForDownloadedFileUrl(url);
+}
+
 function getBlockDownloadedFileUrls(
   blockOutput: object | Array<unknown> | string | null | undefined,
   freshFallbackUrls: ReadonlyArray<string>,
@@ -79,4 +94,8 @@ function getBlockDownloadedFileUrls(
   return blockUrls.map((url) => freshByPath.get(urlKey(url)) ?? url);
 }
 
-export { filenameForDownloadedFileUrl, getBlockDownloadedFileUrls };
+export {
+  filenameForDownloadedFileUrl,
+  getBlockDownloadedFileUrls,
+  pickDownloadedFileFilename,
+};

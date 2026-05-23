@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   filenameForDownloadedFileUrl,
   getBlockDownloadedFileUrls,
+  pickDownloadedFileFilename,
 } from "./blockDownloadedFiles";
 
 describe("filenameForDownloadedFileUrl", () => {
@@ -115,5 +116,25 @@ describe("getBlockDownloadedFileUrls", () => {
     expect(getBlockDownloadedFileUrls(output, fresh)).toEqual([
       "https://s3/b/g.pdf?sig=fresh",
     ]);
+  });
+});
+
+describe("pickDownloadedFileFilename", () => {
+  test("prefers the map entry over URL parsing", () => {
+    const url = "https://api.skyvern.com/v1/artifacts/a_1/content?sig=x";
+    const map = new Map([[url, "invoice-2026.pdf"]]);
+    expect(pickDownloadedFileFilename(url, map)).toBe("invoice-2026.pdf");
+  });
+
+  test("falls back to URL parsing when no map entry is present", () => {
+    const url =
+      "https://api.skyvern.com/v1/artifacts/a_1/content" +
+      "?sig=x&artifact_name=from-url.pdf";
+    expect(pickDownloadedFileFilename(url, new Map())).toBe("from-url.pdf");
+  });
+
+  test("falls back to 'download' label when URL has no usable filename", () => {
+    const url = "https://api.skyvern.com/v1/artifacts/a_1/content?sig=x";
+    expect(pickDownloadedFileFilename(url, new Map())).toBe("download");
   });
 });
