@@ -86,6 +86,20 @@ class TestResolveShareUrl:
         app.STORAGE.get_share_link.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_keyring_set_non_bundled_derives_artifact_name_from_uri(self) -> None:
+        """Frontend parses ?artifact_name= out of the URL. Non-bundled artifacts have
+        no bundle_key, so we must fall back to the URI basename — otherwise the path
+        basename is "content" and the UI falls back to a literal "download" label."""
+        manager = ArtifactManager()
+        artifact = _artifact("a_dl", uri="s3://bucket/downloads/o_1/wr_1/invoice-2026.pdf")
+        with (
+            patch.object(settings, "ARTIFACT_CONTENT_HMAC_KEYRING", _DUMMY_KEYRING_JSON),
+            patch.object(manager, "_bundle_content_url", return_value="https://api/x") as bundle,
+        ):
+            await manager.resolve_share_url(artifact, expiry_seconds=3600)
+        assert bundle.call_args.kwargs["artifact_name"] == "invoice-2026.pdf"
+
+    @pytest.mark.asyncio
     async def test_keyring_unset_non_bundled_returns_storage_presigned(self) -> None:
         manager = ArtifactManager()
         artifact = _artifact("a_2")
