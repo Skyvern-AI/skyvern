@@ -1329,6 +1329,7 @@ class ScriptFallbackEpisodeModel(Base):
     __table_args__ = (
         Index("sfe_org_wpid_index", "organization_id", "workflow_permanent_id"),
         Index("sfe_org_created_at_index", "organization_id", "created_at"),
+        Index("sfe_org_wrid_idx", "organization_id", "workflow_run_id"),
     )
 
     episode_id = Column(String, primary_key=True, default=generate_script_fallback_episode_id)
@@ -1347,6 +1348,7 @@ class ScriptFallbackEpisodeModel(Base):
     reviewed = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     reviewer_output = Column(UnicodeText, nullable=True)
     new_script_revision_id = Column(String, nullable=True)
+    reviewer_version = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

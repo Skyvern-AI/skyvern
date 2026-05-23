@@ -1359,6 +1359,7 @@ class ScriptsRepository(BaseRepository):
         agent_actions: list | dict | None = None,
         page_url: str | None = None,
         page_text_snapshot: str | None = None,
+        reviewer_version: str | None = None,
     ) -> ScriptFallbackEpisode:
         async with self.Session() as session:
             episode = ScriptFallbackEpisodeModel(
@@ -1373,6 +1374,7 @@ class ScriptsRepository(BaseRepository):
                 agent_actions=agent_actions,
                 page_url=sanitize_postgres_text(page_url) if page_url else None,
                 page_text_snapshot=sanitize_postgres_text(page_text_snapshot) if page_text_snapshot else None,
+                reviewer_version=reviewer_version,
             )
             session.add(episode)
             await session.commit()
@@ -1408,14 +1410,38 @@ class ScriptsRepository(BaseRepository):
         self,
         episode_id: str,
         organization_id: str,
+        *,
         agent_actions: list | dict | None = None,
         fallback_succeeded: bool | None = None,
+        reviewer_output: str | None = None,
+        reviewer_version: str | None = None,
+        error_message: str | None = None,
+        classify_result: str | None = None,
+        new_script_revision_id: str | None = None,
     ) -> None:
+        """Additive update. None-valued params are NOT written — existing DB values
+        are preserved. Never flips the ``reviewed`` flag; that path is exclusively
+        owned by ``mark_episode_reviewed``.
+
+        Accepts all fields that mid-run / post-run v3 agents may need to persist
+        incrementally (timeline summaries, agent-action enrichment on fall-through,
+        reviewer_version tagging for demotion, etc.).
+        """
         values: dict = {}
         if agent_actions is not None:
             values["agent_actions"] = agent_actions
         if fallback_succeeded is not None:
             values["fallback_succeeded"] = fallback_succeeded
+        if reviewer_output is not None:
+            values["reviewer_output"] = sanitize_postgres_text(reviewer_output)
+        if reviewer_version is not None:
+            values["reviewer_version"] = reviewer_version
+        if error_message is not None:
+            values["error_message"] = sanitize_postgres_text(error_message)
+        if classify_result is not None:
+            values["classify_result"] = sanitize_postgres_text(classify_result)
+        if new_script_revision_id is not None:
+            values["new_script_revision_id"] = new_script_revision_id
         if not values:
             return
         values["modified_at"] = datetime.now(timezone.utc)
@@ -1543,7 +1569,25 @@ class ScriptsRepository(BaseRepository):
         organization_id: str,
         reviewer_output: str | None = None,
         new_script_revision_id: str | None = None,
+        reviewer_version: str | None = None,
     ) -> None:
+        """Atomic transition: set ``reviewed=True`` with COALESCE semantics on
+        ``reviewer_output``, ``new_script_revision_id``, and ``reviewer_version``.
+
+        Passing ``None`` for any of those fields PRESERVES the existing DB value
+        (via ``COALESCE(:new, existing_column)``). Passing a value overwrites.
+        This makes the method safe to call multiple times without clobbering
+        earlier writes — and removes the need for callers to read-before-write.
+
+        V2 caller audit: the only v2 caller that passes ``reviewer_output=None``
+        is the "no updates" branch in ``_run_reviewer_locked``, which operates
+        on freshly-reviewed episodes where the column is already NULL. COALESCE
+        preserving NULL == old explicit NULL write — no behavioral change.
+
+        Only path that flips ``reviewed`` to True; all additive updates belong
+        in ``update_fallback_episode``.
+        """
+        new_reviewer_output = sanitize_postgres_text(reviewer_output) if reviewer_output else None
         async with self.Session() as session:
             await session.execute(
                 update(ScriptFallbackEpisodeModel)
@@ -1551,12 +1595,65 @@ class ScriptsRepository(BaseRepository):
                 .where(ScriptFallbackEpisodeModel.organization_id == organization_id)
                 .values(
                     reviewed=True,
-                    reviewer_output=sanitize_postgres_text(reviewer_output) if reviewer_output else None,
-                    new_script_revision_id=new_script_revision_id,
+                    reviewer_output=func.coalesce(new_reviewer_output, ScriptFallbackEpisodeModel.reviewer_output),
+                    new_script_revision_id=func.coalesce(
+                        new_script_revision_id, ScriptFallbackEpisodeModel.new_script_revision_id
+                    ),
+                    reviewer_version=func.coalesce(reviewer_version, ScriptFallbackEpisodeModel.reviewer_version),
                     modified_at=datetime.now(timezone.utc),
                 )
             )
             await session.commit()
+
+    @db_operation("get_all_episodes_by_workflow_run_id")
+    async def get_all_episodes_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> list[ScriptFallbackEpisode]:
+        """Return every episode for a workflow run, reviewed or not, any reviewer_version,
+        any fallback_type, in chronological order.
+
+        Non-paginated: scoped to one run so bounded by block count (typically <30).
+        Consumed by the post-run v3 agent for Class A demotion review (which needs
+        reviewed=True rows) alongside Class B processing. Uses the
+        ``sfe_org_wrid_idx`` composite index.
+        """
+        async with self.Session() as session:
+            query = (
+                select(ScriptFallbackEpisodeModel)
+                .filter_by(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                )
+                .order_by(ScriptFallbackEpisodeModel.created_at.asc())
+            )
+            episodes = (await session.scalars(query)).all()
+            return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
+
+    @db_operation("get_unreviewed_episodes_by_workflow_run_id")
+    async def get_unreviewed_episodes_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> list[ScriptFallbackEpisode]:
+        """Convenience wrapper: unreviewed episodes for a workflow run.
+
+        Filters the all-episodes result for ``reviewed == False``. Uses the
+        ``sfe_org_wrid_idx`` composite index (same index serves both queries).
+        """
+        async with self.Session() as session:
+            query = (
+                select(ScriptFallbackEpisodeModel)
+                .filter_by(
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    reviewed=False,
+                )
+                .order_by(ScriptFallbackEpisodeModel.created_at.asc())
+            )
+            episodes = (await session.scalars(query)).all()
+            return [ScriptFallbackEpisode.model_validate(e) for e in episodes]
 
     @db_operation("get_recent_reviewed_episodes")
     async def get_recent_reviewed_episodes(

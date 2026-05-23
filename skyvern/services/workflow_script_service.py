@@ -1733,3 +1733,216 @@ async def create_script_version_from_review(
             workflow_permanent_id=workflow_permanent_id,
         )
         return None
+
+
+async def create_script_version_from_full_code(
+    organization_id: str,
+    workflow_permanent_id: str,
+    base_script: Script,
+    full_main_py: str,
+    workflow: Workflow,
+    workflow_run: WorkflowRun | None = None,
+) -> Script | None:
+    """Create a new script version from a complete main.py rewrite.
+
+    Sibling of :func:`create_script_version_from_review`. The block-patch helper
+    mutates individual @cached function bodies via libcst; this helper replaces
+    the entire main.py verbatim. Used by the v3 post-run (and mid-run) agent's
+    ``persist_script_rewrite`` skill when the right fix is at the orchestrator
+    level (control flow, helper functions, FIELD_MAP constants, imports, etc.)
+    rather than a single block body.
+
+    Safety parity with the block-patch helper:
+    - Pinned-script check at the head (same behavior: log + return ``None``; no
+      exception). Mirrors ``create_script_version_from_review`` explicitly.
+    - Full compile check on the provided main.py BEFORE creating any DB rows or
+      uploading any artifact. Rejection returns ``None`` so no partial state
+      leaks.
+    - Script-block metadata is copied from the base revision (same pattern as
+      the block-patch helper). The new main.py is expected to still define the
+      same @cached functions; script-level validators in the v3 skills catalog
+      are responsible for enforcing that before this helper is called.
+
+    Args:
+        organization_id: The organization ID.
+        workflow_permanent_id: The workflow permanent ID.
+        base_script: The script revision being replaced.
+        full_main_py: The complete new main.py source code.
+        workflow: The workflow model.
+        workflow_run: The workflow run that triggered the rewrite.
+
+    Returns:
+        The new Script revision, or ``None`` if creation failed (including
+        pinned-script skip and compile-check failure).
+    """
+    try:
+        # Defense-in-depth: refuse to mutate a pinned script.
+        # MUST match create_script_version_from_review's behavior (log + return None)
+        # so callers can uniformly treat None as "pinned or failed — don't retry".
+        if await app.DATABASE.scripts.is_script_pinned(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+        ):
+            LOG.info(
+                "Skipping script rewrite — script is pinned",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
+        # Compile the full main.py BEFORE creating the new version. A broken
+        # rewrite should not persist any artifacts or DB rows.
+        try:
+            compile(full_main_py, "<full_rewrite_main.py>", "exec")
+        except SyntaxError as exc:
+            LOG.warning(
+                "Full-script rewrite failed compile check — aborting persist",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+                error=str(exc),
+                lineno=exc.lineno,
+            )
+            return None
+
+        # Create a new script version
+        new_script = await app.DATABASE.scripts.create_script(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+            version=base_script.version + 1,
+            run_id=workflow_run.workflow_run_id if workflow_run else None,
+        )
+
+        # Copy existing script blocks from the base revision. The rewrite is
+        # expected to preserve the same @cached block set (enforced upstream
+        # by script-level validators); we keep the metadata rows intact.
+        existing_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+        )
+
+        for sb in existing_blocks:
+            await app.DATABASE.scripts.create_script_block(
+                organization_id=organization_id,
+                script_id=new_script.script_id,
+                script_revision_id=new_script.script_revision_id,
+                script_block_label=sb.script_block_label,
+                run_signature=sb.run_signature,
+                workflow_run_id=workflow_run.workflow_run_id if workflow_run else sb.workflow_run_id,
+                workflow_run_block_id=sb.workflow_run_block_id,
+                input_fields=sb.input_fields,
+                requires_agent=sb.requires_agent,
+            )
+
+        # Write the full main.py verbatim.
+        main_bytes = full_main_py.encode("utf-8")
+        main_hash = hashlib.sha256(main_bytes).hexdigest()
+
+        main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+            organization_id=organization_id,
+            script_id=new_script.script_id,
+            script_version=new_script.version,
+            file_path="main.py",
+            data=main_bytes,
+        )
+        await app.DATABASE.scripts.create_script_file(
+            script_revision_id=new_script.script_revision_id,
+            script_id=new_script.script_id,
+            organization_id=organization_id,
+            file_path="main.py",
+            file_name="main.py",
+            file_type="file",
+            content_hash=f"sha256:{main_hash}",
+            file_size=len(main_bytes),
+            mime_type="text/x-python",
+            artifact_id=main_artifact_id,
+        )
+
+        # Copy non-block files from base revision (preserves .skyvern metadata etc.).
+        # Same fallback-to-v1 pattern as the block-patch helper.
+        source_files = await app.DATABASE.scripts.get_script_files(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+        )
+        if not any(f.file_path != "main.py" and not f.file_path.startswith("blocks/") for f in source_files):
+            v1_script = await app.DATABASE.scripts.get_script(
+                script_id=base_script.script_id,
+                organization_id=organization_id,
+                version=1,
+            )
+            if v1_script:
+                source_files = await app.DATABASE.scripts.get_script_files(
+                    script_revision_id=v1_script.script_revision_id,
+                    organization_id=organization_id,
+                )
+
+        for f in source_files:
+            if f.file_path == "main.py" or f.file_path.startswith("blocks/"):
+                continue
+            await app.DATABASE.scripts.create_script_file(
+                script_revision_id=new_script.script_revision_id,
+                script_id=new_script.script_id,
+                organization_id=organization_id,
+                file_path=f.file_path,
+                file_name=f.file_name,
+                file_type=f.file_type,
+                content_hash=f.content_hash,
+                file_size=f.file_size,
+                mime_type=f.mime_type,
+                artifact_id=f.artifact_id,
+            )
+
+        # Workflow script mapping — same logic as the block-patch helper.
+        if workflow_run:
+            _script, rendered_cache_key_value, _is_pinned = await get_workflow_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                status=ScriptStatus.published,
+            )
+        else:
+            existing_ws = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                statuses=[ScriptStatus.published],
+            )
+            rendered_cache_key_value = ""
+            for ws in existing_ws:
+                if ws.script_id == base_script.script_id:
+                    rendered_cache_key_value = ws.cache_key_value
+                    break
+
+        await app.DATABASE.scripts.create_workflow_script(
+            organization_id=organization_id,
+            script_id=new_script.script_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key=workflow.cache_key or "",
+            cache_key_value=rendered_cache_key_value,
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id if workflow_run else None,
+            status=ScriptStatus.published,
+        )
+
+        clear_workflow_script_cache(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
+        LOG.info(
+            "Created new script version from full-code rewrite",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            base_version=base_script.version,
+            new_version=new_script.version,
+            main_py_size=len(main_bytes),
+        )
+
+        return new_script
+
+    except Exception:
+        LOG.exception(
+            "Failed to create script version from full code rewrite",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        return None
