@@ -341,6 +341,7 @@ class WorkflowRunResponseBase(BaseModel):
     browser_address: str | None = None
     run_with: str = "agent"
     script_run: ScriptRunResponse | None = None
+    script_id: str | None = None
     errors: list[dict[str, Any]] | None = None
 
     @field_validator("run_with", mode="before")

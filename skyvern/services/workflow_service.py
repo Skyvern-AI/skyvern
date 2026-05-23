@@ -157,6 +157,7 @@ async def get_workflow_run_response(
         browser_profile_id=workflow_run.browser_profile_id,
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         script_run=workflow_run.script_run,
+        script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,

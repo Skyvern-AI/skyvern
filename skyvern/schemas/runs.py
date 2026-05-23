@@ -432,6 +432,10 @@ class WorkflowRunResponse(BaseRunResponse):
         default=None,
         description="Whether to fallback to AI if code run fails.",
     )
+    script_id: str | None = Field(
+        default=None,
+        description="ID of the cached script used for this workflow run, if any.",
+    )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
