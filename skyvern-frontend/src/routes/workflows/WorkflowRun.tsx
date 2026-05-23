@@ -40,7 +40,7 @@ import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkf
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
 import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
-import { filenameForDownloadedFileUrl } from "./workflowRun/blockDownloadedFiles";
+import { pickDownloadedFileFilename } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -303,6 +303,16 @@ function WorkflowRun() {
   const fileUrls = hasFileUrls
     ? (workflowRun.downloaded_file_urls as string[])
     : [];
+  // Prefer the rich downloaded_files array (carries filename, checksum, size)
+  // when the backend sends it; falls back to URL parsing otherwise.
+  const filenameByUrl = new Map<string, string>();
+  if (workflowRun?.downloaded_files) {
+    for (const file of workflowRun.downloaded_files) {
+      if (file.filename) {
+        filenameByUrl.set(file.url, file.filename);
+      }
+    }
+  }
 
   const showBoth =
     (hasSomeExtractedInformation || hasTaskv2Output) && hasFileUrls;
@@ -547,7 +557,10 @@ function WorkflowRun() {
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
                     fileUrls.map((url) => {
-                      const filename = filenameForDownloadedFileUrl(url);
+                      const filename = pickDownloadedFileFilename(
+                        url,
+                        filenameByUrl,
+                      );
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />

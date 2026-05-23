@@ -18,7 +18,7 @@ import { SummarizeOutput } from "@/components/SummarizeOutput";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import {
-  filenameForDownloadedFileUrl,
+  pickDownloadedFileFilename,
   getBlockDownloadedFileUrls,
 } from "./blockDownloadedFiles";
 
@@ -154,6 +154,15 @@ function WorkflowRunOutput() {
       activeBlock.status === Status.Canceled);
 
   const allFileUrls = workflowRun?.downloaded_file_urls ?? [];
+
+  // Prefer the rich downloaded_files array (carries filename) when the backend
+  // sends it; falls back to URL parsing otherwise.
+  const filenameByUrl = new Map<string, string>();
+  for (const file of workflowRun?.downloaded_files ?? []) {
+    if (file.filename) {
+      filenameByUrl.set(file.url, file.filename);
+    }
+  }
 
   // Scope to the surrounding block whenever the user explicitly selected a
   // block or any action inside it, so drilling from a block into its child
@@ -347,7 +356,7 @@ function WorkflowRunOutput() {
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
               fileUrls.map((url) => {
-                const filename = filenameForDownloadedFileUrl(url);
+                const filename = pickDownloadedFileFilename(url, filenameByUrl);
                 return (
                   <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />
