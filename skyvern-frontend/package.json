@@ -98,7 +98,7 @@
     "eslint-plugin-react-hooks": "^4.6.0",
     "eslint-plugin-react-refresh": "^0.4.26",
     "fast-check": "^4.8.0",
-    "jsdom": "^25.0.1",
+    "jsdom": "^29.1.1",
     "lint-staged": "^15.5.2",
     "postcss": "^8.4.37",
     "prettier": "^3.8.1",
