@@ -12,6 +12,12 @@ from skyvern.forge.sdk.schemas.credentials import Credential, CredentialType, Cr
 from skyvern.forge.sdk.schemas.organization_bitwarden_collections import OrganizationBitwardenCollection
 
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+
 class CredentialRepository(BaseRepository):
     """Database operations for credential and Bitwarden collection management."""
 
@@ -190,7 +196,7 @@ class CredentialRepository(BaseRepository):
             ).first()
             if not credential:
                 raise NotFoundError(f"Credential {credential_id} not found")
-            credential.deleted_at = datetime.now(timezone.utc)
+            credential.deleted_at = _utcnow()
             await session.commit()
             await session.refresh(credential)
             return None

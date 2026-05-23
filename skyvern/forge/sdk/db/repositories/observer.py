@@ -33,6 +33,12 @@ from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.schemas.runs import ProxyLocationInput, RunEngine, ScriptRunResponse
 from skyvern.schemas.workflows import BlockStatus, BlockType
 
+
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 LOG = structlog.get_logger()
 
 
@@ -373,11 +379,11 @@ class ObserverRepository(BaseRepository):
                 if status:
                     task_v2.status = status
                     if status == TaskV2Status.queued and task_v2.queued_at is None:
-                        task_v2.queued_at = datetime.now(timezone.utc)
+                        task_v2.queued_at = _utcnow()
                     if status == TaskV2Status.running and task_v2.started_at is None:
-                        task_v2.started_at = datetime.now(timezone.utc)
+                        task_v2.started_at = _utcnow()
                     if status.is_final() and task_v2.finished_at is None:
-                        task_v2.finished_at = datetime.now(timezone.utc)
+                        task_v2.finished_at = _utcnow()
                 if workflow_run_id:
                     task_v2.workflow_run_id = workflow_run_id
                 if workflow_id:

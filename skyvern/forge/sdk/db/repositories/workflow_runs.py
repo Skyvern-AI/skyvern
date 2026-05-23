@@ -49,6 +49,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
 )
 from skyvern.schemas.runs import ProxyLocationInput, RunType
 
+
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 LOG = structlog.get_logger()
 
 
@@ -240,11 +246,11 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    workflow_run.queued_at = datetime.now(timezone.utc)
+                    workflow_run.queued_at = _utcnow()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
-                    workflow_run.started_at = datetime.now(timezone.utc)
+                    workflow_run.started_at = _utcnow()
                 if status and status.is_final() and workflow_run.finished_at is None:
-                    workflow_run.finished_at = datetime.now(timezone.utc)
+                    workflow_run.finished_at = _utcnow()
                 if failure_reason:
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
@@ -346,7 +352,7 @@ class WorkflowRunsRepository(BaseRepository):
         existing value via ``COALESCE``).
         """
         non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
             values["finished_at"] = now

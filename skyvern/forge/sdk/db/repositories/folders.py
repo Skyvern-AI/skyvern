@@ -17,6 +17,12 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.db.base_alchemy_db import _SessionFactory
 
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+
 class FoldersRepository(BaseRepository):
     """Database operations for folder management."""
 
@@ -119,7 +125,7 @@ class FoldersRepository(BaseRepository):
             if description is not None:
                 folder.description = description
 
-            folder.modified_at = datetime.now(timezone.utc)
+            folder.modified_at = _utcnow()
             await session.commit()
             await session.refresh(folder)
             return folder
@@ -220,7 +226,7 @@ class FoldersRepository(BaseRepository):
                         .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
                         .where(WorkflowModel.organization_id == organization_id)
                         .where(WorkflowModel.deleted_at.is_(None))
-                        .values(deleted_at=datetime.now(timezone.utc))
+                        .values(deleted_at=_utcnow())
                     )
                     await session.execute(update_workflows_query)
             else:
@@ -229,12 +235,12 @@ class FoldersRepository(BaseRepository):
                     update(WorkflowModel)
                     .where(WorkflowModel.folder_id == folder_id)
                     .where(WorkflowModel.organization_id == organization_id)
-                    .values(folder_id=None, modified_at=datetime.now(timezone.utc))
+                    .values(folder_id=None, modified_at=_utcnow())
                 )
                 await session.execute(update_workflows_query)
 
             # Soft delete the folder
-            folder.deleted_at = datetime.now(timezone.utc)
+            folder.deleted_at = _utcnow()
             await session.commit()
             return True
 
@@ -355,13 +361,13 @@ class FoldersRepository(BaseRepository):
             workflow_model = await session.get(WorkflowModel, latest_workflow.workflow_id)
             if workflow_model:
                 workflow_model.folder_id = folder_id
-                workflow_model.modified_at = datetime.now(timezone.utc)
+                workflow_model.modified_at = _utcnow()
 
                 # Update folder's modified_at in the same transaction
                 if folder_id:
                     folder_model = await session.get(FolderModel, folder_id)
                     if folder_model:
-                        folder_model.modified_at = datetime.now(timezone.utc)
+                        folder_model.modified_at = _utcnow()
 
                 await session.commit()
                 await session.refresh(workflow_model)

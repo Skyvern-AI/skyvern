@@ -29,8 +29,13 @@ from skyvern.schemas.runs import ProxyLocationInput, RunStatus, RunType
 from skyvern.schemas.steps import AgentStepOutput
 from skyvern.webeye.actions.actions import Action
 
-LOG = structlog.get_logger()
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+LOG = structlog.get_logger()
 
 class TasksRepository(BaseRepository):
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
@@ -486,7 +491,7 @@ class TasksRepository(BaseRepository):
                     step.status = status
 
                     if status.is_terminal() and step.finished_at is None:
-                        step.finished_at = datetime.now(timezone.utc)
+                        step.finished_at = _utcnow()
                 if output is not None:
                     step.output = output.model_dump(exclude_none=True)
                 if is_last is not None:
@@ -565,11 +570,11 @@ class TasksRepository(BaseRepository):
                 if status is not None:
                     task.status = status
                     if status == TaskStatus.queued and task.queued_at is None:
-                        task.queued_at = datetime.now(timezone.utc)
+                        task.queued_at = _utcnow()
                     if status == TaskStatus.running and task.started_at is None:
-                        task.started_at = datetime.now(timezone.utc)
+                        task.started_at = _utcnow()
                     if status.is_final() and task.finished_at is None:
-                        task.finished_at = datetime.now(timezone.utc)
+                        task.finished_at = _utcnow()
                 if extracted_information is not None:
                     task.extracted_information = extracted_information
                 if failure_reason is not None:
@@ -688,7 +693,7 @@ class TasksRepository(BaseRepository):
         async with self.Session() as session:
             update_values: dict[str, Any] = {"status": new_status.value}
             if new_status.is_final():
-                update_values["finished_at"] = func.coalesce(TaskModel.finished_at, datetime.now(timezone.utc))
+                update_values["finished_at"] = func.coalesce(TaskModel.finished_at, _utcnow())
             if failure_reason is not None:
                 update_values["failure_reason"] = failure_reason
 
@@ -908,13 +913,17 @@ class TasksRepository(BaseRepository):
 
         Does NOT raise if the task_runs row is missing (race at creation time).
         """
+        def _strip_tz(dt: datetime | None) -> datetime | None:
+            """task_runs uses TIMESTAMP WITHOUT TIME ZONE; strip tzinfo before writing."""
+            return dt.replace(tzinfo=None) if dt is not None and dt.tzinfo is not None else dt
+
         try:
             async with self.Session() as session:
                 vals: dict[str, Any] = {"status": status}
                 if started_at is not None:
-                    vals["started_at"] = started_at
+                    vals["started_at"] = _strip_tz(started_at)
                 if finished_at is not None:
-                    vals["finished_at"] = finished_at
+                    vals["finished_at"] = _strip_tz(finished_at)
                 stmt = (
                     update(TaskRunModel)
                     .where(TaskRunModel.run_id == run_id)
