@@ -212,12 +212,12 @@ async def test_get_downloaded_files_uses_artifact_urls_when_rows_exist(keyring_c
         file_size=4096,
     )
     mock_list = AsyncMock(return_value=[artifact])
-    build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
+    resolve_url = AsyncMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
 
     with patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app:
         with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
             s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
-            base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+            base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
             base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
             result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
 
@@ -251,14 +251,14 @@ async def test_get_downloaded_files_preserves_artifact_row_order(keyring_configu
         created_at="2026-04-23T00:01:00Z",
     )
     mock_list = AsyncMock(return_value=[first, second])
-    build_url = MagicMock(
-        side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+    resolve_url = AsyncMock(
+        side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
     )
 
     with patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app:
         with patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app:
             s3_app.DATABASE.artifacts.list_artifacts_for_run_by_type = mock_list
-            base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+            base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
             base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
             result = await storage.get_downloaded_files(organization_id="o_1", run_id="wr_1")
 

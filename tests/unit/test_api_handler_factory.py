@@ -511,3 +511,238 @@ class TestGemini3ReasoningEffortExperiment:
         assert "reasoning_effort" not in params
         assert "thinking" not in params
         assert params["thinking_level"] == "minimal"
+
+
+# SKY-10200 — runtime tests for the router timeout-precedence fix and per-hop
+# fallback chain expansion. These complement the config-shape tests in
+# tests/cloud/test_llm_router_fallback.py by pinning the api_handler_factory
+# wiring: that the router is constructed with a default timeout, the call
+# sites don't pass a per-call timeout kwarg (which would clobber per-deployment
+# values), and the fallbacks list expands into per-hop entries.
+
+
+def _make_three_tier_router_config(*, fallback_groups: list[str]) -> LLMRouterConfig:
+    """Synthetic 3+ tier router config that doesn't depend on the cloud
+    `LLMConfigRegistry` registration that's conditional on prod env vars."""
+    deployments = [
+        LLMRouterModelConfig(model_name="primary-group", litellm_params={"model": "openai/primary", "timeout": 60}),
+    ] + [
+        LLMRouterModelConfig(model_name=group, litellm_params={"model": f"openai/{group}", "timeout": 60})
+        for group in fallback_groups
+    ]
+    return LLMRouterConfig(
+        model_name="test-router",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=deployments,
+        redis_host="localhost",
+        redis_port=6379,
+        redis_password="",
+        main_model_group="primary-group",
+        fallback_model_group=fallback_groups,
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        disable_cooldowns=True,
+        temperature=None,
+    )
+
+
+def _stub_for_router_test(monkeypatch: pytest.MonkeyPatch, *, llm_key: str, config: LLMRouterConfig) -> None:
+    """Wire a synthetic LLMRouterConfig into the registry and bypass env-var
+    validation. Mirrors `router_test_context` from tests/unit/helpers.py."""
+    from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry  # local import
+
+    monkeypatch.setattr(LLMConfigRegistry, "validate_config", classmethod(lambda cls, key, cfg: None))
+    LLMConfigRegistry._configs.pop(llm_key, None)  # type: ignore[attr-defined]
+    LLMConfigRegistry.register_config(llm_key, config)
+    LLMAPIHandlerFactory._router_handler_cache.pop(llm_key, None)
+    monkeypatch.setattr(api_handler_factory.skyvern_context, "current", lambda: None)
+    monkeypatch.setattr(api_handler_factory.litellm, "completion_cost", lambda completion_response: 0.0)
+
+    async def fake_llm_messages_builder(prompt, screenshots, add_assistant_prefix):
+        return [{"role": "user", "content": prompt}]
+
+    monkeypatch.setattr(api_handler_factory, "llm_messages_builder", fake_llm_messages_builder)
+
+
+def test_router_constructor_receives_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Router constructor must receive `timeout=settings.LLM_CONFIG_TIMEOUT`
+    so deployments without an explicit per-deployment timeout fall back to this
+    Router-level default (third precedence level per litellm/router.py
+    _get_non_stream_timeout). Pre-fix this was passed at the per-call site
+    instead, clobbering per-deployment values. SKY-10200 CORR-1."""
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["fallback-a", "fallback-b"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_ROUTER_DEFAULT_TIMEOUT", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_ROUTER_DEFAULT_TIMEOUT")
+
+    assert captured.get("timeout") == api_handler_factory.settings.LLM_CONFIG_TIMEOUT, (
+        f"Router must be constructed with timeout=settings.LLM_CONFIG_TIMEOUT; got timeout={captured.get('timeout')!r}"
+    )
+
+
+def test_router_fallbacks_payload_expands_per_hop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fallbacks=[{main: [a, b, c]}, {a: [b, c]}, {b: [c]}] — each non-terminal
+    hop carries its own outgoing chain so secondary entry points (e.g.
+    truncation retry at api_handler_factory.py:1119 which calls
+    router.acompletion(model=fallback_groups[0])) also benefit from the
+    remaining chain. SKY-10200 COMP-4."""
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["hop-a", "hop-b", "hop-c"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_FALLBACK_EXPANSION", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FALLBACK_EXPANSION")
+
+    expected = [
+        {"primary-group": ["hop-a", "hop-b", "hop-c"]},
+        {"hop-a": ["hop-b", "hop-c"]},
+        {"hop-b": ["hop-c"]},
+    ]
+    assert captured.get("fallbacks") == expected, (
+        f"fallbacks payload must expand to per-hop entries; got {captured.get('fallbacks')!r}"
+    )
+
+
+def test_router_fallbacks_payload_single_hop_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For a single-hop chain the expansion produces the same single-dict shape
+    as the legacy payload — no behavior change for routers that don't have a
+    deeper chain. SKY-10200 regression check."""
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["only-fallback"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_FALLBACK_SINGLE_HOP", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FALLBACK_SINGLE_HOP")
+
+    assert captured.get("fallbacks") == [{"primary-group": ["only-fallback"]}], (
+        f"single-hop fallbacks payload must match legacy single-dict shape; got {captured.get('fallbacks')!r}"
+    )
+
+
+def test_router_fallbacks_payload_empty_when_no_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No fallback groups → empty fallbacks list. SKY-10200 regression check."""
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = LLMRouterConfig(
+        model_name="test-router-no-fb",
+        required_env_vars=[],
+        supports_vision=False,
+        add_assistant_prefix=False,
+        model_list=[
+            LLMRouterModelConfig(model_name="primary-group", litellm_params={"model": "openai/primary"}),
+        ],
+        redis_host="localhost",
+        redis_port=6379,
+        redis_password="",
+        main_model_group="primary-group",
+        fallback_model_group=None,
+        routing_strategy="simple-shuffle",
+        num_retries=0,
+        disable_cooldowns=True,
+        temperature=None,
+    )
+    _stub_for_router_test(monkeypatch, llm_key="TEST_FALLBACK_EMPTY", config=config)
+
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_FALLBACK_EMPTY")
+
+    assert captured.get("fallbacks") == [], (
+        f"no-fallback router must construct with empty fallbacks list; got {captured.get('fallbacks')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_acompletion_does_not_pass_timeout_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The handler must NOT pass `timeout=` as a kwarg to router.acompletion;
+    that would override per-deployment litellm_params['timeout'] per litellm
+    precedence (litellm/router.py:_get_non_stream_timeout). SKY-10200 CORR-1."""
+
+    captured_calls: list[dict[str, Any]] = []
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            self._main = kwargs.get("model_list", [{}])[0].get("model_name", "primary-group")
+
+        async def acompletion(self, *, model: str, messages: Any, **kwargs: Any) -> FakeLLMResponse:
+            captured_calls.append({"model": model, "kwargs": dict(kwargs)})
+            return FakeLLMResponse(model)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["hop-a", "hop-b"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_NO_TIMEOUT_KWARG", config=config)
+
+    handler = LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_NO_TIMEOUT_KWARG")
+    await handler(prompt='{"actions": []}', prompt_name="extract-actions")
+
+    assert captured_calls, "router.acompletion was never invoked"
+    for call in captured_calls:
+        assert "timeout" not in call["kwargs"], (
+            f"router.acompletion must not receive timeout= kwarg (it overrides per-deployment timeout); got call={call}"
+        )
+
+
+def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-hop fallback expansion is constructed as strict suffixes — each
+    non-terminal hop appears as a key at most once and each entry's chain
+    drops one head from the parent. Together these prevent litellm from
+    retrying the same hop more than once in a single request. SKY-10200."""
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingRouter:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(api_handler_factory.litellm, "Router", _CapturingRouter)
+
+    config = _make_three_tier_router_config(fallback_groups=["hop-a", "hop-b", "hop-c"])
+    _stub_for_router_test(monkeypatch, llm_key="TEST_NO_DOUBLE_INVOCATION", config=config)
+    LLMAPIHandlerFactory.get_llm_api_handler_with_router("TEST_NO_DOUBLE_INVOCATION")
+
+    fallbacks = captured.get("fallbacks", [])
+    assert fallbacks, "fallbacks payload must be non-empty for a multi-hop chain"
+
+    keys = [next(iter(entry.keys())) for entry in fallbacks]
+    assert len(keys) == len(set(keys)), (
+        f"each non-terminal hop must appear as a key at most once; got duplicates in {keys}. "
+        "A repeated key would cause litellm to retry the same chain twice from that hop."
+    )
+
+    chains = [list(entry.values())[0] for entry in fallbacks]
+    for i in range(1, len(chains)):
+        assert chains[i] == chains[i - 1][1:], (
+            f"each chain must drop one head from the previous (strict suffix); got chains={chains}. "
+            "Non-suffix expansion could re-list already-tried hops and amplify retries."
+        )
