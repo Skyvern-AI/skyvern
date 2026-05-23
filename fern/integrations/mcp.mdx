@@ -86,6 +86,14 @@ This fallback uses [mcp-remote](https://www.npmjs.com/package/mcp-remote) to bri
 </Tab>
 <Tab title="Cursor">
 
+**One-click install** (Cursor 0.43+, OAuth — no API key required):
+
+[Install Skyvern in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=Skyvern&config=eyJ0eXBlIjoic3RyZWFtYWJsZS1odHRwIiwidXJsIjoiaHR0cHM6Ly9hcGkuc2t5dmVybi5jb20vbWNwLyJ9)
+
+Click the link above (or copy-paste it into your browser's address bar). Cursor opens and prompts you to authenticate via browser sign-in.
+
+**Manual setup with API key:**
+
 Add to `~/.cursor/mcp.json`:
 
 ```json
@@ -124,6 +132,16 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 </Tab>
 <Tab title="Codex">
 
+**OAuth (recommended, no API key required):**
+
+```bash
+codex mcp add skyvern --url https://api.skyvern.com/mcp/
+```
+
+Codex opens your browser for Skyvern sign-in and stores the token automatically. Requires `codex --version` ≥ 0.125.0.
+
+**Manual setup with API key** (headless or CI environments):
+
 Add to `~/.codex/config.toml`:
 
 ```toml
@@ -140,6 +158,21 @@ To load the API key from an environment variable instead, use `env_http_headers`
 [mcp_servers.skyvern.env_http_headers]
 x-api-key = "SKYVERN_API_KEY"
 ```
+
+</Tab>
+<Tab title="ChatGPT">
+
+**ChatGPT custom connector (Developer Mode)**
+
+This is not the ChatGPT App Directory. You can add Skyvern as a custom MCP connector immediately without marketplace approval, provided your ChatGPT plan has the custom connector feature available (Plus, Team, and Enterprise plans).
+
+1. In ChatGPT, open **Settings → Connectors** (look under **Integrations** or **Beta features** if Connectors is not visible).
+2. Click **Add connector** and choose the **MCP** type.
+3. Enter the Skyvern MCP URL: `https://api.skyvern.com/mcp/`
+4. ChatGPT detects OAuth support automatically. Follow the browser sign-in prompt to authenticate with your Skyvern account.
+5. Once connected, Skyvern tools appear in the tool panel for navigating pages, filling forms, extracting data, and running workflows.
+
+No API key is required — OAuth handles authentication.
 
 </Tab>
 </Tabs>
