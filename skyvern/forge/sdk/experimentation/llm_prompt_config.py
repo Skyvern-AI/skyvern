@@ -122,7 +122,7 @@ async def get_check_user_goal_llm_override(
         )
         return None
 
-    if variant in _CHECK_USER_GOAL_CONTROL_VARIANTS:
+    if variant is None or variant in _CHECK_USER_GOAL_CONTROL_VARIANTS:
         return None
 
     cached = _resolved_check_user_goal_handler_cache.get(variant)
