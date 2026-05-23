@@ -35,6 +35,7 @@ import {
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { stringify as convertToYAML } from "yaml";
+import { useNodeCollapseStore } from "./editor/collapse/useNodeCollapseStore";
 import { convert } from "./editor/workflowEditorUtils";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -83,13 +84,14 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
       const client = await getClient(credentialGetter);
       return client.delete(`/workflows/${id}`);
     },
-    onSuccess: () => {
+    onSuccess: (_data, deletedId) => {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
       queryClient.invalidateQueries({
         queryKey: ["folders"],
       });
+      useNodeCollapseStore.getState().pruneWorkflow(deletedId);
       onSuccessfullyDeleted?.();
     },
     onError: (error: AxiosError) => {

@@ -8,6 +8,8 @@ import {
 import { useState } from "react";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { toast } from "@/components/ui/use-toast";
+import { useNodeCollapseStore } from "../editor/collapse/useNodeCollapseStore";
+import { useWorkflowScopeId } from "../editor/WorkflowScopeContext";
 
 /**
  * Sanitizes a block label to be a valid Python/Jinja2 identifier.
@@ -51,6 +53,7 @@ function useNodeLabelChangeHandler({ id, initialValue }: Props) {
   const [label, setLabel] = useState(initialValue);
   const nodes = useNodes<AppNode>();
   const { setNodes } = useReactFlow();
+  const workflowId = useWorkflowScopeId() ?? "__global__";
   const {
     parameters: workflowParameters,
     setParameters: setWorkflowParameters,
@@ -74,6 +77,13 @@ function useNodeLabelChangeHandler({ id, initialValue }: Props) {
     }
 
     const newLabel = getUniqueLabelForExistingNode(sanitized, existingLabels);
+    const oldLabel = nodes.find((node) => node.id === id)?.data.label;
+    if (oldLabel && oldLabel !== newLabel) {
+      useNodeCollapseStore
+        .getState()
+        .renameBlock(workflowId, oldLabel, newLabel);
+    }
+
     setLabel(newLabel);
     setNodes(
       getUpdatedNodesAfterLabelUpdateForParameterKeys(

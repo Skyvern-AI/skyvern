@@ -1,72 +1,30 @@
-import {
-  Handle,
-  Node,
-  NodeProps,
-  Position,
-  useEdges,
-  useNodes,
-  useReactFlow,
-} from "@xyflow/react";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { useParams } from "react-router-dom";
+import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
 import type { StartNode } from "./types";
-import { AppNode } from "..";
 import {
   Accordion,
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { ProxyLocation } from "@/api/types";
-import { Label } from "@/components/ui/label";
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
-import { Input } from "@/components/ui/input";
-import { ProxySelector } from "@/components/ProxySelector";
-import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserProfileSelector";
-import { Switch } from "@/components/ui/switch";
 import { Separator } from "@/components/ui/separator";
-import { ModelSelector } from "@/components/ModelSelector";
 import {
   WorkflowModel,
   scriptableWorkflowBlockTypes,
   type WorkflowBlockType,
 } from "@/routes/workflows/types/workflowTypes";
-import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "../Taskv2Node/types";
-import { KeyValueInput } from "@/components/KeyValueInput";
-import { placeholders } from "@/routes/workflows/editor/helpContent";
 import { useToggleScriptForNodeCallback } from "@/routes/workflows/hooks/useToggleScriptForNodeCallback";
-import { useResetProfileMutation } from "@/routes/workflows/hooks/useResetProfileMutation";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
 import { Flippable } from "@/components/Flippable";
 import { useRerender } from "@/hooks/useRerender";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { BlockCodeEditor } from "@/routes/workflows/components/BlockCodeEditor";
-import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { cn } from "@/util/utils";
-import { Button } from "@/components/ui/button";
-import { TestWebhookDialog } from "@/components/TestWebhookDialog";
-import { getWorkflowBlocks } from "../../workflowEditorUtils";
+import { BuildModeOnly } from "../BuildModeOnly";
 import { isLoopNode } from "../LoopNode/types";
+import { WorkflowSettingsEditor } from "./WorkflowSettingsEditor";
 
 interface StartSettings {
   webhookCallbackUrl: string;
@@ -83,65 +41,17 @@ interface StartSettings {
 function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
   const reactFlowInstance = useReactFlow();
-  const nodes = useNodes<AppNode>();
-  const edges = useEdges();
   const [facing, setFacing] = useState<"front" | "back">("front");
-  const [isResetProfileDialogOpen, setIsResetProfileDialogOpen] =
-    useState(false);
-  const { workflowPermanentId } = useParams();
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const script = blockScriptStore.scripts.__start_block__;
   const rerender = useRerender({ prefix: "accordion" });
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
-  const resetProfileMutation = useResetProfileMutation({
-    workflowPermanentId,
-    onSuccess: () => setIsResetProfileDialogOpen(false),
-  });
-
-  // Local state for webhook URL to fix race condition where data.webhookCallbackUrl
-  // isn't updated yet when user clicks "Test Webhook" after typing
-  const webhookCallbackUrl = data.withWorkflowSettings
-    ? data.webhookCallbackUrl
-    : "";
-  const [localWebhookUrl, setLocalWebhookUrl] = useState(webhookCallbackUrl);
-  const prevWebhookUrl = useRef(webhookCallbackUrl);
-
-  // Sync from parent only on external changes (e.g., undo/redo), not our own updates
-  useEffect(() => {
-    if (!data.withWorkflowSettings) {
-      setLocalWebhookUrl("");
-      return;
-    }
-
-    const parentChanged = webhookCallbackUrl !== prevWebhookUrl.current;
-    const isExternalChange =
-      parentChanged && localWebhookUrl === prevWebhookUrl.current;
-
-    if (isExternalChange) {
-      setLocalWebhookUrl(webhookCallbackUrl);
-    }
-    prevWebhookUrl.current = webhookCallbackUrl;
-  }, [data.withWorkflowSettings, webhookCallbackUrl, localWebhookUrl]);
 
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
   const loopParent = parentNode && isLoopNode(parentNode) ? parentNode : null;
-  const withWorkflowSettings = data.withWorkflowSettings;
-  const finallyBlockLabel = withWorkflowSettings
-    ? data.finallyBlockLabel
-    : null;
-
-  // Only allow terminal blocks (next_block_label === null) for the finally block dropdown.
-  const terminalBlockLabels = useMemo(() => {
-    return getWorkflowBlocks(nodes, edges)
-      .filter((block) => (block.next_block_label ?? null) === null)
-      .map((block) => block.label);
-  }, [nodes, edges]);
-  const terminalBlockLabelSet = useMemo(() => {
-    return new Set(terminalBlockLabels);
-  }, [terminalBlockLabels]);
 
   const makeStartSettings = (data: StartNode["data"]): StartSettings => {
     return {
@@ -173,8 +83,6 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
     };
   };
 
-  const update = useUpdate<StartNode["data"]>({ id, editable: true });
-
   useEffect(() => {
     setFacing(data.showCode ? "back" : "front");
   }, [data.showCode]);
@@ -183,16 +91,6 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
     workflowSettingsStore.setWorkflowSettings(makeStartSettings(data));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
-
-  useEffect(() => {
-    if (
-      withWorkflowSettings &&
-      finallyBlockLabel &&
-      !terminalBlockLabelSet.has(finallyBlockLabel)
-    ) {
-      update({ finallyBlockLabel: null });
-    }
-  }, [finallyBlockLabel, withWorkflowSettings, terminalBlockLabelSet, update]);
 
   function nodeIsFlippable(node: Node) {
     return (
@@ -249,340 +147,24 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
             <div className="relative">
               <header className="mb-6 mt-2">Start</header>
               <Separator />
-              <Accordion
-                type="single"
-                collapsible
-                onValueChange={() => rerender.bump()}
-              >
-                <AccordionItem value="settings" className="mt-4 border-b-0">
-                  <AccordionTrigger className="py-2">
-                    Workflow Settings
-                  </AccordionTrigger>
-                  <AccordionContent className="pl-6 pr-1 pt-1">
-                    <div key={rerender.key} className="space-y-4">
-                      <div className="space-y-2">
-                        <ModelSelector
-                          className="nopan w-52 text-xs"
-                          value={data.model}
-                          onChange={(value) => {
-                            update({ model: value });
-                          }}
-                        />
+              <BuildModeOnly>
+                <Accordion
+                  type="single"
+                  collapsible
+                  onValueChange={() => rerender.bump()}
+                >
+                  <AccordionItem value="settings" className="mt-4 border-b-0">
+                    <AccordionTrigger className="py-2">
+                      Workflow Settings
+                    </AccordionTrigger>
+                    <AccordionContent className="pl-6 pr-1 pt-1">
+                      <div key={rerender.key}>
+                        <WorkflowSettingsEditor blockId={id} />
                       </div>
-                      <div className="space-y-2">
-                        <div className="flex gap-2">
-                          <Label>Webhook Callback URL</Label>
-                          <HelpTooltip content="The URL of a webhook endpoint to send the workflow results" />
-                        </div>
-                        <div className="flex flex-col gap-2">
-                          <Input
-                            className="w-full"
-                            value={localWebhookUrl}
-                            placeholder="https://"
-                            onChange={(event) => {
-                              setLocalWebhookUrl(event.target.value);
-                              update({
-                                webhookCallbackUrl: event.target.value,
-                              });
-                            }}
-                          />
-                          <TestWebhookDialog
-                            runType="workflow_run"
-                            runId={null}
-                            initialWebhookUrl={localWebhookUrl || undefined}
-                            autoRunOnOpen={false}
-                            trigger={
-                              <Button
-                                type="button"
-                                variant="secondary"
-                                className="self-start"
-                                disabled={!localWebhookUrl}
-                              >
-                                Test Webhook
-                              </Button>
-                            }
-                          />
-                        </div>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex gap-2">
-                          <Label>Proxy Location</Label>
-                          <HelpTooltip content="Route Skyvern through one of our available proxies." />
-                        </div>
-                        <ProxySelector
-                          value={data.proxyLocation}
-                          onChange={(value) => {
-                            update({ proxyLocation: value });
-                          }}
-                        />
-                      </div>
-                      <div className="flex flex-col gap-4 rounded-md bg-slate-elevation5 p-4 pl-4">
-                        <div className="flex flex-col gap-4">
-                          <div className="flex justify-between">
-                            <div className="flex items-center gap-2">
-                              <Label>Run With</Label>
-                              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
-                            </div>
-                            <Select
-                              value={data.runWith || "agent"}
-                              onValueChange={(value) => {
-                                update({ runWith: value });
-                              }}
-                            >
-                              <SelectTrigger className="w-48">
-                                <SelectValue placeholder="Run Method" />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="agent">
-                                  Skyvern Agent
-                                </SelectItem>
-                                <SelectItem value="code">Code</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
-                          <div className="space-y-2">
-                            <div className="flex items-center gap-2">
-                              <Label>AI Fallback (self-healing)</Label>
-                              <HelpTooltip content="If a run with code fails, fallback to AI and regenerate the code." />
-                              <Switch
-                                className="ml-auto"
-                                checked={data.aiFallback}
-                                onCheckedChange={(value) => {
-                                  update({ aiFallback: value });
-                                }}
-                              />
-                            </div>
-                          </div>
-                          <div className="space-y-2">
-                            <div className="flex gap-2">
-                              <Label>Code Key (optional)</Label>
-                              <HelpTooltip content="A static or dynamic key for directing code generation." />
-                            </div>
-                            <WorkflowBlockInputTextarea
-                              nodeId={id}
-                              onChange={(value) => {
-                                const v = value.length ? value : null;
-                                update({ scriptCacheKey: v });
-                              }}
-                              value={data.scriptCacheKey ?? ""}
-                              placeholder={placeholders["scripts"]["scriptKey"]}
-                              className="nopan text-xs"
-                            />
-                          </div>
-                        </div>
-                        {/* )} */}
-                      </div>
-                      <div className="flex flex-col gap-4">
-                        <div className="space-y-2">
-                          <div className="flex items-center gap-2">
-                            <Label>Run Sequentially</Label>
-                            <HelpTooltip content="Run the workflow in a sequential order" />
-                            <Switch
-                              className="ml-auto"
-                              checked={data.runSequentially}
-                              onCheckedChange={(value) => {
-                                update({
-                                  runSequentially: value,
-                                  sequentialKey: value
-                                    ? data.sequentialKey
-                                    : null,
-                                });
-                              }}
-                            />
-                          </div>
-                        </div>
-                        {data.runSequentially && (
-                          <div className="flex flex-col gap-4 rounded-md bg-slate-elevation4 p-4 pl-4">
-                            <div className="space-y-2">
-                              <div className="flex gap-2">
-                                <Label>Sequential Key (optional)</Label>
-                                <HelpTooltip content="A static or dynamic key for directing sequential workflow execution." />
-                              </div>
-                              <WorkflowBlockInputTextarea
-                                nodeId={id}
-                                onChange={(value) => {
-                                  const v = value.length ? value : null;
-                                  update({ sequentialKey: v });
-                                }}
-                                value={data.sequentialKey ?? ""}
-                                placeholder={placeholders["sequentialKey"]}
-                                className="nopan text-xs"
-                              />
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Save &amp; Reuse Session</Label>
-                          <HelpTooltip content="Persist session information across workflow runs" />
-                          <Switch
-                            className="ml-auto"
-                            checked={data.persistBrowserSession}
-                            onCheckedChange={(value) => {
-                              update({ persistBrowserSession: value });
-                            }}
-                          />
-                        </div>
-                        {data.persistBrowserSession && workflowPermanentId && (
-                          <Dialog
-                            open={isResetProfileDialogOpen}
-                            onOpenChange={setIsResetProfileDialogOpen}
-                          >
-                            <DialogTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="secondary"
-                                size="sm"
-                                className="nopan"
-                              >
-                                <ReloadIcon className="mr-2 h-3 w-3" />
-                                Reset Profile
-                              </Button>
-                            </DialogTrigger>
-                            <DialogContent>
-                              <DialogHeader>
-                                <DialogTitle>Reset saved profile?</DialogTitle>
-                                <DialogDescription>
-                                  Clears the saved browser profile for this
-                                  workflow. The next run will start from a fresh
-                                  browser state. Use this if the saved profile
-                                  is stuck or producing errors.
-                                </DialogDescription>
-                              </DialogHeader>
-                              <DialogFooter>
-                                <DialogClose asChild>
-                                  <Button variant="secondary">Cancel</Button>
-                                </DialogClose>
-                                <Button
-                                  variant="destructive"
-                                  onClick={() => {
-                                    resetProfileMutation.mutate();
-                                  }}
-                                  disabled={resetProfileMutation.isPending}
-                                >
-                                  {resetProfileMutation.isPending && (
-                                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                                  )}
-                                  Reset Profile
-                                </Button>
-                              </DialogFooter>
-                            </DialogContent>
-                          </Dialog>
-                        )}
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Default Browser Profile</Label>
-                          <HelpTooltip content="The default browser profile used when running this workflow. Can be overridden per run." />
-                        </div>
-                        <BrowserProfileSelector
-                          value={data.browserProfileId}
-                          onChange={(value) => {
-                            update({ browserProfileId: value });
-                          }}
-                          compact
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Extra HTTP Headers</Label>
-                          <HelpTooltip content="Specify some self-defined HTTP requests headers" />
-                        </div>
-                        <KeyValueInput
-                          value={
-                            data.extraHttpHeaders &&
-                            typeof data.extraHttpHeaders === "object"
-                              ? JSON.stringify(data.extraHttpHeaders)
-                              : (data.extraHttpHeaders ?? null)
-                          }
-                          onChange={(val) => {
-                            const v =
-                              val === null
-                                ? "{}"
-                                : typeof val === "string"
-                                  ? val.trim()
-                                  : JSON.stringify(val);
-
-                            const normalized = v === "" ? "{}" : v;
-
-                            if (normalized === data.extraHttpHeaders) {
-                              return;
-                            }
-
-                            update({ extraHttpHeaders: normalized });
-                          }}
-                          addButtonText="Add Header"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Max Screenshot Scrolls</Label>
-                          <HelpTooltip
-                            content={`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
-                          />
-                        </div>
-                        <Input
-                          value={data.maxScreenshotScrolls ?? ""}
-                          placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
-                          onChange={(event) => {
-                            const value =
-                              event.target.value === ""
-                                ? null
-                                : Number(event.target.value);
-
-                            update({ maxScreenshotScrolls: value });
-                          }}
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Execute on Any Outcome</Label>
-                          <HelpTooltip content="Select a block that will always run after the workflow completes, whether it succeeds, fails, or terminates early. Useful for cleanup tasks like logging out." />
-                        </div>
-                        <Select
-                          value={data.finallyBlockLabel ?? "none"}
-                          onValueChange={(value) => {
-                            update({
-                              finallyBlockLabel:
-                                value === "none" ? null : value,
-                            });
-                          }}
-                        >
-                          <SelectTrigger>
-                            <SelectValue placeholder="None" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="none">None</SelectItem>
-                            {terminalBlockLabels.map((label) => (
-                              <SelectItem key={label} value={label}>
-                                {label}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2">
-                          <Label>Workflow System Prompt</Label>
-                          <HelpTooltip content="Applied to every LLM call in this workflow, including any sub-agents." />
-                        </div>
-                        <WorkflowBlockInputTextarea
-                          nodeId={id}
-                          onChange={(value) => {
-                            update({
-                              workflowSystemPrompt: value.length ? value : null,
-                            });
-                          }}
-                          value={data.workflowSystemPrompt ?? ""}
-                          placeholder="e.g. Format all dates as YYYY-MM-DD and all currency values as USD with two decimals."
-                          className="nopan text-xs"
-                        />
-                      </div>
-                    </div>
-                  </AccordionContent>
-                </AccordionItem>
-              </Accordion>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </BuildModeOnly>
             </div>
           </div>
         </div>

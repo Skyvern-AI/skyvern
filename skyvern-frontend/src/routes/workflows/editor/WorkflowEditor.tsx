@@ -75,6 +75,9 @@ function WorkflowEditor() {
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,
+    cdpConnectHeaders: workflow.cdp_connect_headers
+      ? JSON.stringify(workflow.cdp_connect_headers)
+      : null,
     runWith: workflow.run_with ?? "agent",
     codeVersion: workflow.code_version ?? null,
     scriptCacheKey: workflow.cache_key,
@@ -90,16 +93,30 @@ function WorkflowEditor() {
   const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);
 
   return (
-    <div className="relative flex h-screen w-full">
-      <ReactFlowProvider>
-        <Workspace
-          initialEdges={elements.edges}
-          initialNodes={elements.nodes}
-          initialTitle={workflow.title}
-          showBrowser={false}
-          workflow={workflow}
-        />
-      </ReactFlowProvider>
+    <div className="relative flex h-screen w-full flex-col">
+      {elements.validationError ? (
+        <div
+          role="alert"
+          className="z-10 border-b border-amber-700/40 bg-amber-950/50 px-4 py-2 text-sm text-amber-200"
+        >
+          <strong className="font-semibold">
+            Workflow validation warning:
+          </strong>{" "}
+          {elements.validationError.message}
+        </div>
+      ) : null}
+      <div className="relative flex flex-1">
+        <ReactFlowProvider>
+          <Workspace
+            key={workflowPermanentId}
+            initialEdges={elements.edges}
+            initialNodes={elements.nodes}
+            initialTitle={workflow.title}
+            showBrowser={false}
+            workflow={workflow}
+          />
+        </ReactFlowProvider>
+      </div>
     </div>
   );
 }

@@ -4,17 +4,9 @@ from pathlib import Path
 import pytest
 from sqlalchemy.exc import DBAPIError
 
-MIGRATION_DIR = Path(__file__).resolve().parents[2] / "alembic/versions"
-
-
-def _find_migration_path() -> Path:
-    paths = [
-        path
-        for path in sorted(MIGRATION_DIR.glob("*_add_cdp_connect_headers.py"))
-        if "_LOCK_TIMEOUT" in path.read_text()
-    ]
-    assert len(paths) == 1
-    return paths[0]
+MIGRATION_PATH = (
+    Path(__file__).resolve().parents[2] / "alembic/versions/2026_05_22_2059-0b0bd1875c6e_add_cdp_connect_headers.py"
+)
 
 
 class _OrigLockError(Exception):
@@ -44,7 +36,7 @@ class _FakeOp:
 
 
 def _load_migration_module():
-    spec = importlib.util.spec_from_file_location("cdp_connect_headers_migration", _find_migration_path())
+    spec = importlib.util.spec_from_file_location("cdp_connect_headers_migration", MIGRATION_PATH)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
