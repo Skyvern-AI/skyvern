@@ -4,9 +4,10 @@ from pathlib import Path
 # This is the attribute name used to tag interactable elements
 SKYVERN_ID_ATTR: str = "unique_id"
 
-# Value sent in the x-user-agent header by the Skyvern UI. Used to distinguish UI-triggered
-# runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
+# Values sent in the x-user-agent header by first-party Skyvern clients. Used to distinguish
+# UI- and MCP-triggered runs from API/SDK callers (e.g. for trigger_type classification and routing strategy).
 SKYVERN_UI_USER_AGENT: str = "skyvern-ui"
+SKYVERN_MCP_USER_AGENT: str = "skyvern-mcp"
 
 SKYVERN_DIR = Path(__file__).parent
 REPO_ROOT_DIR = SKYVERN_DIR.parent
