@@ -432,7 +432,7 @@ class RealBrowserState(BrowserState):
                     except Exception:
                         LOG.warning("Failed to stop playwright", exc_info=True)
         except asyncio.TimeoutError:
-            LOG.error("Timeout to close playwright, might leave the broswer opening forever")
+            LOG.error("Timeout to close playwright, might leave the browser opening forever")
 
     async def take_fullpage_screenshot(
         self,

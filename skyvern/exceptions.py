@@ -761,7 +761,7 @@ class SVGConversionFailed(SkyvernException):
 
 class UnsupportedActionType(SkyvernException):
     def __init__(self, action_type: str):
-        super().__init__(f"Unsupport action type: {action_type}")
+        super().__init__(f"Unsupported action type: {action_type}")
 
 
 class InvalidElementForTextInput(SkyvernException):
