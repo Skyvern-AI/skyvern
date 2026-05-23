@@ -945,8 +945,8 @@ class SkyvernElement:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
         except TimeoutError:
-            LOG.info(
-                "Timeout to execute scrolling into view, try to re-focus to locate the element",
+            LOG.warning(
+                "Scroll into view timed out",
                 element_id=self.get_id(),
             )
             await self.blur()

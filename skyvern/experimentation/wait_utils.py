@@ -105,12 +105,20 @@ async def scroll_into_view_wait(
     """
     Wait after scrolling element into view.
 
-    Note: This is called from low-level DOM utilities (SkyvernElement.scroll_into_view)
-    which don't have task context available. Threading context through would require
-    invasive changes to many call sites. Defaults are reasonable for this utility function.
+    Uses explicit task/workflow/org IDs when provided; otherwise reads from the
+    current SkyvernContext so PostHog wait-time experiments apply during agent runs.
     """
+    if task_id is None or workflow_run_id is None or organization_id is None:
+        from skyvern.forge.sdk.core import skyvern_context  # noqa: PLC0415
+
+        context = skyvern_context.current()
+        if context is not None:
+            task_id = task_id or context.task_id
+            workflow_run_id = workflow_run_id or context.workflow_run_id
+            organization_id = organization_id or context.organization_id
+
     wait_config = await get_or_create_wait_config(task_id, workflow_run_id, organization_id)
-    wait_seconds = get_wait_time(wait_config, "scroll_into_view_wait", default=2.0)
+    wait_seconds = get_wait_time(wait_config, "scroll_into_view_wait", default=0.3)
     await asyncio.sleep(wait_seconds)
 
 
