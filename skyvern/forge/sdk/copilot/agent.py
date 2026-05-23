@@ -238,6 +238,9 @@ def _request_policy_agent_inputs(
     chat_history_text: str,
     previous_user_message: str | None,
 ) -> tuple[str, str]:
+    if policy.raw_secret_detected:
+        # Raw-secret turns use redacted latest content before skip-test follow-up reuse.
+        return redact_raw_secrets_for_prompt(user_message), chat_history_text
     if policy.testing_intent == "skip_test" and len(user_message) < 160 and previous_user_message:
         return (
             f"{user_message}\n\nDraft the workflow requested earlier:\n"
@@ -358,6 +361,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "`credential_name_unresolved` and "
             + "`allow_missing_credentials_in_draft` is true, call `update_and_run_blocks`; it will save the draft "
             + "workflow and skip the browser run with a credential setup message. "
+            + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run blocks, "
+            + "and tell the user to store the redacted secret as a saved credential before testing. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
         return prompt + _docs_answer_turn_directive(getattr(ctx, "turn_intent", None))
@@ -597,6 +602,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+        if policy is not None and policy.raw_secret_handling == "redacted_draft":
+            return (
+                "I drafted the workflow with the pasted secret redacted. "
+                "Store the secret as a saved credential before testing; this draft has not been verified end-to-end."
+            )
         if ctx.allow_untested_workflow_draft:
             return (
                 "I drafted the workflow without testing it, as requested. "
@@ -1541,7 +1551,8 @@ def _build_output_policy_blocked_result(
         user_response = (
             "The selected credential is not approved for one of the URLs in this workflow. "
             "Please use a saved credential tested for that URL, update the block URL to match the credential's "
-            "tested site, or adjust the workflow to avoid using credentials."
+            "tested site, or adjust the workflow to avoid using credentials. If the credential was already in this "
+            "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
     elif preserved_workflow is not None:

@@ -1,10 +1,19 @@
+from enum import StrEnum
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+class ErrorType(StrEnum):
+    USER_DEFINED_ERROR = "USER_DEFINED_ERROR"
+    SYSTEM_DEFINED_ERROR = "SYSTEM_DEFINED_ERROR"
 
 
 class UserDefinedError(BaseModel):
     error_code: str
     reasoning: str
     confidence_float: float = Field(..., ge=0, le=1)
+    error_type: Literal[ErrorType.USER_DEFINED_ERROR] = ErrorType.USER_DEFINED_ERROR
 
     def __repr__(self) -> str:
         return f"{self.reasoning}(error_code={self.error_code}, confidence_float={self.confidence_float})"
@@ -37,6 +46,7 @@ def filter_to_user_defined_codes(
 class SkyvernDefinedError(BaseModel):
     error_code: str
     reasoning: str
+    error_type: Literal[ErrorType.SYSTEM_DEFINED_ERROR] = ErrorType.SYSTEM_DEFINED_ERROR
 
     def __repr__(self) -> str:
         return f"{self.reasoning}(error_code={self.error_code})"
