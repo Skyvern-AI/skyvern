@@ -39,7 +39,7 @@ import {
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
   DropdownMenu,
@@ -507,7 +507,13 @@ function Workflows() {
             placeholder="Search by title or parameter..."
             className="w-48 lg:w-72"
           />
-          <div className="flex gap-4">
+          <div className="flex items-center gap-4">
+            <Link
+              to="/discover"
+              className="text-sm text-slate-400 hover:text-slate-200"
+            >
+              Or start from a description →
+            </Link>
             <ImportWorkflowButton
               onImportStart={startPolling}
               selectedFolderId={selectedFolderId}
@@ -530,6 +536,7 @@ function Workflows() {
                     createWorkflowMutation.mutate({
                       ...emptyWorkflowRequest,
                       folder_id: selectedFolderId,
+                      _via: "blank",
                     });
                   }}
                 >
