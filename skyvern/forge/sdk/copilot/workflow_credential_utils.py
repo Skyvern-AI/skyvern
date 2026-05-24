@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -7,6 +8,7 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 _NESTED_BLOCK_LIST_KEYS = ("loop_blocks", "blocks")
 _BRANCH_LIST_KEYS = ("branch_conditions", "branches", "ordered_branches")
+URL_CANDIDATE_RE = re.compile(r"\b(?:https?://[^\s)>,]+|www\.[^\s)>,]+)", re.IGNORECASE)
 
 
 def parse_workflow_yaml(workflow_yaml: str) -> Any:

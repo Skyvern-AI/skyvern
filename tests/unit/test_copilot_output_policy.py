@@ -1227,7 +1227,19 @@ def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
     )
 
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+    assert "provide the missing details" not in agent_result.user_response
+    assert "couldn't identify which details were missing" in agent_result.user_response
+    assert agent_result.response_type == "ASK_QUESTION"
     assert agent_result.updated_workflow is None
+    assert agent_result.output_policy_diagnostics == {
+        "raw_output_kind": "informational_answer",
+        "final_output_kind": "clarification_request",
+        "hard_block_reason_codes": [],
+        "soft_rewrite_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
+        "raw_would_have_failed": True,
+        "contained_failure": True,
+        "final_output_policy_allowed": True,
+    }
 
 
 def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
@@ -1294,6 +1306,8 @@ def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxo
 
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
     assert "task_v2" not in agent_result.user_response
+    assert agent_result.output_policy_diagnostics is not None
+    assert "unbacked_workflow_delivery_claim" in agent_result.output_policy_diagnostics["soft_rewrite_reason_codes"]
     assert agent_result.updated_workflow is None
 
 

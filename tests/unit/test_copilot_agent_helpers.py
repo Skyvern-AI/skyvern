@@ -26,6 +26,8 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_transcript_context,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -1229,8 +1231,81 @@ workflow_definition:
 
         assert "here's the workflow" not in agent_result.user_response.lower()
         assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
+        assert "couldn't identify which details were missing" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
+        assert agent_result.response_type == "ASK_QUESTION"
+
+    def test_unbacked_workflow_claim_uses_turn_intent_missing_context(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.BUILD,
+                user_goal="Buy tickets for Wrexham vs LA Galaxy",
+                authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+                missing_context_question=(
+                    "Which ticketing site or seller should the workflow use? "
+                    "Actual purchase or payment requires explicit human approval."
+                ),
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "here's the workflow" not in agent_result.user_response.lower()
+        assert "Which ticketing site or seller should the workflow use?" in agent_result.user_response
+        assert "Actual purchase or payment requires explicit human approval." in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.updated_workflow is None
+
+    def test_unbacked_workflow_claim_renders_diagnosis_missing_context_labels(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            latest_diagnosis_repair_contract=SimpleNamespace(
+                diagnosis_result=SimpleNamespace(missing_context=["workflow_run_id", "block_results"])
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "Required context was unavailable: the workflow run ID and the block run results." in (
+            agent_result.user_response
+        )
+        assert "workflow_run_id" not in agent_result.user_response
+        assert "block_results" not in agent_result.user_response
+
+    def test_unbacked_workflow_claim_renders_turn_context_omissions(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            turn_context_packet=TurnContextPacket(
+                turn_intent_summary={},
+                transcript_context=TranscriptContext(
+                    earliest_user_turn="",
+                    latest_prior_user_turn="",
+                    latest_assistant_turn="",
+                    retained_history="",
+                    omitted_any=False,
+                ),
+                omissions=[
+                    TurnContextOmission(
+                        context_key="browser_state",
+                        reason="not_implemented",
+                    )
+                ],
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "Required context was unavailable: the current browser tab or page state." in agent_result.user_response
 
     def test_initial_part_workflow_claim_is_rewritten_without_proposal(self) -> None:
         ctx = _ctx(last_test_ok=None)
@@ -1246,6 +1321,7 @@ workflow_definition:
 
         assert "initial part of your workflow" not in agent_result.user_response.lower()
         assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 

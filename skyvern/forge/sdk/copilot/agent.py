@@ -70,6 +70,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
+    RequiredContextKey,
     TurnIntent,
     TurnIntentMode,
     build_turn_intent,
@@ -707,9 +708,29 @@ _CANCEL_REPLY_UNVALIDATED = (
 )
 _CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
 _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
-    "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
-    "so I can build and test it."
+    "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
+    "from this turn. Please retry with the target site, page, or workflow requirement."
 )
+_UNBACKED_WORKFLOW_DELIVERY_PREFIX = "I wasn't able to produce a workflow proposal in this turn."
+_GENERIC_MISSING_CONTEXT_PHRASES = (
+    "missing details",
+    "one more detail",
+)
+_REQUIRED_CONTEXT_LABELS = {
+    RequiredContextKey.CURRENT_WORKFLOW: "the current workflow",
+    RequiredContextKey.PROPOSED_WORKFLOW: "the proposed workflow",
+    RequiredContextKey.LATEST_ASSISTANT_PROPOSAL: "the latest workflow proposal",
+    RequiredContextKey.WORKFLOW_CHANGE: "the workflow change to apply",
+    RequiredContextKey.LATEST_RUN_RESULT: "the latest run result",
+    RequiredContextKey.CREDENTIAL_METADATA: "the saved credential metadata",
+    RequiredContextKey.DOCS_CONTEXT: "the relevant documentation context",
+    RequiredContextKey.BROWSER_STATE: "the current browser tab or page state",
+}
+_DIAGNOSIS_MISSING_CONTEXT_LABELS = {
+    "workflow_run_id": "the workflow run ID",
+    "block_results": "the block run results",
+    "failure_reason": "the failure reason",
+}
 _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Internal workflow names are not the right interface to use when building with Copilot. "
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
@@ -753,6 +774,87 @@ def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
     run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80)
     status_sentence = f" Last run status: {run_status}." if run_status else ""
     return reason, status_sentence
+
+
+def _specific_missing_context_question(value: Any) -> str:
+    question = _clean_recorded_failure_text(value, max_chars=320)
+    if not question:
+        return ""
+    lowered = question.lower()
+    if any(phrase in lowered for phrase in _GENERIC_MISSING_CONTEXT_PHRASES):
+        return ""
+    if question[-1] not in ".?!":
+        question += "."
+    return question
+
+
+def _join_human_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _required_context_label(value: Any) -> str:
+    if isinstance(value, RequiredContextKey):
+        return _REQUIRED_CONTEXT_LABELS[value]
+    if isinstance(value, str):
+        if value in _DIAGNOSIS_MISSING_CONTEXT_LABELS:
+            return _DIAGNOSIS_MISSING_CONTEXT_LABELS[value]
+        try:
+            return _REQUIRED_CONTEXT_LABELS[RequiredContextKey(value)]
+        except ValueError:
+            return _clean_recorded_failure_text(value, max_chars=120)
+    return ""
+
+
+def _turn_context_missing_context_labels(ctx: CopilotContext) -> list[str]:
+    packet = getattr(ctx, "turn_context_packet", None)
+    omissions = getattr(packet, "omissions", None)
+    if not isinstance(omissions, list):
+        return []
+    labels: list[str] = []
+    for omission in omissions:
+        label = _required_context_label(getattr(omission, "context_key", None))
+        if label:
+            labels.append(label)
+    return list(dict.fromkeys(labels))
+
+
+def _diagnosis_missing_context_labels(ctx: CopilotContext) -> list[str]:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    missing_context = getattr(diagnosis, "missing_context", None)
+    if not isinstance(missing_context, list):
+        return []
+    labels = [_required_context_label(item) for item in missing_context]
+    return list(dict.fromkeys(label for label in labels if label))
+
+
+def _unbacked_workflow_delivery_reply(ctx: CopilotContext) -> str:
+    turn_intent = getattr(ctx, "turn_intent", None)
+    if isinstance(turn_intent, TurnIntent):
+        question = _specific_missing_context_question(turn_intent.missing_context_question)
+        if question:
+            return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} I need this before I can build and test it: {question}"
+
+    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if request_policy is not None:
+        question = _specific_missing_context_question(request_policy.clarification_question)
+        if question:
+            return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} I need this before I can build and test it: {question}"
+
+    missing_context = _diagnosis_missing_context_labels(ctx) or _turn_context_missing_context_labels(ctx)
+    if missing_context:
+        items = _join_human_list(missing_context)
+        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} Required context was unavailable: {items}."
+
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if reason:
+        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} The recorded blocker was: {reason}.{status_sentence}"
+
+    return _UNBACKED_WORKFLOW_DELIVERY_REPLY
 
 
 def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
@@ -1156,6 +1258,7 @@ def _translate_to_agent_result(
     )
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
+    unbacked_workflow_delivery_rewritten = False
     if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
         user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
         soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
@@ -1171,7 +1274,10 @@ def _translate_to_agent_result(
     # Preserve the unbacked-proposal correction when both soft rewrites apply:
     # a reply must not imply a workflow exists when no proposal was produced.
     if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
-        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
+        user_response = _unbacked_workflow_delivery_reply(ctx)
+        resp_type = "ASK_QUESTION"
+        output_policy_verdict.output_kind = CopilotOutputKind.CLARIFICATION_REQUEST
+        unbacked_workflow_delivery_rewritten = True
         soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
         output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
     if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
@@ -1221,7 +1327,13 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        proposal_disposition="review_untested" if unvalidated else "auto_applicable",
+        proposal_disposition=(
+            "no_proposal"
+            if unbacked_workflow_delivery_rewritten and last_workflow is None
+            else "review_untested"
+            if unvalidated
+            else "auto_applicable"
+        ),
         output_policy_diagnostics=output_policy_diagnostics,
     )
 
