@@ -555,6 +555,7 @@ More extensive documentation can be found on our [📕 docs page](https://www.sk
 | Azure OpenAI | Any GPT models deployed to your Azure subscription |
 | AWS Bedrock | Claude 4.7, Claude 4.6 (Sonnet, Opus), Claude 4.5 (Sonnet, Opus) |
 | Gemini | Gemini 3.1 Pro, Gemini 3 Flash, Gemini 2.5 Pro/Flash |
+| Baidu Qianfan / ERNIE | ERNIE 5.1, ERNIE 5.0, ERNIE 4.5 Turbo |
 | Ollama | Run any locally hosted model via [Ollama](https://github.com/ollama/ollama) |
 | OpenRouter | Access models through [OpenRouter](https://openrouter.ai) |
 | OpenAI-compatible | Any custom API endpoint that follows OpenAI's API format (via [liteLLM](https://docs.litellm.ai/docs/providers/openai_compatible)) |
