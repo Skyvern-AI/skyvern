@@ -13,15 +13,14 @@ from pydantic import ValidationError
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot.context import StructuredContext
-from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE, url_origin
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 
 RecoverableFailureKind = Literal["validation", "tool_call", "external_dep", "timeout", "unknown"]
 
 _REASON_SUMMARY_MAX_CHARS = 120
 _RECOVERABLE_ERROR_ID_PREFIX = "cpe"
-_RECORDED_FAILURE_URL_RE = re.compile(r"https?://[^\s)>,]+")
 _RECORDED_FAILURE_CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
 _BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
@@ -69,7 +68,7 @@ def clean_recorded_failure_text(value: object, max_chars: int = _REASON_SUMMARY_
     text = redact_raw_secrets_for_prompt(" ".join(text.split()))
     text = _redact_browser_session_references(text)
     text = _RECORDED_FAILURE_CREDENTIAL_ID_RE.sub("[CREDENTIAL_ID]", text)
-    text = _RECORDED_FAILURE_URL_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", text)
+    text = URL_CANDIDATE_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", text)
     if len(text) > max_chars:
         text = text[: max_chars - 3].rstrip() + "..."
     return text
