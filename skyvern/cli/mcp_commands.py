@@ -430,7 +430,10 @@ def _extract_entry_api_key(entry: dict) -> str:
         if isinstance(api_key, str):
             return api_key
 
-    env = entry.get("environment") or entry.get("env", {})
+    env = entry.get("environment")
+    if env is None:
+        env = entry.get("env", {})
+
     if isinstance(env, dict):
         api_key = env.get("SKYVERN_API_KEY")
         if isinstance(api_key, str):
