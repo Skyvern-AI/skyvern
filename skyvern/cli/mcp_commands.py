@@ -399,11 +399,17 @@ def _entry_kind(entry: dict | None) -> str:
     if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
         return "mcp-remote bridge"
 
-    if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
-        return "local stdio"
+  entry_type = entry.get("type")
 
-    if entry.get("type") in {"local"}:
-        return "local stdio"
+if entry_type == "local":
+    return "local stdio"
+
+if entry_type in {"http", "remote"}:
+    return "remote http"
+
+if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
+    return "local stdio"
+
 
     if entry.get("type") in {"http", "remote"} or "url" in entry or isinstance(entry.get("http_headers"), dict):
         return "remote http"
