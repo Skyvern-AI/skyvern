@@ -1,3 +1,6 @@
+import asyncio
+
+import structlog
 from fastapi import HTTPException, status
 
 from skyvern.config import settings
@@ -5,9 +8,18 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import (
+    BulkCancelRunsResponse,
+    RunEngine,
+    RunResponse,
+    RunType,
+    TaskRunRequest,
+    TaskRunResponse,
+)
 from skyvern.schemas.webhooks import RunWebhookReplayResponse
 from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
+
+LOG = structlog.get_logger()
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -148,6 +160,24 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to cancel: {run.task_run_type}",
         )
+
+
+async def bulk_cancel_runs(
+    run_ids: list[str], organization_id: str | None = None, api_key: str | None = None
+) -> BulkCancelRunsResponse:
+    cancelled: list[str] = []
+    failed: list[str] = []
+
+    async def _cancel_one(run_id: str) -> None:
+        try:
+            await cancel_run(run_id, organization_id=organization_id, api_key=api_key)
+            cancelled.append(run_id)
+        except Exception:
+            LOG.warning("bulk_cancel_runs: failed to cancel run", run_id=run_id, exc_info=True)
+            failed.append(run_id)
+
+    await asyncio.gather(*[_cancel_one(run_id) for run_id in dict.fromkeys(run_ids)])
+    return BulkCancelRunsResponse(cancelled=cancelled, failed=failed)
 
 
 async def retry_run_webhook(

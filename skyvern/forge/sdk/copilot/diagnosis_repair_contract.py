@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 from typing import Any
 
@@ -8,12 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 _TEXT_MAX = 240
 _SUMMARY_MAX = 180
 _MAX_ITEMS = 20
 _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
-_URL_CANDIDATE_RE = re.compile(r"https?://[^\s)>,]+")
 
 
 class StrictModel(BaseModel):
@@ -217,7 +216,7 @@ def _safe_str(value: Any) -> str | None:
 
 def _safe_text(value: str | None, max_chars: int = _TEXT_MAX) -> str:
     text = redact_raw_secrets_for_prompt((value or "").strip())
-    text = _URL_CANDIDATE_RE.sub(lambda m: url_origin(m.group(0)) or "[URL]", text)
+    text = URL_CANDIDATE_RE.sub(lambda m: url_origin(m.group(0)) or "[URL]", text)
     return text if len(text) <= max_chars else text[: max_chars - 3].rstrip() + "..."
 
 

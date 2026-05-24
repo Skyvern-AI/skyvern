@@ -8,15 +8,26 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotNonRetriableNavError,
+    CopilotTotalTimeoutError,
+    CopilotUnrecoverableToolError,
+)
+from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
     _classify_request,
     build_transcript_context,
+    redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -181,6 +192,39 @@ class TestFailedTestResponseNormalization:
         assert "without testing it, as requested" in rewritten
         assert "not been verified end-to-end" in rewritten
         assert "successful" not in rewritten.lower()
+
+    def test_rewrite_redacted_secret_draft_points_to_saved_credentials(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        ctx = _ctx(
+            allow_untested_workflow_draft=True,
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_update_block_count=2,
+            last_test_ok=None,
+            request_policy=RequestPolicy(raw_secret_detected=True, raw_secret_handling="redacted_draft"),
+        )
+
+        rewritten = _rewrite_failed_test_response("Done.", ctx)
+
+        assert "pasted secret redacted" in rewritten
+        assert "Store the secret as a saved credential" in rewritten
+        assert "not been verified end-to-end" in rewritten
+
+    def test_request_policy_agent_inputs_redacts_blocked_raw_secret_turns(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        user_message, chat_history_text = agent_module._request_policy_agent_inputs(
+            RequestPolicy(raw_secret_detected=True, raw_secret_handling="block", testing_intent="skip_test"),
+            user_message="Use password: hunter2 to log in.",
+            chat_history_text="prior context",
+            previous_user_message="build the workflow",
+        )
+
+        assert "hunter2" not in user_message
+        assert "[REDACTED_SECRET]" in user_message
+        assert chat_history_text == "prior context"
 
     def test_should_surface_untested_draft_fires_on_workflow_credential_inputs_unbound(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _should_surface_untested_draft_despite_question
@@ -466,6 +510,50 @@ class TestRequestPolicyInputGuardrail:
         assert ctx.request_policy.credential_input_kind == "none"
         assert ctx.request_policy.raw_secret_detected is False
         assert ctx.request_policy.allow_run_blocks is True
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_redacted_draft_policy_sanitizes_agent_input(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+
+        raw_message = (
+            "Convert this SDK snippet into a workflow:\n"
+            "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
+        )
+        policy = RequestPolicy(
+            testing_intent="skip_test",
+            credential_input_kind="placeholder",
+            raw_secret_detected=True,
+            raw_secret_handling="redacted_draft",
+            allow_run_blocks=False,
+            allow_missing_credentials_in_draft=True,
+        )
+        monkeypatch.setattr(agent_module, "build_request_policy", AsyncMock(return_value=policy))
+        ctx = _ctx()
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=agent_module.RequestPolicyGuardrailInputs(
+                user_message=raw_message,
+                workflow_yaml="",
+                chat_history_text="",
+                chat_history_messages=[],
+                global_llm_context="",
+                organization_id="org-1",
+                handler=None,
+            ),
+        )
+
+        result = await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=ctx))
+
+        assert result.output.tripwire_triggered is False
+        assert ctx.request_policy is policy
+        assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in ctx.user_message
+        assert ctx.user_message == redact_raw_secrets_for_prompt(raw_message)
+        assert "[REDACTED_SECRET]" in ctx.user_message
+        assert ctx.allow_untested_workflow_draft is True
 
 
 class TestShouldRestorePersistedWorkflow:
@@ -840,6 +928,107 @@ workflow_definition:
         )
         assert "same IP/workflow shape" in agent_result.user_response
 
+    def test_unexpected_error_exit_names_failure_and_preserves_context(self) -> None:
+        ctx = _ctx()
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=agent_module.CopilotRequestPolicyMissingError(),
+        )
+
+        assert "An unexpected error occurred. Please try again." not in agent_result.user_response
+        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "The workflow was not modified" in agent_result.user_response
+        assert "reference cpe_" in agent_result.user_response
+        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+        assert agent_result.updated_workflow is None
+
+    def test_unexpected_error_exit_redacts_sensitive_identifiers(self) -> None:
+        ctx = _ctx(workflow_persisted=True)
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=RuntimeError("credential cred_12345 was rejected while opening https://example.com/private/path"),
+        )
+
+        assert "cred_12345" not in agent_result.user_response
+        assert "https://example.com/private/path" not in agent_result.user_response
+        assert "credential" not in agent_result.user_response.lower()
+        assert "https://example.com" not in agent_result.user_response
+        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "The workflow was preserved" in agent_result.user_response
+        assert "reference cpe_" in agent_result.user_response
+
+    def test_unexpected_error_exit_does_not_persist_tool_output_preview(self) -> None:
+        ctx = _ctx()
+        ctx.tool_activity.append(
+            {
+                "tool": "get_run_results",
+                "summary": "OK",
+                "output_preview": "block_1: user@example.com password=hunter2",
+            }
+        )
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=RuntimeError("boom"),
+        )
+
+        assert "user@example.com" not in (agent_result.global_llm_context or "")
+        assert "hunter2" not in (agent_result.global_llm_context or "")
+        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+
+    def test_recoverable_failure_maps_expected_exception_families(self) -> None:
+        assert (
+            build_recoverable_failure(
+                CopilotTotalTimeoutError(),
+                workflow_modified=False,
+                internal_error_id="cpe_timeout",
+            ).failure_kind
+            == "timeout"
+        )
+        assert (
+            build_recoverable_failure(
+                CopilotUnrecoverableToolError("click", "browser failed"),
+                workflow_modified=False,
+                internal_error_id="cpe_tool",
+            ).failure_kind
+            == "tool_call"
+        )
+        assert (
+            build_recoverable_failure(
+                yaml.YAMLError("bad yaml"),
+                workflow_modified=False,
+                internal_error_id="cpe_validation",
+            ).failure_kind
+            == "validation"
+        )
+        assert (
+            build_recoverable_failure(
+                LLMProviderError("OPENAI_GPT5_5"),
+                workflow_modified=False,
+                internal_error_id="cpe_external",
+            ).failure_kind
+            == "external_dep"
+        )
+
+    def test_recoverable_failure_uses_chained_navigation_reason(self) -> None:
+        nav_error = CopilotNonRetriableNavError("https://example.com", "net::ERR_NAME_NOT_RESOLVED")
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = nav_error
+
+        failure = build_recoverable_failure(
+            wrapper,
+            workflow_modified=False,
+            internal_error_id="cpe_nav",
+        )
+
+        assert failure.failure_kind == "tool_call"
+        assert failure.reason_summary == "A browser navigation step could not reach the target URL"
+
     def test_reply_still_rewrites_after_failed_test(self) -> None:
         ctx = _ctx(
             last_update_block_count=2,
@@ -1042,8 +1231,81 @@ workflow_definition:
 
         assert "here's the workflow" not in agent_result.user_response.lower()
         assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
+        assert "couldn't identify which details were missing" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
+        assert agent_result.response_type == "ASK_QUESTION"
+
+    def test_unbacked_workflow_claim_uses_turn_intent_missing_context(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.BUILD,
+                user_goal="Buy tickets for Wrexham vs LA Galaxy",
+                authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+                missing_context_question=(
+                    "Which ticketing site or seller should the workflow use? "
+                    "Actual purchase or payment requires explicit human approval."
+                ),
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "here's the workflow" not in agent_result.user_response.lower()
+        assert "Which ticketing site or seller should the workflow use?" in agent_result.user_response
+        assert "Actual purchase or payment requires explicit human approval." in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
+        assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.updated_workflow is None
+
+    def test_unbacked_workflow_claim_renders_diagnosis_missing_context_labels(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            latest_diagnosis_repair_contract=SimpleNamespace(
+                diagnosis_result=SimpleNamespace(missing_context=["workflow_run_id", "block_results"])
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "Required context was unavailable: the workflow run ID and the block run results." in (
+            agent_result.user_response
+        )
+        assert "workflow_run_id" not in agent_result.user_response
+        assert "block_results" not in agent_result.user_response
+
+    def test_unbacked_workflow_claim_renders_turn_context_omissions(self) -> None:
+        ctx = _ctx(
+            last_test_ok=None,
+            turn_context_packet=TurnContextPacket(
+                turn_intent_summary={},
+                transcript_context=TranscriptContext(
+                    earliest_user_turn="",
+                    latest_prior_user_turn="",
+                    latest_assistant_turn="",
+                    retained_history="",
+                    omitted_any=False,
+                ),
+                omissions=[
+                    TurnContextOmission(
+                        context_key="browser_state",
+                        reason="not_implemented",
+                    )
+                ],
+            ),
+        )
+        result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
+        agent_result = agent_module._translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        )
+
+        assert "Required context was unavailable: the current browser tab or page state." in agent_result.user_response
 
     def test_initial_part_workflow_claim_is_rewritten_without_proposal(self) -> None:
         ctx = _ctx(last_test_ok=None)
@@ -1059,6 +1321,7 @@ workflow_definition:
 
         assert "initial part of your workflow" not in agent_result.user_response.lower()
         assert "wasn't able to produce a workflow proposal" in agent_result.user_response
+        assert "provide the missing details" not in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
@@ -1359,7 +1622,102 @@ class TestRequestPolicyCredentialResolution:
         get_credentials_by_ids.assert_awaited_once_with(["cred_valid"], organization_id="org-1")
 
     @pytest.mark.asyncio
-    async def test_raw_inline_secret_refuses_before_model_classification(self, monkeypatch) -> None:
+    async def test_existing_workflow_credential_ids_ignore_yaml_comments(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        async def handler(**kwargs):
+            return {"testing_intent": "unspecified", "credential_input_kind": "none"}
+
+        policy = await build_request_policy(
+            user_message="Please update the navigation goal.",
+            workflow_yaml="""
+workflow_definition:
+  # cred_comment should not be treated as a workflow credential.
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_safe
+  blocks:
+    - block_type: navigation
+      label: open_site
+      url: https://login.example.test
+      parameter_keys:
+        - login_credentials
+""",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.existing_workflow_credential_ids == ["cred_safe"]
+        assert "cred_comment" not in policy.existing_workflow_credential_ids
+
+    @pytest.mark.asyncio
+    async def test_existing_workflow_credential_ids_include_inline_conditional_branch_blocks(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        async def handler(**kwargs):
+            return {"testing_intent": "unspecified", "credential_input_kind": "none"}
+
+        policy = await build_request_policy(
+            user_message="Please update the navigation goal.",
+            workflow_yaml="""
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_branch
+  blocks:
+    - block_type: conditional
+      label: route_login
+      branch_conditions:
+        - is_default: true
+          blocks:
+            - block_type: login
+              label: login
+              url: https://login.example.test
+              parameter_keys:
+                - login_credentials
+""",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.existing_workflow_credential_ids == ["cred_branch"]
+        assert policy.existing_workflow_credential_origins == {"cred_branch": ["https://login.example.test"]}
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_with_invalid_conditional_surfaces_both_clarifications(self) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "raw_secret",
+                "raw_secret_handling": "block",
+            }
+
+        policy = await build_request_policy(
+            user_message="password=hunter2, then move my loop block into the conditional blocks",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.clarification_reason == "raw_secret"
+        assert policy.clarification_question is not None
+        assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in policy.clarification_question
+        assert "Conditional blocks route to other blocks" in policy.clarification_question
+
+    @pytest.mark.asyncio
+    async def test_raw_inline_secret_refuses_after_redacted_classification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
@@ -1369,10 +1727,21 @@ class TestRequestPolicyCredentialResolution:
             "DATABASE",
             SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
         )
-        handler = AsyncMock()
+        handler = AsyncMock(
+            return_value={
+                "testing_intent": "unspecified",
+                "credential_input_kind": "raw_secret",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "raw_secret",
+                "completion_contract": None,
+                "raw_secret_handling": "block",
+            }
+        )
 
         policy = await build_request_policy(
-            user_message="Use username test@example.com and password=hunter2 to log in.",
+            user_message="Use username test@example.com and password=s3cr3tValue991! to log in.",
             workflow_yaml="",
             chat_history=[],
             global_llm_context="",
@@ -1386,8 +1755,9 @@ class TestRequestPolicyCredentialResolution:
         assert policy.allow_update_workflow is False
         assert policy.allow_run_blocks is False
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
-        assert "hunter2" not in (policy.clarification_question or "")
-        handler.assert_not_awaited()
+        assert "s3cr3tValue991" not in (policy.clarification_question or "")
+        handler.assert_awaited_once()
+        assert "s3cr3tValue991" not in handler.await_args.kwargs["prompt"]
         get_credentials_by_ids.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1442,7 +1812,7 @@ class TestRequestPolicyCredentialResolution:
         assert policy.clarification_question and "Which saved credential" in policy.clarification_question
 
     @pytest.mark.asyncio
-    async def test_bulk_colon_delimited_credentials_refuse_before_model_classification(self, monkeypatch) -> None:
+    async def test_bulk_colon_delimited_credentials_refuse_after_redacted_classification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
 
@@ -1452,7 +1822,18 @@ class TestRequestPolicyCredentialResolution:
             "DATABASE",
             SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
         )
-        handler = AsyncMock()
+        handler = AsyncMock(
+            return_value={
+                "testing_intent": "unspecified",
+                "credential_input_kind": "raw_secret",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "raw_secret",
+                "completion_contract": None,
+                "raw_secret_handling": "block",
+            }
+        )
 
         policy = await build_request_policy(
             user_message=(
@@ -1472,8 +1853,133 @@ class TestRequestPolicyCredentialResolution:
         assert policy.allow_run_blocks is False
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in (policy.clarification_question or "")
         assert "FakePass123" not in repr(policy.to_trace_data())
-        handler.assert_not_awaited()
+        handler.assert_awaited_once()
+        assert "FakePass123" not in handler.await_args.kwargs["prompt"]
         get_credentials_by_ids.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_code_conversion_proceeds_as_redacted_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock())),
+        )
+        captured: dict[str, str] = {}
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            captured["prompt"] = prompt
+            return {
+                "testing_intent": "require_test",
+                "credential_input_kind": "placeholder",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "requires_user_clarification": False,
+                "clarification_reason": "none",
+                "completion_contract": None,
+                "raw_secret_handling": "redacted_draft",
+            }
+
+        policy = await build_request_policy(
+            user_message=(
+                "Convert this SDK snippet into a workflow:\n"
+                "client = DemoClient(api_key='sk-abcdefghijklmnopqrstuvwxyz1234567890')"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in captured["prompt"]
+        assert policy.raw_secret_detected is True
+        assert policy.raw_secret_handling == "redacted_draft"
+        assert policy.user_response_policy == "proceed"
+        assert policy.testing_intent == "skip_test"
+        assert policy.allow_update_workflow is True
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is True
+        assert policy.requires_user_clarification is False
+
+    @pytest.mark.asyncio
+    async def test_raw_secret_login_request_still_blocks_after_redacted_classifier(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock())),
+        )
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "raw_secret",
+                "credential_refs": [],
+                "login_page_urls": [],
+                "requires_user_clarification": True,
+                "clarification_reason": "raw_secret",
+                "completion_contract": None,
+                "raw_secret_handling": "block",
+            }
+
+        policy = await build_request_policy(
+            user_message="Use username test@example.com and password=s3cr3tValue991! to log in.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.raw_secret_detected is True
+        assert policy.raw_secret_handling == "block"
+        assert policy.user_response_policy == "ask_clarification"
+        assert policy.allow_update_workflow is False
+        assert policy.allow_run_blocks is False
+
+    @pytest.mark.asyncio
+    async def test_repeated_unresolved_saved_credential_name_defers_to_draft(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(**kwargs):
+            return {
+                "testing_intent": "unspecified",
+                "credential_input_kind": "credential_name",
+                "credential_refs": ["missing_login"],
+                "login_page_urls": [],
+                "requires_user_clarification": False,
+                "clarification_reason": "none",
+                "completion_contract": None,
+            }
+
+        policy = await build_request_policy(
+            user_message="missing_login",
+            workflow_yaml="",
+            chat_history=_history(
+                (
+                    "ai",
+                    "Which saved credential should I use? Please provide the exact credential name or a credential ID beginning with cred_.",
+                ),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.user_response_policy == "proceed"
+        assert policy.allow_update_workflow is True
+        assert policy.allow_run_blocks is False
+        assert policy.allow_missing_credentials_in_draft is True
+        assert policy.requires_user_clarification is False
 
     @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:

@@ -46,11 +46,18 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
     output_policy_verdict_from_trace_data,
     output_policy_verdict_to_trace_data,
-    url_origin,
 )
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     parse_final_response,
+)
+from skyvern.forge.sdk.copilot.recoverable_failure import (
+    RecoverableFailure,
+    build_recoverable_failure,
+    clean_recorded_failure_text,
+    format_recoverable_failure_reply,
+    iter_exception_chain,
+    merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     CREDENTIAL_DEFERRED_DRAFT_REASONS,
@@ -63,6 +70,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
+    RequiredContextKey,
     TurnIntent,
     TurnIntentMode,
     build_turn_intent,
@@ -112,7 +120,7 @@ def _copilot_turn_span(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     turn_index: int | None,
-) -> Iterator[None]:
+) -> Iterator[Any]:
     tracer = otel_trace.get_tracer("skyvern")
     with tracer.start_as_current_span(_COPILOT_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
@@ -125,7 +133,7 @@ def _copilot_turn_span(
         if chat_request.workflow_permanent_id:
             span.set_attribute("workflow_permanent_id", chat_request.workflow_permanent_id)
         apply_context_attrs(span)
-        yield
+        yield span
 
 
 def _resolve_request_policy_handler(fallback_handler: Any) -> Any:
@@ -148,6 +156,10 @@ class RequestPolicyGuardrailInputs:
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
+
+
+class CopilotRequestPolicyMissingError(Exception):
+    """Raised when the request-policy guardrail fails before producing a policy."""
 
 
 async def _resolve_live_browser_session_id(
@@ -238,6 +250,9 @@ def _request_policy_agent_inputs(
     chat_history_text: str,
     previous_user_message: str | None,
 ) -> tuple[str, str]:
+    if policy.raw_secret_detected:
+        # Raw-secret turns use redacted latest content before skip-test follow-up reuse.
+        return redact_raw_secrets_for_prompt(user_message), chat_history_text
     if policy.testing_intent == "skip_test" and len(user_message) < 160 and previous_user_message:
         return (
             f"{user_message}\n\nDraft the workflow requested earlier:\n"
@@ -358,6 +373,8 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "`credential_name_unresolved` and "
             + "`allow_missing_credentials_in_draft` is true, call `update_and_run_blocks`; it will save the draft "
             + "workflow and skip the browser run with a credential setup message. "
+            + "If `raw_secret_handling` is `redacted_draft`, build only from the redacted request, do not run blocks, "
+            + "and tell the user to store the redacted secret as a saved credential before testing. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
         return prompt + _docs_answer_turn_directive(getattr(ctx, "turn_intent", None))
@@ -597,6 +614,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         )
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+        if policy is not None and policy.raw_secret_handling == "redacted_draft":
+            return (
+                "I drafted the workflow with the pasted secret redacted. "
+                "Store the secret as a saved credential before testing; this draft has not been verified end-to-end."
+            )
         if ctx.allow_untested_workflow_draft:
             return (
                 "I drafted the workflow without testing it, as requested. "
@@ -665,7 +687,6 @@ _MAX_TURNS_REPLY_UNVALIDATED = (
 _MAX_TURNS_REPLY_TESTED = (
     "I've reached the maximum number of steps, but I have a tested draft for you. Accept it to save, or discard."
 )
-_UNEXPECTED_ERROR_REPLY_DEFAULT = "An unexpected error occurred. Please try again."
 _UNEXPECTED_ERROR_REPLY_UNVALIDATED = (
     "I hit an unexpected issue before I could finish testing. I have a draft workflow you can keep — "
     "accept it to save (note: it hasn't been verified end-to-end), or discard."
@@ -687,9 +708,29 @@ _CANCEL_REPLY_UNVALIDATED = (
 )
 _CANCEL_REPLY_TESTED = "Cancelled. I have a tested draft for you. Accept it to save, or discard."
 _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
-    "I wasn't able to produce a workflow proposal in this turn. Please try again, or provide the missing details "
-    "so I can build and test it."
+    "I wasn't able to produce a workflow proposal in this turn, and I couldn't identify which details were missing "
+    "from this turn. Please retry with the target site, page, or workflow requirement."
 )
+_UNBACKED_WORKFLOW_DELIVERY_PREFIX = "I wasn't able to produce a workflow proposal in this turn."
+_GENERIC_MISSING_CONTEXT_PHRASES = (
+    "missing details",
+    "one more detail",
+)
+_REQUIRED_CONTEXT_LABELS = {
+    RequiredContextKey.CURRENT_WORKFLOW: "the current workflow",
+    RequiredContextKey.PROPOSED_WORKFLOW: "the proposed workflow",
+    RequiredContextKey.LATEST_ASSISTANT_PROPOSAL: "the latest workflow proposal",
+    RequiredContextKey.WORKFLOW_CHANGE: "the workflow change to apply",
+    RequiredContextKey.LATEST_RUN_RESULT: "the latest run result",
+    RequiredContextKey.CREDENTIAL_METADATA: "the saved credential metadata",
+    RequiredContextKey.DOCS_CONTEXT: "the relevant documentation context",
+    RequiredContextKey.BROWSER_STATE: "the current browser tab or page state",
+}
+_DIAGNOSIS_MISSING_CONTEXT_LABELS = {
+    "workflow_run_id": "the workflow run ID",
+    "block_results": "the block run results",
+    "failure_reason": "the failure reason",
+}
 _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Internal workflow names are not the right interface to use when building with Copilot. "
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
@@ -705,7 +746,6 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
-_RECORDED_FAILURE_URL_RE = re.compile(r"https?://[^\s)>,]+")
 
 
 def _workflow_block_count(ctx: CopilotContext) -> int | None:
@@ -719,16 +759,8 @@ def _workflow_block_count(ctx: CopilotContext) -> int | None:
 
 
 def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
-    from skyvern.forge.sdk.copilot.enforcement import redact_browser_session_references
-
-    if not isinstance(value, str):
-        return ""
-    text = redact_raw_secrets_for_prompt(" ".join(value.split()))
-    text = redact_browser_session_references(text)
-    text = _RECORDED_FAILURE_URL_RE.sub(lambda match: url_origin(match.group(0)) or "[URL]", text)
-    if len(text) > max_chars:
-        text = text[: max_chars - 3].rstrip() + "..."
-    return text.rstrip(".")
+    # Caller-owned sentence templates add punctuation around these fragments.
+    return clean_recorded_failure_text(value, max_chars=max_chars).rstrip(".")
 
 
 def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
@@ -742,6 +774,87 @@ def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
     run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80)
     status_sentence = f" Last run status: {run_status}." if run_status else ""
     return reason, status_sentence
+
+
+def _specific_missing_context_question(value: Any) -> str:
+    question = _clean_recorded_failure_text(value, max_chars=320)
+    if not question:
+        return ""
+    lowered = question.lower()
+    if any(phrase in lowered for phrase in _GENERIC_MISSING_CONTEXT_PHRASES):
+        return ""
+    if question[-1] not in ".?!":
+        question += "."
+    return question
+
+
+def _join_human_list(items: list[str]) -> str:
+    if len(items) <= 1:
+        return items[0] if items else ""
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def _required_context_label(value: Any) -> str:
+    if isinstance(value, RequiredContextKey):
+        return _REQUIRED_CONTEXT_LABELS[value]
+    if isinstance(value, str):
+        if value in _DIAGNOSIS_MISSING_CONTEXT_LABELS:
+            return _DIAGNOSIS_MISSING_CONTEXT_LABELS[value]
+        try:
+            return _REQUIRED_CONTEXT_LABELS[RequiredContextKey(value)]
+        except ValueError:
+            return _clean_recorded_failure_text(value, max_chars=120)
+    return ""
+
+
+def _turn_context_missing_context_labels(ctx: CopilotContext) -> list[str]:
+    packet = getattr(ctx, "turn_context_packet", None)
+    omissions = getattr(packet, "omissions", None)
+    if not isinstance(omissions, list):
+        return []
+    labels: list[str] = []
+    for omission in omissions:
+        label = _required_context_label(getattr(omission, "context_key", None))
+        if label:
+            labels.append(label)
+    return list(dict.fromkeys(labels))
+
+
+def _diagnosis_missing_context_labels(ctx: CopilotContext) -> list[str]:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    missing_context = getattr(diagnosis, "missing_context", None)
+    if not isinstance(missing_context, list):
+        return []
+    labels = [_required_context_label(item) for item in missing_context]
+    return list(dict.fromkeys(label for label in labels if label))
+
+
+def _unbacked_workflow_delivery_reply(ctx: CopilotContext) -> str:
+    turn_intent = getattr(ctx, "turn_intent", None)
+    if isinstance(turn_intent, TurnIntent):
+        question = _specific_missing_context_question(turn_intent.missing_context_question)
+        if question:
+            return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} I need this before I can build and test it: {question}"
+
+    request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
+    if request_policy is not None:
+        question = _specific_missing_context_question(request_policy.clarification_question)
+        if question:
+            return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} I need this before I can build and test it: {question}"
+
+    missing_context = _diagnosis_missing_context_labels(ctx) or _turn_context_missing_context_labels(ctx)
+    if missing_context:
+        items = _join_human_list(missing_context)
+        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} Required context was unavailable: {items}."
+
+    reason, status_sentence = _recorded_failure_summary(ctx)
+    if reason:
+        return f"{_UNBACKED_WORKFLOW_DELIVERY_PREFIX} The recorded blocker was: {reason}.{status_sentence}"
+
+    return _UNBACKED_WORKFLOW_DELIVERY_REPLY
 
 
 def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
@@ -860,6 +973,16 @@ def _build_wip_exit_result(
     return _build_exit_result(ctx, recorded_failure_reply or default_reply, global_llm_context, cancelled=cancelled)
 
 
+def _merge_exit_context(
+    global_llm_context: str | None,
+    *,
+    failure: RecoverableFailure | None = None,
+) -> str | None:
+    if failure is None:
+        return global_llm_context
+    return merge_failure_into_context(global_llm_context, failure)
+
+
 def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
     return _build_wip_exit_result(
         ctx,
@@ -887,14 +1010,48 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
     )
 
 
-def _build_unexpected_error_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
-    return _build_wip_exit_result(
+def _build_unexpected_error_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    error: BaseException | None = None,
+    *,
+    span: Any | None = None,
+) -> AgentResult:
+    failure = build_recoverable_failure(
+        error,
+        workflow_modified=ctx.workflow_persisted,
+    )
+    default_reply = format_recoverable_failure_reply(failure)
+    enriched_context = _merge_exit_context(global_llm_context, failure=failure)
+    result = _build_wip_exit_result(
         ctx,
-        global_llm_context,
-        default_reply=_UNEXPECTED_ERROR_REPLY_DEFAULT,
+        enriched_context,
+        default_reply=default_reply,
         unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
         tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
     )
+    LOG.warning(
+        "Copilot unexpected error translated to recoverable reply",
+        failure_kind=failure.failure_kind,
+        internal_error_id=failure.internal_error_id,
+        exception_type=failure.exception_type,
+        error_type=type(error).__name__ if error else None,
+        workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+        workflow_copilot_chat_id=getattr(ctx, "workflow_copilot_chat_id", None),
+        workflow_modified=failure.workflow_modified,
+        has_proposal=result.updated_workflow is not None,
+        proposal_disposition=result.proposal_disposition,
+        last_test_ok=getattr(ctx, "last_test_ok", None),
+    )
+    current_span = span or otel_trace.get_current_span()
+    current_span.set_attribute("copilot.error_recovered", True)
+    current_span.set_attribute("copilot.error_failure_kind", failure.failure_kind)
+    current_span.set_attribute("copilot.error_id", failure.internal_error_id)
+    if failure.exception_type:
+        current_span.set_attribute("copilot.error_exception_type", failure.exception_type)
+    current_span.set_attribute("copilot.error_reply_proposal_disposition", result.proposal_disposition)
+    current_span.set_attribute("copilot.error_workflow_modified", failure.workflow_modified)
+    return result
 
 
 def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
@@ -1101,6 +1258,7 @@ def _translate_to_agent_result(
     )
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
+    unbacked_workflow_delivery_rewritten = False
     if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
         user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
         soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
@@ -1116,7 +1274,10 @@ def _translate_to_agent_result(
     # Preserve the unbacked-proposal correction when both soft rewrites apply:
     # a reply must not imply a workflow exists when no proposal was produced.
     if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
-        user_response = _UNBACKED_WORKFLOW_DELIVERY_REPLY
+        user_response = _unbacked_workflow_delivery_reply(ctx)
+        resp_type = "ASK_QUESTION"
+        output_policy_verdict.output_kind = CopilotOutputKind.CLARIFICATION_REQUEST
+        unbacked_workflow_delivery_rewritten = True
         soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
         output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
     if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
@@ -1166,7 +1327,13 @@ def _translate_to_agent_result(
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        proposal_disposition="review_untested" if unvalidated else "auto_applicable",
+        proposal_disposition=(
+            "no_proposal"
+            if unbacked_workflow_delivery_rewritten and last_workflow is None
+            else "review_untested"
+            if unvalidated
+            else "auto_applicable"
+        ),
         output_policy_diagnostics=output_policy_diagnostics,
     )
 
@@ -1227,17 +1394,8 @@ _RETRIABLE_LLM_ERROR_TEXT = (
 _LLM_ERROR_MODULE_MARKERS = ("openai", "litellm", "anthropic")
 
 
-def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
-    chain: list[BaseException] = []
-    current: BaseException | None = exc
-    while current is not None and current not in chain:
-        chain.append(current)
-        current = current.__cause__ or current.__context__
-    return chain
-
-
 def _is_retriable_llm_error(exc: BaseException) -> bool:
-    for item in _iter_exception_chain(exc):
+    for item in iter_exception_chain(exc):
         module = type(item).__module__.lower()
         name = type(item).__name__
         text = str(item).lower()
@@ -1541,7 +1699,8 @@ def _build_output_policy_blocked_result(
         user_response = (
             "The selected credential is not approved for one of the URLs in this workflow. "
             "Please use a saved credential tested for that URL, update the block URL to match the credential's "
-            "tested site, or adjust the workflow to avoid using credentials."
+            "tested site, or adjust the workflow to avoid using credentials. If the credential was already in this "
+            "workflow without a tracked URL, re-select it so Copilot can confirm its URL scope."
         )
         add_saved_draft_copy = True
     elif preserved_workflow is not None:
@@ -1594,28 +1753,71 @@ async def run_copilot_agent(
     turn_index: int | None = None,
     prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
-    # Initialize tracing before opening the turn span so Logfire's OTel provider
-    # is installed; otherwise the very first turn lands the parent span on
-    # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
-    ensure_tracing_initialized()
-    with _copilot_turn_span(
-        chat_request=chat_request,
-        chat_history=chat_history,
-        turn_index=turn_index,
-    ):
-        return await _run_copilot_turn_impl(
-            stream=stream,
-            organization_id=organization_id,
+    try:
+        # Initialize tracing before opening the turn span so Logfire's OTel provider
+        # is installed; otherwise the very first turn lands the parent span on
+        # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
+        ensure_tracing_initialized()
+        with _copilot_turn_span(
             chat_request=chat_request,
             chat_history=chat_history,
-            global_llm_context=global_llm_context,
-            debug_run_info_text=debug_run_info_text,
-            llm_api_handler=llm_api_handler,
-            api_key=api_key,
-            security_rules=security_rules,
-            config=config,
-            prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+            turn_index=turn_index,
+        ) as turn_span:
+            try:
+                return await _run_copilot_turn_impl(
+                    stream=stream,
+                    organization_id=organization_id,
+                    chat_request=chat_request,
+                    chat_history=chat_history,
+                    global_llm_context=global_llm_context,
+                    debug_run_info_text=debug_run_info_text,
+                    llm_api_handler=llm_api_handler,
+                    api_key=api_key,
+                    security_rules=security_rules,
+                    config=config,
+                    prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+                )
+            except Exception as exc:
+                LOG.error(
+                    "Copilot turn unhandled error",
+                    error_type=type(exc).__name__,
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                    exc_info=True,
+                )
+                turn_span.record_exception(exc)
+                ctx = CopilotContext(
+                    organization_id=organization_id,
+                    workflow_id=chat_request.workflow_id,
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    workflow_yaml=chat_request.workflow_yaml or "",
+                    browser_session_id=None,
+                    stream=stream,
+                    api_key=api_key,
+                    user_message=chat_request.message,
+                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                )
+                return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+    except Exception as exc:
+        LOG.error(
+            "Copilot turn unhandled error",
+            error_type=type(exc).__name__,
+            workflow_permanent_id=chat_request.workflow_permanent_id,
+            workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+            exc_info=True,
         )
+        ctx = CopilotContext(
+            organization_id=organization_id,
+            workflow_id=chat_request.workflow_id,
+            workflow_permanent_id=chat_request.workflow_permanent_id,
+            workflow_yaml=chat_request.workflow_yaml or "",
+            browser_session_id=None,
+            stream=stream,
+            api_key=api_key,
+            user_message=chat_request.message,
+            workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        )
+        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
 
 
 async def _run_copilot_turn_impl(
@@ -1723,7 +1925,7 @@ async def _run_copilot_turn_impl(
             prior_workflow_yaml=chat_request.workflow_yaml,
         )
     if request_policy is None:
-        raise RuntimeError("Copilot request-policy input guardrail did not populate request policy")
+        raise CopilotRequestPolicyMissingError()
 
     agent_user_message, safe_chat_history_text = _request_policy_agent_inputs(
         request_policy,
@@ -1957,7 +2159,7 @@ async def _run_copilot_turn_impl(
                     error_message=exc.error_message,
                     organization_id=organization_id,
                 )
-                return _build_unexpected_error_exit_result(ctx, global_llm_context)
+                return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
             except CopilotNonRetriableNavError as exc:
                 LOG.warning(
                     "Copilot run halted on non-retriable navigation error",
@@ -1980,4 +2182,4 @@ async def _run_copilot_turn_impl(
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
-        return _build_unexpected_error_exit_result(ctx, global_llm_context)
+        return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)

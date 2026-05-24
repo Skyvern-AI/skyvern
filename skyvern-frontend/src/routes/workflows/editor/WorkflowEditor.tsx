@@ -1,6 +1,7 @@
 import { ReactFlowProvider } from "@xyflow/react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useEffect } from "react";
+import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import {
   getElements,
@@ -17,6 +18,8 @@ import { useMountEffect } from "@/hooks/useMountEffect";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
+  const [searchParams] = useSearchParams();
+  const posthog = usePostHog();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -31,6 +34,13 @@ function WorkflowEditor() {
   const blockOutputStore = useBlockOutputStore();
 
   useMountEffect(() => blockOutputStore.reset());
+
+  useMountEffect(() => {
+    const via = searchParams.get("via");
+    if (via) {
+      posthog?.capture("copilot.discover.started", { entry_point: via });
+    }
+  });
 
   useEffect(() => {
     if (workflow) {
