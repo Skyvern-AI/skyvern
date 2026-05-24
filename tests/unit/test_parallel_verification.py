@@ -786,3 +786,44 @@ async def test_persist_scrape_artifacts_bundling_disabled(monkeypatch: pytest.Mo
     assert ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT in artifact_types
     economy_tree_mock.assert_called_once()
     full_tree_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_persist_scrape_artifacts_bundling_disabled_logs_and_reraises_failures(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """All scrape artifact uploads run to completion; failures are logged and the first is re-raised."""
+    agent = ForgeAgent()
+    now = datetime.now(UTC)
+    task, step, scraped_page, economy_tree_mock, full_tree_mock = _make_scrape_test_fixtures(now, monkeypatch)
+
+    expected_error = RuntimeError("artifact upload failed")
+
+    async def _create_artifact(*, step: Step, artifact_type: ArtifactType, data: bytes) -> str:
+        if artifact_type == ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP:
+            raise expected_error
+        return f"artifact-{artifact_type.value}"
+
+    create_artifact_mock = AsyncMock(side_effect=_create_artifact)
+    monkeypatch.setattr("skyvern.forge.agent.app.ARTIFACT_MANAGER.create_artifact", create_artifact_mock)
+
+    context = SkyvernContext(
+        task_id=task.task_id,
+        step_id=None,
+        organization_id=task.organization_id,
+        workflow_run_id=task.workflow_run_id,
+        tz_info=ZoneInfo("UTC"),
+    )
+    context.enable_speed_optimizations = True
+    context.use_artifact_bundling = False
+
+    with pytest.raises(RuntimeError, match="artifact upload failed"):
+        await agent._persist_scrape_artifacts(task=task, step=step, scraped_page=scraped_page, context=context)
+
+    assert create_artifact_mock.await_count == 6
+    assert any(
+        "Failed to persist scrape artifact" in record.message and "visible_elements_id_css_map" in record.message
+        for record in caplog.records
+    )
+    economy_tree_mock.assert_called_once()
+    full_tree_mock.assert_not_called()

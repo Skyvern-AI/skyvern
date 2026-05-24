@@ -175,7 +175,10 @@ function WorkflowPage() {
             </Link>
           </Button>
           <Button asChild variant="secondary">
-            <Link to={`/workflows/${workflowPermanentId}/build`}>
+            <Link
+              to={`/workflows/${workflowPermanentId}/build`}
+              data-testid="workflow-open-editor-link"
+            >
               <Pencil2Icon className="mr-2 size-4" />
               Edit
             </Link>

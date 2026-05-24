@@ -16,6 +16,7 @@ class BrowserState(Protocol):
     browser_context: BrowserContext | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
+    allow_content_blocking_extensions: bool
     pw: Playwright
 
     async def check_and_fix_state(
@@ -28,6 +29,7 @@ class BrowserState(Protocol):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> None: ...
@@ -56,6 +58,7 @@ class BrowserState(Protocol):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> Page: ...

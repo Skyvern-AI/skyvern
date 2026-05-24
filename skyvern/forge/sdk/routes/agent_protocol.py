@@ -29,7 +29,6 @@ from skyvern import analytics
 from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_UI_USER_AGENT
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
@@ -49,10 +48,12 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_params
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
+    BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON,
+    BULK_CANCEL_RUNS_CODE_SAMPLE_TS,
     CANCEL_RUN_CODE_SAMPLE_PYTHON,
     CANCEL_RUN_CODE_SAMPLE_TS,
     CREATE_WORKFLOW_CODE_SAMPLE_CURL,
@@ -77,6 +78,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_WORKFLOW_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router, legacy_v2_router
+from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestionBase, AISuggestionRequest
 from skyvern.forge.sdk.schemas.organizations import (
     GetOrganizationAPIKeysResponse,
@@ -121,6 +123,8 @@ from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
     BlockRunResponse,
+    BulkCancelRunsRequest,
+    BulkCancelRunsResponse,
     RunEngine,
     RunResponse,
     RunStatus,
@@ -263,6 +267,7 @@ async def run_task(
             model=run_request.model,
             max_screenshot_scrolls=run_request.max_screenshot_scrolls,
             extra_http_headers=run_request.extra_http_headers,
+            cdp_connect_headers=run_request.cdp_connect_headers,
             browser_address=run_request.browser_address,
         )
         task_v1_response = await task_v1_service.run_task(
@@ -310,9 +315,7 @@ async def run_task(
         )
     if run_request.engine == RunEngine.skyvern_v2:
         # create task v2
-        v2_trigger_type = (
-            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-        )
+        v2_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
         try:
             task_v2 = await task_v2_service.initialize_task_v2(
                 organization=current_org,
@@ -330,6 +333,7 @@ async def run_task(
                 model=run_request.model,
                 max_screenshot_scrolling_times=run_request.max_screenshot_scrolls,
                 extra_http_headers=run_request.extra_http_headers,
+                cdp_connect_headers=run_request.cdp_connect_headers,
                 browser_session_id=run_request.browser_session_id,
                 browser_address=run_request.browser_address,
                 run_with=run_request.run_with,
@@ -439,13 +443,14 @@ async def run_workflow(
         browser_profile_id=workflow_run_request.browser_profile_id,
         max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
         extra_http_headers=workflow_run_request.extra_http_headers,
+        cdp_connect_headers=workflow_run_request.cdp_connect_headers,
         browser_address=workflow_run_request.browser_address,
         run_with=workflow_run_request.run_with,
         ai_fallback=workflow_run_request.ai_fallback,
         run_metadata=workflow_run_request.run_metadata,
     )
 
-    trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
+    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -567,6 +572,36 @@ async def cancel_run(
     analytics.capture("skyvern-oss-agent-cancel-run")
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@base_router.post(
+    "/runs/cancel",
+    tags=["Agent", "Workflow Runs"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "bulk_cancel_runs",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": BULK_CANCEL_RUNS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
+    description="Cancel multiple runs (tasks or workflows) in a single request",
+    summary="Bulk cancel runs",
+)
+@base_router.post("/runs/cancel/", include_in_schema=False)
+async def bulk_cancel_runs(
+    data: BulkCancelRunsRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> BulkCancelRunsResponse:
+    analytics.capture("skyvern-oss-agent-bulk-cancel-runs")
+
+    return await run_service.bulk_cancel_runs(
+        data.run_ids, organization_id=current_org.organization_id, api_key=x_api_key
+    )
 
 
 @legacy_base_router.post(
@@ -745,6 +780,7 @@ async def create_workflow_from_prompt(
             proxy_location=request.proxy_location,
             max_screenshot_scrolling_times=request.max_screenshot_scrolls,
             extra_http_headers=request.extra_http_headers,
+            cdp_connect_headers=request.cdp_connect_headers,
             max_iterations=x_max_iterations_override,
             max_steps=x_max_steps_override,
             status=WorkflowStatus.published if request.publish_workflow else WorkflowStatus.auto_generated,
@@ -1952,9 +1988,7 @@ async def run_block(
             block_labels=block_run_request.block_labels,
         )
 
-        block_trigger_type = (
-            WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-        )
+        block_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
         workflow_run = await block_service.ensure_workflow_run(
             organization=organization,
             template=template,
@@ -2629,7 +2663,7 @@ async def run_workflow_legacy(
     )
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
 
-    legacy_trigger_type = WorkflowRunTriggerType.manual if x_user_agent == "skyvern-ui" else WorkflowRunTriggerType.api
+    legacy_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -3534,9 +3568,7 @@ async def run_task_v2(
     await PermissionCheckerFactory.get_instance().check(organization, browser_session_id=data.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(organization.organization_id)
 
-    legacy_v2_trigger_type = (
-        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-    )
+    legacy_v2_trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         task_v2 = await task_v2_service.initialize_task_v2(
             organization=organization,
@@ -3553,6 +3585,7 @@ async def run_task_v2(
             max_screenshot_scrolling_times=data.max_screenshot_scrolls,
             browser_session_id=data.browser_session_id,
             extra_http_headers=data.extra_http_headers,
+            cdp_connect_headers=data.cdp_connect_headers,
             browser_address=data.browser_address,
             trigger_type=legacy_v2_trigger_type,
         )

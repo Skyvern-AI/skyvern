@@ -39,6 +39,8 @@ type WorkflowPanelStore = {
   closeWorkflowPanel: () => void;
   setWorkflowPanelState: (state: WorkflowPanelState) => void;
   toggleWorkflowPanel: () => void;
+  selectedBlockId: string | null;
+  setSelectedBlockId: (id: string | null) => void;
 };
 
 const useWorkflowPanelStore = create<WorkflowPanelStore>((set, get) => {
@@ -65,6 +67,11 @@ const useWorkflowPanelStore = create<WorkflowPanelStore>((set, get) => {
           active: !get().workflowPanelState.active,
         },
       });
+    },
+    selectedBlockId: null,
+    setSelectedBlockId: (selectedBlockId: string | null) => {
+      // Single-select invariant: assigning replaces any prior id.
+      set({ selectedBlockId });
     },
   };
 });

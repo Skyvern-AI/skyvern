@@ -91,3 +91,84 @@ async def get_llm_handler_for_prompt_type(
             exc_info=True,
         )
         return None
+
+
+# PostHog encodes a disabled multivariate flag as `False`; JS-style booleans
+# can also surface as strings.
+_CHECK_USER_GOAL_CONTROL_VARIANTS = {None, False, "False", "false", "", "control"}
+
+# Failures intentionally not cached so a transient factory error doesn't
+# permanently disable the experiment for the process.
+_resolved_check_user_goal_handler_cache: dict[str, LLMAPIHandler] = {}
+_invalid_check_user_goal_variants_logged: set[str] = set()
+
+
+async def get_check_user_goal_llm_override(
+    distinct_id: str, organization_id: str | None = None
+) -> LLMAPIHandler | None:
+    """Resolve the CHECK_USER_GOAL_LLM_NAME multivariate flag to an LLM handler."""
+    try:
+        variant = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
+            "CHECK_USER_GOAL_LLM_NAME",
+            distinct_id,
+            properties={"organization_id": organization_id},
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to read CHECK_USER_GOAL_LLM_NAME; falling back to default handler",
+            distinct_id=distinct_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return None
+
+    if variant is None or variant in _CHECK_USER_GOAL_CONTROL_VARIANTS:
+        return None
+
+    cached = _resolved_check_user_goal_handler_cache.get(variant)
+    if cached is not None:
+        return cached
+
+    try:
+        handler = LLMAPIHandlerFactory.get_llm_api_handler(variant)
+    except Exception:
+        if variant not in _invalid_check_user_goal_variants_logged:
+            LOG.warning(
+                "Failed to initialize handler for CHECK_USER_GOAL_LLM_NAME variant",
+                variant=variant,
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+            )
+            _invalid_check_user_goal_variants_logged.add(variant)
+        return None
+
+    _resolved_check_user_goal_handler_cache[variant] = handler
+    LOG.info(
+        "Using CHECK_USER_GOAL_LLM_NAME override handler",
+        variant=variant,
+        distinct_id=distinct_id,
+        organization_id=organization_id,
+    )
+    return handler
+
+
+async def resolve_check_user_goal_handler(
+    distinct_id: str,
+    organization_id: str | None,
+    default_handler: LLMAPIHandler,
+) -> LLMAPIHandler:
+    """Return CHECK_USER_GOAL_LLM_NAME override (flex-wrapped) if set; else default_handler."""
+    try:
+        override = await get_check_user_goal_llm_override(distinct_id, organization_id)
+    except Exception:
+        LOG.warning(
+            "Failed to resolve CHECK_USER_GOAL_LLM_NAME; using default handler",
+            distinct_id=distinct_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+        return default_handler
+
+    if override is None:
+        return default_handler
+    return LLMAPIHandlerFactory.wrap_for_flex_routing(override)

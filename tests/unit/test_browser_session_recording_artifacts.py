@@ -236,14 +236,14 @@ async def test_get_shared_recordings_returns_short_signed_urls(keyring_configure
         file_size=16384,
     )
     mock_list = AsyncMock(return_value=[artifact])
-    build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
+    resolve_url = AsyncMock(return_value="https://api.skyvern.com/v1/artifacts/a_42/content?expiry=x&kid=y&sig=z")
 
     with (
         patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app,
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
     ):
         s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-        base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+        base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
         base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
         result = await storage.get_shared_recordings_in_browser_session(
             organization_id="o_1", browser_session_id="pbs_1"
@@ -267,14 +267,14 @@ async def test_get_shared_recordings_filters_unsupported_extensions(keyring_conf
     good = _make_recording_artifact("a_good", "s3://b/v1/.../videos/2026-04-26/ok.webm")
     bad = _make_recording_artifact("a_bad", "s3://b/v1/.../videos/2026-04-26/sneaky.exe")
     mock_list = AsyncMock(return_value=[good, bad])
-    build_url = MagicMock(return_value="https://api.skyvern.com/v1/artifacts/a_good/content")
+    resolve_url = AsyncMock(return_value="https://api.skyvern.com/v1/artifacts/a_good/content")
 
     with (
         patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app,
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
     ):
         s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-        base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+        base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
         base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
         result = await storage.get_shared_recordings_in_browser_session(
             organization_id="o_1", browser_session_id="pbs_1"
@@ -296,8 +296,8 @@ async def test_get_shared_recordings_sorts_newest_first(keyring_configured):
         "a_new", "s3://b/v1/.../videos/2026-04-26/newer.webm", created_at="2026-04-26T00:00:00Z"
     )
     mock_list = AsyncMock(return_value=[older, newer])
-    build_url = MagicMock(
-        side_effect=lambda artifact_id, **_: f"https://api.skyvern.com/v1/artifacts/{artifact_id}/content"
+    resolve_url = AsyncMock(
+        side_effect=lambda artifact, **_: f"https://api.skyvern.com/v1/artifacts/{artifact.artifact_id}/content"
     )
 
     with (
@@ -305,7 +305,7 @@ async def test_get_shared_recordings_sorts_newest_first(keyring_configured):
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
     ):
         s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-        base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+        base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
         base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
         result = await storage.get_shared_recordings_in_browser_session(
             organization_id="o_1", browser_session_id="pbs_1"
@@ -334,14 +334,14 @@ async def test_get_shared_recordings_falls_back_to_presigned_for_legacy_session(
     )
 
     mock_list = AsyncMock(return_value=[])  # no rows
-    build_url = MagicMock()  # must NOT be called
+    resolve_url = AsyncMock()  # must NOT be called
 
     with (
         patch("skyvern.forge.sdk.artifact.storage.base.app") as base_app,
         patch("skyvern.forge.sdk.artifact.storage.s3.app") as s3_app,
     ):
         s3_app.DATABASE.artifacts.list_artifacts_for_browser_session_by_type = mock_list
-        base_app.ARTIFACT_MANAGER.build_signed_content_url = build_url
+        base_app.ARTIFACT_MANAGER.resolve_share_url = resolve_url
         base_app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds = AsyncMock(return_value=12 * 60 * 60)
         result = await storage.get_shared_recordings_in_browser_session(
             organization_id="o_1", browser_session_id="pbs_old"
@@ -350,7 +350,7 @@ async def test_get_shared_recordings_falls_back_to_presigned_for_legacy_session(
     assert len(result) == 1
     assert _is_amazonaws_s3_url(result[0].url)
     assert result[0].file_size == 1024
-    build_url.assert_not_called()
+    resolve_url.assert_not_awaited()
 
 
 @pytest.mark.asyncio

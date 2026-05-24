@@ -33,10 +33,16 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
-from skyvern.webeye.cdp_connection import build_cdp_connect_headers
+from skyvern.webeye.cdp_connection import (
+    build_cdp_connect_headers,
+)
 from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics as _connect_over_cdp_with_diagnostics
+from skyvern.webeye.cdp_connection import (
+    merge_cdp_connect_headers,
+    parse_default_cdp_connect_headers,
+)
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.dialog_handler import set_dialog_handler
 
@@ -252,7 +258,7 @@ async def _apply_download_behaviour(browser: Browser) -> None:
 
 class BrowserContextCreator(Protocol):
     def __call__(
-        self, playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict[str, Any]
+        self, playwright: Playwright, proxy_location: ProxyLocationInput = None, **kwargs: dict[str, Any]
     ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]]: ...
 
 
@@ -291,7 +297,7 @@ class BrowserContextFactory:
 
     @staticmethod
     def build_browser_args(
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         cdp_port: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -343,12 +349,22 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if settings.ENABLE_PROXY:
+        # Custom per-request proxy URL takes precedence over the global proxy pool.
+        # Users may pass proxy_location={"url": "http://user:pass@host:port"} to
+        # route this specific task/session through their own proxy server.
+        if isinstance(proxy_location, dict) and "url" in proxy_location:
+            proxy_url = proxy_location["url"]
+            if _is_valid_proxy_url(proxy_url):
+                args["proxy"] = {"server": proxy_url}
+                LOG.info("Using custom per-request proxy URL", proxy_url=_redact_proxy_url(proxy_url))
+            else:
+                LOG.warning("Invalid custom proxy URL provided, ignoring", proxy_url=_redact_proxy_url(proxy_url))
+        elif settings.ENABLE_PROXY:
             proxy_config = setup_proxy()
             if proxy_config:
                 args["proxy"] = proxy_config
 
-        if proxy_location:
+        if isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args
@@ -391,8 +407,8 @@ class BrowserContextFactory:
             set_dialog_handler(browser_context=browser_context)
             await app.AGENT_FUNCTION.setup_browser_context_extensions(browser_context=browser_context, **kwargs)
 
-            proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
-            if proxy_location is not None:
+            proxy_location: ProxyLocationInput = kwargs.get("proxy_location")
+            if isinstance(proxy_location, ProxyLocation):
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
@@ -445,6 +461,22 @@ def setup_proxy() -> dict | None:
     except Exception as e:
         LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
         return None
+
+
+def _redact_proxy_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        if not parsed.hostname:
+            return "<redacted>"
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        userinfo = ""
+        if parsed.username:
+            userinfo = f"{parsed.username}:***@" if parsed.password else f"{parsed.username}@"
+        return f"{parsed.scheme}://{userinfo}{host}"
+    except Exception:
+        return "<redacted>"
 
 
 def _is_valid_proxy_url(url: str) -> bool:
@@ -548,8 +580,9 @@ def _is_chrome_running() -> bool:
 
 async def _create_headless_chromium(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -557,6 +590,7 @@ async def _create_headless_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -637,8 +671,9 @@ async def _create_headless_chromium(
 
 async def _create_headful_chromium(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -646,6 +681,7 @@ async def _create_headful_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -754,8 +790,9 @@ def is_valid_chromium_user_data_dir(directory: str) -> bool:
 
 async def _create_cdp_connection_browser(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -763,6 +800,7 @@ async def _create_cdp_connection_browser(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -813,13 +851,19 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
-    return await _connect_to_cdp_browser(playwright, settings.BROWSER_REMOTE_DEBUGGING_URL, extra_http_headers)
+    return await _connect_to_cdp_browser(
+        playwright,
+        settings.BROWSER_REMOTE_DEBUGGING_URL,
+        extra_http_headers=extra_http_headers,
+        cdp_connect_headers=cdp_connect_headers,
+    )
 
 
 async def _connect_to_cdp_browser(
     playwright: Playwright,
     remote_browser_url: str,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
@@ -833,10 +877,15 @@ async def _connect_to_cdp_browser(
     )
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    cdp_headers = merge_cdp_connect_headers(
+        default_headers=parse_default_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS),
+        per_row_headers=cdp_connect_headers,
+        managed_host_header=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER) or {},
+    )
     browser = await _connect_over_cdp_with_diagnostics(
         playwright,
         remote_browser_url,
-        headers=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER),
+        headers=cdp_headers or None,
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
     )
 

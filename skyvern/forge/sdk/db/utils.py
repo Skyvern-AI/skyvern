@@ -124,7 +124,8 @@ def deserialize_proxy_location(
     Handles:
     - None -> None
     - ProxyLocation enum string (e.g., "RESIDENTIAL") -> ProxyLocation enum
-    - JSON string (e.g., '{"country": "US", ...}') -> GeoTarget object
+    - JSON string with country key (e.g., '{"country": "US", ...}') -> GeoTarget object
+    - JSON string with url key (e.g., '{"url": "http://..."}') -> dict (custom proxy URL)
     """
     if value is None:
         return None
@@ -132,12 +133,17 @@ def deserialize_proxy_location(
     value = value.strip()
     result: ProxyLocationInput = None
 
-    # Try to parse as JSON first (for GeoTarget)
+    # Try to parse as JSON first (for GeoTarget or custom proxy URL dict)
     if value.startswith("{"):
         try:
             data = json.loads(value)
             if not isinstance(data, dict):
-                raise ValueError("GeoTarget proxy_location JSON must be an object")
+                raise ValueError("proxy_location JSON must be an object")
+
+            # Custom proxy URL dict: {"url": "http://..."} for self-hosted deployments.
+            if "url" in data and "country" not in data:
+                LOG.info("Deserialized proxy_location as custom proxy URL dict", db_value=value)
+                return data
 
             # Handle malformed subdivision (e.g., boolean instead of string)
             subdivision = data.get("subdivision")
@@ -310,6 +316,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         proxy_location=deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
+        cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
@@ -507,6 +514,7 @@ def convert_to_workflow(
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
+        cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
@@ -555,6 +563,7 @@ def convert_to_workflow_run(
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,

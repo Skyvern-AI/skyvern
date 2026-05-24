@@ -567,6 +567,16 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
 
 
+class UploadFileMaxSizeExceeded(SkyvernException):
+    def __init__(self, file_size_bytes: int, max_size_bytes: int) -> None:
+        self.file_size_bytes = file_size_bytes
+        self.max_size_bytes = max_size_bytes
+        super().__init__(
+            f"Upload file size {file_size_bytes / 1024 / 1024:.1f} MB exceeded the maximum "
+            f"allowed size of {max_size_bytes / 1024 / 1024:.0f} MB."
+        )
+
+
 class DownloadFileMaxWaitingTime(SkyvernException):
     def __init__(self, downloading_files: list[str]) -> None:
         self.downloading_files = downloading_files

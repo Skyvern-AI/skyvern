@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -90,6 +91,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -299,6 +301,20 @@ def _schedule_summary_shadow_check_for_hit(
     )
 
 
+def _discard_background_task_result(task: asyncio.Task) -> None:
+    # Retrieve the exception so asyncio does not warn about an unretrieved task failure.
+    if not task.cancelled():
+        task.exception()
+
+
+async def _cancel_pending_prefetch_task(task: asyncio.Task | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 async def _build_open_tabs_context(
     browser_state: BrowserState,
     working_page: Page | None,
@@ -485,6 +501,7 @@ class ForgeAgent:
             model=task_block.model,
             max_screenshot_scrolling_times=workflow_run.max_screenshot_scrolls,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_session_id=workflow_run.browser_session_id,
             download_timeout=task_block.download_timeout,
@@ -556,6 +573,7 @@ class ForgeAgent:
             model=task_request.model,
             max_screenshot_scrolling_times=task_request.max_screenshot_scrolls,
             extra_http_headers=task_request.extra_http_headers,
+            cdp_connect_headers=task_request.cdp_connect_headers,
             browser_session_id=task_request.browser_session_id,
             browser_address=task_request.browser_address,
             include_extracted_text=task_request.include_extracted_text,
@@ -1283,6 +1301,20 @@ class ForgeAgent:
             actions_and_results=None,
             cua_response=None,
         )
+        prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None
+        current_artifact_task: asyncio.Task | None = None
+
+        async def await_background_artifact_task() -> None:
+            nonlocal current_artifact_task
+            if current_artifact_task is None:
+                return
+            task = current_artifact_task
+            current_artifact_task = None
+            try:
+                await task
+            except Exception:
+                LOG.warning("Background artifact task failed, continuing", exc_info=True)
+
         try:
             LOG.info(
                 "Starting agent step",
@@ -1322,6 +1354,7 @@ class ForgeAgent:
             speculative_plan: SpeculativePlan | None = None
             reuse_speculative_llm_response = False
             speculative_llm_metadata: SpeculativeLLMMetadata | None = None
+            is_extraction_task = not task.navigation_goal and not isinstance(task_block, ValidationBlock)
             if context:
                 speculative_plan = context.speculative_plans.pop(step.step_id, None)
 
@@ -1341,6 +1374,12 @@ class ForgeAgent:
                     context=context,
                 )
             else:
+                if is_extraction_task and engine not in CUA_ENGINES and injected_actions is None:
+                    prefetched_summary_task = asyncio.create_task(
+                        self._fetch_data_extraction_summary_response(task, step)
+                    )
+                    prefetched_summary_task.add_done_callback(_discard_background_task_result)
+
                 (
                     scraped_page,
                     extract_action_prompt,
@@ -1399,8 +1438,15 @@ class ForgeAgent:
                 )
 
             else:
-                if not task.navigation_goal and not isinstance(task_block, ValidationBlock):
-                    actions = [await self.create_extract_action(task, step, scraped_page)]
+                if is_extraction_task:
+                    actions = [
+                        await self.create_extract_action(
+                            task,
+                            step,
+                            scraped_page,
+                            prefetched_summary_task=prefetched_summary_task,
+                        )
+                    ]
                 else:
                     llm_key_override = task.llm_key
                     # FIXME: Redundant engine check?
@@ -1623,6 +1669,8 @@ class ForgeAgent:
 
             element_id_to_last_action: dict[str, int] = dict()
             for action_idx, action_node in enumerate(action_linked_list):
+                await await_background_artifact_task()
+
                 context = skyvern_context.ensure_context()
                 if context.refresh_working_page:
                     LOG.warning(
@@ -1646,7 +1694,9 @@ class ForgeAgent:
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
                     action.action_id = (await app.DATABASE.workflow_params.create_action(action=action)).action_id
-                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    current_artifact_task = asyncio.create_task(
+                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    )
                     break
 
                 action = action_node.action
@@ -1759,7 +1809,9 @@ class ForgeAgent:
                 )
                 await asyncio.sleep(wait_time)
                 if not is_page_level_scroll:
-                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    current_artifact_task = asyncio.create_task(
+                        self.record_artifacts_after_action(task, step, browser_state, engine, action)
+                    )
                 else:
                     LOG.info(
                         "Skipping post-action artifacts for page-level scroll",
@@ -1840,6 +1892,8 @@ class ForgeAgent:
                         output=detailed_agent_step_output.to_agent_step_output(),
                     )
                     return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+
+            await await_background_artifact_task()
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
@@ -1952,6 +2006,9 @@ class ForgeAgent:
                 output=detailed_agent_step_output.to_agent_step_output(),
             )
             return failed_step, detailed_agent_step_output.get_clean_detailed_output()
+        finally:
+            await _cancel_pending_prefetch_task(prefetched_summary_task)
+            await await_background_artifact_task()
 
     async def _generate_cua_actions(
         self,
@@ -2646,15 +2703,15 @@ class ForgeAgent:
             )
 
         if use_check_user_goal_handler:
-            # Use the dedicated check-user-goal handler (new behavior)
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.CHECK_USER_GOAL_LLM_API_HANDLER
-            )
+            default_handler = app.CHECK_USER_GOAL_LLM_API_HANDLER
         else:
-            # Use the primary LLM handler (legacy behavior)
-            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-                llm_key_override, default=app.LLM_API_HANDLER
-            )
+            default_handler = app.LLM_API_HANDLER
+
+        distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
+        default_handler = await resolve_check_user_goal_handler(
+            distinct_id_for_override, task.organization_id, default_handler
+        )
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key_override, default=default_handler)
 
         verification_result = await llm_api_handler(
             prompt=verification_prompt,
@@ -3204,34 +3261,62 @@ class ForgeAgent:
                 element_tree_in_prompt=element_tree_in_prompt.encode("utf-8"),
             )
         else:
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+            scrape_artifact_types = [
+                ArtifactType.HTML_SCRAPE,
+                ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                ArtifactType.VISIBLE_ELEMENTS_TREE,
+                ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+            ]
+            results = await asyncio.gather(
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step, artifact_type=ArtifactType.HTML_SCRAPE, data=scraped_page.html.encode("utf-8")
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
+                    data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
+                    data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
+                    data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
+                    data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
+                ),
+                app.ARTIFACT_MANAGER.create_artifact(
+                    step=step,
+                    artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
+                    data=element_tree_in_prompt.encode("utf-8"),
+                ),
+                return_exceptions=True,
             )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_CSS_MAP,
-                data=json.dumps(scraped_page.id_to_css_dict, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_ID_FRAME_MAP,
-                data=json.dumps(scraped_page.id_to_frame_dict, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE,
-                data=json.dumps(scraped_page.element_tree, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_TRIMMED,
-                data=json.dumps(scraped_page.element_tree_trimmed, indent=2).encode("utf-8"),
-            )
-            await app.ARTIFACT_MANAGER.create_artifact(
-                step=step,
-                artifact_type=ArtifactType.VISIBLE_ELEMENTS_TREE_IN_PROMPT,
-                data=element_tree_in_prompt.encode("utf-8"),
-            )
+            failures = [
+                (artifact_type, result)
+                for artifact_type, result in zip(scrape_artifact_types, results, strict=True)
+                if isinstance(result, BaseException)
+            ]
+            for artifact_type, exc in failures:
+                LOG.error(
+                    "Failed to persist scrape artifact",
+                    artifact_type=artifact_type,
+                    step_id=step.step_id,
+                    task_id=task.task_id,
+                    step_order=step.order,
+                    step_retry=step.retry_index,
+                    error=str(exc),
+                )
+            if failures:
+                raise failures[0][1]
 
     def _build_element_tree_for_prompt(
         self,
@@ -5729,11 +5814,10 @@ class ForgeAgent:
         )
 
     @staticmethod
-    async def create_extract_action(task: Task, step: Step, scraped_page: ScrapedPage) -> ExtractAction:
+    async def _fetch_data_extraction_summary_response(task: Task, step: Step) -> dict[str, Any]:
         context = skyvern_context.ensure_context()
         local_datetime_str = datetime.now(context.tz_info).isoformat()
         capped_schema = truncate_extraction_schema(task.extracted_information_schema)
-        # generate reasoning by prompt llm to think briefly what data to extract
         summary_kwargs: dict[str, Any] = {
             "data_extraction_goal": task.data_extraction_goal,
             "data_extraction_schema": capped_schema,
@@ -5747,25 +5831,11 @@ class ForgeAgent:
             kwargs=summary_kwargs,
         )
 
-        # Cache the summary LLM call — the inputs (goal, schema) are identical
-        # across loop iterations that share an extraction configuration, even
-        # when each iteration navigates to a different URL. The `try` is
-        # narrowed to just compute_cache_key + lookup so a downstream log
-        # failure can't double-count as a lookup_error.
         workflow_run_id = context.workflow_run_id if context else None
-        # task.workflow_permanent_id is unset on most fetch paths — fall back to context.
         wpid_for_cache = task.workflow_permanent_id or (context.workflow_permanent_id if context else None)
         cache_key: str | None = None
         lookup_result: extraction_cache.LookupResult | None = None
         try:
-            # data-extraction-summary plans *what* will be extracted from
-            # goal + schema; only those inputs, plus the date (via datetime),
-            # affect the rendered prompt, so everything else is intentionally
-            # omitted. Hash the post-ceiling value for `data_extraction_schema`
-            # — when the rendered prompt exceeds PROMPT_HARD_CEILING_TOKENS the
-            # ceiling drops that field to None, so two oversized-schema requests
-            # that both get dropped produce an identical LLM prompt and must
-            # share a cache key.
             cache_key = extraction_cache.compute_cache_key(
                 call_path="agent",
                 data_extraction_goal=task.data_extraction_goal,
@@ -5786,8 +5856,6 @@ class ForgeAgent:
                 cache_path="agent",
                 exc_info=True,
             )
-            # Preserve cache_key so the store() below can still warm the cache
-            # for subsequent identical calls even when lookup() fails transiently.
 
         if lookup_result is not None and lookup_result.hit and isinstance(lookup_result.value, dict):
             LOG.info(
@@ -5811,8 +5879,6 @@ class ForgeAgent:
                     cache_path="agent",
                 )
             elif lookup_result is not None:
-                # Genuine miss only — non-dict hits are logged as a warning above and
-                # must NOT also emit a miss log (would double-count in Datadog).
                 LOG.info(
                     "data-extraction-summary cache miss",
                     workflow_run_id=workflow_run_id,
@@ -5912,6 +5978,27 @@ class ForgeAgent:
                 "data_extraction_summary_resp unexpectedly None after cache/LLM block "
                 f"(workflow_run_id={workflow_run_id!r}, cache_key={cache_key!r})"
             )
+        return data_extraction_summary_resp
+
+    @staticmethod
+    async def create_extract_action(
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None,
+    ) -> ExtractAction:
+        if prefetched_summary_task is not None:
+            try:
+                data_extraction_summary_resp = await prefetched_summary_task
+            except Exception as exc:
+                LOG.warning(
+                    "Prefetched extraction summary failed, falling back to inline call",
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+                data_extraction_summary_resp = await ForgeAgent._fetch_data_extraction_summary_response(task, step)
+        else:
+            data_extraction_summary_resp = await ForgeAgent._fetch_data_extraction_summary_response(task, step)
         return ExtractAction(
             reasoning=data_extraction_summary_resp.get("summary", "Extracting information from the page"),
             data_extraction_goal=task.data_extraction_goal,

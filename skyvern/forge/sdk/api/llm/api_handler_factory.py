@@ -765,13 +765,28 @@ class LLMAPIHandlerFactory:
         else:
             fallback_groups = list(llm_config.fallback_model_group)
 
+        # Emit one fallbacks entry per non-terminal hop so secondary entry points
+        # (e.g. truncation retry that calls router.acompletion(model=fallback_groups[0]))
+        # also benefit from the remaining chain. For the primary entry point
+        # this is equivalent to the legacy single-dict shape because litellm's
+        # run_async_fallback outer loop iterates either form end-to-end. SKY-10200.
+        chain = [llm_config.main_model_group, *fallback_groups]
+        fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
+
         router = litellm.Router(
             model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
-            fallbacks=([{llm_config.main_model_group: fallback_groups}] if fallback_groups else []),
+            fallbacks=fallbacks_payload,
+            # Router-level default timeout. Per litellm router precedence
+            # (litellm/router.py:_get_non_stream_timeout) this is the fallback
+            # used when neither the caller kwarg nor the per-deployment
+            # litellm_params['timeout'] is set. Setting it here (and dropping
+            # the per-call timeout kwarg below) lets per-deployment timeouts
+            # actually apply — previously the call-site value clobbered them.
+            timeout=settings.LLM_CONFIG_TIMEOUT,
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
@@ -988,11 +1003,13 @@ class LLMAPIHandlerFactory:
 
                 model_used = main_model_group
                 llm_request_json = ""
+                llm_duration_seconds = 0.0
 
                 async def _call_primary_with_vertex_cache(
                     cache_name: str,
                     cache_variant_name: str | None,
                 ) -> tuple[ModelResponse, str, str]:
+                    nonlocal llm_duration_seconds
                     if primary_model_dict is None:
                         raise ValueError("Primary router model missing configuration")
                     litellm_params = copy.deepcopy(primary_model_dict.get("litellm_params") or {})
@@ -1031,23 +1048,34 @@ class LLMAPIHandlerFactory:
                         cache_variant=cache_variant_name,
                     )
                     request_payload_json = await _log_llm_request_artifact(request_model, True)
-                    response = await litellm.acompletion(
-                        model=request_model,
-                        messages=active_messages,
-                        drop_params=True,
-                        **active_params,
-                    )
+                    _llm_call_start = time.perf_counter()
+                    try:
+                        response = await litellm.acompletion(
+                            model=request_model,
+                            messages=active_messages,
+                            drop_params=True,
+                            **active_params,
+                        )
+                    finally:
+                        llm_duration_seconds += time.perf_counter() - _llm_call_start
                     return response, request_model, request_payload_json
 
                 async def _call_router_without_cache() -> tuple[ModelResponse, str]:
+                    nonlocal llm_duration_seconds
                     request_payload_json = await _log_llm_request_artifact(llm_key, False)
-                    response = await router.acompletion(
-                        model=main_model_group,
-                        messages=messages,
-                        timeout=settings.LLM_CONFIG_TIMEOUT,
-                        drop_params=True,
-                        **parameters,
-                    )
+                    _llm_call_start = time.perf_counter()
+                    try:
+                        # No timeout= kwarg: per-deployment litellm_params['timeout']
+                        # wins, falling through to the Router-level default for
+                        # deployments without an explicit value. See SKY-10200.
+                        response = await router.acompletion(
+                            model=main_model_group,
+                            messages=messages,
+                            drop_params=True,
+                            **parameters,
+                        )
+                    finally:
+                        llm_duration_seconds += time.perf_counter() - _llm_call_start
                     return response, request_payload_json
 
                 try:
@@ -1103,13 +1131,18 @@ class LLMAPIHandlerFactory:
                         fallback_params = {
                             k: v for k, v in parameters.items() if k not in ("max_completion_tokens", "max_tokens")
                         }
-                        response = await router.acompletion(
-                            model=fallback_model,
-                            messages=messages,
-                            timeout=settings.LLM_CONFIG_TIMEOUT,
-                            drop_params=True,
-                            **fallback_params,
-                        )
+                        _llm_call_start = time.perf_counter()
+                        try:
+                            # No timeout= kwarg here either; see SKY-10200 note on
+                            # the primary call site above.
+                            response = await router.acompletion(
+                                model=fallback_model,
+                                messages=messages,
+                                drop_params=True,
+                                **fallback_params,
+                            )
+                        finally:
+                            llm_duration_seconds += time.perf_counter() - _llm_call_start
                         model_used = response.model or fallback_model
                         if is_truncated_response(response):
                             _fb_usage = response.usage if hasattr(response, "usage") and response.usage else None
@@ -1328,6 +1361,7 @@ class LLMAPIHandlerFactory:
                     model=model_used,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
+                    llm_duration_seconds=llm_duration_seconds,
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
@@ -1669,6 +1703,7 @@ class LLMAPIHandlerFactory:
                         LOG.warning("Could not find static prompt to strip from cached request")
 
                 t_llm_request = time.perf_counter()
+                llm_duration_seconds = 0.0
                 try:
                     # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                     # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
@@ -1678,6 +1713,7 @@ class LLMAPIHandlerFactory:
                         drop_params=True,  # Drop unsupported parameters gracefully
                         **active_parameters,
                     )
+                    llm_duration_seconds = time.perf_counter() - t_llm_request
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
@@ -1866,6 +1902,7 @@ class LLMAPIHandlerFactory:
                     prompt_name=prompt_name,
                     model=llm_config.model_name,
                     duration_seconds=duration_seconds,
+                    llm_duration_seconds=llm_duration_seconds,
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
@@ -2226,6 +2263,7 @@ class LLMCaller:
                     )
 
             t_llm_request = time.perf_counter()
+            llm_duration_seconds = 0.0
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
@@ -2234,6 +2272,7 @@ class LLMCaller:
                     tools=tools,
                     **active_parameters,
                 )
+                llm_duration_seconds = time.perf_counter() - t_llm_request
                 if use_message_history:
                     # only update message_history when the request is successful
                     self.message_history = messages
@@ -2337,6 +2376,7 @@ class LLMCaller:
                 prompt_name=prompt_name,
                 model=self.llm_config.model_name,
                 duration_seconds=duration_seconds,
+                llm_duration_seconds=llm_duration_seconds,
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,

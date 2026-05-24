@@ -144,6 +144,9 @@ function getWorkflowElements(version: WorkflowVersion) {
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,
+    cdpConnectHeaders: version.cdp_connect_headers
+      ? JSON.stringify(version.cdp_connect_headers)
+      : null,
     runWith: version.run_with ?? "agent",
     codeVersion: version.code_version ?? null,
     scriptCacheKey: version.cache_key,
@@ -221,6 +224,12 @@ function WorkflowComparisonRenderer({
   );
   const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
 
+  // useNodesState only reads its initial argument; re-sync when colored nodes
+  // change so "modified" highlights show up after blockColors settles.
+  useEffect(() => {
+    setNodes(coloredNodes as AppNode[]);
+  }, [coloredNodes, setNodes]);
+
   const handleNodesChange = useCallback(
     (changes: NodeChange<AppNode>[]) => {
       onNodesChange(changes);
@@ -239,7 +248,7 @@ function WorkflowComparisonRenderer({
     <div className="h-full w-full rounded-lg border bg-white">
       <FlowRenderer
         hideBackground={false}
-        hideControls={true}
+        readOnly
         nodes={nodes}
         edges={edges}
         setNodes={setNodes}

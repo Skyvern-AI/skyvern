@@ -130,6 +130,7 @@ from skyvern.schemas.workflows import (
 from skyvern.services import script_service, workflow_script_service
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
+from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
@@ -348,6 +349,69 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
                     queue.append(item)
 
     return workflow_dict
+
+
+def v3_script_review_cap_key(workflow_permanent_id: str) -> str:
+    """Build the Redis key for the v3 daily script-review counter.
+
+    Module-level (not instance) so the mint-audit trigger in
+    ``workflow_script_service.py:_log_mint_audit_findings`` can read the
+    cap without holding a ``WorkflowService`` instance.
+    """
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    return f"script_review_counter:v3:{workflow_permanent_id}:{today}"
+
+
+async def peek_script_review_cap_v3(
+    workflow_permanent_id: str,
+    organization_id: str | None = None,
+    *,
+    fail_closed: bool = False,
+) -> bool:
+    """Read-only check of the v3 daily cap. Returns True if cap exceeded.
+
+    Pass ``fail_closed=True`` (used by the mint-audit trigger) to treat
+    cache unavailability as "cap exceeded" so a Redis outage doesn't
+    cause LLM-cost runaway. The default ``fail_closed=False`` matches
+    the legacy post-run helper's behavior — cache errors fall through
+    and let the review proceed.
+    """
+    try:
+        cache = CacheFactory.get_cache()
+        if cache is None:
+            return fail_closed
+        cap_key = v3_script_review_cap_key(workflow_permanent_id)
+        raw_count = await cache.get(cap_key)
+        if raw_count is None:
+            return False
+        # Fetch cap (same PostHog lookup the instance method uses).
+        default_cap: int = settings.SCRIPT_REVIEW_DAILY_CAP
+        cap = default_cap
+        if organization_id and app.EXPERIMENTATION_PROVIDER:
+            try:
+                payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
+                    "script_review_daily_cap",
+                    organization_id,
+                    properties={"organization_id": organization_id},
+                )
+                if payload is not None:
+                    custom_cap = int(payload)
+                    if custom_cap > 0:
+                        cap = custom_cap
+            except Exception:
+                LOG.debug(
+                    "Failed to fetch script_review_daily_cap from PostHog, using default",
+                    organization_id=organization_id,
+                    exc_info=True,
+                )
+        return int(raw_count) >= cap
+    except Exception:
+        LOG.debug(
+            "Failed to check v3 script review cap",
+            workflow_permanent_id=workflow_permanent_id,
+            exc_info=True,
+        )
+        return fail_closed
 
 
 class WorkflowService:
@@ -678,22 +742,14 @@ class WorkflowService:
             )
             download_id_set = set(download_ids)
             for artifact in artifacts:
-                url = app.ARTIFACT_MANAGER.build_signed_content_url(
-                    artifact_id=artifact.artifact_id,
-                    artifact_name=artifact.bundle_key,
-                    artifact_type=artifact.artifact_type,
-                    expiry_seconds=expiry_seconds,
-                )
+                url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
+                if url is None:
+                    continue
                 url_map[artifact.artifact_id] = url
                 if artifact.artifact_id in download_id_set:
                     filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
                     fileinfo_map[artifact.artifact_id] = FileInfo(
-                        url=app.ARTIFACT_MANAGER.build_signed_content_url(
-                            artifact_id=artifact.artifact_id,
-                            artifact_name=filename,
-                            artifact_type=artifact.artifact_type,
-                            expiry_seconds=expiry_seconds,
-                        ),
+                        url=url,
                         checksum=artifact.checksum,
                         filename=filename,
                         file_size=artifact.file_size,
@@ -902,6 +958,13 @@ class WorkflowService:
                 and workflow.browser_profile_id is not None
             ):
                 workflow_request.browser_profile_id = workflow.browser_profile_id
+            if workflow_request.cdp_connect_headers is None:
+                if workflow.cdp_connect_headers is not None:
+                    workflow_request.cdp_connect_headers = workflow.cdp_connect_headers
+            else:
+                workflow_request.cdp_connect_headers = merge_masked_headers(
+                    workflow_request.cdp_connect_headers, workflow.cdp_connect_headers
+                )
             if workflow_request.run_with is None:
                 workflow_request.run_with = workflow.run_with
 
@@ -1323,6 +1386,7 @@ class WorkflowService:
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
+        workflow_override: Workflow | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -1344,7 +1408,9 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        workflow = workflow_override or await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_run.workflow_permanent_id
+        )
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
@@ -3503,6 +3569,7 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
@@ -3534,6 +3601,7 @@ class WorkflowService:
                 is_saved_task=is_saved_task,
                 status=status,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 cache_key=cache_key,
                 ai_fallback=True if ai_fallback is None else ai_fallback,
@@ -3561,6 +3629,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
         status: WorkflowStatus = WorkflowStatus.auto_generated,
@@ -3701,6 +3770,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
@@ -3913,6 +3983,7 @@ class WorkflowService:
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
+        cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
@@ -3935,6 +4006,7 @@ class WorkflowService:
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
@@ -3958,6 +4030,7 @@ class WorkflowService:
             model=model,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
             ai_fallback=ai_fallback,
             cache_key=cache_key,
@@ -4307,6 +4380,7 @@ class WorkflowService:
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
             extra_http_headers=workflow_request.extra_http_headers,
+            cdp_connect_headers=workflow_request.cdp_connect_headers,
             browser_address=workflow_request.browser_address,
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
@@ -5200,27 +5274,12 @@ class WorkflowService:
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
         total_steps = None
-        total_cost = None
         if include_step_count or include_cost:
-            if include_cost:
-                # step counts and block list are independent — fetch in parallel.
-                (step_count, completed_step_count), workflow_run_blocks = await asyncio.gather(
-                    app.DATABASE.tasks.get_step_counts_by_task_ids(
-                        task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                    ),
-                    app.DATABASE.observer.get_workflow_run_blocks(
-                        workflow_run_id=workflow_run_id, organization_id=organization_id
-                    ),
-                )
-                text_prompt_blocks = [
-                    block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
-                ]
-                # This is a temporary cost calculation.
-                total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
-            else:
-                step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                    task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                )
+            # `include_cost` is retained as a legacy alias for callers that
+            # previously received `total_steps` alongside deprecated cost data.
+            step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+            )
             total_steps = step_count
 
         return WorkflowRunResponseBase(
@@ -5235,6 +5294,7 @@ class WorkflowService:
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             queued_at=workflow_run.queued_at,
             started_at=workflow_run.started_at,
             finished_at=workflow_run.finished_at,
@@ -5249,7 +5309,9 @@ class WorkflowService:
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
-            total_cost=total_cost,
+            total_cost=None,
+            credits_used=workflow_run.credits_used,
+            cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
@@ -5258,6 +5320,7 @@ class WorkflowService:
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
+            script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
         )
 
@@ -5788,6 +5851,17 @@ class WorkflowService:
             if existing_latest_workflow:
                 existing_version = existing_latest_workflow.version
 
+                # Missing field inherits the stored dict; an explicit dict (possibly
+                # with mask sentinels for unedited keys) is resolved entry-by-entry
+                # against the stored value so newly-added keys aren't dropped.
+                if request.cdp_connect_headers is None:
+                    effective_cdp_connect_headers = existing_latest_workflow.cdp_connect_headers
+                else:
+                    effective_cdp_connect_headers = merge_masked_headers(
+                        request.cdp_connect_headers,
+                        existing_latest_workflow.cdp_connect_headers,
+                    )
+
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5803,6 +5877,7 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
+                    cdp_connect_headers=effective_cdp_connect_headers,
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -5822,6 +5897,10 @@ class WorkflowService:
                     edited_by=edited_by,
                 )
             else:
+                # No existing workflow to inherit from; merge_masked_headers drops
+                # any keys whose value is the mask sentinel so we never persist the
+                # literal "***" placeholder from a misbehaving client.
+                new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5837,6 +5916,7 @@ class WorkflowService:
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
                     extra_http_headers=request.extra_http_headers,
+                    cdp_connect_headers=new_cdp_connect_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
@@ -5914,6 +5994,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
@@ -5931,6 +6012,7 @@ class WorkflowService:
             status=status,
             max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
@@ -6447,9 +6529,22 @@ class WorkflowService:
 
     @staticmethod
     def _script_review_cap_key(workflow_permanent_id: str) -> str:
-        """Build the Redis key for the daily script-review counter."""
+        """Build the Redis key for the daily script-review counter (v2 cohort)."""
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
+
+    @staticmethod
+    def _v3_script_review_cap_key(workflow_permanent_id: str) -> str:
+        """Build the Redis key for the daily script-review counter (v3 cohort).
+
+        Separate from the v2 key so cohort comparisons stay clean and v3
+        traffic doesn't contaminate v2's counter. Thin wrapper around the
+        module-level ``v3_script_review_cap_key`` so non-WorkflowService
+        callers (e.g. the mint-audit trigger in workflow_script_service.py)
+        can reach the same key construction without holding an instance
+        reference.
+        """
+        return v3_script_review_cap_key(workflow_permanent_id)
 
     async def _get_script_review_cap(self, organization_id: str | None) -> int:
         """Return the effective daily script-review cap for an organization.
@@ -6495,16 +6590,28 @@ class WorkflowService:
         return default_cap
 
     async def _check_script_review_cap(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
-        """Check if the daily script-review cap has been reached for this wpid.
+        """Check if the daily script-review cap has been reached for this wpid (v2 cohort).
 
         Returns True if the cap is exceeded and the review should be skipped.
         Uses Redis get/set to maintain a per-wpid daily counter.
         """
+        return await self._check_review_cap_for_key(
+            cap_key=self._script_review_cap_key(workflow_permanent_id),
+            organization_id=organization_id,
+        )
+
+    async def _check_script_review_cap_v3(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
+        """v3 cohort mirror of ``_check_script_review_cap`` reading the v3 key."""
+        return await self._check_review_cap_for_key(
+            cap_key=self._v3_script_review_cap_key(workflow_permanent_id),
+            organization_id=organization_id,
+        )
+
+    async def _check_review_cap_for_key(self, cap_key: str, organization_id: str | None) -> bool:
         try:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return False
-            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             if raw_count is not None:
                 count = int(raw_count)
@@ -6512,11 +6619,11 @@ class WorkflowService:
                 if count >= cap:
                     return True
         except Exception:
-            LOG.debug("Failed to check script review cap, allowing review", exc_info=True)
+            LOG.debug("Failed to check script review cap, allowing review", cap_key=cap_key, exc_info=True)
         return False
 
     async def _increment_script_review_counter(self, workflow_permanent_id: str) -> None:
-        """Increment the daily script-review counter for this wpid.
+        """Increment the daily script-review counter for this wpid (v2 cohort).
 
         Uses Redis get+set with a 48-hour TTL (covers timezone edge cases).
         Note: get+set is not atomic, so concurrent reviews for the same wpid
@@ -6525,16 +6632,72 @@ class WorkflowService:
         Acceptable because the cap is a spam guard, not a hard limit, and the
         repo restricts Redis to get/set/lock only.
         """
+        await self._increment_review_counter_for_key(self._script_review_cap_key(workflow_permanent_id))
+
+    async def _increment_script_review_counter_v3(self, workflow_permanent_id: str) -> None:
+        """v3 cohort mirror of ``_increment_script_review_counter`` writing v3 key.
+
+        Used post-dispatch in ``_trigger_script_reviewer`` after a successful
+        v3 cohort review. Separating from v2 lets us compare cohort counters
+        cleanly.
+        """
+        await self._increment_review_counter_for_key(self._v3_script_review_cap_key(workflow_permanent_id))
+
+    async def _increment_review_counter_for_key(self, cap_key: str) -> None:
         try:
             cache = CacheFactory.get_cache()
             if cache is None:
                 return
-            cap_key = self._script_review_cap_key(workflow_permanent_id)
             raw_count = await cache.get(cap_key)
             new_count = (int(raw_count) + 1) if raw_count is not None else 1
             await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
         except Exception:
-            LOG.debug("Failed to increment script review counter", exc_info=True)
+            LOG.debug("Failed to increment script review counter", cap_key=cap_key, exc_info=True)
+
+    async def _check_and_increment_cap_v3(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str | None = None,
+    ) -> int | None:
+        """Atomic check-and-increment for the v3 daily cap counter.
+
+        v3 persist skills (``persist_block_edit``, ``persist_script_rewrite``) call
+        this instead of the separate ``_check_script_review_cap`` +
+        ``_increment_script_review_counter`` pattern. A wpid-level Redis lock wraps
+        the get-check-set sequence, so concurrent v3 persists across different
+        script_ids (same wpid) serialize through it — fixes the race documented on
+        the v2 helpers.
+
+        Returns:
+            - the new counter value (1-based) on success, i.e. cap NOT exceeded.
+            - ``None`` if the cap is exceeded OR if cache is unavailable (caller
+              should treat ``None`` the same as cap-exceeded; fail closed).
+
+        Uses only the allowed Redis primitives: ``get`` / ``set`` / ``get_lock``;
+        no INCR/DECR.
+
+        v2 helpers above are intentionally unchanged; fixing v2's latent race is
+        out of scope for this PR.
+        """
+        try:
+            cache = CacheFactory.get_cache()
+            if cache is None:
+                return None
+            cap = await self._get_script_review_cap(organization_id)
+            cap_key = self._v3_script_review_cap_key(workflow_permanent_id)
+            lock_name = f"v3_cap:{workflow_permanent_id}"
+            lock = cache.get_lock(lock_name, blocking_timeout=2, timeout=5)
+            async with lock:
+                raw_count = await cache.get(cap_key)
+                current = int(raw_count) if raw_count is not None else 0
+                if current >= cap:
+                    return None
+                new_count = current + 1
+                await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
+                return new_count
+        except Exception:
+            LOG.warning("v3 cap check_and_increment failed — failing closed", exc_info=True)
+            return None
 
     async def _run_reviewer_locked(
         self,

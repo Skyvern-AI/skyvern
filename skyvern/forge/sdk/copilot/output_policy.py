@@ -4,7 +4,6 @@ import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
-from urllib.parse import urlparse
 
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.output_utils import (
@@ -12,7 +11,14 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_yaml_in_chat,
 )
 from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy, contains_email_password_pair
-from skyvern.utils.yaml_loader import safe_load_no_dates
+from skyvern.forge.sdk.copilot.workflow_credential_utils import (
+    block_credential_ids,
+    credential_params,
+    parse_workflow_yaml,
+    url_origin,
+    workflow_blocks,
+    workflow_credential_origins_from_parsed,
+)
 
 WORKFLOW_PRESENT_SENTINEL = object()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
@@ -471,12 +477,18 @@ def _apply_credential_policy(
 
     approved_ids = _approved_credential_ids(request_policy)
     allowed_unresolved_ids = _allowed_unresolved_credential_ids(request_policy)
-    allowed_ids = approved_ids | allowed_unresolved_ids
+    allowed_ids = approved_ids | allowed_unresolved_ids | _existing_workflow_credential_ids(request_policy)
     if any(credential_id not in allowed_ids for credential_id in found_ids):
         verdict.add(OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
 
-    if workflow_yaml and _workflow_broadens_credential_scope(workflow_yaml, request_policy):
-        verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
+    if workflow_yaml:
+        parsed_workflow = parse_workflow_yaml(workflow_yaml)
+        if isinstance(parsed_workflow, dict):
+            proposed_origins = workflow_credential_origins_from_parsed(parsed_workflow)
+            if _workflow_broadens_credential_scope(parsed_workflow, request_policy) or (
+                _existing_workflow_broadens_credential_scope(proposed_origins, request_policy)
+            ):
+                verdict.add(OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED)
 
 
 def _approved_credential_ids(request_policy: RequestPolicy) -> set[str]:
@@ -495,6 +507,44 @@ def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str
     return ids
 
 
+def _existing_workflow_credential_ids(request_policy: RequestPolicy) -> set[str]:
+    # Saved credential IDs are issued with the cred_ prefix; skip anything else defensively.
+    return {
+        credential_id
+        for credential_id in request_policy.existing_workflow_credential_ids
+        if isinstance(credential_id, str) and credential_id.startswith("cred_")
+    }
+
+
+def _existing_workflow_broadens_credential_scope(
+    proposed_origins: dict[str, set[str]],
+    request_policy: RequestPolicy,
+) -> bool:
+    existing_ids = _existing_workflow_credential_ids(request_policy)
+    if not existing_ids:
+        return False
+
+    prior_origins = {
+        credential_id: {
+            origin for origin in origins if isinstance(origin, str) and origin.startswith(("http://", "https://"))
+        }
+        for credential_id, origins in request_policy.existing_workflow_credential_origins.items()
+        if isinstance(credential_id, str)
+    }
+    for credential_id in existing_ids:
+        new_origins = proposed_origins.get(credential_id, set())
+        if not new_origins:
+            continue
+        allowed_origins = prior_origins.get(credential_id, set())
+        if not allowed_origins:
+            # Existing workflow credentials without a known prior origin cannot
+            # safely authorize a newly introduced URL.
+            return True
+        if any(origin not in allowed_origins for origin in new_origins):
+            return True
+    return False
+
+
 def _credential_ids(value: Any) -> set[str]:
     if value is None:
         return set()
@@ -504,11 +554,7 @@ def _credential_ids(value: Any) -> set[str]:
     return found
 
 
-def _workflow_broadens_credential_scope(workflow_yaml: str, request_policy: RequestPolicy) -> bool:
-    parsed = _parse_workflow_yaml(workflow_yaml)
-    if not isinstance(parsed, dict):
-        return False
-
+def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request_policy: RequestPolicy) -> bool:
     approved_origins = _approved_origins_by_id(request_policy)
     if not approved_origins:
         # No tested_url metadata means there is no deterministic origin scope
@@ -517,24 +563,18 @@ def _workflow_broadens_credential_scope(workflow_yaml: str, request_policy: Requ
         # missing credential metadata.
         return False
 
-    workflow_definition = parsed.get("workflow_definition")
+    workflow_definition = parsed_workflow.get("workflow_definition")
     if not isinstance(workflow_definition, dict):
         return False
 
-    credential_params = _credential_params(workflow_definition.get("parameters"))
-    if not credential_params:
+    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    if not credential_params_by_key:
         return False
 
     return any(
-        _block_broadens_credential_scope(block, credential_params, approved_origins) for block in _blocks(parsed)
+        _block_broadens_credential_scope(block, credential_params_by_key, approved_origins)
+        for block in workflow_blocks(parsed_workflow)
     )
-
-
-def _parse_workflow_yaml(workflow_yaml: str) -> Any:
-    try:
-        return safe_load_no_dates(workflow_yaml)
-    except Exception:
-        return None
 
 
 def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]]:
@@ -549,64 +589,12 @@ def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]
     return origins
 
 
-def url_origin(url: str) -> str | None:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    if not parsed.netloc:
-        return None
-    # Keep scheme in the origin. http:// and https:// are different security
-    # contexts, so crossing between them is treated as scope broadening.
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
-
-
-def _credential_params(parameters: Any) -> dict[str, str]:
-    if not isinstance(parameters, list):
-        return {}
-    credential_params: dict[str, str] = {}
-    for parameter in parameters:
-        if not isinstance(parameter, dict):
-            continue
-        key = parameter.get("key")
-        if not isinstance(key, str):
-            continue
-        parameter_type = str(parameter.get("parameter_type") or "").lower()
-        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
-        if parameter_type == "credential" and isinstance(parameter.get("credential_id"), str):
-            credential_params[key] = parameter["credential_id"]
-        elif (
-            parameter_type == "workflow"
-            and workflow_parameter_type == "credential_id"
-            and isinstance(parameter.get("default_value"), str)
-        ):
-            credential_params[key] = parameter["default_value"]
-    return credential_params
-
-
-def _blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
-        return []
-
-    collected: list[dict[str, Any]] = []
-
-    def visit(blocks: Any) -> None:
-        if not isinstance(blocks, list):
-            return
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            collected.append(block)
-            visit(block.get("loop_blocks"))
-
-    visit(workflow_definition.get("blocks"))
-    return collected
-
-
 def _block_broadens_credential_scope(
     block: dict[str, Any],
-    credential_params: dict[str, str],
+    credential_params_by_key: dict[str, str],
     approved_origins: dict[str, set[str]],
 ) -> bool:
-    credential_ids = _block_credential_ids(block, credential_params)
+    credential_ids = block_credential_ids(block, credential_params_by_key)
     if not credential_ids:
         return False
 
@@ -622,16 +610,3 @@ def _block_broadens_credential_scope(
         if allowed_origins and origin not in allowed_origins:
             return True
     return False
-
-
-def _block_credential_ids(block: dict[str, Any], credential_params: dict[str, str]) -> set[str]:
-    credential_ids: set[str] = set()
-    parameter_keys = block.get("parameter_keys")
-    if isinstance(parameter_keys, list):
-        for key in parameter_keys:
-            if isinstance(key, str) and key in credential_params:
-                credential_ids.add(credential_params[key])
-    direct_credential_id = block.get("credential_id")
-    if isinstance(direct_credential_id, str):
-        credential_ids.add(direct_credential_id)
-    return credential_ids

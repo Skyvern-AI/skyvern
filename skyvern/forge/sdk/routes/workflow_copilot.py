@@ -11,6 +11,7 @@ from typing import Any, Iterator
 import structlog
 import yaml
 from fastapi import Depends, HTTPException, Request, status
+from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 
@@ -27,6 +28,12 @@ from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
+from skyvern.forge.sdk.copilot.recoverable_failure import (
+    RecoverableFailure,
+    build_recoverable_failure,
+    format_recoverable_failure_reply,
+    merge_failure_into_context,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
@@ -254,13 +261,17 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
 
 
 def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
+    if agent_result is None:
+        return "no_proposal"
     disposition = getattr(agent_result, "proposal_disposition", None)
-    if disposition in ("auto_applicable", "review_untested", "review_tested"):
+    if disposition in ("no_proposal", "auto_applicable", "review_untested", "review_tested"):
         return disposition
     if getattr(agent_result, "unvalidated", False) is True:
         return "review_untested"
     if getattr(agent_result, "force_review", False) is True:
         return "review_tested"
+    if getattr(agent_result, "updated_workflow", None) is None:
+        return "no_proposal"
     return "auto_applicable"
 
 
@@ -288,6 +299,41 @@ def _should_restore_persisted_workflow(auto_accept: bool | None, agent_result: o
     return not _effective_auto_accept(auto_accept, agent_result)
 
 
+def _record_recoverable_failure_span_attrs(
+    failure: RecoverableFailure,
+    *,
+    proposal_disposition: ProposalDisposition,
+) -> None:
+    current_span = otel_trace.get_current_span()
+    current_span.set_attribute("copilot.error_recovered", True)
+    current_span.set_attribute("copilot.error_failure_kind", failure.failure_kind)
+    current_span.set_attribute("copilot.error_id", failure.internal_error_id)
+    if failure.exception_type:
+        current_span.set_attribute("copilot.error_exception_type", failure.exception_type)
+    current_span.set_attribute("copilot.error_workflow_modified", failure.workflow_modified)
+    current_span.set_attribute("copilot.error_reply_proposal_disposition", proposal_disposition)
+
+
+def _build_recoverable_route_agent_result(
+    error: BaseException,
+    *,
+    workflow_modified: bool,
+    clear_proposed_workflow: bool,
+    global_llm_context: str | None,
+) -> tuple[AgentResult, RecoverableFailure]:
+    failure = build_recoverable_failure(error, workflow_modified=workflow_modified)
+    agent_result = AgentResult(
+        user_response=format_recoverable_failure_reply(failure),
+        updated_workflow=None,
+        global_llm_context=merge_failure_into_context(global_llm_context, failure),
+        workflow_was_persisted=False,
+        proposal_disposition="no_proposal",
+        clear_proposed_workflow=clear_proposed_workflow,
+    )
+    _record_recoverable_failure_span_attrs(failure, proposal_disposition="no_proposal")
+    return agent_result, failure
+
+
 async def _clear_proposed_workflow(chat: Any) -> None:
     await app.DATABASE.workflow_params.update_workflow_copilot_chat(
         organization_id=chat.organization_id,
@@ -303,6 +349,11 @@ def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: Agen
     if _proposal_disposition(agent_result) == "review_untested":
         proposed_data["_copilot_unvalidated"] = True
     return proposed_data
+
+
+def _output_policy_blocked_final_response(agent_result: AgentResult) -> bool:
+    diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
+    return isinstance(diagnostics, dict) and diagnostics.get("final_output_policy_allowed") is False
 
 
 async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult, restored: bool) -> None:
@@ -321,9 +372,14 @@ async def _persist_proposed_workflow_state(chat: Any, agent_result: AgentResult,
         # auto-accept toggle.
         await _clear_proposed_workflow(chat)
     elif (
-        auto_accept_effective
+        # This intentionally checks the raw setting, not
+        # ``auto_accept_effective``: no-proposal OutputPolicy blocks are not
+        # auto-applicable, but ordinary auto-accept turns still need to clear a
+        # stale unvalidated card because the UI has no review panel for it.
+        chat.auto_accept is True
         and chat.proposed_workflow is not None
         and chat.proposed_workflow.get("_copilot_unvalidated") is True
+        and not _output_policy_blocked_final_response(agent_result)
     ):
         # The leftover unvalidated proposal is no longer attached to the chat
         # tail; clear it so reload doesn't resurrect a stale Accept/Reject card.
@@ -1301,6 +1357,7 @@ async def _new_copilot_chat_post(
         original_workflow: Workflow | None = None
         chat = None
         agent_result: AgentResult | None = None
+        global_llm_context: str | None = None
         terminal_frame_emitted = False
         cancel_watcher: asyncio.Task[None] | None = None
         # Single-element list used as a closure flag (mutable bool by reference).
@@ -1339,7 +1396,6 @@ async def _new_copilot_chat_post(
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             )
-            global_llm_context = None
             for message in reversed(chat_messages):
                 if message.global_llm_context is not None:
                     global_llm_context = message.global_llm_context
@@ -1513,21 +1569,51 @@ async def _new_copilot_chat_post(
                 )
             )
         except LLMProviderError as exc:
-            if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+            if restored:
                 await _restore_workflow_definition(original_workflow, organization.organization_id)
-            LOG.error(
-                "LLM provider error (copilot v2)",
-                organization_id=organization.organization_id,
-                error=str(exc),
-                exc_info=True,
-            )
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamErrorUpdate(
-                    type=WorkflowCopilotStreamMessageType.ERROR,
-                    error="Failed to process your request. Please try again.",
+            if chat is not None:
+                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
+                recovered_result, failure = _build_recoverable_route_agent_result(
+                    exc,
+                    workflow_modified=workflow_modified,
+                    clear_proposed_workflow=restored or workflow_modified,
+                    global_llm_context=global_llm_context,
                 )
-            )
+                LOG.error(
+                    "LLM provider error translated to recoverable workflow copilot v2 reply",
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    failure_kind=failure.failure_kind,
+                    internal_error_id=failure.internal_error_id,
+                    exception_type=failure.exception_type,
+                    exc_info=True,
+                )
+                await asyncio.shield(
+                    _finalise_normal_turn(
+                        stream=stream,
+                        chat=chat,
+                        organization_id=organization.organization_id,
+                        original_workflow=original_workflow,
+                        chat_request=chat_request,
+                        agent_result=recovered_result,
+                    )
+                )
+                terminal_frame_emitted = True
+            else:
+                LOG.error(
+                    "LLM provider error (copilot v2)",
+                    organization_id=organization.organization_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                terminal_frame_emitted = True
+                await stream.send(
+                    WorkflowCopilotStreamErrorUpdate(
+                        type=WorkflowCopilotStreamMessageType.ERROR,
+                        error="Failed to process your request. Please try again.",
+                    )
+                )
         except asyncio.CancelledError:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                 await asyncio.shield(_restore_workflow_definition(original_workflow, organization.organization_id))
@@ -1564,21 +1650,51 @@ async def _new_copilot_chat_post(
                 )
                 raise
         except Exception as exc:
-            if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
+            restored = chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result)
+            if restored:
                 await _restore_workflow_definition(original_workflow, organization.organization_id)
-            LOG.error(
-                "Unexpected error in workflow copilot v2",
-                organization_id=organization.organization_id,
-                error=str(exc),
-                exc_info=True,
-            )
-            terminal_frame_emitted = True
-            await stream.send(
-                WorkflowCopilotStreamErrorUpdate(
-                    type=WorkflowCopilotStreamMessageType.ERROR,
-                    error="An error occurred. Please try again.",
+            if chat is not None:
+                workflow_modified = bool(getattr(agent_result, "workflow_was_persisted", False)) and not restored
+                recovered_result, failure = _build_recoverable_route_agent_result(
+                    exc,
+                    workflow_modified=workflow_modified,
+                    clear_proposed_workflow=restored or workflow_modified,
+                    global_llm_context=global_llm_context,
                 )
-            )
+                LOG.error(
+                    "Unexpected workflow copilot v2 error translated to recoverable reply",
+                    organization_id=organization.organization_id,
+                    workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                    failure_kind=failure.failure_kind,
+                    internal_error_id=failure.internal_error_id,
+                    exception_type=failure.exception_type,
+                    exc_info=True,
+                )
+                await asyncio.shield(
+                    _finalise_normal_turn(
+                        stream=stream,
+                        chat=chat,
+                        organization_id=organization.organization_id,
+                        original_workflow=original_workflow,
+                        chat_request=chat_request,
+                        agent_result=recovered_result,
+                    )
+                )
+                terminal_frame_emitted = True
+            else:
+                LOG.error(
+                    "Unexpected error in workflow copilot v2",
+                    organization_id=organization.organization_id,
+                    error=str(exc),
+                    exc_info=True,
+                )
+                terminal_frame_emitted = True
+                await stream.send(
+                    WorkflowCopilotStreamErrorUpdate(
+                        type=WorkflowCopilotStreamMessageType.ERROR,
+                        error="An error occurred. Please try again.",
+                    )
+                )
         finally:
             if cancel_watcher is not None and not cancel_watcher.done():
                 cancel_watcher.cancel()

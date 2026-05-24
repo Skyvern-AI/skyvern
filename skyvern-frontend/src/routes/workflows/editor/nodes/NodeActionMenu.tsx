@@ -8,11 +8,18 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useRecordingStore } from "@/store/useRecordingStore";
 
 type Props = {
   isDeletable?: boolean;
   isScriptable?: boolean;
+  isCanvasLocked?: boolean;
   showScriptText?: string;
   onDelete?: () => void;
   onShowScript?: () => void;
@@ -21,16 +28,38 @@ type Props = {
 function NodeActionMenu({
   isDeletable = true,
   isScriptable = false,
+  isCanvasLocked = false,
   showScriptText,
   onDelete,
   onShowScript,
 }: Props) {
   const recordingStore = useRecordingStore();
   const isRecording = recordingStore.isRecording;
+  const deleteGated = isRecording || isCanvasLocked;
+  const deleteGateReason = isRecording
+    ? "Stop recording to delete blocks"
+    : isCanvasLocked
+      ? "Unlock canvas to delete blocks"
+      : null;
 
   if (!isDeletable && !isScriptable) {
     return null;
   }
+
+  const deleteItem = isDeletable ? (
+    <DropdownMenuItem
+      disabled={deleteGated}
+      onSelect={(event) => {
+        if (deleteGated) {
+          event.preventDefault();
+          return;
+        }
+        onDelete?.();
+      }}
+    >
+      Delete Block
+    </DropdownMenuItem>
+  ) : null;
 
   return (
     <DropdownMenu modal={false}>
@@ -40,15 +69,17 @@ function NodeActionMenu({
       <DropdownMenuContent>
         <DropdownMenuLabel>Block Actions</DropdownMenuLabel>
         <DropdownMenuSeparator />
-        {isDeletable && (
-          <DropdownMenuItem
-            disabled={isRecording}
-            onSelect={() => {
-              onDelete?.();
-            }}
-          >
-            Delete Block
-          </DropdownMenuItem>
+        {deleteItem && deleteGated && deleteGateReason ? (
+          <TooltipProvider delayDuration={200}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="block">{deleteItem}</span>
+              </TooltipTrigger>
+              <TooltipContent side="left">{deleteGateReason}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        ) : (
+          deleteItem
         )}
         {isScriptable && onShowScript && (
           <DropdownMenuItem

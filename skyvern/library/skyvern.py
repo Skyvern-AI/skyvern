@@ -97,6 +97,7 @@ class Skyvern(AsyncSkyvern):
         api_key: str,
         environment: SkyvernEnvironment = SkyvernEnvironment.CLOUD,
         base_url: str | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = True,
         httpx_client: httpx.AsyncClient | None = None,
@@ -111,6 +112,7 @@ class Skyvern(AsyncSkyvern):
                 instances. Defaults to SkyvernEnvironment.CLOUD.
             base_url: Override the base URL for the Skyvern API. If not provided, uses the default URL for
                 the specified environment.
+            headers: Additional headers to send with every API request.
             timeout: Timeout in seconds for API requests. If not provided, uses the default timeout.
             follow_redirects: Whether to automatically follow HTTP redirects. Defaults to True.
             httpx_client: Custom httpx AsyncClient for making API requests.
@@ -120,6 +122,7 @@ class Skyvern(AsyncSkyvern):
             base_url=base_url,
             environment=environment,
             api_key=api_key,
+            headers=headers,
             timeout=timeout,
             follow_redirects=follow_redirects,
             httpx_client=httpx_client,

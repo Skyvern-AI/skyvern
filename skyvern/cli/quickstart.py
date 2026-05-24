@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import importlib.metadata
+import re
+import shutil
 import subprocess
 import sys
 from enum import Enum
@@ -556,6 +558,62 @@ def _configure_local_browser_streaming_defaults() -> None:
         set_key(str(frontend_env), "VITE_BROWSER_STREAMING_MODE", "cdp", quote_mode="never")
 
 
+_LOCALHOST_DB_RE = re.compile(r"^\s*(?:export\s+)?DATABASE_STRING\s*=.*@localhost[/:\"]", re.IGNORECASE)
+_COMPOSE_DATABASE_STRING = 'DATABASE_STRING="postgresql+psycopg://skyvern:skyvern@postgres/skyvern"'
+
+
+def _rewrite_localhost_db_string(content: str) -> str | None:
+    lines = content.splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        if _LOCALHOST_DB_RE.match(line):
+            lines[i] = _COMPOSE_DATABASE_STRING
+            changed = True
+    if not changed:
+        return None
+    result = "\n".join(lines)
+    if content.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _bootstrap_compose_env_files() -> None:
+    env_path = Path(".env")
+    env_example = Path(".env.example")
+
+    if not env_path.exists():
+        if env_example.exists():
+            content = env_example.read_text()
+            rewritten = _rewrite_localhost_db_string(content)
+            env_path.write_text(rewritten if rewritten is not None else content, encoding="utf-8")
+            console.print("[green]Created .env from .env.example[/green]")
+    else:
+        try:
+            content = env_path.read_text()
+        except OSError:
+            content = ""
+        rewritten = _rewrite_localhost_db_string(content)
+        if rewritten is not None:
+            console.print(
+                Panel(
+                    "[bold yellow]DATABASE_STRING pointing to localhost detected in .env.[/bold yellow]\n\n"
+                    "Docker Compose uses its own Postgres service. The connection string will be "
+                    "rewritten to point to the compose [cyan]postgres[/cyan] host.",
+                    border_style="yellow",
+                )
+            )
+            if Confirm.ask("Rewrite DATABASE_STRING for Docker Compose?", default=True):
+                env_path.write_text(rewritten, encoding="utf-8")
+                console.print("[green]Rewrote DATABASE_STRING for Docker Compose[/green]")
+
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        frontend_env.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(frontend_example, frontend_env)
+        console.print("[green]Created skyvern-frontend/.env from .env.example[/green]")
+
+
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     from skyvern.cli.llm_setup import setup_llm_providers  # noqa: PLC0415
@@ -563,6 +621,7 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
     capture_setup_event("docker-compose-start")
 
+    _bootstrap_compose_env_files()
     _handle_running_compose_stack()
     _handle_postgres_container_conflict()
 

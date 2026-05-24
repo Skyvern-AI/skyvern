@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * ```tsx
@@ -18,12 +18,30 @@ const useRerender = ({
   prefix: string;
 }) => {
   const [forceRenderKey, setForceRenderKey] = useState(0);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const delayRef = useRef(delay);
+  delayRef.current = delay;
 
-  const bump = () => {
-    setTimeout(() => {
+  const bump = useCallback(() => {
+    if (timeoutRef.current !== null) {
+      clearTimeout(timeoutRef.current);
+    }
+    timeoutRef.current = setTimeout(() => {
+      timeoutRef.current = null;
       setForceRenderKey((prev) => prev + 1);
-    }, delay);
-  };
+    }, delayRef.current);
+  }, []);
+
+  // Cancel any pending bump on unmount so the setForceRenderKey call cannot
+  // fire after the component (or its test environment) has been torn down.
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current !== null) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    };
+  }, []);
 
   return {
     bump,

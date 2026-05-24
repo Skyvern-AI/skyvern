@@ -56,6 +56,7 @@ def _make_service_with_mocks(
         proxy_location=None,
         webhook_callback_url=None,
         extra_http_headers=None,
+        cdp_connect_headers=None,
         browser_profile_id=None,
         run_with="agent",
         code_version=None,

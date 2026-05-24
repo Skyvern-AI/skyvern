@@ -405,7 +405,7 @@ def build_turn_intent(
     confidence = 0.2 if (has_workflow or has_prior_context or chat_history) else 0.0
     missing_context_question = None
 
-    if request_policy.raw_secret_detected:
+    if request_policy.raw_secret_detected and request_policy.raw_secret_handling != "redacted_draft":
         mode = TurnIntentMode.REFUSE
         expected_output = TurnIntentExpectedOutput.REFUSAL
         confidence = 0.9

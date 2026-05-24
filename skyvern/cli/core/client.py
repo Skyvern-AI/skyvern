@@ -10,6 +10,7 @@ import structlog
 
 from skyvern.client import SkyvernEnvironment
 from skyvern.config import settings
+from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.library.skyvern import Skyvern
 
 from .api_key_hash import hash_api_key_for_cache
@@ -67,6 +68,7 @@ def _build_cloud_client(api_key: str) -> Skyvern:
         api_key=api_key,
         environment=SkyvernEnvironment.CLOUD,
         base_url=base_url,
+        headers={"x-user-agent": SKYVERN_MCP_USER_AGENT},
     )
 
 
@@ -95,6 +97,11 @@ def _close_skyvern_instance_best_effort(instance: Skyvern) -> None:
 def get_active_api_key() -> str | None:
     """Return the effective API key for this request/context."""
     return _api_key_override.get() or _resolve_api_key()
+
+
+def has_api_key_override() -> bool:
+    """Return whether the current context carries a request-scoped API key."""
+    return _api_key_override.get() is not None
 
 
 def set_api_key_override(api_key: str | None) -> Token[str | None]:
