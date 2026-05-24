@@ -186,6 +186,9 @@ def _build_opencode_remote_mcp_entry(api_key: str, url: str = _DEFAULT_REMOTE_UR
 
     OpenCode auto-discovers OAuth when the field is omitted, which can fail with
     callback timeouts (see https://github.com/Skyvern-AI/skyvern/issues/6044).
+    OpenCode documents MCP server config, including `oauth: false`, at:
+    https://opencode.ai/docs/mcp-servers/
+
     """
     entry: dict = {
         "type": "remote",
