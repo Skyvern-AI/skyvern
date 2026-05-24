@@ -572,9 +572,13 @@ def _select_profile(profile_name: str | None, discovered: list[SwitchTarget]) ->
 def _entry_location(entry: dict) -> str:
     kind = _entry_kind(entry)
     if kind == "local stdio":
+    env = entry.get("environment")
+    if env is None:
         env = entry.get("env", {})
-        if isinstance(env, dict):
-            return str(env.get("SKYVERN_BASE_URL", ""))
+
+    if isinstance(env, dict):
+        return str(env.get("SKYVERN_BASE_URL", ""))
+
     if kind == "remote http":
         return str(entry.get("url", ""))
     if kind == "mcp-remote bridge":
