@@ -1640,13 +1640,21 @@ def setup_mcporter() -> None:
         try:
             if not path.exists():
                 continue
-            cfg, err = _load_mcp_config(path)
+           if name == "OpenCode":
+                cfg, err = _load_opencode_config(path)
+                servers_key = "mcp"
+            else:
+                cfg, err = _load_mcp_config(path)
+                servers_key = "mcpServers"
+
             if err or not cfg:
                 continue
-            servers = cfg.get("mcpServers", {})
+
+            servers = cfg.get(servers_key, {})
             if _find_server_key(servers, "skyvern"):
-                console.print(f"  [green]\u2713[/green] {name} \u2014 {path}")
+                console.print(f"  [green]\u2713[/green] {name} — {path}")
                 found.append(name)
+
         except Exception:
             continue
 
