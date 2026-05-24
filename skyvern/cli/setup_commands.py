@@ -413,9 +413,9 @@ def _load_openclaw_config(config_path: Path) -> tuple[dict | None, str | None]:
         return {}, None
 
     try:
-        existing = json5.loads(config_path.read_text(encoding="utf-8"))
-    except ValueError:
-        return None, f"Cannot parse {config_path}. Fix the JSON5/JSON and re-run."
+    existing = json5.loads(config_path.read_text(encoding="utf-8"))
+except ValueError:
+    return None, f"Cannot parse {config_path}. Fix the JSON/JSONC and re-run."
 
     if not isinstance(existing, dict):
         return None, f"{config_path} must contain a top-level JSON object."
