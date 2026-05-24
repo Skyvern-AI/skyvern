@@ -8,9 +8,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import yaml
 
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotNonRetriableNavError,
+    CopilotTotalTimeoutError,
+    CopilotUnrecoverableToolError,
+)
+from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_failure
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
@@ -917,6 +925,107 @@ workflow_definition:
             agent_result.user_response
         )
         assert "same IP/workflow shape" in agent_result.user_response
+
+    def test_unexpected_error_exit_names_failure_and_preserves_context(self) -> None:
+        ctx = _ctx()
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=agent_module.CopilotRequestPolicyMissingError(),
+        )
+
+        assert "An unexpected error occurred. Please try again." not in agent_result.user_response
+        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "The workflow was not modified" in agent_result.user_response
+        assert "reference cpe_" in agent_result.user_response
+        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+        assert agent_result.updated_workflow is None
+
+    def test_unexpected_error_exit_redacts_sensitive_identifiers(self) -> None:
+        ctx = _ctx(workflow_persisted=True)
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=RuntimeError("credential cred_12345 was rejected while opening https://example.com/private/path"),
+        )
+
+        assert "cred_12345" not in agent_result.user_response
+        assert "https://example.com/private/path" not in agent_result.user_response
+        assert "credential" not in agent_result.user_response.lower()
+        assert "https://example.com" not in agent_result.user_response
+        assert "Copilot hit an internal error before it could finish this turn" in agent_result.user_response
+        assert "The workflow was preserved" in agent_result.user_response
+        assert "reference cpe_" in agent_result.user_response
+
+    def test_unexpected_error_exit_does_not_persist_tool_output_preview(self) -> None:
+        ctx = _ctx()
+        ctx.tool_activity.append(
+            {
+                "tool": "get_run_results",
+                "summary": "OK",
+                "output_preview": "block_1: user@example.com password=hunter2",
+            }
+        )
+
+        agent_result = agent_module._build_unexpected_error_exit_result(
+            ctx,
+            global_llm_context=None,
+            error=RuntimeError("boom"),
+        )
+
+        assert "user@example.com" not in (agent_result.global_llm_context or "")
+        assert "hunter2" not in (agent_result.global_llm_context or "")
+        assert "copilot turn failed: unknown cpe_" in (agent_result.global_llm_context or "")
+
+    def test_recoverable_failure_maps_expected_exception_families(self) -> None:
+        assert (
+            build_recoverable_failure(
+                CopilotTotalTimeoutError(),
+                workflow_modified=False,
+                internal_error_id="cpe_timeout",
+            ).failure_kind
+            == "timeout"
+        )
+        assert (
+            build_recoverable_failure(
+                CopilotUnrecoverableToolError("click", "browser failed"),
+                workflow_modified=False,
+                internal_error_id="cpe_tool",
+            ).failure_kind
+            == "tool_call"
+        )
+        assert (
+            build_recoverable_failure(
+                yaml.YAMLError("bad yaml"),
+                workflow_modified=False,
+                internal_error_id="cpe_validation",
+            ).failure_kind
+            == "validation"
+        )
+        assert (
+            build_recoverable_failure(
+                LLMProviderError("OPENAI_GPT5_5"),
+                workflow_modified=False,
+                internal_error_id="cpe_external",
+            ).failure_kind
+            == "external_dep"
+        )
+
+    def test_recoverable_failure_uses_chained_navigation_reason(self) -> None:
+        nav_error = CopilotNonRetriableNavError("https://example.com", "net::ERR_NAME_NOT_RESOLVED")
+        wrapper = RuntimeError("wrapped")
+        wrapper.__cause__ = nav_error
+
+        failure = build_recoverable_failure(
+            wrapper,
+            workflow_modified=False,
+            internal_error_id="cpe_nav",
+        )
+
+        assert failure.failure_kind == "tool_call"
+        assert failure.reason_summary == "A browser navigation step could not reach the target URL"
 
     def test_reply_still_rewrites_after_failed_test(self) -> None:
         ctx = _ctx(

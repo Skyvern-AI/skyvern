@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 import typer
@@ -73,3 +74,115 @@ def test_quickstart_reraises_intentional_typer_exit(monkeypatch: pytest.MonkeyPa
         )
 
     assert capture_errors == []
+
+
+def test_bootstrap_creates_env_and_rewrites_localhost_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    example = tmp_path / ".env.example"
+    example.write_text('KEY=value\nDATABASE_STRING="postgresql+psycopg://skyvern@localhost/skyvern"\n')
+    monkeypatch.chdir(tmp_path)
+
+    quickstart._bootstrap_compose_env_files()
+
+    result = (tmp_path / ".env").read_text()
+    assert "localhost" not in result
+    assert "KEY=value" in result
+    assert 'DATABASE_STRING="postgresql+psycopg://skyvern:skyvern@postgres/skyvern"' in result
+
+
+def test_bootstrap_creates_env_without_db_string_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    example = tmp_path / ".env.example"
+    example.write_text("KEY=value\n")
+    monkeypatch.chdir(tmp_path)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert (tmp_path / ".env").read_text() == "KEY=value\n"
+
+
+def test_bootstrap_does_not_overwrite_existing_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".env.example").write_text("KEY=example\n")
+    existing = tmp_path / ".env"
+    existing.write_text("KEY=existing\n")
+    monkeypatch.chdir(tmp_path)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert existing.read_text() == "KEY=existing\n"
+
+
+def test_bootstrap_creates_frontend_env_from_example(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".env.example").write_text("")
+    frontend_dir = tmp_path / "skyvern-frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / ".env.example").write_text("VITE_KEY=val\n")
+    monkeypatch.chdir(tmp_path)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert (frontend_dir / ".env").read_text() == "VITE_KEY=val\n"
+
+
+def test_bootstrap_does_not_overwrite_existing_frontend_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / ".env.example").write_text("")
+    frontend_dir = tmp_path / "skyvern-frontend"
+    frontend_dir.mkdir()
+    (frontend_dir / ".env.example").write_text("VITE_KEY=example\n")
+    existing = frontend_dir / ".env"
+    existing.write_text("VITE_KEY=existing\n")
+    monkeypatch.chdir(tmp_path)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert existing.read_text() == "VITE_KEY=existing\n"
+
+
+def test_bootstrap_rewrites_localhost_db_string_when_confirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_content = 'ENABLE_OPENAI=false\nDATABASE_STRING="postgresql+psycopg://skyvern@localhost/skyvern"\nENV=local\n'
+    (tmp_path / ".env").write_text(env_content)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(quickstart.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    quickstart._bootstrap_compose_env_files()
+
+    result = (tmp_path / ".env").read_text()
+    assert "localhost" not in result
+    assert 'DATABASE_STRING="postgresql+psycopg://skyvern:skyvern@postgres/skyvern"' in result
+    assert "ENABLE_OPENAI=false" in result
+    assert "ENV=local" in result
+
+
+def test_bootstrap_rewrites_export_prefixed_db_string(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_content = 'export DATABASE_STRING="postgresql+psycopg://skyvern@localhost/skyvern"\n'
+    (tmp_path / ".env").write_text(env_content)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(quickstart.Confirm, "ask", lambda *_args, **_kwargs: True)
+
+    quickstart._bootstrap_compose_env_files()
+
+    result = (tmp_path / ".env").read_text()
+    assert "localhost" not in result
+    assert 'DATABASE_STRING="postgresql+psycopg://skyvern:skyvern@postgres/skyvern"' in result
+
+
+def test_bootstrap_keeps_localhost_db_string_when_declined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_content = 'DATABASE_STRING="postgresql+psycopg://skyvern@localhost/skyvern"\n'
+    (tmp_path / ".env").write_text(env_content)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(quickstart.Confirm, "ask", lambda *_args, **_kwargs: False)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert (tmp_path / ".env").read_text() == env_content
+
+
+def test_bootstrap_skips_rewrite_for_non_localhost_db_string(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_content = 'DATABASE_STRING="postgresql+psycopg://skyvern@postgres/skyvern"\n'
+    (tmp_path / ".env").write_text(env_content)
+    confirm_calls: list[object] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(quickstart.Confirm, "ask", lambda *args, **kwargs: confirm_calls.append(args) or True)
+
+    quickstart._bootstrap_compose_env_files()
+
+    assert confirm_calls == [], "should not prompt when DATABASE_STRING does not point to localhost"
+    assert (tmp_path / ".env").read_text() == env_content

@@ -475,3 +475,12 @@ class TaskRunListItem(BaseModel):
         endpoint's Run.script_run field.  Do not rely on dict contents here.
         """
         return bool(v)
+
+
+class BulkCancelRunsRequest(BaseModel):
+    run_ids: list[str] = Field(max_length=100, description="List of run IDs to cancel")
+
+
+class BulkCancelRunsResponse(BaseModel):
+    cancelled: list[str] = Field(description="Run IDs that were successfully cancelled")
+    failed: list[str] = Field(description="Run IDs that could not be cancelled")
