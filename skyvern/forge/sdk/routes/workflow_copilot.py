@@ -2052,6 +2052,7 @@ def convert_to_history_messages(
         WorkflowCopilotChatHistoryMessage(
             sender=message.sender,
             content=message.content,
+            turn_outcome=message.turn_outcome,
             created_at=message.created_at,
         )
         for message in messages
