@@ -14,7 +14,6 @@ from skyvern.forge.sdk.copilot.agent import (
     _TIMEOUT_REPLY_DEFAULT,
     _TIMEOUT_REPLY_TESTED,
     _TIMEOUT_REPLY_UNVALIDATED,
-    _UNEXPECTED_ERROR_REPLY_DEFAULT,
     _UNEXPECTED_ERROR_REPLY_TESTED,
     _UNEXPECTED_ERROR_REPLY_UNVALIDATED,
     _build_cancel_exit_result,
@@ -51,6 +50,7 @@ def _ctx(
     ctx.total_tokens_used = None
     ctx.last_good_workflow = last_good_workflow
     ctx.last_good_workflow_yaml = last_good_workflow_yaml
+    ctx.tool_activity = []
     ctx.latest_diagnosis_repair_contract = None
     ctx.test_after_update_done = last_test_ok is not None
     ctx.last_update_block_count = None
@@ -244,7 +244,10 @@ class TestBuildUnexpectedErrorExitResult:
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
         assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT
+        assert "An unexpected error occurred. Please try again." not in result.user_response
+        assert "Copilot hit an internal error before it could finish this turn" in result.user_response
+        assert "The workflow was not modified" in result.user_response
+        assert "reference cpe_" in result.user_response
 
     def test_untested_workflow_surfaces_as_unvalidated_wip(self) -> None:
         wf = MagicMock(name="wf")
@@ -277,7 +280,9 @@ class TestBuildUnexpectedErrorExitResult:
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
         assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT
+        assert "Copilot hit an internal error before it could finish this turn" in result.user_response
+        assert "The workflow was preserved" in result.user_response
+        assert "reference cpe_" in result.user_response
 
     def test_failed_test_uses_recorded_blocker_reply(self) -> None:
         wf = MagicMock(name="wf")
@@ -346,7 +351,9 @@ class TestBuildUnexpectedErrorExitResult:
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
         assert result.unvalidated is False
-        assert result.user_response == _UNEXPECTED_ERROR_REPLY_DEFAULT
+        assert "Copilot hit an internal error before it could finish this turn" in result.user_response
+        assert "The workflow was preserved" in result.user_response
+        assert "reference cpe_" in result.user_response
 
 
 class TestBuildCancelExitResult:

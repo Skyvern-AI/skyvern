@@ -52,6 +52,8 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
+    BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON,
+    BULK_CANCEL_RUNS_CODE_SAMPLE_TS,
     CANCEL_RUN_CODE_SAMPLE_PYTHON,
     CANCEL_RUN_CODE_SAMPLE_TS,
     CREATE_WORKFLOW_CODE_SAMPLE_CURL,
@@ -121,6 +123,8 @@ from skyvern.schemas.runs import (
     CUA_ENGINES,
     BlockRunRequest,
     BlockRunResponse,
+    BulkCancelRunsRequest,
+    BulkCancelRunsResponse,
     RunEngine,
     RunResponse,
     RunStatus,
@@ -572,6 +576,36 @@ async def cancel_run(
     analytics.capture("skyvern-oss-agent-cancel-run")
 
     await run_service.cancel_run(run_id, organization_id=current_org.organization_id, api_key=x_api_key)
+
+
+@base_router.post(
+    "/runs/cancel",
+    tags=["Agent", "Workflow Runs"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "bulk_cancel_runs",
+        "x-fern-examples": [
+            {
+                "code-samples": [
+                    {"sdk": "python", "code": BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON},
+                    {"sdk": "typescript", "code": BULK_CANCEL_RUNS_CODE_SAMPLE_TS},
+                ]
+            }
+        ],
+    },
+    description="Cancel multiple runs (tasks or workflows) in a single request",
+    summary="Bulk cancel runs",
+)
+@base_router.post("/runs/cancel/", include_in_schema=False)
+async def bulk_cancel_runs(
+    data: BulkCancelRunsRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> BulkCancelRunsResponse:
+    analytics.capture("skyvern-oss-agent-bulk-cancel-runs")
+
+    return await run_service.bulk_cancel_runs(
+        data.run_ids, organization_id=current_org.organization_id, api_key=x_api_key
+    )
 
 
 @legacy_base_router.post(

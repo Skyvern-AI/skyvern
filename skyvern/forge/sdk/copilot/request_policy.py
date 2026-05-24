@@ -15,6 +15,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.output_utils import parse_final_response
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_credential_ids, workflow_credential_origins
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -28,6 +29,7 @@ LOG = structlog.get_logger()
 PROMPT_NAME = "workflow-copilot-request-policy"
 _TESTING_INTENTS = {"require_test", "skip_test", "unspecified"}
 _KINDS = {"none", "raw_secret", "credential_id", "credential_name", "website_stored_credential", "placeholder"}
+_RAW_SECRET_HANDLINGS = {"none", "block", "redacted_draft"}
 ClarificationReason = Literal[
     "none",
     "raw_secret",
@@ -39,6 +41,7 @@ ClarificationReason = Literal[
     "missing_target_context",
     "workflow_credential_inputs_unbound",
 ]
+RawSecretHandling = Literal["none", "block", "redacted_draft"]
 _VALID_CLARIFICATION_REASONS: frozenset[ClarificationReason] = frozenset(get_args(ClarificationReason))
 CREDENTIAL_DEFERRED_DRAFT_REASONS: frozenset[ClarificationReason] = frozenset(
     {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
@@ -132,7 +135,11 @@ class RequestPolicy:
     clarification_question: str | None = None
     raw_secret_detected: bool = False
     raw_secret_evidence: str | None = None
+    raw_secret_handling: RawSecretHandling = "none"
     clarification_reason: ClarificationReason = "none"
+    existing_workflow_credential_ids: list[str] = field(default_factory=list)
+    # Sorted at the trace/JSON boundary; YAML traversal uses sets.
+    existing_workflow_credential_origins: dict[str, list[str]] = field(default_factory=dict)
 
     def to_trace_data(self) -> dict[str, Any]:
         return {
@@ -146,6 +153,11 @@ class RequestPolicy:
             "has_completion_contract": bool(self.completion_contract),
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
+            "raw_secret_handling": self.raw_secret_handling,
+            "existing_workflow_credential_id_count": len(self.existing_workflow_credential_ids),
+            "existing_workflow_credential_origin_count": sum(
+                len(origins) for origins in self.existing_workflow_credential_origins.values()
+            ),
         }
 
     def prompt_summary(self) -> str:
@@ -156,9 +168,12 @@ class RequestPolicy:
             f"allow_update_workflow: {self.allow_update_workflow}",
             f"allow_run_blocks: {self.allow_run_blocks}",
             f"allow_missing_credentials_in_draft: {self.allow_missing_credentials_in_draft}",
+            f"raw_secret_handling: {self.raw_secret_handling}",
         ]
         if self.completion_contract:
             lines.append(f"completion_contract: {self.completion_contract}")
+        if self.raw_secret_detected:
+            lines.append(f"raw_secret_detected: {self.raw_secret_detected}")
         if self.resolved_credentials:
             lines += [
                 "resolved_credentials:",
@@ -394,6 +409,12 @@ def _coerce_clarification_reason(value: Any) -> ClarificationReason:
     return "none"
 
 
+def _coerce_raw_secret_handling(value: Any) -> RawSecretHandling:
+    if value in _RAW_SECRET_HANDLINGS:
+        return cast(RawSecretHandling, value)
+    return "none"
+
+
 def redact_raw_secrets_for_prompt(text: str) -> str:
     redacted = text or ""
     for pattern in _RAW_SECRET_PATTERNS:
@@ -422,10 +443,13 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
         raw_secret_evidence=raw_secret_evidence,
+        raw_secret_handling=_coerce_raw_secret_handling(raw.get("raw_secret_handling")),
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
     )
     if policy.credential_input_kind == "raw_secret":
         policy.clarification_reason = "raw_secret"
+        if policy.raw_secret_handling == "none":
+            policy.raw_secret_handling = "block"
     if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
         policy.requires_user_clarification = True
     return policy
@@ -451,6 +475,18 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
     return None
 
 
+def _classifier_fallback_policy(ids: list[str], *, raw_secret_present: bool) -> RequestPolicy:
+    if raw_secret_present:
+        return RequestPolicy(
+            credential_input_kind="raw_secret",
+            credential_refs=ids,
+            raw_secret_detected=True,
+            raw_secret_handling="block",
+            clarification_reason="raw_secret",
+        )
+    return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
+
+
 async def _classify_request(
     user_message: str,
     workflow_yaml: str,
@@ -459,15 +495,11 @@ async def _classify_request(
     handler: Any,
 ) -> RequestPolicy:
     ids = _credential_ids(user_message)
-    if _raw_secret_detected(user_message):
-        return RequestPolicy(
-            credential_input_kind="raw_secret",
-            credential_refs=ids,
-            raw_secret_detected=True,
-            clarification_reason="raw_secret",
-        )
+    raw_secret_present = _raw_secret_detected(user_message)
+    if raw_secret_present and handler is None:
+        return _classifier_fallback_policy(ids, raw_secret_present=True)
     structural_reason = _structural_clarification_reason(user_message)
-    if structural_reason != "none":
+    if structural_reason != "none" and not raw_secret_present:
         return RequestPolicy(
             credential_input_kind="credential_id" if ids else "none",
             credential_refs=ids,
@@ -475,12 +507,17 @@ async def _classify_request(
             clarification_reason=structural_reason,
         )
     if handler is None:
-        return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
+        return _classifier_fallback_policy(ids, raw_secret_present=False)
 
-    transcript = build_transcript_context(chat_history, user_message)
+    # Raw-secret turns intentionally reach the classifier when available so it
+    # can distinguish unsafe secret use from redacted draft/spec conversion.
+    # Timeout and exception fallbacks remain conservative blocks below.
+    safe_user_message = redact_raw_secrets_for_prompt(user_message) if raw_secret_present else user_message
+    transcript = build_transcript_context(chat_history, safe_user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
-        user_message=escape_code_fences(user_message),
+        user_message=escape_code_fences(safe_user_message),
+        raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),
         earliest_user_turn=transcript.earliest_user_turn,
         latest_prior_user_turn=transcript.latest_prior_user_turn,
@@ -495,20 +532,32 @@ async def _classify_request(
         )
     except asyncio.TimeoutError:
         LOG.warning("request-policy classifier timed out")
-        return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
+        return _classifier_fallback_policy(ids, raw_secret_present=raw_secret_present)
     except Exception as exc:
         LOG.warning("request-policy classifier failed", error=str(exc))
-        return RequestPolicy(credential_input_kind="credential_id" if ids else "none", credential_refs=ids)
+        return _classifier_fallback_policy(ids, raw_secret_present=raw_secret_present)
 
     policy = _classification_from_raw(raw)
     policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
     policy.credential_refs = _clean_list(policy.credential_refs + ids)
+    if raw_secret_present:
+        policy.raw_secret_detected = True
+        if policy.raw_secret_handling == "redacted_draft":
+            if policy.credential_input_kind == "raw_secret":
+                policy.credential_input_kind = "placeholder"
+            policy.raw_secret_evidence = None
+        else:
+            policy.credential_input_kind = "raw_secret"
+            policy.raw_secret_handling = "block"
+            policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
     if policy.testing_intent == "skip_test" and policy.completion_contract:
         policy.testing_intent = "unspecified"
     if ids and policy.credential_input_kind in ("none", "placeholder"):
         policy.credential_input_kind = "credential_id"
-    if policy.credential_input_kind == "raw_secret" and not _verify_raw_secret_evidence(
-        policy.raw_secret_evidence, user_message
+    if (
+        policy.credential_input_kind == "raw_secret"
+        and not raw_secret_present
+        and not _verify_raw_secret_evidence(policy.raw_secret_evidence, user_message)
     ):
         # The classifier claimed raw_secret but cited no verifiable secret in
         # the latest message — typically a token carried over from a prior turn.
@@ -709,7 +758,23 @@ def _should_defer_repeated_unresolved_credential_question(
     )
 
 
-async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> None:
+def _defer_unresolved_credential_for_draft(policy: RequestPolicy) -> None:
+    # Preserve the reason code for observability after the question stops being user-blocking.
+    policy.requires_user_clarification = False
+    policy.user_response_policy = "proceed"
+    policy.allow_update_workflow = True
+    policy.allow_run_blocks = False
+    policy.allow_missing_credentials_in_draft = True
+    policy.clarification_reason = "credential_name_unresolved"
+    policy.clarification_question = None
+
+
+async def _resolve_credentials(
+    policy: RequestPolicy,
+    organization_id: str,
+    *,
+    defer_unresolved_credential_name: bool = False,
+) -> None:
     if policy.credential_input_kind == "credential_id":
         ids = _clean_list([ref for ref in policy.credential_refs if ref.startswith("cred_")])
         if not ids:
@@ -764,8 +829,10 @@ async def _resolve_credentials(policy: RequestPolicy, organization_id: str) -> N
                     reason="credential_name_unresolved",
                 )
                 return
-            elif policy.testing_intent == "skip_test":
+            elif policy.testing_intent == "skip_test" or defer_unresolved_credential_name:
                 policy.allow_run_blocks, policy.allow_missing_credentials_in_draft = False, True
+                if defer_unresolved_credential_name:
+                    _defer_unresolved_credential_for_draft(policy)
             else:
                 _block(
                     policy,
@@ -905,7 +972,21 @@ async def build_request_policy(
 ) -> RequestPolicy:
     policy = await _classify_request(user_message, workflow_yaml, chat_history, global_llm_context, handler)
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
+    policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
+    policy.existing_workflow_credential_origins = {
+        credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
+    }
     _prioritize_credential_clarification(policy)
+
+    if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":
+        policy.testing_intent = "skip_test"
+        policy.requires_user_clarification = False
+        policy.user_response_policy = "proceed"
+        policy.allow_update_workflow = True
+        policy.allow_run_blocks = False
+        policy.allow_missing_credentials_in_draft = True
+        policy.clarification_reason = "none"
+        policy.clarification_question = None
 
     if policy.clarification_reason == "none" and not policy.raw_secret_detected:
         if _workflow_credential_inputs_unbound(workflow_yaml):
@@ -940,10 +1021,13 @@ async def build_request_policy(
         policy.allow_run_blocks = False
         policy.allow_missing_credentials_in_draft = True
 
-    if policy.raw_secret_detected:
+    if policy.raw_secret_detected and policy.raw_secret_handling != "redacted_draft":
+        question = _RAW_SECRET_QUESTION
+        if policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
+            question += "\n\n" + _clarification_question(policy, global_llm_context)
         _block(
             policy,
-            _RAW_SECRET_QUESTION,
+            question,
             reason="raw_secret",
         )
     elif policy.requires_user_clarification and policy.clarification_reason in _PRE_RESOLUTION_CLARIFICATION_REASONS:
@@ -956,7 +1040,11 @@ async def build_request_policy(
             # conservative clarification flag; _resolve_credentials will block
             # again if the lookup is missing or ambiguous.
             policy.requires_user_clarification = False
-            await _resolve_credentials(policy, organization_id)
+            await _resolve_credentials(
+                policy,
+                organization_id,
+                defer_unresolved_credential_name=_last_assistant_message_was_saved_credential_question(chat_history),
+            )
         except Exception:
             LOG.warning(
                 "request-policy credential resolution failed",

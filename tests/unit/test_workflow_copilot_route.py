@@ -23,6 +23,9 @@ import pytest
 
 from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
 from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
@@ -177,6 +180,7 @@ def _setup_new_copilot_mocks(
         get_workflow_run_blocks=AsyncMock(return_value=[]),
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
+    app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
 
     return restore_mock
 
@@ -258,6 +262,244 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         restore_mock.assert_awaited_once()
     else:
         restore_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+
+    async def fake_llm_handler(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        fake_llm_handler,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._restore_workflow_definition",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(agent_module, "ensure_tracing_initialized", lambda: None)
+    monkeypatch.setattr(
+        agent_module,
+        "_run_copilot_turn_impl",
+        AsyncMock(side_effect=agent_module.CopilotRequestPolicyMissingError()),
+    )
+
+    workflow_params = SimpleNamespace(
+        get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+        get_workflow_copilot_chat_messages=AsyncMock(return_value=[]),
+        update_workflow_copilot_chat=AsyncMock(),
+        create_workflow_copilot_chat_message=AsyncMock(
+            return_value=SimpleNamespace(created_at=datetime(2026, 4, 14, tzinfo=timezone.utc))
+        ),
+    )
+    app.DATABASE.workflow_params = workflow_params
+    app.DATABASE.workflows = SimpleNamespace(
+        get_workflow_by_permanent_id=AsyncMock(return_value=original_workflow),
+    )
+    app.DATABASE.observer = SimpleNamespace(
+        get_workflow_run_blocks=AsyncMock(return_value=[]),
+    )
+    app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
+    app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
+    app.AGENT_FUNCTION.resolve_org_api_key = AsyncMock(return_value="sk-test-key")
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    contents = [
+        call.kwargs.get("content") for call in workflow_params.create_workflow_copilot_chat_message.await_args_list
+    ]
+    assert "Please update it" in contents
+    assistant_contents = [content for content in contents if isinstance(content, str) and content != "Please update it"]
+    assert len(assistant_contents) == 1
+    assert "An unexpected error occurred. Please try again." not in assistant_contents[0]
+    assert "Copilot hit an internal error before it could finish this turn" in assistant_contents[0]
+    assert "The workflow was not modified" in assistant_contents[0]
+    assert "reference cpe_" in assistant_contents[0]
+
+    frames = [call.args[0] for call in stream.send.await_args_list if call.args]
+    assert any(isinstance(frame, WorkflowCopilotStreamResponseUpdate) for frame in frames)
+    assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_summary"),
+    [
+        (RuntimeError("route boom"), "Copilot hit an internal error before it could finish this turn"),
+        (LLMProviderError("OPENAI_GPT5_5"), "A Copilot dependency stopped responding"),
+    ],
+)
+async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+    expected_summary: str,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=False,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+    )
+    _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot.run_copilot_agent",
+        AsyncMock(side_effect=error),
+    )
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    contents = [
+        call.kwargs.get("content")
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+    ]
+    assert "Please update it" in contents
+    assistant_contents = [content for content in contents if isinstance(content, str) and content != "Please update it"]
+    assert len(assistant_contents) == 1
+    assert expected_summary in assistant_contents[0]
+    assert "The workflow was not modified" in assistant_contents[0]
+    assert "reference cpe_" in assistant_contents[0]
+
+    frames = [call.args[0] for call in stream.send.await_args_list if call.args]
+    assert any(isinstance(frame, WorkflowCopilotStreamResponseUpdate) for frame in frames)
+    assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_route_error_after_restore_reports_workflow_not_modified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow={"workflow_id": "stale"},
+        auto_accept=False,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    agent_result = SimpleNamespace(
+        user_response="unused",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        unvalidated=False,
+    )
+    restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
+    finalise_results: list[object] = []
+    original_finalise = workflow_copilot_route._finalise_normal_turn
+
+    async def flaky_finalise(*args: object, **kwargs: object) -> object:
+        finalise_results.append(kwargs["agent_result"])
+        if len(finalise_results) == 1:
+            raise RuntimeError("post-agent route boom")
+        return await original_finalise(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_copilot_route, "_finalise_normal_turn", flaky_finalise)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test-key"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    stream = MagicMock()
+    stream.send = AsyncMock(return_value=True)
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    assert len(finalise_results) == 2
+    recovered_result = finalise_results[1]
+    assert "The workflow was not modified" in recovered_result.user_response
+    assert "The workflow was preserved" not in recovered_result.user_response
+    assert recovered_result.clear_proposed_workflow is True
+    contents = [
+        call.kwargs.get("content")
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+    ]
+    assistant_contents = [content for content in contents if isinstance(content, str) and content != "Please update it"]
+    assert len(assistant_contents) == 1
+    assert "The workflow was not modified" in assistant_contents[0]
+    assert "The workflow was preserved" not in assistant_contents[0]
+    update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
+    clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
+    assert len(clear_calls) == 1
 
 
 @pytest.mark.asyncio
