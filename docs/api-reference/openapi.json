@@ -11762,6 +11762,15 @@
             "maximum": 1,
             "minimum": 0,
             "title": "Confidence Float"
+          },
+          "error_type": {
+            "type": "string",
+            "enum": [
+              "USER_DEFINED_ERROR"
+            ],
+            "title": "Error Type",
+            "default": "USER_DEFINED_ERROR",
+            "description": "Discriminator that identifies this error as originating from user-defined error criteria. Always `USER_DEFINED_ERROR` for this schema."
           }
         },
         "type": "object",
