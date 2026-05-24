@@ -1097,8 +1097,18 @@ def setup_guided(
                         browser_remote_debugging_url=env_browser_url,
                     )
                 else:
-                    entry = _build_opencode_remote_mcp_entry(resolved_key, url=url or _DEFAULT_REMOTE_URL)
+                    remote_url = url or _DEFAULT_REMOTE_URL
+                    parsed = urlparse(remote_url)
+                    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                        console.print(
+                            f"[red]Invalid URL: {remote_url} (must be a full URL like https://api.skyvern.com/mcp/)[/red]"
+                        )
+                        raise typer.Exit(code=1)
+                    entry = _build_opencode_remote_mcp_entry(resolved_key, url=remote_url)
+
                 _upsert_opencode_config(config_path, entry, dry_run=dry_run, yes=True, tool_name=tool.name)
+                console.print(f"[dim]{_opencode_setup_success_message(local=local)}[/dim]")
+
             else:
                 entry = _build_entry(
                     resolved_key,
