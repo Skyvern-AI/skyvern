@@ -276,10 +276,18 @@ def _has_api_key(entry: dict | None) -> bool:
     headers = entry.get("headers")
     if isinstance(headers, dict) and headers.get("x-api-key"):
         return True
-    if entry.get("http_headers", {}).get("x-api-key"):
+    http_headers = entry.get("http_headers")
+    if isinstance(http_headers, dict) and http_headers.get("x-api-key"):
         return True
-    if entry.get("env", {}).get("SKYVERN_API_KEY"):
+
+    env = entry.get("env")
+    if isinstance(env, dict) and env.get("SKYVERN_API_KEY"):
         return True
+
+    environment = entry.get("environment")
+    if isinstance(environment, dict) and environment.get("SKYVERN_API_KEY"):
+        return True
+
     # mcp-remote bridge: API key is in args as "--header", "x-api-key:..."
     args = entry.get("args", [])
     return any(isinstance(a, str) and a.startswith("x-api-key:") for a in args)
