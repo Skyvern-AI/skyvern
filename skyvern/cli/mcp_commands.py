@@ -407,12 +407,19 @@ if entry_type == "local":
 if entry_type in {"http", "remote"}:
     return "remote http"
 
+entry_type = entry.get("type")
+
+if entry_type == "local":
+    return "local stdio"
+
+if entry_type in {"http", "remote"}:
+    return "remote http"
+
 if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
     return "local stdio"
 
-
-    if entry.get("type") in {"http", "remote"} or "url" in entry or isinstance(entry.get("http_headers"), dict):
-        return "remote http"
+if "url" in entry or isinstance(entry.get("http_headers"), dict):
+    return "remote http"
 
     return "unsupported"
 
