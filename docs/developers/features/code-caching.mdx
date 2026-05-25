@@ -8,7 +8,7 @@ keywords:
   - code caching
   - code generation
   - run_with
-  - Skyvern 2.0 with Code
+  - cached code
   - deterministic runs
   - script generation
   - cost optimization
@@ -19,14 +19,14 @@ When Skyvern's agent completes a task or workflow, it records the actions it too
 
 ## How it works
 
-The first run uses the agent as normal. Set `engine="skyvern-2.0"` when creating the task or workflow, and Skyvern records the actions as generated code while the agent executes.
+The first run uses the agent as normal. Create a workflow and run it with `run_with="agent"` so Skyvern can record the successful browser actions as generated code.
 
 On subsequent runs, pass `run_with="code"` to execute the cached code directly. No screenshots, no LLM reasoning, just the recorded action sequence replaying against the page.
 
 If the cached code hits something unexpected (a layout change, a new field, a missing element), Skyvern re-runs with the full agent and regenerates the cache. You don't need to handle this yourself.
 
 <Note>
-The SDK default engine is `skyvern-1.0`. To use code caching, explicitly set `engine="skyvern-2.0"`. In the Cloud UI, `skyvern-2.0` is the default.
+The SDK and Cloud UI default to `skyvern-1.0` for new task creation. Use workflows plus `run_with="code"` for cached replays.
 </Note>
 
 ## What gets cached
