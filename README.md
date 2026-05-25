@@ -65,13 +65,12 @@ If you'd like to try it out, navigate to [app.skyvern.com](https://app.skyvern.c
 
 Choose your preferred setup method:
 
-> **Database default**: As of skyvern 1.0.31+, `skyvern run server` defaults to a SQLite database at `~/.skyvern/data.db` so it works out of the box with no Postgres setup. To use Postgres instead, set `DATABASE_STRING` in `.env` or pass `--database-string` to `skyvern quickstart`. Docker Compose always uses the bundled Postgres service.
+> **Database default**: `skyvern quickstart` and `skyvern run server` default to a SQLite database at `~/.skyvern/data.db` so the pip path works without Postgres or Docker. To use Postgres instead, pass `--postgres` for a local container or `--database-string` for an existing database. Docker Compose always uses the bundled Postgres service.
 
-### Option A: pip install (Recommended)
+### Option A: pip install (Recommended for Python-managed local setup)
 
 Dependencies needed:
-- [Python 3.11.x](https://www.python.org/downloads/), works with 3.12, not ready yet for 3.13
-- [NodeJS & NPM](https://nodejs.org/en/download/)
+- [Python 3.11, 3.12, or 3.13](https://www.python.org/downloads/)
 
 Additionally, for Windows:
 - [Rust](https://rustup.rs/)
@@ -80,7 +79,7 @@ Additionally, for Windows:
 #### 1. Install Skyvern
 
 ```bash
-pip install skyvern
+pip install "skyvern[all]"
 ```
 
 #### 2. Run Skyvern
@@ -88,6 +87,8 @@ pip install skyvern
 ```bash
 skyvern quickstart
 ```
+
+The pip quickstart uses SQLite by default. For a local Postgres container, run `skyvern quickstart --postgres`.
 
 ### Option B: Docker Compose
 
@@ -132,7 +133,9 @@ uv pip install skyvern
 **Skyvern is a Playwright extension that adds AI-powered browser automation.** It gives you the full power of Playwright with additional AI capabilities—use natural language prompts to interact with elements, extract data, and automate complex multi-step workflows.
 
 **Installation:**
-- Python: `pip install skyvern` then run `skyvern quickstart` for local setup
+- Python SDK / cloud API: `pip install skyvern`
+- Local server + packaged UI: `pip install "skyvern[all]"` then run `skyvern quickstart`
+- Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --postgres`
 - TypeScript: `npm install @skyvern/client`
 
 ### AI-Powered Page Commands
@@ -204,7 +207,7 @@ summary = await page.prompt("Summarize what's on this page")
 ```bash
 skyvern run all
 ```
-Navigate to http://localhost:8080 to run tasks through the web interface.
+Navigate to http://localhost:8080 to run tasks through the web interface. If the packaged UI is missing, `skyvern run ui` will offer to install the matching UI package. For non-interactive setup, use `skyvern run ui --install-ui` or `skyvern run all --install-ui`.
 
 **Python SDK:**
 ```python

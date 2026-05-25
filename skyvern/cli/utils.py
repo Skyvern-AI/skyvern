@@ -5,12 +5,14 @@ import sys
 import time
 
 import typer
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from skyvern.analytics import capture_setup_error, capture_setup_event
 from skyvern.cli.console import console
-from skyvern.utils.env_paths import resolve_backend_env_path, resolve_frontend_env_path
+from skyvern.cli.ui_runtime import has_frontend_runtime
+from skyvern.utils.env_paths import resolve_backend_env_path
 
 
 def wait_for_docker_services(ui_port: int = 8080, api_port: int = 8000, timeout: int = 120) -> bool:
@@ -48,14 +50,14 @@ async def start_services(server_only: bool = False) -> None:
         server_only: If True, only start the server, not the UI.
     """
     try:
-        frontend_env_path = None if server_only else resolve_frontend_env_path()
-        if not server_only and frontend_env_path is None:
+        frontend_available = False if server_only else has_frontend_runtime()
+        if not server_only and not frontend_available:
             server_only = True
             console.print(
                 Panel(
                     "[yellow]No Skyvern frontend runtime was found in this install.[/yellow]\n\n"
-                    "Starting the backend API server only. Wheel installs do not include the UI app; "
-                    "use a source checkout or Docker Compose when you need the local UI.",
+                    f"Starting the backend API server only. Install [cyan]{escape('skyvern[ui]')}[/cyan] "
+                    "or use a source checkout / Docker Compose when you need the local UI.",
                     title="Backend-only install",
                     border_style="yellow",
                 )

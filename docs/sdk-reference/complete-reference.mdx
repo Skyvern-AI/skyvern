@@ -33,7 +33,7 @@ npm install @skyvern/client
 </CodeGroup>
 
 <Note>
-`pip install skyvern` is the lightweight SDK for Skyvern Cloud and remote API calls. Embedded local SDK features such as `Skyvern.local()` and local browser control require `pip install "skyvern[local]"`. Local server and local stdio MCP commands require `pip install "skyvern[server]"`. Guided quickstart and migrations currently require Docker Compose or a source checkout.
+`pip install skyvern` is the lightweight SDK for Skyvern Cloud and remote API calls. Embedded local SDK features such as `Skyvern.local()` and local browser control require `pip install "skyvern[local]"`. For a local server with the packaged web UI and default SQLite database, use `pip install "skyvern[all]"`. Use `skyvern[server]` or `skyvern[ui]` only when you intentionally want one side without the other.
 </Note>
 
 <CodeGroup>

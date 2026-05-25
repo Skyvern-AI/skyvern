@@ -89,11 +89,11 @@ Before deploying, ensure you have:
 
 PostgreSQL 14+ is included in the Docker Compose setup. If you prefer an external database, configure `DATABASE_STRING` to point to your own instance.
 
-For local server commands from PyPI, install the server extra: `pip install "skyvern[server]"`. The lightweight `pip install skyvern` package is for Skyvern Cloud / remote API SDK usage and does not include the local server stack. Guided quickstart and migrations currently require Docker Compose or a source checkout.
+For local server commands with the packaged web UI from PyPI, install `pip install "skyvern[all]"`. The pip quickstart uses SQLite at `~/.skyvern/data.db` by default; pass `--postgres` for a local Postgres container or `--database-string` for an existing database. Use `skyvern[server]` only when you intentionally want the local server stack without the packaged UI, and add `skyvern[ui]` later if needed. The lightweight `pip install skyvern` package is for Skyvern Cloud / remote API SDK usage and does not include the local server stack.
 
 For a full self-hosted deployment with the web UI, use Docker Compose. The Compose stack starts the API server, browser runtime, Postgres, and the Skyvern web UI together.
 
-For the source-checkout `pip install ".[server]"` path (Option A in the README), the default is a SQLite database at `~/.skyvern/data.db` — zero-config for local dev. To opt into Postgres for that path, run `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`.
+For the source-checkout `pip install ".[server]"` path, the default is also SQLite for local dev. To opt into Postgres for that path, run `skyvern quickstart --postgres` or `skyvern quickstart --database-string=postgresql+psycopg://user:pass@host:5432/dbname`.
 
 ## Choose your deployment method
 

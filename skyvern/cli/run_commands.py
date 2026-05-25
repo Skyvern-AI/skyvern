@@ -1,8 +1,12 @@
 import asyncio
 import atexit
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -11,24 +15,32 @@ from typing import TYPE_CHECKING, Annotated, List, Literal, Optional
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
-import psutil
 import typer
-import uvicorn
 from dotenv import set_key
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm
-from starlette.middleware import Middleware
-from starlette.responses import JSONResponse as StarletteJSONResponse
-from starlette.responses import Response as StarletteResponse
 
 from skyvern._cli_bootstrap import prepare_cli_runtime
 from skyvern.cli.commands._output import output_error
 from skyvern.cli.commands._tty import is_interactive
 from skyvern.cli.console import console
 from skyvern.cli.core.result import set_concise_responses
+from skyvern.cli.ui_runtime import (
+    ARTIFACT_PORT,
+    UI_PORT,
+    UI_PACKAGE_NAME,
+    InstalledUiConfig,
+    artifact_api_base_url_with_token,
+    has_frontend_runtime,
+    installed_ui_dist_available,
+    prepare_installed_ui_dist,
+    serve_installed_ui,
+)
 from skyvern.utils import detect_os
 from skyvern.utils.env_paths import (
     EnvIntent,
+    load_backend_env_files,
     resolve_backend_env_path,
     resolve_frontend_env_path,
 )
@@ -88,6 +100,8 @@ def get_pids_on_port(port: int) -> List[int]:
     """Return a list of PIDs listening on the given port."""
     pids = []
     try:
+        import psutil  # noqa: PLC0415
+
         for conn in psutil.net_connections(kind="inet"):
             if conn.laddr and conn.laddr.port == port and conn.pid:
                 pids.append(conn.pid)
@@ -118,6 +132,8 @@ def run_server() -> None:
         from skyvern.cli.lazy import _handle_missing_dep  # noqa: PLC0415
 
         _handle_missing_dep(exc)
+
+    import uvicorn  # noqa: PLC0415
 
     prepare_cli_runtime(intent=EnvIntent.SERVER)
     from skyvern.config import settings  # noqa: PLC0415
@@ -169,23 +185,144 @@ def _handle_port_conflict(port: int, *, force: bool, command_hint: str) -> bool:
     return True
 
 
+def _installed_ui_config() -> InstalledUiConfig:
+    backend_env_path = resolve_backend_env_path(intent=EnvIntent.SERVER)
+    if backend_env_path.exists():
+        load_backend_env_files(intent=EnvIntent.SERVER)
+    else:
+        console.print(f"[yellow]Backend .env file not found at {backend_env_path}; using UI defaults.[/yellow]")
+
+    api_port = os.getenv("PORT", "8000")
+    api_base_url = os.getenv("VITE_API_BASE_URL", f"http://localhost:{api_port}/api/v1")
+    wss_base_url = os.getenv("VITE_WSS_BASE_URL", f"ws://localhost:{api_port}/api/v1")
+    artifact_api_base_url = os.getenv("VITE_ARTIFACT_API_BASE_URL", f"http://localhost:{ARTIFACT_PORT}")
+    return InstalledUiConfig(
+        api_base_url=api_base_url,
+        wss_base_url=wss_base_url,
+        artifact_api_base_url=artifact_api_base_url,
+        skyvern_api_key=os.getenv("SKYVERN_API_KEY", ""),
+        browser_streaming_mode=os.getenv("BROWSER_STREAMING_MODE", "vnc"),
+    )
+
+
+def _ui_install_target() -> str:
+    try:
+        skyvern_version = importlib.metadata.version("skyvern")
+    except importlib.metadata.PackageNotFoundError:
+        return UI_PACKAGE_NAME
+    return f"{UI_PACKAGE_NAME}=={skyvern_version}"
+
+
+def _print_missing_ui_assets() -> None:
+    ui_install_command = escape('pip install "skyvern[ui]"')
+    all_install_command = escape('pip install "skyvern[all]"')
+    console.print(
+        Panel(
+            "[bold red]ERROR: Skyvern UI assets are not installed.[/bold red]\n\n"
+            f"Run [cyan]{ui_install_command}[/cyan] for the packaged UI, "
+            f"or [cyan]{all_install_command}[/cyan] for local server + UI.\n\n"
+            "For frontend development, run this command from a Skyvern source checkout.",
+            border_style="red",
+        )
+    )
+
+
+def _install_packaged_ui_if_requested(*, assume_yes: bool = False) -> bool:
+    install_target = _ui_install_target()
+    if not assume_yes:
+        if not is_interactive():
+            return False
+        if not Confirm.ask(f"Install packaged Skyvern UI assets now ({install_target})?", default=True):
+            return False
+
+    console.print(f"📦 [bold blue]Installing {install_target}...[/bold blue]")
+    result = subprocess.run([sys.executable, "-m", "pip", "install", install_target], check=False)
+    if result.returncode != 0:
+        console.print(f"[bold red]Failed to install {install_target}.[/bold red]")
+        return False
+
+    importlib.invalidate_caches()
+    if installed_ui_dist_available():
+        console.print("✅ [green]Packaged Skyvern UI assets installed.[/green]")
+        return True
+
+    console.print(f"[bold red]Installed {install_target}, but packaged UI assets were not found.[/bold red]")
+    return False
+
+
+def _missing_run_all_dependencies() -> list[str]:
+    required_modules = ["uvicorn", "sqlalchemy", "alembic"]
+    return [module for module in required_modules if importlib.util.find_spec(module) is None]
+
+
+def _print_missing_run_all_dependencies(missing_modules: list[str]) -> None:
+    all_install_command = escape('pip install "skyvern[all]"')
+    ui_install_command = escape("skyvern run ui --install-ui")
+    missing = ", ".join(missing_modules)
+    console.print(
+        Panel(
+            "[bold red]ERROR: `skyvern run all` needs the local server dependencies.[/bold red]\n\n"
+            f"Missing: [yellow]{missing}[/yellow]\n"
+            f"Run [cyan]{all_install_command}[/cyan] to install the local server and packaged UI together.\n\n"
+            f"If you only want the packaged UI, run [cyan]{ui_install_command}[/cyan].",
+            border_style="red",
+        )
+    )
+
+
+def _run_installed_ui(*, force: bool) -> None:
+    if not _handle_port_conflict(ARTIFACT_PORT, force=force, command_hint="skyvern stop ui"):
+        return
+
+    artifact_token = secrets.token_urlsafe(24)
+    config = _installed_ui_config()
+    config = InstalledUiConfig(
+        api_base_url=config.api_base_url,
+        wss_base_url=config.wss_base_url,
+        artifact_api_base_url=artifact_api_base_url_with_token(config.artifact_api_base_url, artifact_token),
+        skyvern_api_key=config.skyvern_api_key,
+        browser_streaming_mode=config.browser_streaming_mode,
+    )
+    dist_dir = prepare_installed_ui_dist(config)
+    console.print(
+        Panel(
+            "[bold green]Starting packaged Skyvern UI...[/bold green]\n\n"
+            f"UI: [cyan]http://localhost:{UI_PORT}[/cyan]\n"
+            f"Artifact server: [cyan]http://localhost:{ARTIFACT_PORT}[/cyan]",
+            border_style="green",
+        )
+    )
+    serve_installed_ui(dist_dir, ui_port=UI_PORT, artifact_port=ARTIFACT_PORT, artifact_token=artifact_token)
+
+
 @run_app.command(name="ui")
 def run_ui(
-    force: bool = typer.Option(False, "--force", help="Kill existing process on port 8080 without prompting."),
+    force: Annotated[
+        bool, typer.Option("--force", help="Kill existing process on port 8080 without prompting.")
+    ] = False,
+    install_ui: Annotated[
+        bool, typer.Option("--install-ui", help="Install packaged UI assets if they are missing.")
+    ] = False,
 ) -> None:
     """Run the Skyvern UI server.
 
     Examples:
       skyvern run ui
       skyvern run ui --force
+      skyvern run ui --install-ui
     """
     console.print(Panel("[bold blue]Starting Skyvern UI Server...[/bold blue]", border_style="blue"))
-    if not _handle_port_conflict(8080, force=force, command_hint="skyvern run ui --force"):
-        return
-
     frontend_env_path = resolve_frontend_env_path()
     if frontend_env_path is None:
-        console.print("[bold red]ERROR: Skyvern Frontend directory not found.[/bold red]")
+        if not installed_ui_dist_available() and not _install_packaged_ui_if_requested(assume_yes=install_ui):
+            _print_missing_ui_assets()
+            return
+        if not _handle_port_conflict(UI_PORT, force=force, command_hint="skyvern run ui --force"):
+            return
+        _run_installed_ui(force=force)
+        return
+
+    if not _handle_port_conflict(UI_PORT, force=force, command_hint="skyvern run ui --force"):
         return
 
     frontend_dir = frontend_env_path.parent
@@ -329,10 +466,23 @@ def run_docker() -> None:
 
 
 @run_app.command(name="all")
-def run_all() -> None:
+def run_all(
+    install_ui: Annotated[
+        bool, typer.Option("--install-ui", help="Install packaged UI assets if they are missing.")
+    ] = False,
+) -> None:
     """Run the Skyvern API server and UI server in parallel."""
+    missing_dependencies = _missing_run_all_dependencies()
+    if missing_dependencies:
+        _print_missing_run_all_dependencies(missing_dependencies)
+        raise typer.Exit(1)
+
     from skyvern.cli.utils import start_services  # noqa: PLC0415
 
+    if not has_frontend_runtime():
+        installed = _install_packaged_ui_if_requested(assume_yes=install_ui)
+        if install_ui and not installed:
+            raise typer.Exit(1)
     asyncio.run(start_services())
 
 
@@ -403,6 +553,9 @@ class _ServerCardMiddleware:
         self.card = build_server_card(self.transport_type, endpoint_url)
 
     async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
+        from starlette.responses import JSONResponse as StarletteJSONResponse  # noqa: PLC0415
+        from starlette.responses import Response as StarletteResponse  # noqa: PLC0415
+
         if scope["type"] == "http" and scope["path"] == "/.well-known/mcp/server-card.json":
             cors_headers = {
                 "Access-Control-Allow-Origin": "*",
@@ -454,6 +607,7 @@ def run_mcp(
     from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
+    from starlette.middleware import Middleware  # noqa: PLC0415
 
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
