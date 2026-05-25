@@ -302,6 +302,7 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -352,6 +353,7 @@ async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
         total_tokens=123,
         response_type="REPLY",
         proposal_disposition="review_untested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -407,6 +409,7 @@ async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
         total_tokens=123,
         response_type="REPLY",
         proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -450,6 +453,7 @@ async def test_route_cancel_review_tested_persists_proposal_without_unvalidated_
         total_tokens=456,
         response_type="REPLY",
         proposal_disposition="review_tested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -495,6 +499,7 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
         total_tokens=None,
         response_type="REPLY",
         proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -524,6 +529,7 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip_and_no_pe
         total_tokens=None,
         response_type="REPLY",
         proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -602,6 +608,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
         total_tokens=123,
         response_type="REPLY",
         proposal_disposition="review_untested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
@@ -679,6 +686,7 @@ async def test_timeout_wip_review_tested_propagates_to_response_frame(
         total_tokens=789,
         response_type="REPLY",
         proposal_disposition="review_tested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
