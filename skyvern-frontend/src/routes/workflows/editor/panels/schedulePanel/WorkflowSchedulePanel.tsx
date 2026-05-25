@@ -80,9 +80,9 @@ function WorkflowSchedulePanel({ onClose }: Props) {
   };
 
   return (
-    <div className="flex h-full w-[22rem] flex-col rounded-lg border border-slate-700 bg-slate-elevation3">
-      <div className="flex items-center justify-between border-b border-slate-700 px-4 py-4">
-        <h3 className="text-sm font-normal text-slate-50">
+    <div className="flex h-full w-[22rem] flex-col rounded-lg border border-border bg-slate-elevation3">
+      <div className="flex items-center justify-between border-b border-border px-4 py-4">
+        <h3 className="text-sm font-normal text-foreground">
           Schedules
           {schedules && schedules.length > 0 ? ` (${schedules.length})` : ""}
         </h3>
@@ -111,14 +111,14 @@ function WorkflowSchedulePanel({ onClose }: Props) {
           <div className="flex flex-col gap-3 px-4 py-2">
             {isLoading && (
               <div className="flex items-center justify-center py-8">
-                <ReloadIcon className="size-5 animate-spin text-slate-400" />
+                <ReloadIcon className="size-5 animate-spin text-muted-foreground" />
               </div>
             )}
             {isError && (
               <div className="py-8 text-center text-sm text-red-400">
                 Failed to load schedules.
                 {error?.message && (
-                  <span className="block text-xs text-slate-500">
+                  <span className="block text-xs text-muted-foreground">
                     {error.message}
                   </span>
                 )}
@@ -127,7 +127,7 @@ function WorkflowSchedulePanel({ onClose }: Props) {
             {!isLoading &&
               !isError &&
               (!schedules || schedules.length === 0) && (
-                <div className="py-8 text-center text-sm text-slate-500">
+                <div className="py-8 text-center text-sm text-muted-foreground">
                   No schedules configured.
                   <br />
                   Click &quot;Add&quot; to create one.

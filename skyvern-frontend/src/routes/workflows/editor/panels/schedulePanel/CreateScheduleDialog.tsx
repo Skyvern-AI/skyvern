@@ -184,7 +184,7 @@ function CreateScheduleDialog({
               className={cn(!valid && cronExpression && "border-destructive")}
             />
             {humanReadable && (
-              <p className="text-sm text-slate-400">{humanReadable}</p>
+              <p className="text-sm text-muted-foreground">{humanReadable}</p>
             )}
             {!valid && cronExpression && (
               <p className="text-sm text-destructive">
@@ -211,14 +211,14 @@ function CreateScheduleDialog({
               placeholder="Search timezones..."
             />
             {timezoneFilter !== null && (
-              <div className="max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
+              <div className="max-h-40 overflow-y-auto rounded-md border border-border bg-slate-elevation3">
                 {filteredTimezones.slice(0, 20).map((tz) => (
                   <button
                     key={tz}
                     type="button"
                     className={cn(
-                      "w-full px-3 py-1.5 text-left text-sm hover:bg-slate-700",
-                      tz === timezone && "bg-slate-700 text-slate-50",
+                      "w-full px-3 py-1.5 text-left text-sm hover:bg-slate-elevation4",
+                      tz === timezone && "bg-slate-elevation4 text-foreground",
                     )}
                     onMouseDown={(e) => {
                       e.preventDefault();
@@ -230,23 +230,23 @@ function CreateScheduleDialog({
                   </button>
                 ))}
                 {filteredTimezones.length === 0 && (
-                  <div className="px-3 py-2 text-sm text-slate-500">
+                  <div className="px-3 py-2 text-sm text-muted-foreground">
                     No timezones found
                   </div>
                 )}
               </div>
             )}
-            <p className="text-xs text-slate-500">Current: {timezone}</p>
+            <p className="text-xs text-muted-foreground">Current: {timezone}</p>
           </div>
 
           {nextRuns.length > 0 && (
             <div className="space-y-2">
               <Label>Next Scheduled Runs</Label>
-              <div className="space-y-1 rounded-md border border-slate-700 bg-slate-elevation3 p-3">
+              <div className="space-y-1 rounded-md border border-border bg-slate-elevation3 p-3">
                 {nextRuns.map((run) => (
                   <div
                     key={run.toISOString()}
-                    className="text-xs text-slate-400"
+                    className="text-xs text-muted-foreground"
                   >
                     {formatNextRun(run, timezone)}
                   </div>

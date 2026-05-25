@@ -38,10 +38,12 @@ export function WhileLoopPostRunFields({
           <div className="flex gap-16">
             <div className="w-80">
               <h1 className="text-sm">While condition</h1>
-              <h2 className="text-sm text-slate-400">{WHILE_CONDITION_HELP}</h2>
+              <h2 className="text-sm text-muted-foreground">
+                {WHILE_CONDITION_HELP}
+              </h2>
             </div>
             <div className="w-full space-y-2">
-              <div className="text-xs capitalize text-slate-500">
+              <div className="text-xs capitalize text-muted-foreground">
                 {whileDefinition.condition.criteria_type.replace(/_/g, " ")}
               </div>
               <AutoResizingTextarea
@@ -55,7 +57,9 @@ export function WhileLoopPostRunFields({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-sm">Block output</h1>
-            <h2 className="text-sm text-slate-400">{BLOCK_OUTPUT_HELP}</h2>
+            <h2 className="text-sm text-muted-foreground">
+              {BLOCK_OUTPUT_HELP}
+            </h2>
           </div>
           <CodeEditor
             className="w-full"
@@ -78,7 +82,7 @@ export function WhileLoopPostRunFields({
             <h1 className="text-sm">While condition</h1>
             <HelpTooltip content={WHILE_CONDITION_HELP} />
           </div>
-          <div className="text-xs capitalize text-slate-500">
+          <div className="text-xs capitalize text-muted-foreground">
             {whileDefinition.condition.criteria_type.replace(/_/g, " ")}
           </div>
           <AutoResizingTextarea

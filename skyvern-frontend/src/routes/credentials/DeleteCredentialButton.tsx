@@ -71,7 +71,7 @@ function DeleteCredentialButton({ credential }: Props) {
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
         </DialogHeader>
-        <div className="text-sm text-slate-400">
+        <div className="text-sm text-muted-foreground">
           The credential{" "}
           <span className="font-bold text-primary">{credential.name}</span> will
           be PERMANENTLY deleted. The Skyvern team has no way to restore a

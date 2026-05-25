@@ -29,7 +29,7 @@ function TaskNodeParametersPanel({
   return (
     <div className="space-y-2">
       <header className="flex gap-2">
-        <h1 className="text-xs text-slate-300">Parameters</h1>
+        <h1 className="text-xs text-muted-foreground">Parameters</h1>
         <HelpTooltip content={helpTooltips["task"]["parameters"]} />
       </header>
       <MultiSelect

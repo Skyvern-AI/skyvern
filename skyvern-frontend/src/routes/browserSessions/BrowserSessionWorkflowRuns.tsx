@@ -76,8 +76,10 @@ function BrowserSessionWorkflowRuns() {
     return (
       <div className="flex h-full w-full items-center justify-center">
         <div className="text-center">
-          <div className="mb-2 text-lg text-gray-500">No runs available</div>
-          <div className="text-sm text-gray-400">
+          <div className="mb-2 text-lg text-muted-foreground">
+            No runs available
+          </div>
+          <div className="text-sm text-muted-foreground">
             No workflow runs on this browser session
           </div>
         </div>

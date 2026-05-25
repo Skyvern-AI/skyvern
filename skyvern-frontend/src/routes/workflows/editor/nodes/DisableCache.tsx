@@ -23,7 +23,7 @@ function DisableCache({
       */}
       <div className="flex items-center justify-between">
         <div className="flex gap-2">
-          <Label className="text-xs font-normal text-slate-300">
+          <Label className="text-xs font-normal text-muted-foreground">
             Disable Cache
           </Label>
           <HelpTooltip content="Disable caching for this block." />

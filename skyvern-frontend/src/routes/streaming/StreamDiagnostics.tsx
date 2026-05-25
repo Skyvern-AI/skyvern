@@ -32,7 +32,7 @@ const STREAM_MODE_COPY: Record<
   unavailable: {
     label: "Unavailable",
     title: "Browser streaming is unavailable for this session",
-    className: "border-slate-500/40 bg-slate-500/10 text-slate-300",
+    className: "border-border bg-muted text-muted-foreground",
   },
 };
 
@@ -70,20 +70,22 @@ function StreamStatusPanel({
   return (
     <div
       className={cn(
-        "flex h-full w-full items-center justify-center rounded-md bg-slate-900 p-6 text-slate-300",
+        "flex h-full w-full items-center justify-center rounded-md border bg-slate-elevation1 p-6 text-muted-foreground",
         className,
       )}
     >
       <div className="flex max-w-md flex-col gap-2 text-sm">
-        <div className="flex items-center gap-2 font-medium text-slate-100">
-          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-slate-400" />
+        <div className="flex items-center gap-2 font-medium text-foreground">
+          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-muted-foreground" />
           <span>{diagnostic.title}</span>
         </div>
         {diagnostic.detail && (
-          <div className="text-slate-400">{diagnostic.detail}</div>
+          <div className="text-muted-foreground">{diagnostic.detail}</div>
         )}
         {diagnostic.hint && (
-          <div className="text-xs text-slate-500">{diagnostic.hint}</div>
+          <div className="text-xs text-muted-foreground/70">
+            {diagnostic.hint}
+          </div>
         )}
         {children}
       </div>

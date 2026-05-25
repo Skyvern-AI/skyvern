@@ -65,7 +65,7 @@ function CredentialsList({ filter, onStartBackgroundTest }: Props = {}) {
 
   if (filteredCredentials.length === 0 && page === 1) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
+      <div className="rounded-md border border-border bg-slate-elevation1 p-6 text-sm text-muted-foreground">
         {filter ? EMPTY_MESSAGE[filter] : "No credentials stored yet."}
       </div>
     );
