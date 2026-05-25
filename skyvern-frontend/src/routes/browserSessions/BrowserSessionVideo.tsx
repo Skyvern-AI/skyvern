@@ -62,10 +62,10 @@ function BrowserSessionVideo() {
     return (
       <div className="flex h-full w-full items-center justify-center">
         <div className="text-center">
-          <div className="mb-2 text-lg text-gray-500">
+          <div className="mb-2 text-lg text-muted-foreground">
             No recordings available
           </div>
-          <div className="text-sm text-gray-400">
+          <div className="text-sm text-muted-foreground">
             {isSessionRunning
               ? "Recordings will be available after the session completes"
               : "No recordings were created for this session"}
@@ -79,7 +79,7 @@ function BrowserSessionVideo() {
     <div className="h-full w-full p-4">
       <div className="mb-4">
         <h2 className="text-xl font-semibold">Browser Session Videos</h2>
-        <p className="text-sm text-gray-500">
+        <p className="text-sm text-muted-foreground">
           Recorded videos from this browser session
         </p>
       </div>
@@ -94,7 +94,7 @@ function BrowserSessionVideo() {
               <h3 className="font-medium">
                 {recording.filename || `Recording ${index + 1}`}
                 {recording.modified_at && (
-                  <span className="ml-2 text-sm text-gray-500">
+                  <span className="ml-2 text-sm text-muted-foreground">
                     ({new Date(recording.modified_at).toLocaleString()})
                   </span>
                 )}
@@ -111,7 +111,7 @@ function BrowserSessionVideo() {
                 >
                   Your browser does not support the video tag.
                 </video>
-                <div className="mt-2 text-xs text-gray-500">
+                <div className="mt-2 text-xs text-muted-foreground">
                   <a
                     href={getRecordingUrl(recording.url)!}
                     target="_blank"
@@ -123,13 +123,13 @@ function BrowserSessionVideo() {
                 </div>
               </div>
             ) : (
-              <div className="text-gray-500">
+              <div className="text-muted-foreground">
                 Video URL not available - video may still be processing
               </div>
             )}
 
             {recording.checksum && (
-              <div className="mt-2 text-sm text-gray-600">
+              <div className="mt-2 text-sm text-muted-foreground">
                 Checksum: {recording.checksum}
               </div>
             )}

@@ -132,7 +132,7 @@ function PayloadParameterFields({
 
   if (parameters.length === 0 && staleKeys.length === 0) {
     return (
-      <p className="text-xs text-slate-500">
+      <p className="text-xs text-muted-foreground">
         This workflow has no input parameters.
       </p>
     );
@@ -141,7 +141,7 @@ function PayloadParameterFields({
   return (
     <div className="space-y-3">
       {parameters.length === 0 && (
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-muted-foreground">
           This workflow has no input parameters.
         </p>
       )}
@@ -153,8 +153,10 @@ function PayloadParameterFields({
           <div key={param.key} className="space-y-1.5">
             <div className="flex items-center justify-between">
               <div className="flex items-baseline gap-2">
-                <Label className="text-xs text-slate-300">{param.key}</Label>
-                <span className="text-[10px] text-slate-500">
+                <Label className="text-xs text-muted-foreground">
+                  {param.key}
+                </Label>
+                <span className="text-[10px] text-muted-foreground">
                   {param.workflow_parameter_type}
                 </span>
               </div>
@@ -169,7 +171,9 @@ function PayloadParameterFields({
               )}
             </div>
             {param.description && (
-              <p className="text-[10px] text-slate-500">{param.description}</p>
+              <p className="text-[10px] text-muted-foreground">
+                {param.description}
+              </p>
             )}
             {isCredential && !isDynamic ? (
               <CredentialSelector
@@ -194,7 +198,7 @@ function PayloadParameterFields({
                 {isCredential &&
                   !payloadValues[param.key] &&
                   param.default_value != null && (
-                    <p className="text-[10px] text-slate-500">
+                    <p className="text-[10px] text-muted-foreground">
                       Default:{" "}
                       {credentialNameById.get(String(param.default_value)) ??
                         String(param.default_value)}
@@ -211,7 +215,7 @@ function PayloadParameterFields({
           <p className="text-[10px] font-medium uppercase text-amber-400">
             Dormant payload entries
           </p>
-          <p className="text-[10px] text-slate-400">
+          <p className="text-[10px] text-muted-foreground">
             The target workflow no longer declares these parameters. They are
             saved but never consumed at runtime, and any malformed Jinja2 here
             will still fail the trigger at execute time. Delete or align the
@@ -219,9 +223,9 @@ function PayloadParameterFields({
           </p>
           {staleKeys.map((key) => (
             <div key={key} className="flex items-center gap-2">
-              <Label className="text-xs text-slate-300">{key}</Label>
+              <Label className="text-xs text-muted-foreground">{key}</Label>
               <code
-                className="min-w-0 grow truncate text-[10px] text-slate-400"
+                className="min-w-0 grow truncate text-[10px] text-muted-foreground"
                 title={payloadValues[key]}
               >
                 {payloadValues[key]}

@@ -15,11 +15,11 @@ function Handle({
   return (
     <div
       className={cn(
-        "absolute flex h-[1.25rem] w-[10px] flex-wrap items-center justify-center gap-[2px] bg-slate-800 pb-1 pt-1",
+        "absolute flex h-[1.25rem] w-[10px] flex-wrap items-center justify-center gap-[2px] bg-slate-elevation5 pb-1 pt-1",
         {
           "cursor-col-resize": direction === "vertical",
           "cursor-row-resize": direction === "horizontal",
-          "bg-slate-700": isDragging,
+          "bg-slate-elevation4": isDragging,
         },
       )}
       onDoubleClick={() => onDoubleClick?.()}
@@ -430,8 +430,8 @@ function Splitter({
             onDoubleClick={snap}
           >
             <div
-              className={cn("h-full w-[2px] bg-slate-800", {
-                "bg-slate-700": isDragging,
+              className={cn("h-full w-[2px] bg-slate-elevation5", {
+                "bg-slate-elevation4": isDragging,
               })}
             />
             <Handle

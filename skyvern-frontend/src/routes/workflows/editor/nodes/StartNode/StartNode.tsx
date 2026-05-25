@@ -194,30 +194,31 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
         id="a"
         className="opacity-0"
       />
-      <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+      <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
         Start
         {loopParent ? (
-          <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
-            <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
-            <div className="space-y-1 text-left font-normal text-slate-400">
+          <div className="mt-4 flex gap-3 rounded-md bg-slate-elevation5 p-3 normal-case tracking-normal">
+            <span className="rounded bg-slate-elevation4 p-1 text-lg">💡</span>
+            <div className="space-y-1 text-left font-normal text-muted-foreground">
               {loopParent.data.loopKind === "while" ? (
                 <>
                   Use{" "}
-                  <code className="text-white">{`{{ current_index }}`}</code> to
-                  get the current zero-based loop index for a given iteration.
+                  <code className="text-foreground">{`{{ current_index }}`}</code>{" "}
+                  to get the current zero-based loop index for a given
+                  iteration.
                 </>
               ) : (
                 <>
                   Use{" "}
-                  <code className="text-white">{`{{ current_value }}`}</code> to
-                  get the current loop value for a given iteration.
+                  <code className="text-foreground">{`{{ current_value }}`}</code>{" "}
+                  to get the current loop value for a given iteration.
                 </>
               )}
             </div>
           </div>
         ) : null}
         {isInsideConditional && (
-          <div className="mt-4 rounded-md border border-dashed border-slate-500 p-4 text-center font-normal normal-case tracking-normal text-slate-300">
+          <div className="mt-4 rounded-md border border-dashed border-input p-4 text-center font-normal normal-case tracking-normal text-muted-foreground">
             Start adding blocks to be executed for the selected condition
           </div>
         )}

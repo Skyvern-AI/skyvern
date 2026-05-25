@@ -242,7 +242,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">URL</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               The starting URL for the task
                             </h2>
                           </div>
@@ -266,7 +266,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Navigation Goal</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Where should Skyvern go and what should Skyvern
                               do?
                             </h2>
@@ -297,7 +297,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                             <FormLabel>
                               <div className="w-72">
                                 <h1 className="text-lg">Navigation Payload</h1>
-                                <h2 className="text-base text-slate-400">
+                                <h2 className="text-base text-muted-foreground">
                                   Specify important parameters, routes, or
                                   states
                                 </h2>
@@ -375,7 +375,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Data Extraction Goal</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               What outputs are you looking to get?
                             </h2>
                           </div>
@@ -403,7 +403,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Data Schema</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Specify the output format in JSON
                             </h2>
                           </div>
@@ -454,7 +454,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Include Action History</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Whether to include action history when verifying
                               the task completion.
                             </h2>
@@ -484,7 +484,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Max Steps Override</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Want to allow this task to execute more or less
                               steps than the default?
                             </h2>
@@ -522,7 +522,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Webhook Callback URL</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               The URL of a webhook endpoint to send the
                               extracted information
                             </h2>
@@ -574,7 +574,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                               <div className="flex items-center gap-2 text-lg">
                                 Proxy Location
                               </div>
-                              <h2 className="text-sm text-slate-400">
+                              <h2 className="text-sm text-muted-foreground">
                                 Route Skyvern through one of our available
                                 proxies.
                               </h2>
@@ -604,7 +604,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Max Screenshot Scrolls</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                             </h2>
                           </div>
@@ -642,7 +642,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Extra HTTP Headers</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Specify some self defined HTTP requests headers in
                               Dict format
                             </h2>
@@ -671,7 +671,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Error Messages</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               Specify any error outputs you would like to be
                               notified about
                             </h2>
@@ -703,7 +703,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">2FA Identifier</h1>
-                            <h2 className="text-base text-slate-400"></h2>
+                            <h2 className="text-base text-muted-foreground"></h2>
                           </div>
                         </FormLabel>
                         <div className="w-full">
@@ -729,7 +729,7 @@ function CreateNewTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Browser Address</h1>
-                            <h2 className="text-base text-slate-400">
+                            <h2 className="text-base text-muted-foreground">
                               The address of the Browser server to use for the
                               task run.
                             </h2>

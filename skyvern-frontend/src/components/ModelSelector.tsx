@@ -79,7 +79,9 @@ function ModelSelector({
   return (
     <div className="flex items-center justify-between">
       <div className="flex gap-2">
-        <Label className="text-xs font-normal text-slate-300">Model</Label>
+        <Label className="text-xs font-normal text-muted-foreground">
+          Model
+        </Label>
         <HelpTooltip content="The LLM model to use for this block" />
       </div>
       <div className="relative flex items-center">
@@ -112,13 +114,13 @@ function ModelSelector({
         {value && clearable && (
           <>
             <div
-              className="pointer-events-none absolute right-8 top-1/2 h-5 w-px -translate-y-1/2 bg-slate-200 opacity-70 dark:bg-slate-700"
+              className="pointer-events-none absolute right-8 top-1/2 h-5 w-px -translate-y-1/2 bg-slate-elevation3 opacity-70 dark:bg-slate-elevation4"
               aria-hidden="true"
             />
             <button
               type="button"
               aria-label="Clear selection"
-              className="absolute right-0 z-10 flex h-9 w-8 items-center justify-center text-slate-400 hover:text-red-500 focus:outline-none"
+              className="absolute right-0 z-10 flex h-9 w-8 items-center justify-center text-muted-foreground hover:text-red-500 focus:outline-none"
               onClick={() => onChange(null)}
               tabIndex={0}
             >

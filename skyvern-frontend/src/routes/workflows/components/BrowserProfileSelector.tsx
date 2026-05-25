@@ -125,7 +125,7 @@ function BrowserProfileSelector({
           </span>
         </div>
         <div className="flex items-center pr-2">
-          <ChevronDownIcon className="size-4 text-slate-500" />
+          <ChevronDownIcon className="size-4 text-muted-foreground" />
         </div>
       </div>
     );
@@ -163,14 +163,14 @@ function BrowserProfileSelector({
           )}
         >
           {hasValue ? (
-            <span className="text-slate-200">{triggerLabel}</span>
+            <span className="text-foreground">{triggerLabel}</span>
           ) : (
             <span className="text-muted-foreground">{triggerLabel}</span>
           )}
         </div>
         <div className="flex items-center pr-2">
           <ChevronDownIcon
-            className={`size-4 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}
+            className={`size-4 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
           />
         </div>
       </div>
@@ -178,17 +178,17 @@ function BrowserProfileSelector({
       {open && (
         <div
           ref={dropdownRef}
-          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-slate-600 bg-slate-800 shadow-lg"
+          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-popover"
           onMouseDown={(e) => e.preventDefault()}
         >
-          <div className="border-b border-slate-600 px-3 py-2">
+          <div className="border-b px-3 py-2">
             <input
               ref={inputRef}
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search browser profiles..."
-              className="w-full bg-transparent text-sm text-slate-200 placeholder:text-muted-foreground focus-visible:outline-none"
+              className="w-full bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none"
             />
           </div>
           <div
@@ -206,11 +206,11 @@ function BrowserProfileSelector({
               type="button"
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => handleSelect(null)}
-              className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
-                !hasValue ? "bg-slate-700" : ""
+              className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                !hasValue ? "bg-accent" : ""
               }`}
             >
-              <span className="text-slate-200">None</span>
+              <span className="text-foreground">None</span>
             </button>
             {(isFetching || isTyping) && profiles.length === 0 ? (
               <>
@@ -225,7 +225,7 @@ function BrowserProfileSelector({
                 ))}
               </>
             ) : profiles.length === 0 ? (
-              <div className="px-3 py-3 text-xs text-slate-500">
+              <div className="px-3 py-3 text-xs text-muted-foreground">
                 {debouncedSearch
                   ? `No browser profiles match "${debouncedSearch}".`
                   : "No browser profiles found."}
@@ -240,15 +240,15 @@ function BrowserProfileSelector({
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => handleSelect(profile.browser_profile_id)}
-                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm transition-colors hover:bg-slate-700 ${
-                        isSelected ? "bg-slate-700" : ""
+                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                        isSelected ? "bg-accent" : ""
                       }`}
                     >
-                      <span className="font-medium text-slate-200">
+                      <span className="font-medium text-foreground">
                         {profile.name}
                       </span>
                       {profile.description && (
-                        <span className="truncate text-xs text-slate-400">
+                        <span className="truncate text-xs text-muted-foreground">
                           {profile.description}
                         </span>
                       )}
@@ -257,7 +257,7 @@ function BrowserProfileSelector({
                 })}
                 {isFetchingNextPage && (
                   <div className="flex items-center justify-center py-2">
-                    <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                    <ReloadIcon className="h-3 w-3 animate-spin text-muted-foreground" />
                   </div>
                 )}
               </>

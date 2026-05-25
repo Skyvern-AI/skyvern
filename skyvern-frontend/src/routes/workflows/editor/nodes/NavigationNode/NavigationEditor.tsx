@@ -70,11 +70,23 @@ function NavigationEditorBody({
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const isV2Mode = data.engine === RunEngine.SkyvernV2;
+  const allowLegacyV2Selection = data.legacyV2Available || isV2Mode;
+  const availableEngines = allowLegacyV2Selection
+    ? [
+        RunEngine.SkyvernV1,
+        RunEngine.SkyvernV2,
+        RunEngine.OpenaiCua,
+        RunEngine.AnthropicCua,
+      ]
+    : [RunEngine.SkyvernV1, RunEngine.OpenaiCua, RunEngine.AnthropicCua];
   const hasInteracted = useHasInteractedThisSession();
 
   const handleEngineChange = (value: RunEngine) => {
     if (!editable) return;
-    const updates: Partial<NavigationNodeData> = { engine: value };
+    const updates: Partial<NavigationNodeData> = {
+      engine: value,
+      legacyV2Available: allowLegacyV2Selection,
+    };
     if (value === RunEngine.SkyvernV2) {
       updates.prompt = data.navigationGoal || data.prompt;
       updates.navigationGoal = "";
@@ -131,12 +143,7 @@ function NavigationEditorBody({
             value={data.engine}
             onChange={handleEngineChange}
             className="nopan w-72 text-xs"
-            availableEngines={[
-              RunEngine.SkyvernV1,
-              RunEngine.SkyvernV2,
-              RunEngine.OpenaiCua,
-              RunEngine.AnthropicCua,
-            ]}
+            availableEngines={availableEngines}
           />
         </div>
       </div>
@@ -281,12 +288,7 @@ function NavigationEditorBody({
             value={data.engine}
             onChange={handleEngineChange}
             className="nopan w-72 text-xs"
-            availableEngines={[
-              RunEngine.SkyvernV1,
-              RunEngine.SkyvernV2,
-              RunEngine.OpenaiCua,
-              RunEngine.AnthropicCua,
-            ]}
+            availableEngines={availableEngines}
           />
         </div>
       </div>

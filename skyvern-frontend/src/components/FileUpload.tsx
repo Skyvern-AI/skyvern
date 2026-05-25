@@ -130,7 +130,7 @@ function FileUpload({ value, onChange, required }: Props) {
           <Label
             htmlFor={inputId}
             className={cn(
-              "flex w-full cursor-pointer items-center justify-center border border-dashed py-8 hover:border-slate-500",
+              "flex w-full cursor-pointer items-center justify-center border border-dashed py-8 hover:border-input",
             )}
             onDragOver={(event) => {
               event.preventDefault();

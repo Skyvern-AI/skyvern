@@ -2,7 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
-import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
@@ -13,14 +12,6 @@ import { ProxySelector } from "@/components/ProxySelector";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
-import {
-  CustomSelectItem,
-  Select,
-  SelectContent,
-  SelectItemText,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -32,7 +23,6 @@ import {
   PaperPlaneIcon,
   Pencil1Icon,
   ReloadIcon,
-  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -126,12 +116,6 @@ function deriveHandoffTitle(prompt: string): string {
   return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
-function runWithFromSelector(
-  legacyVersion: "v1" | "v2" | "v2-code",
-): "agent" | "code" {
-  return legacyVersion === "v2-code" ? "code" : "agent";
-}
-
 function buildBlankWorkflowRequest(
   title: string,
   runWith: "agent" | "code" = "agent",
@@ -153,7 +137,6 @@ function buildBlankWorkflowRequest(
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">("v2"); // v2 (agent) is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -181,16 +164,8 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const submitInFlightRef = useRef(false);
 
   const generateWorkflowMutation = useMutation({
-    mutationFn: async ({
-      prompt,
-      version,
-    }: {
-      prompt: string;
-      version: string;
-    }) => {
+    mutationFn: async ({ prompt }: { prompt: string }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const v = version === "v1" ? "v1" : "v2";
-
       const request: Record<string, unknown> = {
         user_prompt: prompt,
         webhook_callback_url: webhookCallbackUrl,
@@ -198,7 +173,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
-        run_with: version === "v2-code" ? "code" : "agent",
+        run_with: "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema
           ? (() => {
@@ -220,9 +195,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           : null,
       };
 
-      if (v === "v1") {
-        request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
-      }
+      request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
 
       const result = await client.post<
         Createv2TaskRequest,
@@ -230,7 +203,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       >(
         "/workflows/create-from-prompt",
         {
-          task_version: v,
+          task_version: "v1",
           request,
         },
         {
@@ -318,41 +291,39 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const isSubmitting =
     generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
 
-  const submitPrompt = ({
-    prompt,
-    legacyVersion,
-  }: {
-    prompt: string;
-    legacyVersion: "v1" | "v2" | "v2-code";
-  }) => {
+  const submitPrompt = ({ prompt }: { prompt: string }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
     }
     submitInFlightRef.current = true;
-    const runWith = runWithFromSelector(legacyVersion);
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt, runWith });
+      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
       return;
     }
-    generateWorkflowMutation.mutate({ prompt, version: legacyVersion });
+    generateWorkflowMutation.mutate({ prompt });
   };
 
   return (
     <div>
-      <div
-        className="rounded-sm py-[4.25rem]"
-        style={{
-          background: `url(${img}) 50% / cover no-repeat`,
-        }}
-      >
-        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-          <span className="text-2xl">
-            What task would you like to accomplish?
-          </span>
+      <div className="relative overflow-hidden rounded-2xl border border-border bg-card py-14 shadow-card">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 bg-gradient-to-br from-brand-soft via-brand-soft/30 to-card dark:from-brand/15 dark:via-card dark:to-card"
+        />
+        <div className="relative mx-auto flex min-w-44 flex-col items-center gap-6 px-8">
+          <div className="flex flex-col items-center gap-2 text-center">
+            <span className="text-2xl font-semibold">
+              What task would you like to accomplish?
+            </span>
+            <p className="max-w-md text-sm text-muted-foreground">
+              Describe what you want Skyvern to do. We&apos;ll generate a
+              workflow you can run, edit, and re-use.
+            </p>
+          </div>
           <div className="flex w-full max-w-xl flex-col">
             <div
               className={cn(
-                "flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4",
+                "flex w-full items-center gap-2 rounded-xl bg-slate-elevation4 py-2 pr-4",
                 {
                   "pointer-events-none opacity-50": promptImprovalIsPending,
                 },
@@ -364,71 +335,6 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Enter your prompt..."
               />
-              <Select
-                value={selectValue}
-                onValueChange={(value: "v1" | "v2" | "v2-code") => {
-                  setSelectValue(value);
-                }}
-              >
-                <SelectTrigger className="w-48 focus:ring-0">
-                  {selectValue === "v2-code" ? (
-                    <div className="relative z-10 flex w-full flex-col items-center">
-                      <div className="flex items-center gap-1">
-                        <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
-                        <div className="font-normal text-white">
-                          Skyvern 2.0
-                        </div>
-                      </div>
-                      <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
-                        with code
-                      </div>
-                    </div>
-                  ) : (
-                    <SelectValue className="relative z-10" />
-                  )}
-                </SelectTrigger>
-                <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v1">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 1.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for simple tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 2.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for complex tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem
-                    value="v2-code"
-                    className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
-                  >
-                    <div className="animate-shimmer absolute inset-0 bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
-                    <div className="relative flex items-center gap-2 space-y-2">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
-                            Skyvern 2.0
-                          </SelectItemText>
-                          <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
-                        </div>
-                        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text text-xs font-semibold text-transparent">
-                          with code
-                        </div>
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                </SelectContent>
-              </Select>
               <ImprovePrompt
                 isVisible={Boolean(prompt.trim())}
                 onBegin={() => {
@@ -463,7 +369,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <PaperPlaneIcon
                     className="size-6 cursor-pointer"
                     onClick={() => {
-                      submitPrompt({ prompt, legacyVersion: selectValue });
+                      submitPrompt({ prompt });
                     }}
                   />
                 )}
@@ -471,12 +377,12 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
             </div>
             {showAdvancedSettings ? (
               <div className="rounded-b-lg px-2">
-                <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
+                <div className="space-y-4 rounded-b-xl bg-slate-elevation1 p-4">
                   <header>Advanced Settings</header>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Webhook Callback URL</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The URL of a webhook endpoint to send the extracted
                         information
                       </div>
@@ -509,7 +415,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Proxy Location</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Route Skyvern through one of our available proxies.
                       </div>
                     </div>
@@ -521,7 +427,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Browser Session ID</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The ID of a persistent browser session
                       </div>
                     </div>
@@ -536,7 +442,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Browser Address</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The address of the Browser server to use for the task
                         run.
                       </div>
@@ -552,7 +458,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">2FA Identifier</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The identifier for a 2FA code for this task.
                       </div>
                     </div>
@@ -566,7 +472,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Extra HTTP Headers</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Specify some self defined HTTP requests headers in Dict
                         format
                       </div>
@@ -591,7 +497,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Generate Script</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Whether to generate scripts for this task run (on
                         success).
                       </div>
@@ -606,7 +512,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Publish Workflow</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Whether to create a workflow alongside this task run.
                         Will also be created if "Generate Scripts" is true.
                       </div>
@@ -621,7 +527,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Max Steps Override</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The maximum number of steps to take for this task.
                       </div>
                     </div>
@@ -636,7 +542,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Data Schema</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Specify the output data schema in JSON format
                       </div>
                     </div>
@@ -654,7 +560,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Max Screenshot Scrolls</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                       </div>
                     </div>
@@ -672,7 +578,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           </div>
         </div>
       </div>
-      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+      <div className="flex flex-wrap justify-center gap-3 px-4 py-6">
         {exampleCases.map((example) => {
           return (
             <ExampleCasePill
@@ -680,10 +586,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
               icon={example.icon}
               label={example.label}
               onClick={() => {
-                submitPrompt({
-                  prompt: example.prompt,
-                  legacyVersion: "v2",
-                });
+                submitPrompt({ prompt: example.prompt });
               }}
             />
           );

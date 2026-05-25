@@ -99,6 +99,34 @@ describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
   it("defines --warning under .dark", () => {
     expect(dark).toMatch(/--warning:\s*[^;]+;/);
   });
+
+  it("defines --brand under :root", () => {
+    expect(root).toMatch(/--brand:\s*[^;]+;/);
+  });
+
+  it("defines --brand-foreground under :root", () => {
+    expect(root).toMatch(/--brand-foreground:\s*[^;]+;/);
+  });
+
+  it("defines --brand-soft under :root", () => {
+    expect(root).toMatch(/--brand-soft:\s*[^;]+;/);
+  });
+
+  it("defines --brand under .dark", () => {
+    expect(dark).toMatch(/--brand:\s*[^;]+;/);
+  });
+
+  it("defines --shadow-card under :root", () => {
+    expect(root).toMatch(/--shadow-card:\s*[^;]+;/);
+  });
+
+  it("defines --xy-controls-button-background-color under :root", () => {
+    expect(root).toMatch(/--xy-controls-button-background-color:\s*[^;]+;/);
+  });
+
+  it("defines --xy-controls-button-background-color under .dark", () => {
+    expect(dark).toMatch(/--xy-controls-button-background-color:\s*[^;]+;/);
+  });
 });
 
 describe("--ring is consistent across cloud/eval/src", () => {
@@ -117,4 +145,25 @@ describe("--ring is consistent across cloud/eval/src", () => {
     const values = CSS_FILES.map((f) => ringValue(load(f), ".dark"));
     expect(new Set(values).size).toBe(1);
   });
+});
+
+describe("light-mode neutral hierarchy", () => {
+  // Skyvern Figma DS intentionally collapses --secondary, --muted, and --accent
+  // to a single neutral surface in dark mode (#1e293b) and the corresponding
+  // light gray in light mode. Don't enforce 3-way distinct.
+  function tokenValue(css: string, selector: string, name: string): string {
+    const block = blockBetween(css, selector);
+    const m = block.match(new RegExp(`--${name}:\\s*([^;]+);`));
+    return (m?.[1] ?? "").trim();
+  }
+
+  it.each(CSS_FILES)(
+    "--secondary, --muted, --accent are defined in :root of %s",
+    (file) => {
+      const css = load(file);
+      expect(tokenValue(css, ":root", "secondary")).toBeTruthy();
+      expect(tokenValue(css, ":root", "muted")).toBeTruthy();
+      expect(tokenValue(css, ":root", "accent")).toBeTruthy();
+    },
+  );
 });

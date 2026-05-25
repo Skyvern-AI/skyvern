@@ -98,9 +98,9 @@ function EpisodeDetail({ episode }: { episode: ScriptFallbackEpisode }) {
       : errorMessage;
 
   return (
-    <div className="rounded border border-slate-700 bg-slate-800/50 p-3 text-sm">
+    <div className="rounded border border-border bg-slate-elevation5/50 p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-slate-200">{episode.block_label}</span>
+        <span className="font-mono text-foreground">{episode.block_label}</span>
         <Badge variant="secondary" className="text-xs">
           {fallbackTypeLabels[episode.fallback_type] ?? episode.fallback_type}
         </Badge>
@@ -122,7 +122,7 @@ function EpisodeDetail({ episode }: { episode: ScriptFallbackEpisode }) {
       </div>
       {errorMessage && (
         <div className="mt-2">
-          <p className="text-xs text-slate-400">{displayMessage}</p>
+          <p className="text-xs text-muted-foreground">{displayMessage}</p>
           {isTruncated && (
             <button
               onClick={() => setExpanded(!expanded)}
@@ -194,21 +194,21 @@ function DiffSection({
         <CodeIcon className="size-3.5" />
         {showDiff ? "Hide code changes" : "View code changes"}
         {beforeVersion != null && afterVersion != null && (
-          <span className="text-xs text-slate-500">
+          <span className="text-xs text-muted-foreground">
             v{beforeVersion} → v{afterVersion}
           </span>
         )}
       </button>
       {showDiff && isLoading && (
-        <p className="mt-2 text-xs text-slate-500">Loading diff…</p>
+        <p className="mt-2 text-xs text-muted-foreground">Loading diff…</p>
       )}
       {showDiff && hasBothVersions && (
-        <div className="mt-3 overflow-hidden rounded border border-slate-700">
+        <div className="mt-3 overflow-hidden rounded border border-border">
           <ScriptDiffViewer original={beforeText} modified={afterText} />
         </div>
       )}
       {showDiff && noCodeAvailable && (
-        <p className="mt-2 text-xs text-slate-500">
+        <p className="mt-2 text-xs text-muted-foreground">
           Code not available for these versions.
         </p>
       )}

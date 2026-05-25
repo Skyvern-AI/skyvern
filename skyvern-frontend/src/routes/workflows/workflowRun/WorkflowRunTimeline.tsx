@@ -120,7 +120,7 @@ function WorkflowRunTimeline({
               </div>
             )}
             {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-slate-400">
+              <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
                 Formulating actions...
               </div>
             )}

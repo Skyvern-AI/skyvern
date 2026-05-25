@@ -325,14 +325,14 @@ function WorkflowParameterEditPanel({
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
-            <Label className="text-xs text-slate-300">Key</Label>
+            <Label className="text-xs text-muted-foreground">Key</Label>
             <Input value={key} onChange={(e) => setKey(e.target.value)} />
             {keyValidationError && (
               <p className="text-xs text-destructive">{keyValidationError}</p>
             )}
           </div>
           <div className="space-y-1">
-            <Label className="text-xs text-slate-300">Description</Label>
+            <Label className="text-xs text-muted-foreground">Description</Label>
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -436,7 +436,7 @@ function WorkflowParameterEditPanel({
                         });
                       }}
                     />
-                    <Label className="text-xs text-slate-300">
+                    <Label className="text-xs text-muted-foreground">
                       Use Default Value
                     </Label>
                   </div>
@@ -479,7 +479,7 @@ function WorkflowParameterEditPanel({
               {/* Step 1: Credential Type */}
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Credential Type
                   </Label>
                   <HelpTooltip content="Select the type of credential you want to use. Password for login credentials, Secret for sensitive data fields, Credit Card for payment information." />
@@ -506,7 +506,9 @@ function WorkflowParameterEditPanel({
               {/* Step 2: Source */}
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Source</Label>
+                  <Label className="text-xs text-muted-foreground">
+                    Source
+                  </Label>
                   <HelpTooltip content="Select the storage location for your credentials. Skyvern supports managed credentials such as Bitwarden, 1Password, and Azure Key Vault that connect directly to your vault. If you use a custom external credential service, you can add it here as well." />
                 </div>
                 <Select
@@ -537,7 +539,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     URL Parameter Key
                   </Label>
                   <HelpTooltip content="Optional. The workflow parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
@@ -549,7 +551,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Bitwarden Collection ID
                   </Label>
                   <HelpTooltip content="Find in the Bitwarden collection URL. Supports workflow parameters." />
@@ -561,7 +563,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Bitwarden Item ID
                   </Label>
                   <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports workflow parameters." />
@@ -581,7 +583,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Bitwarden Collection ID
                   </Label>
                   <HelpTooltip content="Collection containing the identity, such as {{ parameter_name }}." />
@@ -593,7 +595,9 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">Identity Key</Label>
+                  <Label className="text-xs text-muted-foreground">
+                    Identity Key
+                  </Label>
                   <HelpTooltip content="Identity name or identifier, such as {{ parameter_name }}." />
                 </div>
                 <Input
@@ -603,7 +607,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Identity Fields
                   </Label>
                   <HelpTooltip content="Comma-separated list of field names to extract from the Bitwarden identity (e.g., 'ssn, address, phone')." />
@@ -622,7 +626,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Bitwarden Collection ID
                   </Label>
                   <HelpTooltip content="Collection containing the credit card. Supports workflow parameters." />
@@ -634,7 +638,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Bitwarden Item ID
                   </Label>
                   <HelpTooltip content="Credit card item ID. Supports workflow parameters." />
@@ -654,7 +658,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     1Password Vault ID
                   </Label>
                   <HelpTooltip content="Find this in the 1Password vault URL. Supports workflow parameters." />
@@ -666,7 +670,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     1Password Item ID
                   </Label>
                   <HelpTooltip content="Find this in the 1Password item URL. Supports workflow parameters." />
@@ -677,8 +681,8 @@ function WorkflowParameterEditPanel({
                 />
               </div>
               {credentialDataType === "creditCard" && (
-                <div className="rounded-md bg-slate-800 p-2">
-                  <div className="space-y-1 text-xs text-slate-400">
+                <div className="rounded-md bg-slate-elevation5 p-2">
+                  <div className="space-y-1 text-xs text-muted-foreground">
                     Credit Cards: Due to a 1Password limitation, add the
                     expiration date as a separate text field named "Expire Date"
                     in the format MM/YYYY (e.g. 09/2027).
@@ -693,7 +697,7 @@ function WorkflowParameterEditPanel({
             <>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Azure Key Vault Name
                   </Label>
                   <HelpTooltip content="The name of your Azure Key Vault instance (e.g., 'my-company-vault'). This is the name you see in the Azure portal." />
@@ -705,7 +709,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Azure Username Secret Key
                   </Label>
                   <HelpTooltip content="The secret name in Azure Key Vault that stores the username (e.g., 'my-app-username')." />
@@ -718,7 +722,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Azure Password Secret Key
                   </Label>
                   <HelpTooltip content="The secret name in Azure Key Vault that stores the password (e.g., 'my-app-password')." />
@@ -730,7 +734,7 @@ function WorkflowParameterEditPanel({
               </div>
               <div className="space-y-1">
                 <div className="flex gap-2">
-                  <Label className="text-xs text-slate-300">
+                  <Label className="text-xs text-muted-foreground">
                     Azure TOTP Secret Key
                   </Label>
                   <HelpTooltip content="Optional. The secret name in Azure Key Vault that stores the TOTP secret for two-factor authentication." />
@@ -747,7 +751,7 @@ function WorkflowParameterEditPanel({
           {showSkyvernCredentialSelector && (
             <div className="space-y-1">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-muted-foreground">
                   Skyvern Credential
                 </Label>
                 <HelpTooltip content="Select a credential from your Skyvern credential store. These are managed credentials you've previously added to Skyvern." />
@@ -763,7 +767,7 @@ function WorkflowParameterEditPanel({
           {showCustomCredentialSelector && (
             <div className="space-y-1">
               <div className="flex gap-2">
-                <Label className="text-xs text-slate-300">
+                <Label className="text-xs text-muted-foreground">
                   Custom Credential
                 </Label>
                 <HelpTooltip content="Select a credential managed by your custom credential service. These credentials are stored in your external credential vault." />
@@ -778,7 +782,9 @@ function WorkflowParameterEditPanel({
 
           {type === "context" && (
             <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Source Parameter</Label>
+              <Label className="text-xs text-muted-foreground">
+                Source Parameter
+              </Label>
               <SourceParameterKeySelector
                 value={sourceParameterKey}
                 onChange={setSourceParameterKey}

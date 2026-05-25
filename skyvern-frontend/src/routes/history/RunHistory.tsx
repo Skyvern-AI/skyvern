@@ -1,4 +1,5 @@
 import {
+  CounterClockwiseClockIcon,
   ExclamationTriangleIcon,
   LightningBoltIcon,
   MixerHorizontalIcon,
@@ -236,12 +237,17 @@ function RunHistory() {
       ));
     }
 
-    // No runs found
     if (runs?.length === 0) {
       return (
         <TableRow>
           <TableCell colSpan={6}>
-            <div className="text-center">No runs found</div>
+            <div className="flex flex-col items-center gap-3 py-12">
+              <CounterClockwiseClockIcon className="size-8 text-muted-foreground" />
+              <div className="text-base font-medium">No runs yet</div>
+              <p className="text-sm text-muted-foreground">
+                Workflow and task runs will appear here once they execute.
+              </p>
+            </div>
           </TableCell>
         </TableRow>
       );
@@ -263,17 +269,17 @@ function RunHistory() {
             {triggerType && <TriggerTypeBadge triggerType={triggerType} />}
             {run.script_run && (
               <Tip content="Ran with code">
-                <LightningBoltIcon className="text-[gold]" />
+                <LightningBoltIcon className="text-warning" />
               </Tip>
             )}
             {run.workflow_deleted && (
               <Tip content="Source workflow deleted">
-                <ExclamationTriangleIcon className="text-amber-400" />
+                <ExclamationTriangleIcon className="text-warning" />
               </Tip>
             )}
             <span
               className={cn(
-                run.workflow_deleted && "text-slate-400",
+                run.workflow_deleted && "text-muted-foreground",
                 "truncate",
               )}
             >
@@ -287,7 +293,7 @@ function RunHistory() {
       return (
         <React.Fragment key={run.task_run_id}>
           <TableRow
-            className="cursor-pointer"
+            className="cursor-pointer transition-colors hover:bg-muted/40"
             onClick={(event) => {
               handleNavigate(event, navPath);
             }}
@@ -305,7 +311,9 @@ function RunHistory() {
               {isKnownStatus(run.status) ? (
                 <StatusBadge status={run.status} />
               ) : (
-                <span className="text-sm text-slate-400">{run.status}</span>
+                <span className="text-sm text-muted-foreground">
+                  {run.status}
+                </span>
               )}
             </TableCell>
             <TableCell
@@ -314,7 +322,7 @@ function RunHistory() {
             >
               {basicLocalTimeFormat(run.created_at)}
             </TableCell>
-            <TableCell className="text-slate-400">
+            <TableCell className="text-muted-foreground">
               {executionTime ?? "-"}
             </TableCell>
             <TableCell>
@@ -330,7 +338,7 @@ function RunHistory() {
                             event.stopPropagation();
                             toggleParametersExpanded(run.run_id);
                           }}
-                          className={cn(isExpanded && "text-blue-400")}
+                          className={cn(isExpanded && "text-brand")}
                         >
                           <MixerHorizontalIcon className="h-4 w-4" />
                         </Button>
@@ -347,10 +355,7 @@ function RunHistory() {
 
           {isExpanded && run.workflow_permanent_id && (
             <TableRow key={`${run.run_id}-params`}>
-              <TableCell
-                colSpan={6}
-                className="bg-slate-50 dark:bg-slate-900/50"
-              >
+              <TableCell colSpan={6} className="bg-muted/50">
                 <WorkflowRunParametersInline
                   workflowPermanentId={run.workflow_permanent_id}
                   workflowRunId={run.run_id}
@@ -374,8 +379,15 @@ function RunHistory() {
 
   return (
     <div className="space-y-4">
-      <header>
-        <h1 className="text-2xl">Run History</h1>
+      <header className="space-y-3">
+        <div className="flex items-center gap-2">
+          <CounterClockwiseClockIcon className="size-6" />
+          <h1 className="text-2xl">Run History</h1>
+        </div>
+        <p className="text-muted-foreground">
+          Browse every workflow run, task run, and Skyvern 2.0 session in your
+          organization.
+        </p>
       </header>
       {workflowPermanentIdFilter ? (
         <div
@@ -431,23 +443,31 @@ function RunHistory() {
         <Table className="sm:table-fixed">
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
+              <TableHead className="w-[20%] rounded-tl-lg text-muted-foreground">
                 Run ID
               </TableHead>
-              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
-              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
-              <TableHead className="w-[27%] text-slate-400">
+              <TableHead className="w-[20%] text-muted-foreground">
+                Detail
+              </TableHead>
+              <TableHead className="w-[16%] text-muted-foreground">
+                Status
+              </TableHead>
+              <TableHead className="w-[27%] text-muted-foreground">
                 Created At
               </TableHead>
-              <TableHead className="w-[8%] text-slate-400">Duration</TableHead>
-              <TableHead className="w-[8%] rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[8%] text-muted-foreground">
+                Duration
+              </TableHead>
+              <TableHead className="w-[8%] rounded-tr-lg text-muted-foreground"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>
         </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+        <div className="flex flex-col items-center gap-3 px-3 py-3 sm:flex-row sm:justify-between">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="whitespace-nowrap text-muted-foreground">
+              Items per page
+            </span>
             <Select
               value={String(itemsPerPage)}
               onValueChange={(size) => {
@@ -557,7 +577,7 @@ function WorkflowRunParametersInline({
 
   if (!hasParameters && !hasExtraHeaders) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-muted-foreground">
         No parameters for this run
       </div>
     );

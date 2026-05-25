@@ -10,12 +10,12 @@ function TasksPage() {
   return (
     <div className="space-y-8">
       <PromptBox />
-      <div className="flex w-fit gap-1 rounded-sm border border-slate-700 p-2">
+      <div className="flex w-fit gap-1 rounded-sm border border-border p-2">
         <div
           className={cn(
-            "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+            "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-elevation4",
             {
-              "bg-slate-700": view === "history",
+              "bg-slate-elevation4": view === "history",
             },
           )}
           onClick={() => setView("history")}
@@ -24,9 +24,9 @@ function TasksPage() {
         </div>
         <div
           className={cn(
-            "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-700",
+            "cursor-pointer rounded-sm px-3 py-2 hover:bg-slate-elevation4",
             {
-              "bg-slate-700": view === "myTasks",
+              "bg-slate-elevation4": view === "myTasks",
             },
           )}
           onClick={() => setView("myTasks")}
