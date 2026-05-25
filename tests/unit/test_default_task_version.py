@@ -90,11 +90,21 @@ class TestTaskRunRequestEngine:
         req = TaskRunRequest(prompt="hello", engine=RunEngine.skyvern_v2)
         assert req.engine == RunEngine.skyvern_v2
 
-    def test_publish_workflow_forces_v2(self) -> None:
-        """publish_workflow=True must force engine to v2, since v1 doesn't support it."""
+    def test_publish_workflow_routes_to_legacy_v2(self) -> None:
+        """publish_workflow=True keeps existing callers on the legacy v2 publish path."""
         from skyvern.schemas.runs import RunEngine, TaskRunRequest
 
         req = TaskRunRequest(prompt="hello", publish_workflow=True)
+        assert req.engine == RunEngine.skyvern_v2
+
+        req = TaskRunRequest(prompt="hello", engine=RunEngine.skyvern_v1, publish_workflow=True)
+        assert req.engine == RunEngine.skyvern_v2
+
+    def test_publish_workflow_with_explicit_v2_preserved(self) -> None:
+        """Explicit v2 publish_workflow requests stay on the v2 path."""
+        from skyvern.schemas.runs import RunEngine, TaskRunRequest
+
+        req = TaskRunRequest(prompt="hello", engine=RunEngine.skyvern_v2, publish_workflow=True)
         assert req.engine == RunEngine.skyvern_v2
 
     def test_publish_workflow_false_keeps_v1(self) -> None:

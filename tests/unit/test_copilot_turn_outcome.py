@@ -8,6 +8,7 @@ from skyvern.forge.sdk.copilot.turn_outcome import (
     build_minimal_turn_outcome,
     build_turn_outcome,
     derive_response_kind,
+    escalation_reply_for,
 )
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 
@@ -72,3 +73,14 @@ def test_turn_outcome_json_round_trip() -> None:
     payload = outcome.model_dump(mode="json")
     restored = TurnOutcome.model_validate(payload)
     assert restored == outcome
+
+
+def test_escalation_reply_for_covers_derivable_kinds() -> None:
+    for kind in (ResponseKind.BUILD, ResponseKind.CLARIFY, ResponseKind.DIAGNOSE, ResponseKind.REFUSE):
+        text = escalation_reply_for(kind)
+        assert isinstance(text, str)
+        assert text
+
+
+def test_escalation_reply_for_recover_falls_back_to_clarify_text() -> None:
+    assert escalation_reply_for(ResponseKind.RECOVER) == escalation_reply_for(ResponseKind.CLARIFY)

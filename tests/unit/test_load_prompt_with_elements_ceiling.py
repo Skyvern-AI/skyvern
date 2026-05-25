@@ -19,13 +19,16 @@ def test_ceiling_fallback_keys_by_template_has_known_mappings() -> None:
         "previous_extracted_information",
         "extracted_information_schema",
         "extracted_text",
+        "non_vision_page_context",
     ]
     assert CEILING_FALLBACK_KEYS_BY_TEMPLATE["extract-action"] == [
         "action_history",
         "navigation_payload_str",
+        "non_vision_page_context",
     ]
     assert CEILING_FALLBACK_KEYS_BY_TEMPLATE["data-extraction-summary"] == [
         "data_extraction_schema",
+        "non_vision_page_context",
     ]
 
 
@@ -107,6 +110,33 @@ def test_load_prompt_with_elements_respects_ceiling_for_small_prompts() -> None:
 
     assert "small blob" in rendered
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+
+
+def test_load_prompt_with_elements_tracked_drops_non_vision_context_as_last_resort() -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked
+    from skyvern.utils.token_counter import count_tokens
+
+    oversized_non_vision_context = '{"visible_text":"' + ("UNIQUE_NON_VISION_CONTEXT " * 300_000) + '"}'
+
+    rendered, post_kwargs = load_prompt_with_elements_tracked(
+        element_tree_builder=_make_element_tree_builder(),
+        prompt_engine=engine_module,
+        template_name="extract-information",
+        data_extraction_goal="Extract documents",
+        extracted_information_schema=None,
+        current_url="https://example.test",
+        extracted_text=None,
+        error_code_mapping_str=None,
+        navigation_payload=None,
+        local_datetime="2026-04-14T12:00:00",
+        previous_extracted_information=None,
+        non_vision_page_context=oversized_non_vision_context,
+    )
+
+    assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+    assert "UNIQUE_NON_VISION_CONTEXT" not in rendered
+    assert post_kwargs["non_vision_page_context"] is None
 
 
 def test_enforce_prompt_ceiling_tracked_reports_dropped_keys() -> None:

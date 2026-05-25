@@ -24,6 +24,14 @@ def test_screenshots_stripped_when_flag_on() -> None:
     assert _llm_screenshots_enabled_metric(config, ctx) is False
 
 
+def test_vision_fallback_prompt_keeps_screenshots_when_flag_on() -> None:
+    config = MagicMock(spec=LLMConfig)
+    config.supports_vision = True
+    ctx = SkyvernContext(disable_llm_screenshots=True)
+    assert _llm_screenshots_for_call([b"png"], config, ctx, "extract-text-from-image") == [b"png"]
+    assert _llm_screenshots_enabled_metric(config, ctx, "extract-text-from-image") is True
+
+
 def test_non_vision_model_never_attaches() -> None:
     config = MagicMock(spec=LLMConfig)
     config.supports_vision = False
