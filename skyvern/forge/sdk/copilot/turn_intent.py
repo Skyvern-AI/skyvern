@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
+from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Any
 
@@ -71,6 +72,7 @@ class TurnIntentReasonCode(StrEnum):
     KEYWORD_HEURISTIC = "keyword_heuristic"
     CONFIRMATION_CARRYOVER = "confirmation_carryover"
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
+    USER_NON_PROGRESS = "user_non_progress"
 
 
 class TurnIntentAuthority(BaseModel):
@@ -334,6 +336,65 @@ def _is_bare_affirmative(user_message: str) -> bool:
     return normalized in _AFFIRMATIVE_REPLIES
 
 
+_NON_PROGRESS_MARKER_RE = re.compile(
+    r"\b(?:"
+    r"i\s+can'?t\s+see\s+(?:it|that|them|those|the)"
+    r"|still\s+(?:not|isn'?t|doesn'?t)\s+working"
+    r"|still\s+(?:nothing|nope|none|no\s+luck)"
+    r"|(?:still|it|that|this)\s+doesn'?t\s+work\b"
+    r"|same\s+(?:problem|issue|answer|reply)"
+    r"|didn'?t\s+(?:work|help)"
+    r"|doesn'?t\s+help"
+    r"|(?:still\s+)?can'?t\s+find\s+(?:it|that|them|those|the)\b"
+    r"|where\s+(?:is|are|'?s)\s+(?:it|that|they|them)\b"
+    r"|i\s+already\s+looked\b"
+    r"|i\s+looked\s+(?:everywhere|already|but|and)"
+    r"|not\s+(?:there|here|working)"
+    r"|no\s+luck"
+    r"|that\s+didn'?t\s+(?:work|help)"
+    r")\b",
+    re.IGNORECASE,
+)
+_NON_PROGRESS_SHORT_LIMIT = 80
+_NON_PROGRESS_RESTATE_THRESHOLD = 0.7
+
+
+def _user_signals_non_progress(user_message: str, chat_history: list[WorkflowCopilotChatHistoryMessage]) -> bool:
+    """True when the current user turn re-engages on the same problem.
+
+    Requires at least one prior AI reply — without that, marker phrases like
+    "where is my X" on a first turn are genuine questions, not non-progress
+    restatements of a stuck conversation.
+    """
+    text = (user_message or "").strip()
+    if not text:
+        return False
+    has_prior_ai_reply = any(
+        m.sender == WorkflowCopilotChatSender.AI and (m.content or "").strip() for m in chat_history
+    )
+    if not has_prior_ai_reply:
+        return False
+    if _NON_PROGRESS_MARKER_RE.search(text):
+        return True
+    if len(text) > _NON_PROGRESS_SHORT_LIMIT:
+        return False
+    prior = next(
+        (
+            (m.content or "").strip()
+            for m in reversed(chat_history)
+            if m.sender == WorkflowCopilotChatSender.USER and (m.content or "").strip()
+        ),
+        "",
+    )
+    if not prior:
+        return False
+    current_norm = re.sub(r"\s+", " ", text.lower()).strip()
+    prior_norm = re.sub(r"\s+", " ", prior.lower()).strip()
+    if not current_norm or not prior_norm:
+        return False
+    return SequenceMatcher(None, current_norm, prior_norm).ratio() >= _NON_PROGRESS_RESTATE_THRESHOLD
+
+
 def _carryover_mode_from_prior_turn(
     chat_history: list[WorkflowCopilotChatHistoryMessage], *, has_workflow: bool
 ) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
@@ -433,6 +494,9 @@ def build_turn_intent(
         mode, expected_output = carried_mode
         confidence = 0.3
         reason_codes.append(TurnIntentReasonCode.CONFIRMATION_CARRYOVER)
+
+    if _user_signals_non_progress(user_message, chat_history):
+        reason_codes.append(TurnIntentReasonCode.USER_NON_PROGRESS)
 
     if mode == TurnIntentMode.EDIT:
         unresolved_block_refs = _unresolved_explicit_block_refs(user_message, workflow_yaml)
