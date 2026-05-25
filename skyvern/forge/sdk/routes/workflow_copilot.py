@@ -38,6 +38,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotApplyProposedWorkflowRequest,
@@ -388,6 +389,7 @@ async def _persist_cancel_turn(
     rollback uses the same ``workflow_was_persisted`` source of truth as
     the success path; pass ``None`` for pre-agent cancels.
     """
+    turn_outcome: TurnOutcome | None
     if agent_result is None:
         user_response = "Cancelled by user."
         updated_workflow = None
@@ -395,6 +397,7 @@ async def _persist_cancel_turn(
         total_tokens = None
         response_type = "REPLY"
         output_policy_diagnostics = None
+        turn_outcome = None
         if chat.proposed_workflow is not None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -411,6 +414,7 @@ async def _persist_cancel_turn(
         total_tokens = getattr(agent_result, "total_tokens", None)
         response_type = getattr(agent_result, "response_type", "REPLY")
         output_policy_diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
+        turn_outcome = agent_result.turn_outcome
 
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -427,6 +431,7 @@ async def _persist_cancel_turn(
             sender=WorkflowCopilotChatSender.AI,
             content=user_response,
             global_llm_context=updated_global_llm_context,
+            turn_outcome=turn_outcome,
         )
     )
     proposal_disposition = _proposal_disposition(agent_result)
@@ -504,6 +509,7 @@ async def _finalise_normal_turn(
         sender=WorkflowCopilotChatSender.AI,
         content=user_response,
         global_llm_context=updated_global_llm_context,
+        turn_outcome=agent_result.turn_outcome,
     )
 
     proposal_disposition = _proposal_disposition(agent_result)
