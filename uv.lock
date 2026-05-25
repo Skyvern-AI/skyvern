@@ -27,6 +27,7 @@ constraints = [
     { name = "werkzeug", specifier = ">=3.1.6" },
 ]
 overrides = [
+    { name = "httpx", extras = ["socks"], specifier = ">=0.26.0" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "openai", specifier = ">=2.24.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
@@ -263,7 +264,7 @@ dependencies = [
     { name = "anyio" },
     { name = "distro" },
     { name = "docstring-parser" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "jiter" },
     { name = "pydantic" },
     { name = "sniffio" },
@@ -1181,7 +1182,7 @@ dependencies = [
     { name = "cyclopts" },
     { name = "exceptiongroup" },
     { name = "griffelib" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "jsonref" },
     { name = "jsonschema-path" },
     { name = "mcp" },
@@ -1595,7 +1596,7 @@ dependencies = [
     { name = "anyio" },
     { name = "distro" },
     { name = "google-auth", extra = ["requests"] },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "pydantic" },
     { name = "requests" },
     { name = "sniffio" },
@@ -1972,7 +1973,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "httpcore" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "wsproto" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cd/cd/ca91a07ae446451f7476bf3fcc909e98cb942ff032ebfda0e3fe449aca7b/httpx_ws-0.9.0.tar.gz", hash = "sha256:797373326f70eec1ae96f6e43ae9f12002fd7d73aee139a4985eaab964338a08", size = 107105, upload-time = "2026-03-28T14:11:10.781Z" }
@@ -1988,7 +1989,7 @@ dependencies = [
     { name = "filelock" },
     { name = "fsspec" },
     { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "packaging" },
     { name = "pyyaml" },
     { name = "tqdm" },
@@ -2484,7 +2485,7 @@ version = "4.5.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "async-lru" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "ipykernel" },
     { name = "jinja2" },
     { name = "jupyter-core" },
@@ -2556,7 +2557,7 @@ dependencies = [
     { name = "cachetools" },
     { name = "cryptography" },
     { name = "exceptiongroup", marker = "python_full_version < '3.12'" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "httpx-ws" },
     { name = "packaging" },
     { name = "python-box" },
@@ -2722,7 +2723,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "click" },
     { name = "fastuuid" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "importlib-metadata" },
     { name = "jinja2" },
     { name = "jsonschema" },
@@ -2897,7 +2898,7 @@ version = "1.27.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "httpx-sse" },
     { name = "jsonschema" },
     { name = "pydantic" },
@@ -3436,7 +3437,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "distro" },
-    { name = "httpx" },
+    { name = "httpx", extra = ["socks"] },
     { name = "jiter" },
     { name = "pydantic" },
     { name = "sniffio" },
@@ -5785,6 +5786,7 @@ local = [
     { name = "tornado" },
     { name = "urllib3" },
     { name = "websockets" },
+    { name = "yutori" },
     { name = "zstandard" },
 ]
 server = [
@@ -5854,6 +5856,7 @@ server = [
     { name = "urllib3" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
+    { name = "yutori" },
     { name = "zstandard" },
 ]
 
@@ -6041,6 +6044,8 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'server'", specifier = ">=0.44.0" },
     { name = "websockets", marker = "extra == 'local'", specifier = ">=12.0,<15.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=12.0,<15.1" },
+    { name = "yutori", marker = "extra == 'local'", specifier = ">=0.5.0" },
+    { name = "yutori", marker = "extra == 'server'", specifier = ">=0.5.0" },
     { name = "zstandard", marker = "extra == 'local'", specifier = ">=0.25.0" },
     { name = "zstandard", marker = "extra == 'server'", specifier = ">=0.25.0" },
 ]
@@ -7025,6 +7030,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/43/68/8c5b36aa5178900b37387937bc2c2fe0e9505537f713495472dcf6f6fccc/yarl-1.23.0-cp313-cp313t-win_amd64.whl", hash = "sha256:dd00607bffbf30250fe108065f07453ec124dbf223420f57f5e749b04295e090", size = 94932, upload-time = "2026-03-01T22:06:39.579Z" },
     { url = "https://files.pythonhosted.org/packages/c6/cc/d79ba8292f51f81f4dc533a8ccfb9fc6992cabf0998ed3245de7589dc07c/yarl-1.23.0-cp313-cp313t-win_arm64.whl", hash = "sha256:ac09d42f48f80c9ee1635b2fcaa819496a44502737660d3c0f2ade7526d29144", size = 84786, upload-time = "2026-03-01T22:06:41.988Z" },
     { url = "https://files.pythonhosted.org/packages/69/68/c8739671f5699c7dc470580a4f821ef37c32c4cb0b047ce223a7f115757f/yarl-1.23.0-py3-none-any.whl", hash = "sha256:a2df6afe50dea8ae15fa34c9f824a3ee958d785fd5d089063d960bae1daa0a3f", size = 48288, upload-time = "2026-03-01T22:07:51.388Z" },
+]
+
+[[package]]
+name = "yutori"
+version = "0.7.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx", extra = ["socks"] },
+    { name = "openai" },
+    { name = "pillow" },
+    { name = "rich" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/03/f0/4a3efd68010b8f88f40f6c042331de03810f953915d6b28905caacd08c5f/yutori-0.7.6.tar.gz", hash = "sha256:e71d1f269c60eab3936beae899bdef356bfb95a9543055538e15c23b50035b4c", size = 114515, upload-time = "2026-05-15T22:55:38.715Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/26/e5/6a98a3c80f3bb235d24ee1805bfab102d189e1a2e3e863c57b6b01f4a8b6/yutori-0.7.6-py3-none-any.whl", hash = "sha256:fbc19ca6fd36bce5333b243358ab411744dd1904bce3d33d9fe0cc34290d33ca", size = 97805, upload-time = "2026-05-15T22:55:37.507Z" },
 ]
 
 [[package]]

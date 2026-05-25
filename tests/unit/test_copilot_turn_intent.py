@@ -408,6 +408,82 @@ def test_build_turn_intent_omits_workflow_change_on_first_turn() -> None:
     assert RequiredContextKey.WORKFLOW_CHANGE not in intent.required_context
 
 
+def _ai_message(text: str) -> WorkflowCopilotChatHistoryMessage:
+    return WorkflowCopilotChatHistoryMessage(
+        sender=WorkflowCopilotChatSender.AI,
+        content=text,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def test_user_non_progress_fires_on_stuck_marker() -> None:
+    intent = build_turn_intent(
+        user_message="i can't see it",
+        workflow_yaml="",
+        chat_history=[_user_message("where is my downloaded file"), _ai_message("Check the Artifacts panel.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS in intent.reason_codes
+
+
+def test_user_non_progress_fires_on_short_restatement() -> None:
+    intent = build_turn_intent(
+        user_message="where's my downloaded file?",
+        workflow_yaml="",
+        chat_history=[_user_message("where is my downloaded file"), _ai_message("Check the Artifacts panel.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS in intent.reason_codes
+
+
+def test_user_non_progress_does_not_fire_on_topic_switch_after_ai_reply() -> None:
+    """Regression: 'where is my X' is a topic switch, not non-progress, even with prior AI."""
+    intent = build_turn_intent(
+        user_message="where is my API key stored?",
+        workflow_yaml="",
+        chat_history=[_user_message("build me a workflow"), _ai_message("Drafted v1.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS not in intent.reason_codes
+
+
+def test_user_non_progress_does_not_fire_on_first_turn_even_when_marker_matches() -> None:
+    """Regression: a first-turn 'where is my X' is a real question, not non-progress."""
+    intent = build_turn_intent(
+        user_message="where is my API key stored?",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS not in intent.reason_codes
+
+
+def test_user_non_progress_does_not_fire_on_topic_switch() -> None:
+    intent = build_turn_intent(
+        user_message="now build me a workflow for invoicing",
+        workflow_yaml="",
+        chat_history=[_user_message("where is my downloaded file"), _ai_message("Check the Artifacts panel.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS not in intent.reason_codes
+
+
+def test_user_non_progress_does_not_fire_on_legitimate_followup() -> None:
+    intent = build_turn_intent(
+        user_message="where is the documentation for loop blocks?",
+        workflow_yaml="",
+        chat_history=[_user_message("build me a workflow"), _ai_message("Drafted v1.")],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+    assert TurnIntentReasonCode.USER_NON_PROGRESS not in intent.reason_codes
+
+
 def test_store_request_policy_attaches_turn_intent_to_context() -> None:
     ctx = CopilotContext(
         organization_id="org-1",

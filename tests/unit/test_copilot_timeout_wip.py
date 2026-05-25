@@ -77,7 +77,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_untested_workflow_surfaces_as_unvalidated_wip(self) -> None:
@@ -88,7 +88,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
 
     def test_failed_test_drops_proposal(self) -> None:
@@ -99,7 +99,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_passing_test_surfaces_as_tested_proposal(self) -> None:
@@ -110,7 +110,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_TESTED
 
     def test_missing_yaml_drops_untested_proposal(self) -> None:
@@ -121,7 +121,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_missing_yaml_drops_tested_proposal(self) -> None:
@@ -132,7 +132,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
     def test_suspicious_success_drops_proposal(self) -> None:
@@ -148,7 +148,7 @@ class TestBuildTimeoutExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _TIMEOUT_REPLY_DEFAULT
 
 
@@ -159,7 +159,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _MAX_TURNS_REPLY_DEFAULT
 
     def test_untested_workflow_surfaces_as_unvalidated_wip(self) -> None:
@@ -169,7 +169,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is wf
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _MAX_TURNS_REPLY_UNVALIDATED
 
     def test_passing_test_surfaces_as_tested_proposal(self) -> None:
@@ -179,7 +179,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is wf
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _MAX_TURNS_REPLY_TESTED
 
     def test_failed_test_drops_proposal(self) -> None:
@@ -189,7 +189,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _MAX_TURNS_REPLY_DEFAULT
 
     def test_suspicious_success_drops_proposal(self) -> None:
@@ -204,7 +204,7 @@ class TestBuildMaxTurnsExitResult:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _MAX_TURNS_REPLY_DEFAULT
 
 
@@ -219,7 +219,7 @@ class TestBuildCancelledExitResult:
         assert result.cancelled is False
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _TIMEOUT_REPLY_UNVALIDATED
 
     def test_regular_cancel_uses_cancel_wip_path(self) -> None:
@@ -231,7 +231,7 @@ class TestBuildCancelledExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _CANCEL_REPLY_UNVALIDATED
 
 
@@ -243,7 +243,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert "An unexpected error occurred. Please try again." not in result.user_response
         assert "Copilot hit an internal error before it could finish this turn" in result.user_response
         assert "The workflow was not modified" in result.user_response
@@ -257,7 +257,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _UNEXPECTED_ERROR_REPLY_UNVALIDATED
 
     def test_passing_test_surfaces_as_tested_proposal(self) -> None:
@@ -268,7 +268,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
 
     def test_failed_test_drops_proposal(self) -> None:
@@ -279,7 +279,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert "Copilot hit an internal error before it could finish this turn" in result.user_response
         assert "The workflow was preserved" in result.user_response
         assert "reference cpe_" in result.user_response
@@ -309,7 +309,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == (
             "I built a 4-block draft and tested it, but the test couldn't finish: "
             "The browser session disappeared before screenshot verification could complete. "
@@ -329,7 +329,7 @@ class TestBuildUnexpectedErrorExitResult:
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is wf
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == (
             "I built a 2-block draft, but I couldn't verify it: "
             "Browser session not found while reading https://example.test. Last run status: aborted."
@@ -350,7 +350,7 @@ class TestBuildUnexpectedErrorExitResult:
 
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert "Copilot hit an internal error before it could finish this turn" in result.user_response
         assert "The workflow was preserved" in result.user_response
         assert "reference cpe_" in result.user_response
@@ -365,7 +365,7 @@ class TestBuildCancelExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _CANCEL_REPLY_DEFAULT
 
     def test_untested_workflow_surfaces_as_unvalidated_cancel_wip(self) -> None:
@@ -377,7 +377,7 @@ class TestBuildCancelExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is True
+        assert result.proposal_disposition == "review_untested"
         assert result.user_response == _CANCEL_REPLY_UNVALIDATED
 
     def test_passing_test_surfaces_as_tested_cancel_proposal(self) -> None:
@@ -389,7 +389,7 @@ class TestBuildCancelExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is wf
         assert result.workflow_yaml == "version: '1.0'"
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _CANCEL_REPLY_TESTED
 
     def test_failed_test_drops_cancel_proposal(self) -> None:
@@ -401,7 +401,7 @@ class TestBuildCancelExitResult:
         assert result.cancelled is True
         assert result.updated_workflow is None
         assert result.workflow_yaml is None
-        assert result.unvalidated is False
+        assert result.proposal_disposition == "auto_applicable"
         assert result.user_response == _CANCEL_REPLY_DEFAULT
 
 
@@ -427,8 +427,7 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         assert result.cancelled is True
         assert result.updated_workflow is ctx.last_good_workflow
         assert result.workflow_yaml == "version: good"
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _CANCEL_REPLY_TESTED
 
     def test_timeout_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
@@ -437,8 +436,7 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         result = _build_timeout_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is ctx.last_good_workflow
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _TIMEOUT_REPLY_TESTED
 
     def test_max_turns_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
@@ -447,8 +445,7 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         result = _build_max_turns_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is ctx.last_good_workflow
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _MAX_TURNS_REPLY_TESTED
 
     def test_unexpected_error_with_overwrite_surfaces_last_good_as_tested_force_review(self) -> None:
@@ -457,8 +454,7 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is ctx.last_good_workflow
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == _UNEXPECTED_ERROR_REPLY_TESTED
 
     def test_unexpected_error_with_overwrite_and_blocker_describes_latest_attempt_separately(self) -> None:
@@ -472,8 +468,7 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is ctx.last_good_workflow
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.user_response == (
             f"{_UNEXPECTED_ERROR_REPLY_TESTED} "
             "The latest attempted change did not verify: "
@@ -488,7 +483,6 @@ class TestWipExitSurfacesLastGoodWithForceReviewNotUnvalidated:
         result = _build_cancelled_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is ctx.last_good_workflow
-        assert result.unvalidated is False
-        assert result.force_review is True
+        assert result.proposal_disposition == "review_tested"
         assert result.cancelled is False
         assert result.user_response == _TIMEOUT_REPLY_TESTED

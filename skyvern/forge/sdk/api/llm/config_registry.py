@@ -972,6 +972,18 @@ if settings.ENABLE_QIANFAN:
             ),
         )
 
+if settings.ENABLE_YUTORI:
+    LLMConfigRegistry.register_config(
+        "YUTORI_NAVIGATOR",
+        LLMConfig(
+            settings.YUTORI_MODEL,
+            ["YUTORI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=4096,
+        ),
+    )
+
 if settings.ENABLE_GEMINI:
     LLMConfigRegistry.register_config(
         "GEMINI_FLASH_2_0",

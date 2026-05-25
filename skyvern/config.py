@@ -290,6 +290,14 @@ class Settings(BaseSettings):
     QIANFAN_API_KEY: str | None = None
     QIANFAN_API_BASE: str = "https://api.baiduqianfan.ai/v1"
 
+    # Yutori Navigator
+    ENABLE_YUTORI: bool = False
+    YUTORI_API_KEY: str | None = None
+    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
+    YUTORI_MODEL: str = "n1.5-latest"
+    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
+    YUTORI_TOOL_SET: str = ""
+
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
     OPENAI_COMPATIBLE_API_KEY: str | None = None
