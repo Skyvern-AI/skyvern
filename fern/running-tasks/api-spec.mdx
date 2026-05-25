@@ -28,7 +28,7 @@ Production: `https://api.skyvern.com/v1/run/tasks`
 | prompt | String | yes | "Apply for a job" | The goal or task description for Skyvern to accomplish |
 | url | String | no | https://www.example.com | The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL |
 | title | String | no | "Job Application Task" | Optional title for the task |
-| engine | String | no | "skyvern-2.0" | The Skyvern engine version to use for this task. Supported values are "skyvern-1.0" and "skyvern-2.0". Default is "skyvern-2.0" |
+| engine | String | no | "skyvern-1.0" | The Skyvern engine version to use for this task. Supported values are "skyvern-1.0" and "skyvern-2.0". Default is "skyvern-1.0" |
 | proxy_location | String | no | "RESIDENTIAL" | Geographic Proxy location to route the browser traffic through. Default is "RESIDENTIAL" |
 | data_extraction_schema | Object | no | \{ "success": \{ "type": "boolean" } } | Schema defining what data should be extracted from the webpage |
 | error_code_mapping | Object | no | \{ "AUTH_FAILED": "Authentication failed" } | Custom mapping of error codes to error messages if Skyvern encounters an error |
@@ -37,7 +37,7 @@ Production: `https://api.skyvern.com/v1/run/tasks`
 | totp_identifier | String | no | "user@example.com" | Identifier for TOTP (Time-based One-Time Password) authentication if codes are being pushed to Skyvern |
 | totp_url | String | no | https://api.example.com/totp | URL for TOTP authentication setup if Skyvern should be polling endpoint for 2FA codes |
 | browser_session_id | String | no | "sess_123" | ID of an existing browser session to reuse, having it continue from the current screen state |
-| publish_workflow | Boolean | no | false | Whether to publish this task as a reusable workflow. Default is false |
+| publish_workflow | Boolean | no | false | Deprecated. Publish an explicitly requested V2 task as a reusable workflow. Default is false |
 
 ## Example Request (Apply for a job)
 
@@ -48,7 +48,7 @@ POST https://api.skyvern.com/v1/run/tasks
     "prompt": "Apply for a job on behalf of this person: name: Chris P Bacon. email: chris@pbacon.com",
     "url": "https://jobs.lever.co/leverdemo-8/45d39614-464a-4b62-a5cd-8683ce4fb80a/apply",
     "title": "Job Application Task",
-    "engine": "skyvern-2.0",
+    "engine": "skyvern-1.0",
     "proxy_location": "RESIDENTIAL",
     "data_extraction_schema": {
         "application_success": {
@@ -113,7 +113,7 @@ The response follows the same schema as the task creation response, containing:
 | created_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was created |
 | modified_at | String | "2025-04-03T14:08:29.505Z" | Timestamp when this run was last modified |
 | run_type | String | "task_v1" | Type of task run - either task_v1 or task_v2 |
-| run_request | Object | \{ "prompt": "string", "url": "string", "title": "string", "engine": "skyvern-2.0", "proxy_location": "RESIDENTIAL", "data_extraction_schema": \{ "additionalProp1": \{ } \}, "error_code_mapping": \{ "additionalProp1": "string" \}, "max_steps": 0, "webhook_url": "string", "totp_identifier": "string", "totp_url": "string", "browser_session_id": "string", "publish_workflow": false } | The original request parameters used to start this task run |
+| run_request | Object | \{ "prompt": "string", "url": "string", "title": "string", "engine": "skyvern-1.0", "proxy_location": "RESIDENTIAL", "data_extraction_schema": \{ "additionalProp1": \{ } \}, "error_code_mapping": \{ "additionalProp1": "string" \}, "max_steps": 0, "webhook_url": "string", "totp_identifier": "string", "totp_url": "string", "browser_session_id": "string", "publish_workflow": false } | The original request parameters used to start this task run |
 
 ## Request - List Steps (GET)
 Each task run is made up of "steps" which are the individual actions Skyvern takes to complete the task. You can use this endpoint to get all the steps of the run.
