@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import mimetypes
 import os
 import posixpath
 import re
@@ -26,6 +25,15 @@ UI_PACKAGE_MODULE = "skyvern_ui"
 UI_CACHE_ENV_VAR = "SKYVERN_UI_CACHE_DIR"
 ARTIFACT_PATH_ROOTS_ENV_VAR = "SKYVERN_ARTIFACT_PATH_ROOTS"
 UI_BIND_HOST = "127.0.0.1"
+_IMAGE_CONTENT_TYPES = {
+    ".avif": "image/avif",
+    ".gif": "image/gif",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+}
 
 
 @dataclass(frozen=True)
@@ -192,15 +200,6 @@ def _local_ui_origins(ui_port: int) -> tuple[str, str]:
     return (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
 
 
-def _is_within_root(candidate: str, root: Path) -> bool:
-    candidate_key = os.path.normcase(candidate)
-    root_key = os.path.normcase(os.path.realpath(root))
-    if candidate_key == root_key:
-        return True
-    root_prefix = root_key if root_key.endswith(os.sep) else f"{root_key}{os.sep}"
-    return candidate_key.startswith(root_prefix)
-
-
 def _normalize_artifact_path(raw_path: str) -> str | None:
     if "\x00" in raw_path or "\r" in raw_path or "\n" in raw_path:
         return None
@@ -210,6 +209,10 @@ def _normalize_artifact_path(raw_path: str) -> str | None:
             return None
         raw_path = urllib.parse.unquote(parsed.path)
     return os.path.realpath(os.path.expanduser(raw_path))
+
+
+def _image_content_type(path: Path) -> str:
+    return _IMAGE_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -306,14 +309,21 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         if normalized is None:
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid artifact path")
             return None
-        if not any(_is_within_root(normalized, root) for root in self.artifact_roots):
-            self.send_error(HTTPStatus.FORBIDDEN, "Artifact path is outside the configured roots")
-            return None
-        artifact_path = Path(normalized)
-        if not artifact_path.exists() or not artifact_path.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
-            return None
-        return artifact_path
+        normalized_key = os.path.normcase(normalized)
+        for root in self.artifact_roots:
+            root_key = os.path.normcase(os.path.realpath(root))
+            root_prefix = root_key if root_key.endswith(os.sep) else f"{root_key}{os.sep}"
+            if normalized_key != root_key and not normalized_key.startswith(root_prefix):
+                continue
+
+            artifact_path = Path(normalized)
+            if not artifact_path.exists() or not artifact_path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
+                return None
+            return artifact_path
+
+        self.send_error(HTTPStatus.FORBIDDEN, "Artifact path is outside the configured roots")
+        return None
 
     def _send_recording(self, raw_path: str | None) -> None:
         artifact_path = self._validate_path(raw_path)
@@ -347,9 +357,8 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         artifact_path = self._validate_path(raw_path)
         if artifact_path is None:
             return
-        content_type = mimetypes.guess_type(str(artifact_path))[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type", _image_content_type(artifact_path))
         self.send_header("Content-Length", str(artifact_path.stat().st_size))
         self.end_headers()
         with artifact_path.open("rb") as stream:
