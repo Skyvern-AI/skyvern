@@ -26,7 +26,6 @@ UI_PACKAGE_MODULE = "skyvern_ui"
 UI_CACHE_ENV_VAR = "SKYVERN_UI_CACHE_DIR"
 ARTIFACT_PATH_ROOTS_ENV_VAR = "SKYVERN_ARTIFACT_PATH_ROOTS"
 UI_BIND_HOST = "127.0.0.1"
-_SAFE_CORS_ORIGIN_RE = re.compile(r"^http://(?:localhost|127\.0\.0\.1):\d{1,5}$")
 
 
 @dataclass(frozen=True)
@@ -182,14 +181,15 @@ def _should_serve_spa_index(request_path: str) -> bool:
     return posixpath.splitext(request_path.rstrip("/"))[1] == ""
 
 
-def _validate_cors_origin(origin: str) -> str:
-    if not _SAFE_CORS_ORIGIN_RE.fullmatch(origin):
-        raise ValueError(f"Invalid local UI origin: {origin!r}")
-    parsed = urllib.parse.urlparse(origin)
-    port = parsed.port
-    if port is None or port <= 0 or port > 65535:
-        raise ValueError(f"Invalid local UI origin port: {origin!r}")
-    return origin
+def _validate_tcp_port(port: int) -> int:
+    if isinstance(port, bool) or not isinstance(port, int) or port <= 0 or port > 65535:
+        raise ValueError(f"Invalid TCP port: {port!r}")
+    return port
+
+
+def _local_ui_origins(ui_port: int) -> tuple[str, str]:
+    port = _validate_tcp_port(ui_port)
+    return (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
 
 
 def _is_within_root(candidate: str, root: Path) -> bool:
@@ -234,7 +234,7 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
     server_version = "SkyvernArtifactServer/1.0"
     artifact_token: str | None = None
     artifact_roots: tuple[Path, ...] = ()
-    allowed_origins: tuple[str, ...] = ()
+    ui_port: int = UI_PORT
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
@@ -278,14 +278,14 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Unknown artifact endpoint")
 
     def _cors_origin(self) -> str | None:
-        if not self.allowed_origins:
-            return None
+        localhost_origin, loopback_origin = _local_ui_origins(self.ui_port)
         request_origin = self.headers.get("Origin")
-        for allowed_origin in self.allowed_origins:
-            if request_origin == allowed_origin:
-                return allowed_origin
+        if request_origin == localhost_origin:
+            return localhost_origin
+        if request_origin == loopback_origin:
+            return loopback_origin
         if request_origin is None:
-            return self.allowed_origins[0]
+            return localhost_origin
         return None
 
     def _route_path(self, parsed_path: str) -> str | None:
@@ -387,14 +387,14 @@ def _artifact_handler_class(
     *,
     artifact_token: str | None,
     artifact_roots: tuple[Path, ...],
-    allowed_origins: tuple[str, ...],
+    ui_port: int,
 ) -> type[_ArtifactHandler]:
     class ConfiguredArtifactHandler(_ArtifactHandler):
         pass
 
     ConfiguredArtifactHandler.artifact_token = artifact_token
     ConfiguredArtifactHandler.artifact_roots = artifact_roots
-    ConfiguredArtifactHandler.allowed_origins = tuple(_validate_cors_origin(origin) for origin in allowed_origins)
+    ConfiguredArtifactHandler.ui_port = _validate_tcp_port(ui_port)
     return ConfiguredArtifactHandler
 
 
@@ -410,11 +410,10 @@ def serve_installed_ui(
     def ui_handler(*args: Any, **kwargs: Any) -> _SinglePageAppHandler:
         return _SinglePageAppHandler(*args, directory=str(dist_dir), **kwargs)
 
-    allowed_origins = (f"http://localhost:{ui_port}", f"http://127.0.0.1:{ui_port}")
     artifact_handler = _artifact_handler_class(
         artifact_token=artifact_token,
         artifact_roots=_configured_artifact_roots(),
-        allowed_origins=allowed_origins,
+        ui_port=ui_port,
     )
     ui_server = _ReusableThreadingHTTPServer((UI_BIND_HOST, ui_port), ui_handler)
     artifact_server = _ReusableThreadingHTTPServer((UI_BIND_HOST, artifact_port), artifact_handler)

@@ -87,7 +87,7 @@ def test_artifact_handler_options_includes_cors_headers() -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(),
-        allowed_origins=("http://localhost:8080",),
+        ui_port=8080,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -108,17 +108,17 @@ def test_artifact_handler_options_includes_cors_headers() -> None:
         thread.join(timeout=5)
 
 
-def test_artifact_handler_rejects_invalid_cors_origin() -> None:
+def test_artifact_handler_rejects_invalid_ui_port() -> None:
     try:
         ui_runtime._artifact_handler_class(
             artifact_token="token",
             artifact_roots=(),
-            allowed_origins=("http://localhost:8080\r\nX-Injected: yes",),
+            ui_port=0,
         )
     except ValueError:
         return
 
-    raise AssertionError("Expected invalid CORS origin to be rejected")
+    raise AssertionError("Expected invalid UI port to be rejected")
 
 
 def test_artifact_handler_rejects_missing_token(tmp_path) -> None:
@@ -127,7 +127,7 @@ def test_artifact_handler_rejects_missing_token(tmp_path) -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(tmp_path.resolve(),),
-        allowed_origins=("http://localhost:8080",),
+        ui_port=8080,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -156,7 +156,7 @@ def test_artifact_handler_rejects_paths_outside_allowed_roots(tmp_path) -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(allowed_root.resolve(),),
-        allowed_origins=("http://localhost:8080",),
+        ui_port=8080,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -185,7 +185,7 @@ def test_artifact_handler_rejects_traversal_that_starts_with_allowed_root(tmp_pa
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(allowed_root.resolve(),),
-        allowed_origins=("http://localhost:8080",),
+        ui_port=8080,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -211,7 +211,7 @@ def test_artifact_handler_serves_paths_inside_allowed_roots(tmp_path) -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(tmp_path.resolve(),),
-        allowed_origins=("http://localhost:8080",),
+        ui_port=8080,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
