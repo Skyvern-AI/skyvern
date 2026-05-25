@@ -134,8 +134,7 @@ def test_build_timeout_exit_result_surfaces_last_good_after_failure() -> None:
     result = _build_timeout_exit_result(ctx, global_llm_context=None)
     assert result.updated_workflow is ctx.last_good_workflow
     assert result.workflow_yaml == "yaml-good"
-    assert result.unvalidated is False
-    assert result.force_review is True
+    assert result.proposal_disposition == "review_tested"
     assert result.user_response == _TIMEOUT_REPLY_TESTED
 
 
@@ -151,8 +150,7 @@ def test_build_timeout_exit_result_surfaces_last_good_on_mid_flight_cancellation
     ctx.last_good_workflow_yaml = "yaml-good"
     result = _build_timeout_exit_result(ctx, global_llm_context=None)
     assert result.updated_workflow is ctx.last_good_workflow
-    assert result.unvalidated is False
-    assert result.force_review is True
+    assert result.proposal_disposition == "review_tested"
 
 
 def test_build_timeout_exit_result_falls_through_when_no_last_good() -> None:
@@ -197,7 +195,7 @@ def test_translate_to_agent_result_salvages_last_good_on_failed_reply() -> None:
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
     assert agent_result.workflow_yaml == "yaml-good"
-    assert agent_result.unvalidated is True
+    assert agent_result.proposal_disposition == "review_untested"
     # Failure rewrite would have replaced the agent's text with one based on
     # ``last_update_block_count=5``; salvage must skip the rewrite.
     assert agent_result.user_response.startswith(agent_text)
@@ -224,7 +222,7 @@ def test_translate_to_agent_result_salvages_after_failure_then_update_workflow()
         result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
-    assert agent_result.unvalidated is True
+    assert agent_result.proposal_disposition == "review_untested"
     assert agent_result.user_response.startswith(agent_text)
     assert "Use Review to inspect it" in agent_result.user_response
     assert "Accept to save it" in agent_result.user_response

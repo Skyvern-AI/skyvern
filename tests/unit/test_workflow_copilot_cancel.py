@@ -351,7 +351,7 @@ async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
         cancelled=True,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=True,
+        proposal_disposition="review_untested",
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -381,7 +381,6 @@ async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
     assert frame.message == "Cancelled. I have a draft workflow you can keep."
     assert frame.updated_workflow == {"workflow_id": "wf-canonical", "title": "Draft"}
     assert frame.proposal_disposition == "review_untested"
-    assert frame.unvalidated is True
     assert frame.cancelled is True
 
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
@@ -407,7 +406,7 @@ async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
         cancelled=True,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -427,12 +426,12 @@ async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
         p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
     ]
     assert len(response_frames) == 1
-    assert response_frames[0].unvalidated is False
+    assert response_frames[0].proposal_disposition == "auto_applicable"
     assert response_frames[0].cancelled is True
 
 
 @pytest.mark.asyncio
-async def test_route_cancel_force_review_persists_proposal_without_unvalidated_marker(
+async def test_route_cancel_review_tested_persists_proposal_without_unvalidated_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancel + WIP-rescue: persisted proposal must NOT carry the ``_copilot_unvalidated`` marker."""
@@ -450,8 +449,7 @@ async def test_route_cancel_force_review_persists_proposal_without_unvalidated_m
         cancelled=True,
         total_tokens=456,
         response_type="REPLY",
-        unvalidated=False,
-        force_review=True,
+        proposal_disposition="review_tested",
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -473,9 +471,7 @@ async def test_route_cancel_force_review_persists_proposal_without_unvalidated_m
     ]
     assert len(response_frames) == 1
     assert response_frames[0].proposal_disposition == "review_tested"
-    assert response_frames[0].unvalidated is False
     assert response_frames[0].cancelled is True
-    assert response_frames[0].force_review is True
 
 
 @pytest.mark.asyncio
@@ -498,7 +494,7 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -527,7 +523,7 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip_and_no_pe
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -605,7 +601,7 @@ async def test_timeout_wip_result_streams_normal_response_frame(
         cancelled=False,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=True,
+        proposal_disposition="review_untested",
     )
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
@@ -641,7 +637,6 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     assert len(response_frames) == 1
     assert response_frames[0].updated_workflow == {"workflow_id": "wf-draft", "title": "Draft"}
     assert response_frames[0].proposal_disposition == "review_untested"
-    assert response_frames[0].unvalidated is True
     assert response_frames[0].total_tokens == 123
 
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
@@ -651,10 +646,10 @@ async def test_timeout_wip_result_streams_normal_response_frame(
 
 
 @pytest.mark.asyncio
-async def test_timeout_wip_force_review_propagates_to_response_frame(
+async def test_timeout_wip_review_tested_propagates_to_response_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-cancel WIP rescue propagates ``force_review`` to the SSE frame so the frontend skips auto-apply."""
+    """Non-cancel WIP rescue propagates ``review_tested`` so the frontend skips auto-apply."""
     monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
     captured = _install_fake_create(monkeypatch)
 
@@ -683,8 +678,7 @@ async def test_timeout_wip_force_review_propagates_to_response_frame(
         cancelled=False,
         total_tokens=789,
         response_type="REPLY",
-        unvalidated=False,
-        force_review=True,
+        proposal_disposition="review_tested",
     )
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
@@ -719,9 +713,7 @@ async def test_timeout_wip_force_review_propagates_to_response_frame(
     ]
     assert len(response_frames) == 1
     assert response_frames[0].proposal_disposition == "review_tested"
-    assert response_frames[0].unvalidated is False
     assert response_frames[0].cancelled is False
-    assert response_frames[0].force_review is True
 
 
 # ---------------------------------------------------------------------------
