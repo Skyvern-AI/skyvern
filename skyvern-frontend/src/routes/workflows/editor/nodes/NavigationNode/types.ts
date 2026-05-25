@@ -21,6 +21,7 @@ export type NavigationNodeData = NodeBaseData & {
   totpIdentifier: string | null;
   disableCache: boolean;
   includeActionHistoryInVerification: boolean;
+  legacyV2Available: boolean;
   // V2-specific fields (used when engine is SkyvernV2)
   prompt: string;
   maxSteps: number | null;
@@ -49,6 +50,7 @@ export const navigationNodeDefaultData: NavigationNodeData = {
   continueOnFailure: false,
   disableCache: false,
   includeActionHistoryInVerification: false,
+  legacyV2Available: false,
   ignoreWorkflowSystemPrompt: false,
   // V2-specific fields
   prompt: "",

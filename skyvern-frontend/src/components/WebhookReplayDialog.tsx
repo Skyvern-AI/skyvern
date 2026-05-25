@@ -269,7 +269,7 @@ export function WebhookReplayDialog({
           </div>
 
           {replayResult && (
-            <div className="max-h-[320px] space-y-3 overflow-y-auto rounded-md border border-slate-200 p-4">
+            <div className="max-h-[320px] space-y-3 overflow-y-auto rounded-md border border-border p-4">
               <div className="flex flex-wrap gap-4 text-sm">
                 <span>
                   <span className="font-medium">Status:</span>{" "}
@@ -288,7 +288,7 @@ export function WebhookReplayDialog({
                 </div>
               )}
               {replayResult.response_body && (
-                <div className="space-y-2 rounded-md border border-slate-200/80 p-2">
+                <div className="space-y-2 rounded-md border border-border/80 p-2">
                   <Label>Response Body</Label>
                   <CodeEditor
                     language="json"

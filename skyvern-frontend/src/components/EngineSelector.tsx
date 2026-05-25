@@ -32,8 +32,8 @@ const allEngineOptions: Array<EngineOption> = [
   {
     value: RunEngine.SkyvernV2,
     label: "Skyvern 2.0",
-    badge: "Multi-Goal",
-    badgeVariant: "warning",
+    badge: "Legacy",
+    badgeVariant: "default",
   },
   {
     value: RunEngine.OpenaiCua,
@@ -66,7 +66,7 @@ function BadgeLabel({ option }: { option: EngineOption }) {
           className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium", {
             "bg-green-500/20 text-green-400": option.badgeVariant === "success",
             "bg-amber-500/20 text-amber-400": option.badgeVariant === "warning",
-            "bg-slate-500/20 text-slate-400":
+            "bg-slate-elevation5/20 text-muted-foreground":
               option.badgeVariant === "default" || !option.badgeVariant,
           })}
         >

@@ -11,7 +11,7 @@ function DataSchema({ value, onChange }: Props) {
   if (value === null) {
     return (
       <div className="flex gap-2">
-        <Label className="text-xs text-slate-300">Data Schema</Label>
+        <Label className="text-xs text-muted-foreground">Data Schema</Label>
         <Checkbox
           checked={false}
           onCheckedChange={() => {
@@ -25,7 +25,7 @@ function DataSchema({ value, onChange }: Props) {
   return (
     <div className="space-y-2">
       <div className="flex gap-2">
-        <Label className="text-xs text-slate-300">Data Schema</Label>
+        <Label className="text-xs text-muted-foreground">Data Schema</Label>
         <Checkbox
           checked
           onCheckedChange={() => {

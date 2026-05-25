@@ -24,7 +24,7 @@ function ConditionalBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Executed Expression</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               The branch expression that was evaluated
             </h2>
           </div>
@@ -38,7 +38,7 @@ function ConditionalBlockParameters({
           </div>
           <div className="flex w-full items-center gap-3">
             <Switch checked={executedBranchResult} disabled />
-            <span className="text-sm text-slate-400">
+            <span className="text-sm text-muted-foreground">
               {executedBranchResult ? "True" : "False"}
             </span>
           </div>
@@ -48,7 +48,7 @@ function ConditionalBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Next Block</h1>
-            <h2 className="text-base text-slate-400">
+            <h2 className="text-base text-muted-foreground">
               The block that was executed after the condition
             </h2>
           </div>
@@ -65,23 +65,23 @@ function ConditionalBlockParameters({
       ) : null}
       {branchConditions && branchConditions.length > 0 ? (
         <div className="space-y-3">
-          <h2 className="text-base font-semibold text-slate-300">
+          <h2 className="text-base font-semibold text-muted-foreground">
             Branch Conditions
           </h2>
           {branchConditions.map((condition) => (
             <div
               key={condition.id}
-              className="space-y-2 rounded border border-slate-700/40 bg-slate-elevation3 p-3"
+              className="space-y-2 rounded border border-border/40 bg-slate-elevation3 p-3"
             >
               {condition.description ? (
-                <p className="text-sm text-slate-400">
+                <p className="text-sm text-muted-foreground">
                   {condition.description}
                 </p>
               ) : null}
               {condition.criteria?.expression ? (
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium">Expression:</span>
-                  <code className="text-sm text-slate-300">
+                  <code className="text-sm text-muted-foreground">
                     {condition.criteria.expression}
                   </code>
                 </div>
@@ -89,13 +89,13 @@ function ConditionalBlockParameters({
               {condition.next_block_label ? (
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium">Next Block:</span>
-                  <span className="text-sm text-slate-300">
+                  <span className="text-sm text-muted-foreground">
                     {condition.next_block_label}
                   </span>
                 </div>
               ) : null}
               {condition.is_default ? (
-                <span className="inline-block rounded bg-slate-700 px-2 py-0.5 text-xs">
+                <span className="inline-block rounded bg-slate-elevation4 px-2 py-0.5 text-xs">
                   Default
                 </span>
               ) : null}

@@ -47,13 +47,14 @@ function NavLinkItem({
       onClick={onItemClick ? () => onItemClick(link) : undefined}
       className={({ isActive }) => {
         return cn(
-          "block rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
+          "block rounded-lg py-2 pl-3 text-muted-foreground hover:bg-muted hover:text-primary",
           { "py-1 pl-0 text-[0.8rem]": isMobile },
           {
-            "bg-muted": isActive,
+            "border border-brand/30 bg-brand-soft text-foreground hover:bg-brand-soft hover:text-foreground dark:border-brand/40 dark:bg-brand/10 dark:text-brand-foreground":
+              isActive,
           },
           {
-            "text-primary": groupIsActive,
+            "text-primary": groupIsActive && !isActive,
             "px-3": sidebarCollapsed,
           },
         );
@@ -78,11 +79,12 @@ function NavLinkItem({
         </div>
         {!sidebarCollapsed && (link.beta || link.training) && (
           <Badge
-            className="rounded-[40px] px-2 py-1"
-            style={{
-              backgroundColor: groupIsActive ? "#301615" : "#1E1016",
-              color: groupIsActive ? "#EA580C" : "#8D3710",
-            }}
+            className={cn(
+              "rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+              link.beta
+                ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                : "bg-brand text-brand-foreground hover:bg-brand/90",
+            )}
           >
             {link.beta ? "Beta" : "Training"}
           </Badge>
@@ -126,7 +128,7 @@ function NavLinkGroup({
       })}
     >
       <div
-        className={cn("py-2 text-slate-400", {
+        className={cn("py-2 text-muted-foreground", {
           "text-primary": groupIsActive,
           "mt-2 py-1 text-[0.8rem] font-medium uppercase": isMobile,
         })}
@@ -209,7 +211,7 @@ function NavLinkGroup({
                   : undefined
               }
               className={cn(
-                "flex w-full items-center gap-2 rounded-lg py-2 pl-3 text-slate-400 hover:bg-muted hover:text-primary",
+                "flex w-full items-center gap-2 rounded-lg py-2 pl-3 text-muted-foreground hover:bg-muted hover:text-primary",
                 { "py-1 pl-0 text-[0.8rem]": isMobile },
                 {
                   "justify-center px-3": sidebarCollapsed,

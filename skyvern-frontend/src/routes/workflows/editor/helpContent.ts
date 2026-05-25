@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Skyvern 1.0: Fast, single-goal tasks. Skyvern 2.0: Complex, multi-goal tasks (slower).",
+    "Skyvern 1.0 is the default for new browser tasks. Existing V2 blocks remain supported.",
 } as const;
 
 export const basePlaceholderContent = {

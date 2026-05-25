@@ -36,14 +36,14 @@ function SummaryDisplay({
       className="space-y-1 rounded bg-slate-elevation3 p-4"
     >
       {isStale && (
-        <p className="text-xs text-slate-400">
+        <p className="text-xs text-muted-foreground">
           Out of date - re-summarize for the current output.
         </p>
       )}
       <p
         className={
           isStale
-            ? "whitespace-pre-wrap text-sm text-slate-400"
+            ? "whitespace-pre-wrap text-sm text-muted-foreground"
             : "whitespace-pre-wrap text-sm"
         }
       >
