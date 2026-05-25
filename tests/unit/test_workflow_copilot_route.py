@@ -237,6 +237,7 @@ async def test_flag_on_mid_stream_disconnect_restores_when_persisted_and_not_aut
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=False,
         proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
 
     restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -389,6 +390,7 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
         unvalidated=False,
+        turn_outcome=None,
     )
     _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     monkeypatch.setattr(
@@ -455,6 +457,7 @@ async def test_route_error_after_restore_reports_workflow_not_modified(
         workflow_was_persisted=True,
         clear_proposed_workflow=False,
         unvalidated=False,
+        turn_outcome=None,
     )
     restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
     finalise_results: list[object] = []
@@ -580,6 +583,7 @@ async def test_proposed_workflow_cleared_on_restore(
         workflow_was_persisted=workflow_was_persisted,
         clear_proposed_workflow=clear_proposed_flag,
         proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
 
     _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -652,6 +656,7 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
             "final_output_policy_allowed": False,
             "hard_block_reason_codes": ["internal_tool_instruction_leak"],
         },
+        turn_outcome=None,
     )
 
     _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
@@ -715,6 +720,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
             "raw_would_have_failed": True,
             "contained_failure": True,
         },
+        turn_outcome=None,
     )
 
     restore_mock = _setup_new_copilot_mocks(monkeypatch, chat, original_workflow, agent_result)
