@@ -28,6 +28,7 @@ import {
   parameterIsOnePasswordCredential,
   ParametersState,
   parameterIsAzureVaultCredential,
+  AUTO_GENERATED_CREDENTIAL_KEY_PATTERN,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
@@ -809,6 +810,22 @@ function WorkflowParameterEditPanel({
                     variant: "destructive",
                     title: "Failed to add parameter",
                     description: `${key} is reserved, please use another key`,
+                  });
+                  return;
+                }
+                // `credentials`/`credentials_N` keys are reserved for the Login
+                // block's auto-generated credential wrappers — letting a user author
+                // one would make the auto-gen-vs-user-authored provenance heuristic
+                // ambiguous. Block only when the key is newly set to a reserved name.
+                if (
+                  (type === "credential" || isCredentialSelected) &&
+                  key !== initialValues?.key &&
+                  AUTO_GENERATED_CREDENTIAL_KEY_PATTERN.test(key)
+                ) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save parameter",
+                    description: `"${key}" is reserved for auto-generated credential variables. Please choose a different key.`,
                   });
                   return;
                 }
