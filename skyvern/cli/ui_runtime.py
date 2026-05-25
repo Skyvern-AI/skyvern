@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import threading
@@ -25,6 +26,7 @@ UI_PACKAGE_MODULE = "skyvern_ui"
 UI_CACHE_ENV_VAR = "SKYVERN_UI_CACHE_DIR"
 ARTIFACT_PATH_ROOTS_ENV_VAR = "SKYVERN_ARTIFACT_PATH_ROOTS"
 UI_BIND_HOST = "127.0.0.1"
+_SAFE_CORS_ORIGIN_RE = re.compile(r"^http://(?:localhost|127\.0\.0\.1):\d{1,5}$")
 
 
 @dataclass(frozen=True)
@@ -174,12 +176,40 @@ def _configured_artifact_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
+def _should_serve_spa_index(request_path: str) -> bool:
+    if request_path in {"", "/"}:
         return False
-    return True
+    return posixpath.splitext(request_path.rstrip("/"))[1] == ""
+
+
+def _validate_cors_origin(origin: str) -> str:
+    if not _SAFE_CORS_ORIGIN_RE.fullmatch(origin):
+        raise ValueError(f"Invalid local UI origin: {origin!r}")
+    parsed = urllib.parse.urlparse(origin)
+    port = parsed.port
+    if port is None or port <= 0 or port > 65535:
+        raise ValueError(f"Invalid local UI origin port: {origin!r}")
+    return origin
+
+
+def _is_within_root(candidate: str, root: Path) -> bool:
+    candidate_key = os.path.normcase(candidate)
+    root_key = os.path.normcase(os.path.realpath(root))
+    if candidate_key == root_key:
+        return True
+    root_prefix = root_key if root_key.endswith(os.sep) else f"{root_key}{os.sep}"
+    return candidate_key.startswith(root_prefix)
+
+
+def _normalize_artifact_path(raw_path: str) -> str | None:
+    if "\x00" in raw_path or "\r" in raw_path or "\n" in raw_path:
+        return None
+    if raw_path.startswith("file://"):
+        parsed = urllib.parse.urlparse(raw_path)
+        if parsed.netloc not in {"", "localhost"}:
+            return None
+        raw_path = urllib.parse.unquote(parsed.path)
+    return os.path.realpath(os.path.expanduser(raw_path))
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -195,8 +225,7 @@ class _SinglePageAppHandler(SimpleHTTPRequestHandler):
 
     def send_head(self) -> Any:
         parsed = urllib.parse.urlparse(self.path)
-        requested_path = Path(self.directory) / parsed.path.lstrip("/")
-        if self.command in {"GET", "HEAD"} and not requested_path.exists():
+        if self.command in {"GET", "HEAD"} and _should_serve_spa_index(parsed.path):
             self.path = "/index.html"
         return super().send_head()
 
@@ -231,20 +260,19 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             return
 
         params = urllib.parse.parse_qs(parsed.query)
-        raw_path = params.get("path", [""])[0]
-        artifact_path = Path(raw_path) if raw_path else None
+        raw_path = params.get("path", [None])[0]
 
         if route_path == "/artifact/recording":
-            self._send_recording(artifact_path)
+            self._send_recording(raw_path)
             return
         if route_path == "/artifact/image":
-            self._send_file(artifact_path)
+            self._send_file(raw_path)
             return
         if route_path == "/artifact/json":
-            self._send_json(artifact_path)
+            self._send_json(raw_path)
             return
         if route_path == "/artifact/text":
-            self._send_text(artifact_path)
+            self._send_text(raw_path)
             return
 
         self.send_error(HTTPStatus.NOT_FOUND, "Unknown artifact endpoint")
@@ -253,8 +281,9 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         if not self.allowed_origins:
             return None
         request_origin = self.headers.get("Origin")
-        if request_origin in self.allowed_origins:
-            return request_origin
+        for allowed_origin in self.allowed_origins:
+            if request_origin == allowed_origin:
+                return allowed_origin
         if request_origin is None:
             return self.allowed_origins[0]
         return None
@@ -269,25 +298,25 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             return None
         return parsed_path[len(token_prefix) :]
 
-    def _validate_path(self, path: Path | None) -> Path | None:
-        if path is None:
+    def _validate_path(self, raw_path: str | None) -> Path | None:
+        if raw_path is None:
             self.send_error(HTTPStatus.BAD_REQUEST, "Missing path")
             return None
-        try:
-            resolved = path.expanduser().resolve()
-        except OSError:
+        normalized = _normalize_artifact_path(raw_path)
+        if normalized is None:
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid artifact path")
             return None
-        if not any(_is_relative_to(resolved, root) for root in self.artifact_roots):
+        if not any(_is_within_root(normalized, root) for root in self.artifact_roots):
             self.send_error(HTTPStatus.FORBIDDEN, "Artifact path is outside the configured roots")
             return None
-        if not resolved.exists() or not resolved.is_file():
+        artifact_path = Path(normalized)
+        if not artifact_path.exists() or not artifact_path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
             return None
-        return resolved
+        return artifact_path
 
-    def _send_recording(self, path: Path | None) -> None:
-        artifact_path = self._validate_path(path)
+    def _send_recording(self, raw_path: str | None) -> None:
+        artifact_path = self._validate_path(raw_path)
         range_header = self.headers.get("Range")
         if artifact_path is None:
             return
@@ -314,8 +343,8 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             stream.seek(start)
             self.wfile.write(stream.read(content_length))
 
-    def _send_file(self, path: Path | None) -> None:
-        artifact_path = self._validate_path(path)
+    def _send_file(self, raw_path: str | None) -> None:
+        artifact_path = self._validate_path(raw_path)
         if artifact_path is None:
             return
         content_type = mimetypes.guess_type(str(artifact_path))[0] or "application/octet-stream"
@@ -326,14 +355,14 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         with artifact_path.open("rb") as stream:
             shutil.copyfileobj(stream, self.wfile)
 
-    def _send_json(self, path: Path | None) -> None:
-        artifact_path = self._validate_path(path)
+    def _send_json(self, raw_path: str | None) -> None:
+        artifact_path = self._validate_path(raw_path)
         if artifact_path is None:
             return
         try:
             payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+        except Exception:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid artifact JSON")
             return
         encoded = json.dumps(payload).encode("utf-8")
         self.send_response(HTTPStatus.OK)
@@ -342,8 +371,8 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _send_text(self, path: Path | None) -> None:
-        artifact_path = self._validate_path(path)
+    def _send_text(self, raw_path: str | None) -> None:
+        artifact_path = self._validate_path(raw_path)
         if artifact_path is None:
             return
         contents = artifact_path.read_bytes()
@@ -365,7 +394,7 @@ def _artifact_handler_class(
 
     ConfiguredArtifactHandler.artifact_token = artifact_token
     ConfiguredArtifactHandler.artifact_roots = artifact_roots
-    ConfiguredArtifactHandler.allowed_origins = allowed_origins
+    ConfiguredArtifactHandler.allowed_origins = tuple(_validate_cors_origin(origin) for origin in allowed_origins)
     return ConfiguredArtifactHandler
 
 

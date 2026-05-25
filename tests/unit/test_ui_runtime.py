@@ -77,6 +77,12 @@ def test_has_frontend_runtime_accepts_installed_package(monkeypatch) -> None:
     assert ui_runtime.has_frontend_runtime() is True
 
 
+def test_spa_fallback_only_handles_extensionless_routes() -> None:
+    assert ui_runtime._should_serve_spa_index("/runs/local-task") is True
+    assert ui_runtime._should_serve_spa_index("/assets/app.js") is False
+    assert ui_runtime._should_serve_spa_index("/../outside.txt") is False
+
+
 def test_artifact_handler_options_includes_cors_headers() -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
@@ -100,6 +106,19 @@ def test_artifact_handler_options_includes_cors_headers() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_artifact_handler_rejects_invalid_cors_origin() -> None:
+    try:
+        ui_runtime._artifact_handler_class(
+            artifact_token="token",
+            artifact_roots=(),
+            allowed_origins=("http://localhost:8080\r\nX-Injected: yes",),
+        )
+    except ValueError:
+        return
+
+    raise AssertionError("Expected invalid CORS origin to be rejected")
 
 
 def test_artifact_handler_rejects_missing_token(tmp_path) -> None:
@@ -146,6 +165,36 @@ def test_artifact_handler_rejects_paths_outside_allowed_roots(tmp_path) -> None:
     try:
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
         connection.request("GET", f"/token/artifact/text?path={artifact}")
+        response = connection.getresponse()
+
+        assert response.status == 403
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_artifact_handler_rejects_traversal_that_starts_with_allowed_root(tmp_path) -> None:
+    allowed_root = tmp_path / "allowed"
+    outside_root = tmp_path / "outside"
+    allowed_root.mkdir()
+    outside_root.mkdir()
+    artifact = outside_root / "artifact.txt"
+    artifact.write_text("secret")
+    handler = ui_runtime._artifact_handler_class(
+        artifact_token="token",
+        artifact_roots=(allowed_root.resolve(),),
+        allowed_origins=("http://localhost:8080",),
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        traversal_path = allowed_root / ".." / "outside" / "artifact.txt"
+        connection.request("GET", f"/token/artifact/text?path={traversal_path}")
         response = connection.getresponse()
 
         assert response.status == 403

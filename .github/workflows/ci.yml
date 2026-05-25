@@ -7,6 +7,10 @@ on:
   pull_request:
   push:
     branches: [main]
+
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Run tests and pre-commit hooks
