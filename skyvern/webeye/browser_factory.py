@@ -19,7 +19,17 @@ from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import structlog
-from playwright.async_api import Browser, BrowserContext, ConsoleMessage, Download, Page, Playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    ConsoleMessage,
+    Download,
+)
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import (
+    Page,
+    Playwright,
+)
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -129,10 +139,11 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
 
     async def _on_page(page: Page) -> None:
         try:
-            if not page.video:
+            video = page.video
+            if not video:
                 return
-            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                raw_path = await page.video.path()
+            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
+                raw_path = await video.path()
             if raw_path is None:
                 return
             video_path = str(raw_path)
@@ -145,6 +156,14 @@ def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts:
                     return
             tracked_paths.add(video_path)
             browser_artifacts.video_artifacts.append(VideoArtifact(video_path=video_path))
+        except PlaywrightError:
+            LOG.debug("Failed to register popup page video", exc_info=True)
+        except TimeoutError:
+            try:
+                page_origin = urlparse(page.url).hostname or "unknown"
+            except Exception:
+                page_origin = "unknown"
+            LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
         except Exception:
             LOG.warning("Failed to register popup page video", exc_info=True)
 
