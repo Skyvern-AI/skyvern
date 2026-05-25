@@ -20,8 +20,8 @@ Parameter: `engine`
 
 This parameter defines the engine that powers the agent task.
 
-- `skyvern-2.0`: this is the default engine. It's the latest Skyvern agent that performs really well with complex and multi-step tasks. It scores **state of the art** 85.85% on the [WebVoyager benchmark](https://www.skyvern.com/blog/skyvern-2-0-state-of-the-art-web-navigation-with-85-8-on-webvoyager-eval/).
-- `skyvern-1.0`: performs really well for tasks with a simple goal, like filling a form, or searching for information on Google.
+- `skyvern-1.0`: the default engine. Performs well for tasks with a simple goal, like filling a form, or searching for information on Google.
+- `skyvern-2.0`: remains available for existing V2 workflows and explicitly requested V2 task runs.
 - `openai-cua`: uses OpenAI's CUA model.
 - `anthropic-cua`: uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 - `ui-tars`: uses the UI-TARS model (Seed1.5-VL) via Doubao API for computer vision and GUI automation with multi-turn conversation support (https://seed.bytedance.com/zh/tech/seed1_5_vl).
