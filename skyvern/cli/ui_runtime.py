@@ -211,8 +211,8 @@ def _normalize_artifact_path(raw_path: str) -> str | None:
     return os.path.realpath(os.path.expanduser(raw_path))
 
 
-def _image_content_type(path: Path) -> str:
-    return _IMAGE_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+def _image_content_type(path: str) -> str:
+    return _IMAGE_CONTENT_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -301,95 +301,98 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             return None
         return parsed_path[len(token_prefix) :]
 
-    def _validate_path(self, raw_path: str | None) -> Path | None:
+    def _send_validated_artifact(self, raw_path: str | None, artifact_kind: str) -> None:
         if raw_path is None:
             self.send_error(HTTPStatus.BAD_REQUEST, "Missing path")
-            return None
+            return
         normalized = _normalize_artifact_path(raw_path)
         if normalized is None:
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid artifact path")
-            return None
-        normalized_key = os.path.normcase(normalized)
+            return
         for root in self.artifact_roots:
-            root_key = os.path.normcase(os.path.realpath(root))
-            root_prefix = root_key if root_key.endswith(os.sep) else f"{root_key}{os.sep}"
-            if normalized_key != root_key and not normalized_key.startswith(root_prefix):
+            root_path = os.path.realpath(root)
+            root_prefix = root_path if root_path.endswith(os.sep) else f"{root_path}{os.sep}"
+            if normalized != root_path and not normalized.startswith(root_prefix):
                 continue
 
-            artifact_path = Path(normalized)
-            if not artifact_path.exists() or not artifact_path.is_file():
+            if not os.path.isfile(normalized):
                 self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
-                return None
-            return artifact_path
+                return
+
+            if artifact_kind == "recording":
+                range_header = self.headers.get("Range")
+                if not range_header:
+                    self.send_error(HTTPStatus.BAD_REQUEST, "Missing range header")
+                    return
+
+                video_size = os.path.getsize(normalized)
+                match = re.match(r"bytes=(\d+)-", range_header)
+                start = int(match.group(1)) if match else 0
+                if start >= video_size:
+                    self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    return
+                end = min(start + 1_000_000, video_size) - 1
+                content_length = end - start + 1
+
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{video_size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(content_length))
+                self.send_header("Content-Type", "video/mp4")
+                self.end_headers()
+                with open(normalized, "rb") as stream:
+                    stream.seek(start)
+                    self.wfile.write(stream.read(content_length))
+                return
+            if artifact_kind == "image":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", _image_content_type(normalized))
+                self.send_header("Content-Length", str(os.path.getsize(normalized)))
+                self.end_headers()
+                with open(normalized, "rb") as stream:
+                    shutil.copyfileobj(stream, self.wfile)
+                return
+            if artifact_kind == "json":
+                try:
+                    with open(normalized, encoding="utf-8") as stream:
+                        payload = json.load(stream)
+                except Exception:
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid artifact JSON")
+                    return
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
+            if artifact_kind == "text":
+                with open(normalized, "rb") as stream:
+                    contents = stream.read()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(contents)))
+                self.end_headers()
+                self.wfile.write(contents)
+                return
+
+            self.send_error(HTTPStatus.NOT_FOUND, "Unknown artifact endpoint")
+            return
 
         self.send_error(HTTPStatus.FORBIDDEN, "Artifact path is outside the configured roots")
-        return None
+        return
 
     def _send_recording(self, raw_path: str | None) -> None:
-        artifact_path = self._validate_path(raw_path)
-        range_header = self.headers.get("Range")
-        if artifact_path is None:
-            return
-        if not range_header:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Missing range header")
-            return
-
-        video_size = artifact_path.stat().st_size
-        match = re.match(r"bytes=(\d+)-", range_header)
-        start = int(match.group(1)) if match else 0
-        if start >= video_size:
-            self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-            return
-        end = min(start + 1_000_000, video_size) - 1
-        content_length = end - start + 1
-
-        self.send_response(HTTPStatus.PARTIAL_CONTENT)
-        self.send_header("Content-Range", f"bytes {start}-{end}/{video_size}")
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Length", str(content_length))
-        self.send_header("Content-Type", "video/mp4")
-        self.end_headers()
-        with artifact_path.open("rb") as stream:
-            stream.seek(start)
-            self.wfile.write(stream.read(content_length))
+        self._send_validated_artifact(raw_path, "recording")
 
     def _send_file(self, raw_path: str | None) -> None:
-        artifact_path = self._validate_path(raw_path)
-        if artifact_path is None:
-            return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", _image_content_type(artifact_path))
-        self.send_header("Content-Length", str(artifact_path.stat().st_size))
-        self.end_headers()
-        with artifact_path.open("rb") as stream:
-            shutil.copyfileobj(stream, self.wfile)
+        self._send_validated_artifact(raw_path, "image")
 
     def _send_json(self, raw_path: str | None) -> None:
-        artifact_path = self._validate_path(raw_path)
-        if artifact_path is None:
-            return
-        try:
-            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-        except Exception:
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid artifact JSON")
-            return
-        encoded = json.dumps(payload).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        self._send_validated_artifact(raw_path, "json")
 
     def _send_text(self, raw_path: str | None) -> None:
-        artifact_path = self._validate_path(raw_path)
-        if artifact_path is None:
-            return
-        contents = artifact_path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(contents)))
-        self.end_headers()
-        self.wfile.write(contents)
+        self._send_validated_artifact(raw_path, "text")
 
 
 def _artifact_handler_class(
