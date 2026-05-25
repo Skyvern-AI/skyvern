@@ -25,8 +25,8 @@ interface InteractiveStreamViewProps {
 
 function UrlBar({ url }: { url: string }) {
   return (
-    <div className="flex h-8 w-full items-center gap-2 rounded-t-md bg-slate-800 px-3 text-xs text-slate-300">
-      <GlobeIcon className="h-3 w-3 flex-shrink-0 text-slate-400" />
+    <div className="flex h-8 w-full items-center gap-2 rounded-t-md bg-slate-elevation5 px-3 text-xs text-muted-foreground">
+      <GlobeIcon className="h-3 w-3 flex-shrink-0 text-muted-foreground" />
       <span className="truncate">{url}</span>
     </div>
   );

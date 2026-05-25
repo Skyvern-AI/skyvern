@@ -59,13 +59,13 @@ function VerificationCodeBanner({
       <div className="flex items-center justify-between border-b border-amber-500/30 bg-amber-500/10 px-4 py-2.5">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <LockClosedIcon className="h-3.5 w-3.5 flex-shrink-0 text-amber-400" />
-          <p className="truncate text-xs text-slate-200">
-            <span className="text-slate-100">{label}</span> needs 2FA
+          <p className="truncate text-xs text-foreground">
+            <span className="text-foreground">{label}</span> needs 2FA
           </p>
           {timeRemaining !== null && (
             <span
               className={`ml-2 flex items-center gap-1 text-xs font-medium ${
-                isTimeCritical ? "text-red-300" : "text-slate-400"
+                isTimeCritical ? "text-red-300" : "text-muted-foreground"
               }`}
             >
               <ClockIcon className="h-3 w-3" />

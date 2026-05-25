@@ -133,11 +133,11 @@ function ScrollableActionList({
             refs.current[i] = element;
           }}
           className={cn(
-            "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 hover:border-slate-50",
+            "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 hover:border-foreground",
             {
               "border-l-destructive": !action.success,
               "border-l-success": action.success,
-              "border-slate-50": selected,
+              "border-foreground ring-1 ring-ring": selected,
             },
           )}
           onClick={() => onActiveIndexChange(i)}
@@ -179,11 +179,13 @@ function ScrollableActionList({
                 )}
               </div>
             </div>
-            <div className="text-xs text-slate-400">{action.reasoning}</div>
+            <div className="text-xs text-muted-foreground">
+              {action.reasoning}
+            </div>
             {action.type === ActionTypes.InputText && (
               <>
                 <Separator />
-                <div className="text-xs text-slate-400">
+                <div className="text-xs text-muted-foreground">
                   Input: {action.input}
                 </div>
               </>
@@ -198,10 +200,10 @@ function ScrollableActionList({
   return (
     <div className="h-[40rem] w-1/3 rounded border bg-slate-elevation1">
       <div className="flex items-center gap-2 p-4">
-        <div className="flex h-8 flex-1 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
+        <div className="flex h-8 flex-1 items-center justify-center rounded-sm bg-slate-elevation4 px-3 text-xs text-foreground">
           Actions: {taskDetails.actions}
         </div>
-        <div className="flex h-8 flex-1 items-center justify-center rounded-sm bg-slate-700 px-3 text-xs text-gray-50">
+        <div className="flex h-8 flex-1 items-center justify-center rounded-sm bg-slate-elevation4 px-3 text-xs text-foreground">
           Steps: {taskDetails.steps}
         </div>
         {isViewingV2 && <RunViewingModeToggle />}
@@ -218,10 +220,11 @@ function ScrollableActionList({
                 }}
                 className={cn(
                   useCompact
-                    ? "flex cursor-pointer items-center gap-2 rounded-md border-2 bg-slate-elevation3 px-3 py-2 text-xs hover:border-slate-50"
-                    : "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 p-4 hover:border-slate-50",
+                    ? "flex cursor-pointer items-center gap-2 rounded-md border-2 bg-slate-elevation3 px-3 py-2 text-xs hover:border-foreground"
+                    : "flex cursor-pointer rounded-lg border-2 bg-slate-elevation3 p-4 hover:border-foreground",
                   {
-                    "border-slate-50": activeIndex === "stream",
+                    "border-foreground ring-1 ring-ring":
+                      activeIndex === "stream",
                   },
                 )}
                 onClick={() => onActiveIndexChange("stream")}
@@ -233,7 +236,7 @@ function ScrollableActionList({
                       useCompact ? "h-3 w-3 animate-pulse" : "h-6 w-6",
                     )}
                   />
-                  <span className={cn(useCompact && "text-xs text-slate-200")}>
+                  <span className={cn(useCompact && "text-xs text-foreground")}>
                     Live
                   </span>
                 </div>

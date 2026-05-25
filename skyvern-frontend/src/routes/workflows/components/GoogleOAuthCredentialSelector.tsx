@@ -98,7 +98,7 @@ function GoogleOAuthCredentialSelector({
           <button
             type="button"
             onClick={handleUseAccountPicker}
-            className="text-xs text-slate-400 underline hover:text-slate-300"
+            className="text-xs text-muted-foreground underline hover:text-muted-foreground"
           >
             Use account picker
           </button>
@@ -122,7 +122,7 @@ function GoogleOAuthCredentialSelector({
                     <p className="text-sm font-medium">
                       <SelectItemText>{cred.credential_name}</SelectItemText>
                     </p>
-                    <p className="text-xs text-slate-400">{cred.id}</p>
+                    <p className="text-xs text-muted-foreground">{cred.id}</p>
                   </div>
                 </CustomSelectItem>
               ))}

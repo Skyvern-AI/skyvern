@@ -174,7 +174,7 @@ function PushTotpCodeForm({
           readOnly={mutation.isPending}
           className="min-h-[4.5rem]"
         />
-        <p className="text-xs text-slate-400">
+        <p className="text-xs text-muted-foreground">
           We only store this to help the current login. Avoid pasting unrelated
           sensitive data.
         </p>

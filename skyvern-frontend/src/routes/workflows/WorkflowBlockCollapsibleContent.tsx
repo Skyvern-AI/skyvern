@@ -126,9 +126,9 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                   {statusIsFinalized(task) && (
                     <div
                       className={cn(
-                        "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700",
+                        "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-slate-elevation4",
                         {
-                          "bg-slate-700 text-foreground":
+                          "bg-slate-elevation4 text-foreground":
                             activeTab === "output",
                         },
                       )}
@@ -146,9 +146,10 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
 
                   <div
                     className={cn(
-                      "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
+                      "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground",
                       {
-                        "bg-slate-700 text-foreground": activeTab === "goal",
+                        "bg-slate-elevation4 text-foreground":
+                          activeTab === "goal",
                       },
                     )}
                     onClick={() => {
@@ -159,9 +160,9 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                   </div>
                   <div
                     className={cn(
-                      "cursor-pointer rounded-sm px-3 py-2 text-slate-400 hover:bg-slate-700 hover:text-foreground",
+                      "cursor-pointer rounded-sm px-3 py-2 text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground",
                       {
-                        "bg-slate-700 text-foreground":
+                        "bg-slate-elevation4 text-foreground":
                           activeTab === "parameters",
                       },
                     )}

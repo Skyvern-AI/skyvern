@@ -15,7 +15,7 @@ const triggerConfig: Record<
   { icon: React.ReactNode; label: string }
 > = {
   [TriggerType.Manual]: {
-    icon: <CursorArrowIcon className="size-3.5 text-slate-400" />,
+    icon: <CursorArrowIcon className="size-3.5 text-muted-foreground" />,
     label: "Manual",
   },
   [TriggerType.Api]: {

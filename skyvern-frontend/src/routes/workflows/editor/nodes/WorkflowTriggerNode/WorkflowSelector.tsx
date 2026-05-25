@@ -131,11 +131,11 @@ function WorkflowSelector({
         <div className="min-w-0 flex-1 truncate px-3 py-2">
           {hasSelection ? (
             <>
-              <span className="text-slate-300">{workflowTitle}</span>
-              <span className="ml-1.5 text-slate-500">[{value}]</span>
+              <span className="text-muted-foreground">{workflowTitle}</span>
+              <span className="ml-1.5 text-muted-foreground">[{value}]</span>
             </>
           ) : value ? (
-            <span className="text-slate-300">{value}</span>
+            <span className="text-muted-foreground">{value}</span>
           ) : (
             <span className="text-muted-foreground">
               Select a workflow to trigger...
@@ -146,7 +146,7 @@ function WorkflowSelector({
           {hasSelection && (
             <button
               type="button"
-              className="rounded p-0.5 text-slate-500 hover:bg-muted hover:text-slate-300"
+              className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-muted-foreground"
               onClick={(e) => {
                 e.stopPropagation();
                 handleClear();
@@ -169,7 +169,7 @@ function WorkflowSelector({
             </button>
           )}
           <ChevronDownIcon
-            className={`size-4 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`}
+            className={`size-4 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
           />
         </div>
       </div>
@@ -178,11 +178,11 @@ function WorkflowSelector({
       {open && (
         <div
           ref={dropdownRef}
-          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-slate-600 bg-slate-800 shadow-lg"
+          className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-border bg-slate-elevation5 shadow-lg"
           onMouseDown={(e) => e.preventDefault()}
         >
           {/* Search input */}
-          <div className="border-b border-slate-600 px-3 py-2">
+          <div className="border-b border-border px-3 py-2">
             <input
               ref={inputRef}
               id={`workflow-selector-${nodeId}`}
@@ -190,7 +190,7 @@ function WorkflowSelector({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search workflows..."
-              className="w-full bg-transparent text-xs text-slate-300 placeholder:text-muted-foreground focus-visible:outline-none"
+              className="w-full bg-transparent text-xs text-muted-foreground placeholder:text-muted-foreground focus-visible:outline-none"
             />
           </div>
           {/* Results */}
@@ -218,7 +218,7 @@ function WorkflowSelector({
                 ))}
               </>
             ) : workflows.length === 0 ? (
-              <div className="px-3 py-3 text-xs text-slate-500">
+              <div className="px-3 py-3 text-xs text-muted-foreground">
                 No workflows found.
               </div>
             ) : (
@@ -231,14 +231,14 @@ function WorkflowSelector({
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => handleSelect(workflow)}
-                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs transition-colors hover:bg-slate-700 ${
-                        isSelected ? "bg-slate-700" : ""
+                      className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs transition-colors hover:bg-slate-elevation4 ${
+                        isSelected ? "bg-slate-elevation4" : ""
                       }`}
                     >
-                      <span className="font-medium text-slate-200">
+                      <span className="font-medium text-foreground">
                         {workflow.title}
                       </span>
-                      <span className="text-slate-500">
+                      <span className="text-muted-foreground">
                         {workflow.workflow_permanent_id}
                       </span>
                     </button>
@@ -246,7 +246,7 @@ function WorkflowSelector({
                 })}
                 {isFetchingNextPage && (
                   <div className="flex items-center justify-center py-2">
-                    <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
+                    <ReloadIcon className="h-3 w-3 animate-spin text-muted-foreground" />
                   </div>
                 )}
               </>

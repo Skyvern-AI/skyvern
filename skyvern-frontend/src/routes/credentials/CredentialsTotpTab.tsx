@@ -69,9 +69,9 @@ function CredentialsTotpTab() {
 
   return (
     <div className="space-y-6">
-      <div className="rounded-lg border border-slate-700 bg-slate-elevation1 p-6">
+      <div className="rounded-lg border border-border bg-slate-elevation1 p-6">
         <h2 className="text-lg font-semibold">Push a 2FA Code</h2>
-        <p className="mt-1 text-sm text-slate-400">
+        <p className="mt-1 text-sm text-muted-foreground">
           Paste the verification message you received. Skyvern extracts the code
           and attaches it to the relevant run.
         </p>
@@ -160,7 +160,7 @@ function CredentialsTotpTab() {
         )}
 
         {!isFeatureUnavailable && (
-          <div className="rounded-lg border border-slate-700 bg-slate-elevation1">
+          <div className="rounded-lg border border-border bg-slate-elevation1">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -189,7 +189,7 @@ function CredentialsTotpTab() {
                   <TableRow>
                     <TableCell
                       colSpan={6}
-                      className="text-center text-sm text-slate-300"
+                      className="text-center text-sm text-muted-foreground"
                     >
                       No 2FA codes yet. Paste a verification message above or
                       configure automatic forwarding.
@@ -212,7 +212,7 @@ function CredentialsTotpTab() {
                           {code.otp_type ?? "unknown"}
                         </Badge>
                         {code.source ? (
-                          <span className="ml-2 text-xs text-slate-400">
+                          <span className="ml-2 text-xs text-muted-foreground">
                             {code.source}
                           </span>
                         ) : null}
