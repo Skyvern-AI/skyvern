@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
 class UrlVisit(BaseModel):
@@ -135,6 +136,7 @@ class AgentResult:
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
+    turn_outcome: TurnOutcome | None = None
 
 
 @dataclass

@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
     # These help prevent cached actions from executing before the page is fully loaded
