@@ -492,6 +492,7 @@ def _check_llm_config() -> CheckResult:
         "BEDROCK": {"enable": "ENABLE_BEDROCK", "key": None},
         "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
         "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
+        "ORCAROUTER": {"enable": "ENABLE_ORCAROUTER", "key": "ORCAROUTER_API_KEY"},
         "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
     }
 

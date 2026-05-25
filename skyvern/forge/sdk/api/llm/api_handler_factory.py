@@ -1460,6 +1460,11 @@ class LLMAPIHandlerFactory:
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
+        # OrcaRouter talks OpenAI-compatible REST; route through LLMCaller to skip LiteLLM.
+        if llm_key == "ORCAROUTER":
+            llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
+            return llm_caller.call
+
         # For GitHub Copilot via OPENAI_COMPATIBLE, use LLMCaller for a custom header
         if llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
@@ -2081,6 +2086,16 @@ class LLMCaller:
             self.openai_client = AsyncOpenAI(
                 api_key=settings.OPENROUTER_API_KEY,
                 base_url=settings.OPENROUTER_API_BASE,
+                http_client=ForgeAsyncHttpxClientWrapper(),
+            )
+        elif self.llm_key == "ORCAROUTER":
+            # OrcaRouter is an OpenAI-compatible multi-model gateway. Talk to it directly
+            # via AsyncOpenAI (LiteLLM doesn't have a native provider for it). The model id
+            # sent on the wire is the one configured in ORCAROUTER_MODEL.
+            self.llm_key = settings.ORCAROUTER_MODEL or self.llm_key
+            self.openai_client = AsyncOpenAI(
+                api_key=settings.ORCAROUTER_API_KEY,
+                base_url=settings.ORCAROUTER_API_BASE,
                 http_client=ForgeAsyncHttpxClientWrapper(),
             )
         elif self.llm_key == "OPENAI_COMPATIBLE" and LLMAPIHandlerFactory.is_github_copilot_endpoint():
@@ -2707,6 +2722,11 @@ class LLMCaller:
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
         if self.original_llm_key.startswith("openrouter/"):
+            return empty_call_stats
+
+        if self.original_llm_key == "ORCAROUTER":
+            # OrcaRouter usage shape varies per upstream model; skip stats accounting
+            # to match the OpenRouter LLMCaller path.
             return empty_call_stats
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot

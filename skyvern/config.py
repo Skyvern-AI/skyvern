@@ -433,6 +433,12 @@ class Settings(BaseSettings):
     OPENROUTER_MODEL: str | None = None
     OPENROUTER_API_BASE: str = "https://openrouter.ai/api/v1"
 
+    # ORCAROUTER
+    ENABLE_ORCAROUTER: bool = False
+    ORCAROUTER_API_KEY: str | None = None
+    ORCAROUTER_MODEL: str | None = None
+    ORCAROUTER_API_BASE: str = "https://api.orcarouter.ai/v1"
+
     # GROQ
     ENABLE_GROQ: bool = False
     GROQ_API_KEY: str | None = None
