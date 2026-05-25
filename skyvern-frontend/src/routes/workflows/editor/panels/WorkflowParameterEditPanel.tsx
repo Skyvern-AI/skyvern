@@ -33,6 +33,15 @@ import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import {
+  CredentialDataType,
+  CredentialSource,
+  detectInitialCredentialDataType,
+  detectInitialCredentialSource,
+  detectInitialParameterTypeSelection,
+  header,
+  ParameterTypeSelection,
+} from "./WorkflowParameterEditPanel.helpers";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -50,19 +59,6 @@ const workflowParameterTypeOptions = [
   { label: "file", value: WorkflowParameterValueType.FileURL },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
-
-type CredentialDataType = "password" | "secret" | "creditCard";
-type CredentialSource =
-  | "bitwarden"
-  | "skyvern"
-  | "onepassword"
-  | "azurevault"
-  | "custom";
-
-// When selecting from the Value Type dropdown, "credential" is a special value that triggers
-// credential-specific UI. This is separate from WorkflowParameterValueType which only includes
-// data types like string, integer, etc.
-type ParameterTypeSelection = WorkflowParameterValueType | "credential";
 
 // Determine available sources based on credential data type
 function getAvailableSourcesForDataType(
@@ -104,25 +100,6 @@ function getAvailableSourcesForDataType(
   }
 }
 
-function header(
-  type: WorkflowEditorParameterType,
-  isEdit: boolean,
-  isCredentialSelected: boolean,
-) {
-  const prefix = isEdit ? "Edit" : "Add";
-  if (type === "workflow" && !isEdit) {
-    // Unified add mode
-    return `${prefix} Parameter`;
-  }
-  if (type === "workflow") {
-    return `${prefix} Input Parameter`;
-  }
-  if (type === "credential" || (!isEdit && isCredentialSelected)) {
-    return `${prefix} Credential Parameter`;
-  }
-  return `${prefix} Context Parameter`;
-}
-
 /**
  * Validates that a parameter key is a valid Python/Jinja2 identifier.
  * Parameter keys are used in Jinja2 templates, so they must be valid identifiers.
@@ -157,36 +134,6 @@ function validateParameterKey(key: string): string | null {
   }
 
   return null;
-}
-
-// Helper to detect initial credential data type from existing parameter
-function detectInitialCredentialDataType(
-  initialValues: ParametersState[number] | undefined,
-): CredentialDataType {
-  if (!initialValues) return "password";
-  if (initialValues.parameterType === "secret") return "secret";
-  if (initialValues.parameterType === "creditCardData") return "creditCard";
-  return "password";
-}
-
-// Helper to detect initial credential source from existing parameter
-function detectInitialCredentialSource(
-  initialValues: ParametersState[number] | undefined,
-  isCloud: boolean,
-): CredentialSource {
-  if (!initialValues) return isCloud ? "skyvern" : "bitwarden";
-
-  if (initialValues.parameterType === "secret") return "bitwarden";
-  if (initialValues.parameterType === "creditCardData") return "bitwarden";
-  if (initialValues.parameterType === "onepassword") return "onepassword";
-
-  if (initialValues.parameterType === "credential") {
-    if (parameterIsSkyvernCredential(initialValues)) return "skyvern";
-    if (parameterIsBitwardenCredential(initialValues)) return "bitwarden";
-    if (parameterIsAzureVaultCredential(initialValues)) return "azurevault";
-  }
-
-  return isCloud ? "skyvern" : "bitwarden";
 }
 
 function WorkflowParameterEditPanel({
@@ -251,12 +198,10 @@ function WorkflowParameterEditPanel({
       ? (initialValues?.collectionId ?? "")
       : "",
   );
+  const initialParameterTypeSelection =
+    detectInitialParameterTypeSelection(initialValues);
   const [parameterType, setParameterType] = useState<ParameterTypeSelection>(
-    type === "credential"
-      ? "credential"
-      : initialValues?.parameterType === "workflow"
-        ? initialValues.dataType
-        : "string",
+    initialParameterTypeSelection ?? "string",
   );
 
   const [defaultValueState, setDefaultValueState] = useState<{
@@ -343,11 +288,8 @@ function WorkflowParameterEditPanel({
     hasCustomCredentialService,
   );
 
-  // Check if we're in unified add mode and credential is selected
   const isCredentialSelected = parameterType === "credential";
-  const showCredentialFields =
-    type === "credential" ||
-    (type === "workflow" && !isEditMode && isCredentialSelected);
+  const showCredentialFields = type === "workflow" && isCredentialSelected;
 
   // Determine what fields to show based on credential data type and source
   const showBitwardenPasswordFields =
@@ -378,7 +320,7 @@ function WorkflowParameterEditPanel({
       <ScrollAreaViewport className="max-h-[500px]">
         <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
-            <span>{header(type, isEditMode, isCredentialSelected)}</span>
+            <span>{header(type, isEditMode)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
@@ -454,22 +396,22 @@ function WorkflowParameterEditPanel({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      {workflowParameterTypeOptions
-                        .filter((option) => {
-                          // In edit mode, don't show credential option
-                          if (isEditMode && option.value === "credential") {
-                            return false;
-                          }
-                          return true;
-                        })
-                        .map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
+                      {workflowParameterTypeOptions.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
+                {isEditMode &&
+                  initialParameterTypeSelection !== null &&
+                  initialParameterTypeSelection !== parameterType && (
+                    <p className="text-xs text-amber-400">
+                      Changing the type of an existing parameter may break
+                      blocks that reference it.
+                    </p>
+                  )}
               </div>
               {/* Default value section - only for non-credential types */}
               {!isCredentialSelected && (
@@ -945,8 +887,8 @@ function WorkflowParameterEditPanel({
                   return;
                 }
 
-                // Handle credential parameters based on type + source combination
-                if (type === "credential" || isCredentialSelected) {
+                // Handle credential parameters based on source + data-type combination
+                if (isCredentialSelected) {
                   // Skyvern managed credentials or Custom credential service
                   if (
                     credentialSource === "skyvern" ||

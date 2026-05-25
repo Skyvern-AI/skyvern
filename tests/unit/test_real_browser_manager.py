@@ -473,3 +473,71 @@ async def test_popup_video_listener_registers_pre_existing_pages() -> None:
 
     paths = [va.video_path for va in artifacts.video_artifacts]
     assert paths == ["/tmp/videos/initial.webm"]
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_page_closed_no_warning() -> None:
+    """PlaywrightError (e.g. Page closed) must not produce a WARNING log."""
+    import structlog.testing
+    from playwright.async_api import Error as PlaywrightError
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=PlaywrightError("Page closed"))
+
+    with structlog.testing.capture_logs() as cap:
+        await handler(page)
+
+    assert len(artifacts.video_artifacts) == 0
+    warning_events = [e for e in cap if e["log_level"] == "warning"]
+    assert len(warning_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_timeout_logs_sanitized_origin() -> None:
+    """TimeoutError logs WARNING with only the domain, no query params or PII."""
+    import structlog.testing
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=TimeoutError())
+    page.url = "https://user:pass@example.com/o/oauth2/auth?client_id=secret&redirect_uri=https://evil.com"
+
+    with structlog.testing.capture_logs() as cap:
+        await handler(page)
+
+    assert len(artifacts.video_artifacts) == 0
+    warning_events = [e for e in cap if e["log_level"] == "warning"]
+    assert len(warning_events) == 1
+    logged = str(warning_events[0])
+    assert "example.com" in logged  # nosemgrep: incomplete-url-substring-sanitization
+    assert "user:pass" not in logged
+    assert "client_id=secret" not in logged
+    assert "redirect_uri" not in logged
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_timeout_url_error_safe() -> None:
+    """If page.url itself raises, the handler still completes without crashing."""
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=TimeoutError())
+    type(page).url = property(lambda self: (_ for _ in ()).throw(RuntimeError("page destroyed")))
+
+    await handler(page)
+    assert len(artifacts.video_artifacts) == 0

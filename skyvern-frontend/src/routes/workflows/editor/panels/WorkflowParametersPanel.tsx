@@ -163,11 +163,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                             operation: "edit",
                             parameter: parameter,
                             type:
-                              parameter.parameterType === "onepassword" ||
-                              parameter.parameterType === "secret" ||
-                              parameter.parameterType === "creditCardData"
-                                ? WorkflowEditorParameterTypes.Credential
-                                : parameter.parameterType,
+                              parameter.parameterType === "context"
+                                ? WorkflowEditorParameterTypes.Context
+                                : WorkflowEditorParameterTypes.Workflow,
                           });
                         }}
                       />
