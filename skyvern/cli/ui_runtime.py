@@ -312,73 +312,68 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
         for root in self.artifact_roots:
             root_path = os.path.realpath(root)
             root_prefix = root_path if root_path.endswith(os.sep) else f"{root_path}{os.sep}"
-            if normalized != root_path and not normalized.startswith(root_prefix):
-                continue
+            if normalized.startswith(root_prefix):
+                try:
+                    with open(normalized, "rb") as stream:
+                        file_size = os.fstat(stream.fileno()).st_size
 
-            try:
-                # The requested path is only opened after realpath containment in
-                # the configured artifact roots above.
-                # codeql[py/path-injection]
-                with open(normalized, "rb") as stream:
-                    file_size = os.fstat(stream.fileno()).st_size
+                        if artifact_kind == "recording":
+                            range_header = self.headers.get("Range")
+                            if not range_header:
+                                self.send_error(HTTPStatus.BAD_REQUEST, "Missing range header")
+                                return
 
-                    if artifact_kind == "recording":
-                        range_header = self.headers.get("Range")
-                        if not range_header:
-                            self.send_error(HTTPStatus.BAD_REQUEST, "Missing range header")
+                            match = re.match(r"bytes=(\d+)-", range_header)
+                            start = int(match.group(1)) if match else 0
+                            if start >= file_size:
+                                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                                return
+                            end = min(start + 1_000_000, file_size) - 1
+                            content_length = end - start + 1
+
+                            self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                            self.send_header("Accept-Ranges", "bytes")
+                            self.send_header("Content-Length", str(content_length))
+                            self.send_header("Content-Type", "video/mp4")
+                            self.end_headers()
+                            stream.seek(start)
+                            self.wfile.write(stream.read(content_length))
+                            return
+                        if artifact_kind == "image":
+                            self.send_response(HTTPStatus.OK)
+                            self.send_header("Content-Type", _image_content_type(normalized))
+                            self.send_header("Content-Length", str(file_size))
+                            self.end_headers()
+                            shutil.copyfileobj(stream, self.wfile)
+                            return
+                        if artifact_kind == "json":
+                            try:
+                                payload = json.loads(stream.read().decode("utf-8"))
+                            except Exception:
+                                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid artifact JSON")
+                                return
+                            encoded = json.dumps(payload).encode("utf-8")
+                            self.send_response(HTTPStatus.OK)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(encoded)))
+                            self.end_headers()
+                            self.wfile.write(encoded)
+                            return
+                        if artifact_kind == "text":
+                            contents = stream.read()
+                            self.send_response(HTTPStatus.OK)
+                            self.send_header("Content-Type", "text/plain; charset=utf-8")
+                            self.send_header("Content-Length", str(len(contents)))
+                            self.end_headers()
+                            self.wfile.write(contents)
                             return
 
-                        match = re.match(r"bytes=(\d+)-", range_header)
-                        start = int(match.group(1)) if match else 0
-                        if start >= file_size:
-                            self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                            return
-                        end = min(start + 1_000_000, file_size) - 1
-                        content_length = end - start + 1
-
-                        self.send_response(HTTPStatus.PARTIAL_CONTENT)
-                        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                        self.send_header("Accept-Ranges", "bytes")
-                        self.send_header("Content-Length", str(content_length))
-                        self.send_header("Content-Type", "video/mp4")
-                        self.end_headers()
-                        stream.seek(start)
-                        self.wfile.write(stream.read(content_length))
+                        self.send_error(HTTPStatus.NOT_FOUND, "Unknown artifact endpoint")
                         return
-                    if artifact_kind == "image":
-                        self.send_response(HTTPStatus.OK)
-                        self.send_header("Content-Type", _image_content_type(normalized))
-                        self.send_header("Content-Length", str(file_size))
-                        self.end_headers()
-                        shutil.copyfileobj(stream, self.wfile)
-                        return
-                    if artifact_kind == "json":
-                        try:
-                            payload = json.loads(stream.read().decode("utf-8"))
-                        except Exception:
-                            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Invalid artifact JSON")
-                            return
-                        encoded = json.dumps(payload).encode("utf-8")
-                        self.send_response(HTTPStatus.OK)
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(encoded)))
-                        self.end_headers()
-                        self.wfile.write(encoded)
-                        return
-                    if artifact_kind == "text":
-                        contents = stream.read()
-                        self.send_response(HTTPStatus.OK)
-                        self.send_header("Content-Type", "text/plain; charset=utf-8")
-                        self.send_header("Content-Length", str(len(contents)))
-                        self.end_headers()
-                        self.wfile.write(contents)
-                        return
-
-                    self.send_error(HTTPStatus.NOT_FOUND, "Unknown artifact endpoint")
+                except OSError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
                     return
-            except OSError:
-                self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
-                return
 
         self.send_error(HTTPStatus.FORBIDDEN, "Artifact path is outside the configured roots")
         return
