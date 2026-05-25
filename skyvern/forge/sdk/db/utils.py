@@ -79,7 +79,10 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    ExecuteJsAction,
     ExtractAction,
+    GoBackAction,
+    GoForwardAction,
     GotoUrlAction,
     HoverAction,
     InputTextAction,
@@ -225,6 +228,9 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
     ActionType.GOTO_URL: GotoUrlAction,
+    ActionType.GO_BACK: GoBackAction,
+    ActionType.GO_FORWARD: GoForwardAction,
+    ActionType.EXECUTE_JS: ExecuteJsAction,
 }
 
 

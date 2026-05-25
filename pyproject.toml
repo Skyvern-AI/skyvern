@@ -26,6 +26,7 @@ dependencies = [
 local = [
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    "yutori>=0.5.0",
     "sqlalchemy>=2.0.29,<3",
     "aiohttp>=3.13.4,<4",
     "python-multipart>=0.0.27,<1",
@@ -86,6 +87,7 @@ local = [
 server = [
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    "yutori>=0.5.0",
     # Plain pip sees LiteLLM's exact openai pin and therefore resolves this
     # range to openai-agents 0.10.x. Cloud/source installs include the cloud
     # group below, where uv overrides let the newer 0.14.x SDK resolve.
@@ -251,6 +253,8 @@ override-dependencies = [
     "jsonschema>=4.23.0",
     "python-dotenv>=1.0.0",
     "openai>=2.24.0",
+    # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
+    "httpx[socks]>=0.26.0",
 ]
 constraint-dependencies = [
     "authlib>=1.7.1",

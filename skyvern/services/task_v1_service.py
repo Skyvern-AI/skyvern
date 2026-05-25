@@ -94,6 +94,8 @@ async def run_task(
         run_type = RunType.anthropic_cua
     elif engine == RunEngine.ui_tars:
         run_type = RunType.ui_tars
+    elif engine == RunEngine.yutori_navigator:
+        run_type = RunType.yutori_navigator
     await app.DATABASE.tasks.create_task_run(
         task_run_type=run_type,
         organization_id=organization.organization_id,

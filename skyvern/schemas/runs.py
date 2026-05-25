@@ -51,7 +51,9 @@ from skyvern.utils.url_validators import validate_url
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
-    TaskRunTypeField: TypeAlias = Literal["task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars"]
+    TaskRunTypeField: TypeAlias = Literal[
+        "task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
+    ]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
@@ -60,6 +62,7 @@ else:
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
+        RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
 

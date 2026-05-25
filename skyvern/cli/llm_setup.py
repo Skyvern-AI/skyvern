@@ -185,6 +185,20 @@ def setup_llm_providers(env_path: Path | str | None = None) -> None:
     else:
         set_env_var("ENABLE_GEMINI", "false")
 
+    console.print("\n[bold blue]--- Yutori Navigator Configuration ---[/bold blue]")
+    console.print("To enable Yutori Navigator, you must have a Yutori API key.")
+    enable_yutori = Confirm.ask("Do you want to enable Yutori Navigator?")
+    if enable_yutori:
+        yutori_api_key = Prompt.ask("Enter your Yutori API key", password=True)
+        if not yutori_api_key:
+            console.print("[red]Error: Yutori API key is required. Yutori Navigator will not be enabled.[/red]")
+        else:
+            update_or_add_env_var("YUTORI_API_KEY", yutori_api_key)
+            update_or_add_env_var("ENABLE_YUTORI", "true")
+            enabled_providers.append("yutori_navigator")
+    else:
+        update_or_add_env_var("ENABLE_YUTORI", "false")
+
     console.print("\n[bold blue]--- Ollama / Local LLM Configuration ---[/bold blue]")
     console.print("Use any locally-running model via Ollama (e.g. gemma4, qwen3, deepseek-r1).")
     console.print("[dim]Requires Ollama running locally: https://ollama.com[/dim]")
