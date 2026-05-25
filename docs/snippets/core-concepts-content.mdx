@@ -298,7 +298,7 @@ In the Skyvern UI, go to **Runs**, click a run, and view the **Actions** and **R
 
 ## Engines
 
-Skyvern supports multiple AI engines. `skyvern-2.0` is the latest and default for the Cloud UI (the SDK defaults to `skyvern-1.0`). Other options include `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), and `ui-tars`.
+Skyvern supports multiple AI engines. `skyvern-1.0` is the default for the Cloud UI and SDK. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. Other options include `openai-cua` (OpenAI Computer Use Agent), `anthropic-cua` (Anthropic Computer Use Agent), and `ui-tars`.
 
 ```python
 from skyvern.schemas.runs import RunEngine
@@ -306,7 +306,7 @@ from skyvern.schemas.runs import RunEngine
 result = await skyvern.run_task(
     prompt="Extract pricing data",
     url="https://example.com",
-    engine=RunEngine.skyvern_v2
+    engine=RunEngine.skyvern_v1
 )
 ```
 

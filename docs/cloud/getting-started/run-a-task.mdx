@@ -39,16 +39,16 @@ Below the prompt box, **quick-action buttons** offer pre-built examples like "Ad
 
 ## Choosing an engine
 
-The dropdown next to the send button controls which engine runs the task.
+New tasks created from the Discover page use the default Skyvern 1.0 task engine. For API and SDK calls, the `engine` parameter controls which engine runs the task.
 
 | Engine | Best for |
 |--------|----------|
-| **Skyvern 2.0 with Code** | Complex, multi-step tasks. Generates reusable scripts. **(Default)** |
-| **Skyvern 2.0** | Complex tasks without script generation |
-| **Skyvern 1.0** | Simple, single-objective tasks. Faster and cheaper. |
+| **Skyvern 1.0** | Default for new tasks. Simple, single-objective tasks. Faster and cheaper. |
+| **OpenAI CUA** | Computer-use tasks powered by OpenAI's CUA model |
+| **Anthropic CUA** | Computer-use tasks powered by Anthropic's Claude model |
 
 <Tip>
-Start with the default. Switch to Skyvern 1.0 when you have a straightforward, single-page task and want faster execution.
+Start with the default. Move repeated automations into workflows when you need scheduling, reusable parameters, or cached code replays.
 </Tip>
 
 ---

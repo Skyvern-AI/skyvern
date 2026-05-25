@@ -188,17 +188,17 @@ Use schedules for daily reports, hourly monitoring, periodic data syncs, or anyt
 
 An **engine** is the AI model Skyvern uses to drive the browser. Different engines have different strengths — speed, accuracy on complex pages, cost — and you can pick one per task or per block.
 
-The engine picker appears on the Discover page (for tasks) and on every browser-driven block in the workflow editor.
+The engine picker appears in API/SDK task requests and on supported browser-driven blocks in the workflow editor.
 
 | Engine | When to use |
 |--------|-------------|
-| **Skyvern 2.0** | Default. Best balance of accuracy and speed for most automations. |
-| **Skyvern 1.0** | Lighter and faster for simple, single-page interactions. |
+| **Skyvern 1.0** | Default for new tasks. Lighter and faster for simple, single-page interactions. |
+| **Skyvern 2.0** | Available for existing V2 workflows and explicitly requested V2 task runs. |
 | **OpenAI CUA** | OpenAI's Computer Use Agent. Good for visual reasoning. |
 | **Anthropic CUA** | Anthropic's Claude Computer Use. Strong at multi-step planning. |
 | **UI-TARS** | Lightweight CUA model option. |
 
-If you're not sure, leave it on the default. Switch engines if you hit accuracy issues on a specific site.
+If you're not sure, use the default. Move repeated automations into workflows when you need scheduling, reusable parameters, or cached code replays.
 
 ---
 
