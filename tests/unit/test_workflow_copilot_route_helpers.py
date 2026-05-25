@@ -22,27 +22,23 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
     _proposal_disposition,
     _should_restore_persisted_workflow,
 )
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamResponseUpdate
 from skyvern.schemas.runs import ProxyLocation
 
 
 def _agent_result(
     *,
     persisted: bool,
-    unvalidated: bool = False,
+    proposal_disposition: str = "auto_applicable",
     cancelled: bool = False,
-    force_review: bool = False,
     updated_workflow: Any = None,
     **kwargs: Any,
 ) -> MagicMock:
     """MagicMock with override flags explicitly set so a forgotten attr can't pass via MagicMock truthiness."""
     r = MagicMock()
     r.workflow_was_persisted = persisted
-    r.proposal_disposition = (
-        "review_untested" if unvalidated else "review_tested" if force_review else "auto_applicable"
-    )
-    r.unvalidated = unvalidated
+    r.proposal_disposition = proposal_disposition
     r.cancelled = cancelled
-    r.force_review = force_review
     r.updated_workflow = updated_workflow
     for k, v in kwargs.items():
         setattr(r, k, v)
@@ -64,8 +60,10 @@ class TestShouldRestorePersistedWorkflow:
         assert _should_restore_persisted_workflow(False, not_persisted) is False
         assert _should_restore_persisted_workflow(False, None) is False
 
-    def test_unvalidated_timeout_wip_forces_rollback_under_auto_accept(self) -> None:
-        agent_result = _agent_result(persisted=True, unvalidated=True, updated_workflow=MagicMock())
+    def test_review_untested_timeout_wip_forces_rollback_under_auto_accept(self) -> None:
+        agent_result = _agent_result(
+            persisted=True, proposal_disposition="review_untested", updated_workflow=MagicMock()
+        )
 
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
@@ -76,49 +74,36 @@ class TestShouldRestorePersistedWorkflow:
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
 
-    def test_force_review_wip_forces_rollback_under_auto_accept(self) -> None:
-        agent_result = _agent_result(persisted=True, force_review=True, updated_workflow=MagicMock())
+    def test_review_tested_wip_forces_rollback_under_auto_accept(self) -> None:
+        agent_result = _agent_result(persisted=True, proposal_disposition="review_tested", updated_workflow=MagicMock())
 
         assert _should_restore_persisted_workflow(True, agent_result) is True
         assert _should_restore_persisted_workflow(False, agent_result) is True
 
 
 class TestEffectiveAutoAccept:
-    def test_unvalidated_overrides_auto_accept(self) -> None:
-        unvalidated = MagicMock()
-        unvalidated.unvalidated = True
-        unvalidated.cancelled = False
-        unvalidated.force_review = False
+    def test_review_untested_overrides_auto_accept(self) -> None:
+        review_untested = MagicMock()
+        review_untested.proposal_disposition = "review_untested"
+        review_untested.cancelled = False
 
-        assert _effective_auto_accept(True, unvalidated) is False
-        assert _effective_auto_accept(False, unvalidated) is False
+        assert _effective_auto_accept(True, review_untested) is False
+        assert _effective_auto_accept(False, review_untested) is False
 
     def test_cancelled_overrides_auto_accept(self) -> None:
         cancelled = MagicMock()
-        cancelled.unvalidated = False
         cancelled.cancelled = True
-        cancelled.force_review = False
 
         assert _effective_auto_accept(True, cancelled) is False
         assert _effective_auto_accept(False, cancelled) is False
 
-    def test_force_review_overrides_auto_accept(self) -> None:
-        force_review = MagicMock()
-        force_review.proposal_disposition = "review_tested"
-        force_review.unvalidated = False
-        force_review.cancelled = False
-        force_review.force_review = True
+    def test_review_tested_overrides_auto_accept(self) -> None:
+        review_tested = MagicMock()
+        review_tested.proposal_disposition = "review_tested"
+        review_tested.cancelled = False
 
-        assert _effective_auto_accept(True, force_review) is False
-        assert _effective_auto_accept(False, force_review) is False
-
-    def test_review_untested_disposition_overrides_auto_accept(self) -> None:
-        result = MagicMock()
-        result.proposal_disposition = "review_untested"
-        result.cancelled = False
-
-        assert _effective_auto_accept(True, result) is False
-        assert _effective_auto_accept(False, result) is False
+        assert _effective_auto_accept(True, review_tested) is False
+        assert _effective_auto_accept(False, review_tested) is False
 
     def test_no_proposal_disposition_overrides_auto_accept(self) -> None:
         result = MagicMock()
@@ -129,25 +114,15 @@ class TestEffectiveAutoAccept:
         assert _effective_auto_accept(False, result) is False
 
     def test_missing_proposal_disposition_is_no_proposal_without_updated_workflow(self) -> None:
-        result = MagicMock(spec=["unvalidated", "force_review", "updated_workflow"])
-        result.unvalidated = False
-        result.force_review = False
+        result = MagicMock(spec=["updated_workflow"])
         result.updated_workflow = None
 
         assert _proposal_disposition(result) == "no_proposal"
 
-    def test_legacy_flag_fallback_for_stacked_deploy(self) -> None:
-        result = MagicMock(spec=["unvalidated", "force_review"])
-        result.unvalidated = False
-        result.force_review = True
-
-        assert _proposal_disposition(result) == "review_tested"
-
     def test_validated_proposal_respects_auto_accept_setting(self) -> None:
         validated = MagicMock()
-        validated.unvalidated = False
+        validated.proposal_disposition = "auto_applicable"
         validated.cancelled = False
-        validated.force_review = False
 
         assert _effective_auto_accept(True, validated) is True
         assert _effective_auto_accept(False, validated) is False
@@ -157,6 +132,11 @@ class TestEffectiveAutoAccept:
         assert _proposal_disposition(None) == "no_proposal"
         assert _effective_auto_accept(True, None) is False
         assert _effective_auto_accept(False, None) is False
+
+
+def test_response_update_schema_omits_legacy_review_flags() -> None:
+    assert "unvalidated" not in WorkflowCopilotStreamResponseUpdate.model_fields
+    assert "force_review" not in WorkflowCopilotStreamResponseUpdate.model_fields
 
 
 class TestNormalizeCopilotYamlTitleCoercion:

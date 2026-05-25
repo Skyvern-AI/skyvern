@@ -88,13 +88,9 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
-  proposal_disposition?: ProposalDisposition;
-  // Legacy mirror for proposal_disposition === "review_untested".
-  unvalidated?: boolean;
+  proposal_disposition: ProposalDisposition;
   // Cancel forces explicit review.
   cancelled?: boolean;
-  // Legacy mirror for proposal_disposition === "review_tested".
-  force_review?: boolean;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {

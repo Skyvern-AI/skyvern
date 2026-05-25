@@ -43,33 +43,6 @@ describe("shouldAutoApplyWorkflowResponse", () => {
     ).toBe(false);
   });
 
-  it("uses the enum over legacy booleans when both are present", () => {
-    expect(
-      shouldAutoApplyWorkflowResponse(
-        response({
-          proposal_disposition: "auto_applicable",
-          unvalidated: true,
-          force_review: true,
-        }),
-        true,
-        false,
-      ),
-    ).toBe(true);
-  });
-
-  it("falls back to legacy review booleans before the enum ships", () => {
-    expect(
-      shouldAutoApplyWorkflowResponse(
-        response({
-          proposal_disposition: undefined,
-          force_review: true,
-        }),
-        true,
-        false,
-      ),
-    ).toBe(false);
-  });
-
   it("does not auto-apply cancelled turns", () => {
     expect(
       shouldAutoApplyWorkflowResponse(

@@ -563,9 +563,8 @@ class TestShouldRestorePersistedWorkflow:
         r = MagicMock()
         r.workflow_was_persisted = persisted
         r.updated_workflow = updated_workflow
-        r.unvalidated = False
+        r.proposal_disposition = "auto_applicable"
         r.cancelled = False
-        r.force_review = False
         return r
 
     def test_restores_when_no_proposal_even_under_auto_accept(self) -> None:
@@ -891,7 +890,7 @@ workflow_definition:
 
         assert agent_result.user_response == specific_question
         assert agent_result.updated_workflow is None
-        assert agent_result.unvalidated is False
+        assert agent_result.proposal_disposition == "auto_applicable"
         assert agent_result.response_type == "ASK_QUESTION"
 
     def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
@@ -1044,7 +1043,7 @@ workflow_definition:
         assert "test failed" in agent_result.user_response.lower()
         assert "All done" not in agent_result.user_response
         assert agent_result.updated_workflow is None
-        assert agent_result.unvalidated is False
+        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_reply_after_failed_test_surfaces_unvalidated_wip_when_draft_on_hand(self) -> None:
         wf = SimpleNamespace(name="drafted")
@@ -1062,7 +1061,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
@@ -1081,7 +1080,7 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
         assert "review" in agent_result.user_response.lower()
         assert "accept" in agent_result.user_response.lower()
         assert "reject" in agent_result.user_response.lower()
@@ -1102,7 +1101,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
         assert "Please provide credentials before I continue." in agent_result.user_response
         assert "review" in agent_result.user_response.lower()
         assert "accept" in agent_result.user_response.lower()
@@ -1150,7 +1149,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
 
     def test_goal_reached_default_true_keeps_verified_path(self) -> None:
         # Backwards-compat: stale prompts that omit goal_reached must continue
@@ -1168,7 +1167,7 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.unvalidated is False
+        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_goal_reached_true_explicit_keeps_verified_path(self) -> None:
         wf = SimpleNamespace(name="drafted")
@@ -1184,7 +1183,7 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.unvalidated is False
+        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_goal_reached_string_false_is_coerced(self) -> None:
         # LLMs occasionally emit JSON-as-string values; ``"false"`` must flip
@@ -1204,7 +1203,7 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
 
     def test_goal_reached_false_without_last_workflow_returns_no_proposal(self) -> None:
         # The unvalidated WIP fallback only fires when ``ctx.last_workflow``
@@ -1220,7 +1219,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
-        assert agent_result.unvalidated is False
+        assert agent_result.proposal_disposition == "auto_applicable"
 
     def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
         ctx = _ctx(last_test_ok=None)
@@ -1354,7 +1353,7 @@ workflow_definition:
         )
 
         assert agent_result.updated_workflow is wf
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
         assert "test failed" in agent_result.user_response.lower()
         assert "keep the draft" in agent_result.user_response.lower()
 
@@ -2515,7 +2514,7 @@ workflow_definition:
 
         assert agent_result.updated_workflow is wf
         assert agent_result.workflow_yaml == "title: drafted"
-        assert agent_result.unvalidated is True
+        assert agent_result.proposal_disposition == "review_untested"
         assert "without testing it, as requested" in agent_result.user_response
 
 

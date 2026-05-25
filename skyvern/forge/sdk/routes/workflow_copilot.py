@@ -266,21 +266,9 @@ def _proposal_disposition(agent_result: object | None) -> ProposalDisposition:
     disposition = getattr(agent_result, "proposal_disposition", None)
     if disposition in ("no_proposal", "auto_applicable", "review_untested", "review_tested"):
         return disposition
-    if getattr(agent_result, "unvalidated", False) is True:
-        return "review_untested"
-    if getattr(agent_result, "force_review", False) is True:
-        return "review_tested"
     if getattr(agent_result, "updated_workflow", None) is None:
         return "no_proposal"
     return "auto_applicable"
-
-
-def _legacy_unvalidated(proposal_disposition: ProposalDisposition) -> bool:
-    return proposal_disposition == "review_untested"
-
-
-def _legacy_force_review(proposal_disposition: ProposalDisposition) -> bool:
-    return proposal_disposition == "review_tested"
 
 
 def _effective_auto_accept(auto_accept: bool | None, agent_result: object | None) -> bool:
@@ -454,10 +442,8 @@ async def _persist_cancel_turn(
                     total_tokens=total_tokens,
                     response_type=response_type,
                     proposal_disposition=proposal_disposition,
-                    unvalidated=_legacy_unvalidated(proposal_disposition),
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
-                    force_review=_legacy_force_review(proposal_disposition),
                 )
             )
         )
@@ -531,9 +517,7 @@ async def _finalise_normal_turn(
             total_tokens=getattr(agent_result, "total_tokens", None),
             response_type=getattr(agent_result, "response_type", "REPLY"),
             proposal_disposition=proposal_disposition,
-            unvalidated=_legacy_unvalidated(proposal_disposition),
             output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
-            force_review=_legacy_force_review(proposal_disposition),
         )
     )
 

@@ -125,10 +125,6 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
     )
-    unvalidated: bool = Field(
-        False,
-        description="Legacy mirror for proposal_disposition=review_untested.",
-    )
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -136,10 +132,6 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     output_policy_diagnostics: dict[str, Any] | None = Field(
         None,
         description="Diagnostic output-policy labels for raw-vs-final quality reporting.",
-    )
-    force_review: bool = Field(
-        False,
-        description="Legacy mirror for proposal_disposition=review_tested.",
     )
 
 

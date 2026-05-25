@@ -136,14 +136,6 @@ class AgentResult:
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
 
-    @property
-    def unvalidated(self) -> bool:
-        return self.proposal_disposition == "review_untested"
-
-    @property
-    def force_review(self) -> bool:
-        return self.proposal_disposition == "review_tested"
-
 
 @dataclass
 class CopilotContext(AgentContext):
