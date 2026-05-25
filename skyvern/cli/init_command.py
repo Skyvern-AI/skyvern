@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar, overload
@@ -25,7 +25,6 @@ from skyvern.utils.env_paths import (
     resolve_backend_env_path,
 )
 
-from .browser import setup_browser_config
 from .console import console
 from .database import setup_postgresql
 from .llm_setup import setup_llm_providers, update_or_add_env_var
@@ -130,7 +129,12 @@ def _ensure_playwright_chromium(browser_type: str | None, skip_browser_install: 
     ) as progress:
         progress.add_task("[bold blue]Downloading Chromium, this may take a moment...", total=None)
         try:
-            subprocess.run(["playwright", "install", "chromium"], check=True, capture_output=True, text=True)
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             capture_setup_event("playwright-install-complete", success=True)
             console.print("✅ [green]Chromium installation complete.[/green]")
             return BrowserInstallStatus(required=True, ready=True, attempted=True)
@@ -293,7 +297,10 @@ def _install_server_extra_for_missing_dependency(exc: ImportError) -> None:
     _SERVER_EXTRA_INSTALL_ATTEMPTED = True
     console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", target], check=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--retries", "5", "--timeout", "60", target],
+            check=True,
+        )
     except subprocess.CalledProcessError as install_error:
         console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
         _print_local_server_dependency_hint(missing_module, target)
@@ -308,11 +315,27 @@ def _run_with_server_dependency_install(action: Callable[[], _T]) -> _T:
             _install_server_extra_for_missing_dependency(exc)
 
 
+async def _setup_local_organization_from_database() -> str:
+    """Seed the local org/API key without constructing the full server runtime."""
+    from skyvern.config import settings  # noqa: PLC0415
+
+    from .mcp import setup_local_organization_from_database_string  # noqa: PLC0415
+
+    return await setup_local_organization_from_database_string(settings.DATABASE_STRING)
+
+
 @overload
 def init_env(
     no_postgres: bool = False,
     database_string: str = "",
     skip_browser_install: bool = False,
+    mode: Literal["local", "cloud"] | None = None,
+    skip_llm_setup: bool = False,
+    configure_mcp: bool | None = None,
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
+    browser_location: str | None = None,
+    remote_debugging_url: str | None = None,
+    analytics_id: str | None = None,
     env_scope: str | None = None,
     env_path: Path | str | None = None,
     return_result: Literal[False] = False,
@@ -324,6 +347,13 @@ def init_env(
     no_postgres: bool = False,
     database_string: str = "",
     skip_browser_install: bool = False,
+    mode: Literal["local", "cloud"] | None = None,
+    skip_llm_setup: bool = False,
+    configure_mcp: bool | None = None,
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
+    browser_location: str | None = None,
+    remote_debugging_url: str | None = None,
+    analytics_id: str | None = None,
     env_scope: str | None = None,
     env_path: Path | str | None = None,
     return_result: Literal[True] = True,
@@ -334,6 +364,13 @@ def init_env(
     no_postgres: bool = False,
     database_string: str = "",
     skip_browser_install: bool = False,
+    mode: Literal["local", "cloud"] | None = None,
+    skip_llm_setup: bool = False,
+    configure_mcp: bool | None = None,
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
+    browser_location: str | None = None,
+    remote_debugging_url: str | None = None,
+    analytics_id: str | None = None,
     env_scope: str | None = None,
     env_path: Path | str | None = None,
     return_result: bool = False,
@@ -348,7 +385,7 @@ def init_env(
     )
     console.print("[italic]This wizard will help you set up Skyvern.[/italic]")
 
-    infra_choice = Prompt.ask(
+    infra_choice = mode or Prompt.ask(
         "Would you like to run Skyvern [bold blue]local[/bold blue]ly or in the [bold purple]cloud[/bold purple]?",
         choices=["local", "cloud"],
     )
@@ -385,27 +422,16 @@ def init_env(
         console.print("✅ [green]Database migration complete.[/green]")
 
         console.print("🔑 [bold blue]Generating local organization API key...[/bold blue]")
-
-        def _load_start_forge_app() -> Callable[[], object]:
-            from skyvern.forge.forge_app_initializer import start_forge_app  # noqa: PLC0415
-
-            return start_forge_app
-
-        def _load_setup_local_organization() -> Callable[[], Coroutine[Any, Any, str]]:
-            from .mcp import setup_local_organization  # noqa: PLC0415
-
-            return setup_local_organization
-
-        start_forge_app = _run_with_server_dependency_install(_load_start_forge_app)
-        setup_local_organization = _run_with_server_dependency_install(_load_setup_local_organization)
-        _run_with_server_dependency_install(start_forge_app)
-        api_key = _run_with_server_dependency_install(lambda: asyncio.run(setup_local_organization()))
+        api_key = _run_with_server_dependency_install(lambda: asyncio.run(_setup_local_organization_from_database()))
         if api_key:
             console.print("✅ [green]Local organization API key generated.[/green]")
         else:
             console.print("[red]Failed to generate local organization API key. Please check server logs.[/red]")
 
-        if backend_env_path.exists():
+        if skip_llm_setup:
+            console.print("[yellow]Skipping LLM setup as requested.[/yellow]")
+            set_env_var("ENV", "local")
+        elif backend_env_path.exists():
             console.print(f"💡 [{backend_env_path}] file already exists.", style="yellow", markup=False)
             redo_llm_setup = Confirm.ask(
                 "Do you want to go through [bold yellow]LLM provider setup again[/bold yellow]?",
@@ -421,13 +447,29 @@ def init_env(
             setup_llm_providers(env_path=backend_env_path)
 
         console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
-        browser_type, browser_location, remote_debugging_url = setup_browser_config()
-        result.browser_type = browser_type
-        set_env_var("BROWSER_TYPE", browser_type)
-        if browser_location:
-            set_env_var("CHROME_EXECUTABLE_PATH", browser_location)
-        if remote_debugging_url:
-            set_env_var("BROWSER_REMOTE_DEBUGGING_URL", remote_debugging_url)
+        selected_browser_type: str
+        selected_browser_location: str | None
+        selected_remote_debugging_url: str | None
+        if browser_type:
+            selected_browser_type = browser_type
+            selected_browser_location = browser_location
+            selected_remote_debugging_url = remote_debugging_url
+            capture_setup_event(
+                "browser-config-select",
+                success=True,
+                extra_data={"type": selected_browser_type, "source": "cli-option"},
+            )
+        else:
+            from .browser import setup_browser_config  # noqa: PLC0415
+
+            selected_browser_type, selected_browser_location, selected_remote_debugging_url = setup_browser_config()
+
+        result.browser_type = selected_browser_type
+        set_env_var("BROWSER_TYPE", selected_browser_type)
+        if selected_browser_location:
+            set_env_var("CHROME_EXECUTABLE_PATH", selected_browser_location)
+        if selected_remote_debugging_url:
+            set_env_var("BROWSER_REMOTE_DEBUGGING_URL", selected_remote_debugging_url)
         set_env_var("BROWSER_STREAMING_MODE", "cdp")
         console.print("✅ [green]Browser configuration complete.[/green]")
 
@@ -488,9 +530,11 @@ def init_env(
         console.print("  This starts Chrome on your machine and creates a tunnel so Skyvern Cloud can control it.")
         console.print("  Learn more: [link]https://www.skyvern.com/docs/optimization/browser-tunneling[/link]")
 
-    analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
-    analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
-    set_env_var("ANALYTICS_ID", analytics_id)
+    resolved_analytics_id = analytics_id
+    if resolved_analytics_id is None:
+        analytics_id_input = Prompt.ask("Please enter your email for analytics (press enter to skip)", default="")
+        resolved_analytics_id = analytics_id_input if analytics_id_input else str(uuid.uuid4())
+    set_env_var("ANALYTICS_ID", resolved_analytics_id)
     if api_key:
         set_env_var("SKYVERN_API_KEY", api_key)
     console.print(f"✅ [green]{backend_env_path} file has been initialized.[/green]")
@@ -499,7 +543,14 @@ def init_env(
     _mcp_browser_type = os.environ.get("BROWSER_TYPE") if run_local else None
     _mcp_browser_url = os.environ.get("BROWSER_REMOTE_DEBUGGING_URL") if run_local else None
 
-    if Confirm.ask("\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?", default=True):
+    should_configure_mcp = configure_mcp
+    if should_configure_mcp is None:
+        should_configure_mcp = Confirm.ask(
+            "\nWould you like to [bold yellow]configure the MCP server[/bold yellow]?",
+            default=True,
+        )
+
+    if should_configure_mcp:
         from .mcp import setup_mcp  # noqa: PLC0415
 
         setup_mcp(
@@ -567,6 +618,8 @@ def init_browser() -> None:
     """Initialize only the browser configuration and install Chromium."""
     console.print("\n[bold blue]Configuring browser settings...[/bold blue]")
     capture_setup_event("browser-config-start")
+    from .browser import setup_browser_config  # noqa: PLC0415
+
     browser_type, browser_location, remote_debugging_url = setup_browser_config()
     update_or_add_env_var("BROWSER_TYPE", browser_type)
     if browser_location:

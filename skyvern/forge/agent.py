@@ -157,6 +157,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -2278,6 +2279,7 @@ class ForgeAgent:
         call_kwargs: dict[str, Any] = {
             "step": step,
             "screenshots": scraped_page.screenshots,
+            "prompt_name": "anthropic-cua",
             "use_message_history": True,
             "tools": tools,
             "raw_response": True,
@@ -2781,6 +2783,10 @@ class ForgeAgent:
         # no new_elements_ids threading — so we also drop Skyvern IDs.
         _ctx = skyvern_context.current()
         lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
+        non_vision_page_context = await build_non_vision_page_context_if_needed(
+            scraped_page=scraped_page_refreshed,
+            page=page,
+        )
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -2791,6 +2797,7 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            non_vision_page_context=non_vision_page_context,
             html_need_skyvern_attrs=False,
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
@@ -3483,6 +3490,7 @@ class ForgeAgent:
         verification_code_check: bool,
         show_close_page_action: bool,
         complete_criterion: str | None,
+        non_vision_enabled: bool = False,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
@@ -3494,6 +3502,8 @@ class ForgeAgent:
             variant_parts.append("vc")
         if show_close_page_action:
             variant_parts.append("cp")
+        if non_vision_enabled:
+            variant_parts.append("nv")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
@@ -3765,6 +3775,10 @@ class ForgeAgent:
 
         open_tabs_context = await _build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
+        non_vision_page_context = await build_non_vision_page_context_if_needed(
+            scraped_page=scraped_page,
+            page=page,
+        )
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -3792,11 +3806,13 @@ class ForgeAgent:
                     "show_close_page_action": show_close_page_action,
                     "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
+                    "non_vision_page_context": non_vision_page_context,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
                     show_close_page_action=show_close_page_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    non_vision_enabled=bool(non_vision_page_context),
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3884,6 +3900,7 @@ class ForgeAgent:
             show_close_page_action=show_close_page_action,
             open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
+            non_vision_page_context=non_vision_page_context,
             # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
             # (default html_need_skyvern_attrs=True) — the planner emits
             # `click(id=...)` references. Gate lean on the PostHog flag.
@@ -5290,6 +5307,7 @@ class ForgeAgent:
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt,
@@ -5435,6 +5453,7 @@ class ForgeAgent:
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,

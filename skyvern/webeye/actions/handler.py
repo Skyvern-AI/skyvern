@@ -120,6 +120,7 @@ from skyvern.webeye.cdp_download_interceptor import (
     is_download_response,
     normalize_download_filename,
 )
+from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -1395,6 +1396,10 @@ async def handle_sequential_click_for_dropdown(
         without_screenshots=True,
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+        non_vision_page_context=await build_non_vision_page_context_if_needed(
+            scraped_page=scraped_page_after_open,
+            page=page,
+        ),
         lean_compress_long_href=lean_enabled,
         lean_compress_image_src=lean_enabled,
         lean_strip_url_query_strings=lean_enabled,
@@ -1432,25 +1437,13 @@ async def handle_sequential_click_for_dropdown(
         step=step,
     )
 
-    options = CustomSelectPromptOptions(
-        field_information=dropdown_select_context.intention
-        if dropdown_select_context.intention
-        else dropdown_select_context.field,
-        is_date_related=dropdown_select_context.is_date_related,
-        required_field=dropdown_select_context.is_required,
-    )
-
     if dropdown_select_context.is_date_related:
-        return await _select_date_from_emerging_elements_or_skip(
-            current_element_id=anchor_element.get_id(),
-            options=options,
-            page=page,
-            scraped_page=scraped_page,
-            step=step,
-            task=task,
-            scraped_page_after_open=scraped_page_after_open,
-            new_interactable_element_ids=new_interactable_element_ids,
+        LOG.info(
+            "The dropdown is date related, exiting the sequential click logic and skipping the remaining actions",
         )
+        result = ActionSuccess()
+        result.skip_remaining_actions = True
+        return result
 
     LOG.info(
         "Found the dropdown menu element after clicking, triggering the sequential click logic",
@@ -1459,7 +1452,13 @@ async def handle_sequential_click_for_dropdown(
 
     return await select_from_emerging_elements(
         current_element_id=anchor_element.get_id(),
-        options=options,
+        options=CustomSelectPromptOptions(
+            field_information=dropdown_select_context.intention
+            if dropdown_select_context.intention
+            else dropdown_select_context.field,
+            is_date_related=dropdown_select_context.is_date_related,
+            required_field=dropdown_select_context.is_required,
+        ),
         page=page,
         scraped_page=scraped_page,
         step=step,
@@ -4124,6 +4123,7 @@ async def sequentially_select_from_dropdown(
             elements="".join(json_to_html(element) for element in secondary_increment_element),
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
+            non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
         json_response = await llm_api_handler(
@@ -4181,49 +4181,6 @@ class CustomSelectPromptOptions(BaseModel):
     required_field: bool = False
     field_information: str = ""
     target_value: str | None = None
-
-
-async def _select_date_from_emerging_elements_or_skip(
-    current_element_id: str,
-    options: CustomSelectPromptOptions,
-    page: Page,
-    scraped_page: ScrapedPage,
-    step: Step,
-    task: Task,
-    scraped_page_after_open: ScrapedPage,
-    new_interactable_element_ids: list[str],
-) -> ActionResult:
-    try:
-        result = await select_from_emerging_elements(
-            current_element_id=current_element_id,
-            options=options,
-            page=page,
-            scraped_page=scraped_page,
-            step=step,
-            task=task,
-            scraped_page_after_open=scraped_page_after_open,
-            new_interactable_element_ids=new_interactable_element_ids,
-        )
-    except Exception:
-        LOG.warning(
-            "Date-related emerging element selection failed, preserving skip behavior",
-            current_element_id=current_element_id,
-            exc_info=True,
-        )
-        result = ActionSuccess()
-
-    if not result.success:
-        LOG.warning(
-            "Date-related emerging element selection returned failure, preserving skip behavior",
-            current_element_id=current_element_id,
-            selection_exception_type=result.exception_type,
-            selection_exception_message=result.exception_message,
-            selection_data=result.data,
-        )
-        result = ActionSuccess()
-
-    result.skip_remaining_actions = True
-    return result
 
 
 def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
@@ -4751,7 +4708,10 @@ async def locate_dropdown_menu(
         await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
-        dropdown_confirm_prompt = prompt_engine.load_prompt("opened-dropdown-confirm")
+        dropdown_confirm_prompt = prompt_engine.load_prompt(
+            "opened-dropdown-confirm",
+            non_vision_page_context=await build_non_vision_page_context_if_needed(page=skyvern_frame.get_frame()),
+        )
         LOG.debug(
             "Confirm if it's an opened dropdown menu",
             element=element_dict,
@@ -5180,6 +5140,7 @@ async def extract_information_for_navigation_goal(
         extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
+        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page_refreshed),
     )
 
     # Self-heal guard: on the second retry onward (``retry_index > 1``) the
@@ -5227,6 +5188,7 @@ async def extract_information_for_navigation_goal(
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
             workflow_system_prompt=task.workflow_system_prompt,
+            non_vision_page_context=post_ceiling_kwargs.get("non_vision_page_context"),
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -5676,6 +5638,7 @@ async def extract_user_defined_errors(
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
+        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page_refreshed),
     )
     json_response = await app.EXTRACTION_LLM_API_HANDLER(
         prompt=prompt,
