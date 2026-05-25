@@ -143,7 +143,12 @@ class TaskRunRequest(BaseModel):
     )
     publish_workflow: bool = Field(
         default=False,
-        description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
+        description=(
+            "Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. "
+            "For backwards compatibility, this routes the request through the legacy `skyvern-2.0` "
+            "publish path. Prefer creating reusable workflows through the workflow APIs."
+        ),
+        json_schema_extra={"deprecated": True},
     )
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
@@ -192,7 +197,7 @@ class TaskRunRequest(BaseModel):
         return mask_header_values(headers)
 
     @model_validator(mode="after")
-    def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
+    def _route_publish_workflow_to_v2(self) -> TaskRunRequest:
         if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
             self.engine = RunEngine.skyvern_v2
         return self
