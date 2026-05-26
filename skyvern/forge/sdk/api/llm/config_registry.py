@@ -10,6 +10,8 @@ from skyvern.schemas.llm import LiteLLMParams, LLMConfig, LLMRouterConfig
 
 LOG = structlog.get_logger()
 
+FLEX_EXECUTION_TIMEOUT_SECONDS = 180.0
+
 
 class LLMConfigRegistry:
     _configs: dict[str, LLMRouterConfig | LLMConfig] = {}
@@ -119,7 +121,7 @@ if settings.ENABLE_OPENAI:
                 api_key=settings.OPENAI_API_KEY,
                 model_info={"model_name": "gpt-5-mini-2025-08-07"},
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -149,7 +151,7 @@ if settings.ENABLE_OPENAI:
                 api_key=settings.OPENAI_API_KEY,
                 model_info={"model_name": "gpt-5-nano-2025-08-07"},
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -215,7 +217,7 @@ if settings.ENABLE_OPENAI:
                 api_key=settings.OPENAI_API_KEY,
                 model_info={"model_name": "gpt-5.4-mini"},
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -245,7 +247,7 @@ if settings.ENABLE_OPENAI:
                 api_key=settings.OPENAI_API_KEY,
                 model_info={"model_name": "gpt-5.4-nano"},
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1094,7 +1096,7 @@ if settings.ENABLE_GEMINI:
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1112,7 +1114,7 @@ if settings.ENABLE_GEMINI:
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1146,7 +1148,7 @@ if settings.ENABLE_GEMINI:
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
                 service_tier="flex",
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1630,7 +1632,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1652,7 +1654,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1674,7 +1676,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,  # Vertex flex best-effort SLA upper bound (15 min)
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1694,7 +1696,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1713,7 +1715,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
@@ -1732,7 +1734,7 @@ if settings.ENABLE_VERTEX_AI:
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
                 service_tier="SERVICE_TIER_FLEX",
                 extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
-                timeout=900.0,
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
             ),
         ),
     )
