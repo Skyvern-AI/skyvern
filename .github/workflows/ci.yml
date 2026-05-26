@@ -7,10 +7,8 @@ on:
   pull_request:
   push:
     branches: [main]
-
 permissions:
   contents: read
-
 jobs:
   test:
     name: Run tests and pre-commit hooks
@@ -132,7 +130,6 @@ jobs:
         run: npm run lint
       - name: Run build
         run: npm run build
-
   pip-package-smoke:
     name: pip Package Smoke Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest

@@ -163,15 +163,16 @@ def _candidate_artifact_roots() -> list[Path]:
         if configured:
             roots.append(Path(configured).expanduser())
 
+    skyvern_settings: Any | None
     try:
-        from skyvern.config import settings  # noqa: PLC0415
+        from skyvern.config import settings as skyvern_settings  # noqa: PLC0415
     except Exception:
-        settings = None
-    if settings is not None:
+        skyvern_settings = None
+    if skyvern_settings is not None:
         roots.extend(
             [
-                Path(settings.ARTIFACT_STORAGE_PATH).expanduser(),
-                Path(settings.TEMP_PATH).expanduser(),
+                Path(skyvern_settings.ARTIFACT_STORAGE_PATH).expanduser(),
+                Path(skyvern_settings.TEMP_PATH).expanduser(),
             ]
         )
 

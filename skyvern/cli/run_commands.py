@@ -30,8 +30,8 @@ from skyvern.cli.console import console
 from skyvern.cli.core.result import set_concise_responses
 from skyvern.cli.ui_runtime import (
     ARTIFACT_PORT,
-    UI_PORT,
     UI_PACKAGE_NAME,
+    UI_PORT,
     InstalledUiConfig,
     artifact_api_base_url_with_token,
     has_frontend_runtime,
@@ -742,11 +742,12 @@ def run_mcp(
 ) -> None:
     """Run the MCP server with configurable transport for local or remote hosting."""
     prepare_cli_runtime(intent=EnvIntent.CLOUD)
+    from starlette.middleware import Middleware  # noqa: PLC0415
+
     from skyvern.cli.core.mcp_http_auth import MCPAPIKeyMiddleware  # noqa: PLC0415
     from skyvern.cli.core.session_manager import set_stateless_http_mode  # noqa: PLC0415
     from skyvern.cli.mcp_tools import mcp  # noqa: PLC0415
     from skyvern.cli.mcp_tools.telemetry import configure_mcp_telemetry_runtime  # noqa: PLC0415
-    from starlette.middleware import Middleware  # noqa: PLC0415
 
     path = _normalize_mcp_path(path)
     stateless_http_enabled = transport != "stdio" and stateless_http
