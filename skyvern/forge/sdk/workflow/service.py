@@ -5388,12 +5388,22 @@ class WorkflowService:
                 and browser_state.browser_artifacts.browser_session_dir
                 and not workflow_run.browser_profile_id
             ):
-                await app.STORAGE.store_browser_session(
-                    workflow_run.organization_id,
-                    workflow.workflow_permanent_id,
-                    browser_state.browser_artifacts.browser_session_dir,
-                )
-                LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
+                if workflow_run.status == WorkflowRunStatus.completed:
+                    await app.STORAGE.store_browser_session(
+                        workflow_run.organization_id,
+                        workflow.workflow_permanent_id,
+                        browser_state.browser_artifacts.browser_session_dir,
+                    )
+                    LOG.info(
+                        "Persisted browser session for workflow run",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                else:
+                    LOG.info(
+                        "Skipped persisting browser session for non-completed workflow run",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_status=workflow_run.status,
+                    )
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
 
