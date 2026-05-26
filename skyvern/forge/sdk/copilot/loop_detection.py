@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
 from skyvern.forge.failure_classifier import classify_from_failure_reason
+from skyvern.forge.sdk.copilot.blocker_signal import maybe_clear_blocker_signal_on_tool_success
 
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
@@ -225,9 +226,12 @@ def record_tool_step_result_for_ctx(
     result: Mapping[str, Any],
 ) -> None:
     tracker = _ctx_failed_step_tracker(ctx)
-    if tracker is None:
-        return
-    record_tool_step_result(tracker, tool_name, arguments, result)
+    if tracker is not None:
+        record_tool_step_result(tracker, tool_name, arguments, result)
+    # Strict ``is True`` check: a malformed result dict missing ``ok`` entirely
+    # must not be treated as success and accidentally clear a blocker signal.
+    if result.get("ok") is True:
+        maybe_clear_blocker_signal_on_tool_success(ctx, tool_name)
 
 
 def clear_failed_step_tracker_for_tools_in_ctx(ctx: Any, tool_names: Iterable[str]) -> None:

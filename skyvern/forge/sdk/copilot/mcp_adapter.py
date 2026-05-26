@@ -20,7 +20,11 @@ from mcp.types import (
     TextContent,
 )
 
-from skyvern.forge.sdk.copilot.build_phase import _phase_tool_error
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    build_loop_blocker_signal,
+    stash_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -56,6 +60,10 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+
+
+def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
+    return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
 
 
 def _apply_schema_overlay(
@@ -106,7 +114,7 @@ def _copilot_to_call_tool_result(
 ) -> CallToolResult:
     sanitized = sanitize_tool_result_for_llm("", copilot_result)
     content: list[TextContent] = [TextContent(type="text", text=json.dumps(sanitized))]
-    is_error = not copilot_result.get("ok", True)
+    is_error = copilot_result.get("ok", True) is not True
     return CallToolResult(content=content, isError=is_error)
 
 
@@ -201,21 +209,17 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
-        # Defense-in-depth phase gate for MCP-exposed browser primitives. The
-        # native gate (`_authority_tool_error` in tools.py) covers native
-        # function_tool calls; this branch covers tools dispatched only
-        # through SkyvernOverlayMCPServer, which never pass through the
-        # native gate. The two checks share `_phase_tool_error`, so a tool
-        # gated at both layers reports the same error message.
-        phase_error = _phase_tool_error(copilot_ctx, tool_name)
-        if phase_error:
+        # MCP-side phase gate; mirror of `_authority_tool_error` in tools.py for MCP-only tools.
+        phase_signal = _phase_blocker_signal(copilot_ctx, tool_name)
+        if phase_signal is not None:
             LOG.warning(
                 "Phase-gated MCP tool call rejected",
                 tool_name=tool_name,
                 build_phase=getattr(getattr(copilot_ctx, "build_phase", None), "value", None),
             )
-            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": phase_error})
-            return _copilot_to_call_tool_result({"ok": False, "error": phase_error})
+            payload = stash_blocker_signal(copilot_ctx, phase_signal)
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
@@ -223,7 +227,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 "Failed tool step loop detected, skipping execution",
                 tool_name=tool_name,
             )
-            return _copilot_to_call_tool_result({"ok": False, "error": loop_error})
+            payload = _stash_and_emit_loop_blocker(copilot_ctx, loop_error, tool_name)
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
         loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
@@ -232,20 +237,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 "Tool loop detected, skipping execution",
                 tool_name=tool_name,
             )
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "ok": False,
-                                "error": loop_error,
-                            }
-                        ),
-                    )
-                ],
-                isError=True,
-            )
+            payload = _stash_and_emit_loop_blocker(copilot_ctx, loop_error, tool_name)
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         if overlay.pre_hook:
             hook_result = await overlay.pre_hook(arguments, copilot_ctx)

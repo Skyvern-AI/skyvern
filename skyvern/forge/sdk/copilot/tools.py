@@ -30,9 +30,16 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    RecoveryHint,
+    build_loop_blocker_signal,
+    clear_blocker_signal_for_reason_codes,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
-    _phase_tool_error,
+    _phase_blocker_signal,
     advance_to_composing,
     advance_to_discovering,
     advance_to_testing,
@@ -550,9 +557,42 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
     if is_trusted_final or was_per_tool_budget:
         copilot_ctx.pending_reconciliation_run_id = None
         copilot_ctx.pending_reconciliation_requires_user_input = False
+        clear_blocker_signal_for_reason_codes(
+            copilot_ctx,
+            frozenset(
+                {
+                    "tool_error_pending_reconciliation_no_input",
+                    "tool_error_pending_reconciliation_requires_input",
+                }
+            ),
+        )
         return
     if resolved_status == WorkflowRunStatus.canceled.value:
         copilot_ctx.pending_reconciliation_requires_user_input = True
+        # Replace the no_input blocker with the requires-input one; unrelated
+        # blockers (e.g. `loop_detected`) survive the targeted clear.
+        existing_blocker = getattr(copilot_ctx, "blocker_signal", None)
+        # Preserve the original blocked_tool so trace queries filtering on it correlate the no_input → requires_input transition.
+        original_blocked_tool = (
+            existing_blocker.blocked_tool
+            if (
+                isinstance(existing_blocker, CopilotToolBlockerSignal)
+                and existing_blocker.internal_reason_code == "tool_error_pending_reconciliation_no_input"
+                and existing_blocker.blocked_tool
+            )
+            else "get_run_results"
+        )
+        clear_blocker_signal_for_reason_codes(
+            copilot_ctx,
+            frozenset({"tool_error_pending_reconciliation_no_input"}),
+        )
+        stash_blocker_signal(
+            copilot_ctx,
+            _pending_reconciliation_requires_input_signal(
+                pending_run_id=pending_run_id,
+                blocked_tool=original_blocked_tool,
+            ),
+        )
 
 
 def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> None:
@@ -635,7 +675,9 @@ def _requested_block_label_set(arguments: dict[str, Any] | None) -> set[str] | N
     return {label for label in block_labels if isinstance(label, str) and label}
 
 
-def _per_tool_budget_problem_rerun_error(ctx: Any, arguments: dict[str, Any] | None) -> str | None:
+def _per_tool_budget_problem_rerun_signal(
+    ctx: Any, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
     problem_labels = _per_tool_budget_problem_label_set(ctx)
     if not problem_labels:
         return None
@@ -646,13 +688,69 @@ def _per_tool_budget_problem_rerun_error(ctx: Any, arguments: dict[str, Any] | N
         return None
 
     labels = ", ".join(sorted(blocked_labels))
-    return (
+    agent_steering = (
         "The prior PER_TOOL_BUDGET run's get_run_results showed navigation "
         f"block(s) [{labels}] were canceled or failed while applying page state. "
         "Do NOT rerun those block label(s) unchanged with run_blocks_and_collect_debug. "
         "Update the workflow to split or replace the oversized navigation block first, "
         "prefer a code or validation block for DOM/page-state verification, or run only "
         "newly-created smaller block labels that apply one missing constraint at a time."
+    )
+    user_facing = "The previous run hit the per-step time budget. I need a smaller scope before I can rerun."
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
+        internal_reason_code="tool_error_per_tool_budget_rerun",
+        blocked_tool=tool_name,
+    )
+
+
+_RECONCILIATION_REQUIRES_INPUT_USER_FACING = (
+    "The previous run was canceled. Tell me whether to retry, keep the draft as-is, or adjust the workflow first."
+)
+_RECONCILIATION_NO_INPUT_USER_FACING = (
+    "The previous run ended without a verified result. I'll check what happened before doing anything else this turn."
+)
+
+
+def _pending_reconciliation_requires_input_signal(
+    *, pending_run_id: str, blocked_tool: str
+) -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            f"The canceled run {pending_run_id} has already been inspected. "
+            f"Do NOT run more blocks in this turn; ask the user whether to retry, "
+            f"accept the unverified draft, or adjust the workflow first. This guard "
+            f"prevents duplicate side effects on live sites."
+        ),
+        user_facing_reason=_RECONCILIATION_REQUIRES_INPUT_USER_FACING,
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset(),
+        internal_reason_code="tool_error_pending_reconciliation_requires_input",
+        blocked_tool=blocked_tool,
+    )
+
+
+def _pending_reconciliation_no_input_signal(*, pending_run_id: str, blocked_tool: str) -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            f"The previous block-running tool call for run {pending_run_id} "
+            f"ended without a trustworthy terminal status. "
+            f'Call `get_run_results(workflow_run_id="{pending_run_id}")` '
+            f"first, report the result to the user, then await user input "
+            f"before running more blocks. This guard prevents duplicate "
+            f"side effects on live sites."
+        ),
+        user_facing_reason=_RECONCILIATION_NO_INPUT_USER_FACING,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        internal_reason_code="tool_error_pending_reconciliation_no_input",
+        blocked_tool=blocked_tool,
     )
 
 
@@ -813,7 +911,7 @@ def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
     return max(1, min(PER_TOOL_CALL_BUDGET_SECONDS, int(remaining_after_reply_reserve)))
 
 
-def _late_block_running_call_error(ctx: AgentContext) -> str | None:
+def _late_block_running_call_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
     remaining = _copilot_seconds_remaining(ctx)
     if remaining is None or remaining > COPILOT_FINAL_REPLY_RESERVE_SECONDS:
         return None
@@ -826,31 +924,45 @@ def _late_block_running_call_error(ctx: AgentContext) -> str | None:
         and isinstance(last_good_workflow_yaml, str)
         and last_good_workflow_yaml
     ):
-        return (
+        agent_steering = (
             f"Wall-clock budget too low to retry: about {int(max(0.0, remaining))}s remain of the "
             f"{TOTAL_TIMEOUT_SECONDS}s session budget. A verified workflow exists from before the failure. "
             "Do NOT call update_and_run_blocks or run_blocks_and_collect_debug again. REPLY now: summarize "
             "what worked, name the block that failed, and tell the user they can keep the verified prefix or discard."
         )
-
-    if isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
-        return (
+    elif isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
+        agent_steering = (
             f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
             "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
             "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
         )
+    else:
+        agent_steering = (
+            f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
+            "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
+            "progress gathered so far, and make clear which parts have not been verified end-to-end."
+        )
 
-    return (
-        f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn. "
-        "Do NOT start another block-running tool call; reply to the user with the workflow draft and "
-        "progress gathered so far, and make clear which parts have not been verified end-to-end."
+    user_facing = "I'm running out of time on this turn. I'll wrap up with what I have so far."
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="stop",
+        cleared_by_tools=frozenset(),
+        # The "wrap up with what we have" semantic means the draft saved
+        # earlier in the turn should still surface — only the chat reply
+        # is overridden by the renderer.
+        preserves_workflow_draft=True,
+        internal_reason_code="tool_error_late_block_running",
+        blocked_tool=tool_name,
     )
 
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
-        return detected
+        return _emit_tool_blocker_signal(ctx, _build_loop_blocker_signal(detected, tool_name=tool_name))
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
@@ -859,7 +971,7 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
     if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
-            return detected
+            return _emit_tool_blocker_signal(ctx, _build_loop_blocker_signal(detected, tool_name=tool_name))
 
     # Hard-abort when the agent has re-fired the same action sequence against
     # the page N times without intervening success. This is the signal that
@@ -879,36 +991,47 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
         if isinstance(pending_run_id, str) and pending_run_id:
             if getattr(ctx, "pending_reconciliation_requires_user_input", False) is True:
-                return (
-                    f"The canceled run {pending_run_id} has already been inspected. "
-                    f"Do NOT run more blocks in this turn; ask the user whether to retry, "
-                    f"accept the unverified draft, or adjust the workflow first. This guard "
-                    f"prevents duplicate side effects on live sites."
+                return _emit_tool_blocker_signal(
+                    ctx,
+                    _pending_reconciliation_requires_input_signal(
+                        pending_run_id=pending_run_id, blocked_tool=tool_name
+                    ),
                 )
-            return (
-                f"The previous block-running tool call for run {pending_run_id} "
-                f"ended without a trustworthy terminal status. "
-                f'Call `get_run_results(workflow_run_id="{pending_run_id}")` '
-                f"first, report the result to the user, then await user input "
-                f"before running more blocks. This guard prevents duplicate "
-                f"side effects on live sites."
+            return _emit_tool_blocker_signal(
+                ctx,
+                _pending_reconciliation_no_input_signal(pending_run_id=pending_run_id, blocked_tool=tool_name),
             )
 
         if tool_name == "run_blocks_and_collect_debug":
-            budget_rerun_error = _per_tool_budget_problem_rerun_error(ctx, arguments)
-            if budget_rerun_error is not None:
-                return budget_rerun_error
+            budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
+            if budget_signal is not None:
+                return _emit_tool_blocker_signal(ctx, budget_signal)
 
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
         if streak >= REPEATED_ACTION_STREAK_ABORT_AT:
-            return (
+            agent_steering = (
                 f"Repeated-action abort: the last {streak} runs fired the same "
                 "action sequence against the page without making progress. "
                 "The site is likely blocked by a captcha, popup, anti-bot "
                 "challenge, or hidden validation error that the agent is not "
                 "detecting. Do NOT retry this tool — conclude the workflow is "
                 "not automatable as-is and report back to the user."
+            )
+            user_facing = (
+                "I tried the same actions a few times without making progress. The site looks blocked. I'll stop here."
+            )
+            return _emit_tool_blocker_signal(
+                ctx,
+                CopilotToolBlockerSignal(
+                    blocker_kind="tool_error",
+                    agent_steering_text=agent_steering,
+                    user_facing_reason=user_facing,
+                    recovery_hint="stop",
+                    cleared_by_tools=frozenset(),
+                    internal_reason_code="tool_error_repeated_action_abort",
+                    blocked_tool=tool_name,
+                ),
             )
 
         # Within-turn fail-fast for permanent navigation errors (DNS / cert /
@@ -921,57 +1044,109 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         # body.
         prior_nav_error = getattr(ctx, "last_test_non_retriable_nav_error", None)
         if isinstance(prior_nav_error, str) and prior_nav_error:
-            return (
+            agent_steering = (
                 f"Prior run in this turn hit a permanent navigation error "
                 f"({prior_nav_error[:200]}). Do NOT retry — the URL is unreachable "
                 "regardless of subdomain or path variations. Reply to the user "
                 "explaining the failure and asking them to verify the URL."
             )
+            user_facing = "The URL I tried isn't reachable. Tell me the correct address and I'll try again."
+            return _emit_tool_blocker_signal(
+                ctx,
+                CopilotToolBlockerSignal(
+                    blocker_kind="tool_error",
+                    agent_steering_text=agent_steering,
+                    user_facing_reason=user_facing,
+                    recovery_hint="ask_user_clarifying",
+                    cleared_by_tools=frozenset(),
+                    internal_reason_code="tool_error_non_retriable_nav",
+                    blocked_tool=tool_name,
+                ),
+            )
 
-        late_block_running_error = _late_block_running_call_error(ctx)
-        if late_block_running_error is not None:
-            return late_block_running_error
+        late_signal = _late_block_running_call_signal(ctx, tool_name)
+        if late_signal is not None:
+            return _emit_tool_blocker_signal(ctx, late_signal)
     return None
 
 
-def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+_build_loop_blocker_signal = build_loop_blocker_signal
+
+
+def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
     policy = getattr(ctx, "request_policy", None)
     if not isinstance(policy, RequestPolicy):
         return None
-    error: str | None = None
+
+    agent_steering: str | None = None
+    user_facing: str | None = None
+    reason_code: str | None = None
+    recovery_hint: RecoveryHint = "report_blocker_to_user"
+    cleared_by: frozenset[str] = frozenset()
+
     if tool_name == "update_workflow" and not policy.allow_update_workflow:
-        error = (
+        reason_code = "request_policy_blocks_update_workflow"
+        agent_steering = (
             "Request policy blocks workflow updates for the latest user message. "
             "Ask the user for safe stored credential metadata instead."
         )
+        user_facing = "I need stored credential metadata before I can update this workflow."
+        recovery_hint = "ask_user_clarifying"
     elif tool_name in BLOCK_RUNNING_TOOLS and not policy.allow_run_blocks:
         if policy.testing_intent == "skip_test":
-            error = "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+            reason_code = "request_policy_blocks_run_blocks_skip_test"
+            agent_steering = (
+                "Request policy says the latest user message asked for an untested draft. Use update_workflow only."
+            )
+            user_facing = "I'll save this as an untested draft because the request asked me not to run it."
+            recovery_hint = "retry_with_different_tool"
+            cleared_by = frozenset({"update_workflow"})
         elif policy.clarification_reason == "workflow_credential_inputs_unbound":
-            error = (
+            reason_code = "request_policy_blocks_run_blocks_credential_unbound"
+            agent_steering = (
                 "Skipped test run: the existing workflow references credential parameters "
                 "whose keys point to workflow inputs that are not configured. REPLY to the user "
                 "with: 'I applied your requested change. I couldn't test the modified workflow "
                 "because I couldn't find the required credentials — please add them via the "
                 "Credentials UI, then I can try again.' Keep the unvalidated draft surfaced."
             )
+            user_facing = (
+                "I applied your requested change. I couldn't test the modified workflow because "
+                "the required credentials aren't set up. Add them in the Credentials UI and ask "
+                "me to test it."
+            )
+            recovery_hint = "report_blocker_to_user"
         else:
-            error = (
+            reason_code = "request_policy_blocks_run_blocks_generic"
+            agent_steering = (
                 "Request policy blocks block-running tools for the latest user message. "
                 "Ask the user for the required safe credential or clarification before testing."
             )
-    if error is not None:
-        LOG.info(
-            "copilot authority gate blocked tool",
-            authority_gate_layer="request_policy",
-            blocked_tool=tool_name,
-            request_policy_allow_update_workflow=policy.allow_update_workflow,
-            request_policy_allow_run_blocks=policy.allow_run_blocks,
-            request_policy_testing_intent=policy.testing_intent,
-            request_policy_clarification_reason=policy.clarification_reason,
-        )
-        return error
-    return None
+            user_facing = "I need a credential or clarification from you before I can test this workflow."
+            recovery_hint = "ask_user_clarifying"
+
+    if reason_code is None or agent_steering is None or user_facing is None:
+        return None
+
+    LOG.info(
+        "copilot authority gate evaluated tool",
+        authority_gate_layer="request_policy",
+        blocked_tool=tool_name,
+        request_policy_allow_update_workflow=policy.allow_update_workflow,
+        request_policy_allow_run_blocks=policy.allow_run_blocks,
+        request_policy_testing_intent=policy.testing_intent,
+        request_policy_clarification_reason=policy.clarification_reason,
+        safe_reason_code=reason_code,
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint=recovery_hint,
+        cleared_by_tools=cleared_by,
+        internal_reason_code=reason_code,
+        blocked_tool=tool_name,
+    )
 
 
 def _request_policy_allows_credential_deferred_draft(ctx: AgentContext) -> bool:
@@ -1003,7 +1178,7 @@ def _turn_intent_has_edit_target(intent: TurnIntent) -> bool:
     )
 
 
-def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
+def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
     intent = getattr(ctx, "turn_intent", None)
     if not isinstance(intent, TurnIntent):
         return None
@@ -1015,7 +1190,7 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
         labels = sorted(_workflow_yaml_blocks_by_label(getattr(ctx, "workflow_yaml", None)))
         label_hint = ", ".join(labels[:8]) if labels else "no labeled blocks"
         LOG.info(
-            "copilot authority gate blocked tool",
+            "copilot authority gate evaluated tool",
             authority_gate_layer="turn_intent",
             turn_intent_mode=intent.mode.value,
             turn_intent_target_entity_types=sorted(intent.target_entities),
@@ -1023,11 +1198,21 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
             blocked_tool=tool_name,
             safe_reason_code=reason_code,
         )
-        return (
-            f"TurnIntent classified this turn as `edit`, but the latest user message references workflow/block "
-            f"identifier(s) that are not present in the current workflow: {', '.join(unresolved_refs)}. "
-            f"Current workflow labels include: {label_hint}. Ask the user which current block should change before "
-            f"mutating or running blocks. safe_reason_code={reason_code}."
+        unresolved_str = ", ".join(unresolved_refs)
+        return _build_turn_intent_signal(
+            tool_name=tool_name,
+            classifier_mode=intent.mode.value,
+            reason_code=reason_code,
+            agent_steering_text=(
+                f"The latest user message references workflow/block identifier(s) that are not present in the "
+                f"current workflow: {unresolved_str}. Current workflow labels include: {label_hint}. Ask the user "
+                f"which current block should change before mutating or running blocks."
+            ),
+            user_facing_reason=(
+                f"I couldn't find the block(s) you mentioned ({unresolved_str}). "
+                f"Tell me which existing block to change."
+            ),
+            recovery_hint="ask_user_clarifying",
         )
 
     if (
@@ -1037,17 +1222,23 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     ):
         reason_code = "turn_intent_missing_edit_target"
         LOG.info(
-            "copilot authority gate blocked tool",
+            "copilot authority gate evaluated tool",
             authority_gate_layer="turn_intent",
             turn_intent_mode=intent.mode.value,
             turn_intent_target_entity_types=sorted(intent.target_entities),
             blocked_tool=tool_name,
             safe_reason_code=reason_code,
         )
-        return (
-            f"TurnIntent classified this turn as `edit`, but could not identify a specific workflow edit target, "
-            f"so `{tool_name}` is not allowed. Ask the user which workflow/block should change before mutating. "
-            f"safe_reason_code={reason_code}."
+        return _build_turn_intent_signal(
+            tool_name=tool_name,
+            classifier_mode=intent.mode.value,
+            reason_code=reason_code,
+            agent_steering_text=(
+                "Could not identify a specific workflow edit target. Ask the user which workflow/block should "
+                "change before mutating."
+            ),
+            user_facing_reason="Tell me which block or workflow you'd like me to change.",
+            recovery_hint="ask_user_clarifying",
         )
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
@@ -1091,7 +1282,7 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     else:
         reason_code = "turn_intent_run_blocked"
     LOG.info(
-        "copilot authority gate blocked tool",
+        "copilot authority gate evaluated tool",
         authority_gate_layer="turn_intent",
         turn_intent_mode=intent.mode.value,
         turn_intent_target_entity_types=sorted(intent.target_entities),
@@ -1103,24 +1294,70 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     )
     action = "ask the user" if authority.requires_user_input else "answer the user"
     detail = f" Ask: {intent.missing_context_question}" if intent.missing_context_question else ""
+
     if blocks_run and not blocks_update and authority.may_update_workflow:
-        return (
-            f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
-            f"to run browser blocks for the latest user message. Use `update_workflow` only and keep the draft "
-            f"unvalidated. safe_reason_code={reason_code}.{detail}"
+        return _build_turn_intent_signal(
+            tool_name=tool_name,
+            classifier_mode=intent.mode.value,
+            reason_code=reason_code,
+            agent_steering_text=(
+                "Browser blocks may not run for the latest user message. Use update_workflow only and keep the "
+                f"draft unvalidated.{detail}"
+            ),
+            user_facing_reason="I'll save the change as a draft without running it.",
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({"update_workflow"}),
         )
     if blocks_context_read and not blocks_update and not blocks_run:
-        return (
-            f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
-            f"to read run context for the latest user message. Answer using the context already provided. "
-            f"safe_reason_code={reason_code}.{detail}"
+        return _build_turn_intent_signal(
+            tool_name=tool_name,
+            classifier_mode=intent.mode.value,
+            reason_code=reason_code,
+            agent_steering_text=(
+                "Run context may not be read for the latest user message. Answer using the context already "
+                f"provided.{detail}"
+            ),
+            user_facing_reason="I'll answer with the information I already have.",
+            recovery_hint="report_blocker_to_user",
         )
-    return (
-        f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
-        "for the latest user message. Do not update workflow YAML or run browser blocks, and do not "
-        f"fetch additional run context with tools; {action} using the available context instead. "
-        f"safe_reason_code={reason_code}.{detail}"
+    return _build_turn_intent_signal(
+        tool_name=tool_name,
+        classifier_mode=intent.mode.value,
+        reason_code=reason_code,
+        agent_steering_text=(
+            "This tool is not allowed for the latest user message. Do not update workflow YAML or run browser "
+            "blocks, and do not fetch additional run context with tools; "
+            f"{action} using the available context instead.{detail}"
+        ),
+        user_facing_reason="I'll respond with the information I already have.",
+        recovery_hint="ask_user_clarifying" if authority.requires_user_input else "report_blocker_to_user",
     )
+
+
+def _build_turn_intent_signal(
+    *,
+    tool_name: str,
+    classifier_mode: str,
+    reason_code: str,
+    agent_steering_text: str,
+    user_facing_reason: str,
+    recovery_hint: RecoveryHint,
+    cleared_by_tools: frozenset[str] = frozenset(),
+) -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="authority_denied",
+        agent_steering_text=agent_steering_text,
+        user_facing_reason=user_facing_reason,
+        recovery_hint=recovery_hint,
+        cleared_by_tools=cleared_by_tools,
+        internal_reason_code=reason_code,
+        blocked_tool=tool_name,
+        classifier_mode=classifier_mode,
+    )
+
+
+def _emit_tool_blocker_signal(ctx: AgentContext, signal: CopilotToolBlockerSignal) -> str:
+    return stash_blocker_signal(ctx, signal)
 
 
 def _authority_tool_error(
@@ -1129,28 +1366,32 @@ def _authority_tool_error(
     *,
     ignore_request_policy_error: bool = False,
 ) -> str | None:
-    turn_intent_error = _turn_intent_tool_error(ctx, tool_name)
-    request_policy_error = _request_policy_tool_error(ctx, tool_name)
-    if turn_intent_error is not None and request_policy_error is not None:
+    # Request-policy precedes turn-intent unless explicitly ignored.
+    turn_intent_signal = _turn_intent_tool_error(ctx, tool_name)
+    request_policy_signal = _request_policy_tool_error(ctx, tool_name)
+    if turn_intent_signal is not None and request_policy_signal is not None:
         LOG.info(
             "copilot authority gate blocked tool",
             authority_gate_layer="both",
             blocked_tool=tool_name,
         )
-    if request_policy_error is not None and not ignore_request_policy_error:
-        return request_policy_error
-    if turn_intent_error is not None:
-        return turn_intent_error
-    phase_error = _phase_tool_error(ctx, tool_name)
-    if phase_error is not None:
+    chosen = (
+        request_policy_signal
+        if (request_policy_signal is not None and not ignore_request_policy_error)
+        else turn_intent_signal
+    )
+    if chosen is not None:
+        return _emit_tool_blocker_signal(ctx, chosen)
+    phase_signal = _phase_blocker_signal(ctx, tool_name)
+    if phase_signal is not None:
         LOG.info(
             "copilot authority gate blocked tool",
             authority_gate_layer="build_phase",
             blocked_tool=tool_name,
             build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
-            safe_reason_code="build_phase_gate",
         )
-    return phase_error
+        return _emit_tool_blocker_signal(ctx, phase_signal)
+    return None
 
 
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
@@ -4134,13 +4375,25 @@ async def update_workflow_tool(
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
     if _request_policy_allows_credential_deferred_draft(copilot_ctx):
-        result = {
-            "ok": False,
-            "error": (
-                "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
-                "and skip the browser run with the required credential setup message."
-            ),
-        }
+        agent_steering = (
+            "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
+            "and skip the browser run with the required credential setup message."
+        )
+        user_facing = (
+            "I can save this as a draft without running it because the credentials aren't set up yet. "
+            "Add them in the Credentials UI and ask me to test the workflow."
+        )
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="authority_denied",
+            agent_steering_text=agent_steering,
+            user_facing_reason=user_facing,
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({"update_and_run_blocks"}),
+            internal_reason_code="request_policy_credential_deferred_redirect",
+            blocked_tool="update_workflow",
+        )
+        payload = _emit_tool_blocker_signal(copilot_ctx, signal)
+        result = {"ok": False, "error": payload}
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
         return json.dumps(result)
 
@@ -4308,9 +4561,9 @@ async def get_run_results_tool(
     loop_error = _tool_loop_error(copilot_ctx, "get_run_results", params)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
-    turn_intent_error = _turn_intent_tool_error(copilot_ctx, "get_run_results")
-    if turn_intent_error:
-        return json.dumps({"ok": False, "error": turn_intent_error})
+    authority_error = _authority_tool_error(copilot_ctx, "get_run_results")
+    if authority_error:
+        return json.dumps({"ok": False, "error": authority_error})
 
     result = await _get_run_results(params, copilot_ctx)
     _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)

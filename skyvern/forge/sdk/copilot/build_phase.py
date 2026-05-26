@@ -27,6 +27,7 @@ import yaml
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
 
@@ -180,15 +181,10 @@ def advance_to_testing(ctx: CopilotContext) -> None:
     _log_transition(ctx, prev=prev, new=ctx.build_phase, reason="update_workflow_succeeded")
 
 
-def _phase_tool_error(ctx: Any, tool_name: str) -> str | None:
-    """Shared phase-aware authority error. Returns the steering error string
-    when the (phase, tool) pair is forbidden; None otherwise.
+def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal | None:
+    """Phase-aware authority blocker, parallel to `_turn_intent_tool_error` / `_request_policy_tool_error`."""
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 
-    Called from both the native gate (`_authority_tool_error` in tools.py)
-    and the MCP-adapter gate (`SkyvernOverlayMCPServer.call_tool` pre-pre-hook).
-    Errors flow back to the LLM as next-step steering, per the ai-agents
-    'errors as steering' guidance.
-    """
     phase = getattr(ctx, "build_phase", None)
     if not isinstance(phase, BuildPhase):
         return None
@@ -197,24 +193,54 @@ def _phase_tool_error(ctx: Any, tool_name: str) -> str | None:
     in_mutation = phase in MUTATION_PERMITTED_PHASES
 
     if tool_name in _DISCOVERY_TOOLS and in_mutation:
-        return (
-            "discover_workflow_entrypoint is only available before composition. "
-            "The workflow already has a target URL — proceed with update_workflow or update_and_run_blocks. "
-            "safe_reason_code=build_phase_discovery_disallowed_post_compose."
+        return CopilotToolBlockerSignal(
+            blocker_kind="phase_gated",
+            agent_steering_text=(
+                "discover_workflow_entrypoint is only available before composition. "
+                "The workflow already has a target URL — proceed with update_workflow or update_and_run_blocks. "
+                "safe_reason_code=build_phase_discovery_disallowed_post_compose."
+            ),
+            user_facing_reason="I already have a target for this workflow — I'll keep editing it instead of starting over.",
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
+            internal_reason_code="build_phase_discovery_disallowed_post_compose",
+            blocked_tool=tool_name,
         )
 
     if tool_name in _BROWSER_PRIMITIVE_TOOLS and in_discovery:
-        return (
-            "Direct browser tools are not callable before composition. "
-            "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
-            "safe_reason_code=build_phase_browser_blocked_pre_compose."
+        return CopilotToolBlockerSignal(
+            blocker_kind="phase_gated",
+            agent_steering_text=(
+                "Direct browser tools are not callable before composition. "
+                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL. "
+                "safe_reason_code=build_phase_browser_blocked_pre_compose."
+            ),
+            user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
+            recovery_hint="ask_user_clarifying",
+            cleared_by_tools=frozenset(),
+            internal_reason_code="build_phase_browser_blocked_pre_compose",
+            blocked_tool=tool_name,
         )
 
     if tool_name in _MUTATION_TOOLS and in_discovery:
-        return (
-            "Workflow mutation is gated to composition. "
-            "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
-            "safe_reason_code=build_phase_mutation_blocked_pre_compose."
+        return CopilotToolBlockerSignal(
+            blocker_kind="phase_gated",
+            agent_steering_text=(
+                "Workflow mutation is gated to composition. "
+                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                "safe_reason_code=build_phase_mutation_blocked_pre_compose."
+            ),
+            user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
+            recovery_hint="ask_user_clarifying",
+            cleared_by_tools=frozenset(),
+            internal_reason_code="build_phase_mutation_blocked_pre_compose",
+            blocked_tool=tool_name,
         )
 
     return None
+
+
+def _phase_tool_error(ctx: Any, tool_name: str) -> str | None:
+    """Thin compatibility shim: returns the LLM-visible steering text from `_phase_blocker_signal`."""
+    signal = _phase_blocker_signal(ctx, tool_name)
+    return signal.agent_steering_text if signal is not None else None
