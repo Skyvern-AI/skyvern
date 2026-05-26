@@ -300,11 +300,11 @@ function TestWebhookDialog({
                     <CollapsibleContent className="mt-4 space-y-4">
                       <div className="space-y-2">
                         <Label>Headers Sent</Label>
-                        <div className="space-y-1 rounded-md border bg-slate-elevation1 p-3 font-mono text-sm dark:bg-background">
+                        <div className="space-y-1 rounded-md border bg-slate-50 p-3 font-mono text-sm dark:bg-slate-950">
                           {Object.entries(result.headers_sent).map(
                             ([key, value]) => (
                               <div key={key}>
-                                <span className="text-muted-foreground dark:text-muted-foreground">
+                                <span className="text-slate-600 dark:text-slate-400">
                                   {key}:
                                 </span>{" "}
                                 {value}

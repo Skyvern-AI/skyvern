@@ -23,6 +23,7 @@ import { useHasInteractedThisSession } from "../../panels/useHasInteractedThisSe
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
+import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { errorMappingExampleValue } from "../types";
 import { type AppNode } from "..";
@@ -72,6 +73,9 @@ function ActionEditorBody({
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const hasInteracted = useHasInteractedThisSession();
+  const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
+    data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
+  );
 
   return (
     <div data-testid="action-block-form" className="space-y-4">
@@ -137,11 +141,6 @@ function ActionEditorBody({
                   onParametersChange={(parameterKeys) =>
                     update({ parameterKeys })
                   }
-                  onCredentialTotpIdentifier={(totpIdentifier) => {
-                    if (!data.totpIdentifier?.trim()) {
-                      update({ totpIdentifier });
-                    }
-                  }}
                 />
               </div>
               <div className="flex items-center justify-between">
@@ -276,9 +275,18 @@ function ActionEditorBody({
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
-                  placeholder={placeholders["action"]["totpIdentifier"]}
+                  placeholder={
+                    !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                      ? `${credentialTotpIdentifier} (from credential)`
+                      : placeholders["action"]["totpIdentifier"]
+                  }
                   className="nopan text-xs"
                 />
+                {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                  <p className="text-xs text-slate-500">
+                    Leave empty to use the credential's value.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">

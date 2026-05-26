@@ -137,7 +137,7 @@ function SpreadsheetCombobox({
             e.preventDefault();
           }
         }}
-        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-border bg-slate-elevation1 p-0 shadow-lg"
+        className="nopan w-[var(--radix-popover-trigger-width)] overflow-hidden rounded-md border border-slate-700 bg-slate-900 p-0 shadow-lg"
       >
         <SpreadsheetListPanel
           credentialId={credentialId}
@@ -214,14 +214,14 @@ function SpreadsheetListPanel({
   if (isReconnectRequired(listing.error)) {
     return (
       <div className="w-full p-3 text-xs">
-        <p className="mb-2 text-foreground">
+        <p className="mb-2 text-slate-200">
           Reconnect this Google account to enable the sheet picker.
         </p>
         <a
           href="/integrations"
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-muted-foreground underline hover:text-foreground"
+          className="inline-flex items-center gap-1 text-slate-300 underline hover:text-slate-100"
         >
           Open integrations <ExternalLinkIcon className="size-3" />
         </a>
@@ -242,7 +242,7 @@ function SpreadsheetListPanel({
   return (
     <>
       {allowCreate ? (
-        <div className="border-b border-border">
+        <div className="border-b border-slate-700">
           <InlineCreateRow
             label="Create new spreadsheet"
             placeholder="Spreadsheet title"
@@ -277,7 +277,7 @@ function SpreadsheetListPanel({
             Could not load spreadsheets. Please try again.
           </div>
         ) : items.length === 0 ? (
-          <div className="px-3 py-3 text-xs text-muted-foreground">
+          <div className="px-3 py-3 text-xs text-slate-500">
             No spreadsheets found.
           </div>
         ) : (
@@ -293,11 +293,11 @@ function SpreadsheetListPanel({
                     firstSheetName: null,
                   })
                 }
-                className="flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs hover:bg-slate-elevation4"
+                className="flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs hover:bg-slate-700"
               >
-                <span className="font-medium text-foreground">{ss.name}</span>
+                <span className="font-medium text-slate-200">{ss.name}</span>
                 {ss.modified_time ? (
-                  <span className="text-muted-foreground">
+                  <span className="text-slate-500">
                     Modified {new Date(ss.modified_time).toLocaleString()}
                   </span>
                 ) : null}
@@ -305,7 +305,7 @@ function SpreadsheetListPanel({
             ))}
             {listing.isFetchingNextPage ? (
               <div className="flex items-center justify-center py-2">
-                <ReloadIcon className="size-3 animate-spin text-muted-foreground" />
+                <ReloadIcon className="size-3 animate-spin text-slate-400" />
               </div>
             ) : null}
           </>

@@ -138,7 +138,7 @@ function WorkflowPostRunParameters() {
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-sm">Loop Values</h1>
-                <h2 className="text-sm text-muted-foreground">
+                <h2 className="text-sm text-slate-400">
                   The values that are being looped over
                 </h2>
               </div>
@@ -423,7 +423,7 @@ function WorkflowPostRunParameters() {
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Run With</h1>
-                <h2 className="text-base text-muted-foreground">
+                <h2 className="text-base text-slate-400">
                   Execution mode for this run
                 </h2>
               </div>
@@ -453,7 +453,7 @@ function WorkflowPostRunParameters() {
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Task 2.0 Prompt</h1>
-                <h2 className="text-base text-muted-foreground">
+                <h2 className="text-base text-slate-400">
                   The original prompt for the task
                 </h2>
               </div>

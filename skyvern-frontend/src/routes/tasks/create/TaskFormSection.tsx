@@ -33,14 +33,14 @@ function TaskFormSection({
         >
           <div
             className={cn(
-              "flex w-7 items-center justify-center rounded-full border border-border",
+              "flex w-7 items-center justify-center rounded-full border border-slate-400",
               {
                 "border-destructive": !active && hasError,
-                "bg-slate-elevation4 text-foreground": active || hovering,
+                "bg-slate-400 text-slate-950": active || hovering,
               },
             )}
           >
-            <span className={"text-foreground"}>{String(index)}</span>
+            <span className={"text-slate-50"}>{String(index)}</span>
           </div>
           <span
             className={cn("text-lg", {

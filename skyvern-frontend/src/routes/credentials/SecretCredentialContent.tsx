@@ -43,7 +43,7 @@ function SecretCredentialContent({
       <div className="flex">
         <div className="w-72 shrink-0 space-y-1">
           <Label>Name</Label>
-          <div className="text-sm text-muted-foreground">
+          <div className="text-sm text-slate-400">
             The name of the credential
           </div>
         </div>
@@ -132,7 +132,7 @@ function SecretCredentialContent({
             </div>
           </div>
         )}
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-slate-400">
           {
             "Use in HTTP Request blocks with: {{ credential_name.secret_value }}"
           }

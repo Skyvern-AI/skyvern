@@ -63,7 +63,7 @@ function WorkflowFolderSelector({
           size="icon"
           className={cn(
             "h-8 w-8",
-            currentFolderId ? "text-blue-400" : "text-muted-foreground",
+            currentFolderId ? "text-blue-400" : "text-slate-400",
           )}
         >
           <FolderIcon className="h-4 w-4" />
@@ -77,7 +77,7 @@ function WorkflowFolderSelector({
         <div className="border-b p-3">
           <h4 className="mb-2 text-sm font-medium">Move to folder</h4>
           <div className="relative">
-            <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+            <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <Input
               placeholder="Search folders..."
               value={search}
@@ -88,7 +88,7 @@ function WorkflowFolderSelector({
           </div>
         </div>
         <div
-          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-border [&::-webkit-scrollbar-thumb]:bg-slate-elevation4 dark:[&::-webkit-scrollbar-thumb]:border-border dark:[&::-webkit-scrollbar-thumb]:bg-slate-elevation5 [&::-webkit-scrollbar-track]:bg-slate-elevation2 dark:[&::-webkit-scrollbar-track]:bg-slate-elevation5 [&::-webkit-scrollbar]:w-2"
+          className="max-h-[300px] overflow-y-auto [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
           onScroll={(e) =>
             handleInfiniteScroll(
               e,
@@ -101,7 +101,7 @@ function WorkflowFolderSelector({
           {currentFolderId && (
             <button
               onClick={() => handleFolderSelect(null)}
-              className="flex w-full items-center justify-between border-b px-3 py-2 text-left text-sm transition-colors hover:bg-slate-elevation1 dark:hover:bg-slate-elevation5"
+              className="flex w-full items-center justify-between border-b px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-slate-800"
             >
               <div className="flex items-center gap-2">
                 <Cross2Icon className="h-4 w-4 text-red-400" />
@@ -127,7 +127,7 @@ function WorkflowFolderSelector({
               ))}
             </>
           ) : folders.length === 0 ? (
-            <div className="px-3 py-8 text-center text-sm text-muted-foreground">
+            <div className="px-3 py-8 text-center text-sm text-slate-400">
               No folders found
             </div>
           ) : (
@@ -139,14 +139,14 @@ function WorkflowFolderSelector({
                     key={folder.folder_id}
                     onClick={() => handleFolderSelect(folder.folder_id)}
                     disabled={isCurrentFolder}
-                    className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-elevation1 disabled:opacity-50 dark:hover:bg-slate-elevation5"
+                    className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
                   >
                     <div className="flex items-center gap-2">
                       <FolderIcon className="h-4 w-4 text-blue-400" />
                       <div className="flex flex-col">
                         <span>{folder.title}</span>
                         {folder.description && (
-                          <span className="text-xs text-muted-foreground">
+                          <span className="text-xs text-slate-400">
                             {folder.description}
                           </span>
                         )}
@@ -160,7 +160,7 @@ function WorkflowFolderSelector({
               })}
               {isFetchingNextPage && (
                 <div className="flex items-center justify-center py-2">
-                  <ReloadIcon className="h-3 w-3 animate-spin text-muted-foreground" />
+                  <ReloadIcon className="h-3 w-3 animate-spin text-slate-400" />
                 </div>
               )}
             </>

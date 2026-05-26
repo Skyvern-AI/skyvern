@@ -20,7 +20,7 @@ export const WorkflowCopilotButton = forwardRef<
       <ChatBubbleIcon className="h-4 w-4" />
       <span>Copilot</span>
       {messageCount > 0 && (
-        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-brand-cta text-xs font-bold text-brand-cta-foreground">
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
           {messageCount}
         </span>
       )}

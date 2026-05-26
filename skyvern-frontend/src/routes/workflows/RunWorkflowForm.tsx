@@ -572,7 +572,7 @@ function RunWorkflowForm({
             <h1 className="text-3xl">
               Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
-            <h2 className="text-lg text-muted-foreground">
+            <h2 className="text-lg text-slate-400">
               Fill the placeholder values that you have linked throughout your
               workflow.
             </h2>
@@ -606,7 +606,6 @@ function RunWorkflowForm({
             />
             <Button
               type="submit"
-              variant="brand"
               disabled={
                 runWorkflowMutation.isPending ||
                 hasLoginBlockValidationError ||
@@ -738,17 +737,17 @@ function RunWorkflowForm({
                   return (
                     <FormItem>
                       <div className="flex gap-16">
-                        <FormLabel className="!text-foreground">
+                        <FormLabel className="!text-slate-50">
                           <div className="w-72">
                             <div className="flex items-center gap-2 text-lg">
                               {parameter.key}
-                              <span className="text-sm text-muted-foreground">
+                              <span className="text-sm text-slate-400">
                                 {getLabelForWorkflowParameterType(
                                   parameter.workflow_parameter_type,
                                 )}
                               </span>
                             </div>
-                            <h2 className="text-sm text-muted-foreground">
+                            <h2 className="text-sm text-slate-400">
                               {parameter.description}
                             </h2>
                           </div>
@@ -827,7 +826,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Webhook Callback URL
                         </div>
-                        <h2 className="text-sm text-muted-foreground">
+                        <h2 className="text-sm text-slate-400">
                           The URL of a webhook endpoint to send the details of
                           the workflow result.
                         </h2>
@@ -887,7 +886,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Proxy Location
                         </div>
-                        <h2 className="text-sm text-muted-foreground">
+                        <h2 className="text-sm text-slate-400">
                           Route Skyvern through one of our available proxies.
                         </h2>
                       </div>
@@ -938,7 +937,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           Run With
                         </div>
-                        <h2 className="text-sm text-muted-foreground">
+                        <h2 className="text-sm text-slate-400">
                           {descriptions[field.value] ?? descriptions.agent}
                         </h2>
                       </div>
@@ -979,7 +978,7 @@ function RunWorkflowForm({
                         <div className="flex items-center gap-2 text-lg">
                           AI Fallback (self-healing)
                         </div>
-                        <h2 className="text-sm text-muted-foreground">
+                        <h2 className="text-sm text-slate-400">
                           If the run fails when running with code, keep this on
                           to have AI attempt to fix the issue and regenerate the
                           code.
@@ -1025,7 +1024,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Session ID
                                 </div>
-                                <h2 className="text-sm text-muted-foreground">
+                                <h2 className="text-sm text-slate-400">
                                   Use a persistent browser session to maintain
                                   state and enable browser interaction.
                                 </h2>
@@ -1062,7 +1061,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Profile
                                 </div>
-                                <h2 className="text-sm text-muted-foreground">
+                                <h2 className="text-sm text-slate-400">
                                   Load a saved browser profile to reuse cookies,
                                   storage, and signed-in state for this run.
                                 </h2>
@@ -1095,7 +1094,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Browser Address
                                 </div>
-                                <h2 className="text-sm text-muted-foreground">
+                                <h2 className="text-sm text-slate-400">
                                   The address of the Browser server to use for
                                   the workflow run.
                                 </h2>
@@ -1133,7 +1132,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Extra HTTP Headers
                                 </div>
-                                <h2 className="text-sm text-muted-foreground">
+                                <h2 className="text-sm text-slate-400">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
                                 </h2>
@@ -1203,7 +1202,7 @@ function RunWorkflowForm({
                                 <div className="flex items-center gap-2 text-lg">
                                   Max Screenshot Scrolls
                                 </div>
-                                <h2 className="text-sm text-muted-foreground">
+                                <h2 className="text-sm text-slate-400">
                                   {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                                 </h2>
                               </div>

@@ -24,7 +24,7 @@ function Taskv2BlockParameters({
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Prompt</h1>
-          <h2 className="text-base text-muted-foreground">
+          <h2 className="text-base text-slate-400">
             The instructions for this task
           </h2>
         </div>
@@ -69,7 +69,7 @@ function Taskv2BlockParameters({
           </div>
           <div className="flex w-full items-center gap-3">
             <Switch checked={true} disabled />
-            <span className="text-sm text-muted-foreground">
+            <span className="text-sm text-slate-400">
               Cache is disabled for this block
             </span>
           </div>
