@@ -709,6 +709,7 @@ function convertToNode(
           downloadSuffix: null,
           parameterKeys: [],
           includeActionHistoryInVerification: false,
+          legacyV2Available: true,
         },
       };
     }
@@ -770,6 +771,7 @@ function convertToNode(
           completeCriterion: block.complete_criterion ?? "",
           terminateCriterion: block.terminate_criterion ?? "",
           engine: block.engine ?? RunEngine.SkyvernV1,
+          legacyV2Available: isV2Engine,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
           // When engine is SkyvernV2, use navigation_goal as the prompt
@@ -2238,7 +2240,8 @@ function createNode(
       };
     }
     case "taskv2": {
-      // Redirect taskv2 creation to navigation with SkyvernV2 engine
+      // Defensive fallback for stale callers that still request the removed
+      // add-menu type. Persisted task_v2 blocks are preserved by blockToNode.
       return {
         ...identifiers,
         ...common,
@@ -2246,7 +2249,6 @@ function createNode(
         data: {
           ...navigationNodeDefaultData,
           label,
-          engine: RunEngine.SkyvernV2,
         },
       };
     }
