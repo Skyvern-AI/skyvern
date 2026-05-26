@@ -1207,7 +1207,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     adaptive_caching: bool = False
     code_version: int | None = Field(default=None, ge=1, le=2)
     generate_script_on_terminal: bool = False
-    run_sequentially: bool = False
+    run_sequentially: bool = Field(default=False, title="Prevent Overlapping Runs")
     sequential_key: str | None = None
     folder_id: str | None = None
 
