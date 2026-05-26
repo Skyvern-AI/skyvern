@@ -600,6 +600,7 @@ class ScriptReviewer:
                         episode_id=episode.episode_id,
                         organization_id=organization_id,
                         reviewer_output="TRIAGE: not_code_fixable — skipped",
+                        reviewer_version="v2",
                     )
                     LOG.info(
                         "ScriptReviewer: skipping non-code-fixable episode",

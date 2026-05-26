@@ -31,6 +31,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.services.script_reviewer_v3.skills.base import Skill, SkillError, SkillResult
+from skyvern.services.script_reviewer_v3.types import PostRunContext
 
 LOG = structlog.get_logger()
 
@@ -114,6 +115,15 @@ def _update_context_revision(
             agent_context.script_id = new_script_id
 
 
+def _record_v3_persist_cap_acquisition(agent_context: Any) -> None:
+    """Mark contexts that already consumed the v3 persist cap."""
+    if not isinstance(agent_context, PostRunContext):
+        return
+    agent_context.v3_persist_cap_consumed = True
+    current_count = getattr(agent_context, "v3_persist_cap_acquisitions", 0) or 0
+    agent_context.v3_persist_cap_acquisitions = int(current_count) + 1
+
+
 async def _enforce_v3_cap(
     workflow_permanent_id: str,
     organization_id: str | None = None,
@@ -166,6 +176,7 @@ async def _handler_persist_block_edit(args: dict[str, Any], context: Any) -> Ski
                 "hint": "Per-wpid daily v3 persist cap reached. No edit was applied.",
             }
         )
+    _record_v3_persist_cap_acquisition(context)
 
     # Per-script Redis lock to serialize concurrent persists. v3_persist scope
     # is distinct from v2's script_reviewer:{} lock so the two don't deadlock.
@@ -256,6 +267,7 @@ async def _handler_persist_script_rewrite(args: dict[str, Any], context: Any) ->
                 "reason": "daily_cap_exceeded",
             }
         )
+    _record_v3_persist_cap_acquisition(context)
 
     cache = CacheFactory.get_cache()
     base_script_id = persist_ctx["base_script"].script_id

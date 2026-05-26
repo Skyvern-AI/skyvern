@@ -330,6 +330,8 @@ async def v3_review_post_run(
             budget_used=prc.budget,
             timeline=[],
             per_episode_persist_results=persist_results,
+            v3_persist_cap_consumed=prc.v3_persist_cap_consumed,
+            v3_persist_cap_acquisitions=prc.v3_persist_cap_acquisitions,
         )
 
     # Single deterministic pass to apply per-episode persists. Persists run
@@ -369,6 +371,8 @@ async def v3_review_post_run(
         budget_used=result.budget,
         timeline=result.timeline,
         per_episode_persist_results=persist_results,
+        v3_persist_cap_consumed=prc.v3_persist_cap_consumed,
+        v3_persist_cap_acquisitions=prc.v3_persist_cap_acquisitions,
     )
 
 

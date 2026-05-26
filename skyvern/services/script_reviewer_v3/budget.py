@@ -137,8 +137,8 @@ class RunBudget:
         pre-charged at the per-review ceiling). Returns ``None`` if either cap
         would be exceeded — caller should skip v3 and fall through to agent.
 
-        Reservation (not actual usage) is held until :meth:`InvocationHandle.finalize_cost`
-        reconciles with the true cost spent during the review.
+        Reservation (not actual usage) is held until :meth:`reconcile_invocation`
+        replaces the reservation with the true cost spent during the review.
         """
         async with self._lock:
             if self._invocations_used >= self.max_invocations_per_run:
@@ -149,6 +149,21 @@ class RunBudget:
             self._invocations_used += 1
             self._cost_reserved_usd = new_reservation
             return InvocationHandle(budget=self, reserved_usd=self.per_review_cost_ceiling_usd)
+
+    async def reconcile_invocation(self, *, reserved_usd: float, actual_usd: float) -> None:
+        """Replace a pre-charged invocation reservation with actual spend."""
+        async with self._lock:
+            self._cost_reserved_usd = max(
+                0.0,
+                self._cost_reserved_usd - reserved_usd + actual_usd,
+            )
+            if actual_usd > reserved_usd:
+                LOG.warning(
+                    "v3 review exceeded cost reservation",
+                    reserved_usd=reserved_usd,
+                    actual_usd=actual_usd,
+                    overshoot_usd=actual_usd - reserved_usd,
+                )
 
     def to_metrics(self) -> dict[str, float | int]:
         return {
@@ -175,18 +190,7 @@ class InvocationHandle:
     reserved_usd: float
 
     async def finalize_cost(self, actual_usd: float) -> None:
-        async with self.budget._lock:
-            # Adjust reserved -> actual:
-            # - remove the reserved amount, add back the actual amount
-            # - clamp at 0 to handle transient arithmetic edge cases
-            self.budget._cost_reserved_usd = max(
-                0.0,
-                self.budget._cost_reserved_usd - self.reserved_usd + actual_usd,
-            )
-            if actual_usd > self.reserved_usd:
-                LOG.warning(
-                    "v3 review exceeded cost reservation",
-                    reserved_usd=self.reserved_usd,
-                    actual_usd=actual_usd,
-                    overshoot_usd=actual_usd - self.reserved_usd,
-                )
+        await self.budget.reconcile_invocation(
+            reserved_usd=self.reserved_usd,
+            actual_usd=actual_usd,
+        )
