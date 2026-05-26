@@ -145,11 +145,13 @@ def parse_action(
         click_context = action.get("click_context", None)
         if click_context:
             click_context = ClickContext.model_validate(click_context)
+        double_click = action.get("double_click", False)
         return ClickAction(
             **base_action_dict,
             file_url=file_url,
             download=action.get("download", False),
             click_context=click_context,
+            repeat=2 if double_click else 1,
         )
 
     if action_type == ActionType.INPUT_TEXT:

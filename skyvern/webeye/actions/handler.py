@@ -3131,6 +3131,26 @@ async def _did_page_respond(
         return True
 
 
+def _get_click_count(action: ClickAction | UploadFileAction) -> int:
+    if isinstance(action, ClickAction):
+        return action.repeat
+    return 1
+
+
+async def _locator_click(
+    locator: Locator,
+    click_count: int,
+    timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
+    **kwargs: Any,
+) -> None:
+    if click_count == 2:
+        await locator.dblclick(timeout=timeout, **kwargs)
+    elif click_count >= 3:
+        await locator.click(timeout=timeout, click_count=click_count, **kwargs)
+    else:
+        await locator.click(timeout=timeout, **kwargs)
+
+
 async def chain_click(
     task: Task,
     scraped_page: ScrapedPage,
@@ -3148,6 +3168,7 @@ async def chain_click(
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
     locator = skyvern_element.locator
+    click_count = _get_click_count(action)
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
     file = pending_upload_files or []
@@ -3190,7 +3211,7 @@ async def chain_click(
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
-            await locator.click(timeout=timeout)
+            await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         action_results = [ActionSuccess()]
         return action_results
@@ -3207,7 +3228,7 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_element := await skyvern_element.find_label_for(dom=dom):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await _locator_click(bound_element.get_locator(), click_count, timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3225,7 +3246,7 @@ async def chain_click(
                 if bound_element := await skyvern_element.find_element_in_label_children(
                     dom=dom, element_type=InteractiveElement.INPUT
                 ):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await _locator_click(bound_element.get_locator(), click_count, timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3243,7 +3264,7 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
+                    await _locator_click(bound_locator, click_count, timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3260,7 +3281,7 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
+                    await _locator_click(bound_locator, click_count, timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3300,7 +3321,7 @@ async def chain_click(
                 )
 
             try:
-                await skyvern_element.coordinate_click(page=page)
+                await skyvern_element.coordinate_click(page=page, click_count=click_count)
                 action_results.append(ActionSuccess())
                 return action_results
             except Exception as e:

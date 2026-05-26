@@ -28,6 +28,7 @@ Reply in JSON format with the following keys:
         "repeat": int, // For KEYPRESS only: how many times to press the key in rapid succession without re-evaluating the page between presses. Use this when navigating transient menus (e.g., ArrowDown 3 times to reach an item). Defaults to 1. null if not KEYPRESS action.
         "direction": str, // The direction to scroll for SCROLL action only. Allowed values: "up", "down". null if not SCROLL action.
         "file_url": str, // The url of the file to upload if applicable. This field must be present for UPLOAD_FILE but can also be present for CLICK only if the click is to upload the file. It should be null otherwise.
+        "double_click": bool, // For CLICK action only. True only when the element requires a double-click to activate (e.g., opening a file in a file manager, entering edit mode in a spreadsheet cell, or expanding a tree node). Defaults to false for normal clicks. Do not use double-click for regular buttons, links, form elements, clickable grid rows, icons, or dashboard cards.
         "download": bool, // Can only be true for CLICK or SELECT_OPTION actions. If true, the browser will trigger a download by clicking the element. If false, the browser will click the element without triggering a download.
         "option": {  // The option to select for SELECT_OPTION action only. null if not SELECT_OPTION action
             "label": str, // the label of the option if any. MAKE SURE YOU USE THIS LABEL TO SELECT THE OPTION. DO NOT PUT ANYTHING OTHER THAN A VALID OPTION LABEL HERE
