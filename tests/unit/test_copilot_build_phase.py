@@ -253,3 +253,60 @@ def test_phase_tool_error_returns_none_when_phase_attr_missing() -> None:
         pass
 
     assert _phase_tool_error(_NoPhase(), "navigate_browser") is None
+
+
+@pytest.mark.parametrize(
+    "tool_name,phase,expected_reason_code,expected_recovery_hint,cleared_by",
+    [
+        (
+            "discover_workflow_entrypoint",
+            BuildPhase.COMPOSING,
+            "build_phase_discovery_disallowed_post_compose",
+            "retry_with_different_tool",
+            frozenset({"update_workflow", "update_and_run_blocks"}),
+        ),
+        (
+            "navigate_browser",
+            BuildPhase.INITIAL,
+            "build_phase_browser_blocked_pre_compose",
+            "ask_user_clarifying",
+            frozenset(),
+        ),
+        (
+            "update_workflow",
+            BuildPhase.INITIAL,
+            "build_phase_mutation_blocked_pre_compose",
+            "ask_user_clarifying",
+            frozenset(),
+        ),
+    ],
+)
+def test_phase_blocker_signal_returns_structured_signal(
+    tool_name: str,
+    phase: BuildPhase,
+    expected_reason_code: str,
+    expected_recovery_hint: str,
+    cleared_by: frozenset[str],
+) -> None:
+    from skyvern.forge.sdk.copilot.blocker_signal import _LEAK_DENY_TOKENS
+    from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+
+    ctx = _Ctx(phase)
+    signal = _phase_blocker_signal(ctx, tool_name)
+    assert signal is not None
+    assert signal.blocker_kind == "phase_gated"
+    assert signal.internal_reason_code == expected_reason_code
+    assert signal.recovery_hint == expected_recovery_hint
+    assert signal.cleared_by_tools == cleared_by
+    assert signal.blocked_tool == tool_name
+    for token in _LEAK_DENY_TOKENS:
+        assert token.lower() not in signal.user_facing_reason.lower()
+
+
+def test_phase_blocker_signal_returns_none_when_phase_attr_missing() -> None:
+    from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+
+    class _NoPhase:
+        pass
+
+    assert _phase_blocker_signal(_NoPhase(), "navigate_browser") is None
