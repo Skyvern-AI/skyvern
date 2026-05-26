@@ -463,6 +463,14 @@ class AgentFunction:
         """
         return None
 
+    def get_non_flex_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a non-flex router twin for the given LLM key, or None if no twin exists.
+
+        Cloud overrides this with the flex-router → standard-router mapping.
+        OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
     async def should_use_flex_llm_routing(
         self,
         *,
