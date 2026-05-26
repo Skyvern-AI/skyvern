@@ -51,6 +51,12 @@ import {
   type WorkflowStartNodeData,
 } from "./types";
 
+const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
+  "Queues new runs of this workflow until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
+
+const SEQUENTIAL_KEY_TOOLTIP =
+  "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against workflow parameters, for example {{ account_id }} to serialize per account.";
+
 function WorkflowSettingsEditor({ blockId }: { blockId: string }) {
   // Subscribe to the start node's data slice. The sidebar mount lives
   // outside the per-node renderer, and the body also subscribes to
@@ -255,8 +261,8 @@ function WorkflowSettingsEditorBody({
       <div className="flex flex-col gap-4">
         <div className="space-y-2">
           <div className="flex items-center gap-2">
-            <Label>Run Sequentially</Label>
-            <HelpTooltip content="Run the workflow in a sequential order" />
+            <Label>Prevent Overlapping Runs</Label>
+            <HelpTooltip content={PREVENT_OVERLAPPING_RUNS_TOOLTIP} />
             <Switch
               className="ml-auto"
               checked={data.runSequentially}
@@ -274,7 +280,7 @@ function WorkflowSettingsEditorBody({
             <div className="space-y-2">
               <div className="flex gap-2">
                 <Label>Sequential Key (optional)</Label>
-                <HelpTooltip content="A static or dynamic key for directing sequential workflow execution." />
+                <HelpTooltip content={SEQUENTIAL_KEY_TOOLTIP} />
               </div>
               <WorkflowBlockInputTextarea
                 nodeId={blockId}
