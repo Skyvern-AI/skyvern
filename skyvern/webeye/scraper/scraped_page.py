@@ -217,31 +217,56 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
 
+    @staticmethod
+    def _is_pdf_embed(element: dict) -> str | None:
+        if element.get("tagName", "") != "embed":
+            return None
+        attributes: dict = element.get("attributes", {})
+        if not attributes:
+            return None
+        type_attr: str | None = attributes.get("type")
+        if not type_attr or type_attr.lower() != "application/pdf":
+            return None
+        return attributes.get("src", "")
+
     def check_pdf_viewer_embed(self) -> str | None:
         """
         Check if the page contains a PDF viewer embed.
         If found, return the src attribute of the embed.
+
+        Detection works at two levels:
+        1. Whole-page: entire page has exactly one element and it is a PDF embed.
+        2. Per-frame: any child frame has exactly one element and it is a PDF embed.
+           This covers multi-frame pages (e.g. framesets) where the PDF is loaded
+           in one frame while other frames contain navigation elements.
         """
-        if len(self.elements) != 1:
-            return None
+        if len(self.elements) == 1:
+            pdf_src = self._is_pdf_embed(self.elements[0])
+            if pdf_src is not None:
+                LOG.info("Found a PDF viewer page", element=self.elements[0])
+                return pdf_src
 
-        element = self.elements[0]
-        if element.get("tagName", "") != "embed":
-            return None
+        if self.id_to_frame_dict:
+            frame_elements: dict[str, list[dict]] = {}
+            for element in self.elements:
+                element_id = element.get("id", "")
+                frame_id = self.id_to_frame_dict.get(element_id, "main.frame")
+                if frame_id == "main.frame":
+                    continue
+                frame_elements.setdefault(frame_id, []).append(element)
 
-        attributes: dict = element.get("attributes", {})
-        if not attributes:
-            return None
+            for frame_id, elements in frame_elements.items():
+                if len(elements) == 1:
+                    pdf_src = self._is_pdf_embed(elements[0])
+                    if pdf_src is not None:
+                        LOG.info(
+                            "Found a PDF viewer embed in frame",
+                            frame_id=frame_id,
+                            element=elements[0],
+                        )
+                        return pdf_src
 
-        type_attr: str | None = attributes.get("type")
-        if not type_attr:
-            return None
-
-        if type_attr.lower() != "application/pdf":
-            return None
-
-        LOG.info("Found a PDF viewer page", element=element)
-        return attributes.get("src", "")
+        return None
 
     async def check_pdf_iframe(self) -> str | None:
         """

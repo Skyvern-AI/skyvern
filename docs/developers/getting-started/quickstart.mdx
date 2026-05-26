@@ -42,7 +42,7 @@ npm install @skyvern/client
 </CodeGroup>
 
 <Info>
-`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install the local extra: `pip install "skyvern[local]"`. For a local Skyvern server with the packaged web UI, use `pip install "skyvern[all]"`. For advanced partial installs, `skyvern[server]` installs only the local server stack and `skyvern[ui]` installs only the packaged UI assets.
+`pip install skyvern` is the lightweight Python SDK for Skyvern Cloud and remote API usage. If you are using embedded local mode with `Skyvern.local()` or `launch_local_browser()`, install the local extra: `pip install "skyvern[local]"`. For a local Skyvern server, self-hosted instance, or local stdio MCP, install the server extra instead: `pip install "skyvern[server]"`. For full local setup with migrations and the web UI, use Docker Compose or a source checkout.
 </Info>
 
 <Accordion title="Troubleshooting: Python version errors">
@@ -196,12 +196,13 @@ This is invaluable for debugging and understanding how Skyvern interprets your p
 You can run Skyvern with a browser on your own machine. This is useful for development, debugging, or automating internal tools on your local network.
 
 **Prerequisites:**
-- Skyvern local server + packaged UI extra installed (`pip install "skyvern[all]"`)
-- If you intentionally installed only `skyvern[server]`, add the packaged UI with `pip install "skyvern[ui]"`. If it is missing, `skyvern run ui` can install it interactively; use `skyvern run ui --install-ui` for non-interactive UI-only setup.
+- Skyvern server extra installed (`pip install "skyvern[server]"`)
+- Source checkout or Docker Compose for guided quickstart and database migrations
+- PostgreSQL database (local install or Docker)
 - An LLM API key (OpenAI, Anthropic, Azure OpenAI, Gemini, Ollama, or any OpenAI-compatible provider)
 
 <Note>
-The pip quickstart uses SQLite at `~/.skyvern/data.db` by default, so Docker and Postgres are optional. Use `skyvern quickstart --postgres` to start a local Postgres container, or `skyvern quickstart --database-string=...` for an existing database.
+Docker is optional. If you have PostgreSQL installed locally, Skyvern will detect and use it automatically. Use `skyvern init --no-postgres` to skip database setup entirely if you're managing PostgreSQL separately. The PyPI wheel installs the local-server dependencies, but guided quickstart currently needs repository migration files from a source checkout.
 </Note>
 
 ### Set up local Skyvern
@@ -220,7 +221,7 @@ skyvern init
 
 
 This interactive wizard will:
-1. Set up your database (SQLite by default, Postgres if requested)
+1. Set up your database (detects local PostgreSQL or uses Docker)
 2. Configure your LLM provider
 3. Choose browser mode (headless, headful, or connect to existing Chrome)
 4. Generate local API credentials
