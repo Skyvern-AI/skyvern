@@ -306,7 +306,7 @@ function TaskDetails() {
             )}
           </div>
         </div>
-        <div className="text-2xl text-muted-foreground underline underline-offset-4">
+        <div className="text-2xl text-slate-400 underline underline-offset-4">
           {workflowIsLoading || workflowRunIsLoading ? (
             <Skeleton className="h-8 w-64" />
           ) : (

@@ -12,7 +12,7 @@ function CodeBlockParameters({ code, parameters }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Code</h1>
-          <h2 className="text-base text-muted-foreground">
+          <h2 className="text-base text-slate-400">
             The Python snippet executed for this block
           </h2>
         </div>
@@ -29,7 +29,7 @@ function CodeBlockParameters({ code, parameters }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Parameters</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               Inputs passed to this code block
             </h2>
           </div>
@@ -37,11 +37,11 @@ function CodeBlockParameters({ code, parameters }: Props) {
             {parameters.map((parameter) => (
               <div
                 key={parameter.key}
-                className="rounded border border-border/40 bg-slate-elevation3 p-3"
+                className="rounded border border-slate-700/40 bg-slate-elevation3 p-3"
               >
                 <p className="font-medium">{parameter.key}</p>
                 {parameter.description ? (
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-sm text-slate-400">
                     {parameter.description}
                   </p>
                 ) : null}

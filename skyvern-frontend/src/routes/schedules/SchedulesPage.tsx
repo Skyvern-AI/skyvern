@@ -113,7 +113,7 @@ function StatusDisplay({ enabled }: Readonly<{ enabled: boolean }>) {
             <circle cx="8" cy="8" r="4" fill="currentColor" />
           </svg>
         </span>
-        <span className="text-sm capitalize text-muted-foreground">active</span>
+        <span className="text-sm capitalize text-slate-300">active</span>
       </div>
     );
   }
@@ -124,7 +124,7 @@ function StatusDisplay({ enabled }: Readonly<{ enabled: boolean }>) {
           <circle cx="8" cy="8" r="4" fill="currentColor" />
         </svg>
       </span>
-      <span className="text-sm capitalize text-muted-foreground">paused</span>
+      <span className="text-sm capitalize text-slate-300">paused</span>
     </div>
   );
 }
@@ -408,7 +408,7 @@ function SchedulesPage() {
               {statusFilters.length > 0 && (
                 <button
                   type="button"
-                  className="w-full cursor-pointer p-2 text-left text-sm text-muted-foreground hover:text-foreground"
+                  className="w-full cursor-pointer p-2 text-left text-sm text-slate-400 hover:text-slate-200"
                   onClick={() => {
                     setStatusFilters([]);
                     setPage(1);
@@ -420,7 +420,7 @@ function SchedulesPage() {
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
-        <Button variant="brand" onClick={() => setCreateDialogOpen(true)}>
+        <Button onClick={() => setCreateDialogOpen(true)}>
           <PlusIcon className="mr-1.5 size-4" />
           Create Schedule
         </Button>
@@ -428,9 +428,9 @@ function SchedulesPage() {
 
       {/* Table */}
       <div className="space-y-4">
-        <div className="overflow-hidden rounded-lg border border-border">
+        <div className="overflow-hidden rounded-lg border border-slate-700">
           <Table className="table-fixed">
-            <TableHeader className="bg-slate-elevation2 text-muted-foreground [&_tr]:border-b-0">
+            <TableHeader className="bg-slate-elevation2 text-slate-400 [&_tr]:border-b-0">
               <TableRow>
                 {showCheckbox && (
                   <TableHead className="w-[3%]">
@@ -454,7 +454,7 @@ function SchedulesPage() {
               {isLoading && (
                 <TableRow>
                   <TableCell colSpan={columnCount} className="py-8 text-center">
-                    <ReloadIcon className="mx-auto size-5 animate-spin text-muted-foreground" />
+                    <ReloadIcon className="mx-auto size-5 animate-spin text-slate-400" />
                   </TableCell>
                 </TableRow>
               )}
@@ -466,7 +466,7 @@ function SchedulesPage() {
                   >
                     Failed to load schedules.
                     {error?.message && (
-                      <span className="block text-xs text-muted-foreground">
+                      <span className="block text-xs text-slate-500">
                         {error.message}
                       </span>
                     )}
@@ -477,7 +477,7 @@ function SchedulesPage() {
                 <TableRow>
                   <TableCell
                     colSpan={columnCount}
-                    className="py-8 text-center text-sm text-muted-foreground"
+                    className="py-8 text-center text-sm text-slate-500"
                   >
                     No schedules found.
                   </TableCell>
@@ -522,13 +522,13 @@ function SchedulesPage() {
                   <TableCell className="truncate font-medium">
                     {schedule.workflow_title}
                   </TableCell>
-                  <TableCell className="truncate text-muted-foreground">
+                  <TableCell className="truncate text-slate-400">
                     {schedule.name ?? "\u2014"}
                   </TableCell>
-                  <TableCell className="text-muted-foreground">
+                  <TableCell className="text-slate-400">
                     {cronToHumanReadable(schedule.cron_expression)}
                   </TableCell>
-                  <TableCell className="text-muted-foreground">
+                  <TableCell className="text-slate-400">
                     {schedule.next_run ? (
                       <span title={basicTimeFormat(schedule.next_run)}>
                         {basicLocalTimeFormat(schedule.next_run)}
@@ -592,7 +592,7 @@ function SchedulesPage() {
           {/* Pagination with Items per page */}
           <div className="grid grid-cols-3 items-center px-4 py-2">
             <div className="flex items-center gap-2">
-              <span className="whitespace-nowrap text-sm text-muted-foreground">
+              <span className="whitespace-nowrap text-sm text-slate-400">
                 Items per page
               </span>
               <Select value={String(pageSize)} onValueChange={setPageSize}>
@@ -655,11 +655,11 @@ function SchedulesPage() {
 
       {/* Multi-select bulk action bar */}
       {selected.size > 0 && (
-        <div className="fixed inset-x-0 bottom-6 mx-auto flex w-fit items-center gap-3 rounded-lg border border-border bg-slate-elevation1 px-6 py-3 shadow-xl">
-          <span className="text-sm text-muted-foreground">
+        <div className="fixed inset-x-0 bottom-6 mx-auto flex w-fit items-center gap-3 rounded-lg border border-slate-700 bg-slate-900 px-6 py-3 shadow-xl">
+          <span className="text-sm text-slate-300">
             {isBulkOperating ? "Processing…" : `${selected.size} selected`}
           </span>
-          <div className="h-6 w-px bg-slate-elevation4" />
+          <div className="h-6 w-px bg-slate-700" />
           <Button
             size="sm"
             className="bg-green-900 text-green-50 hover:bg-green-800"

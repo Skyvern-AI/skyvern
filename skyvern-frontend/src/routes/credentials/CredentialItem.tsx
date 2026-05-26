@@ -63,10 +63,10 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
       <div className="border-l pl-5">
         <div className="flex gap-5">
           <div className="shrink-0 space-y-2">
-            <p className="text-sm text-muted-foreground">Username/Email</p>
-            <p className="text-sm text-muted-foreground">Password</p>
+            <p className="text-sm text-slate-400">Username/Email</p>
+            <p className="text-sm text-slate-400">Password</p>
             {credentialData.totp_type !== "none" && (
-              <p className="text-sm text-muted-foreground">2FA Type</p>
+              <p className="text-sm text-slate-400">2FA Type</p>
             )}
           </div>
           <div className="space-y-2">
@@ -86,8 +86,8 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
       <div className="flex gap-5 border-l pl-5">
         <div className="flex gap-5">
           <div className="shrink-0 space-y-2">
-            <p className="text-sm text-muted-foreground">Card Number</p>
-            <p className="text-sm text-muted-foreground">Brand</p>
+            <p className="text-sm text-slate-400">Card Number</p>
+            <p className="text-sm text-slate-400">Brand</p>
           </div>
         </div>
         <div className="flex gap-5">
@@ -104,9 +104,9 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
     credentialDetails = (
       <div className="flex gap-5 border-l pl-5">
         <div className="shrink-0 space-y-2">
-          <p className="text-sm text-muted-foreground">Secret Value</p>
+          <p className="text-sm text-slate-400">Secret Value</p>
           {credentialData.secret_label ? (
-            <p className="text-sm text-muted-foreground">Type</p>
+            <p className="text-sm text-slate-400">Type</p>
           ) : null}
         </div>
         <div className="space-y-2">
@@ -125,9 +125,7 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
         <p className="w-full truncate" title={credential.name}>
           {credential.name}
         </p>
-        <p className="text-sm text-muted-foreground">
-          {credential.credential_id}
-        </p>
+        <p className="text-sm text-slate-400">{credential.credential_id}</p>
         {activeTest && (
           <div className="flex items-center gap-1 text-xs">
             <ReloadIcon className="size-3 animate-spin text-blue-400" />

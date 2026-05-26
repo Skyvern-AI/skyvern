@@ -102,7 +102,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">URL</h1>
-          <h2 className="text-base text-muted-foreground">
+          <h2 className="text-base text-slate-400">
             The starting URL for the block
           </h2>
         </div>
@@ -113,7 +113,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Navigation Goal</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               What should Skyvern do on this page?
             </h2>
           </div>
@@ -125,7 +125,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Navigation Payload</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               Specify important parameters, routes, or states
             </h2>
           </div>
@@ -144,7 +144,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Data Extraction Goal</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               What outputs are you looking to get?
             </h2>
           </div>
@@ -159,7 +159,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Data Schema</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               Specify the output format in JSON
             </h2>
           </div>
@@ -178,7 +178,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Completion Criteria</h1>
-            <h2 className="text-base text-muted-foreground">Complete if...</h2>
+            <h2 className="text-base text-slate-400">Complete if...</h2>
           </div>
           <AutoResizingTextarea
             value={block.complete_criterion ?? ""}
@@ -191,7 +191,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Termination Criteria</h1>
-            <h2 className="text-base text-muted-foreground">Terminate if...</h2>
+            <h2 className="text-base text-slate-400">Terminate if...</h2>
           </div>
           <AutoResizingTextarea
             value={block.terminate_criterion ?? ""}
@@ -204,7 +204,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">Include Action History</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               Whether to include action history in the completion verification
             </h2>
           </div>
@@ -220,13 +220,13 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Continue on Failure</h1>
-          <h2 className="text-base text-muted-foreground">
+          <h2 className="text-base text-slate-400">
             Whether to continue the workflow if this block fails
           </h2>
         </div>
         <div className="flex w-full items-center gap-3">
           <Switch checked={block.continue_on_failure} disabled />
-          <span className="text-sm text-muted-foreground">
+          <span className="text-sm text-slate-400">
             {block.continue_on_failure ? "Enabled" : "Disabled"}
           </span>
         </div>
@@ -234,7 +234,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
 
       {hasAdvancedSettings ? (
         <>
-          <h2 className="text-base font-semibold text-muted-foreground">
+          <h2 className="text-base font-semibold text-slate-300">
             Advanced Settings
           </h2>
 
@@ -242,7 +242,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Engine</h1>
-                <h2 className="text-base text-muted-foreground">
+                <h2 className="text-base text-slate-400">
                   The execution engine used for this block
                 </h2>
               </div>
@@ -254,7 +254,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Error Code Mapping</h1>
-                <h2 className="text-base text-muted-foreground">
+                <h2 className="text-base text-slate-400">
                   Custom error codes and their descriptions
                 </h2>
               </div>
@@ -312,7 +312,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
               </div>
               <div className="flex w-full items-center gap-3">
                 <Switch checked={true} disabled />
-                <span className="text-sm text-muted-foreground">Enabled</span>
+                <span className="text-sm text-slate-400">Enabled</span>
               </div>
             </div>
           ) : null}
@@ -333,7 +333,7 @@ function TaskBlockParameters({ block, definitionBlock }: Props) {
               </div>
               <div className="flex w-full items-center gap-3">
                 <Switch checked={true} disabled />
-                <span className="text-sm text-muted-foreground">
+                <span className="text-sm text-slate-400">
                   Cache is disabled for this block
                 </span>
               </div>

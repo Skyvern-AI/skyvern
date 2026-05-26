@@ -32,7 +32,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
           "relative flex h-24 flex-col gap-3 rounded-lg border p-4 text-left transition-colors hover:border-blue-400",
           isSelected
             ? "border-blue-400 bg-blue-50 ring-2 ring-blue-400/20 dark:bg-blue-950/20"
-            : "border-border bg-slate-elevation1 dark:border-border",
+            : "border-slate-200 bg-slate-elevation1 dark:border-slate-700",
         )}
       >
         <div className="flex items-start gap-3">
@@ -41,7 +41,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
           </div>
           <div className="flex min-w-0 flex-1 flex-col gap-1">
             <div className="flex items-start justify-between gap-2">
-              <h3 className="truncate text-sm font-medium text-foreground dark:text-foreground">
+              <h3 className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
                 {folder.title}
               </h3>
               <div
@@ -56,7 +56,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
                     <TooltipTrigger asChild>
                       <button
                         onClick={() => setIsEditDialogOpen(true)}
-                        className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-slate-elevation5/20 hover:text-muted-foreground"
+                        className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-500/20 hover:text-slate-300"
                         aria-label="Edit folder"
                       >
                         <Pencil1Icon className="h-4 w-4" />
@@ -71,7 +71,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
                 />
               </div>
             </div>
-            <p className="text-xs text-muted-foreground dark:text-muted-foreground">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
               {folder.workflow_count}{" "}
               {folder.workflow_count === 1 ? "workflow" : "workflows"}
             </p>

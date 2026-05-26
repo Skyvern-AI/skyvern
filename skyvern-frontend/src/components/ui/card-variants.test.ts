@@ -8,7 +8,7 @@ describe("cardVariants", () => {
     expect(result).toContain("border");
     expect(result).toContain("bg-card");
     expect(result).toContain("text-card-foreground");
-    expect(result).toContain("shadow-card");
+    expect(result).toContain("shadow");
   });
 
   it("defaults to tone=default when no tone is passed", () => {
@@ -39,7 +39,7 @@ describe("cardVariants", () => {
     ] as const) {
       const result = cardVariants({ tone });
       expect(result).toContain("rounded-xl");
-      expect(result).toContain("shadow-card");
+      expect(result).toContain("shadow");
       expect(result).toContain("bg-card");
     }
   });

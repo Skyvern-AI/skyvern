@@ -258,7 +258,7 @@ function WorkflowRunStream({
 
   if (workflowRun?.status === Status.Created) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-elevation1 py-8 text-lg">
+      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
         <span>Workflow has been created.</span>
         <span>Stream will start when the workflow is running.</span>
       </div>
@@ -266,7 +266,7 @@ function WorkflowRunStream({
   }
   if (workflowRun?.status === Status.Queued) {
     return (
-      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-elevation1 py-8 text-lg">
+      <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
         <span>Your workflow run is queued.</span>
         <span>Stream will start when the workflow is running.</span>
       </div>

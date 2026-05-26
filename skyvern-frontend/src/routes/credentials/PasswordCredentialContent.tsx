@@ -295,7 +295,7 @@ function PasswordCredentialContent({
           </AccordionTrigger>
           <AccordionContent>
             <div className="space-y-4">
-              <p className="text-sm text-muted-foreground">
+              <p className="text-sm text-slate-400">
                 Set up Skyvern to automatically retrieve two-factor
                 authentication codes.
               </p>
@@ -365,11 +365,11 @@ function PasswordCredentialContent({
                         )}
                       </div>
                     </div>
-                    <p className="mt-1 text-sm text-muted-foreground">
+                    <p className="mt-1 text-sm text-slate-400">
                       {totpIdentifierHelper}
                     </p>
                   </div>
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-sm text-slate-400">
                     <Link
                       to="https://www.skyvern.com/contact"
                       target="_blank"
@@ -425,7 +425,7 @@ function PasswordCredentialContent({
                       />
                     )}
                   </div>
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-sm text-slate-400">
                     You need to find the authenticator secret from the website
                     where you are using the credential. Here are some guides
                     from popular authenticator apps:{"  "}

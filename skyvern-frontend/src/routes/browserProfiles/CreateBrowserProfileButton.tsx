@@ -23,7 +23,6 @@ function CreateBrowserProfileButton({
 
   return (
     <Button
-      variant="brand"
       size={size}
       disabled={disabled}
       title={

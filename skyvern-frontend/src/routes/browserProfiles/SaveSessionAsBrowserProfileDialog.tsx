@@ -72,17 +72,15 @@ function SaveSessionAsBrowserProfileDialog({
         </DialogHeader>
         <form onSubmit={handleSubmit}>
           <div className="grid gap-4 pb-4">
-            <div className="rounded-md border bg-slate-elevation2 px-3 py-2">
-              <div className="text-xs text-muted-foreground">
-                Source session
-              </div>
-              <div className="truncate font-mono text-xs text-foreground">
+            <div className="rounded-md border border-slate-700 bg-slate-elevation2 px-3 py-2">
+              <div className="text-xs text-slate-400">Source session</div>
+              <div className="truncate font-mono text-xs text-slate-200">
                 {browserSessionId}
               </div>
             </div>
             <div className="grid gap-2">
               <Label htmlFor="save-browser-profile-name">
-                Name <span className="text-destructive">*</span>
+                Name <span className="text-red-400">*</span>
               </Label>
               <Input
                 id="save-browser-profile-name"
@@ -94,8 +92,7 @@ function SaveSessionAsBrowserProfileDialog({
             </div>
             <div className="grid gap-2">
               <Label htmlFor="save-browser-profile-description">
-                Description{" "}
-                <span className="text-muted-foreground">(optional)</span>
+                Description <span className="text-slate-400">(optional)</span>
               </Label>
               <Textarea
                 id="save-browser-profile-description"
@@ -114,7 +111,7 @@ function SaveSessionAsBrowserProfileDialog({
             >
               Cancel
             </Button>
-            <Button type="submit" variant="brand" disabled={!canSubmit}>
+            <Button type="submit" disabled={!canSubmit}>
               Save Profile
             </Button>
           </DialogFooter>
