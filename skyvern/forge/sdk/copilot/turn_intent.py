@@ -171,6 +171,10 @@ _NEW_BROWSER_TASK_TERMS = ("go to", "navigate to", "open", "visit", "search for"
 _EDIT_TERMS = ("edit", "update", "change", "modify", "replace", "fix")
 _DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error", "result")
 _RUN_CONTEXT_REQUEST_TERMS = ("get_run_results", "workflow_run_id", "run result", "run results")
+# Subset of _DIAGNOSE_TERMS that name unambiguous diagnose intent. "result" is in
+# _DIAGNOSE_TERMS but absent here: a browser task on a no-blocks workflow that
+# mentions "results" is a build request, not a run-result inspection.
+_CLEAR_DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error")
 _DOCS_TERMS = (
     "explain",
     "how do",
@@ -225,17 +229,32 @@ def _is_explicit_run_context_request(user_message: str) -> bool:
     return _contains_any(user_message, _RUN_CONTEXT_REQUEST_TERMS)
 
 
-def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
+def _workflow_definition_dict(workflow_yaml: str | None) -> dict | None:
     if not workflow_yaml:
-        return set()
+        return None
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
-        return set()
+        return None
     if not isinstance(parsed, dict):
-        return set()
+        return None
     workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
+    return workflow_definition if isinstance(workflow_definition, dict) else None
+
+
+def _workflow_has_blocks(workflow_yaml: str | None) -> bool:
+    workflow_definition = _workflow_definition_dict(workflow_yaml)
+    if workflow_definition is None:
+        return False
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return False
+    return any(isinstance(block, dict) for block in blocks)
+
+
+def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
+    workflow_definition = _workflow_definition_dict(workflow_yaml)
+    if workflow_definition is None:
         return set()
     blocks = workflow_definition.get("blocks")
     if not isinstance(blocks, list):
@@ -251,16 +270,8 @@ def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
 
 
 def _workflow_parameter_keys(workflow_yaml: str | None) -> set[str]:
-    if not workflow_yaml:
-        return set()
-    try:
-        parsed = safe_load_no_dates(workflow_yaml)
-    except yaml.YAMLError:
-        return set()
-    if not isinstance(parsed, dict):
-        return set()
-    workflow_definition = parsed.get("workflow_definition")
-    if not isinstance(workflow_definition, dict):
+    workflow_definition = _workflow_definition_dict(workflow_yaml)
+    if workflow_definition is None:
         return set()
     parameters = workflow_definition.get("parameters")
     if not isinstance(parameters, list):
@@ -309,10 +320,27 @@ def _unresolved_explicit_block_refs(user_message: str, workflow_yaml: str | None
 
 
 def _mode_from_keywords(
-    user_message: str, *, has_workflow: bool
+    user_message: str,
+    *,
+    has_workflow: bool,
+    has_workflow_blocks: bool,
+    has_prior_run_signal: bool,
 ) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
     if has_workflow and _contains_any(user_message, _EDIT_TERMS):
         return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
+    # A browser-task verb on a saved workflow with no buildable blocks is a new
+    # build request even when the message mentions "results"; suppress only when
+    # the user names diagnosis or docs intent, or a prior run is attached. The
+    # no-yaml case still falls through to the trailing browser-task fallback.
+    if (
+        has_workflow
+        and not has_workflow_blocks
+        and not has_prior_run_signal
+        and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS)
+        and not _contains_any(user_message, _CLEAR_DIAGNOSE_TERMS)
+        and not _contains_any(user_message, _DOCS_TERMS)
+    ):
+        return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
     if _contains_any(user_message, _DIAGNOSE_TERMS):
         return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
     if _contains_any(user_message, _DOCS_TERMS):
@@ -447,7 +475,11 @@ def _user_signals_non_progress(user_message: str, chat_history: list[WorkflowCop
 
 
 def _carryover_mode_from_prior_turn(
-    chat_history: list[WorkflowCopilotChatHistoryMessage], *, has_workflow: bool
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    *,
+    has_workflow: bool,
+    has_workflow_blocks: bool,
+    has_prior_run_signal: bool,
 ) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
     """Mode of the most recent prior user turn that keyword-classifies. A bare
     confirmation carries no keywords of its own, so it inherits the turn it confirms."""
@@ -459,7 +491,12 @@ def _carryover_mode_from_prior_turn(
         # back to the substantive request, not to the nearest confirmation.
         if not content or _is_bare_affirmative(content):
             continue
-        if carried := _mode_from_keywords(content, has_workflow=has_workflow):
+        if carried := _mode_from_keywords(
+            content,
+            has_workflow=has_workflow,
+            has_workflow_blocks=has_workflow_blocks,
+            has_prior_run_signal=has_prior_run_signal,
+        ):
             return carried
     return None
 
@@ -477,6 +514,7 @@ def build_turn_intent(
     browser_session_id: str | None = None,
 ) -> TurnIntent:
     has_workflow = bool((workflow_yaml or "").strip())
+    has_workflow_blocks = _workflow_has_blocks(workflow_yaml)
     has_prior_context = bool((global_llm_context or "").strip())
     target_entities: dict[str, list[str]] = {}
     required_context: list[RequiredContextKey] = []
@@ -542,12 +580,22 @@ def build_turn_intent(
         expected_output = TurnIntentExpectedOutput.WORKFLOW_DRAFT
         confidence = 0.6
         reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_SKIP_TEST)
-    elif keyword_mode := _mode_from_keywords(user_message, has_workflow=has_workflow):
+    elif keyword_mode := _mode_from_keywords(
+        user_message,
+        has_workflow=has_workflow,
+        has_workflow_blocks=has_workflow_blocks,
+        has_prior_run_signal=has_prior_run_signal,
+    ):
         mode, expected_output = keyword_mode
         confidence = 0.35
         reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
     elif _is_bare_affirmative(user_message) and (
-        carried_mode := _carryover_mode_from_prior_turn(chat_history, has_workflow=has_workflow)
+        carried_mode := _carryover_mode_from_prior_turn(
+            chat_history,
+            has_workflow=has_workflow,
+            has_workflow_blocks=has_workflow_blocks,
+            has_prior_run_signal=has_prior_run_signal,
+        )
     ):
         mode, expected_output = carried_mode
         confidence = 0.3
