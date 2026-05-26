@@ -58,12 +58,10 @@ function CredentialsPage() {
     <div className="space-y-5">
       <h1 className="text-2xl">Credentials</h1>
       <div className="flex items-center justify-between">
-        <div className="w-96 text-sm text-muted-foreground">
-          {subHeaderText}
-        </div>
+        <div className="w-96 text-sm text-slate-300">{subHeaderText}</div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
-            <Button variant="brand">
+            <Button>
               <PlusIcon className="mr-2 size-6" /> Add
             </Button>
           </DropdownMenuTrigger>
@@ -142,8 +140,8 @@ function CredentialsPage() {
 
       {/* Footer note - only for Passwords and Credit Cards tabs */}
       {activeTab !== "twoFactor" && (
-        <div className="mt-8 border-t border-border pt-4">
-          <div className="text-sm italic text-muted-foreground">
+        <div className="mt-8 border-t border-slate-700 pt-4">
+          <div className="text-sm italic text-slate-400">
             <strong>Note:</strong> This feature requires a Bitwarden-compatible
             server ({" "}
             <a

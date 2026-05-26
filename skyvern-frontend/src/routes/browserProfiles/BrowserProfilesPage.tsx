@@ -24,7 +24,7 @@ function BrowserProfilesPage() {
   return (
     <div className="space-y-5">
       <h1 className="text-2xl">Browser Profiles</h1>
-      <div className="w-96 text-sm text-muted-foreground">{subHeaderText}</div>
+      <div className="w-96 text-sm text-slate-300">{subHeaderText}</div>
       <div className="flex items-center justify-between gap-4">
         <TableSearchInput
           value={search}

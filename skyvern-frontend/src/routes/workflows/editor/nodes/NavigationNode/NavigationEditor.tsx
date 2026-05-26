@@ -25,6 +25,7 @@ import { type AppNode } from "..";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
+import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import {
   MAX_STEPS_DEFAULT,
   type NavigationNode,
@@ -80,6 +81,9 @@ function NavigationEditorBody({
       ]
     : [RunEngine.SkyvernV1, RunEngine.OpenaiCua, RunEngine.AnthropicCua];
   const hasInteracted = useHasInteractedThisSession();
+  const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
+    data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
+  );
 
   const handleEngineChange = (value: RunEngine) => {
     if (!editable) return;
@@ -208,9 +212,18 @@ function NavigationEditorBody({
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
-                  placeholder={placeholders["navigation"]["totpIdentifier"]}
+                  placeholder={
+                    !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                      ? `${credentialTotpIdentifier} (from credential)`
+                      : placeholders["navigation"]["totpIdentifier"]
+                  }
                   className="nopan text-xs"
                 />
+                {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                  <p className="text-xs text-slate-500">
+                    Leave empty to use the credential's value.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">
@@ -307,11 +320,6 @@ function NavigationEditorBody({
                   onParametersChange={(parameterKeys) =>
                     update({ parameterKeys })
                   }
-                  onCredentialTotpIdentifier={(totpIdentifier) => {
-                    if (!data.totpIdentifier?.trim()) {
-                      update({ totpIdentifier });
-                    }
-                  }}
                 />
               </div>
               <div className="space-y-2">
@@ -470,9 +478,18 @@ function NavigationEditorBody({
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
-                  placeholder={placeholders["navigation"]["totpIdentifier"]}
+                  placeholder={
+                    !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                      ? `${credentialTotpIdentifier} (from credential)`
+                      : placeholders["navigation"]["totpIdentifier"]
+                  }
                   className="nopan text-xs"
                 />
+                {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                  <p className="text-xs text-slate-500">
+                    Leave empty to use the credential's value.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">

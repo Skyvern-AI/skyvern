@@ -120,7 +120,7 @@ export function QuickHeadersDialog({ onAdd, children }: Props) {
                 return (
                   <div
                     key={index}
-                    className={`cursor-pointer rounded-lg border p-3 transition-colors hover:bg-slate-elevation1 dark:hover:bg-slate-elevation5 ${
+                    className={`cursor-pointer rounded-lg border p-3 transition-colors hover:bg-slate-50 dark:hover:bg-slate-800 ${
                       isSelected
                         ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
                         : ""
@@ -134,7 +134,7 @@ export function QuickHeadersDialog({ onAdd, children }: Props) {
                         <Badge variant="outline" className="font-mono text-xs">
                           {header.name}
                         </Badge>
-                        <span className="text-sm text-muted-foreground dark:text-muted-foreground">
+                        <span className="text-sm text-slate-600 dark:text-slate-400">
                           {header.value}
                         </span>
                       </div>
@@ -144,7 +144,7 @@ export function QuickHeadersDialog({ onAdd, children }: Props) {
                         </Badge>
                       )}
                     </div>
-                    <div className="mt-1 text-xs text-muted-foreground">
+                    <div className="mt-1 text-xs text-slate-500">
                       {header.description}
                     </div>
                   </div>
@@ -200,8 +200,8 @@ export function QuickHeadersDialog({ onAdd, children }: Props) {
               <h4 className="mb-3 text-sm font-medium">
                 Selected Headers ({Object.keys(selectedHeaders).length})
               </h4>
-              <div className="rounded-lg border bg-slate-elevation1 p-3 dark:bg-slate-elevation5">
-                <pre className="text-xs text-muted-foreground dark:text-muted-foreground">
+              <div className="rounded-lg border bg-slate-50 p-3 dark:bg-slate-800">
+                <pre className="text-xs text-slate-600 dark:text-slate-400">
                   {JSON.stringify(selectedHeaders, null, 2)}
                 </pre>
               </div>

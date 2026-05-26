@@ -112,7 +112,7 @@ function ScheduleDetailPage() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
-        <ReloadIcon className="size-6 animate-spin text-muted-foreground" />
+        <ReloadIcon className="size-6 animate-spin text-slate-400" />
       </div>
     );
   }
@@ -234,20 +234,18 @@ function ScheduleDetailPage() {
           <ArrowLeftIcon className="size-4" />
         </Button>
         <div className="flex-1">
-          <h1 className="text-2xl font-normal text-foreground">
+          <h1 className="text-2xl font-normal text-slate-50">
             {schedule.name ?? workflowTitle}
           </h1>
           {schedule.description && (
-            <p className="text-sm text-muted-foreground">
-              {schedule.description}
-            </p>
+            <p className="text-sm text-slate-400">{schedule.description}</p>
           )}
-          <p className="text-xs text-muted-foreground">
+          <p className="text-xs text-slate-500">
             {humanReadable} · {schedule.timezone}
           </p>
           <Link
             to={`/workflows/${schedule.workflow_permanent_id}/runs`}
-            className="mt-1 inline-block text-xs text-muted-foreground hover:text-foreground hover:underline"
+            className="mt-1 inline-block text-xs text-slate-400 hover:text-slate-200 hover:underline"
             onClick={(e) => e.stopPropagation()}
           >
             {workflowTitle} runs →
@@ -267,11 +265,9 @@ function ScheduleDetailPage() {
       {/* Content grid */}
       <div className="grid grid-cols-2 gap-6">
         {/* Schedule Configuration */}
-        <div className="rounded-lg border border-border p-4">
+        <div className="rounded-lg border border-slate-700 p-4">
           <div className="mb-4 flex items-center justify-between">
-            <h3 className="text-sm text-muted-foreground">
-              Schedule Configuration
-            </h3>
+            <h3 className="text-sm text-slate-400">Schedule Configuration</h3>
             {!editing && (
               <Button
                 variant="ghost"
@@ -354,9 +350,7 @@ function ScheduleDetailPage() {
                   )}
                 />
                 {editHumanReadable && (
-                  <p className="text-xs text-muted-foreground">
-                    {editHumanReadable}
-                  </p>
+                  <p className="text-xs text-slate-400">{editHumanReadable}</p>
                 )}
                 {!editValid && editCron && (
                   <p className="text-xs text-destructive">
@@ -385,15 +379,14 @@ function ScheduleDetailPage() {
                   className="h-8 text-sm"
                 />
                 {timezoneFilter !== null && (
-                  <div className="max-h-32 overflow-y-auto rounded-md border border-border bg-slate-elevation3">
+                  <div className="max-h-32 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
                     {filteredTimezones.slice(0, 15).map((tz) => (
                       <button
                         key={tz}
                         type="button"
                         className={cn(
-                          "w-full px-3 py-1 text-left text-xs hover:bg-slate-elevation4",
-                          tz === editTimezone &&
-                            "bg-slate-elevation4 text-foreground",
+                          "w-full px-3 py-1 text-left text-xs hover:bg-slate-700",
+                          tz === editTimezone && "bg-slate-700 text-slate-50",
                         )}
                         onMouseDown={(e) => {
                           e.preventDefault();
@@ -405,13 +398,13 @@ function ScheduleDetailPage() {
                       </button>
                     ))}
                     {filteredTimezones.length === 0 && (
-                      <div className="px-3 py-1.5 text-xs text-muted-foreground">
+                      <div className="px-3 py-1.5 text-xs text-slate-500">
                         No timezones found
                       </div>
                     )}
                   </div>
                 )}
-                <p className="text-xs text-muted-foreground">
+                <p className="text-xs text-slate-500">
                   Current: {editTimezone}
                 </p>
               </div>
@@ -424,7 +417,7 @@ function ScheduleDetailPage() {
                     {editNextRuns.map((run) => (
                       <p
                         key={run.toISOString()}
-                        className="text-xs text-muted-foreground"
+                        className="text-xs text-slate-500"
                       >
                         {formatNextRun(run, editTimezone)}
                       </p>
@@ -456,18 +449,18 @@ function ScheduleDetailPage() {
           ) : (
             <div className="space-y-3">
               <div className="flex items-start justify-between">
-                <span className="text-sm text-muted-foreground">Frequency</span>
-                <span className="text-sm text-foreground">{humanReadable}</span>
+                <span className="text-sm text-slate-400">Frequency</span>
+                <span className="text-sm text-slate-50">{humanReadable}</span>
               </div>
               <div className="flex items-start justify-between">
-                <span className="text-sm text-muted-foreground">Timezone</span>
-                <span className="text-sm text-foreground">
+                <span className="text-sm text-slate-400">Timezone</span>
+                <span className="text-sm text-slate-50">
                   {schedule.timezone}
                 </span>
               </div>
               <div className="flex items-start justify-between">
-                <span className="text-sm text-muted-foreground">Cron</span>
-                <code className="font-mono text-xs text-foreground">
+                <span className="text-sm text-slate-400">Cron</span>
+                <code className="font-mono text-xs text-slate-50">
                   {schedule.cron_expression}
                 </code>
               </div>
@@ -477,24 +470,22 @@ function ScheduleDetailPage() {
 
         {/* Details + Upcoming Runs */}
         <div className="space-y-6">
-          <div className="rounded-lg border border-border p-4">
-            <h3 className="mb-4 text-sm text-muted-foreground">Details</h3>
+          <div className="rounded-lg border border-slate-700 p-4">
+            <h3 className="mb-4 text-sm text-slate-400">Details</h3>
             <div className="space-y-2">
               <div className="flex items-start justify-between">
-                <span className="text-sm text-muted-foreground">Created</span>
+                <span className="text-sm text-slate-400">Created</span>
                 <span
-                  className="text-sm text-foreground"
+                  className="text-sm text-slate-50"
                   title={basicTimeFormat(schedule.created_at)}
                 >
                   {basicLocalTimeFormat(schedule.created_at)}
                 </span>
               </div>
               <div className="flex items-start justify-between">
-                <span className="text-sm text-muted-foreground">
-                  Last Modified
-                </span>
+                <span className="text-sm text-slate-400">Last Modified</span>
                 <span
-                  className="text-sm text-foreground"
+                  className="text-sm text-slate-50"
                   title={basicTimeFormat(schedule.modified_at)}
                 >
                   {basicLocalTimeFormat(schedule.modified_at)}
@@ -504,8 +495,8 @@ function ScheduleDetailPage() {
           </div>
 
           {hasUserFacingParameters(workflowParameters) && (
-            <div className="rounded-lg border border-border p-4">
-              <h3 className="mb-4 text-sm text-muted-foreground">
+            <div className="rounded-lg border border-slate-700 p-4">
+              <h3 className="mb-4 text-sm text-slate-400">
                 Workflow Parameters
               </h3>
               <div className="space-y-2">
@@ -520,22 +511,22 @@ function ScheduleDetailPage() {
                         key={parameter.key}
                         className="flex items-start justify-between gap-4"
                       >
-                        <span className="font-mono text-xs text-muted-foreground">
+                        <span className="font-mono text-xs text-slate-400">
                           {parameter.key}
                         </span>
-                        <span className="max-w-[60%] truncate text-right text-xs text-foreground">
+                        <span className="max-w-[60%] truncate text-right text-xs text-slate-50">
                           {hasValue ? (
                             formatScheduleParameterValue(storedValue)
                           ) : parameter.default_value !== null &&
                             parameter.default_value !== undefined ? (
-                            <span className="italic text-muted-foreground">
+                            <span className="italic text-slate-500">
                               default:{" "}
                               {formatScheduleParameterValue(
                                 parameter.default_value,
                               )}
                             </span>
                           ) : (
-                            <span className="italic text-muted-foreground">
+                            <span className="italic text-slate-500">
                               (not set)
                             </span>
                           )}
@@ -547,16 +538,14 @@ function ScheduleDetailPage() {
             </div>
           )}
 
-          <div className="rounded-lg border border-border p-4">
-            <h3 className="mb-4 text-sm text-muted-foreground">
-              Upcoming Runs
-            </h3>
-            <p className="mb-2 text-xs text-muted-foreground">
+          <div className="rounded-lg border border-slate-700 p-4">
+            <h3 className="mb-4 text-sm text-slate-400">Upcoming Runs</h3>
+            <p className="mb-2 text-xs text-slate-400">
               Next {next_runs.length} runs
             </p>
             <div className="space-y-0.5">
               {next_runs.map((run) => (
-                <p key={run} className="text-xs text-muted-foreground">
+                <p key={run} className="text-xs text-slate-500">
                   {formatNextRun(new Date(run), schedule.timezone)}
                 </p>
               ))}

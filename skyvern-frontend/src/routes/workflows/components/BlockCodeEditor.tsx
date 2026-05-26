@@ -52,7 +52,7 @@ function BlockCodeEditor({
 
       <div
         className={cn(
-          "transform-origin-center flex h-full w-[30rem] flex-col space-y-4 rounded-lg border border-border bg-slate-elevation3 px-6 py-4 transition-all",
+          "transform-origin-center flex h-full w-[30rem] flex-col space-y-4 rounded-lg border border-slate-600 bg-slate-elevation3 px-6 py-4 transition-all",
         )}
         onClick={(e) => {
           onClick?.(e);
@@ -61,7 +61,7 @@ function BlockCodeEditor({
         <header className="relative !mt-0 flex h-[2.75rem] justify-between gap-2">
           {blockType ? (
             <div className="flex w-full gap-2">
-              <div className="relative flex h-[2.75rem] w-[2.75rem] items-center justify-center overflow-hidden rounded border border-border">
+              <div className="relative flex h-[2.75rem] w-[2.75rem] items-center justify-center overflow-hidden rounded border border-slate-600">
                 <WorkflowBlockIcon
                   workflowBlockType={blockType}
                   className="size-6"
@@ -74,13 +74,11 @@ function BlockCodeEditor({
               <div className="flex w-full flex-col gap-1">
                 {blockLabel}
                 <div className="flex w-full items-center justify-center gap-1">
-                  <span className="text-xs text-muted-foreground">
-                    {blockTitle}
-                  </span>
+                  <span className="text-xs text-slate-400">{blockTitle}</span>
                   <div className="ml-auto scale-[60%] opacity-50">
                     <KeyIcon />
                   </div>
-                  <span className="text-xs text-muted-foreground">
+                  <span className="text-xs text-slate-400">
                     {cacheKeyValue === "" || !cacheKeyValue
                       ? "(none)"
                       : cacheKeyValue}
@@ -93,7 +91,7 @@ function BlockCodeEditor({
               {title ?? blockLabel}
             </header>
           )}
-          <div className="absolute right-[-0.5rem] top-0 flex h-[2rem] w-[2rem] items-center justify-center rounded hover:bg-slate-elevation5">
+          <div className="absolute right-[-0.5rem] top-0 flex h-[2rem] w-[2rem] items-center justify-center rounded hover:bg-slate-800">
             <ExitIcon
               onClick={() => {
                 const result = onExit ? onExit() : true;
@@ -122,7 +120,7 @@ function BlockCodeEditor({
             />
           </div>
         ) : (
-          <div className="flex h-full w-full items-center justify-center bg-background">
+          <div className="flex h-full w-full items-center justify-center bg-slate-950">
             No script defined
           </div>
         )}
