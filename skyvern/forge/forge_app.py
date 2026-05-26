@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -45,6 +46,8 @@ from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistent
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
+
+LOG = structlog.get_logger()
 
 
 class ForgeApp:
@@ -261,6 +264,13 @@ def create_forge_app() -> ForgeApp:
     app.AGENT_FUNCTION = AgentFunction()
     app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
     app.PERSISTENT_SESSIONS_MANAGER.watch_session_pool()
+    if settings.BROWSER_TYPE == "cdp-connect" and settings.BROWSER_STREAMING_MODE != "cdp":
+        LOG.warning(
+            "BROWSER_TYPE=cdp-connect is set but BROWSER_STREAMING_MODE is not 'cdp'; "
+            "the debugger live-browser panel will be unavailable. "
+            "Set BROWSER_STREAMING_MODE=cdp to stream the remote browser through this backend.",
+            browser_streaming_mode=settings.BROWSER_STREAMING_MODE,
+        )
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()

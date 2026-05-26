@@ -31,6 +31,7 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
@@ -2081,11 +2082,24 @@ async def _run_copilot_turn_impl(
         previous_user_message=previous_user_message,
     )
 
-    # Hydrate the per-chat discovery counter from the inbound global_llm_context.
-    # `ctx.build_phase` stays at the safe default and `initial_build_phase` is
-    # not yet called from the agent loop — that activates in the discovery PR.
+    # Hydrate the per-chat discovery counter from the inbound global_llm_context
+    # and set the initial build phase. Phase is set once per turn by the
+    # orchestrator; transitions happen inside `discover_workflow_entrypoint`
+    # and `update_and_run_blocks`, never from a model emission.
     prior_structured_context = StructuredContext.from_json_str(global_llm_context)
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
+    ctx.build_phase = initial_build_phase(
+        ctx.turn_intent,
+        chat_request.message or "",
+        agent_user_message or "",
+        chat_request.workflow_yaml or "",
+    )
+    LOG.info(
+        "copilot.build_phase_initial",
+        build_phase=ctx.build_phase.value,
+        workflow_permanent_id=chat_request.workflow_permanent_id,
+        prior_discovery_calls_made=ctx.prior_discovery_calls_made,
+    )
 
     # Preflight feasibility classifier — fires on every turn so mid-session pivots
     # to impossible targets are caught the same as first-turn structural mismatches.
@@ -2206,6 +2220,9 @@ async def _run_copilot_turn_impl(
             allowlist=frozenset(alias_map.values()),
             context_provider=lambda: ctx,
         )
+        # The discovery walker reaches the connected FastMCP client through
+        # ctx, without exposing private overlay state.
+        ctx.discovery_mcp_server = mcp_server
         agent = Agent(
             name="workflow-copilot",
             instructions=system_prompt,
