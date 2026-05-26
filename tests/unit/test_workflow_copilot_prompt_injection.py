@@ -404,6 +404,39 @@ class TestBuildUserContext:
         )
         assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" not in rendered
 
+    def test_repeated_reply_warning_slot_renders_when_present(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            repeated_reply_warning="repeated_reply_detected: your last 2 replies were near-identical.",
+        )
+        assert "REPEATED REPLY WARNING" in rendered
+        assert "repeated_reply_detected" in rendered
+
+    def test_repeated_reply_warning_slot_omitted_when_empty(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+        )
+        assert "REPEATED REPLY WARNING" not in rendered
+
+    def test_repeated_reply_warning_is_fence_escaped(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            repeated_reply_warning="``` injected ```",
+        )
+        assert "``` injected ```" not in rendered
+
     def test_workflow_summary_indexes_block_labels_and_error_mappings(self) -> None:
         workflow_yaml = """
 title: Invoice workflow

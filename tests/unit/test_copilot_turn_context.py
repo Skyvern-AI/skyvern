@@ -58,6 +58,72 @@ def test_edit_turn_includes_workflow_proposal_and_transcript_context() -> None:
     assert packet.omissions == []
 
 
+def test_repeated_reply_context_attached_when_assistant_repeats() -> None:
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntentReasonCode
+    from skyvern.forge.sdk.copilot.turn_outcome import build_minimal_turn_outcome
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind
+
+    answer = "The file is stored as an artifact in the Artifacts section of the run results page."
+    outcome = build_minimal_turn_outcome(answer, response_kind=ResponseKind.DIAGNOSE)
+    history = [
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="where is my file",
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.AI,
+            content=answer,
+            turn_outcome=outcome,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.USER,
+            content="i cannot see it",
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        WorkflowCopilotChatHistoryMessage(
+            sender=WorkflowCopilotChatSender.AI,
+            content=answer,
+            turn_outcome=outcome,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=TurnIntent(
+                mode=TurnIntentMode.UNKNOWN,
+                reason_codes=[TurnIntentReasonCode.USER_NON_PROGRESS],
+            ),
+            request_policy=RequestPolicy(),
+            user_message="i still cannot see it",
+            chat_history=history,
+        )
+    )
+
+    assert packet.repeated_reply_context is not None
+    assert outcome.normalized_reply_signature in packet.repeated_reply_context.blocked_signatures
+    assert "repeated_reply_detected" in packet.repeated_reply_context.rendered_summary
+    trace = packet.to_trace_data()
+    assert "repeated_reply_context" in trace["sections"]
+
+
+def test_repeated_reply_context_omitted_without_repeat() -> None:
+    packet = TurnContextAssembler().assemble(
+        TurnContextInputs(
+            turn_intent=TurnIntent(mode=TurnIntentMode.UNKNOWN),
+            request_policy=RequestPolicy(),
+            user_message="where is my file",
+            chat_history=_history(("user", "build a workflow"), ("ai", "Drafted v1")),
+        )
+    )
+
+    assert packet.repeated_reply_context is None
+    trace = packet.to_trace_data()
+    assert "repeated_reply_context" not in trace["sections"]
+    assert trace["repeated_reply_count"] == 0
+
+
 def test_diagnose_turn_includes_run_context_or_reports_missing() -> None:
     available = TurnContextAssembler().assemble(
         TurnContextInputs(
