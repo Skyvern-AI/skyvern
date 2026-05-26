@@ -12616,7 +12616,7 @@
           "run_sequentially": {
             "type": "boolean",
             "nullable": true,
-            "title": "Run Sequentially"
+            "title": "Prevent Overlapping Runs"
           },
           "sequential_key": {
             "type": "string",
@@ -12760,7 +12760,7 @@
           },
           "run_sequentially": {
             "type": "boolean",
-            "title": "Run Sequentially",
+            "title": "Prevent Overlapping Runs",
             "default": false
           },
           "sequential_key": {
