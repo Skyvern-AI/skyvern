@@ -83,7 +83,7 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
     >
       <CardHeader
         className={cn("rounded-t-md bg-slate-elevation1", {
-          "bg-slate-elevation1": hovering,
+          "bg-slate-900": hovering,
         })}
       >
         <CardTitle className="flex items-center justify-between font-normal">
@@ -144,15 +144,15 @@ function SavedTaskCard({ workflowId, title, url, description }: Props) {
             </DialogContent>
           </Dialog>
         </CardTitle>
-        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground">
+        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
           {url}
         </CardDescription>
       </CardHeader>
       <CardContent
         className={cn(
-          "h-36 cursor-pointer overflow-scroll rounded-b-md bg-slate-elevation3 p-4 text-sm text-muted-foreground",
+          "h-36 cursor-pointer overflow-scroll rounded-b-md bg-slate-elevation3 p-4 text-sm text-slate-300",
           {
-            "bg-slate-elevation5": hovering,
+            "bg-slate-800": hovering,
           },
         )}
         onClick={() => {

@@ -142,7 +142,7 @@ function ImprovePrompt(props: Props) {
                 setSelectedPromptVersion(value as "improved" | "original")
               }
             />
-            <div className="max-h-96 overflow-y-auto rounded-md border border-border bg-slate-elevation5 p-4">
+            <div className="max-h-96 overflow-y-auto rounded-md border border-slate-700 bg-slate-800 p-4">
               <p className="whitespace-pre-wrap text-sm">
                 {selectedPromptVersion === "improved"
                   ? improvedPrompt

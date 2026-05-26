@@ -21,7 +21,7 @@ function TextPromptBlockParameters({
       <div className="flex gap-16">
         <div className="w-80">
           <h1 className="text-lg">Prompt</h1>
-          <h2 className="text-base text-muted-foreground">
+          <h2 className="text-base text-slate-400">
             Instructions passed to the selected LLM
           </h2>
         </div>
@@ -39,7 +39,7 @@ function TextPromptBlockParameters({
         <div className="flex gap-16">
           <div className="w-80">
             <h1 className="text-lg">JSON Schema</h1>
-            <h2 className="text-base text-muted-foreground">
+            <h2 className="text-base text-slate-400">
               Expected shape of the model response
             </h2>
           </div>
@@ -66,11 +66,11 @@ function TextPromptBlockParameters({
             {parameters.map((parameter) => (
               <div
                 key={parameter.key}
-                className="rounded border border-border/40 bg-slate-elevation3 p-3"
+                className="rounded border border-slate-700/40 bg-slate-elevation3 p-3"
               >
                 <p className="font-medium">{parameter.key}</p>
                 {parameter.description ? (
-                  <p className="text-sm text-muted-foreground">
+                  <p className="text-sm text-slate-400">
                     {parameter.description}
                   </p>
                 ) : null}

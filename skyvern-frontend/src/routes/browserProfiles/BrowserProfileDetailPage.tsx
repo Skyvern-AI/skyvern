@@ -43,7 +43,7 @@ function BrowserProfileDetailPage() {
       )}
 
       {!isLoading && (isError || !profile) && (
-        <div className="rounded-md border bg-slate-elevation1 p-6 text-sm text-muted-foreground">
+        <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
           Browser profile not found.
         </div>
       )}
@@ -54,12 +54,10 @@ function BrowserProfileDetailPage() {
             <div className="space-y-2">
               <h1 className="text-2xl">{profile.name}</h1>
               {profile.description && (
-                <p className="text-sm text-muted-foreground">
-                  {profile.description}
-                </p>
+                <p className="text-sm text-slate-300">{profile.description}</p>
               )}
               {profile.deleted_at && (
-                <p className="text-sm text-warning">
+                <p className="text-sm text-amber-400">
                   Deleted {basicLocalTimeFormat(profile.deleted_at)}
                 </p>
               )}
@@ -82,9 +80,9 @@ function BrowserProfileDetailPage() {
             </div>
           </div>
 
-          <div className="rounded-lg border bg-slate-elevation1 p-6">
+          <div className="rounded-lg border border-slate-700 bg-slate-elevation1 p-6">
             <dl className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-[180px_1fr]">
-              <dt className="text-sm text-muted-foreground">ID</dt>
+              <dt className="text-sm text-slate-400">ID</dt>
               <dd className="flex items-center font-mono text-sm">
                 <span className="break-all">{profile.browser_profile_id}</span>
                 <CopyText
@@ -93,14 +91,14 @@ function BrowserProfileDetailPage() {
                 />
               </dd>
 
-              <dt className="text-sm text-muted-foreground">Source Browser</dt>
+              <dt className="text-sm text-slate-400">Source Browser</dt>
               <dd className="text-sm">
                 {profile.source_browser_type ?? (
                   <span className="opacity-50">—</span>
                 )}
               </dd>
 
-              <dt className="text-sm text-muted-foreground">Created</dt>
+              <dt className="text-sm text-slate-400">Created</dt>
               <dd
                 className="text-sm"
                 title={basicTimeFormat(profile.created_at)}
@@ -108,7 +106,7 @@ function BrowserProfileDetailPage() {
                 {basicLocalTimeFormat(profile.created_at)}
               </dd>
 
-              <dt className="text-sm text-muted-foreground">Last Modified</dt>
+              <dt className="text-sm text-slate-400">Last Modified</dt>
               <dd
                 className="text-sm"
                 title={basicTimeFormat(profile.modified_at)}

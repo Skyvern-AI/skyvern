@@ -132,7 +132,7 @@ function BrowserSession() {
                           ? "bg-blue-500/20 text-blue-500"
                           : browserSession.status === "failed"
                             ? "bg-red-500/20 text-red-500"
-                            : "bg-muted-foreground/20 text-muted-foreground"
+                            : "bg-gray-500/20 text-gray-500"
                     }`}
                   >
                     {browserSession.status}
@@ -175,7 +175,7 @@ function BrowserSession() {
           {browserSessionId && browserSession?.status === "running" && (
             <div className="ml-auto flex items-center gap-2">
               <Button
-                variant="brand"
+                variant="default"
                 onClick={() => setIsSaveProfileDialogOpen(true)}
               >
                 <BrowserIcon className="mr-2 h-4 w-4" />

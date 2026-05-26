@@ -55,10 +55,10 @@ function StatusDistribution({
     running: "bg-blue-500",
     failed: "bg-red-500",
     terminated: "bg-orange-500",
-    canceled: "bg-slate-elevation4",
+    canceled: "bg-slate-400",
     timed_out: "bg-yellow-500",
-    created: "bg-slate-elevation4",
-    queued: "bg-slate-elevation4",
+    created: "bg-slate-300",
+    queued: "bg-slate-300",
   };
 
   return (
@@ -67,7 +67,7 @@ function StatusDistribution({
         {Object.entries(statusCounts).map(([status, count]) => (
           <div
             key={status}
-            className={statusColors[status] ?? "bg-slate-elevation4"}
+            className={statusColors[status] ?? "bg-slate-300"}
             style={{ width: `${(count / totalCount) * 100}%` }}
             title={`${status}: ${count} (${Math.round((count / totalCount) * 100)}%)`}
           />
@@ -77,7 +77,7 @@ function StatusDistribution({
         {Object.entries(statusCounts).map(([status, count]) => (
           <div key={status} className="flex items-center gap-1.5">
             <div
-              className={`size-2.5 rounded-full ${statusColors[status] ?? "bg-slate-elevation4"}`}
+              className={`size-2.5 rounded-full ${statusColors[status] ?? "bg-slate-300"}`}
             />
             <span>
               {status}: {count} ({Math.round((count / totalCount) * 100)}%)

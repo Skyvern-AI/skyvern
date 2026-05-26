@@ -2,7 +2,7 @@ import { cva } from "class-variance-authority";
 
 /** Default tone preserves pre-cva Card output. Non-default tones swap only the border color (border-tint, no background wash). */
 const cardVariants = cva(
-  "rounded-xl border bg-card text-card-foreground shadow-card",
+  "rounded-xl border bg-card text-card-foreground shadow",
   {
     variants: {
       tone: {

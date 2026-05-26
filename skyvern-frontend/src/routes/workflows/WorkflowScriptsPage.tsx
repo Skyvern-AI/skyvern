@@ -288,8 +288,8 @@ function ScriptsTableRows({
       <TableRow>
         <TableCell colSpan={TABLE_COL_COUNT}>
           <div className="flex flex-col items-center gap-2 py-12 text-center">
-            <FileTextIcon className="size-8 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">
+            <FileTextIcon className="size-8 text-slate-400" />
+            <p className="text-sm text-slate-500">
               No scripts yet. Scripts are created automatically when this
               workflow runs with Code mode enabled.
             </p>

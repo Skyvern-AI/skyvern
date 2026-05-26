@@ -91,7 +91,7 @@ function ColumnMappingEditor({
 
   if (entries.length === 0) {
     return (
-      <div className="rounded-md border border-dashed border-border bg-slate-elevation1/40 p-3 text-xs text-muted-foreground">
+      <div className="rounded-md border border-dashed border-slate-700 bg-slate-900/40 p-3 text-xs text-slate-400">
         <div className="mb-2">
           No column mappings. Add mappings when your data is a list of objects;
           each source field maps to one sheet column.
@@ -112,7 +112,7 @@ function ColumnMappingEditor({
 
   return (
     <div className={cn("space-y-2", disabled && "opacity-60")}>
-      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 text-[0.65rem] uppercase tracking-wider text-muted-foreground">
+      <div className="grid grid-cols-[1fr_1fr_auto] gap-2 text-[0.65rem] uppercase tracking-wider text-slate-500">
         <Label className="text-[0.65rem]">Source field</Label>
         <Label className="text-[0.65rem]">
           Destination

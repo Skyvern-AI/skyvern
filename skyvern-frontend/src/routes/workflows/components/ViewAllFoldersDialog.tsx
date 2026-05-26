@@ -66,7 +66,7 @@ function ViewAllFoldersDialog({
         </DialogHeader>
 
         <div className="relative mb-4">
-          <MagnifyingGlassIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <MagnifyingGlassIcon className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
             type="text"
             placeholder="Search folders..."
@@ -77,7 +77,7 @@ function ViewAllFoldersDialog({
         </div>
 
         <div
-          className="max-h-[500px] overflow-y-auto pr-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-border [&::-webkit-scrollbar-thumb]:bg-slate-elevation4 dark:[&::-webkit-scrollbar-thumb]:border-border dark:[&::-webkit-scrollbar-thumb]:bg-slate-elevation5 [&::-webkit-scrollbar-track]:bg-slate-elevation2 dark:[&::-webkit-scrollbar-track]:bg-slate-elevation5 [&::-webkit-scrollbar]:w-2"
+          className="max-h-[500px] overflow-y-auto pr-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-slate-100 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:border-slate-800 dark:[&::-webkit-scrollbar-thumb]:bg-slate-600 [&::-webkit-scrollbar-track]:bg-slate-100 dark:[&::-webkit-scrollbar-track]:bg-slate-800 [&::-webkit-scrollbar]:w-2"
           onScroll={(e) =>
             handleInfiniteScroll(
               e,
@@ -93,7 +93,7 @@ function ViewAllFoldersDialog({
               {Array.from({ length: 12 }).map((_, index) => (
                 <div
                   key={`skeleton-${index}`}
-                  className="flex h-24 flex-col gap-3 rounded-lg border border-border bg-slate-elevation1 p-4 dark:border-border"
+                  className="flex h-24 flex-col gap-3 rounded-lg border border-slate-200 bg-slate-elevation1 p-4 dark:border-slate-700"
                 >
                   <div className="flex items-start gap-3">
                     <Skeleton className="mt-0.5 h-5 w-5" />
@@ -106,7 +106,7 @@ function ViewAllFoldersDialog({
               ))}
             </div>
           ) : folders.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+            <div className="flex flex-col items-center justify-center py-12 text-slate-400">
               <p>No folders found</p>
             </div>
           ) : (
@@ -124,14 +124,14 @@ function ViewAllFoldersDialog({
               {isFetchingNextPage && (
                 <div className="mt-4 flex items-center justify-center py-4">
                   <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  <span className="text-sm text-muted-foreground">
+                  <span className="text-sm text-slate-400">
                     Loading more folders...
                   </span>
                 </div>
               )}
               {!hasNextPage && folders.length > 20 && (
                 <div className="mt-4 flex items-center justify-center py-4">
-                  <span className="text-sm text-muted-foreground">
+                  <span className="text-sm text-slate-400">
                     All folders loaded
                   </span>
                 </div>
