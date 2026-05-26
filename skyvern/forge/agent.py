@@ -19,6 +19,7 @@ from openai.types.responses.response import Response as OpenAIResponse
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
+from yutori.navigator.tools import GET_ELEMENT_BY_REF_SCRIPT, evaluate_tool_script
 
 from skyvern import analytics
 from skyvern.config import settings
@@ -83,6 +84,8 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import LLM_PROVIDER_ERROR_RETRYABLE_TASK_TYPE, LLM_PROVIDER_ERROR_TYPE
 from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
+from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
+from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_response_to_actions
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -141,6 +144,7 @@ from skyvern.webeye.actions.actions import (
     ReloadPageAction,
     TerminateAction,
     VerificationStatus,
+    WaitAction,
     WebAction,
 )
 from skyvern.webeye.actions.handler import ActionHandler
@@ -153,6 +157,7 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -783,9 +788,17 @@ class ForgeAgent:
                     ui_tars_llm_caller.initialize_conversation(task)
                     llm_caller = ui_tars_llm_caller
 
+            if engine == RunEngine.yutori_navigator and not llm_caller:
+                llm_caller = LLMCallerManager.get_llm_caller(task.task_id)
+                if not llm_caller:
+                    llm_key = task.llm_key or settings.YUTORI_LLM_KEY
+                    yutori_caller = YutoriNavigatorLLMCaller(llm_key=llm_key, screenshot_scaling_enabled=False)
+                    yutori_caller.initialize_conversation(task)
+                    llm_caller = yutori_caller
+
             # TODO: remove the code after migrating everything to llm callers
             # currently, only anthropic cua and ui_tars tasks use llm_caller
-            if engine in [RunEngine.anthropic_cua, RunEngine.ui_tars] and llm_caller:
+            if engine in [RunEngine.anthropic_cua, RunEngine.ui_tars, RunEngine.yutori_navigator] and llm_caller:
                 LLMCallerManager.set_llm_caller(task.task_id, llm_caller)
 
             step, detailed_output = await self.agent_step(
@@ -1436,6 +1449,14 @@ class ForgeAgent:
                     scraped_page=scraped_page,
                     llm_caller=llm_caller,
                 )
+            elif engine == RunEngine.yutori_navigator:
+                assert llm_caller is not None
+                actions = await self._generate_yutori_navigator_actions(
+                    task=task,
+                    step=step,
+                    scraped_page=scraped_page,
+                    llm_caller=llm_caller,
+                )
 
             else:
                 if is_extraction_task:
@@ -1917,6 +1938,34 @@ class ForgeAgent:
                 if secret_key in context.totp_codes:
                     context.totp_codes.pop(secret_key)
 
+            # Update Navigator caller with actual action results so the next
+            # step's tool responses include real execution data.
+            if (
+                engine == RunEngine.yutori_navigator
+                and detailed_agent_step_output
+                and detailed_agent_step_output.actions_and_results
+            ):
+                nav_caller = LLMCallerManager.get_llm_caller(task.task_id)
+                if isinstance(nav_caller, YutoriNavigatorLLMCaller):
+                    for action, results in detailed_agent_step_output.actions_and_results:
+                        if not results or not action.tool_call_id:
+                            continue
+                        r = results[-1]
+                        result_str: str | None
+                        if isinstance(action, WaitAction):
+                            # Skyvern's handle_wait_action always returns ActionFailure by
+                            # design (to discourage v1/v2 engines from leaning on wait), but
+                            # Navigator emits wait as a deliberate cooperative pause —
+                            # surface a positive tool result so the model sees WaitAction success.
+                            result_str = f"Waited {action.seconds}s"
+                        elif r.success:
+                            # Use actual data when available (JS output, etc.)
+                            result_str = str(r.data) if r.data is not None else None
+                        else:
+                            # Provide error details so the model can recover
+                            result_str = f"ERROR: {r.exception_message or 'Action failed'}"
+                        nav_caller.update_pending_result(action.tool_call_id, result_str)
+
             # Check if Skyvern already returned a complete action, if so, don't run user goal check
             has_decisive_action = False
             if detailed_agent_step_output and detailed_agent_step_output.actions_and_results:
@@ -2230,6 +2279,7 @@ class ForgeAgent:
         call_kwargs: dict[str, Any] = {
             "step": step,
             "screenshots": scraped_page.screenshots,
+            "prompt_name": "anthropic-cua",
             "use_message_history": True,
             "tools": tools,
             "raw_response": True,
@@ -2317,6 +2367,79 @@ class ForgeAgent:
             actions_count=len(actions),
         )
 
+        return actions
+
+    async def _generate_yutori_navigator_actions(
+        self,
+        task: Task,
+        step: Step,
+        scraped_page: ScrapedPage,
+        llm_caller: LLMCaller,
+    ) -> list[Action]:
+        if not isinstance(llm_caller, YutoriNavigatorLLMCaller):
+            raise ValueError(f"Expected YutoriNavigatorLLMCaller, got {type(llm_caller)}")
+        if not scraped_page.screenshots:
+            raise ValueError("No screenshots found for Yutori Navigator action generation")
+        # Only initialize the conversation on the very first step. Step retries
+        # share the same order with an incremented retry_index — we must keep
+        # the existing message_history (including overridden tool results like
+        # "Waited Ns") so Navigator can recover instead of replaying.
+        if step.order == 0 and step.retry_index == 0:
+            llm_caller.initialize_conversation(task)
+
+        # Detect last step — send stop-and-summarize instead of normal tool result.
+        context = skyvern_context.current()
+        override_max_steps = context.max_steps_override if context else None
+        max_steps = override_max_steps or task.max_steps_per_run or settings.MAX_STEPS_PER_RUN
+        is_last_step = step.order + 1 >= max_steps
+
+        if is_last_step:
+            llm_caller.add_stop_and_summarize(scraped_page.screenshots[0], scraped_page.url)
+        elif not llm_caller.message_history:
+            llm_caller.add_initial_message(scraped_page.screenshots[0])
+        else:
+            llm_caller.flush_pending_tool_results(scraped_page.screenshots[0], scraped_page.url)
+
+        nav_resp = await llm_caller.generate_response(step)
+
+        # Resolve ref-based targeting to coordinates before parsing.
+        # Navigator can target elements by ref ID instead of coordinates;
+        # we resolve inline so the parser always sees coordinates.
+        if nav_resp.tool_calls:
+            page = await scraped_page._browser_state.get_working_page()
+            for tc in nav_resp.tool_calls:
+                args = json.loads(tc["function"]["arguments"])
+                if args.get("ref") and not args.get("coordinates"):
+                    result = await evaluate_tool_script(page, GET_ELEMENT_BY_REF_SCRIPT, args["ref"])
+                    if result.get("success"):
+                        args["coordinates"] = result["coordinates"]
+                        tc["function"]["arguments"] = json.dumps(args)
+
+        window_dimension = (
+            cast(Resolution, scraped_page.window_dimension)
+            if scraped_page.window_dimension
+            else Resolution(width=settings.BROWSER_WIDTH, height=settings.BROWSER_HEIGHT)
+        )
+
+        actions = parse_navigator_response_to_actions(
+            nav_resp,
+            window_dimension["width"],
+            window_dimension["height"],
+            task=task,
+            step=step,
+        )
+        if nav_resp.tool_calls and not actions:
+            tool_names = [tool_call["function"]["name"] for tool_call in nav_resp.tool_calls]
+            LOG.warning(
+                "Unsupported Yutori Navigator tool calls returned no executable actions",
+                task_id=task.task_id,
+                step_order=step.order,
+                tool_calls=tool_names,
+            )
+            raise FailedToParseActionInstruction(
+                reason=f"Unsupported Yutori Navigator tool calls: {', '.join(tool_names)}",
+                error_type="UNSUPPORTED_YUTORI_TOOL_CALLS",
+            )
         return actions
 
     async def _speculate_next_step_plan(
@@ -2660,6 +2783,10 @@ class ForgeAgent:
         # no new_elements_ids threading — so we also drop Skyvern IDs.
         _ctx = skyvern_context.current()
         lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
+        non_vision_page_context = await build_non_vision_page_context_if_needed(
+            scraped_page=scraped_page_refreshed,
+            page=page,
+        )
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -2670,6 +2797,7 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            non_vision_page_context=non_vision_page_context,
             html_need_skyvern_attrs=False,
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
@@ -3362,6 +3490,7 @@ class ForgeAgent:
         verification_code_check: bool,
         show_close_page_action: bool,
         complete_criterion: str | None,
+        non_vision_enabled: bool = False,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
@@ -3373,6 +3502,8 @@ class ForgeAgent:
             variant_parts.append("vc")
         if show_close_page_action:
             variant_parts.append("cp")
+        if non_vision_enabled:
+            variant_parts.append("nv")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
@@ -3644,6 +3775,10 @@ class ForgeAgent:
 
         open_tabs_context = await _build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
+        non_vision_page_context = await build_non_vision_page_context_if_needed(
+            scraped_page=scraped_page,
+            page=page,
+        )
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -3671,11 +3806,13 @@ class ForgeAgent:
                     "show_close_page_action": show_close_page_action,
                     "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
+                    "non_vision_page_context": non_vision_page_context,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
                     show_close_page_action=show_close_page_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+                    non_vision_enabled=bool(non_vision_page_context),
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3763,6 +3900,7 @@ class ForgeAgent:
             show_close_page_action=show_close_page_action,
             open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
+            non_vision_page_context=non_vision_page_context,
             # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
             # (default html_need_skyvern_attrs=True) — the planner emits
             # `click(id=...)` references. Gate lean on the PostHog flag.
@@ -4029,22 +4167,32 @@ class ForgeAgent:
             task_id=task.task_id,
             organization_id=task.organization_id,
         )
+        complete_action_content: str | None = None
         for step in reversed(steps):
             if step.status != StepStatus.completed:
                 continue
             if not step.output or not step.output.actions_and_results:
                 continue
             for action, action_results in step.output.actions_and_results:
-                if action.action_type != ActionType.EXTRACT:
-                    continue
+                if action.action_type == ActionType.EXTRACT:
+                    for action_result in action_results:
+                        if action_result.success:
+                            LOG.info(
+                                "Extracted information for task",
+                                extracted_information=action_result.data,
+                            )
+                            return action_result.data
+                # For CUA-style engines (e.g. yutori-navigator), the model returns its answer
+                # inside the CompleteAction's output field. Surface that as
+                # extracted_information when no EXTRACT action result is found.
+                if action.action_type == ActionType.COMPLETE and complete_action_content is None:
+                    content = getattr(action, "output", None)
+                    if content:
+                        complete_action_content = content
 
-                for action_result in action_results:
-                    if action_result.success:
-                        LOG.info(
-                            "Extracted information for task",
-                            extracted_information=action_result.data,
-                        )
-                        return action_result.data
+        if complete_action_content:
+            LOG.info("Using CompleteAction content as extracted information", task_id=task.task_id)
+            return complete_action_content
 
         if task.data_extraction_goal:
             LOG.warning(
@@ -5159,6 +5307,7 @@ class ForgeAgent:
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt,
@@ -5304,6 +5453,7 @@ class ForgeAgent:
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,

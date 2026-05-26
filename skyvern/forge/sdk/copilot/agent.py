@@ -75,6 +75,11 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentMode,
     build_turn_intent,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import (
+    apply_repeated_reply_guard,
+    derive_response_kind,
+)
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -336,6 +341,8 @@ def _store_turn_context_packet_on_context(
             debug_run_info_text=debug_run_info_text,
         )
     )
+    if ctx.turn_context_packet.repeated_reply_context is not None:
+        ctx.blocked_reply_signatures = list(ctx.turn_context_packet.repeated_reply_context.blocked_signatures)
 
 
 def _build_system_prompt(
@@ -403,6 +410,7 @@ def _build_user_context(
     user_message: str,
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
+    repeated_reply_warning: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
 
@@ -425,6 +433,7 @@ def _build_user_context(
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
+        repeated_reply_warning=escape_code_fences(repeated_reply_warning or ""),
     )
 
 
@@ -658,17 +667,25 @@ def _build_exit_result(
     user_response: str,
     global_llm_context: str | None,
     cancelled: bool = False,
+    terminal_reason: str | None = None,
 ) -> AgentResult:
     """AgentResult for agent-loop exits that don't go through ``_translate_to_agent_result``."""
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=user_response,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason=terminal_reason or ("cancel" if cancelled else None),
+    )
     return AgentResult(
-        user_response=user_response,
+        user_response=final_text,
         updated_workflow=verified_workflow,
         global_llm_context=global_llm_context,
         workflow_yaml=verified_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
         total_tokens=ctx.total_tokens_used,
         cancelled=cancelled,
+        turn_outcome=outcome,
     )
 
 
@@ -928,9 +945,20 @@ def _build_wip_exit_result(
     unvalidated_reply: str,
     tested_reply: str,
     cancelled: bool = False,
+    terminal_reason: str | None = None,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
     recorded_failure_reply = _recorded_failure_reply(ctx, cancelled=cancelled)
+    effective_terminal = terminal_reason or ("cancel" if cancelled else None)
+
+    def _guard(text: str) -> tuple[str, TurnOutcome]:
+        return apply_repeated_reply_guard(
+            final_text=text,
+            attempted_kind=ResponseKind.CLARIFY,
+            blocked_signatures=ctx.blocked_reply_signatures,
+            terminal_reason=effective_terminal,
+        )
+
     # When an unverified edit/run has overwritten ``last_workflow``, prefer the
     # verified shape while still forcing explicit review.
     if (
@@ -939,8 +967,10 @@ def _build_wip_exit_result(
         and ctx.last_workflow is not ctx.last_good_workflow
         and not ctx.last_test_suspicious_success
     ):
+        reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
+        final_text, outcome = _guard(reply)
         return AgentResult(
-            user_response=_last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply,
+            user_response=final_text,
             updated_workflow=ctx.last_good_workflow,
             global_llm_context=global_llm_context,
             workflow_yaml=ctx.last_good_workflow_yaml,
@@ -948,6 +978,7 @@ def _build_wip_exit_result(
             total_tokens=ctx.total_tokens_used,
             proposal_disposition="review_tested",
             cancelled=cancelled,
+            turn_outcome=outcome,
         )
     if (
         ctx.last_workflow is not None
@@ -960,8 +991,9 @@ def _build_wip_exit_result(
             reply = recorded_failure_reply
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
+        final_text, outcome = _guard(reply)
         return AgentResult(
-            user_response=reply,
+            user_response=final_text,
             updated_workflow=ctx.last_workflow,
             global_llm_context=global_llm_context,
             workflow_yaml=ctx.last_workflow_yaml,
@@ -969,8 +1001,15 @@ def _build_wip_exit_result(
             total_tokens=ctx.total_tokens_used,
             proposal_disposition="review_untested" if unvalidated else "auto_applicable",
             cancelled=cancelled,
+            turn_outcome=outcome,
         )
-    return _build_exit_result(ctx, recorded_failure_reply or default_reply, global_llm_context, cancelled=cancelled)
+    return _build_exit_result(
+        ctx,
+        recorded_failure_reply or default_reply,
+        global_llm_context,
+        cancelled=cancelled,
+        terminal_reason=effective_terminal,
+    )
 
 
 def _merge_exit_context(
@@ -990,6 +1029,7 @@ def _build_timeout_exit_result(ctx: CopilotContext, global_llm_context: str | No
         default_reply=_TIMEOUT_REPLY_DEFAULT,
         unvalidated_reply=_TIMEOUT_REPLY_UNVALIDATED,
         tested_reply=_TIMEOUT_REPLY_TESTED,
+        terminal_reason="timeout",
     )
 
 
@@ -1007,6 +1047,7 @@ def _build_max_turns_exit_result(ctx: CopilotContext, global_llm_context: str | 
         default_reply=_MAX_TURNS_REPLY_DEFAULT,
         unvalidated_reply=_MAX_TURNS_REPLY_UNVALIDATED,
         tested_reply=_MAX_TURNS_REPLY_TESTED,
+        terminal_reason="max_turns",
     )
 
 
@@ -1029,6 +1070,7 @@ def _build_unexpected_error_exit_result(
         default_reply=default_reply,
         unvalidated_reply=_UNEXPECTED_ERROR_REPLY_UNVALIDATED,
         tested_reply=_UNEXPECTED_ERROR_REPLY_TESTED,
+        terminal_reason="unexpected_error",
     )
     LOG.warning(
         "Copilot unexpected error translated to recoverable reply",
@@ -1318,8 +1360,29 @@ def _translate_to_agent_result(
             output_policy_diagnostics=output_policy_diagnostics,
         )
 
+    final_user_response = str(user_response)
+    attempted_kind = derive_response_kind(ctx.turn_intent)
+    tool_call_names = [
+        str(entry.get("tool") or entry.get("name") or "") for entry in ctx.tool_activity if isinstance(entry, dict)
+    ]
+    reason_codes = (
+        [code.value for code in ctx.turn_intent.reason_codes]
+        if ctx.turn_intent and ctx.turn_intent.reason_codes
+        else []
+    )
+    reason_code = ",".join(reason_codes)
+
+    final_user_response, turn_outcome = apply_repeated_reply_guard(
+        final_text=final_user_response,
+        attempted_kind=attempted_kind,
+        blocked_signatures=ctx.blocked_reply_signatures,
+        reason_code=reason_code,
+        turn_intent=ctx.turn_intent,
+        tool_calls=[name for name in tool_call_names if name],
+    )
+
     return AgentResult(
-        user_response=str(user_response),
+        user_response=final_user_response,
         updated_workflow=last_workflow,
         global_llm_context=enriched_context or None,
         response_type=resp_type,
@@ -1335,6 +1398,7 @@ def _translate_to_agent_result(
             else "auto_applicable"
         ),
         output_policy_diagnostics=output_policy_diagnostics,
+        turn_outcome=turn_outcome,
     )
 
 
@@ -1344,6 +1408,7 @@ def _build_feasibility_clarification_result(
     user_message: str,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
+    ctx: CopilotContext,
 ) -> AgentResult:
     """Construct an AgentResult for the feasibility-gate fast-path.
 
@@ -1359,14 +1424,21 @@ def _build_feasibility_clarification_result(
     structured.decisions_made.append(f"feasibility-gate clarification asked: {question}")
     enriched_context = structured.to_json_str()
 
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=question,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="feasibility_clarification",
+    )
     return AgentResult(
-        user_response=question,
+        user_response=final_text,
         updated_workflow=None,
         global_llm_context=enriched_context,
         response_type="ASK_QUESTION",
         workflow_yaml=prior_workflow_yaml or None,
         workflow_was_persisted=False,
         clear_proposed_workflow=True,
+        turn_outcome=outcome,
     )
 
 
@@ -1419,20 +1491,30 @@ def _build_request_policy_clarification_result(
     policy: RequestPolicy,
     prior_global_llm_context: str | None,
     prior_workflow_yaml: str | None,
+    ctx: CopilotContext,
 ) -> AgentResult:
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
         f"request-policy clarification required: {policy.credential_input_kind}/{policy.clarification_reason}"
     )
+    clarification_text = (
+        policy.clarification_question or "I need one more detail before I can build and test this workflow safely."
+    )
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=clarification_text,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code="request_policy_clarification",
+    )
     return AgentResult(
-        user_response=policy.clarification_question
-        or "I need one more detail before I can build and test this workflow safely.",
+        user_response=final_text,
         updated_workflow=None,
         global_llm_context=structured.to_json_str(),
         response_type="ASK_QUESTION",
         workflow_yaml=prior_workflow_yaml or None,
         workflow_was_persisted=False,
         clear_proposed_workflow=True,
+        turn_outcome=outcome,
     )
 
 
@@ -1712,8 +1794,15 @@ def _build_output_policy_blocked_result(
         user_response = "I could not safely return that chat reply. Please adjust the request and try again."
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
+    final_user_response, output_policy_outcome = apply_repeated_reply_guard(
+        final_text=user_response,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=ctx.blocked_reply_signatures,
+        reason_code="output_policy_block",
+        terminal_reason="output_policy_block",
+    )
     return AgentResult(
-        user_response=user_response,
+        user_response=final_user_response,
         updated_workflow=preserved_workflow,
         global_llm_context=structured.to_json_str(),
         response_type="ASK_QUESTION",
@@ -1736,6 +1825,7 @@ def _build_output_policy_blocked_result(
             hard_block_reason_codes=list(verdict.reason_codes),
             soft_rewrite_reason_codes=[],
         ),
+        turn_outcome=output_policy_outcome,
     )
 
 
@@ -1858,14 +1948,24 @@ async def _run_copilot_turn_impl(
                 error=str(e),
                 workflow_permanent_id=chat_request.workflow_permanent_id,
             )
+            missing_sdk_reply = (
+                "Copilot backend is missing the OpenAI Agents SDK dependency. "
+                "Rebuild or redeploy the backend image so `openai-agents` is installed."
+            )
+            # ctx isn't constructed yet at this exit (deploy-state check fires
+            # before CopilotContext allocation), so no inherited bans to thread.
+            final_missing_text, missing_sdk_outcome = apply_repeated_reply_guard(
+                final_text=missing_sdk_reply,
+                attempted_kind=ResponseKind.CLARIFY,
+                blocked_signatures=(),
+                terminal_reason="missing_sdk",
+            )
             return AgentResult(
-                user_response=(
-                    "Copilot backend is missing the OpenAI Agents SDK dependency. "
-                    "Rebuild or redeploy the backend image so `openai-agents` is installed."
-                ),
+                user_response=final_missing_text,
                 updated_workflow=None,
                 global_llm_context=global_llm_context,
                 workflow_yaml=chat_request.workflow_yaml or None,
+                turn_outcome=missing_sdk_outcome,
             )
         raise
 
@@ -1923,6 +2023,7 @@ async def _run_copilot_turn_impl(
             request_policy,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
+            ctx=ctx,
         )
     if request_policy is None:
         raise CopilotRequestPolicyMissingError()
@@ -1952,6 +2053,7 @@ async def _run_copilot_turn_impl(
             user_message=agent_user_message,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=chat_request.workflow_yaml,
+            ctx=ctx,
         )
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
@@ -1998,11 +2100,12 @@ async def _run_copilot_turn_impl(
     )
 
     user_workflow_change_summary = ""
-    if (
-        isinstance(ctx.turn_context_packet, TurnContextPacket)
-        and ctx.turn_context_packet.workflow_change_context is not None
-    ):
-        user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+    repeated_reply_warning = ""
+    if isinstance(ctx.turn_context_packet, TurnContextPacket):
+        if ctx.turn_context_packet.workflow_change_context is not None:
+            user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+        if ctx.turn_context_packet.repeated_reply_context is not None:
+            repeated_reply_warning = ctx.turn_context_packet.repeated_reply_context.rendered_summary
 
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,
@@ -2011,6 +2114,7 @@ async def _run_copilot_turn_impl(
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
+        repeated_reply_warning=repeated_reply_warning,
     )
 
     LOG.info(
@@ -2139,6 +2243,7 @@ async def _run_copilot_turn_impl(
                     request_policy,
                     prior_global_llm_context=global_llm_context,
                     prior_workflow_yaml=chat_request.workflow_yaml,
+                    ctx=ctx,
                 )
             except OutputGuardrailTripwireTriggered as exc:
                 return _build_output_policy_blocked_result(
@@ -2169,16 +2274,24 @@ async def _run_copilot_turn_impl(
                 )
                 # Non-retriable nav errors prove the current workflow doesn't
                 # work; zero the proposal even if other tools succeeded.
+                nav_reply = (
+                    f"The target URL could not be reached. Error: {exc.error_message}. "
+                    "Please verify the URL and try again."
+                )
+                final_nav_text, nav_outcome = apply_repeated_reply_guard(
+                    final_text=nav_reply,
+                    attempted_kind=ResponseKind.CLARIFY,
+                    blocked_signatures=ctx.blocked_reply_signatures,
+                    terminal_reason="non_retriable_nav",
+                )
                 return AgentResult(
-                    user_response=(
-                        f"The target URL could not be reached. Error: {exc.error_message}. "
-                        "Please verify the URL and try again."
-                    ),
+                    user_response=final_nav_text,
                     updated_workflow=None,
                     global_llm_context=global_llm_context,
                     workflow_yaml=None,
                     workflow_was_persisted=ctx.workflow_persisted,
                     total_tokens=ctx.total_tokens_used,
+                    turn_outcome=nav_outcome,
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)

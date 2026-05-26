@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'pyproject.toml'
+permissions:
+  contents: read
 jobs:
   check-version-change:
     runs-on: ubuntu-latest
@@ -59,33 +61,69 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-      # Cache uv's global cache (resolver/downloads) for speed
-      - name: Cache uv cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          path: ~/.cache/uv
-          key: uv-cache-${{ runner.os }}-${{ hashFiles('**/pyproject.toml', '**/uv.lock') }}
-      # Cache the project venv (keyed by lockfile + Python)
-      - name: Cache venv
-        id: cache-venv
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .venv
-          key: venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version || '3.11' }}-${{ hashFiles('**/uv.lock') }}
-      # Create/refresh environment. We install dev deps to get twine/build.
+          node-version-file: .nvmrc
+      # Create/refresh environment. Avoid restoring build caches in the publishing
+      # job so release artifacts are built only from the checked-out source.
       - name: Sync dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
           uv sync --group dev
-      - name: Ensure environment is up to date (on cache hit)
-        if: steps.cache-venv.outputs.cache-hit == 'true'
-        run: uv sync --group dev
       - name: Clean dist directory
         run: rm -rf dist
-      - name: Build Package
-        run: uv build
-      - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: uv run twine upload --repository pypi dist/*
+      - name: Verify package versions match
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          root_version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          ui_version = tomllib.loads(Path("packages/skyvern-ui/pyproject.toml").read_text())["project"]["version"]
+          if root_version != ui_version:
+              raise SystemExit(f"skyvern version {root_version} does not match skyvern-ui version {ui_version}")
+          print(f"Building skyvern and skyvern-ui version {root_version}")
+          PY
+      - name: Build prebuilt UI package
+        run: scripts/build-skyvern-ui-package.sh dist/skyvern-ui
+      - name: Build Skyvern package
+        run: uv build --out-dir dist/skyvern
+      - name: Upload skyvern-ui distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: skyvern-ui-dist
+          path: dist/skyvern-ui/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload skyvern distribution
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: skyvern-dist
+          path: dist/skyvern/*
+          if-no-files-found: error
+          retention-days: 7
+  publish-sdk:
+    runs-on: ubuntu-latest
+    needs: build-sdk
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download skyvern-ui distribution
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: skyvern-ui-dist
+          path: dist/skyvern-ui
+      - name: Download skyvern distribution
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: skyvern-dist
+          path: dist/skyvern
+      - name: Publish skyvern-ui to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist/skyvern-ui/
+      - name: Publish skyvern to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist/skyvern/

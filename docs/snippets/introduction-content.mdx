@@ -20,11 +20,11 @@ Each cycle through this loop is called a **step**. Understanding what happens in
 
 A typical task takes 2 to 10 steps. You can set `max_steps` to cap cost during development.
 
-### The Planner-Agent-Validator system
+### Existing V2 Planner-Agent-Validator system
 
-For anything beyond simple single-page tasks, Skyvern 2.0 wraps the agent loop in a higher-level system with three components:
+Existing V2 workflows may use a higher-level system with three components:
 
-<img src="/images/skyvern-explainer.png" alt="Skyvern 2.0 architecture: Planner breaks prompt into sub-tasks, Task Agent executes them, Validator confirms completion" />
+<img src="/images/skyvern-explainer.png" alt="V2 architecture: Planner breaks prompt into sub-tasks, Task Agent executes them, Validator confirms completion" />
 
 The **Planner** takes your prompt and breaks it into an ordered sequence of sub-tasks. If you say "log into the vendor portal, download all invoices from January, and save them as PDFs," the Planner sequences that into: navigate to login → authenticate → find the invoice section → loop through January invoices → download each one.
 

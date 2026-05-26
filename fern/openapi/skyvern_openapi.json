@@ -291,6 +291,7 @@
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
+                      "yutori_navigator": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -16834,7 +16835,7 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
             "default": "skyvern-1.0"
           },
           "title": {
@@ -17024,7 +17025,8 @@
           "publish_workflow": {
             "type": "boolean",
             "title": "Publish Workflow",
-            "description": "Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
+            "description": "Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.",
+            "deprecated": true,
             "default": false
           },
           "include_action_history_in_verification": {
@@ -17352,10 +17354,11 @@
               "task_v2",
               "openai_cua",
               "anthropic_cua",
-              "ui_tars"
+              "ui_tars",
+              "yutori_navigator"
             ],
             "title": "Run Type",
-            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
+            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars, yutori_navigator"
           },
           "run_request": {
             "anyOf": [

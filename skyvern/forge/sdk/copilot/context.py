@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
 class UrlVisit(BaseModel):
@@ -135,14 +136,7 @@ class AgentResult:
     # Controls whether the route may auto-apply the proposal or must force explicit review.
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
-
-    @property
-    def unvalidated(self) -> bool:
-        return self.proposal_disposition == "review_untested"
-
-    @property
-    def force_review(self) -> bool:
-        return self.proposal_disposition == "review_tested"
+    turn_outcome: TurnOutcome | None = None
 
 
 @dataclass
@@ -183,6 +177,7 @@ class CopilotContext(AgentContext):
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
+    blocked_reply_signatures: list[str] = field(default_factory=list)
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)

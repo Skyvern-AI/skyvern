@@ -123,11 +123,11 @@ If runs consistently time out, increase `max_steps` or simplify the task. If `st
 
 ---
 
-## Use code generation for repeatable tasks
+## Use code generation for repeatable workflows
 
-On Skyvern Cloud, the default **Skyvern 2.0 with Code** engine records the actions the AI takes and generates reusable code from them. Subsequent runs execute the generated code instead of the AI agent, skipping LLM inference and screenshot analysis entirely. This makes them faster, deterministic, and significantly cheaper.
+On Skyvern Cloud, successful workflow runs can record the actions the AI takes and generate reusable code from them. Subsequent runs execute the generated code instead of the AI agent, skipping LLM inference and screenshot analysis entirely. This makes them faster, deterministic, and significantly cheaper.
 
-1. Run your task with the default engine. Skyvern generates code from the recorded actions.
+1. Run your workflow with the agent. Skyvern generates code from the recorded actions.
 2. Subsequent runs execute the cached code directly, no AI reasoning required.
 3. If the code doesn't handle an edge case, adjust your prompt and re-run to regenerate. Skyvern also falls back to the AI agent automatically if the cached code fails.
 
@@ -203,7 +203,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 </CodeGroup>
 
 <Tip>
-Set `publish_workflow: true` to save the generated workflow so you can re-trigger it later or [schedule it on a recurring cron](/cloud/building-workflows/scheduling).
+Create a workflow when you need to re-trigger the automation later or [schedule it on a recurring cron](/cloud/building-workflows/scheduling).
 </Tip>
 
 ---
@@ -214,8 +214,8 @@ Not every task needs the most powerful engine. Use a lighter engine for simple, 
 
 | Engine | Cost | Best for |
 |--------|------|----------|
-| `skyvern-2.0` | Highest | Complex, multi-step tasks that require flexibility |
 | `skyvern-1.0` | Lower | Single-objective tasks like form fills or single-page extraction |
+| `skyvern-2.0` | Highest | Existing V2 workflows or explicitly requested V2 task runs |
 
 <CodeGroup>
 ```python Python

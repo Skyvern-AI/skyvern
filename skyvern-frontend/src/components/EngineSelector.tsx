@@ -32,8 +32,8 @@ const allEngineOptions: Array<EngineOption> = [
   {
     value: RunEngine.SkyvernV2,
     label: "Skyvern 2.0",
-    badge: "Multi-Goal",
-    badgeVariant: "warning",
+    badge: "Legacy",
+    badgeVariant: "default",
   },
   {
     value: RunEngine.OpenaiCua,
@@ -43,6 +43,10 @@ const allEngineOptions: Array<EngineOption> = [
     value: RunEngine.AnthropicCua,
     label: "Anthropic CUA",
   },
+  {
+    value: RunEngine.YutoriNavigator,
+    label: "Yutori Navigator",
+  },
 ];
 
 // Default engines for blocks that don't support V2 mode
@@ -50,6 +54,7 @@ const defaultEngines: Array<RunEngine> = [
   RunEngine.SkyvernV1,
   RunEngine.OpenaiCua,
   RunEngine.AnthropicCua,
+  RunEngine.YutoriNavigator,
 ];
 
 function BadgeLabel({ option }: { option: EngineOption }) {

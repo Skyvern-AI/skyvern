@@ -69,6 +69,12 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_FALLBACK_PROMPT_NAMES = {
+    "anthropic-cua",
+    "css-shape-convert",
+    "extract-text-from-image",
+    "ui-tars-system-prompt",
+}
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
@@ -166,14 +172,25 @@ def _llm_screenshots_for_call(
     screenshots: list[bytes] | None,
     llm_config: LLMConfig | LLMRouterConfig,
     context: SkyvernContext | None,
+    prompt_name: str | None = None,
 ) -> list[bytes] | None:
-    if not llm_config.supports_vision or (context and context.disable_llm_screenshots):
+    if not llm_config.supports_vision:
+        return None
+    if context and context.disable_llm_screenshots and prompt_name not in VISION_FALLBACK_PROMPT_NAMES:
         return None
     return screenshots
 
 
-def _llm_screenshots_enabled_metric(llm_config: LLMConfig | LLMRouterConfig, context: SkyvernContext | None) -> bool:
-    return llm_config.supports_vision and not bool(context and context.disable_llm_screenshots)
+def _llm_screenshots_enabled_metric(
+    llm_config: LLMConfig | LLMRouterConfig,
+    context: SkyvernContext | None,
+    prompt_name: str | None = None,
+) -> bool:
+    if not llm_config.supports_vision:
+        return False
+    if context and context.disable_llm_screenshots and prompt_name not in VISION_FALLBACK_PROMPT_NAMES:
+        return False
+    return True
 
 
 @runtime_checkable
@@ -920,8 +937,8 @@ class LLMAPIHandlerFactory:
                                     **artifact_targets,
                                 )
                             )
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1585,8 +1602,8 @@ class LLMAPIHandlerFactory:
                                 )
                             )
 
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name)
 
                 model_name = llm_config.model_name
 
@@ -2222,8 +2239,8 @@ class LLMCaller:
                             )
                         )
 
-            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context)
-            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context)
+            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name)
+            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2548,6 +2565,10 @@ class LLMCaller:
         if self.llm_key and "UI_TARS" in self.llm_key:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
+        # Route Yutori Navigator models to Yutori SDK
+        if self.llm_key and "YUTORI" in self.llm_key:
+            return await self._call_yutori_navigator(messages, timeout, **active_parameters)
+
         return await litellm.acompletion(
             model=self.llm_config.model_name,
             messages=messages,
@@ -2655,6 +2676,48 @@ class LLMCaller:
             timeout=timeout,
         )
         return response
+
+    async def _call_yutori_navigator(
+        self,
+        messages: list[dict[str, Any]],
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> ModelResponse:
+        """Call the Yutori Navigator API via the Yutori SDK client."""
+        from yutori.navigator import estimate_messages_size_bytes, trimmed_messages_to_fit
+
+        if not app.YUTORI_CLIENT:
+            raise ValueError("YUTORI_CLIENT not initialized. Ensure ENABLE_YUTORI=true and YUTORI_API_KEY is set.")
+
+        # Trim old screenshots if payload exceeds size limit
+        max_bytes = 9_500_000
+        if estimate_messages_size_bytes(messages) > max_bytes:
+            messages, _, removed = trimmed_messages_to_fit(messages, max_bytes=max_bytes)
+            if removed:
+                LOG.info("Trimmed old screenshots for payload size", removed=removed)
+
+        model_name = self.llm_config.model_name
+        tool_set = settings.YUTORI_TOOL_SET or None
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
+
+        LOG.info(
+            "Yutori Navigator request",
+            model_name=model_name,
+            tool_set=tool_set,
+            messages_length=len(messages),
+        )
+
+        completion = await app.YUTORI_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            tool_set=tool_set,
+            timeout=timeout,
+        )
+
+        # Convert to litellm ModelResponse for standard cost/stats tracking
+        response_dict = completion.model_dump()
+        return litellm.ModelResponse(**response_dict)
 
     async def get_call_stats(
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse

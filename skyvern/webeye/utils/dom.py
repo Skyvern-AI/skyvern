@@ -883,9 +883,16 @@ class SkyvernElement:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
 
-    async def coordinate_click(self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def coordinate_click(
+        self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS, click_count: int = 1
+    ) -> None:
         click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
-        await page.mouse.click(click_x, click_y)
+        if click_count == 2:
+            await page.mouse.dblclick(click_x, click_y)
+        elif click_count >= 3:
+            await page.mouse.click(click_x, click_y, click_count=click_count)
+        else:
+            await page.mouse.click(click_x, click_y)
 
     async def blur(self) -> None:
         if not await self.is_visible():

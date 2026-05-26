@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
 class WorkflowCopilotChat(BaseModel):
@@ -32,6 +33,7 @@ class WorkflowCopilotChatMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
+    turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
     created_at: datetime = Field(..., description="When the message was created")
     modified_at: datetime = Field(..., description="When the message was last modified")
 
@@ -76,6 +78,7 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
     created_at: datetime = Field(..., description="When the message was created")
 
 
@@ -122,10 +125,6 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         "auto_applicable",
         description="Whether this proposal may auto-apply or must be reviewed explicitly.",
     )
-    unvalidated: bool = Field(
-        False,
-        description="Legacy mirror for proposal_disposition=review_untested.",
-    )
     cancelled: bool = Field(
         False,
         description="When true, this RESPONSE was emitted by a user cancel; clients must not auto-apply.",
@@ -133,10 +132,6 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
     output_policy_diagnostics: dict[str, Any] | None = Field(
         None,
         description="Diagnostic output-policy labels for raw-vs-final quality reporting.",
-    )
-    force_review: bool = Field(
-        False,
-        description="Legacy mirror for proposal_disposition=review_tested.",
     )
 
 

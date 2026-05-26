@@ -1090,7 +1090,7 @@ workflow_definition:
 
     assert result.response_type == "REPLY"
     assert result.updated_workflow is ctx.last_workflow
-    assert result.unvalidated is True
+    assert result.proposal_disposition == "review_untested"
     assert result.clear_proposed_workflow is False
     assert "without testing it" in result.user_response
     assert "not been verified" in result.user_response

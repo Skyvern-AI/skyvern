@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
     # These help prevent cached actions from executing before the page is fully loaded
@@ -284,6 +285,14 @@ class Settings(BaseSettings):
     VOLCENGINE_API_KEY: str | None = None
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
+
+    # Yutori Navigator
+    ENABLE_YUTORI: bool = False
+    YUTORI_API_KEY: str | None = None
+    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
+    YUTORI_MODEL: str = "n1.5-latest"
+    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
+    YUTORI_TOOL_SET: str = ""
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None

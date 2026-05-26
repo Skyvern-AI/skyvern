@@ -50,11 +50,12 @@ CEILING_FALLBACK_KEYS_BY_TEMPLATE: dict[str, list[str]] = {
         "previous_extracted_information",
         "extracted_information_schema",
         "extracted_text",
+        "non_vision_page_context",
     ],
-    "extract-action": ["action_history", "navigation_payload_str"],
-    "extract-action-dynamic": ["action_history", "navigation_payload_str"],
+    "extract-action": ["action_history", "navigation_payload_str", "non_vision_page_context"],
+    "extract-action-dynamic": ["action_history", "navigation_payload_str", "non_vision_page_context"],
     "extract-action-static": [],
-    "data-extraction-summary": ["data_extraction_schema"],
+    "data-extraction-summary": ["data_extraction_schema", "non_vision_page_context"],
 }
 
 

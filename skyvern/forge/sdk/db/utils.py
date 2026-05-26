@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -78,7 +79,10 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    ExecuteJsAction,
     ExtractAction,
+    GoBackAction,
+    GoForwardAction,
     GotoUrlAction,
     HoverAction,
     InputTextAction,
@@ -224,6 +228,9 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
     ActionType.GOTO_URL: GotoUrlAction,
+    ActionType.GO_BACK: GoBackAction,
+    ActionType.GO_FORWARD: GoForwardAction,
+    ActionType.EXECUTE_JS: ExecuteJsAction,
 }
 
 
@@ -356,7 +363,28 @@ def convert_to_workflow_copilot_chat_message(
             "Converting WorkflowCopilotChatMessage to WorkflowCopilotChatMessageSchema",
             workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         )
-    return WorkflowCopilotChatMessageSchema.model_validate(message_model)
+    raw_outcome = message_model.turn_outcome
+    parsed_outcome: TurnOutcome | None = None
+    if isinstance(raw_outcome, dict):
+        try:
+            parsed_outcome = TurnOutcome.model_validate(raw_outcome)
+        except Exception as exc:
+            LOG.warning(
+                "Failed to parse TurnOutcome from chat row, treating as None",
+                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                exc_info=exc,
+            )
+            parsed_outcome = None
+    return WorkflowCopilotChatMessageSchema(
+        workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+        workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
+        sender=message_model.sender,
+        content=message_model.content,
+        global_llm_context=message_model.global_llm_context,
+        turn_outcome=parsed_outcome,
+        created_at=message_model.created_at,
+        modified_at=message_model.modified_at,
+    )
 
 
 def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
