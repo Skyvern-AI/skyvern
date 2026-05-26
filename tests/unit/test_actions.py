@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from skyvern.webeye.actions.actions import Action, KeypressAction, NullAction, WebAction
+from skyvern.webeye.actions.actions import Action, ClickAction, KeypressAction, NullAction, WebAction
 from skyvern.webeye.actions.parse_actions import parse_action
 
 
@@ -140,4 +140,31 @@ def test_parse_keypress_repeat_clamped_to_minimum_one() -> None:
         scraped_page=_mock_scraped_page(),
     )
     assert isinstance(action, KeypressAction)
+    assert action.repeat == 1
+
+
+def test_parse_click_double_click_true() -> None:
+    action = parse_action(
+        action={"action_type": "CLICK", "id": "1", "reasoning": "test", "double_click": True},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    assert action.repeat == 2
+
+
+def test_parse_click_double_click_false() -> None:
+    action = parse_action(
+        action={"action_type": "CLICK", "id": "1", "reasoning": "test", "double_click": False},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    assert action.repeat == 1
+
+
+def test_parse_click_no_double_click_field() -> None:
+    action = parse_action(
+        action={"action_type": "CLICK", "id": "1", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
     assert action.repeat == 1
