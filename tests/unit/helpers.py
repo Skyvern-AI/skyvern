@@ -56,7 +56,7 @@ class DummyLogger:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict[str, Any]]] = []
 
-    def info(self, event: str, **kwargs: dict[str, Any]) -> None:
+    def info(self, event: str, **kwargs: Any) -> None:
         self.events.append((event, kwargs))
 
     def warning(self, *args, **kwargs) -> None:  # pragma: no cover
