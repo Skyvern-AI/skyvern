@@ -292,7 +292,7 @@ const result = await page.agent.runWorkflow("wpid_abc123", {
 result = await client.run_task(
     prompt: str,                                # Required
     url: str | None = None,
-    engine: RunEngine = RunEngine.skyvern_v2,
+    engine: RunEngine = RunEngine.skyvern_v1,
     wait_for_completion: bool = False,
     timeout: float = 1800,
     max_steps: int | None = None,
@@ -320,7 +320,7 @@ const result = await skyvern.runTask({
   body: {
     prompt: string,                              // Required
     url?: string,
-    engine?: RunEngine,                          // "skyvern_v2" default
+    engine?: RunEngine,                          // "skyvern-1.0" default
     max_steps?: number,
     data_extraction_schema?: Record<string, unknown> | string,
     browser_session_id?: string,
@@ -693,6 +693,7 @@ request_options=RequestOptions(
 
 - `browser_profile_id` works with `run_workflow` only - silently ignored by `run_task`.
 - Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
+- `publish_workflow=True` is deprecated and routes through the legacy Skyvern 2.0 publish path for backwards compatibility. Prefer creating reusable workflows with the workflow APIs.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
 - `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
 - `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
