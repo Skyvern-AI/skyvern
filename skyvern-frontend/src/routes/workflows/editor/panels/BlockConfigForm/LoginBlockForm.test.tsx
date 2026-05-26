@@ -55,6 +55,10 @@ vi.mock("@/components/HelpTooltip", () => ({
   HelpTooltip: () => <span data-testid="help-tooltip" />,
 }));
 
+vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
+  useSelectedCredentialTotpIdentifier: () => null,
+}));
+
 vi.mock("../../nodes/LoginNode/LoginBlockCredentialSelector", () => ({
   LoginBlockCredentialSelector: (props: {
     nodeId: string;

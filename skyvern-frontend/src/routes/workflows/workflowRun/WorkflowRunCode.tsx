@@ -351,16 +351,14 @@ function WorkflowRunCode(props?: Props) {
               "rounded-full border px-2.5 py-1 text-xs transition-colors",
               activeChipVersion === usedVersion
                 ? "border-blue-500 bg-blue-500/20 text-blue-300"
-                : "border-border text-muted-foreground hover:border-input",
+                : "border-slate-700 text-slate-400 hover:border-slate-500",
             )}
             onClick={() => setSelectedVersion(didGenerate ? usedVersion : null)}
             disabled={isEditing}
           >
             Used: #{usedVersion}
           </button>
-          {didGenerate && (
-            <span className="text-xs text-muted-foreground">→</span>
-          )}
+          {didGenerate && <span className="text-xs text-slate-600">→</span>}
         </>
       )}
       {generatedVersion != null && (
@@ -370,16 +368,14 @@ function WorkflowRunCode(props?: Props) {
             "rounded-full border px-2.5 py-1 text-xs transition-colors",
             activeChipVersion === generatedVersion || selectedVersion === null
               ? "border-emerald-500 bg-emerald-500/20 text-emerald-300"
-              : "border-border text-muted-foreground hover:border-input",
+              : "border-slate-700 text-slate-400 hover:border-slate-500",
           )}
           onClick={() => setSelectedVersion(null)}
           disabled={isEditing}
         >
           Generated: #{generatedVersion}
           {usedVersion == null && (
-            <span className="ml-1 text-[10px] text-muted-foreground">
-              (initial)
-            </span>
+            <span className="ml-1 text-[10px] text-slate-500">(initial)</span>
           )}
         </button>
       )}
@@ -452,7 +448,7 @@ function WorkflowRunCode(props?: Props) {
               value={cacheKeyValue}
               onValueChange={(v: string) => setCacheKeyValue(v)}
             >
-              <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-border px-2.5 text-xs [&>span]:text-ellipsis">
+              <SelectTrigger className="h-7 max-w-[15rem] gap-1.5 rounded-full border-slate-700 px-2.5 text-xs [&>span]:text-ellipsis">
                 <SelectValue placeholder="Variant" />
               </SelectTrigger>
               <SelectContent>

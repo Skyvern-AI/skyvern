@@ -245,7 +245,7 @@ function WorkflowComparisonRenderer({
   );
 
   return (
-    <div className="h-full w-full rounded-lg border bg-card">
+    <div className="h-full w-full rounded-lg border bg-white">
       <FlowRenderer
         hideBackground={false}
         readOnly
@@ -354,7 +354,7 @@ function WorkflowComparisonPanel({
           <button
             type="button"
             onClick={() => onCopilotReviewClose("close")}
-            className="absolute right-4 top-4 rounded p-1 text-muted-foreground hover:bg-slate-elevation4 hover:text-foreground"
+            className="absolute right-4 top-4 rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-slate-200"
             title="Close (Esc)"
           >
             <Cross2Icon className="h-5 w-5" />

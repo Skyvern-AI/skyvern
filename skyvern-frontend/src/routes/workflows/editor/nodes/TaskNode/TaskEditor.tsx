@@ -26,6 +26,7 @@ import { type AppNode, isWorkflowBlockNode } from "..";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
+import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { ParametersMultiSelect } from "./ParametersMultiSelect";
 import type { TaskNode, TaskNodeData } from "./types";
 import { dataSchemaExampleValue, errorMappingExampleValue } from "../types";
@@ -65,6 +66,9 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const hasInteracted = useHasInteractedThisSession();
+  const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
+    data?.parameterKeys?.[0],
+  );
   if (!taskNode || !data) {
     return null;
   }
@@ -123,11 +127,6 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   onParametersChange={(parameterKeys) =>
                     update({ parameterKeys })
                   }
-                  onCredentialTotpIdentifier={(totpIdentifier) => {
-                    if (!data.totpIdentifier?.trim()) {
-                      update({ totpIdentifier });
-                    }
-                  }}
                 />
               </div>
             </div>
@@ -362,9 +361,18 @@ function TaskEditorBody({ blockId }: { blockId: string }) {
                   nodeId={blockId}
                   onChange={(value) => update({ totpIdentifier: value })}
                   value={data.totpIdentifier ?? ""}
-                  placeholder={placeholders["task"]["totpIdentifier"]}
+                  placeholder={
+                    !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                      ? `${credentialTotpIdentifier} (from credential)`
+                      : placeholders["task"]["totpIdentifier"]
+                  }
                   className="nopan text-xs"
                 />
+                {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                  <p className="text-xs text-slate-500">
+                    Leave empty to use the credential's value.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">

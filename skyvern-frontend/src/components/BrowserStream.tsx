@@ -945,7 +945,7 @@ function BrowserStream({
           </div>
         )}
         {!isReady && (
-          <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-border text-sm text-muted-foreground">
+          <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
             <StreamStatusPanel diagnostic={streamDiagnostic}>
               {isBrowserSessionBackendReady && (
                 <>

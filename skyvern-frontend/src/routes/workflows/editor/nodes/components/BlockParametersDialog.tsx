@@ -186,14 +186,14 @@ function BlockParametersDialog({
                     >
                       {param.key}
                     </Label>
-                    <span className="text-sm text-muted-foreground">
+                    <span className="text-sm text-slate-400">
                       {getLabelForWorkflowParameterType(
                         param.workflow_parameter_type,
                       )}
                     </span>
                   </div>
                   {param.description && (
-                    <p className="text-sm text-muted-foreground">
+                    <p className="text-sm text-slate-400">
                       {param.description}
                     </p>
                   )}

@@ -322,7 +322,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Title</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               Name of your task
                             </h2>
                           </div>
@@ -346,7 +346,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Description</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               What is the purpose of the task?
                             </h2>
                           </div>
@@ -374,7 +374,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">URL</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               The starting URL for the task
                             </h2>
                           </div>
@@ -398,7 +398,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Navigation Goal</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               Where should Skyvern go and what should Skyvern
                               do?
                             </h2>
@@ -429,7 +429,7 @@ function SavedTaskForm({ initialValues }: Props) {
                             <FormLabel>
                               <div className="w-72">
                                 <h1 className="text-lg">Navigation Payload</h1>
-                                <h2 className="text-base text-muted-foreground">
+                                <h2 className="text-base text-slate-400">
                                   Specify important parameters, routes, or
                                   states
                                 </h2>
@@ -507,7 +507,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Data Extraction Goal</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               What outputs are you looking to get?
                             </h2>
                           </div>
@@ -535,7 +535,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Data Schema</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               Specify the output format in JSON
                             </h2>
                           </div>
@@ -591,7 +591,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Max Steps Override</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               Want to allow this task to execute more or less
                               steps than the default?
                             </h2>
@@ -629,7 +629,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Webhook Callback URL</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               The URL of a webhook endpoint to send the
                               extracted information
                             </h2>
@@ -681,7 +681,7 @@ function SavedTaskForm({ initialValues }: Props) {
                               <div className="flex items-center gap-2 text-lg">
                                 Proxy Location
                               </div>
-                              <h2 className="text-sm text-muted-foreground">
+                              <h2 className="text-sm text-slate-400">
                                 Route Skyvern through one of our available
                                 proxies.
                               </h2>
@@ -712,7 +712,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">Error Messages</h1>
-                            <h2 className="text-base text-muted-foreground">
+                            <h2 className="text-base text-slate-400">
                               Specify any error outputs you would like to be
                               notified about
                             </h2>
@@ -744,7 +744,7 @@ function SavedTaskForm({ initialValues }: Props) {
                         <FormLabel>
                           <div className="w-72">
                             <h1 className="text-lg">2FA Identifier</h1>
-                            <h2 className="text-base text-muted-foreground"></h2>
+                            <h2 className="text-base text-slate-400"></h2>
                           </div>
                         </FormLabel>
                         <div className="w-full">

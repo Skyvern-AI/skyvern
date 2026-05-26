@@ -148,7 +148,7 @@ function DebuggerTaskBlockParameters({ block }: Props) {
         </div>
         <div className="flex items-center gap-3">
           <Switch checked={block.continue_on_failure} disabled />
-          <span className="text-sm text-muted-foreground">
+          <span className="text-sm text-slate-400">
             {block.continue_on_failure ? "Enabled" : "Disabled"}
           </span>
         </div>
