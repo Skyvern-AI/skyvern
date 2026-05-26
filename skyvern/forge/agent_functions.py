@@ -42,6 +42,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 
 LOG = structlog.get_logger()
 
@@ -476,6 +477,14 @@ class AgentFunction:
         routers so the default returns False.
         """
         return False
+
+    async def should_keep_code_mode_for_workflow_run(
+        self,
+        *,
+        workflow: "Workflow",
+        workflow_run: "WorkflowRun",
+    ) -> bool:
+        return True
 
     async def record_workflow_run_metadata(
         self,
