@@ -33,11 +33,11 @@ export function MethodBadge({
       case "PATCH":
         return "bg-purple-100 text-purple-800 border-purple-300 dark:bg-purple-900/20 dark:text-purple-400 dark:border-purple-800";
       case "HEAD":
-        return "bg-gray-100 text-gray-800 border-gray-300 dark:bg-gray-900/20 dark:text-gray-400 dark:border-gray-800";
+        return "bg-slate-elevation2 text-foreground border-border dark:bg-slate-elevation1/20 dark:text-muted-foreground dark:border-border";
       case "OPTIONS":
         return "bg-cyan-100 text-cyan-800 border-cyan-300 dark:bg-cyan-900/20 dark:text-cyan-400 dark:border-cyan-800";
       default:
-        return "bg-slate-100 text-slate-800 border-slate-300 dark:bg-slate-900/20 dark:text-slate-400 dark:border-slate-800";
+        return "bg-slate-elevation2 text-foreground border-border dark:bg-slate-elevation1/20 dark:text-muted-foreground dark:border-border";
     }
   };
 
@@ -212,11 +212,11 @@ export function RequestPreview({
   const hasFiles = files && files.trim() && files !== "{}";
 
   return (
-    <div className="rounded-md border bg-slate-50 p-3 dark:bg-slate-900/50">
+    <div className="rounded-md border bg-slate-elevation1 p-3 dark:bg-slate-elevation1/50">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <MethodBadge method={method} className="shrink-0" />
-          <span className="truncate font-mono text-sm text-slate-600 dark:text-slate-400">
+          <span className="truncate font-mono text-sm text-muted-foreground dark:text-muted-foreground">
             {url || "No URL specified"}
           </span>
           {hasFiles && (
@@ -240,7 +240,7 @@ export function RequestPreview({
           {/* URL */}
           <div>
             <div className="mb-1 text-xs font-medium">URL:</div>
-            <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+            <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-slate-elevation2 p-2 text-xs text-muted-foreground dark:bg-slate-elevation5 dark:text-muted-foreground">
               {url}
             </pre>
           </div>
@@ -248,7 +248,7 @@ export function RequestPreview({
           {/* Headers */}
           <div>
             <div className="mb-1 text-xs font-medium">Headers:</div>
-            <pre className="overflow-x-auto rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+            <pre className="overflow-x-auto rounded bg-slate-elevation2 p-2 text-xs text-muted-foreground dark:bg-slate-elevation5 dark:text-muted-foreground">
               {headers || "{}"}
             </pre>
           </div>
@@ -257,7 +257,7 @@ export function RequestPreview({
           {["POST", "PUT", "PATCH"].includes(method.toUpperCase()) && (
             <div>
               <div className="mb-1 text-xs font-medium">Body:</div>
-              <pre className="overflow-x-auto rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+              <pre className="overflow-x-auto rounded bg-slate-elevation2 p-2 text-xs text-muted-foreground dark:bg-slate-elevation5 dark:text-muted-foreground">
                 {body || "{}"}
               </pre>
             </div>
@@ -268,7 +268,7 @@ export function RequestPreview({
             hasFiles && (
               <div>
                 <div className="mb-1 text-xs font-medium">Files:</div>
-                <pre className="overflow-x-auto rounded bg-slate-100 p-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+                <pre className="overflow-x-auto rounded bg-slate-elevation2 p-2 text-xs text-muted-foreground dark:bg-slate-elevation5 dark:text-muted-foreground">
                   {files || "{}"}
                 </pre>
               </div>

@@ -1,9 +1,9 @@
+import { LightningBoltIcon } from "@radix-ui/react-icons";
+
 import { Skeleton } from "@/components/ui/skeleton";
 import { useGlobalWorkflowsQuery } from "../workflows/hooks/useGlobalWorkflowsQuery";
 import { useNavigate } from "react-router-dom";
 import { WorkflowTemplateCard } from "./WorkflowTemplateCard";
-import testImg from "@/assets/promptBoxBg.png";
-import { TEMPORARY_TEMPLATE_IMAGES } from "./TemporaryTemplateImages";
 import {
   Carousel,
   CarouselContent,
@@ -12,27 +12,55 @@ import {
   CarouselPrevious,
 } from "@/components/ui/carousel";
 
+const VISIBLE_SLOTS = 5;
+
 function WorkflowTemplates() {
   const { data: workflowTemplates, isLoading } = useGlobalWorkflowsQuery();
   const navigate = useNavigate();
 
   if (isLoading) {
     return (
-      <div className="flex gap-6">
-        <Skeleton className="h-48 w-56 rounded-xl" />
-        <Skeleton className="h-48 w-56 rounded-xl" />
-        <Skeleton className="h-48 w-56 rounded-xl" />
+      <div className="space-y-5">
+        <h1 className="flex items-center gap-2 text-2xl">
+          <LightningBoltIcon className="size-6" />
+          Explore Workflows
+        </h1>
+        <div className="flex gap-6">
+          <Skeleton className="h-52 w-56 rounded-xl" />
+          <Skeleton className="h-52 w-56 rounded-xl" />
+          <Skeleton className="h-52 w-56 rounded-xl" />
+        </div>
       </div>
     );
   }
 
-  if (!workflowTemplates) {
-    return null;
+  if (!workflowTemplates || workflowTemplates.length === 0) {
+    return (
+      <div className="space-y-5">
+        <h1 className="flex items-center gap-2 text-2xl">
+          <LightningBoltIcon className="size-6" />
+          Explore Workflows
+        </h1>
+        <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-border bg-muted/40 py-12">
+          <LightningBoltIcon className="size-8 text-muted-foreground" />
+          <div className="text-base font-medium">No templates yet</div>
+          <p className="max-w-sm text-center text-sm text-muted-foreground">
+            Workflow templates will appear here once published. In the meantime,
+            describe a task above to generate a workflow from scratch.
+          </p>
+        </div>
+      </div>
+    );
   }
+
+  const showArrows = workflowTemplates.length > VISIBLE_SLOTS;
 
   return (
     <div className="space-y-5">
-      <h1 className="text-xl">Explore Workflows</h1>
+      <h1 className="flex items-center gap-2 text-2xl">
+        <LightningBoltIcon className="size-6" />
+        Explore Workflows
+      </h1>
       <Carousel
         opts={{
           align: "start",
@@ -48,10 +76,6 @@ function WorkflowTemplates() {
             >
               <WorkflowTemplateCard
                 title={workflow.title}
-                image={
-                  TEMPORARY_TEMPLATE_IMAGES[workflow.workflow_permanent_id] ??
-                  testImg
-                }
                 onClick={() => {
                   navigate(
                     `/workflows/${workflow.workflow_permanent_id}/build`,
@@ -61,8 +85,12 @@ function WorkflowTemplates() {
             </CarouselItem>
           ))}
         </CarouselContent>
-        <CarouselPrevious className="-left-4" />
-        <CarouselNext className="-right-4" />
+        {showArrows && (
+          <>
+            <CarouselPrevious className="-left-4" />
+            <CarouselNext className="-right-4" />
+          </>
+        )}
       </Carousel>
     </div>
   );

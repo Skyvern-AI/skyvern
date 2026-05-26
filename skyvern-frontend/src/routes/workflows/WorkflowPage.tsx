@@ -280,7 +280,7 @@ function WorkflowPage() {
                         >
                           {basicLocalTimeFormat(workflowRun.created_at)}
                         </TableCell>
-                        <TableCell className="text-slate-400">
+                        <TableCell className="text-muted-foreground">
                           {formatExecutionTime(
                             workflowRun.started_at ?? workflowRun.created_at,
                             workflowRun.finished_at,
@@ -323,7 +323,7 @@ function WorkflowPage() {
                         <TableRow key={`${workflowRun.workflow_run_id}-params`}>
                           <TableCell
                             colSpan={5}
-                            className="bg-slate-50 dark:bg-slate-900/50"
+                            className="bg-slate-elevation1 dark:bg-slate-elevation1/50"
                           >
                             <WorkflowRunParameters
                               workflowPermanentId={workflowPermanentId}
@@ -349,9 +349,11 @@ function WorkflowPage() {
             workflowPermanentId={workflowPermanentId}
             workflowRunId={openRunParams}
           />
-          <div className="relative px-3 py-3">
-            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-              <span className="text-slate-400">Items per page</span>
+          <div className="flex flex-col items-center gap-3 px-3 py-3 sm:flex-row sm:justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              <span className="whitespace-nowrap text-muted-foreground">
+                Items per page
+              </span>
               <Select
                 value={String(pageSize)}
                 onValueChange={(size) => {
@@ -477,7 +479,7 @@ function WorkflowRunParameters({
 
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-muted-foreground">
         No parameters for this run
       </div>
     );

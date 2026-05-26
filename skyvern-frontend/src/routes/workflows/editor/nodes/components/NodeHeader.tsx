@@ -779,7 +779,7 @@ function NodeHeader({
             ) : (
               gripHandle
             ))}
-          <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
+          <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-border">
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
           <div className="flex min-w-0 flex-col gap-1">
@@ -794,7 +794,7 @@ function NodeHeader({
             <div className="flex items-center gap-2">
               {transmutations && transmutations.others.length ? (
                 <div className="flex items-center gap-1">
-                  <span className="text-xs text-slate-400">
+                  <span className="text-xs text-muted-foreground">
                     {transmutations.blockTitle}
                   </span>
                   <NoticeMe trigger="viewport">
@@ -819,7 +819,9 @@ function NodeHeader({
                   </NoticeMe>
                 </div>
               ) : (
-                <span className="text-xs text-slate-400">{blockTitle}</span>
+                <span className="text-xs text-muted-foreground">
+                  {blockTitle}
+                </span>
               )}
               {workflowSettingsStore.finallyBlockLabel === blockLabel && (
                 <span className="rounded bg-amber-600/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
@@ -833,7 +835,7 @@ function NodeHeader({
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">
-              <button className="rounded p-1 hover:bg-red-500 hover:text-black disabled:opacity-50">
+              <button className="rounded p-1 hover:bg-destructive hover:text-destructive-foreground disabled:opacity-50">
                 {cancelBlock.isPending ? (
                   <ReloadIcon className="size-6 animate-spin" />
                 ) : (
@@ -859,7 +861,7 @@ function NodeHeader({
               ) : (
                 <PlayIcon
                   className={cn("size-6", {
-                    "pointer-events-none fill-gray-500 text-gray-500":
+                    "pointer-events-none fill-gray-500 text-muted-foreground":
                       workflowRunIsRunningOrQueued ||
                       !workflowPermanentId ||
                       debugSession === undefined ||

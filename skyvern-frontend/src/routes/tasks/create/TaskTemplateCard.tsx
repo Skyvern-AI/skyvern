@@ -28,19 +28,19 @@ function TaskTemplateCard({ title, description, body, onClick }: Props) {
     >
       <CardHeader
         className={cn("rounded-t-md bg-slate-elevation1", {
-          "bg-slate-900": hovering,
+          "bg-slate-elevation1": hovering,
         })}
       >
         <CardTitle className="font-normal">{title}</CardTitle>
-        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-slate-400">
+        <CardDescription className="overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground">
           {description}
         </CardDescription>
       </CardHeader>
       <CardContent
         className={cn(
-          "h-36 cursor-pointer rounded-b-md bg-slate-elevation3 p-4 text-sm text-slate-300",
+          "h-36 cursor-pointer rounded-b-md bg-slate-elevation3 p-4 text-sm text-muted-foreground",
           {
-            "bg-slate-800": hovering,
+            "bg-slate-elevation5": hovering,
           },
         )}
         onClick={() => {

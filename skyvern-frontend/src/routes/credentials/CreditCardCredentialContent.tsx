@@ -70,7 +70,7 @@ function CreditCardCredentialContent({
       <div className="flex">
         <div className="w-72 shrink-0 space-y-1">
           <div>Name</div>
-          <div className="text-sm text-slate-400">
+          <div className="text-sm text-muted-foreground">
             The name of the credential
           </div>
         </div>

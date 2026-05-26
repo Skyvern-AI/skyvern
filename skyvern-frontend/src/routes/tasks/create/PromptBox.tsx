@@ -2,7 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
-import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
 import { GraphIcon } from "@/components/icons/GraphIcon";
@@ -306,20 +305,25 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
 
   return (
     <div>
-      <div
-        className="rounded-sm py-[4.25rem]"
-        style={{
-          background: `url(${img}) 50% / cover no-repeat`,
-        }}
-      >
-        <div className="mx-auto flex min-w-44 flex-col items-center gap-7 px-8">
-          <span className="text-2xl">
-            What task would you like to accomplish?
-          </span>
+      <div className="relative overflow-hidden rounded-2xl border border-border bg-card py-14 shadow-card">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 bg-gradient-to-br from-brand-soft via-brand-soft/30 to-card dark:from-brand/15 dark:via-card dark:to-card"
+        />
+        <div className="relative mx-auto flex min-w-44 flex-col items-center gap-6 px-8">
+          <div className="flex flex-col items-center gap-2 text-center">
+            <span className="text-2xl font-semibold">
+              What task would you like to accomplish?
+            </span>
+            <p className="max-w-md text-sm text-muted-foreground">
+              Describe what you want Skyvern to do. We&apos;ll generate a
+              workflow you can run, edit, and re-use.
+            </p>
+          </div>
           <div className="flex w-full max-w-xl flex-col">
             <div
               className={cn(
-                "flex w-full items-center gap-2 rounded-xl bg-slate-700 py-2 pr-4",
+                "flex w-full items-center gap-2 rounded-xl bg-slate-elevation4 py-2 pr-4",
                 {
                   "pointer-events-none opacity-50": promptImprovalIsPending,
                 },
@@ -373,12 +377,12 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
             </div>
             {showAdvancedSettings ? (
               <div className="rounded-b-lg px-2">
-                <div className="space-y-4 rounded-b-xl bg-slate-900 p-4">
+                <div className="space-y-4 rounded-b-xl bg-slate-elevation1 p-4">
                   <header>Advanced Settings</header>
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Webhook Callback URL</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The URL of a webhook endpoint to send the extracted
                         information
                       </div>
@@ -411,7 +415,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Proxy Location</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Route Skyvern through one of our available proxies.
                       </div>
                     </div>
@@ -423,7 +427,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Browser Session ID</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The ID of a persistent browser session
                       </div>
                     </div>
@@ -438,7 +442,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Browser Address</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The address of the Browser server to use for the task
                         run.
                       </div>
@@ -454,7 +458,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">2FA Identifier</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The identifier for a 2FA code for this task.
                       </div>
                     </div>
@@ -468,7 +472,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Extra HTTP Headers</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Specify some self defined HTTP requests headers in Dict
                         format
                       </div>
@@ -493,7 +497,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Generate Script</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Whether to generate scripts for this task run (on
                         success).
                       </div>
@@ -508,7 +512,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Publish Workflow</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Whether to create a workflow alongside this task run.
                         Will also be created if "Generate Scripts" is true.
                       </div>
@@ -523,7 +527,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Max Steps Override</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         The maximum number of steps to take for this task.
                       </div>
                     </div>
@@ -538,7 +542,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Data Schema</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         Specify the output data schema in JSON format
                       </div>
                     </div>
@@ -556,7 +560,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <div className="flex gap-16">
                     <div className="w-48 shrink-0">
                       <div className="text-sm">Max Screenshot Scrolls</div>
-                      <div className="text-xs text-slate-400">
+                      <div className="text-xs text-muted-foreground">
                         {`The maximum number of scrolls for the post action screenshot. Default is ${MAX_SCREENSHOT_SCROLLS_DEFAULT}. If it's set to 0, it will take the current viewport screenshot.`}
                       </div>
                     </div>
@@ -574,7 +578,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           </div>
         </div>
       </div>
-      <div className="flex flex-wrap justify-center gap-4 rounded-sm bg-slate-elevation1 p-4">
+      <div className="flex flex-wrap justify-center gap-3 px-4 py-6">
         {exampleCases.map((example) => {
           return (
             <ExampleCasePill

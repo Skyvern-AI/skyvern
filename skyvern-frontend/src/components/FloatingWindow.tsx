@@ -578,8 +578,8 @@ function FloatingWindow({
             pointerEvents: "auto",
             overflow: "hidden",
           }}
-          className={cn("rounded-xl border border-slate-700", {
-            "hover:border-slate-600": !isMaximized,
+          className={cn("rounded-xl border border-border", {
+            "hover:border-foreground": !isMaximized,
           })}
           handleStyles={{
             bottomLeft: {

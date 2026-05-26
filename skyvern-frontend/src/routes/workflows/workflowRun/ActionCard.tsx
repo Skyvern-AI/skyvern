@@ -72,13 +72,13 @@ function ActionCard({ action, onClick, active, index, cardClassName }: Props) {
             )}
           </div>
         </div>
-        <div className="break-words text-xs text-slate-400">
+        <div className="break-words text-xs text-muted-foreground">
           {action.reasoning}
         </div>
         {action.action_type === ActionTypes.InputText && (
           <>
             <Separator />
-            <div className="text-xs text-slate-400">
+            <div className="text-xs text-muted-foreground">
               Input:{" "}
               {action.action_type === "input_text"
                 ? (action.text ?? action.response)

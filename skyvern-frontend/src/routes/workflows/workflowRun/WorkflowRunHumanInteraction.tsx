@@ -156,7 +156,7 @@ export function WorkflowRunHumanInteraction({ workflowRunBlock }: Props) {
           <div>{workflowRunBlock.negative_descriptor}</div>
         </Button>
         <Button
-          variant="default"
+          variant="brand"
           onClick={() => {
             setChoice("approve");
             setIsDialogOpen(true);

@@ -27,7 +27,7 @@ function TableSearchInput({
   return (
     <div className={cn("relative", className)}>
       <div className="pointer-events-none absolute left-0 top-0 flex h-9 w-9 items-center justify-center">
-        <MagnifyingGlassIcon className="size-5 text-slate-400" />
+        <MagnifyingGlassIcon className="size-5 text-muted-foreground" />
       </div>
       <Input
         value={value}

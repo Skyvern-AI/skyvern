@@ -1361,7 +1361,7 @@ function Workspace({
           <DialogHeader>
             <DialogTitle>Cycle (Get a new browser)</DialogTitle>
             <DialogDescription>
-              <div className="pb-2 pt-4 text-sm text-slate-400">
+              <div className="pb-2 pt-4 text-sm text-muted-foreground">
                 {cycleBrowser.isPending ? (
                   <>
                     Cooking you up a fresh browser...
@@ -1790,8 +1790,8 @@ function Workspace({
                         data-testid="browser-rate-limit-message"
                         className="flex w-full flex-1 items-center justify-center"
                       >
-                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-slate-700 bg-slate-900 p-8 text-center">
-                          <p className="text-sm text-slate-300">
+                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-border bg-slate-elevation1 p-8 text-center">
+                          <p className="text-sm text-muted-foreground">
                             Failed to load a browser. We have a high demand for
                             browsers right now. The browser will become
                             available again automatically in ~30 minutes. If the

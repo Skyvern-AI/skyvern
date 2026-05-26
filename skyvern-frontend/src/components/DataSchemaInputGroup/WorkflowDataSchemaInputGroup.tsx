@@ -92,7 +92,7 @@ function WorkflowDataSchemaInputGroup({
       <div className="flex h-7 items-center justify-between">
         <div className="flex gap-4">
           <div className="flex gap-2">
-            <Label className="text-xs text-slate-300">Data Schema</Label>
+            <Label className="text-xs text-muted-foreground">Data Schema</Label>
             <HelpTooltip
               content={helpTooltip ?? helpTooltips["task"]["dataSchema"]}
             />
@@ -206,7 +206,9 @@ function WorkflowDataSchemaInputGroup({
             </DialogHeader>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label className="text-sm text-slate-400">Current Schema</Label>
+                <Label className="text-sm text-muted-foreground">
+                  Current Schema
+                </Label>
                 <CodeEditor
                   language="json"
                   value={value}
@@ -218,7 +220,7 @@ function WorkflowDataSchemaInputGroup({
                 />
               </div>
               <div className="space-y-2">
-                <Label className="text-sm text-slate-400">
+                <Label className="text-sm text-muted-foreground">
                   Proposed Schema
                 </Label>
                 <CodeEditor

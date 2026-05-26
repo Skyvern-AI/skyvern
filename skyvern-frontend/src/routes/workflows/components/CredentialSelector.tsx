@@ -86,7 +86,7 @@ function CredentialSelector({ value, onChange, placeholder, required }: Props) {
                     </>
                   )}
                 </div>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs text-muted-foreground">
                   {credential.credential_type === "password"
                     ? "Password"
                     : credential.credential_type === "credit_card"

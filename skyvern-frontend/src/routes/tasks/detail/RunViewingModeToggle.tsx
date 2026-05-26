@@ -25,9 +25,9 @@ function ModeButton({ active, label, onClick, children }: ModeButtonProps) {
           aria-pressed={active}
           onClick={onClick}
           className={cn(
-            "flex h-6 w-7 items-center justify-center rounded-sm text-slate-400 outline-none transition-colors hover:text-slate-100 focus-visible:ring-1 focus-visible:ring-white/40",
+            "flex h-6 w-7 items-center justify-center rounded-sm text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-1 focus-visible:ring-brand",
             {
-              "bg-slate-600 text-slate-50": active,
+              "bg-slate-elevation4 text-foreground": active,
             },
           )}
         >
@@ -49,7 +49,7 @@ function RunViewingModeToggle() {
         role="group"
         aria-label="Action list view density"
         data-slot="run-viewing-mode-toggle"
-        className="flex h-7 items-center gap-0.5 rounded-md border border-slate-700 bg-slate-elevation2 p-0.5"
+        className="flex h-7 items-center gap-0.5 rounded-md border bg-slate-elevation2 p-0.5"
       >
         <ModeButton
           active={viewMode === "compact"}
