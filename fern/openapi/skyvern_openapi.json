@@ -20020,7 +20020,7 @@
                 "type": "null"
               }
             ],
-            "title": "Run Sequentially"
+            "title": "Prevent Overlapping Runs"
           },
           "sequential_key": {
             "anyOf": [
@@ -20283,7 +20283,7 @@
           },
           "run_sequentially": {
             "type": "boolean",
-            "title": "Run Sequentially",
+            "title": "Prevent Overlapping Runs",
             "default": false
           },
           "sequential_key": {
