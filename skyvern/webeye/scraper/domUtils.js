@@ -452,11 +452,27 @@ function isHoverOnlyElement(element) {
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element) {
+  const tagLower = element.tagName.toLowerCase();
+
+  // Web Component libraries often hide native form inputs inside shadow DOM
+  // with CSS while rendering a styled overlay.
+  if (
+    element.getRootNode() instanceof ShadowRoot &&
+    (tagLower === "input" ||
+      tagLower === "textarea" ||
+      tagLower === "select") &&
+    !element.disabled
+  ) {
+    if (tagLower !== "input" || element.type !== "hidden") {
+      return true;
+    }
+  }
+
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.
   if (
-    element.tagName.toLowerCase() === "option" ||
-    (element.tagName.toLowerCase() === "input" &&
+    tagLower === "option" ||
+    (tagLower === "input" &&
       (element.type === "radio" || element.type === "checkbox"))
   )
     return element.parentElement && isElementVisible(element.parentElement);
