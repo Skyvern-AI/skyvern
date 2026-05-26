@@ -70,6 +70,7 @@ from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_r
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
+    READ_CONTEXT_DENIED_MODES,
     UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
     TurnIntent,
     TurnIntentMode,
@@ -1039,10 +1040,30 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
     blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
-    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS
+    # Two paths grant read access to ANSWER_ONLY_CONTEXT_TOOLS, both excluded for DOCS_ANSWER/REFUSE/CLARIFY:
+    #  (1) authority.may_read_run_context — classifier-derived (DIAGNOSE turns)
+    #  (2) pending_reconciliation_run_id — within-turn override anchored to the run-blocks watchdog
+    may_read_run_context = authority.may_read_run_context and intent.mode not in READ_CONTEXT_DENIED_MODES
+    blocks_context_read = tool_name in ANSWER_ONLY_CONTEXT_TOOLS and not may_read_run_context
+
+    within_turn_read_override = False
+    if blocks_context_read and intent.mode not in READ_CONTEXT_DENIED_MODES:
+        pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
+        if isinstance(pending_run_id, str) and pending_run_id:
+            blocks_context_read = False
+            within_turn_read_override = True
+
     if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
         return None
     if not blocks_update and not blocks_run and not blocks_context_read:
+        if within_turn_read_override:
+            LOG.info(
+                "copilot authority gate allowed tool via within-turn read override",
+                authority_gate_layer="turn_intent",
+                turn_intent_mode=intent.mode.value,
+                tool_name=tool_name,
+                turn_intent_within_turn_read_override=True,
+            )
         return None
 
     if intent.mode in NO_MUTATION_TURN_INTENT_MODES and blocks_run:
@@ -1054,7 +1075,7 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
     elif blocks_update:
         reason_code = "turn_intent_update_blocked"
     elif blocks_context_read:
-        reason_code = "turn_intent_no_mutation_context_read_blocked"
+        reason_code = "turn_intent_context_read_blocked"
     else:
         reason_code = "turn_intent_run_blocked"
     LOG.info(
@@ -1064,6 +1085,7 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
         turn_intent_target_entity_types=sorted(intent.target_entities),
         turn_intent_may_update_workflow=authority.may_update_workflow,
         turn_intent_may_run_blocks=authority.may_run_blocks,
+        turn_intent_may_read_run_context=authority.may_read_run_context,
         blocked_tool=tool_name,
         safe_reason_code=reason_code,
     )
@@ -1074,6 +1096,12 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> str | None:
             f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
             f"to run browser blocks for the latest user message. Use `update_workflow` only and keep the draft "
             f"unvalidated. safe_reason_code={reason_code}.{detail}"
+        )
+    if blocks_context_read and not blocks_update and not blocks_run:
+        return (
+            f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
+            f"to read run context for the latest user message. Answer using the context already provided. "
+            f"safe_reason_code={reason_code}.{detail}"
         )
     return (
         f"TurnIntent classified this turn as `{intent.mode.value}`, so `{tool_name}` is not allowed "
@@ -2559,6 +2587,17 @@ async def _run_blocks_and_collect_debug(
 
 async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
     workflow_run_id = params.get("workflow_run_id")
+    pending_run_id = getattr(ctx, "pending_reconciliation_run_id", None)
+    if isinstance(pending_run_id, str) and pending_run_id:
+        if workflow_run_id and workflow_run_id != pending_run_id:
+            return {
+                "ok": False,
+                "error": (
+                    f"Run inspection is pending for {pending_run_id}; "
+                    "call get_run_results with that workflow_run_id first."
+                ),
+            }
+        workflow_run_id = pending_run_id
 
     if not workflow_run_id:
         # Include every final state so the agent can inspect failures via the
@@ -2587,6 +2626,8 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
     )
     if not run:
         return {"ok": False, "error": f"Workflow run not found: {workflow_run_id}"}
+    if getattr(run, "workflow_permanent_id", None) != ctx.workflow_permanent_id:
+        return {"ok": False, "error": f"Workflow run not found for this workflow: {workflow_run_id}"}
 
     blocks = await app.DATABASE.observer.get_workflow_run_blocks(
         workflow_run_id=workflow_run_id,

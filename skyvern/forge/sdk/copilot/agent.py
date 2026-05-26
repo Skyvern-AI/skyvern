@@ -70,6 +70,7 @@ from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
+    READ_CONTEXT_DENIED_MODES,
     RequiredContextKey,
     TurnIntent,
     TurnIntentMode,
@@ -551,7 +552,16 @@ def _native_tools_for_turn(
     turn_intent: TurnIntent | None,
     request_policy: RequestPolicy | None = None,
 ) -> list[Any]:
+    # Deferred: matches the existing tools.py <-> routes.workflow_copilot <-> agent.py cycle workaround.
+    from skyvern.forge.sdk.copilot.tools import ANSWER_ONLY_CONTEXT_TOOLS
+
     if _turn_intent_disables_tools(turn_intent):
+        if (
+            turn_intent is not None
+            and turn_intent.authority.may_read_run_context
+            and turn_intent.mode not in READ_CONTEXT_DENIED_MODES
+        ):
+            return [tool for tool in native_tools if getattr(tool, "name", None) in ANSWER_ONLY_CONTEXT_TOOLS]
         return []
     if _request_policy_requires_update_and_run_skip_path(request_policy):
         return [tool for tool in native_tools if getattr(tool, "name", None) != "update_workflow"]
