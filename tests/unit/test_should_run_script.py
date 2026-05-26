@@ -5,12 +5,17 @@ Verifies the priority chain:
 
 run_with is always "agent" or "code" (never null). When run_with="agent" and
 code_version >= 1, the code_version fallback still applies (workflow intended code mode).
+
+Also covers the app-level code-mode gate: when intended mode is "code",
+WorkflowService asks app.AGENT_FUNCTION whether the run should keep code mode.
 """
 
 from datetime import datetime, timezone
 
 import pytest
 
+from skyvern.forge import app
+from skyvern.forge.agent_functions import AgentFunction
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowRun,
@@ -40,9 +45,9 @@ def _make_workflow(
     )
 
 
-def _make_run(run_with: str = "agent") -> WorkflowRun:
+def _make_run(run_with: str | None = "agent", workflow_run_id: str = "wr_test") -> WorkflowRun:
     return WorkflowRun(
-        workflow_run_id="wr_test",
+        workflow_run_id=workflow_run_id,
         workflow_id="wf_test",
         workflow_permanent_id="wpid_test",
         organization_id="org_test",
@@ -53,8 +58,31 @@ def _make_run(run_with: str = "agent") -> WorkflowRun:
     )
 
 
+class _RecordingAgentFunction(AgentFunction):
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def should_keep_code_mode_for_workflow_run(
+        self,
+        *,
+        workflow: Workflow,
+        workflow_run: WorkflowRun,
+    ) -> bool:
+        self.calls.append(
+            (
+                workflow_run.workflow_run_id,
+                workflow_run.organization_id,
+                workflow.workflow_permanent_id,
+            )
+        )
+        return self.enabled
+
+
 @pytest.fixture
-def service():
+def service(monkeypatch):
+    monkeypatch.setattr(app, "AGENT_FUNCTION", AgentFunction())
+
     from skyvern.forge.sdk.workflow.service import WorkflowService
 
     return WorkflowService()
@@ -63,78 +91,143 @@ def service():
 class TestShouldRunScript:
     """Run-level run_with takes priority, then workflow-level, then code_version fallback, then agent."""
 
-    def test_run_code_overrides_workflow_agent(self, service):
+    @pytest.mark.asyncio
+    async def test_run_code_overrides_workflow_agent(self, service):
         wf = _make_workflow(run_with="agent")
         wr = _make_run(run_with="code")
-        assert service.should_run_script(wf, wr) is True
+        assert await service.should_run_script(wf, wr) is True
 
-    def test_run_agent_overrides_workflow_code(self, service):
+    @pytest.mark.asyncio
+    async def test_run_agent_overrides_workflow_code(self, service):
         wf = _make_workflow(run_with="code")
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_run_agent_overrides_code_version(self, service):
+    @pytest.mark.asyncio
+    async def test_run_agent_overrides_code_version(self, service):
         """Explicit run-level agent overrides code_version fallback."""
         wf = _make_workflow(run_with="agent", code_version=2)
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_workflow_code_with_agent_run(self, service):
+    @pytest.mark.asyncio
+    async def test_workflow_code_with_agent_run(self, service):
         """Workflow says code, run says agent → run wins."""
         wf = _make_workflow(run_with="code")
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_workflow_agent_with_agent_run(self, service):
+    @pytest.mark.asyncio
+    async def test_workflow_agent_with_agent_run(self, service):
         wf = _make_workflow(run_with="agent")
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_workflow_agent_overrides_code_version(self, service):
+    @pytest.mark.asyncio
+    async def test_workflow_agent_overrides_code_version(self, service):
         """Explicit workflow-level agent takes priority over code_version."""
         wf = _make_workflow(run_with="agent", code_version=2)
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_both_agent_defaults_to_agent(self, service):
+    @pytest.mark.asyncio
+    async def test_both_agent_defaults_to_agent(self, service):
         """When both workflow and run are agent, default to agent."""
         wf = _make_workflow(run_with="agent")
         wr = _make_run(run_with="agent")
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_code_version_with_agent_run_with(self, service):
+    @pytest.mark.asyncio
+    async def test_code_version_with_agent_run_with(self, service):
         """code_version >= 1 with run_with=agent should still check code_version fallback."""
         wf = _make_workflow(run_with="agent", code_version=2)
         wr = _make_run(run_with="agent")
         # run_with=agent on both sides → agent wins, code_version ignored
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_code_version_with_code_run_with(self, service):
+    @pytest.mark.asyncio
+    async def test_code_version_with_code_run_with(self, service):
         """code_version >= 1 with explicit run_with=code should run code."""
         wf = _make_workflow(run_with="code", code_version=2)
         wr = _make_run(run_with="agent")
         # run-level agent overrides workflow code
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
 
-    def test_workflow_code_run_code(self, service):
+    @pytest.mark.asyncio
+    async def test_workflow_code_run_code(self, service):
         """Both workflow and run say code → code."""
         wf = _make_workflow(run_with="code", code_version=2)
         wr = _make_run(run_with="code")
-        assert service.should_run_script(wf, wr) is True
+        assert await service.should_run_script(wf, wr) is True
 
-    def test_workflow_code_no_code_version(self, service):
+    @pytest.mark.asyncio
+    async def test_workflow_code_no_code_version(self, service):
         """Workflow says code, no code_version → should still run code."""
         wf = _make_workflow(run_with="code")
         wr = _make_run(run_with="code")
-        assert service.should_run_script(wf, wr) is True
+        assert await service.should_run_script(wf, wr) is True
 
-    def test_legacy_adaptive_caching_does_not_override_agent(self, service):
+    @pytest.mark.asyncio
+    async def test_legacy_adaptive_caching_does_not_override_agent(self, service):
         """Legacy adaptive_caching=True does NOT override explicit run_with=agent."""
         wf = _make_workflow(run_with="agent", adaptive_caching=True)
         wr = _make_run(run_with="agent")
         # Explicit agent wins — adaptive_caching is a legacy fallback
         # that only applied when run_with was null (no longer possible).
-        assert service.should_run_script(wf, wr) is False
+        assert await service.should_run_script(wf, wr) is False
+
+
+class TestCodeModeGate:
+    """WorkflowService asks the app-level gate only for intended-code runs."""
+
+    @pytest.mark.asyncio
+    async def test_gate_enabled_keeps_code(self, monkeypatch):
+        agent_function = _RecordingAgentFunction(enabled=True)
+        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        service = WorkflowService()
+        wf = _make_workflow(run_with="code", code_version=2)
+        wr = _make_run(run_with="code")
+        assert await service.should_run_script(wf, wr) is True
+        assert agent_function.calls == [("wr_test", "org_test", "wpid_test")]
+
+    @pytest.mark.asyncio
+    async def test_gate_disabled_diverts(self, monkeypatch):
+        agent_function = _RecordingAgentFunction(enabled=False)
+        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        service = WorkflowService()
+        wf = _make_workflow(run_with="code", code_version=2)
+        wr = _make_run(run_with="code")
+        assert await service.should_run_script(wf, wr) is False
+
+    @pytest.mark.asyncio
+    async def test_gate_not_consulted_when_intended_agent(self, monkeypatch):
+        agent_function = _RecordingAgentFunction(enabled=False)
+        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        service = WorkflowService()
+        wf = _make_workflow(run_with="agent")
+        wr = _make_run(run_with="agent")
+        assert await service.should_run_script(wf, wr) is False
+        assert agent_function.calls == []
+
+    @pytest.mark.asyncio
+    async def test_inherits_workflow_run_with_when_run_run_with_is_none(self, monkeypatch):
+        """workflow_run.run_with=None means inherit-from-workflow. The app gate
+        must still apply when the workflow itself says 'code'."""
+        agent_function = _RecordingAgentFunction(enabled=False)
+        monkeypatch.setattr(app, "AGENT_FUNCTION", agent_function)
+        from skyvern.forge.sdk.workflow.service import WorkflowService
+
+        service = WorkflowService()
+        wf = _make_workflow(run_with="code", code_version=2)
+        wr = _make_run(run_with=None)
+        assert await service.should_run_script(wf, wr) is False
+        assert len(agent_function.calls) == 1
 
 
 class TestScriptReviewerGate:
@@ -144,6 +237,7 @@ class TestScriptReviewerGate:
     This prevents wasting LLM tokens reviewing scripts based on agent-only runs.
     """
 
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "wf_run_with,run_run_with,code_version,expect_reviewer",
         [
@@ -156,15 +250,16 @@ class TestScriptReviewerGate:
             ("agent", "code", 2, True),  # run-level code + code_version=2 → adaptive
         ],
     )
-    def test_reviewer_gate(self, service, wf_run_with, run_run_with, code_version, expect_reviewer):
+    async def test_reviewer_gate(self, service, wf_run_with, run_run_with, code_version, expect_reviewer):
         wf = _make_workflow(run_with=wf_run_with, code_version=code_version)
         wr = _make_run(run_with=run_run_with)
-        should_review = is_adaptive_caching(wf, wr) and service.should_run_script(wf, wr)
+        should_review = is_adaptive_caching(wf, wr) and await service.should_run_script(wf, wr)
         assert should_review is expect_reviewer
 
-    def test_legacy_adaptive_caching_backward_compat(self, service):
+    @pytest.mark.asyncio
+    async def test_legacy_adaptive_caching_backward_compat(self, service):
         """Legacy adaptive_caching=True with code_version=None still enables reviewer."""
         wf = _make_workflow(run_with="agent", adaptive_caching=True, code_version=None)
         wr = _make_run(run_with="code")
-        should_review = is_adaptive_caching(wf, wr) and service.should_run_script(wf, wr)
+        should_review = is_adaptive_caching(wf, wr) and await service.should_run_script(wf, wr)
         assert should_review is True

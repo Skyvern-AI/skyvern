@@ -1653,7 +1653,7 @@ class WorkflowService:
             # Only trigger if this run used the latest script version — stale runs produce
             # episodes that may already be fixed in newer versions, and reviewing them creates
             # redundant/regressive versions.
-            is_script_execution = self.should_run_script(workflow, workflow_run)
+            is_script_execution = await self.should_run_script(workflow, workflow_run)
             if (
                 is_adaptive_caching(workflow, workflow_run)
                 and is_script_execution
@@ -1824,7 +1824,7 @@ class WorkflowService:
         loaded_script_module = None
         blocks_to_update: set[str] = set()
 
-        is_script_run = self.should_run_script(workflow, workflow_run)
+        is_script_run = await self.should_run_script(workflow, workflow_run)
 
         if script:
             LOG.info(
@@ -6941,21 +6941,26 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
 
-    def should_run_script(
+    async def should_run_script(
         self,
         workflow: Workflow,
         workflow_run: WorkflowRun,
     ) -> bool:
-        """Determine whether this run should attempt to execute cached scripts.
+        """Whether this run should attempt cached-script execution.
 
-        Priority: run-level run_with (if set) > workflow-level run_with.
-        Workflow.run_with is always "code" or "agent" after normalization
-        (NULL and code_version fallback resolved at read time).
-        WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
+        Priority: run-level run_with > workflow-level run_with. Intended-code
+        runs are then passed through the app-level code-mode gate.
         """
         if workflow_run.run_with is not None:
-            return workflow_run.run_with == "code"
-        return workflow.run_with == "code"
+            intended_code = workflow_run.run_with == "code"
+        else:
+            intended_code = workflow.run_with == "code"
+        if not intended_code:
+            return False
+        return await app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run(
+            workflow=workflow,
+            workflow_run=workflow_run,
+        )
 
     async def _mark_script_run_loaded(self, workflow_run_id: str, script: Script) -> None:
         """Record that a cached script was loaded for this workflow run.
