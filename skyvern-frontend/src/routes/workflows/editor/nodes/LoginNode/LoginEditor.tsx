@@ -24,6 +24,7 @@ import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { LoginBlockCredentialSelector } from "./LoginBlockCredentialSelector";
+import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { type LoginNode, type LoginNodeData } from "./types";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
@@ -65,6 +66,9 @@ function LoginEditorBody({
   const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id: blockId });
   const isInsideForLoop = isNodeInsideForLoop(nodes, blockId);
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
+  const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
+    data.parameterKeys.length > 0 ? data.parameterKeys[0] : undefined,
+  );
 
   return (
     <div data-testid="login-block-form" className="space-y-4">
@@ -129,10 +133,6 @@ function LoginEditorBody({
             onUrlAutoFill={(url) => {
               if (editable) update({ url });
             }}
-            currentTotpIdentifier={data.totpIdentifier ?? undefined}
-            onTotpIdentifierAutoFill={(totpIdentifier) => {
-              if (editable) update({ totpIdentifier });
-            }}
           />
         </div>
         <div className="space-y-2">
@@ -144,9 +144,18 @@ function LoginEditorBody({
             nodeId={blockId}
             onChange={(value) => update({ totpIdentifier: value })}
             value={data.totpIdentifier ?? ""}
-            placeholder={placeholders["login"]["totpIdentifier"]}
+            placeholder={
+              !data.totpIdentifier?.trim() && credentialTotpIdentifier
+                ? `${credentialTotpIdentifier} (from credential)`
+                : placeholders["login"]["totpIdentifier"]
+            }
             className="nopan text-xs"
           />
+          {!data.totpIdentifier?.trim() && credentialTotpIdentifier ? (
+            <p className="text-xs text-slate-500">
+              Leave empty to use the credential's value.
+            </p>
+          ) : null}
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">
@@ -186,11 +195,6 @@ function LoginEditorBody({
                   onParametersChange={(parameterKeys) =>
                     update({ parameterKeys })
                   }
-                  onCredentialTotpIdentifier={(totpIdentifier) => {
-                    if (!data.totpIdentifier?.trim()) {
-                      update({ totpIdentifier });
-                    }
-                  }}
                 />
               </div>
               <div className="space-y-2">

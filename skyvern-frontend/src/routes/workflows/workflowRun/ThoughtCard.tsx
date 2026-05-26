@@ -31,7 +31,7 @@ function ThoughtCard({ thought, onClick, active, cardClassName }: Props) {
         </StatusPill>
       </div>
       {(thought.answer || thought.thought) && (
-        <div className="break-words text-xs text-muted-foreground">
+        <div className="break-words text-xs text-slate-400">
           {thought.answer || thought.thought}
         </div>
       )}

@@ -375,12 +375,12 @@ function WorkflowRun() {
                 />
               ) : null}
             </div>
-            <h2 className="text-2xl text-muted-foreground">{workflowRunId}</h2>
+            <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||
                 isWorkflowDeleted) && (
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-muted-foreground">
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-400">
                   {workflowRun.started_at && (
                     <span title={basicTimeFormat(workflowRun.started_at)}>
                       Started: {basicLocalTimeFormat(workflowRun.started_at)}
@@ -401,7 +401,7 @@ function WorkflowRun() {
               )}
             {workflowRun?.browser_session_id && (
               <Link
-                className="font-mono text-sm text-muted-foreground hover:text-foreground hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
                 to={`/browser-session/${workflowRun.browser_session_id}/stream`}
               >
                 Browser Session: {workflowRun.browser_session_id}
@@ -409,7 +409,7 @@ function WorkflowRun() {
             )}
             {workflowRun?.browser_profile_id && (
               <Link
-                className="font-mono text-sm text-muted-foreground hover:text-foreground hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
                 to={`/browser-profiles/${workflowRun.browser_profile_id}`}
               >
                 Browser Profile: {workflowRun.browser_profile_id}

@@ -33,11 +33,11 @@ function ScheduleParametersSection({
     <div className="space-y-2">
       <div className="space-y-1">
         <Label>Workflow Parameters</Label>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-xs text-slate-500">
           Values supplied here are used every time this schedule runs.
         </p>
       </div>
-      <div className="space-y-4 rounded-md border border-border bg-slate-elevation3 p-3">
+      <div className="space-y-4 rounded-md border border-slate-700 bg-slate-elevation3 p-3">
         {workflowParameters.map((parameter) => {
           const error = errors?.[parameter.key];
           const required = isRequired(parameter);
@@ -55,14 +55,14 @@ function ScheduleParametersSection({
                     </span>
                   )}
                 </Label>
-                <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                <span className="text-[10px] uppercase tracking-wide text-slate-500">
                   {getLabelForWorkflowParameterType(
                     parameter.workflow_parameter_type,
                   )}
                 </span>
               </div>
               {parameter.description && (
-                <p className="text-xs text-muted-foreground">
+                <p className="text-xs text-slate-500">
                   {parameter.description}
                 </p>
               )}

@@ -118,7 +118,7 @@ function SavedTasks() {
       >
         <CardHeader
           className={cn("rounded-t-md bg-slate-elevation1", {
-            "bg-slate-elevation1": hovering,
+            "bg-slate-900": hovering,
           })}
         >
           <CardTitle className="font-normal">New Task</CardTitle>
@@ -126,9 +126,9 @@ function SavedTasks() {
         </CardHeader>
         <CardContent
           className={cn(
-            "flex h-36 cursor-pointer items-center justify-center rounded-b-md bg-slate-elevation3 p-4 text-sm text-muted-foreground",
+            "flex h-36 cursor-pointer items-center justify-center rounded-b-md bg-slate-elevation3 p-4 text-sm text-slate-300",
             {
-              "bg-slate-elevation5": hovering,
+              "bg-slate-800": hovering,
             },
           )}
           onClick={() => {

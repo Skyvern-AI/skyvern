@@ -387,18 +387,18 @@ function Workflows() {
 
   return (
     <div className="space-y-10">
-      <div className="flex flex-col gap-6 lg:h-32 lg:flex-row lg:justify-between">
+      <div className="flex h-32 justify-between gap-6">
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
             <h1 className="text-2xl">Workflows</h1>
           </div>
-          <p className="text-muted-foreground">
+          <p className="text-slate-300">
             Create your own complex workflows by connecting web agents together.
             Define a series of actions, set it, and forget it.
           </p>
         </div>
-        <div className="flex flex-wrap gap-5 lg:flex-nowrap">
+        <div className="flex gap-5">
           <NarrativeCard
             index={1}
             description="Save browser sessions and reuse them in subsequent runs"
@@ -458,13 +458,13 @@ function Workflows() {
               ))}
             </div>
           ) : (
-            <div className="rounded-lg border border-border bg-slate-elevation1 py-6 text-center dark:border-border">
+            <div className="rounded-lg border border-slate-200 bg-slate-elevation1 py-6 text-center dark:border-slate-700">
               <div className="mx-auto max-w-md">
                 <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
-                <h3 className="mb-2 text-foreground dark:text-foreground">
+                <h3 className="mb-2 text-slate-900 dark:text-slate-100">
                   Organize Your Workflows with Folders
                 </h3>
-                <p className="mb-4 text-sm text-muted-foreground dark:text-muted-foreground">
+                <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
                   Keep your workflows organized by creating folders. Group
                   related workflows together by project, team, or workflow type
                   for easier management.
@@ -520,10 +520,7 @@ function Workflows() {
             />
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
-                <Button
-                  variant="brand"
-                  disabled={createWorkflowMutation.isPending}
-                >
+                <Button disabled={createWorkflowMutation.isPending}>
                   {createWorkflowMutation.isPending ? (
                     <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                   ) : (
@@ -560,16 +557,12 @@ function Workflows() {
           <Table className="table-fixed">
             <TableHeader className="rounded-t-lg bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-[25%] rounded-tl-lg text-muted-foreground">
+                <TableHead className="w-[25%] rounded-tl-lg text-slate-400">
                   ID
                 </TableHead>
-                <TableHead className="w-[30%] text-muted-foreground">
-                  Title
-                </TableHead>
-                <TableHead className="w-[15%] text-muted-foreground">
-                  Folder
-                </TableHead>
-                <TableHead className="w-[15%] text-muted-foreground">
+                <TableHead className="w-[30%] text-slate-400">Title</TableHead>
+                <TableHead className="w-[15%] text-slate-400">Folder</TableHead>
+                <TableHead className="w-[15%] text-slate-400">
                   Created At
                 </TableHead>
                 <TableHead className="w-[15%] rounded-tr-lg"></TableHead>
@@ -641,7 +634,7 @@ function Workflows() {
                             </div>
                           </TableCell>
                           <TableCell>
-                            <span className="text-muted-foreground">-</span>
+                            <span className="text-slate-400">-</span>
                           </TableCell>
                           <TableCell>
                             {basicLocalTimeFormat(workflow.created_at)}
@@ -738,7 +731,7 @@ function Workflows() {
                                 </span>
                               </div>
                             ) : (
-                              <span className="text-muted-foreground">-</span>
+                              <span className="text-slate-400">-</span>
                             )}
                           </TableCell>
                           <TableCell
@@ -854,7 +847,7 @@ function Workflows() {
                         >
                           <TableCell
                             colSpan={5}
-                            className="bg-slate-elevation1 dark:bg-slate-elevation1/50"
+                            className="bg-slate-50 dark:bg-slate-900/50"
                           >
                             <ParameterDisplayInline
                               parameters={parameterItems}
@@ -870,13 +863,11 @@ function Workflows() {
               )}
             </TableBody>
           </Table>
-          <div className="flex flex-col items-center gap-3 px-3 py-3 sm:flex-row sm:justify-between">
-            <div className="flex items-center gap-2 text-sm">
-              <span className="whitespace-nowrap text-muted-foreground">
-                Items per page
-              </span>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
               <select
-                className="h-9 rounded-md border border-border bg-background px-3"
+                className="h-9 rounded-md border border-slate-300 bg-background px-3"
                 value={itemsPerPage}
                 onChange={(e) => {
                   const next = Number(e.target.value);

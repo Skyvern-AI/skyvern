@@ -94,10 +94,8 @@ function BrowserSessionDownloads() {
     return (
       <div className="flex h-full w-full items-center justify-center">
         <div className="text-center">
-          <div className="mb-2 text-lg text-muted-foreground">
-            No downloaded files
-          </div>
-          <div className="text-sm text-muted-foreground">
+          <div className="mb-2 text-lg text-gray-500">No downloaded files</div>
+          <div className="text-sm text-gray-400">
             Files downloaded during this browser session will appear here
           </div>
         </div>
@@ -109,7 +107,7 @@ function BrowserSessionDownloads() {
     <div className="h-full w-full overflow-auto p-4">
       <div className="mb-4">
         <h2 className="text-xl font-semibold">Downloaded Files</h2>
-        <p className="text-sm text-muted-foreground">
+        <p className="text-sm text-gray-500">
           Files downloaded during this browser session
         </p>
       </div>
@@ -132,7 +130,7 @@ function BrowserSessionDownloads() {
                   {filename}
                 </span>
                 {file.modified_at && (
-                  <div className="mt-0.5 text-xs text-muted-foreground">
+                  <div className="mt-0.5 text-xs text-gray-500">
                     {new Date(file.modified_at).toLocaleString()}
                   </div>
                 )}

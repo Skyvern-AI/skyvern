@@ -168,7 +168,7 @@ function SelfHealApiKeyBanner() {
 
   return (
     <div className="px-4 pt-4">
-      <Alert className="flex flex-col items-center gap-2 border-border bg-slate-elevation1 text-foreground">
+      <Alert className="flex flex-col items-center gap-2 border-slate-700 bg-slate-900 text-slate-50">
         <AlertTitle className="text-center text-base font-semibold tracking-wide">
           {copy.title}
         </AlertTitle>
@@ -182,15 +182,13 @@ function SelfHealApiKeyBanner() {
                 to regenerate it automatically.
               </p>
               {data?.detail ? (
-                <p className="text-xs text-muted-foreground">{data.detail}</p>
+                <p className="text-xs text-slate-300">{data.detail}</p>
               ) : null}
               {data?.next_step ? (
-                <p className="text-xs text-muted-foreground">
-                  {data.next_step}
-                </p>
+                <p className="text-xs text-slate-300">{data.next_step}</p>
               ) : null}
               {authIssue ? (
-                <p className="text-xs text-muted-foreground">
+                <p className="text-xs text-slate-300">
                   Last failed request: HTTP {authIssue.statusCode}
                   {authIssue.path ? ` at ${authIssue.path}` : ""}
                   {authIssue.detail ? ` (${authIssue.detail})` : ""}

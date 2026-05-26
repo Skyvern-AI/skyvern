@@ -15,7 +15,7 @@ function SwitchBarNavigation({ options }: Props) {
   const [searchParams] = useSearchParams();
 
   return (
-    <div className="flex w-fit gap-2 rounded-sm border border-border p-2">
+    <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
       {options.map((option) => {
         return (
           <NavLink
@@ -24,9 +24,9 @@ function SwitchBarNavigation({ options }: Props) {
             key={option.to}
             className={({ isActive }) => {
               return cn(
-                "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-elevation4",
+                "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-700",
                 {
-                  "bg-slate-elevation4": isActive,
+                  "bg-slate-700": isActive,
                 },
               );
             }}

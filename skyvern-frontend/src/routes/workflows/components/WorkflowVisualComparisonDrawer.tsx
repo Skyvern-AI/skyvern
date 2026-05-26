@@ -221,7 +221,7 @@ function WorkflowComparisonRenderer({
           </div>
         </div>
       </div>
-      <div className="h-[calc(100%-3rem)] rounded-lg border bg-card">
+      <div className="h-[calc(100%-3rem)] rounded-lg border bg-white">
         <FlowRenderer
           hideBackground={false}
           readOnly
@@ -295,7 +295,7 @@ function WorkflowVisualComparisonDrawer({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex bg-black/50">
+    <div className="fixed inset-0 z-50 flex bg-black bg-opacity-50">
       {/* Main Drawer */}
       <div className="bg-navy mx-auto my-4 flex w-full max-w-[95vw] flex-col rounded-lg shadow-xl">
         {/* Header */}

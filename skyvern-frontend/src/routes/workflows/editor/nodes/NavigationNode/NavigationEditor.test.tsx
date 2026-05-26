@@ -110,6 +110,10 @@ vi.mock("@/routes/workflows/editor/ErrorCodeMappingEditor", () => ({
   ErrorCodeMappingEditor: () => null,
 }));
 
+vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
+  useSelectedCredentialTotpIdentifier: () => null,
+}));
+
 function setNavigationNode(
   engine: RunEngine,
   overrides: Partial<NavigationNodeData> = {},

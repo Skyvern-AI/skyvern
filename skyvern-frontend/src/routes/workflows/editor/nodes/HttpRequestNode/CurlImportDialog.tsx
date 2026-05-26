@@ -256,7 +256,7 @@ export function CurlImportDialog({ onImport, children }: Props) {
                         <CopyIcon className="h-3 w-3" />
                       </Button>
                     </div>
-                    <pre className="overflow-x-auto whitespace-pre-wrap break-all text-xs text-muted-foreground">
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-all text-xs text-slate-400">
                       {example.curl}
                     </pre>
                   </div>
@@ -276,7 +276,7 @@ export function CurlImportDialog({ onImport, children }: Props) {
                     <Badge variant="outline" className="font-mono">
                       {previewData.method}
                     </Badge>
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-xs text-slate-400">
                       {previewData.url}
                     </span>
                   </div>
@@ -285,7 +285,7 @@ export function CurlImportDialog({ onImport, children }: Props) {
                     Object.keys(previewData.headers).length > 0 && (
                       <div>
                         <div className="mb-1 text-xs font-medium">Headers:</div>
-                        <div className="space-y-1 text-xs text-muted-foreground">
+                        <div className="space-y-1 text-xs text-slate-400">
                           {Object.entries(previewData.headers).map(
                             ([key, value]) => (
                               <div key={key} className="font-mono">
@@ -310,7 +310,7 @@ export function CurlImportDialog({ onImport, children }: Props) {
                             <div className="mb-1 text-xs font-medium">
                               Body:
                             </div>
-                            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-slate-400">
                               {bodyStr || "{}"}
                             </pre>
                           </div>
@@ -321,7 +321,7 @@ export function CurlImportDialog({ onImport, children }: Props) {
                             <div className="mb-1 text-xs font-medium">
                               Body:
                             </div>
-                            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-muted-foreground">
+                            <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-slate-400">
                               {"{}"}
                             </pre>
                           </div>

@@ -104,6 +104,9 @@ vi.mock("../../nodes/components/BlockExecutionOptions", () => ({
 vi.mock("../../nodes/DisableCache", () => ({
   DisableCache: () => <div data-testid="disable-cache" />,
 }));
+vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
+  useSelectedCredentialTotpIdentifier: () => null,
+}));
 
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";

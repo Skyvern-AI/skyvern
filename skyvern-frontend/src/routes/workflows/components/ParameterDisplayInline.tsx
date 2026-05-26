@@ -45,7 +45,7 @@ function ParameterDisplayInline({
 }: ParameterDisplayInlineProps) {
   if (!parameters || parameters.length === 0) {
     return (
-      <div className={cn("ml-8 py-4 text-sm text-muted-foreground", className)}>
+      <div className={cn("ml-8 py-4 text-sm text-slate-400", className)}>
         {emptyMessage}
       </div>
     );
@@ -63,7 +63,7 @@ function ParameterDisplayInline({
             <div
               key={parameter.key}
               className={cn(
-                "grid gap-6 rounded border border-border bg-card p-3 text-sm",
+                "grid gap-6 rounded border bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900",
                 showDescription
                   ? "grid-cols-[minmax(200px,1fr)_minmax(200px,1fr)_minmax(300px,2fr)]"
                   : "grid-cols-[minmax(200px,1fr)_minmax(300px,2fr)]",
@@ -76,22 +76,20 @@ function ParameterDisplayInline({
               </div>
               <div className="truncate">
                 {displayValue === "-" ? (
-                  <span className="text-muted-foreground">-</span>
+                  <span className="text-slate-400">-</span>
                 ) : (
                   <HighlightText text={displayValue} query={searchQuery} />
                 )}
               </div>
               {showDescription ? (
-                <div className="text-muted-foreground">
+                <div className="text-slate-500">
                   {parameter.description ? (
                     <HighlightText
                       text={parameter.description}
                       query={searchQuery}
                     />
                   ) : (
-                    <span className="text-muted-foreground">
-                      No description
-                    </span>
+                    <span className="text-slate-400">No description</span>
                   )}
                 </div>
               ) : null}
