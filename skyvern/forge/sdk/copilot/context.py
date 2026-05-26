@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
@@ -48,6 +49,10 @@ class StructuredContext(BaseModel):
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
+    # Per-chat discovery budget. Survives turn boundaries via
+    # AgentResult.global_llm_context — finalized deterministically at every
+    # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
+    discovery_calls_made: int = 0
 
     def to_json_str(self) -> str:
         return self.model_dump_json(indent=2)
@@ -116,6 +121,27 @@ class StructuredContext(BaseModel):
             self.fields_filled = self.fields_filled[-40:]
         if len(self.credentials_checked) > 50:
             self.credentials_checked = self.credentials_checked[-40:]
+
+
+def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
+    """Fold the per-chat discovery counter into the outgoing global_llm_context.
+
+    Called from agent.py's `_make_agent_result` factory so every AgentResult
+    exit path — timeout, cancel, max-turns, output-policy block, request-
+    policy clarification, feasibility clarification, non-retriable nav error,
+    normal translate-result, missing-SDK fallback, unexpected-error fallback —
+    carries the updated count.
+
+    Returns None when there is nothing to record and no prior context, so the
+    pre-existing 'no global_llm_context' behaviour is preserved.
+    """
+    prior = int(getattr(ctx, "prior_discovery_calls_made", 0) or 0)
+    this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
+    if not raw_context and this_turn == 0:
+        return None
+    sc = StructuredContext.from_json_str(raw_context)
+    sc.discovery_calls_made = prior + this_turn
+    return sc.to_json_str()
 
 
 @dataclass
@@ -290,3 +316,16 @@ class CopilotContext(AgentContext):
     # retries. Declared here (rather than attached dynamically) so future
     # refactors can't strip it silently.
     narrator_state: NarratorState | None = None
+
+    # Default COMPOSING is the safe non-BUILD value; the orchestrator
+    # overrides at turn start via `initial_build_phase`.
+    build_phase: BuildPhase = BuildPhase.COMPOSING
+    # Hydrated from inbound StructuredContext.discovery_calls_made at turn start.
+    prior_discovery_calls_made: int = 0
+    discovery_calls_this_turn: int = 0
+    discovery_step_count: int = 0
+    discovery_started_monotonic: float | None = None
+    discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
+    # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
+    # The discovery tool reaches the connected FastMCP client through this.
+    discovery_mcp_server: Any | None = None
