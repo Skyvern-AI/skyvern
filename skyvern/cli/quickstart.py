@@ -354,7 +354,7 @@ def _run_server_quickstart(
         # Initialize Skyvern (pip install path)
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
         init_result = init_env(
-            no_postgres=no_postgres or not postgres,
+            no_postgres=no_postgres or (not postgres and not database_string),
             database_string=database_string,
             skip_browser_install=skip_browser_install,
             mode="local",
