@@ -5,6 +5,7 @@ from typing import Any, Literal
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from skyvern.forge.sdk.copilot.repeated_reply_summary import RepeatedReplyKind, summarize_repeated_replies
 from skyvern.forge.sdk.copilot.request_policy import (
     RequestPolicy,
     build_transcript_context,
@@ -53,6 +54,13 @@ class WorkflowChangeContext(BaseModel):
     structural_diff_unavailable: bool = False
 
 
+class RepeatedReplyContext(BaseModel):
+    kind: RepeatedReplyKind
+    rendered_summary: str
+    repeat_count: int
+    blocked_signatures: list[str] = Field(default_factory=list)
+
+
 class TranscriptContext(BaseModel):
     earliest_user_turn: str
     latest_prior_user_turn: str
@@ -97,6 +105,7 @@ class TurnContextPacket(BaseModel):
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
     docs_context: DocsContext | None = None
+    repeated_reply_context: RepeatedReplyContext | None = None
     omissions: list[TurnContextOmission] = Field(default_factory=list)
 
     def to_trace_data(self) -> dict[str, Any]:
@@ -107,6 +116,7 @@ class TurnContextPacket(BaseModel):
             "run_context",
             "credential_context",
             "docs_context",
+            "repeated_reply_context",
         )
         return {
             "mode": self.turn_intent_summary.get("mode"),
@@ -117,6 +127,8 @@ class TurnContextPacket(BaseModel):
             "proposal_truncated": bool(self.proposal_context and self.proposal_context.truncated),
             "run_truncated": bool(self.run_context and self.run_context.truncated),
             "workflow_change_kind": self.workflow_change_context.kind if self.workflow_change_context else None,
+            "repeated_reply_kind": self.repeated_reply_context.kind.value if self.repeated_reply_context else None,
+            "repeated_reply_count": self.repeated_reply_context.repeat_count if self.repeated_reply_context else 0,
         }
 
 
@@ -287,6 +299,16 @@ class TurnContextAssembler:
         if RequiredContextKey.DOCS_CONTEXT in required:
             docs_context = DocsContext()
 
+        repeated_reply_context: RepeatedReplyContext | None = None
+        repeated_reply = summarize_repeated_replies(inputs.chat_history, inputs.turn_intent)
+        if repeated_reply.kind is RepeatedReplyKind.REPEATED_REPLY_DETECTED:
+            repeated_reply_context = RepeatedReplyContext(
+                kind=repeated_reply.kind,
+                rendered_summary=repeated_reply.render_prompt_block(),
+                repeat_count=repeated_reply.repeat_count,
+                blocked_signatures=list(repeated_reply.blocked_signatures),
+            )
+
         if RequiredContextKey.BROWSER_STATE in required:
             omissions.append(
                 TurnContextOmission(
@@ -305,6 +327,7 @@ class TurnContextAssembler:
             run_context=run_context,
             credential_context=credential_context,
             docs_context=docs_context,
+            repeated_reply_context=repeated_reply_context,
             omissions=omissions,
         )
 

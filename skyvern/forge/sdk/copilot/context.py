@@ -177,6 +177,7 @@ class CopilotContext(AgentContext):
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
+    blocked_reply_signatures: list[str] = field(default_factory=list)
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)

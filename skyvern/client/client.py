@@ -179,7 +179,7 @@ class Skyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -254,7 +254,7 @@ class Skyvern:
             The extra HTTP headers for the requests in browser.
 
         publish_workflow : typing.Optional[bool]
-            Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
+            Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
 
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete
@@ -2629,7 +2629,7 @@ class AsyncSkyvern:
 
         engine : typing.Optional[RunEngine]
 
-            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+            The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 
         title : typing.Optional[str]
             The title for the task
@@ -2704,7 +2704,7 @@ class AsyncSkyvern:
             The extra HTTP headers for the requests in browser.
 
         publish_workflow : typing.Optional[bool]
-            Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.
+            Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.
 
         include_action_history_in_verification : typing.Optional[bool]
             Whether to include action history when verifying that the task is complete

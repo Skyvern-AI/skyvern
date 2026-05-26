@@ -13,14 +13,6 @@ import { ProxySelector } from "@/components/ProxySelector";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { KeyValueInput } from "@/components/KeyValueInput";
-import {
-  CustomSelectItem,
-  Select,
-  SelectContent,
-  SelectItemText,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -32,7 +24,6 @@ import {
   PaperPlaneIcon,
   Pencil1Icon,
   ReloadIcon,
-  LightningBoltIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
@@ -126,12 +117,6 @@ function deriveHandoffTitle(prompt: string): string {
   return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
-function runWithFromSelector(
-  legacyVersion: "v1" | "v2" | "v2-code",
-): "agent" | "code" {
-  return legacyVersion === "v2-code" ? "code" : "agent";
-}
-
 function buildBlankWorkflowRequest(
   title: string,
   runWith: "agent" | "code" = "agent",
@@ -153,7 +138,6 @@ function buildBlankWorkflowRequest(
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
-  const [selectValue, setSelectValue] = useState<"v1" | "v2" | "v2-code">("v2"); // v2 (agent) is the default
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const [webhookCallbackUrl, setWebhookCallbackUrl] = useState<string | null>(
@@ -181,16 +165,8 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const submitInFlightRef = useRef(false);
 
   const generateWorkflowMutation = useMutation({
-    mutationFn: async ({
-      prompt,
-      version,
-    }: {
-      prompt: string;
-      version: string;
-    }) => {
+    mutationFn: async ({ prompt }: { prompt: string }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
-      const v = version === "v1" ? "v1" : "v2";
-
       const request: Record<string, unknown> = {
         user_prompt: prompt,
         webhook_callback_url: webhookCallbackUrl,
@@ -198,7 +174,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
         totp_identifier: totpIdentifier,
         max_screenshot_scrolls: maxScreenshotScrolls,
         publish_workflow: publishWorkflow,
-        run_with: version === "v2-code" ? "code" : "agent",
+        run_with: "agent",
         ai_fallback: true,
         extracted_information_schema: dataSchema
           ? (() => {
@@ -220,9 +196,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
           : null,
       };
 
-      if (v === "v1") {
-        request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
-      }
+      request.url = "https://google.com"; // a stand-in value; real url is generated via prompt
 
       const result = await client.post<
         Createv2TaskRequest,
@@ -230,7 +204,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
       >(
         "/workflows/create-from-prompt",
         {
-          task_version: v,
+          task_version: "v1",
           request,
         },
         {
@@ -318,23 +292,16 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const isSubmitting =
     generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
 
-  const submitPrompt = ({
-    prompt,
-    legacyVersion,
-  }: {
-    prompt: string;
-    legacyVersion: "v1" | "v2" | "v2-code";
-  }) => {
+  const submitPrompt = ({ prompt }: { prompt: string }) => {
     if (submitInFlightRef.current || isSubmitting) {
       return;
     }
     submitInFlightRef.current = true;
-    const runWith = runWithFromSelector(legacyVersion);
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt, runWith });
+      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
       return;
     }
-    generateWorkflowMutation.mutate({ prompt, version: legacyVersion });
+    generateWorkflowMutation.mutate({ prompt });
   };
 
   return (
@@ -364,71 +331,6 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Enter your prompt..."
               />
-              <Select
-                value={selectValue}
-                onValueChange={(value: "v1" | "v2" | "v2-code") => {
-                  setSelectValue(value);
-                }}
-              >
-                <SelectTrigger className="w-48 focus:ring-0">
-                  {selectValue === "v2-code" ? (
-                    <div className="relative z-10 flex w-full flex-col items-center">
-                      <div className="flex items-center gap-1">
-                        <LightningBoltIcon className="size-4 shrink-0 text-yellow-400" />
-                        <div className="font-normal text-white">
-                          Skyvern 2.0
-                        </div>
-                      </div>
-                      <div className="self-start pl-7 text-xs font-semibold text-yellow-400">
-                        with code
-                      </div>
-                    </div>
-                  ) : (
-                    <SelectValue className="relative z-10" />
-                  )}
-                </SelectTrigger>
-                <SelectContent className="border-slate-500 bg-slate-elevation3">
-                  <CustomSelectItem value="v1">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 1.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for simple tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem value="v2" className="hover:bg-slate-800">
-                    <div className="space-y-2">
-                      <div>
-                        <SelectItemText>Skyvern 2.0</SelectItemText>
-                      </div>
-                      <div className="text-xs text-slate-400">
-                        Best for complex tasks
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                  <CustomSelectItem
-                    value="v2-code"
-                    className="relative overflow-hidden border-2 border-yellow-500/50 bg-gradient-to-r from-yellow-500/10 via-yellow-400/10 to-amber-400/10 hover:bg-slate-800"
-                  >
-                    <div className="animate-shimmer absolute inset-0 bg-gradient-to-r from-transparent via-yellow-400/20 to-transparent" />
-                    <div className="relative flex items-center gap-2 space-y-2">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <SelectItemText className="animate-pulse bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text font-bold text-transparent">
-                            Skyvern 2.0
-                          </SelectItemText>
-                          <LightningBoltIcon className="size-4 animate-bounce text-yellow-400" />
-                        </div>
-                        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-400 bg-clip-text text-xs font-semibold text-transparent">
-                          with code
-                        </div>
-                      </div>
-                    </div>
-                  </CustomSelectItem>
-                </SelectContent>
-              </Select>
               <ImprovePrompt
                 isVisible={Boolean(prompt.trim())}
                 onBegin={() => {
@@ -463,7 +365,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                   <PaperPlaneIcon
                     className="size-6 cursor-pointer"
                     onClick={() => {
-                      submitPrompt({ prompt, legacyVersion: selectValue });
+                      submitPrompt({ prompt });
                     }}
                   />
                 )}
@@ -680,10 +582,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
               icon={example.icon}
               label={example.label}
               onClick={() => {
-                submitPrompt({
-                  prompt: example.prompt,
-                  legacyVersion: "v2",
-                });
+                submitPrompt({ prompt: example.prompt });
               }}
             />
           );

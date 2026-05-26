@@ -44,6 +44,8 @@ Key derivation (shared with the cross-run tier):
       The prompt is sent to the LLM as the `system` message; changing it
       changes the output even if all user-prompt inputs are identical, so two
       calls that differ only in workflow_system_prompt must not collide.
+    - non_vision_page_context — rendered only when screenshots are disabled,
+      so screenshot-backed and non-vision-backed prompts do not collide.
 - Date is intentionally NOT in the key. Two calls on byte-identical page
   content are semantically the same extraction regardless of wall-clock
   date; relying on the content hash keeps hit rate up for scheduled
@@ -506,6 +508,7 @@ def compute_cache_key(
     previous_extracted_information: Any = None,
     llm_key: str | None = None,
     workflow_system_prompt: str | None = None,
+    non_vision_page_context: str | None = None,
 ) -> str:
     """Return a stable sha256 hex digest for the inputs that affect extraction output.
 
@@ -545,6 +548,7 @@ def compute_cache_key(
         _normalize(previous_extracted_information),
         _s(llm_key),
         _s(workflow_system_prompt),
+        _s(non_vision_page_context),
     ]
     joined = "\x1f".join(parts).encode("utf-8", errors="replace")
     return hashlib.sha256(joined).hexdigest()

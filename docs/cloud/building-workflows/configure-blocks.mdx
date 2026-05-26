@@ -54,7 +54,7 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 | Field | Description |
 |-------|-------------|
 | **URL** | Starting URL. Leave blank to continue from the previous block's page. |
-| **Engine** | AI engine: Skyvern 1.0 or Skyvern 2.0 |
+| **Engine** | AI engine. Skyvern 1.0 is the default for new browser blocks. |
 | **Max Steps Override** | Cap the number of AI reasoning steps |
 | **Disable Cache** | Skip cached script execution |
 | **TOTP Identifier** | Link TOTP credentials for 2FA handling |
@@ -69,16 +69,7 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 
 The primary block for browser automation. Accepts a natural-language prompt and autonomously navigates the browser to accomplish the goal.
 
-The block has two engine modes, selected via the **Engine** dropdown. The fields shown change depending on which engine you choose.
-
-**Skyvern 2.0** (recommended):
-
-| Field | Type | Description |
-|-------|------|-------------|
-| **URL** | text | Starting URL (optional) |
-| **Prompt** | text | Natural language instructions for the AI |
-| **Max Steps** | number | Maximum AI steps |
-| **Disable Cache** | boolean | Skip cached script execution |
+The block uses Skyvern 1.0 by default. Existing workflows that already contain V2 browser blocks remain editable and may show a reduced field set.
 
 **Skyvern 1.0:**
 
@@ -86,6 +77,15 @@ The block has two engine modes, selected via the **Engine** dropdown. The fields
 |-------|------|-------------|
 | **URL** | text | Starting URL (optional) |
 | **Prompt** | text | Natural language instructions for the AI |
+
+**Existing V2 blocks:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| **URL** | text | Starting URL (optional) |
+| **Prompt** | text | Natural language instructions for the AI |
+| **Max Steps** | number | Maximum AI steps |
+| **Disable Cache** | boolean | Skip cached script execution |
 
 Additional fields in **Advanced Settings** (Skyvern 1.0 only):
 

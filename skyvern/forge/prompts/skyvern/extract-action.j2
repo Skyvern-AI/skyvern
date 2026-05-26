@@ -1,11 +1,13 @@
-Identify actions to help user progress towards the user goal using the DOM elements given in the list and the screenshot of the website.
+Identify actions to help user progress towards the user goal using the DOM elements given in the list{% if non_vision_page_context %}, the non-vision page context, and the accessibility tree of the website{% else %} and the screenshot of the website{% endif %}.
 Include only the elements that are relevant to the user goal, without altering or imagining new elements.
 Accurately interpret and understand the functional significance of SVG elements based on their shapes and context within the webpage.
 Use the user details to fill in necessary values. Always satisfy required fields if the field isn't already filled in. Don't return any action for the same field, if this field is already filled in and the value is the same as the one you would have filled in.
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 Each interactable element is tagged with an ID. Avoid taking action on a disabled element when there is an alternative action available.
-If you see any information in red in the page screenshot, this means a condition wasn't satisfied. prioritize actions with the red information.
+{% if non_vision_page_context %}If the non-vision page context shows invalid fields, validation messages, error-colored text, dialogs, overlays, or expanded controls, prioritize actions that address those states.
+{% else %}If you see any information in red in the page screenshot, this means a condition wasn't satisfied. prioritize actions with the red information.
 If you see a popup in the page screenshot, prioritize actions on the popup.
+{% endif %}
 
 Reply in JSON format with the following keys:
 {
@@ -53,8 +55,8 @@ Reply in JSON format with the following keys:
     "should_verify_by_magic_link": bool // Whether the page instructs the user to check their email for a magic link to verify the login.{% endif %}
 }
 
-Consider the action history from the last step and the screenshot together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
-Action history from previous steps: (note: even if the action history suggests goal is achieved, check the screenshot and the DOM elements to make sure the goal is achieved)
+Consider the action history from the last step and the {% if non_vision_page_context %}non-vision page context{% else %}screenshot{% endif %} together, if actions from the last step don't yield positive impact, try other actions or other action combinations.
+Action history from previous steps: (note: even if the action history suggests goal is achieved, check the {% if non_vision_page_context %}non-vision page context{% else %}screenshot{% endif %} and the DOM elements to make sure the goal is achieved)
 ```
 {{ action_history }}
 ```
@@ -95,6 +97,12 @@ User details:
 Open browser tabs (CLOSE_PAGE always closes the tab marked [current] — other tabs are shown for context only):
 ```
 {{ open_tabs_context }}
+```
+{% endif %}
+{% if non_vision_page_context %}
+Non-vision page context and accessibility tree:
+```json
+{{ non_vision_page_context }}
 ```
 {% endif %}
 Clickable elements from `{{ current_url }}`:
