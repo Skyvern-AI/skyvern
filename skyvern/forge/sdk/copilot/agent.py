@@ -32,7 +32,13 @@ from pydantic import ValidationError
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import CopilotConfig
-from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, AgentResult, CopilotContext, StructuredContext
+from skyvern.forge.sdk.copilot.context import (
+    COPILOT_RESPONSE_TYPES,
+    AgentResult,
+    CopilotContext,
+    StructuredContext,
+    finalize_discovery_counter_in_global_llm_context,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     UNVALIDATED_DISCLOSURE_PHRASES,
     WORKFLOW_PRESENT_SENTINEL,
@@ -672,6 +678,28 @@ def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     return None, None
 
 
+def _make_agent_result(
+    ctx: CopilotContext | None,
+    *,
+    global_llm_context: str | None = None,
+    turn_outcome: TurnOutcome | None = None,
+    **kwargs: Any,
+) -> AgentResult:
+    """Sole ``AgentResult`` constructor in this module.
+
+    Routes every ``AgentResult`` through the discovery-counter finalizer so
+    the per-chat budget survives every exit path (timeout, cancel, max-turns,
+    output-policy block, clarification helpers, non-retriable nav error,
+    normal translate-result, missing-SDK fallback, unexpected-error fallback).
+    """
+    final_context = (
+        finalize_discovery_counter_in_global_llm_context(ctx, global_llm_context)
+        if ctx is not None
+        else global_llm_context
+    )
+    return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+
+
 def _build_exit_result(
     ctx: CopilotContext,
     user_response: str,
@@ -687,7 +715,8 @@ def _build_exit_result(
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason or ("cancel" if cancelled else None),
     )
-    return AgentResult(
+    return _make_agent_result(
+        ctx,
         user_response=final_text,
         updated_workflow=verified_workflow,
         global_llm_context=global_llm_context,
@@ -979,7 +1008,8 @@ def _build_wip_exit_result(
     ):
         reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
         final_text, outcome = _guard(reply)
-        return AgentResult(
+        return _make_agent_result(
+            ctx,
             user_response=final_text,
             updated_workflow=ctx.last_good_workflow,
             global_llm_context=global_llm_context,
@@ -1002,7 +1032,8 @@ def _build_wip_exit_result(
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
         final_text, outcome = _guard(reply)
-        return AgentResult(
+        return _make_agent_result(
+            ctx,
             user_response=final_text,
             updated_workflow=ctx.last_workflow,
             global_llm_context=global_llm_context,
@@ -1391,7 +1422,8 @@ def _translate_to_agent_result(
         tool_calls=[name for name in tool_call_names if name],
     )
 
-    return AgentResult(
+    return _make_agent_result(
+        ctx,
         user_response=final_user_response,
         updated_workflow=last_workflow,
         global_llm_context=enriched_context or None,
@@ -1440,7 +1472,8 @@ def _build_feasibility_clarification_result(
         blocked_signatures=list(ctx.blocked_reply_signatures),
         reason_code="feasibility_clarification",
     )
-    return AgentResult(
+    return _make_agent_result(
+        ctx,
         user_response=final_text,
         updated_workflow=None,
         global_llm_context=enriched_context,
@@ -1516,7 +1549,8 @@ def _build_request_policy_clarification_result(
         blocked_signatures=list(ctx.blocked_reply_signatures),
         reason_code="request_policy_clarification",
     )
-    return AgentResult(
+    return _make_agent_result(
+        ctx,
         user_response=final_text,
         updated_workflow=None,
         global_llm_context=structured.to_json_str(),
@@ -1811,7 +1845,8 @@ def _build_output_policy_blocked_result(
         reason_code="output_policy_block",
         terminal_reason="output_policy_block",
     )
-    return AgentResult(
+    return _make_agent_result(
+        ctx,
         user_response=final_user_response,
         updated_workflow=preserved_workflow,
         global_llm_context=structured.to_json_str(),
@@ -1970,7 +2005,8 @@ async def _run_copilot_turn_impl(
                 blocked_signatures=(),
                 terminal_reason="missing_sdk",
             )
-            return AgentResult(
+            return _make_agent_result(
+                None,
                 user_response=final_missing_text,
                 updated_workflow=None,
                 global_llm_context=global_llm_context,
@@ -2044,6 +2080,12 @@ async def _run_copilot_turn_impl(
         chat_history_text=safe_chat_history_text,
         previous_user_message=previous_user_message,
     )
+
+    # Hydrate the per-chat discovery counter from the inbound global_llm_context.
+    # `ctx.build_phase` stays at the safe default and `initial_build_phase` is
+    # not yet called from the agent loop — that activates in the discovery PR.
+    prior_structured_context = StructuredContext.from_json_str(global_llm_context)
+    ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
 
     # Preflight feasibility classifier — fires on every turn so mid-session pivots
     # to impossible targets are caught the same as first-turn structural mismatches.
@@ -2294,7 +2336,8 @@ async def _run_copilot_turn_impl(
                     blocked_signatures=ctx.blocked_reply_signatures,
                     terminal_reason="non_retriable_nav",
                 )
-                return AgentResult(
+                return _make_agent_result(
+                    ctx,
                     user_response=final_nav_text,
                     updated_workflow=None,
                     global_llm_context=global_llm_context,
