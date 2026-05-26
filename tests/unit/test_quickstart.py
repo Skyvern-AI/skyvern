@@ -215,6 +215,13 @@ def test_run_server_quickstart_uses_sqlite_by_default(monkeypatch: pytest.Monkey
             "no_postgres": True,
             "database_string": "",
             "skip_browser_install": False,
+            "mode": "local",
+            "skip_llm_setup": False,
+            "configure_mcp": None,
+            "browser_type": None,
+            "browser_location": None,
+            "remote_debugging_url": None,
+            "analytics_id": None,
             "return_result": True,
         }
     ]
@@ -248,6 +255,13 @@ def test_run_server_quickstart_can_request_postgres(monkeypatch: pytest.MonkeyPa
             "no_postgres": False,
             "database_string": "",
             "skip_browser_install": False,
+            "mode": "local",
+            "skip_llm_setup": False,
+            "configure_mcp": None,
+            "browser_type": None,
+            "browser_location": None,
+            "remote_debugging_url": None,
+            "analytics_id": None,
             "return_result": True,
         }
     ]
