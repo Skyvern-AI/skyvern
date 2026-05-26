@@ -30,6 +30,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
@@ -107,6 +108,12 @@ class AgentContext:
 
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
+
+    # Set by tool gates / loop guards / tool-side error branches when a tool
+    # dispatch is blocked. The finalization shim in agent.py reads this at
+    # turn end and overrides the AgentResult with a deterministic
+    # product-language reply. See blocker_signal.py for the contract.
+    blocker_signal: CopilotToolBlockerSignal | None = None
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
