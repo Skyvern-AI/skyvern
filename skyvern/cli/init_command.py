@@ -216,7 +216,8 @@ _LOCAL_SERVER_DEPENDENCY_HINT = (
     "Local Skyvern needs the server dependencies, but this Python environment is missing "
     "[cyan]{module}[/cyan].\n\n"
     "Run [cyan]{install_command}[/cyan] and then rerun [cyan]skyvern quickstart[/cyan].\n\n"
-    "For the full UI + API + Postgres stack, clone the Skyvern repository and use Docker Compose."
+    'For the local API + UI, use [cyan]pip install "skyvern[all]"[/cyan]. '
+    "For a full containerized Postgres stack, clone the Skyvern repository and use Docker Compose."
 )
 
 
@@ -324,6 +325,26 @@ async def _setup_local_organization_from_database() -> str:
     return await setup_local_organization_from_database_string(settings.DATABASE_STRING)
 
 
+def _use_default_sqlite_database(*, env_path: Path | str | None = None) -> None:
+    from skyvern.config import _default_database_string  # noqa: PLC0415
+
+    database_url = _default_database_string()
+    console.print(
+        Panel(
+            "[bold cyan]SQLite Database Setup[/bold cyan]\n\n"
+            f"Using the default SQLite database at [cyan]{database_url}[/cyan].\n"
+            "To use Postgres instead, pass [cyan]--postgres[/cyan] to start a local container "
+            "or [cyan]--database-string[/cyan] for an existing database.",
+            border_style="blue",
+        )
+    )
+    capture_setup_event(
+        "database-skip",
+        success=True,
+        extra_data={"reason": "sqlite_default", "env_path": str(env_path) if env_path is not None else None},
+    )
+
+
 @overload
 def init_env(
     no_postgres: bool = False,
@@ -413,6 +434,8 @@ def init_env(
             console.print("🔗 [bold blue]Using custom database connection...[/bold blue]")
             set_env_var("DATABASE_STRING", database_string)
             console.print(f"✅ [green]Database connection string set in {backend_env_path}.[/green]")
+        elif no_postgres:
+            _use_default_sqlite_database(env_path=backend_env_path)
         else:
             setup_postgresql(no_postgres, env_path=backend_env_path)
         console.print("📊 [bold blue]Running database migrations...[/bold blue]")
@@ -590,11 +613,12 @@ def init_app_factory() -> typer.Typer:
     @app.callback()
     def _init_callback(
         ctx: typer.Context,
-        no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+        no_postgres: bool = typer.Option(False, "--no-postgres", help="Use default SQLite instead of PostgreSQL"),
+        postgres: bool = typer.Option(False, "--postgres", help="Start or reuse a local PostgreSQL container"),
         database_string: str = typer.Option(
             "",
             "--database-string",
-            help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+            help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname).",
         ),
         env_scope: str | None = typer.Option(
             None,
@@ -604,7 +628,10 @@ def init_app_factory() -> typer.Typer:
     ) -> None:
         """Run full initialization when no subcommand is provided."""
         if ctx.invoked_subcommand is None:
-            init_env(no_postgres=no_postgres, database_string=database_string, env_scope=env_scope)
+            if postgres and no_postgres:
+                console.print("[bold red]Use only one of --postgres or --no-postgres.[/bold red]")
+                raise typer.Exit(1)
+            init_env(no_postgres=no_postgres or not postgres, database_string=database_string, env_scope=env_scope)
 
     @app.command(name="browser")
     def _init_browser_command() -> None:

@@ -425,11 +425,11 @@ def test_quickstart_without_server_extra_prints_install_paths(monkeypatch) -> No
     assert result.exit_code == 0
     assert "Cloud/API SDK usage" in result.output
     assert "Embedded local Python SDK via skyvern[local]" in result.output
-    assert "Self-hosted local server via skyvern[server]" in result.output
+    assert "Self-hosted local server + web UI via skyvern[all]" in result.output
     assert "Next command: skyvern setup" in result.output
     assert "Skyvern(api_key=" in result.output
     assert 'pip install "skyvern[local]"' in result.output
-    assert 'pip install "skyvern[server]"' in result.output
+    assert 'pip install "skyvern[all]"' in result.output
     assert "Postgres" in result.output
     assert "Missing Dependency" not in result.output
     assert "Missing:" not in result.output
@@ -491,7 +491,7 @@ def test_quickstart_server_flags_select_server_path_without_server_extra(monkeyp
     assert result.exit_code == 0
     assert "Embedded local Python SDK" not in result.output
     assert "Cloud/API SDK usage" not in result.output
-    assert 'Install: pip install "skyvern[server]"' in result.output
+    assert 'Install: pip install "skyvern[all]"' in result.output
     assert install_calls == []
     assert server_calls == []
 
@@ -538,10 +538,11 @@ def test_quickstart_interactive_server_choice_without_server_extra_prints_instal
     assert result.exit_code == 1
     assert "Choose a quickstart path" in result.output
     assert "Install the missing server dependencies now?" in result.output
-    assert 'Install: pip install "skyvern[server]"' in result.output
+    assert 'Install: pip install "skyvern[all]"' in result.output
     assert "Next: python -m skyvern quickstart" in result.output
-    assert "local server, database, local API key, and MCP" in result.output
-    assert "Wheel installs run the backend only" in result.output
+    assert "local server, packaged UI, SQLite database, local API" in result.output
+    assert "key, and MCP" in result.output
+    assert "frontend development" in result.output
 
 
 def test_quickstart_interactive_server_choice_can_install_server_extra(monkeypatch) -> None:
@@ -563,15 +564,85 @@ def test_quickstart_interactive_server_choice_can_install_server_extra(monkeypat
     result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\n")
 
     assert result.exit_code == 0
-    assert install_calls == [{"assume_yes": False}]
+    assert install_calls == [{"include_ui": True, "assume_yes": False}]
     assert server_calls == [
         {
             "no_postgres": False,
+            "postgres": False,
             "database_string": "",
             "skip_browser_install": False,
             "server_only": False,
         }
     ]
+
+
+def test_quickstart_existing_server_extra_can_install_ui_before_starting(monkeypatch) -> None:
+    ui_install_calls = []
+    server_calls = []
+
+    monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
+    monkeypatch.setattr(quickstart_module, "_has_local_quickstart_extra", lambda: True)
+    monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: True)
+    monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: True)
+    monkeypatch.setattr(quickstart_module, "has_frontend_runtime", lambda: False)
+    monkeypatch.setattr(
+        "skyvern.cli.run_commands._install_packaged_ui_if_requested",
+        lambda: ui_install_calls.append("ui") or True,
+    )
+    monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
+
+    result = CliRunner().invoke(quickstart_module.quickstart_app, ["--install-type", "server"])
+
+    assert result.exit_code == 0
+    assert ui_install_calls == ["ui"]
+    assert server_calls == [
+        {
+            "no_postgres": False,
+            "postgres": False,
+            "database_string": "",
+            "skip_browser_install": False,
+            "server_only": False,
+        }
+    ]
+
+
+def test_quickstart_postgres_flag_preserves_postgres_setup(monkeypatch) -> None:
+    server_calls = []
+
+    monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
+    monkeypatch.setattr(quickstart_module, "_has_local_quickstart_extra", lambda: True)
+    monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: True)
+    monkeypatch.setattr(quickstart_module, "_is_interactive_input", lambda: False)
+    monkeypatch.setattr(quickstart_module, "has_frontend_runtime", lambda: True)
+    monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
+
+    result = CliRunner().invoke(quickstart_module.quickstart_app, ["--install-type", "server", "--postgres"])
+
+    assert result.exit_code == 0
+    assert server_calls == [
+        {
+            "no_postgres": False,
+            "postgres": True,
+            "database_string": "",
+            "skip_browser_install": False,
+            "server_only": False,
+        }
+    ]
+
+
+def test_quickstart_rejects_conflicting_postgres_flags(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quickstart_module,
+        "_has_server_quickstart_extra",
+        lambda: (_ for _ in ()).throw(AssertionError("should not inspect dependencies")),
+    )
+
+    result = CliRunner().invoke(quickstart_module.quickstart_app, ["--postgres", "--no-postgres"])
+
+    assert result.exit_code == 1
+    assert "Conflicting quickstart options" in result.output
+    assert "--postgres" in result.output
+    assert "--no-postgres" in result.output
 
 
 def test_quickstart_interactive_choice_accepts_alias(monkeypatch) -> None:
@@ -599,7 +670,7 @@ def test_quickstart_interactive_choice_reprompts_invalid_alias(monkeypatch) -> N
     assert "Choose one of: cloud/api, local/embedded, server/self-hosted, 1, 2, or 3." in result.output
     assert "Please select a valid option:" not in result.output
     assert "Install the missing server dependencies now?" in result.output
-    assert 'Install: pip install "skyvern[server]"' in result.output
+    assert 'Install: pip install "skyvern[all]"' in result.output
 
 
 def test_quickstart_interactive_eof_falls_back_to_default(monkeypatch) -> None:
@@ -634,7 +705,7 @@ def test_quickstart_server_flags_skip_docker_compose_offer_without_server_extra(
     monkeypatch.setattr(
         quickstart_module,
         "_install_server_extra_for_quickstart",
-        lambda: install_calls.append("install") or True,
+        lambda **kwargs: install_calls.append(kwargs) or True,
     )
     monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
@@ -727,6 +798,7 @@ def test_quickstart_with_server_extra_preserves_existing_flow(monkeypatch) -> No
     assert calls == [
         {
             "no_postgres": True,
+            "postgres": False,
             "database_string": "postgresql+psycopg://user/db",
             "skip_browser_install": True,
             "server_only": True,
@@ -796,7 +868,7 @@ async def test_start_services_without_frontend_runtime_starts_backend_only(monke
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    monkeypatch.setattr(utils, "resolve_frontend_env_path", lambda: None)
+    monkeypatch.setattr(utils, "has_frontend_runtime", lambda: False)
     monkeypatch.setattr(utils, "resolve_backend_env_path", lambda **_kwargs: Path(".env"))
     monkeypatch.setattr(utils.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(utils.asyncio, "sleep", fake_sleep)
@@ -805,3 +877,34 @@ async def test_start_services_without_frontend_runtime_starts_backend_only(monke
     await utils.start_services()
 
     assert commands == [(utils.sys.executable, "-m", "skyvern.cli.commands", "run", "server")]
+
+
+@pytest.mark.asyncio
+async def test_start_services_with_packaged_frontend_runtime_starts_ui(monkeypatch) -> None:
+    import skyvern.cli.utils as utils
+
+    commands = []
+
+    class FakeProcess:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args):
+        commands.append(args)
+        return FakeProcess()
+
+    async def fake_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(utils, "has_frontend_runtime", lambda: True)
+    monkeypatch.setattr(utils, "resolve_backend_env_path", lambda **_kwargs: Path(".env"))
+    monkeypatch.setattr(utils.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(utils.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(utils, "capture_setup_event", lambda *args, **kwargs: None)
+
+    await utils.start_services()
+
+    assert commands == [
+        (utils.sys.executable, "-m", "skyvern.cli.commands", "run", "server"),
+        (utils.sys.executable, "-m", "skyvern.cli.commands", "run", "ui"),
+    ]

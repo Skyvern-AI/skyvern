@@ -157,6 +157,86 @@ server = [
     "tornado>=6.5.5",
     "aiosqlite>=0.21.0,<0.23",
 ]
+ui = [
+    # Extras cannot add files to the already-installed skyvern wheel. Keep the
+    # frontend as a separate same-version distribution containing prebuilt dist
+    # assets, and let the CLI serve those assets without Node/npm at runtime.
+    "skyvern-ui==1.0.36",
+]
+all = [
+    # Keep this list in sync with the server extra plus skyvern-ui. Python
+    # package metadata cannot reference another extra from the same project in a
+    # way that pip reliably expands for all installers.
+    "skyvern-ui==1.0.36",
+    "azure-storage-blob>=12.26.0",
+    "openai>=1.68.2",
+    "yutori>=0.5.0",
+    "openai-agents>=0.10.5,<0.15",
+    "python-dotenv==1.2.2",
+    "sqlalchemy[mypy]>=2.0.29,<3",
+    "aiohttp>=3.13.4,<4",
+    "python-multipart>=0.0.27,<1",
+    "toml>=0.10.2,<0.11",
+    "jinja2>=3.1.2,<4",
+    "uvicorn[standard]>=0.44.0",
+    "litellm==1.83.14",
+    "playwright>1.46.0 ; python_version >= '3.12' and python_version < '3.14'",
+    "playwright==1.46.0 ; python_version >= '3.11' and python_version < '3.12'",
+    "greenlet>3.0.3 ; python_version >= '3.12' and python_version < '3.14'",
+    "greenlet==3.0.3 ; python_version >= '3.11' and python_version < '3.12'",
+    "pillow>=10.2.0",
+    "starlette-context>=0.3.6,<0.6",
+    "fastapi>=0.136.1,<0.137",
+    "psycopg[binary, pool]==3.1.18 ; python_version >= '3.11' and python_version < '3.13'",
+    "psycopg[binary, pool]>=3.2.2,<3.3.0 ; python_version >= '3.13' and python_version < '3.14'",
+    "alembic>=1.12.1,<2",
+    "PyJWT[crypto]>=2.12.0,<3",
+    "aioboto3>=14.3.0,<15",
+    "asyncache>=0.3.1,<0.4",
+    "types-boto3[full]>=1.38.31,<2",
+    "types-toml>=0.10.8.7,<0.11",
+    "filetype>=1.2.0,<2",
+    "fuzzysearch>=0.8,<1",
+    "aioredlock>=0.7.3,<0.8",
+    "tldextract>=5.1.2,<6",
+    "websockets>=12.0,<15.1",
+    "email-validator>=2.2.0,<3",
+    "requests-toolbelt>=1.0.0,<2",
+    "posthog>=3.7.0,<4",
+    "aiofiles>=24.1.0,<25",
+    "pyotp>=2.9.0,<3",
+    "asyncpg>=0.30.0,<0.32",
+    "json5>=0.13.0,<1",
+    "json-repair>=0.59.5,<0.60",
+    "pypdf>=6.7.5,<7",
+    "pdfplumber>=0.11.0,<0.12",
+    "fastmcp>=3.2.0,<4",
+    "psutil>=7.0.0",
+    "tiktoken>=0.9.0",
+    "anthropic>=0.97.0,<0.98",
+    "google-cloud-aiplatform>=1.149.0,<2",
+    "google-auth>=2.49.2,<3",
+    "google-auth-oauthlib>=1.3.1,<2",
+    "onepassword-sdk==0.4.0",
+    "lark>=1.2.2,<2",
+    "libcst>=1.8.2,<2",
+    "curlparser>=0.1.0,<0.2",
+    "pandas>=2.3.1,<4",
+    "azure-identity>=1.24.0,<2",
+    "azure-keyvault-secrets>=4.2.0,<5",
+    "jsonschema>=4.23.0",
+    "python-calamine>=0.6.1",
+    "python-docx>=1.1.0",
+    "urllib3>=2.7.0",
+    "zstandard>=0.25.0",
+    "sse-starlette>=3.4.1,<4",
+    "opentelemetry-api>=1.41.1,<2",
+    "croniter>=1.3.8,<4",
+    "authlib>=1.7.1",
+    "pyasn1>=0.6.3",
+    "tornado>=6.5.5",
+    "aiosqlite>=0.21.0,<0.23",
+]
 
 [dependency-groups]
 cloud = [
@@ -242,6 +322,9 @@ include = [
 ]
 [tool.hatch.build.targets.wheel.force-include]
 "alembic" = "alembic"
+
+[tool.uv.sources]
+skyvern-ui = { path = "packages/skyvern-ui" }
 
 [tool.uv]
 # Supply chain quarantine: block packages published less than 7 days ago.

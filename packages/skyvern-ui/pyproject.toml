@@ -1,0 +1,22 @@
+[project]
+name = "skyvern-ui"
+version = "1.0.36"
+description = "Prebuilt Skyvern UI assets for the Skyvern CLI"
+authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
+requires-python = ">=3.11,<3.14"
+readme = "README.md"
+
+[tool.hatch.build]
+packages = ["skyvern_ui"]
+
+[tool.hatch.build.targets.wheel]
+include = ["skyvern_ui"]
+artifacts = ["skyvern_ui/dist/**"]
+
+[tool.hatch.build.targets.sdist]
+include = ["skyvern_ui", "README.md"]
+artifacts = ["skyvern_ui/dist/**"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

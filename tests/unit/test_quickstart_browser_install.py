@@ -95,8 +95,20 @@ def test_quickstart_does_not_start_services_when_required_browser_is_missing(
     quickstart_module.quickstart(
         ctx=None,  # type: ignore[arg-type]
         no_postgres=False,
+        postgres=False,
         database_string="",
         skip_browser_install=False,
         server_only=False,
         docker_compose=False,
+        install_type=None,
+        env_scope=None,
+        yes=False,
+        non_interactive=False,
+        skip_llm_setup=False,
+        skip_mcp=False,
+        browser_type=None,
+        browser_location=None,
+        remote_debugging_url=None,
+        analytics_id=None,
+        start_services_now=None,
     )

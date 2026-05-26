@@ -186,3 +186,82 @@ def test_bootstrap_skips_rewrite_for_non_localhost_db_string(tmp_path: Path, mon
 
     assert confirm_calls == [], "should not prompt when DATABASE_STRING does not point to localhost"
     assert (tmp_path / ".env").read_text() == env_content
+
+
+def test_run_server_quickstart_uses_sqlite_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    init_calls: list[dict[str, object]] = []
+
+    class InitResult:
+        run_local = False
+
+        def __bool__(self) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        init_command,
+        "init_env",
+        lambda **kwargs: init_calls.append(kwargs) or InitResult(),
+    )
+
+    quickstart._run_server_quickstart(
+        no_postgres=False,
+        database_string="",
+        skip_browser_install=False,
+        server_only=False,
+    )
+
+    assert init_calls == [
+        {
+            "no_postgres": True,
+            "database_string": "",
+            "skip_browser_install": False,
+            "mode": "local",
+            "skip_llm_setup": False,
+            "configure_mcp": None,
+            "browser_type": None,
+            "browser_location": None,
+            "remote_debugging_url": None,
+            "analytics_id": None,
+            "return_result": True,
+        }
+    ]
+
+
+def test_run_server_quickstart_can_request_postgres(monkeypatch: pytest.MonkeyPatch) -> None:
+    init_calls: list[dict[str, object]] = []
+
+    class InitResult:
+        run_local = False
+
+        def __bool__(self) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        init_command,
+        "init_env",
+        lambda **kwargs: init_calls.append(kwargs) or InitResult(),
+    )
+
+    quickstart._run_server_quickstart(
+        no_postgres=False,
+        postgres=True,
+        database_string="",
+        skip_browser_install=False,
+        server_only=False,
+    )
+
+    assert init_calls == [
+        {
+            "no_postgres": False,
+            "database_string": "",
+            "skip_browser_install": False,
+            "mode": "local",
+            "skip_llm_setup": False,
+            "configure_mcp": None,
+            "browser_type": None,
+            "browser_location": None,
+            "remote_debugging_url": None,
+            "analytics_id": None,
+            "return_result": True,
+        }
+    ]

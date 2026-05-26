@@ -48,4 +48,20 @@ def test_init_callback_passes_plain_database_string(monkeypatch) -> None:
     result = CliRunner().invoke(cli_app, ["init"])
 
     assert result.exit_code == 0
+    assert calls == [(True, "", None)]
+
+
+def test_init_callback_postgres_flag_preserves_postgres_setup(monkeypatch) -> None:
+    calls: list[tuple[bool, str, str | None]] = []
+
+    monkeypatch.setattr(
+        "skyvern.cli.init_command.init_env",
+        lambda no_postgres=False, database_string="", env_scope=None: calls.append(
+            (no_postgres, database_string, env_scope)
+        ),
+    )
+
+    result = CliRunner().invoke(cli_app, ["init", "--postgres"])
+
+    assert result.exit_code == 0
     assert calls == [(False, "", None)]

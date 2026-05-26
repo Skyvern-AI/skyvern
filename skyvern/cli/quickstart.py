@@ -19,37 +19,40 @@ from rich.prompt import Confirm, Prompt
 from rich.text import Text
 
 from skyvern.cli.console import console
-from skyvern.utils.env_paths import EnvScope, parse_env_scope, resolve_frontend_env_path
+from skyvern.cli.ui_runtime import has_frontend_runtime
+from skyvern.utils.env_paths import EnvScope, parse_env_scope
 
 quickstart_app = typer.Typer(help="Quickstart command to set up and run Skyvern with one command.")
 
 _SKYVERN_COMPOSE_SERVICES = {"postgres", "skyvern", "skyvern-ui"}
 
 
-def _server_extra_install_target() -> str:
+def _server_extra_install_target(*, include_ui: bool = True) -> str:
     cwd = Path.cwd()
     if (cwd / "pyproject.toml").is_file() and (cwd / "skyvern").is_dir():
         return ".[server]"
 
+    extra = "all" if include_ui else "server"
     try:
         version = importlib.metadata.version("skyvern")
     except importlib.metadata.PackageNotFoundError:
-        return "skyvern[server]"
-    return f"skyvern[server]=={version}"
+        return f"skyvern[{extra}]"
+    return f"skyvern[{extra}]=={version}"
 
 
-def _install_server_extra_for_quickstart(*, assume_yes: bool = False) -> bool:
-    target = _server_extra_install_target()
+def _install_server_extra_for_quickstart(*, include_ui: bool = True, assume_yes: bool = False) -> bool:
+    target = _server_extra_install_target(include_ui=include_ui)
+    dependency_description = "server dependencies and packaged UI" if include_ui else "server dependencies"
     console.print(
         Panel(
-            "Local quickstart needs the server dependencies.\n\n"
+            f"Local quickstart needs the {dependency_description}.\n\n"
             f"Install [cyan]{escape(target)}[/cyan] into the current Python environment now?",
             title="Missing Local Server Dependency",
             border_style="yellow",
         )
     )
     if not assume_yes and not Confirm.ask("Install the missing server dependencies now?", default=True):
-        _print_server_guidance()
+        _print_server_guidance(include_ui=include_ui)
         return False
 
     console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
@@ -60,7 +63,7 @@ def _install_server_extra_for_quickstart(*, assume_yes: bool = False) -> bool:
         )
     except subprocess.CalledProcessError as install_error:
         console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
-        _print_server_guidance()
+        _print_server_guidance(include_ui=include_ui)
         return False
 
     importlib.invalidate_caches()
@@ -162,7 +165,7 @@ def _print_quickstart_selector(
     has_server_extra: bool,
 ) -> None:
     local_status = "installed" if has_local_extra else 'requires `pip install "skyvern[local]"`'
-    server_status = "installed" if has_server_extra else 'requires `pip install "skyvern[server]"`'
+    server_status = "installed" if has_server_extra else 'requires `pip install "skyvern[all]"`'
     message = f"""Choose how you want to use Skyvern:
 
 1. Cloud/API SDK usage
@@ -171,7 +174,7 @@ def _print_quickstart_selector(
 2. Embedded local Python SDK via skyvern[local]
    Status: {local_status}
 
-3. Self-hosted local server via skyvern[server]
+3. Self-hosted local server + web UI via skyvern[all]
    Status: {server_status}
 
 Default: {default_path.value}
@@ -218,17 +221,19 @@ def _select_quickstart_path(
 def _server_quickstart_flags_requested(
     *,
     no_postgres: bool,
+    postgres: bool,
     database_string: str,
     skip_browser_install: bool,
     server_only: bool,
 ) -> bool:
     """Return whether the user supplied options for the Python server setup path."""
-    return no_postgres or bool(database_string) or skip_browser_install or server_only
+    return no_postgres or postgres or bool(database_string) or skip_browser_install or server_only
 
 
 def _server_quickstart_options(
     *,
     no_postgres: bool,
+    postgres: bool,
     database_string: str,
     skip_browser_install: bool,
     server_only: bool,
@@ -242,6 +247,7 @@ def _server_quickstart_options(
 ) -> dict[str, Any]:
     options: dict[str, Any] = {
         "no_postgres": no_postgres,
+        "postgres": postgres,
         "database_string": database_string,
         "skip_browser_install": skip_browser_install,
         "server_only": server_only,
@@ -300,14 +306,19 @@ This path does not require Postgres, Docker, migrations, or `skyvern run server`
     console.print(Panel(Text(message), title="Embedded Local SDK", border_style="cyan"))
 
 
-def _print_server_guidance() -> None:
-    message = """Self-hosted local server
+def _print_server_guidance(*, include_ui: bool = True) -> None:
+    install_command = 'pip install "skyvern[all]"' if include_ui else 'pip install "skyvern[server]"'
+    setup_description = "local server, packaged UI, SQLite database, local API key, and MCP"
+    if not include_ui:
+        setup_description = "local server, SQLite database, local API key, and MCP"
+    message = f"""Self-hosted local server
 
-Install: pip install "skyvern[server]"
+Install: {install_command}
 Next: python -m skyvern quickstart
 
-This path sets up the local server, database, local API key, and MCP.
-Wheel installs run the backend only; use a source checkout or Docker Compose for the local UI.
+This path sets up the {setup_description}.
+Use --postgres or --database-string if you want Postgres instead of SQLite.
+Use a source checkout / Docker Compose when you need frontend development mode.
 """
     console.print(Panel(Text(message), title="Self-Hosted Server", border_style="cyan"))
 
@@ -327,6 +338,7 @@ def _run_server_quickstart(
     database_string: str,
     skip_browser_install: bool,
     server_only: bool,
+    postgres: bool = False,
     skip_llm_setup: bool = False,
     configure_mcp: bool | None = None,
     browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
@@ -342,7 +354,7 @@ def _run_server_quickstart(
         # Initialize Skyvern (pip install path)
         console.print("\n[bold blue]Initializing Skyvern...[/bold blue]")
         init_result = init_env(
-            no_postgres=no_postgres,
+            no_postgres=no_postgres or (not postgres and not database_string),
             database_string=database_string,
             skip_browser_install=skip_browser_install,
             mode="local",
@@ -386,9 +398,7 @@ def _run_server_quickstart(
                 console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
                 asyncio.run(start_services(server_only=server_only))
             else:
-                start_command = (
-                    "skyvern run server" if server_only or resolve_frontend_env_path() is None else "skyvern run all"
-                )
+                start_command = "skyvern run server" if server_only or not has_frontend_runtime() else "skyvern run all"
                 console.print(
                     f"\n[yellow]Skipping service startup. You can start services later with '{start_command}'[/yellow]"
                 )
@@ -763,11 +773,12 @@ def run_docker_compose_setup() -> None:
 @quickstart_app.callback(invoke_without_command=True)
 def quickstart(
     ctx: typer.Context,
-    no_postgres: bool = typer.Option(False, "--no-postgres", help="Skip starting PostgreSQL container"),
+    no_postgres: bool = typer.Option(False, "--no-postgres", help="Use default SQLite instead of PostgreSQL"),
+    postgres: bool = typer.Option(False, "--postgres", help="Start or reuse a local PostgreSQL container"),
     database_string: str = typer.Option(
         "",
         "--database-string",
-        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname). When provided, skips Docker PostgreSQL setup.",
+        help="Custom database connection string (e.g., postgresql+psycopg://user:password@host:port/dbname).",
     ),
     skip_browser_install: bool = typer.Option(
         False, "--skip-browser-install", help="Skip Chromium browser installation"
@@ -858,11 +869,22 @@ def quickstart(
                 )
             )
 
+    if postgres and no_postgres:
+        console.print(
+            Panel(
+                "[bold red]Conflicting quickstart options.[/bold red]\n"
+                "Use only one of [cyan]--postgres[/cyan] or [cyan]--no-postgres[/cyan].",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(1)
+
     has_server_extra = _has_server_quickstart_extra()
     # The server extra is a superset of the local embedded runtime dependencies.
     has_local_extra = has_server_extra or _has_local_quickstart_extra()
     server_flags_requested = _server_quickstart_flags_requested(
         no_postgres=no_postgres,
+        postgres=postgres,
         database_string=database_string,
         skip_browser_install=skip_browser_install,
         server_only=server_only,
@@ -958,7 +980,7 @@ def quickstart(
         console.print("\n[bold blue]Setup Method[/bold blue]")
         console.print("Docker Compose file detected. Choose your setup method:\n")
         console.print("  [cyan]1.[/cyan] [green]Docker Compose (Recommended)[/green] - Full containerized setup")
-        console.print("  [cyan]2.[/cyan] pip install - Local Python setup with Docker for PostgreSQL only\n")
+        console.print("  [cyan]2.[/cyan] pip install - Local Python setup with SQLite by default\n")
 
         use_docker_compose = Confirm.ask(
             "Would you like to use Docker Compose for the full setup?",
@@ -971,14 +993,22 @@ def quickstart(
 
     if not _has_server_quickstart_extra():
         if not yes and not _is_interactive_input():
-            _print_server_guidance()
+            _print_server_guidance(include_ui=not server_only)
             raise typer.Exit(0)
-        if not _install_server_extra_for_quickstart(assume_yes=yes) or not _has_server_quickstart_extra():
+        if (
+            not _install_server_extra_for_quickstart(include_ui=not server_only, assume_yes=yes)
+            or not _has_server_quickstart_extra()
+        ):
             raise typer.Exit(1)
+    elif not server_only and not has_frontend_runtime() and _is_interactive_input():
+        from skyvern.cli.run_commands import _install_packaged_ui_if_requested  # noqa: PLC0415
+
+        _install_packaged_ui_if_requested()
 
     _run_server_quickstart(
         **_server_quickstart_options(
             no_postgres=no_postgres,
+            postgres=postgres,
             database_string=database_string,
             skip_browser_install=skip_browser_install,
             server_only=server_only,
