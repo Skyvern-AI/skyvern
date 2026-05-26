@@ -150,79 +150,87 @@ async def v3_review_in_flight(
                 timeline=[],
             )
 
-    registry = build_registry()
-    llm_caller = LLMCaller(llm_key=V3_REVIEWER_MODEL)
-
-    user_prompt = build_midrun_user_prompt(
-        episode_id=fc.episode_id,
-        fc_summary=_summarize_failure_context(fc),
-    )
-
-    LOG.info(
-        "v3_midrun_started",
-        episode_id=fc.episode_id,
-        workflow_run_id=getattr(fc.context, "workflow_run_id", None),
-        action_type=fc.action_type,
-        failed_selector=fc.failed_selector,
-        budget_max_cycles=budget.max_cycles,
-        budget_max_cost_usd=budget.max_cost_usd,
-    )
-
+    # If setup fails after this point, the reserved invocation is finalized
+    # at $0.00 but the invocation slot remains consumed to prevent retry storms.
     try:
-        result = await asyncio.wait_for(
-            run_agent_loop(
-                llm_caller=llm_caller,
-                system_prompt=MIDRUN_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                registry=registry,
-                agent_kind="midrun",
-                context=fc,
-                budget=budget,
-                organization_id=org_id,
-                prompt_name=prompt_name,
-                invocation_handle=invocation_handle,
-            ),
-            timeout=wall_clock_seconds,
-        )
-    except asyncio.TimeoutError:
-        LOG.warning(
-            "v3_midrun_wall_clock_exceeded",
+        registry = build_registry()
+        llm_caller = LLMCaller(llm_key=V3_REVIEWER_MODEL)
+
+        user_prompt = build_midrun_user_prompt(
             episode_id=fc.episode_id,
-            wall_clock_seconds=wall_clock_seconds,
-            cycles_completed=budget.cycles_used,
+            fc_summary=_summarize_failure_context(fc),
         )
-        decision = Decision.loop_error("wall_clock_exceeded")
-        await _persist_midrun_terminal(organization_id=org_id, fc=fc, decision=decision)
-        return V3MidRunResult(decision=decision, budget_used=budget, timeline=[])
 
-    final_decision = result.terminal_decision or Decision.loop_error("no_terminal")
-    LOG.info(
-        "v3_midrun_complete",
-        episode_id=fc.episode_id,
-        workflow_run_id=getattr(fc.context, "workflow_run_id", None),
-        decision_type=final_decision.type,
-        decision_reason=final_decision.reason,
-        investigation_summary=(final_decision.investigation_summary or "")[:300],
-        new_script_revision_id=final_decision.new_script_revision_id,
-        class_a=final_decision.is_midrun_class_a(),
-        class_b=final_decision.is_midrun_class_b(),
-        cycles_used=result.budget.cycles_used,
-        tokens_used=result.budget.tokens_used,
-        cost_usd_used=round(result.budget.cost_usd_used, 6),
-        elapsed_seconds=round(result.budget.elapsed_seconds, 2),
-    )
+        LOG.info(
+            "v3_midrun_started",
+            episode_id=fc.episode_id,
+            workflow_run_id=getattr(fc.context, "workflow_run_id", None),
+            action_type=fc.action_type,
+            failed_selector=fc.failed_selector,
+            budget_max_cycles=budget.max_cycles,
+            budget_max_cost_usd=budget.max_cost_usd,
+        )
 
-    await _persist_midrun_terminal(
-        organization_id=org_id,
-        fc=fc,
-        decision=final_decision,
-    )
+        try:
+            result = await asyncio.wait_for(
+                run_agent_loop(
+                    llm_caller=llm_caller,
+                    system_prompt=MIDRUN_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    registry=registry,
+                    agent_kind="midrun",
+                    context=fc,
+                    budget=budget,
+                    organization_id=org_id,
+                    prompt_name=prompt_name,
+                ),
+                timeout=wall_clock_seconds,
+            )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "v3_midrun_wall_clock_exceeded",
+                episode_id=fc.episode_id,
+                wall_clock_seconds=wall_clock_seconds,
+                cycles_completed=budget.cycles_used,
+            )
+            decision = Decision.loop_error("wall_clock_exceeded")
+            await _persist_midrun_terminal(organization_id=org_id, fc=fc, decision=decision)
+            return V3MidRunResult(decision=decision, budget_used=budget, timeline=[])
 
-    return V3MidRunResult(
-        decision=final_decision,
-        budget_used=result.budget,
-        timeline=result.timeline,
-    )
+        final_decision = result.terminal_decision or Decision.loop_error("no_terminal")
+        LOG.info(
+            "v3_midrun_complete",
+            episode_id=fc.episode_id,
+            workflow_run_id=getattr(fc.context, "workflow_run_id", None),
+            decision_type=final_decision.type,
+            decision_reason=final_decision.reason,
+            investigation_summary=(final_decision.investigation_summary or "")[:300],
+            new_script_revision_id=final_decision.new_script_revision_id,
+            class_a=final_decision.is_midrun_class_a(),
+            class_b=final_decision.is_midrun_class_b(),
+            cycles_used=result.budget.cycles_used,
+            tokens_used=result.budget.tokens_used,
+            cost_usd_used=round(result.budget.cost_usd_used, 6),
+            elapsed_seconds=round(result.budget.elapsed_seconds, 2),
+        )
+
+        await _persist_midrun_terminal(
+            organization_id=org_id,
+            fc=fc,
+            decision=final_decision,
+        )
+
+        return V3MidRunResult(
+            decision=final_decision,
+            budget_used=result.budget,
+            timeline=result.timeline,
+        )
+    finally:
+        if invocation_handle is not None:
+            try:
+                await invocation_handle.finalize_cost(budget.cost_usd_used)
+            except Exception:  # pragma: no cover
+                LOG.warning("v3_midrun_invocation_handle_finalize_failed", exc_info=True)
 
 
 __all__ = ["v3_review_in_flight"]

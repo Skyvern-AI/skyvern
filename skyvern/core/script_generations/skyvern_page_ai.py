@@ -23,8 +23,14 @@ class SkyvernPageAi(Protocol):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        v3_parent_episode_id: str | None = None,
     ) -> str | None:
-        """Click an element using AI to locate it based on intention."""
+        """Click an element using AI to locate it based on intention.
+
+        ``v3_parent_episode_id`` is set on the recursive fall-through call when
+        the v3 mid-run agent gave up (Class B). It tells the implementation to
+        update the existing fallback episode rather than create a duplicate.
+        """
         ...
 
     async def ai_input_text(
@@ -39,8 +45,12 @@ class SkyvernPageAi(Protocol):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        v3_parent_episode_id: str | None = None,
     ) -> str:
-        """Input text into an element using AI to determine the value."""
+        """Input text into an element using AI to determine the value.
+
+        See ``ai_click`` for the ``v3_parent_episode_id`` contract.
+        """
         ...
 
     async def ai_upload_file(

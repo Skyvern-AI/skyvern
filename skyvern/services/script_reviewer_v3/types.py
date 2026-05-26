@@ -72,6 +72,8 @@ class PostRunContext:
     # demotion review during the post-run pass.
     mid_run_class_a_episode_ids: list[str]
     budget: Budget
+    v3_persist_cap_consumed: bool = False
+    v3_persist_cap_acquisitions: int = 0
 
 
 @dataclasses.dataclass
@@ -149,6 +151,10 @@ class V3PostRunResult:
     # Structured persist outcomes from the post-loop deterministic pass.
     # Populated even when persists fail so the caller sees what was attempted.
     per_episode_persist_results: dict[str, PerEpisodePersistResult] = dataclasses.field(default_factory=dict)
+    # True when a post-run persist skill acquired the v3 daily cap before
+    # attempting a script write. This is distinct from per-episode DB persists.
+    v3_persist_cap_consumed: bool = False
+    v3_persist_cap_acquisitions: int = 0
 
 
 __all__ = [
