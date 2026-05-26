@@ -1320,7 +1320,14 @@ async def handle_click_action(
 
         finally:
             if incremental_scraped:
-                await incremental_scraped.stop_listen_dom_increment()
+                try:
+                    await incremental_scraped.stop_listen_dom_increment()
+                except Exception:
+                    LOG.warning(
+                        "stop_listen_dom_increment failed after click, ignoring",
+                        exc_info=True,
+                        element_id=skyvern_element.get_id(),
+                    )
 
     return results
 
