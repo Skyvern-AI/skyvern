@@ -44,6 +44,7 @@ from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -716,6 +717,36 @@ class LLMAPIHandlerFactory:
             return None
 
     @staticmethod
+    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
+        default for its non-flex twin when `trigger_type == manual` (UI/MCP)."""
+        ctx = skyvern_context.current()
+        if ctx is None or ctx.trigger_type != WorkflowRunTriggerType.manual:
+            return None
+        effective_key = (
+            getattr(default, "llm_key", None)
+            or getattr(getattr(default, "__self__", None), "llm_key", None)
+            or settings.LLM_KEY
+        )
+        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(effective_key)
+        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+            return None
+        try:
+            non_flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(non_flex_key)
+            span = otel_trace.get_current_span()
+            span.set_attribute("non_flex_routing_applied", True)
+            span.set_attribute("non_flex_routing_resolved_key", non_flex_key)
+            return non_flex_handler
+        except Exception:
+            LOG.warning(
+                "Failed to get non-flex LLM API handler, falling back to default (flex) resolution.",
+                non_flex_key=non_flex_key,
+                effective_key=effective_key,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
     def wrap_for_flex_routing(handler: LLMAPIHandler) -> LLMAPIHandler:
         """Wrap a default LLM handler so it applies flex routing when context says so.
 
@@ -726,6 +757,9 @@ class LLMAPIHandlerFactory:
         """
 
         async def flex_aware_handler(*args: Any, **kwargs: Any) -> Any:
+            non_flex_handler = LLMAPIHandlerFactory._maybe_get_non_flex_handler(handler)
+            if non_flex_handler is not None:
+                return await non_flex_handler(*args, **kwargs)
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(handler)
             target = flex_handler if flex_handler is not None else handler
             return await target(*args, **kwargs)
@@ -750,6 +784,9 @@ class LLMAPIHandlerFactory:
         # Flex routing is treated as default-path tier optimization, not a model rewriter.
         # Treat empty string as "no override" — block models persist `llm_key=""` rather than NULL.
         if not override_llm_key:
+            non_flex_handler = LLMAPIHandlerFactory._maybe_get_non_flex_handler(default)
+            if non_flex_handler is not None:
+                return non_flex_handler
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(default)
             if flex_handler is not None:
                 return flex_handler
