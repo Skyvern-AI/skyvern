@@ -70,13 +70,14 @@ def has_frontend_runtime() -> bool:
 
 def installed_ui_version() -> str:
     try:
+        module = __import__(UI_PACKAGE_MODULE)
+        return str(getattr(module, "__version__"))
+    except (AttributeError, ModuleNotFoundError):
+        pass
+    try:
         return metadata.version(UI_PACKAGE_NAME)
     except metadata.PackageNotFoundError:
-        try:
-            module = __import__(UI_PACKAGE_MODULE)
-        except ModuleNotFoundError:
-            return "unknown"
-        return str(getattr(module, "__version__", "unknown"))
+        return "unknown"
 
 
 def _ensure_private_dir(path: Path) -> None:

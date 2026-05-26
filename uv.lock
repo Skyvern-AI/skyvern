@@ -5798,6 +5798,7 @@ all = [
     { name = "urllib3" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
+    { name = "yutori" },
     { name = "zstandard" },
 ]
 local = [
@@ -6185,6 +6186,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'all'", specifier = ">=12.0,<15.1" },
     { name = "websockets", marker = "extra == 'local'", specifier = ">=12.0,<15.1" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=12.0,<15.1" },
+    { name = "yutori", marker = "extra == 'all'", specifier = ">=0.5.0" },
     { name = "yutori", marker = "extra == 'local'", specifier = ">=0.5.0" },
     { name = "yutori", marker = "extra == 'server'", specifier = ">=0.5.0" },
     { name = "zstandard", marker = "extra == 'all'", specifier = ">=0.25.0" },

@@ -170,6 +170,7 @@ all = [
     "skyvern-ui==1.0.36",
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    "yutori>=0.5.0",
     "openai-agents>=0.10.5,<0.15",
     "python-dotenv==1.2.2",
     "sqlalchemy[mypy]>=2.0.29,<3",
