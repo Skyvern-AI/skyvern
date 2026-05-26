@@ -391,3 +391,76 @@ class TestCheckPdfViewerEmbed:
         )
         result = sp.check_pdf_viewer_embed()
         assert result is None
+
+
+class TestCheckPdfViewerEmbedPerFrame:
+    def test_pdf_embed_sole_element_in_child_frame(self) -> None:
+        """Detects PDF embed when it is the only element in a child frame."""
+        data_uri = "data:application/pdf;base64,JVBERi0xLjQ="
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "NAV1", "tagName": "a", "attributes": {"href": "#"}},
+                {"id": "NAV2", "tagName": "a", "attributes": {"href": "#"}},
+                {"id": "PDF1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": data_uri}},
+            ],
+        )
+        sp.id_to_frame_dict = {"NAV1": "frame_top", "NAV2": "frame_top", "PDF1": "frame_content"}
+        result = sp.check_pdf_viewer_embed()
+        assert result == data_uri
+
+    def test_pdf_embed_with_other_elements_in_same_frame_returns_none(self) -> None:
+        """Returns None when PDF embed shares its frame with other elements (not a PDF viewer frame)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "BTN1", "tagName": "button", "attributes": {}},
+                {"id": "PDF1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"BTN1": "frame_a", "PDF1": "frame_a"}
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_backward_compat_single_element_page(self) -> None:
+        """Single-element page with PDF embed still detected (original behavior)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "E1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "test.pdf"}},
+            ],
+        )
+        result = sp.check_pdf_viewer_embed()
+        assert result == "test.pdf"
+
+    def test_no_id_to_frame_dict_falls_through(self) -> None:
+        """Without id_to_frame_dict, multi-element page returns None (no per-frame scan)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"tagName": "a", "attributes": {}},
+                {"tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_main_frame_embed_not_detected_by_per_frame_scan(self) -> None:
+        """Embed in main.frame is not detected by per-frame scan (but whole-page check catches single-element pages)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "NAV1", "tagName": "a", "attributes": {}},
+                {"id": "E1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"NAV1": "frame_top", "E1": "main.frame"}
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_multiple_frames_first_pdf_wins(self) -> None:
+        """When multiple frames each have a sole PDF embed, first match is returned."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "P1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "first.pdf"}},
+                {"id": "P2", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "second.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"P1": "frame_a", "P2": "frame_b"}
+        result = sp.check_pdf_viewer_embed()
+        assert result == "first.pdf"

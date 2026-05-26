@@ -11,7 +11,7 @@ from skyvern.cli.quickstart import quickstart_app
 def test_install_server_extra_assume_yes_skips_prompt(monkeypatch) -> None:
     commands: list[list[str]] = []
 
-    monkeypatch.setattr(quickstart_module, "_server_extra_install_target", lambda **_kwargs: "skyvern[server]==1.2.3")
+    monkeypatch.setattr(quickstart_module, "_server_extra_install_target", lambda: "skyvern[server]==1.2.3")
     monkeypatch.setattr(
         quickstart_module.Confirm,
         "ask",
