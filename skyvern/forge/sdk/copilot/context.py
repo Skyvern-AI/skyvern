@@ -88,7 +88,13 @@ class StructuredContext(BaseModel):
             elif tool == "update_workflow":
                 self.workflow_state = summary
 
-            elif tool in ("click", "evaluate", "run_blocks_and_collect_debug", "get_run_results"):
+            elif tool in (
+                "click",
+                "evaluate",
+                "run_blocks_and_collect_debug",
+                "update_and_run_blocks",
+                "get_run_results",
+            ):
                 self.decisions_made.append(f"{tool}: {summary}")
 
             elif tool == "get_browser_screenshot":
@@ -98,7 +104,7 @@ class StructuredContext(BaseModel):
                         self.urls_visited.append(UrlVisit(url=url, summary="screenshot"))
 
             output = entry.get("output_preview")
-            if output and tool in ("run_blocks_and_collect_debug", "get_run_results"):
+            if output and tool in ("run_blocks_and_collect_debug", "update_and_run_blocks", "get_run_results"):
                 preview = output[:300] if len(output) > 300 else output
                 self.decisions_made.append(f"  output: {preview}")
 

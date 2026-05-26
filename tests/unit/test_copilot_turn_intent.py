@@ -13,7 +13,7 @@ from skyvern.forge.sdk.copilot.agent import (
     _native_tools_for_turn,
     _store_request_policy_on_context,
 )
-from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.context import CopilotContext, StructuredContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.turn_intent import (
     UNRESOLVED_BLOCK_REF_TARGET_ENTITY,
@@ -22,6 +22,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntentAuthority,
     TurnIntentMode,
     TurnIntentReasonCode,
+    _has_structured_prior_run_signal,
     build_turn_intent,
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -83,6 +84,7 @@ def test_turn_intent_trace_data_omits_raw_goal_and_target_values() -> None:
         "may_run_blocks": False,
         "may_answer_without_mutation": True,
         "requires_user_input": False,
+        "may_read_run_context": False,
         "confidence": 0.75,
         "reason_codes": ["request_policy_derived"],
         "target_entity_types": ["credential", "workflow"],
@@ -526,3 +528,163 @@ def test_answer_only_turn_intent_hides_get_run_results_tool() -> None:
     filtered = _native_tools_for_turn(tools, intent)
 
     assert filtered == []
+
+
+def _structured_context_with_run_decision() -> str:
+    return StructuredContext(
+        decisions_made=[
+            "run_blocks_and_collect_debug: ran 3 blocks, hit per-tool-call budget",
+            "  output: block_extract: {'rbt_certified': true}",
+        ],
+    ).to_json_str()
+
+
+def test_build_turn_intent_unknown_with_workflow_run_id_upgrades_to_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_test_123",
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert intent.authority.may_read_run_context is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+
+
+def test_build_turn_intent_unknown_with_persisted_prior_run_signal_upgrades_to_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=_structured_context_with_run_decision(),
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert intent.authority.may_read_run_context is True
+
+
+def test_build_turn_intent_unknown_with_persisted_prior_failed_run_upgrades_to_diagnose() -> None:
+    structured_context = StructuredContext()
+    structured_context.merge_turn_summary(
+        [
+            {
+                "tool": "update_and_run_blocks",
+                "summary": "Failed: The run exceeded the 240s per-tool-call budget. Run ID: wr_budget_123.",
+            }
+        ]
+    )
+    global_llm_context = structured_context.to_json_str()
+    assert _has_structured_prior_run_signal(global_llm_context) is True
+
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context=global_llm_context,
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT in intent.reason_codes
+    assert intent.authority.may_read_run_context is True
+
+
+def test_build_turn_intent_unknown_without_run_signals_stays_unknown() -> None:
+    intent = build_turn_intent(
+        user_message="please continue",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.UNKNOWN
+    assert TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT not in intent.reason_codes
+    assert intent.authority.may_read_run_context is False
+
+
+def test_build_turn_intent_docs_answer_keeps_read_context_false_even_with_run_id() -> None:
+    intent = build_turn_intent(
+        user_message="How do parameters work?",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_test_123",
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_read_run_context is False
+
+
+def test_build_turn_intent_explicit_run_results_outranks_skip_test_policy() -> None:
+    intent = build_turn_intent(
+        user_message="Call get_run_results with workflow_run_id wr_test_123. Do not run blocks.",
+        workflow_yaml="title: Existing workflow\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="skip_test", allow_update_workflow=True, allow_run_blocks=False),
+        workflow_run_id="wr_test_123",
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_read_run_context is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+
+
+def test_build_turn_intent_diagnose_grants_may_read_run_context_without_run_id() -> None:
+    intent = build_turn_intent(
+        user_message="Diagnose the failure.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_read_run_context is True
+
+
+def test_has_structured_prior_run_signal_ignores_workflow_state_only() -> None:
+    payload = StructuredContext(workflow_state="updated workflow yaml diff summary").to_json_str()
+    assert _has_structured_prior_run_signal(payload) is False
+
+
+def test_has_structured_prior_run_signal_ignores_unrelated_decisions() -> None:
+    payload = StructuredContext(
+        decisions_made=["click: clicked submit", "evaluate: returned true"],
+    ).to_json_str()
+    assert _has_structured_prior_run_signal(payload) is False
+
+
+def test_has_structured_prior_run_signal_handles_malformed_json() -> None:
+    assert _has_structured_prior_run_signal("{not valid json") is False
+    assert _has_structured_prior_run_signal("") is False
+
+
+def test_has_structured_prior_run_signal_ignores_failed_tool_attempt_without_output() -> None:
+    # The merger appends a `<tool>: Failed: ...` entry for blocked/loop-rejected
+    # calls, but no `  output:` line (hooks.py only sets output_preview on
+    # ok=True). Failed attempts must not trigger recovery.
+    payload = StructuredContext(
+        decisions_made=["run_blocks_and_collect_debug: Failed: blocked by policy"],
+    ).to_json_str()
+    assert _has_structured_prior_run_signal(payload) is False
+
+
+def test_has_structured_prior_run_signal_matches_output_preview_line() -> None:
+    payload = StructuredContext(
+        decisions_made=[
+            "get_run_results: workflow completed",
+            "  output: block_extract: {'result': 'ok'}",
+        ],
+    ).to_json_str()
+    assert _has_structured_prior_run_signal(payload) is True

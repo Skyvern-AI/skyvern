@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from skyvern.forge.sdk.copilot.context import StructuredContext
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
@@ -36,6 +37,16 @@ NO_MUTATION_TURN_INTENT_MODES = frozenset(
         TurnIntentMode.DIAGNOSE,
         TurnIntentMode.CLARIFY,
         TurnIntentMode.REFUSE,
+    }
+)
+
+# Modes that have no legitimate use of run context. Used by tools.py to scope
+# the intra-turn read-context override away from explicitly answer-only turns.
+READ_CONTEXT_DENIED_MODES = frozenset(
+    {
+        TurnIntentMode.DOCS_ANSWER,
+        TurnIntentMode.REFUSE,
+        TurnIntentMode.CLARIFY,
     }
 )
 
@@ -73,6 +84,7 @@ class TurnIntentReasonCode(StrEnum):
     CONFIRMATION_CARRYOVER = "confirmation_carryover"
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
     USER_NON_PROGRESS = "user_non_progress"
+    RECOVERY_FROM_RUN_CONTEXT = "recovery_from_run_context"
 
 
 class TurnIntentAuthority(BaseModel):
@@ -82,6 +94,8 @@ class TurnIntentAuthority(BaseModel):
     may_run_blocks: bool = False
     may_answer_without_mutation: bool = True
     requires_user_input: bool = False
+    # Decoupled from mutation flags so DIAGNOSE turns may inspect run state without write authority.
+    may_read_run_context: bool = False
 
 
 class TurnIntent(BaseModel):
@@ -140,6 +154,7 @@ class TurnIntent(BaseModel):
             "may_run_blocks": self.authority.may_run_blocks,
             "may_answer_without_mutation": self.authority.may_answer_without_mutation,
             "requires_user_input": self.authority.requires_user_input,
+            "may_read_run_context": self.authority.may_read_run_context,
             "confidence": self.confidence,
             "reason_codes": [reason.value for reason in self.reason_codes],
         }
@@ -155,6 +170,7 @@ _BUILD_TERMS = ("build", "create", "make", "generate")
 _NEW_BROWSER_TASK_TERMS = ("go to", "navigate to", "open", "visit", "search for")
 _EDIT_TERMS = ("edit", "update", "change", "modify", "replace", "fix")
 _DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error", "result")
+_RUN_CONTEXT_REQUEST_TERMS = ("get_run_results", "workflow_run_id", "run result", "run results")
 _DOCS_TERMS = (
     "explain",
     "how do",
@@ -203,6 +219,10 @@ def _word_boundary_pattern(terms: tuple[str, ...]) -> re.Pattern[str]:
 
 def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
     return _word_boundary_pattern(terms).search(text.lower()) is not None
+
+
+def _is_explicit_run_context_request(user_message: str) -> bool:
+    return _contains_any(user_message, _RUN_CONTEXT_REQUEST_TERMS)
 
 
 def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
@@ -302,6 +322,37 @@ def _mode_from_keywords(
     if not has_workflow and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS):
         return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
     return None
+
+
+_PRIOR_RUN_OUTPUT_PREFIX = "  output:"
+_RUN_CONTEXT_DECISION_PREFIXES = (
+    "run_blocks_and_collect_debug:",
+    "update_and_run_blocks:",
+    "get_run_results:",
+)
+_PRIOR_RUN_FAILURE_MARKERS = (
+    "Run ID:",
+    "workflow_run_id",
+    "Outcome is uncertain",
+    "per-tool-call budget",
+)
+
+
+def _decision_records_prior_run(entry: str) -> bool:
+    if entry.startswith(_PRIOR_RUN_OUTPUT_PREFIX):
+        return True
+    if not entry.startswith(_RUN_CONTEXT_DECISION_PREFIXES):
+        return False
+    if any(marker in entry for marker in _PRIOR_RUN_FAILURE_MARKERS):
+        return True
+    return entry.startswith(("run_blocks_and_collect_debug: Run ", "update_and_run_blocks: Run "))
+
+
+def _has_structured_prior_run_signal(global_llm_context: str) -> bool:
+    if not (global_llm_context or "").strip():
+        return False
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return any(isinstance(entry, str) and _decision_records_prior_run(entry) for entry in structured.decisions_made)
 
 
 _AFFIRMATIVE_REPLIES = frozenset(
@@ -466,6 +517,8 @@ def build_turn_intent(
     confidence = 0.2 if (has_workflow or has_prior_context or chat_history) else 0.0
     missing_context_question = None
 
+    has_prior_run_signal = workflow_run_id is not None or _has_structured_prior_run_signal(global_llm_context)
+
     if request_policy.raw_secret_detected and request_policy.raw_secret_handling != "redacted_draft":
         mode = TurnIntentMode.REFUSE
         expected_output = TurnIntentExpectedOutput.REFUSAL
@@ -479,6 +532,11 @@ def build_turn_intent(
         confidence = 0.8
         missing_context_question = request_policy.clarification_question
         reason_codes.append(TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION)
+    elif has_prior_run_signal and _is_explicit_run_context_request(user_message):
+        mode = TurnIntentMode.DIAGNOSE
+        expected_output = TurnIntentExpectedOutput.RUN_RESULT
+        confidence = 0.45
+        reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
     elif request_policy.testing_intent == "skip_test":
         mode = TurnIntentMode.DRAFT_ONLY
         expected_output = TurnIntentExpectedOutput.WORKFLOW_DRAFT
@@ -503,6 +561,11 @@ def build_turn_intent(
         if unresolved_block_refs:
             target_entities[UNRESOLVED_BLOCK_REF_TARGET_ENTITY] = unresolved_block_refs
 
+    if mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
+        mode = TurnIntentMode.DIAGNOSE
+        expected_output = TurnIntentExpectedOutput.RUN_RESULT
+        reason_codes.append(TurnIntentReasonCode.RECOVERY_FROM_RUN_CONTEXT)
+
     if mode == TurnIntentMode.DOCS_ANSWER:
         authority.may_update_workflow = False
         authority.may_run_blocks = False
@@ -514,6 +577,8 @@ def build_turn_intent(
     elif mode == TurnIntentMode.DIAGNOSE:
         authority.may_update_workflow = False
         authority.may_run_blocks = False
+
+    authority.may_read_run_context = mode == TurnIntentMode.DIAGNOSE
 
     return TurnIntent(
         mode=mode,
