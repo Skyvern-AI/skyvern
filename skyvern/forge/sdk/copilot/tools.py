@@ -10,11 +10,16 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import structlog
 import yaml
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover — bs4 is a transitive dep but discovery degrades gracefully without it.
+    BeautifulSoup = None  # type: ignore[assignment, misc]
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
@@ -25,6 +30,13 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_goal_wrapping import wrap_workflow_block_goals
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.build_phase import (
+    BuildPhase,
+    _phase_tool_error,
+    advance_to_composing,
+    advance_to_discovering,
+    advance_to_testing,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
@@ -1127,7 +1139,18 @@ def _authority_tool_error(
         )
     if request_policy_error is not None and not ignore_request_policy_error:
         return request_policy_error
-    return turn_intent_error
+    if turn_intent_error is not None:
+        return turn_intent_error
+    phase_error = _phase_tool_error(ctx, tool_name)
+    if phase_error is not None:
+        LOG.info(
+            "copilot authority gate blocked tool",
+            authority_gate_layer="build_phase",
+            blocked_tool=tool_name,
+            build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
+            safe_reason_code="build_phase_gate",
+        )
+    return phase_error
 
 
 _PARAMETER_TYPE_PLACEHOLDERS: dict[WorkflowParameterType, Any] = {
@@ -4487,9 +4510,553 @@ async def update_and_run_blocks_tool(
             workflow_updated=True,
         )
         enqueue_screenshot_from_result(copilot_ctx, run_result)
+        if run_result.get("ok"):
+            advance_to_testing(copilot_ctx)
 
     sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
     return json.dumps(sanitized)
+
+
+# Build-time entrypoint discovery: navigates and reads pages, returns a
+# candidate URL into the agent's context. Never mutates workflow YAML.
+# Available only during INITIAL / DISCOVERING phases.
+
+_DISCOVERY_PER_CHAT_BUDGET = 3
+_DISCOVERY_PER_TURN_BUDGET = 1
+_DISCOVERY_WALL_CLOCK_SECONDS = 60.0
+_DISCOVERY_STEP_CAP = 8
+_DISCOVERY_EVIDENCE_TRAIL_MAX = 8
+_DISCOVERY_CANDIDATE_FORM_FIELDS_MAX = 10
+_DISCOVERY_HTML_BYTES_MAX = 200_000
+
+_DISCOVERY_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+# host + optional path/query/fragment — handles `example.com/login`,
+# `the-internet.herokuapp.com/tables?x=y`, `site.com?q=x`, `site.com#frag`.
+_DISCOVERY_DOMAIN_WITH_PATH_RE = re.compile(
+    r"^[a-z0-9-]+(\.[a-z]{2,})+([/?#][^\s]*)?$",
+    re.IGNORECASE,
+)
+_DISCOVERY_BARE_WORD_RE = re.compile(r"^[a-z0-9-]{2,32}$", re.IGNORECASE)
+_DISCOVERY_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_DISCOVERY_LOGIN_TITLE_RE = re.compile(r"\b(sign\s*in|log\s*in|login)\b", re.IGNORECASE)
+_DISCOVERY_PASSWORD_INPUT_RE = re.compile(
+    r"<input[^>]*type\s*=\s*[\"']password[\"']",
+    re.IGNORECASE,
+)
+_DISCOVERY_ANTI_BOT_PATTERNS = (
+    "cloudflare",
+    "just a moment",
+    "captcha",
+    "verify you are human",
+    "access denied",
+    "akamai",
+    "are you a robot",
+)
+
+
+def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
+    """Resolve the user-supplied site name/URL into a navigable URL.
+
+    Returns ``(resolved_url, kind)`` where ``kind`` is one of:
+    ``url`` / ``domain`` / ``word`` / ``unresolved``.
+    """
+    token = (site_or_url or "").strip()
+    if not token:
+        return None, "unresolved"
+    if _DISCOVERY_URL_SCHEME_RE.match(token):
+        return token, "url"
+    if _DISCOVERY_DOMAIN_WITH_PATH_RE.match(token):
+        return f"https://{token}", "domain"
+    if _DISCOVERY_BARE_WORD_RE.match(token):
+        return f"https://www.{token.lower()}.com", "word"
+    return None, "unresolved"
+
+
+def _discovery_anchor_score(
+    anchor_text: str,
+    anchor_title: str,
+    href_path: str,
+    intent_tokens: set[str],
+) -> int:
+    """Count intent tokens that appear as substrings of the combined anchor text.
+
+    Substring (not exact-token) matching handles ``sort`` ↔ ``sortable`` and
+    ``table`` ↔ ``tables`` without a full stemmer.
+    """
+    if not intent_tokens:
+        return 0
+    combined = f"{anchor_text} {anchor_title} {href_path}".lower()
+    return sum(1 for token in intent_tokens if token in combined)
+
+
+def _discovery_title_score(page_title: str, intent_tokens: set[str]) -> int:
+    if not intent_tokens or not page_title:
+        return 0
+    lowered = page_title.lower()
+    return sum(1 for token in intent_tokens if token in lowered)
+
+
+def _discovery_detect_login_wall(html: str, page_title: str) -> bool:
+    if _DISCOVERY_LOGIN_TITLE_RE.search(page_title or ""):
+        return True
+    return bool(_DISCOVERY_PASSWORD_INPUT_RE.search(html or ""))
+
+
+def _discovery_detect_anti_bot(html: str, page_title: str) -> bool:
+    lowered_title = (page_title or "").lower()
+    lowered_html = (html or "")[:_DISCOVERY_HTML_BYTES_MAX].lower()
+    return any(pat in lowered_title or pat in lowered_html for pat in _DISCOVERY_ANTI_BOT_PATTERNS)
+
+
+def _discovery_build_result(
+    *,
+    candidate_url: str | None,
+    candidate_form_fields: list[dict[str, Any]],
+    evidence_trail: list[dict[str, Any]],
+    confidence: float,
+    failure_reason: str | None,
+    ok: bool = True,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Shape a `discover_workflow_entrypoint` result envelope.
+
+    Convention: ``ok=True`` for any *completed* walk — including controlled
+    outcomes that report a ``failure_reason`` and ``candidate_url=None``.
+    ``ok=False`` is reserved for actual tool errors (MCP unavailable, browser
+    boot failure, internal exception). Matches the existing copilot
+    ``_request_policy_tool_error`` convention so the eval harness counts a
+    controlled failure as a successful tool call.
+    """
+    return {
+        "ok": ok,
+        "data": {
+            "candidate_url": candidate_url,
+            "candidate_form_fields": candidate_form_fields[:_DISCOVERY_CANDIDATE_FORM_FIELDS_MAX],
+            "evidence_trail": evidence_trail[:_DISCOVERY_EVIDENCE_TRAIL_MAX],
+            "confidence": float(confidence),
+            "failure_reason": failure_reason,
+        },
+        "error": error,
+    }
+
+
+def _discovery_parse_html(html: str) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
+    """Parse HTML for page title, link anchors, and form-field metadata.
+
+    Uses BeautifulSoup if available (a transitive Skyvern dep). Falls back to
+    empty results if not — discovery degrades gracefully rather than crashing.
+    """
+    if BeautifulSoup is None:
+        return "", [], []
+
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return "", [], []
+
+    title_text = ""
+    title_tag = soup.find("title")
+    if title_tag and title_tag.string:
+        title_text = title_tag.string.strip()
+    h1_tag = soup.find("h1")
+    if h1_tag:
+        h1_text = h1_tag.get_text(strip=True)
+        if h1_text:
+            title_text = f"{title_text} {h1_text}".strip()
+
+    anchors: list[dict[str, str]] = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        text = a.get_text(" ", strip=True)
+        anchors.append(
+            {
+                "href": href,
+                "text": text[:240],
+                "title": (a.get("title") or "")[:240],
+            }
+        )
+
+    form_fields: list[dict[str, str]] = []
+    form = soup.find("form")
+    if form is not None:
+        for inp in form.find_all(["input", "select", "textarea"]):
+            field_type = inp.get("type", inp.name) or "text"
+            if field_type.lower() in {"hidden", "submit", "button"}:
+                continue
+            field_name = inp.get("name") or inp.get("id") or ""
+            label_text = ""
+            label_id = inp.get("id")
+            if label_id:
+                label_tag = soup.find("label", attrs={"for": label_id})
+                if label_tag is not None:
+                    label_text = label_tag.get_text(" ", strip=True)
+            form_fields.append(
+                {
+                    "name": field_name[:120],
+                    "label": label_text[:240],
+                    "type": str(field_type)[:40],
+                    "value_hint": (inp.get("placeholder") or "")[:240],
+                }
+            )
+
+    return title_text, anchors, form_fields
+
+
+def _discovery_resolve_href(base_url: str, href: str) -> str | None:
+    try:
+        absolute = urljoin(base_url, href)
+    except Exception:
+        return None
+    parsed_abs = urlparse(absolute)
+    parsed_base = urlparse(base_url)
+    if parsed_abs.scheme not in {"http", "https"}:
+        return None
+    # Same-origin only — discovery does not follow cross-origin links to keep
+    # the entrypoint search bounded to the user's named site.
+    if parsed_abs.netloc and parsed_base.netloc and parsed_abs.netloc != parsed_base.netloc:
+        return None
+    return absolute
+
+
+# Per-call timeout for each MCP primitive inside the discovery walker. The
+# walker also checks the cumulative 60s wall clock between steps, but without
+# a per-call cap a single hung navigate or get_html could block past the
+# cumulative cap (cumulative is only checked between awaits).
+_DISCOVERY_PER_CALL_TIMEOUT_SECONDS = 20.0
+
+
+async def _discovery_navigate(ctx: CopilotContext, url: str) -> dict[str, Any]:
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    try:
+        return await asyncio.wait_for(
+            server.call_internal_tool("skyvern_navigate", {"url": url}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"skyvern_navigate timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+
+
+async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
+    """Read the full page body. ``skyvern_get_html`` requires a selector arg;
+    pass ``body`` so the walker receives the full document body. Without this
+    the raw MCP call fails validation since the inspection tool has a
+    required positional ``selector``.
+    """
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    try:
+        return await asyncio.wait_for(
+            server.call_internal_tool("skyvern_get_html", {"selector": "body"}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"skyvern_get_html timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+
+
+def _discovery_extract_html_payload(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        for key in ("html", "outer_html", "text", "content"):
+            value = data.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _discovery_extract_current_url(result: dict[str, Any], fallback: str) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        url = data.get("url") or data.get("current_url")
+        if isinstance(url, str) and url:
+            return url
+    return fallback
+
+
+async def _discovery_walk(
+    ctx: CopilotContext,
+    *,
+    entry_url: str,
+    intent_hint: str,
+) -> dict[str, Any]:
+    """Deterministic anchor-scoring walker. No inner LLM call.
+
+    Reads each visited page, looks for a strong title/H1 match with the
+    intent_hint, surfaces a form if one is present, and otherwise follows
+    the highest-scored same-origin anchor whose text matches the
+    intent_hint. Bounded by step / wall-clock caps.
+    """
+    intent_tokens = set(_DISCOVERY_TOKEN_RE.findall(intent_hint.lower())) if intent_hint else set()
+    evidence_trail: list[dict[str, Any]] = []
+    current_url = entry_url
+    started = ctx.discovery_started_monotonic or time.monotonic()
+
+    for step in range(_DISCOVERY_STEP_CAP):
+        ctx.discovery_step_count = step + 1
+        elapsed = time.monotonic() - started
+        if elapsed > _DISCOVERY_WALL_CLOCK_SECONDS:
+            return _discovery_build_result(
+                candidate_url=None,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=0.0,
+                failure_reason="wall_clock_limit",
+            )
+
+        nav_result = await _discovery_navigate(ctx, current_url)
+        if not nav_result.get("ok"):
+            evidence_trail.append(
+                {
+                    "url": current_url,
+                    "page_title": "",
+                    "transition_reason": f"navigate_failed: {nav_result.get('error', 'unknown')}"[:240],
+                }
+            )
+            return _discovery_build_result(
+                candidate_url=None,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=0.0,
+                failure_reason="no_candidate",
+            )
+
+        current_url = _discovery_extract_current_url(nav_result, current_url)
+        html_result = await _discovery_get_html(ctx)
+        html = _discovery_extract_html_payload(html_result) if html_result.get("ok") else ""
+        page_title, anchors, form_fields = _discovery_parse_html(html)
+
+        evidence_trail.append(
+            {
+                "url": current_url,
+                "page_title": page_title[:240],
+                "transition_reason": "initial" if step == 0 else "anchor_match",
+            }
+        )
+
+        if _discovery_detect_anti_bot(html, page_title):
+            return _discovery_build_result(
+                candidate_url=None,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=0.0,
+                failure_reason="anti_bot_wall",
+            )
+        if _discovery_detect_login_wall(html, page_title):
+            return _discovery_build_result(
+                candidate_url=None,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=0.0,
+                failure_reason="login_wall",
+            )
+
+        title_score = _discovery_title_score(page_title, intent_tokens)
+
+        if intent_tokens and title_score >= 2:
+            confidence = min(1.0, title_score / max(1, len(intent_tokens)))
+            return _discovery_build_result(
+                candidate_url=current_url,
+                candidate_form_fields=form_fields,
+                evidence_trail=evidence_trail,
+                confidence=confidence,
+                failure_reason=None,
+            )
+
+        if form_fields and (title_score >= 1 or step > 0):
+            confidence = 0.6 if title_score >= 1 else 0.4
+            return _discovery_build_result(
+                candidate_url=current_url,
+                candidate_form_fields=form_fields,
+                evidence_trail=evidence_trail,
+                confidence=confidence,
+                failure_reason=None,
+            )
+
+        if not intent_tokens:
+            return _discovery_build_result(
+                candidate_url=current_url,
+                candidate_form_fields=form_fields,
+                evidence_trail=evidence_trail,
+                confidence=0.3,
+                failure_reason=None,
+            )
+
+        best_score = 0
+        best_href: str | None = None
+        for anchor in anchors:
+            score = _discovery_anchor_score(
+                anchor.get("text", ""),
+                anchor.get("title", ""),
+                anchor.get("href", ""),
+                intent_tokens,
+            )
+            if score > best_score:
+                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
+                if resolved is None:
+                    continue
+                best_score = score
+                best_href = resolved
+
+        if best_score == 0 or best_href is None:
+            return _discovery_build_result(
+                candidate_url=None,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=0.0,
+                failure_reason="no_candidate",
+            )
+
+        current_url = best_href
+
+    return _discovery_build_result(
+        candidate_url=None,
+        candidate_form_fields=[],
+        evidence_trail=evidence_trail,
+        confidence=0.0,
+        failure_reason="step_limit",
+    )
+
+
+async def _discover_workflow_entrypoint_impl(
+    copilot_ctx: Any,
+    site_or_url: str,
+    intent_hint: str,
+) -> dict[str, Any]:
+    """Discovery tool body — separated from the @function_tool wrapper so
+    tests can drive it with a stand-in ctx without the SDK's invocation
+    machinery.
+    """
+    arguments = {"site_or_url": site_or_url, "intent_hint": intent_hint}
+
+    authority_error = _authority_tool_error(copilot_ctx, "discover_workflow_entrypoint")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        return result
+
+    if copilot_ctx.discovery_calls_this_turn >= _DISCOVERY_PER_TURN_BUDGET:
+        result = _discovery_build_result(
+            candidate_url=None,
+            candidate_form_fields=[],
+            evidence_trail=list(copilot_ctx.discovery_evidence_trail),
+            confidence=0.0,
+            failure_reason="discovery_already_completed_this_turn",
+        )
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        return result
+
+    cumulative = copilot_ctx.prior_discovery_calls_made + copilot_ctx.discovery_calls_this_turn
+    if cumulative >= _DISCOVERY_PER_CHAT_BUDGET:
+        result = _discovery_build_result(
+            candidate_url=None,
+            candidate_form_fields=[],
+            evidence_trail=[],
+            confidence=0.0,
+            failure_reason="discovery_budget_exhausted_for_chat",
+        )
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        return result
+
+    entry_url, kind = _resolve_discovery_entry_url(site_or_url)
+    if entry_url is None:
+        result = _discovery_build_result(
+            candidate_url=None,
+            candidate_form_fields=[],
+            evidence_trail=[],
+            confidence=0.0,
+            failure_reason="could_not_resolve_site_name",
+        )
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        return result
+
+    if copilot_ctx.build_phase == BuildPhase.INITIAL:
+        try:
+            advance_to_discovering(copilot_ctx)
+        except ValueError as exc:
+            # Race or unexpected prior advance — proceed without re-transitioning,
+            # but surface the impossible state so it shows up in production logs.
+            LOG.warning(
+                "discover_workflow_entrypoint phase transition to discovering rejected",
+                error=str(exc),
+                build_phase=copilot_ctx.build_phase.value,
+            )
+    copilot_ctx.discovery_calls_this_turn += 1
+
+    with copilot_span(
+        "discover_workflow_entrypoint",
+        data={
+            "site_or_url_kind": kind,
+            "intent_hint_len": len(intent_hint or ""),
+            "phase_entered": copilot_ctx.build_phase.value,
+        },
+    ):
+        try:
+            result = await _discovery_walk(
+                copilot_ctx,
+                entry_url=entry_url,
+                intent_hint=intent_hint or "",
+            )
+        except Exception as exc:
+            LOG.exception("discover_workflow_entrypoint walker raised")
+            result = {
+                "ok": False,
+                "data": {
+                    "candidate_url": None,
+                    "candidate_form_fields": [],
+                    "evidence_trail": [],
+                    "confidence": 0.0,
+                    "failure_reason": None,
+                },
+                "error": f"discover_workflow_entrypoint failed: {exc}",
+            }
+
+    data_payload = result.get("data") or {}
+    data: dict[str, Any] = data_payload if isinstance(data_payload, dict) else {}
+    copilot_ctx.discovery_evidence_trail = list(data.get("evidence_trail", []))
+    if result.get("ok") and data.get("candidate_url"):
+        try:
+            advance_to_composing(copilot_ctx, reason="discovery_returned_candidate")
+        except ValueError as exc:
+            LOG.warning(
+                "discover_workflow_entrypoint phase transition to composing rejected",
+                error=str(exc),
+                build_phase=copilot_ctx.build_phase.value,
+            )
+
+    record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+    return result
+
+
+@function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)
+async def discover_workflow_entrypoint_tool(
+    ctx: RunContextWrapper,
+    site_or_url: str,
+    intent_hint: str,
+) -> str:
+    """Find the page a new workflow should start at when the user named a site but not the page.
+
+    Use this BEFORE writing blocks when the user named a website (with a URL,
+    a bare domain, or a single brand word) but no specific page. Accepts:
+    a URL with or without scheme (``example.com/login`` is fine), a bare
+    domain (``example.com``), or a single brand word (resolved as
+    ``https://www.<word>.com``). English phrases ("the X website") return
+    ``failure_reason=could_not_resolve_site_name`` — ASK_QUESTION for a URL.
+
+    Returns ``candidate_url`` plus a short ``evidence_trail`` and any
+    ``candidate_form_fields``. Use ``candidate_url`` as the ``url`` value
+    on a ``goto_url`` block. Do NOT paste the evidence into workflow YAML.
+
+    Budget: one successful call per turn, three per chat, eight page hops,
+    sixty seconds. On any ``failure_reason``, ASK_QUESTION for a URL — do not
+    retry. Discovery navigates and reads pages; it will NOT type, click form
+    buttons, run JavaScript, or submit forms.
+    """
+    result = await _discover_workflow_entrypoint_impl(ctx.context, site_or_url, intent_hint)
+    return json.dumps(result)
 
 
 NATIVE_TOOLS = [
@@ -4498,4 +5065,5 @@ NATIVE_TOOLS = [
     run_blocks_tool,
     get_run_results_tool,
     update_and_run_blocks_tool,
+    discover_workflow_entrypoint_tool,
 ]

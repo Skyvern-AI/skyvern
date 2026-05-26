@@ -20,6 +20,7 @@ from mcp.types import (
     TextContent,
 )
 
+from skyvern.forge.sdk.copilot.build_phase import _phase_tool_error
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -200,6 +201,22 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
+        # Defense-in-depth phase gate for MCP-exposed browser primitives. The
+        # native gate (`_authority_tool_error` in tools.py) covers native
+        # function_tool calls; this branch covers tools dispatched only
+        # through SkyvernOverlayMCPServer, which never pass through the
+        # native gate. The two checks share `_phase_tool_error`, so a tool
+        # gated at both layers reports the same error message.
+        phase_error = _phase_tool_error(copilot_ctx, tool_name)
+        if phase_error:
+            LOG.warning(
+                "Phase-gated MCP tool call rejected",
+                tool_name=tool_name,
+                build_phase=getattr(getattr(copilot_ctx, "build_phase", None), "value", None),
+            )
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": phase_error})
+            return _copilot_to_call_tool_result({"ok": False, "error": phase_error})
+
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
@@ -281,6 +298,49 @@ class SkyvernOverlayMCPServer(MCPServer):
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)
         return _copilot_to_call_tool_result(copilot_result)
+
+    async def call_internal_tool(
+        self,
+        mcp_tool_name: str,
+        mcp_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Raw FastMCP call for internal copilot subsystems (discovery walker).
+
+        Bypasses overlay hooks, loop detection, and screenshot recording —
+        those are model-facing concerns. Still routes through
+        ``ensure_browser_session`` and ``mcp_browser_context`` for session/auth
+        scoping. Mirrors the error-handling block from ``call_tool`` so MCP-
+        side validation or tool errors surface as ``ok=False`` with an
+        extracted error string rather than silently defaulting to
+        ``ok=True``.
+        """
+        if not self._client:
+            return {"ok": False, "error": "MCP client not connected"}
+        ctx = self._context_provider()
+        err = await ensure_browser_session(ctx)
+        if err:
+            return err
+        merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
+        try:
+            async with mcp_browser_context(ctx):
+                raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+        except Exception as exc:
+            LOG.warning(
+                "Internal MCP tool call failed",
+                tool=mcp_tool_name,
+                error=str(exc),
+                exc_info=True,
+            )
+            return {"ok": False, "error": f"{mcp_tool_name} failed: {exc}"}
+        raw_mcp = dict(raw.structured_content or {})
+        if raw.is_error:
+            raw_mcp["ok"] = False
+            if not raw.structured_content and raw.content:
+                text_parts = [c.text for c in raw.content if hasattr(c, "text")]
+                raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+            else:
+                raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        return mcp_to_copilot(raw_mcp)
 
     async def list_prompts(self) -> ListPromptsResult:
         return ListPromptsResult(prompts=[])

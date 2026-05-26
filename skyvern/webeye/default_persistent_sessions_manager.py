@@ -296,9 +296,12 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             browser_profile_id=browser_profile_id,
         )
 
-        # In local mode, launch the browser immediately for standalone sessions
-        # so the screencast/CDP input endpoints can connect.
-        if settings.BROWSER_STREAMING_MODE == "cdp" and runnable_id is None:
+        # Launch the browser immediately for standalone sessions so the
+        # screencast/CDP input endpoints can connect. Triggered both by the
+        # in-process CDP streaming mode and by cdp-connect, which forwards to a
+        # remote browser and still needs a registered BrowserState locally.
+        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
+        if should_launch and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
                 self._launch_browser_for_session(session_id, organization_id, proxy_location, url)
