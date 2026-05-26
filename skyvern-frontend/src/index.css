@@ -4,68 +4,60 @@
 
 @layer base {
   :root {
-    /* Light tokens — contrast-bumped to match dark-mode visual weight (OpenAI Platform / Linear references) */
-    --background: 0 0% 96%;
-    --foreground: 0 0% 9%;
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
 
     --card: 0 0% 100%;
-    --card-foreground: 0 0% 9%;
+    --card-foreground: 222.2 84% 4.9%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 0 0% 9%;
+    --popover-foreground: 222.2 84% 4.9%;
 
-    --primary: 0 0% 9%;
-    --primary-foreground: 0 0% 100%;
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
 
-    --secondary: 0 0% 94%;
-    --secondary-foreground: 0 0% 9%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
 
-    --tertiary: 220 9% 36%;
-    --tertiary-foreground: 0 0% 100%;
+    --tertiary: 227.6 11.6% 48.8%;
+    --tertiary-foreground: 213 27% 84%;
 
-    --muted: 0 0% 94%;
-    --muted-foreground: 0 0% 32%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
 
-    --accent: 0 0% 92%;
-    --accent-foreground: 0 0% 9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
 
-    --destructive: 0 72% 45%;
-    --destructive-foreground: 0 86% 97%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
     --error-bg-light: rgba(220, 38, 38, 0.1);
 
-    --warning: 41 96% 40%;
-    --warning-foreground: 55 92% 95%;
+    --warning: 32.1 94.6% 43.7%; /* amber-600 */
+    --warning-foreground: 36 100% 97.1%; /* amber-50 */
 
-    --success: 142 71% 36%;
-    --success-foreground: 138 76% 97%;
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
-    --border: 0 0% 84%;
-    --input: 0 0% 84%;
-    --ring: 199 89% 48%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 222.2 84% 5%;
 
     --radius: 0.5rem;
 
-    --slate-elevation-1: 0 0% 97%;
-    --slate-elevation-2: 0 0% 94%;
-    --slate-elevation-3: 0 0% 91%;
-    --slate-elevation-4: 0 0% 87%;
-    --slate-elevation-5: 0 0% 83%;
+    --tertiary: 227.6 11.6% 48.8%;
+    --tertiary-foreground: 213 27% 84%;
 
-    --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.1);
-    --shadow-card:
-      0 1px 2px 0 rgba(15, 23, 42, 0.1), 0 1px 3px 0 rgba(15, 23, 42, 0.14);
-    --shadow-card-hover: 0 6px 16px -4px rgba(15, 23, 42, 0.18);
-    --shadow-elevated: 0 12px 28px -8px rgba(15, 23, 42, 0.2);
-    --shadow-popover: 0 12px 28px -8px rgba(15, 23, 42, 0.22);
+    --warning: 32.1 94.6% 43.7%; /* amber-600 */
+    --warning-foreground: 36 100% 97.1%; /* amber-50 */
 
-    --brand: 199 89% 48%;
-    --brand-foreground: 0 0% 100%;
-    --brand-soft: 199 89% 92%;
+    --success: 142.1 76.2% 36.3%; /* green-600 */
+    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
-    --brand-cta: 199 89% 36%;
-    --brand-cta-foreground: 0 0% 100%;
-
-    --xy-controls-button-background-color: hsl(var(--slate-elevation-2));
+    --slate-elevation-1: 222 47% 96%;
+    --slate-elevation-2: 222 40% 93%;
+    --slate-elevation-3: 222 35% 90%;
+    --slate-elevation-4: 222 30% 87%;
+    --slate-elevation-5: 222 25% 84%;
   }
 
   .dark {
@@ -90,7 +82,7 @@
     --accent: 217.2 32.6% 17.5%;
     --accent-foreground: 210 40% 98%;
 
-    --destructive: 0 72.2% 45%; /* red-700 (darkened from red-600 for AA on solid bg) */
+    --destructive: 0 72.2% 50.6%; /* red-600 */
     --destructive-foreground: 0 85.7% 97.3%; /* red-50 */
     --error-bg-light: rgba(220, 38, 38, 0.1);
 
@@ -109,22 +101,6 @@
     --slate-elevation-3: 227 30% 14%;
     --slate-elevation-4: 231 26% 18%;
     --slate-elevation-5: 230 22% 22%;
-
-    --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
-    --shadow-card: 0 1px 0 0 rgba(0, 0, 0, 0.2), 0 1px 3px 0 rgba(0, 0, 0, 0.4);
-    --shadow-popover: 0 4px 12px -2px rgba(0, 0, 0, 0.5);
-
-    --brand: 199 89% 48%;
-    --brand-foreground: 0 0% 100%;
-    --brand-soft: 199 89% 25%;
-
-    --shadow-card-hover: 0 6px 20px -4px rgba(0, 0, 0, 0.5);
-    --shadow-elevated: 0 12px 32px -8px rgba(0, 0, 0, 0.55);
-
-    --brand-cta: 199 89% 36%;
-    --brand-cta-foreground: 0 0% 100%;
-
-    --xy-controls-button-background-color: hsl(var(--slate-elevation-3));
   }
 }
 

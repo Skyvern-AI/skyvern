@@ -25,6 +25,7 @@ import { DisableCache } from "../DisableCache";
 import { IgnoreWorkflowSystemPrompt } from "../IgnoreWorkflowSystemPrompt";
 import { BlockExecutionOptions } from "../components/BlockExecutionOptions";
 import { type FileDownloadNode, type FileDownloadNodeData } from "./types";
+import { useSelectedCredentialTotpIdentifier } from "../../hooks/useSelectedCredentialTotpIdentifier";
 import { errorMappingExampleValue } from "../types";
 import { ParametersMultiSelect } from "../TaskNode/ParametersMultiSelect";
 import { useUpdate } from "../../useUpdate";
@@ -89,6 +90,9 @@ function FileDownloadEditorBody({
   const parentLoopSkipsOnFail = getParentLoopSkipsOnFail(nodes, blockId);
   const update = useUpdate<FileDownloadNodeData>({ id: blockId, editable });
   const hasInteracted = useHasInteractedThisSession();
+  const credentialTotpIdentifier = useSelectedCredentialTotpIdentifier(
+    parameterKeys.length > 0 ? parameterKeys[0] : undefined,
+  );
 
   return (
     <div data-testid="file-download-block-form" className="space-y-4">
@@ -175,11 +179,6 @@ function FileDownloadEditorBody({
                   availableOutputParameters={outputParameterKeys}
                   parameters={parameterKeys}
                   onParametersChange={(next) => update({ parameterKeys: next })}
-                  onCredentialTotpIdentifier={(next) => {
-                    if (!totpIdentifier?.trim()) {
-                      update({ totpIdentifier: next });
-                    }
-                  }}
                 />
               </div>
               <div className="flex items-center justify-between">
@@ -315,9 +314,18 @@ function FileDownloadEditorBody({
                   nodeId={blockId}
                   onChange={(next) => update({ totpIdentifier: next })}
                   value={totpIdentifier ?? ""}
-                  placeholder={placeholders["download"]["totpIdentifier"]}
+                  placeholder={
+                    !totpIdentifier?.trim() && credentialTotpIdentifier
+                      ? `${credentialTotpIdentifier} (from credential)`
+                      : placeholders["download"]["totpIdentifier"]
+                  }
                   className="nopan text-xs"
                 />
+                {!totpIdentifier?.trim() && credentialTotpIdentifier ? (
+                  <p className="text-xs text-slate-500">
+                    Leave empty to use the credential's value.
+                  </p>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <div className="flex gap-2">

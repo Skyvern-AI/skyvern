@@ -22,7 +22,7 @@ function InlineCreateRow({
     return (
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-foreground hover:bg-slate-elevation4"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-700"
         onClick={() => setEditing(true)}
         disabled={isSubmitting}
       >
@@ -56,7 +56,7 @@ function InlineCreateRow({
       />
       <button
         type="button"
-        className="rounded p-1 text-muted-foreground hover:bg-slate-elevation4 disabled:opacity-50"
+        className="rounded p-1 text-slate-300 hover:bg-slate-700 disabled:opacity-50"
         onClick={() => value.trim() && onConfirm(value.trim())}
         disabled={isSubmitting || !value.trim()}
         aria-label="Confirm"
@@ -65,7 +65,7 @@ function InlineCreateRow({
       </button>
       <button
         type="button"
-        className="rounded p-1 text-muted-foreground hover:bg-slate-elevation4"
+        className="rounded p-1 text-slate-400 hover:bg-slate-700"
         onClick={() => {
           setEditing(false);
           setValue("");

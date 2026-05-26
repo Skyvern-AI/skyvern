@@ -38,7 +38,7 @@ function ZoomableImage(props: HTMLImageElementProps) {
       {modalOpen && (
         <div
           className={clsx(
-            "fixed inset-0 z-50 flex justify-center overflow-auto bg-black/75 p-16",
+            "fixed inset-0 z-50 flex justify-center overflow-auto bg-black bg-opacity-75 p-16",
             {
               "items-center": !zoom,
               "items-baseline": zoom,

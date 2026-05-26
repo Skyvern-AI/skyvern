@@ -1579,7 +1579,7 @@ function FlowRenderer({
         onMouseDownCapture={() => onMouseDownCapture?.()}
       >
         {layoutPhase === "pre-layout" && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-background">
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-950">
             <div className="animate-pulse">
               <LogoMinimized />
             </div>

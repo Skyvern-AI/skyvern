@@ -59,7 +59,7 @@ function sessionIsOpen(browserSession: BrowserSession): boolean {
 }
 
 const No = () => (
-  <Badge className="flex h-7 w-12 justify-center bg-red-900 text-red-50 hover:bg-red-900/80">
+  <Badge className="flex h-7 w-12 justify-center bg-gray-800 text-orange-50 hover:bg-gray-900">
     No
   </Badge>
 );
@@ -185,7 +185,7 @@ function BrowserSessions() {
           <GlobeIcon className="size-6" />
           <h1 className="text-2xl">Browsers</h1>
         </div>
-        <p className="text-muted-foreground">
+        <p className="text-slate-300">
           Create your own live browsers to interact with websites, or run
           workflows in.
         </p>
@@ -196,7 +196,6 @@ function BrowserSessions() {
         <div className="flex justify-end">
           <div className="flex gap-4">
             <Button
-              variant="brand"
               disabled={createBrowserSessionMutation.isPending}
               onClick={() => {
                 setIsDrawerOpen(true);
@@ -215,26 +214,26 @@ function BrowserSessions() {
           <Table className="w-full table-fixed">
             <TableHeader className="rounded-t-lg bg-slate-elevation2">
               <TableRow>
-                <TableHead className="w-1/4 truncate rounded-tl-lg text-muted-foreground">
+                <TableHead className="w-1/4 truncate rounded-tl-lg text-slate-400">
                   ID
                 </TableHead>
-                <TableHead className="w-1/12 truncate text-muted-foreground">
+                <TableHead className="w-1/12 truncate text-slate-400">
                   Open
                 </TableHead>
-                <TableHead className="w-1/6 truncate text-muted-foreground">
+                <TableHead className="w-1/6 truncate text-slate-400">
                   <span className="mr-2">Occupied</span>
                   <HelpTooltip
                     className="inline"
                     content="Browser is busy running a task or workflow"
                   />
                 </TableHead>
-                <TableHead className="w-1/6 truncate text-muted-foreground">
+                <TableHead className="w-1/6 truncate text-slate-400">
                   Started
                 </TableHead>
-                <TableHead className="w-1/6 truncate text-muted-foreground">
+                <TableHead className="w-1/6 truncate text-slate-400">
                   Timeout
                 </TableHead>
-                <TableHead className="w-1/2 truncate text-muted-foreground">
+                <TableHead className="w-1/2 truncate text-slate-400">
                   CDP Url
                 </TableHead>
               </TableRow>
@@ -316,13 +315,11 @@ function BrowserSessions() {
               )}
             </TableBody>
           </Table>
-          <div className="flex flex-col items-center gap-3 px-3 py-3 sm:flex-row sm:justify-between">
-            <div className="flex items-center gap-2 text-sm">
-              <span className="whitespace-nowrap text-muted-foreground">
-                Items per page
-              </span>
+          <div className="relative px-3 py-3">
+            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+              <span className="text-slate-400">Items per page</span>
               <select
-                className="h-9 rounded-md border border-border bg-background"
+                className="h-9 rounded-md border border-slate-300 bg-background"
                 value={itemsPerPage}
                 onChange={(e) => {
                   const next = Number(e.target.value);

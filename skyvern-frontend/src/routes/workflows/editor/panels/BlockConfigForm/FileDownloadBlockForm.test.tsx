@@ -111,17 +111,12 @@ vi.mock("../../nodes/TaskNode/ParametersMultiSelect", () => ({
   ParametersMultiSelect: (props: {
     parameters: Array<string>;
     onParametersChange: (next: Array<string>) => void;
-    onCredentialTotpIdentifier?: (totpIdentifier: string) => void;
     availableOutputParameters: Array<string>;
   }) => (
     <div data-testid="parameters-multi-select">
       <button
         data-testid="parameters-change"
         onClick={() => props.onParametersChange(["param_a"])}
-      />
-      <button
-        data-testid="parameters-credential-totp"
-        onClick={() => props.onCredentialTotpIdentifier?.("totp-from-cred")}
       />
     </div>
   ),
@@ -164,6 +159,10 @@ vi.mock("../../nodes/DisableCache", () => ({
       onClick={() => props.onDisableCacheChange(!props.disableCache)}
     />
   ),
+}));
+
+vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
+  useSelectedCredentialTotpIdentifier: () => null,
 }));
 
 vi.mock("../../ErrorCodeMappingEditor", () => ({
@@ -452,26 +451,6 @@ describe("FileDownloadBlockForm (SKY-9361)", () => {
     expect(updateNodeData).toHaveBeenCalledWith("d1", {
       totpVerificationUrl: "https://totp.example.com/",
     });
-  });
-
-  test("ParametersMultiSelect.onCredentialTotpIdentifier sets totpIdentifier only when current is empty", () => {
-    setFileDownloadNode("d1", { totpIdentifier: null });
-    render(<FileDownloadBlockForm blockId="d1" />);
-
-    fireEvent.click(screen.getByTestId("parameters-credential-totp"));
-
-    expect(updateNodeData).toHaveBeenCalledWith("d1", {
-      totpIdentifier: "totp-from-cred",
-    });
-  });
-
-  test("ParametersMultiSelect.onCredentialTotpIdentifier no-op when totpIdentifier already set", () => {
-    setFileDownloadNode("d1", { totpIdentifier: "preset" });
-    render(<FileDownloadBlockForm blockId="d1" />);
-
-    fireEvent.click(screen.getByTestId("parameters-credential-totp"));
-
-    expect(updateNodeData).not.toHaveBeenCalled();
   });
 
   test("non-editable: edits do not propagate", () => {
