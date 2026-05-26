@@ -19,6 +19,118 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOut
 
 LOG = structlog.get_logger()
 
+IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON = "identical_reply_blocked"
+
+REPEATED_REPLY_ESCALATION_TEMPLATES: dict[ResponseKind, str] = {
+    ResponseKind.BUILD: (
+        "I've offered the same change twice and it isn't moving us forward."
+        " Tell me one concrete edit you want to make to the workflow"
+        " (e.g. a step to add, a page to open, a field to extract) and I'll"
+        " build that exact thing."
+    ),
+    ResponseKind.CLARIFY: (
+        "I've asked the same clarification twice. Let me try a different"
+        " angle — please confirm the single next concrete step you'd like me"
+        " to take, and I'll act on that."
+    ),
+    ResponseKind.DIAGNOSE: (
+        "I've explained that the same way twice. Either the explanation"
+        " isn't matching what you're seeing, or I'm missing context — could"
+        " you share what you actually see, or paste the exact error, so I can"
+        " try a different angle?"
+    ),
+    ResponseKind.REFUSE: (
+        "I've refused that the same way twice. If you want me to reconsider,"
+        " tell me what's different about this case and I'll re-evaluate."
+    ),
+}
+
+
+HANDOFF_REPLY = (
+    "I haven't been able to help with this through repeated attempts. Please"
+    " rephrase the request with more specifics, or use the Help link so a"
+    " teammate can take a closer look."
+)
+
+
+def escalation_reply_for(attempted_kind: ResponseKind) -> str:
+    return REPEATED_REPLY_ESCALATION_TEMPLATES.get(
+        attempted_kind, REPEATED_REPLY_ESCALATION_TEMPLATES[ResponseKind.CLARIFY]
+    )
+
+
+def apply_repeated_reply_guard(
+    *,
+    final_text: str,
+    attempted_kind: ResponseKind,
+    blocked_signatures: Iterable[str],
+    reason_code: str = "",
+    terminal_reason: str | None = None,
+    turn_intent: TurnIntent | None = None,
+    tool_calls: Iterable[str] = (),
+) -> tuple[str, TurnOutcome]:
+    """Centralized post-output guard. Returns ``(final_text, outcome)``.
+
+    When the signature of ``final_text`` is in ``blocked_signatures``, rewrites
+    to the escalation template keyed by ``attempted_kind`` and returns a
+    ``RECOVER`` outcome that records the original signature in its
+    ``blocked_signatures`` so the ban survives to the next turn. If the
+    escalation template itself collides with an already-banned signature
+    (a back-to-back ``RECOVER`` loop), falls back to a generic hand-off so
+    the system cannot self-amplify on the same recovery text. Otherwise
+    returns the original text with a record carrying the inherited bans
+    forward. The rewritten signature is also added to ``blocked_signatures``
+    so a future turn cannot re-emit the same escalation text.
+
+    Pass ``turn_intent`` and ``tool_calls`` to preserve trace metadata on
+    the outcome; otherwise the minimal-shape builder is used.
+    """
+    inherited = list(blocked_signatures)
+    tool_calls_list = list(tool_calls)
+    original_signature = compute_signature(final_text)
+    if inherited and original_signature in inherited:
+        rewritten = escalation_reply_for(attempted_kind)
+        rewritten_signature = compute_signature(rewritten)
+        if rewritten_signature in inherited:
+            rewritten = HANDOFF_REPLY
+            rewritten_signature = compute_signature(rewritten)
+        intent_summary: dict[str, Any] = {}
+        if turn_intent is not None:
+            try:
+                intent_summary = dict(turn_intent.to_trace_data())
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to serialize TurnIntent trace data for RECOVER outcome; using empty dict",
+                    exc_info=exc,
+                )
+        return rewritten, TurnOutcome(
+            turn_intent_summary=intent_summary,
+            response_kind=ResponseKind.RECOVER,
+            reason_code=IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON,
+            normalized_reply_signature=rewritten_signature,
+            tool_calls=[str(c) for c in tool_calls_list if c],
+            terminal_reason=IDENTICAL_REPLY_BLOCKED_TERMINAL_REASON,
+            blocked_signatures=_dedup_signatures([*inherited, original_signature, rewritten_signature]),
+        )
+    if turn_intent is not None or tool_calls_list:
+        return final_text, build_turn_outcome(
+            final_text,
+            turn_intent=turn_intent,
+            response_kind=attempted_kind,
+            reason_code=reason_code,
+            tool_calls=tool_calls_list,
+            terminal_reason=terminal_reason,
+            inherited_blocked_signatures=inherited,
+        )
+    return final_text, build_minimal_turn_outcome(
+        final_text,
+        response_kind=attempted_kind,
+        reason_code=reason_code,
+        terminal_reason=terminal_reason,
+        inherited_blocked_signatures=inherited,
+    )
+
+
 _RESPONSE_KIND_BY_MODE: dict[TurnIntentMode, ResponseKind] = {
     TurnIntentMode.BUILD: ResponseKind.BUILD,
     TurnIntentMode.EDIT: ResponseKind.BUILD,
