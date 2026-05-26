@@ -128,6 +128,8 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
+from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
+from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
@@ -6482,20 +6484,54 @@ class WorkflowService:
                 )
                 return
 
-            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
-            # runaway revision churn when the same issue repeats every run.
-            cap_exceeded = await self._check_script_review_cap(
+            # Resolve cohort FIRST so the cap check + post-dispatch increment
+            # can route to the cohort's own counter.
+            use_v3 = await is_v3_cohort(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
+                workflow_run_id=workflow_run.workflow_run_id,
             )
+
+            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
+            # runaway revision churn when the same issue repeats every run.
+            if use_v3:
+                cap_exceeded = await self._check_script_review_cap_v3(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=workflow.organization_id,
+                )
+            else:
+                cap_exceeded = await self._check_script_review_cap(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=workflow.organization_id,
+                )
             if cap_exceeded:
                 LOG.info(
                     "Skipping script review — daily cap exceeded for wpid",
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     pre_finally_status=pre_finally_status,
+                    cohort="v3" if use_v3 else "v2",
                 )
                 return
+
+            # Fast-path skip: v3 cohort + zero fallback episodes = nothing
+            # to review. Saves an LLM round-trip and a cap-counter increment
+            # on cold-mint runs, which produce no episodes by construction.
+            # v2 keeps its existing behavior (reviews whether or not episodes
+            # exist) — only the v3 path adds this gate.
+            if use_v3:
+                v3_episodes = await app.DATABASE.scripts.get_all_episodes_by_workflow_run_id(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=workflow.organization_id,
+                )
+                if not v3_episodes:
+                    LOG.info(
+                        "v3_postrun_skipped_no_episodes",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        script_revision_id=script_revision_id,
+                    )
+                    return
 
             # Non-blocking lock per script family
             cache = CacheFactory.get_cache()
@@ -6507,11 +6543,23 @@ class WorkflowService:
                 except AttributeError:
                     LOG.debug("Cache doesn't support locking for script reviewer")
 
+            async def _run_reviewer_dispatch() -> Any | None:
+                if use_v3:
+                    return await v3_review_post_run(
+                        organization_id=workflow.organization_id,
+                        workflow_run=workflow_run,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        script_revision_id=script_revision_id,
+                    )
+                await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                return None
+
             review_ran = False
+            review_result: Any | None = None
             if lock is not None:
                 try:
                     async with lock:
-                        await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                        review_result = await _run_reviewer_dispatch()
                         review_ran = True
                 except LockError:
                     LOG.info(
@@ -6521,15 +6569,20 @@ class WorkflowService:
                     )
             else:
                 # No Redis/cache available - proceed without lock (graceful degradation for OSS)
-                await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                review_result = await _run_reviewer_dispatch()
                 review_ran = True
 
-            # Increment the review counter ONLY after a review actually ran.
-            # Skipped reviews (e.g., LockError) should not consume cap budget.
             if review_ran:
-                await self._increment_script_review_counter(
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                )
+                if use_v3:
+                    v3_persist_cap_consumed = bool(getattr(review_result, "v3_persist_cap_consumed", False))
+                    if not v3_persist_cap_consumed:
+                        await self._increment_script_review_counter_v3(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                        )
+                else:
+                    await self._increment_script_review_counter(
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                    )
         except Exception:
             LOG.warning(
                 "Failed to trigger script reviewer",
@@ -6548,11 +6601,10 @@ class WorkflowService:
         """Build the Redis key for the daily script-review counter (v3 cohort).
 
         Separate from the v2 key so cohort comparisons stay clean and v3
-        traffic doesn't contaminate v2's counter. Thin wrapper around the
-        module-level ``v3_script_review_cap_key`` so non-WorkflowService
-        callers (e.g. the mint-audit trigger in workflow_script_service.py)
-        can reach the same key construction without holding an instance
-        reference.
+        traffic doesn't contaminate v2's counter. Thin wrapper around the module-level
+        ``v3_script_review_cap_key`` so non-WorkflowService callers (e.g.
+        the mint-audit trigger in workflow_script_service.py) can reach
+        the same key construction without holding an instance reference.
         """
         return v3_script_review_cap_key(workflow_permanent_id)
 
@@ -6647,9 +6699,7 @@ class WorkflowService:
     async def _increment_script_review_counter_v3(self, workflow_permanent_id: str) -> None:
         """v3 cohort mirror of ``_increment_script_review_counter`` writing v3 key.
 
-        Used post-dispatch in ``_trigger_script_reviewer`` after a successful
-        v3 cohort review. Separating from v2 lets us compare cohort counters
-        cleanly.
+        Called from ``_trigger_script_reviewer`` after a successful v3 review_ran.
         """
         await self._increment_review_counter_for_key(self._v3_script_review_cap_key(workflow_permanent_id))
 
@@ -6694,6 +6744,7 @@ class WorkflowService:
             if cache is None:
                 return None
             cap = await self._get_script_review_cap(organization_id)
+            # v3-specific key — separate from v2's shared key so cohort comparisons stay clean.
             cap_key = self._v3_script_review_cap_key(workflow_permanent_id)
             lock_name = f"v3_cap:{workflow_permanent_id}"
             lock = cache.get_lock(lock_name, blocking_timeout=2, timeout=5)
@@ -6887,6 +6938,7 @@ class WorkflowService:
                         episode_id=episode.episode_id,
                         organization_id=workflow.organization_id,
                         reviewer_output=None,
+                        reviewer_version="v2",
                     )
                 return
 
@@ -6933,6 +6985,7 @@ class WorkflowService:
                     organization_id=workflow.organization_id,
                     reviewer_output=str(updated_blocks) if updated_blocks else None,
                     new_script_revision_id=new_script.script_revision_id if new_script else None,
+                    reviewer_version="v2",
                 )
 
         except Exception:

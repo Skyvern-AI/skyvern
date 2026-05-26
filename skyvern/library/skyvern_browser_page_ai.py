@@ -49,6 +49,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,  # noqa: ARG002 — accepted for Protocol compat, no episode recording in library path
         block_label: str | None = None,  # noqa: ARG002
         recoverable_marker_id: int | None = None,  # noqa: ARG002 — Protocol compat
+        v3_parent_episode_id: str | None = None,  # noqa: ARG002 — Protocol compat; v3 mid-run is server-side only
     ) -> str | None:
         """Click an element using AI via API call.
 
@@ -87,6 +88,7 @@ class SdkSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,  # noqa: ARG002 — Protocol compat, see ai_click docstring
         block_label: str | None = None,  # noqa: ARG002
         recoverable_marker_id: int | None = None,  # noqa: ARG002 — Protocol compat
+        v3_parent_episode_id: str | None = None,  # noqa: ARG002 — Protocol compat; v3 mid-run is server-side only
     ) -> str:
         """Input text into an element using AI via API call."""
 
