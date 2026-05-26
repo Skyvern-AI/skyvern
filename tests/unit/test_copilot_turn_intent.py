@@ -203,6 +203,109 @@ def test_build_turn_intent_marks_blank_workflow_browser_task_as_build() -> None:
     assert intent.authority.may_run_blocks is True
 
 
+_BLANK_SAVED_WORKFLOW_YAML = "title: Saved blank workflow\nworkflow_definition:\n  blocks: []\n  parameters: []\n"
+
+
+def test_build_turn_intent_marks_blank_saved_workflow_browser_task_with_results_word_as_build() -> None:
+    intent = build_turn_intent(
+        user_message=(
+            "Go to https://example.test/registry, search for ABC-1234, expand the entry, "
+            "and report the credential type and expiration date from the results."
+        ),
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+    assert RequiredContextKey.LATEST_RUN_RESULT not in intent.required_context
+
+
+def test_build_turn_intent_marks_create_workflow_with_browser_task_and_results_as_build() -> None:
+    intent = build_turn_intent(
+        user_message=("Create a workflow that opens https://example.test and reports the results."),
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+    assert intent.authority.may_update_workflow is True
+    assert intent.authority.may_run_blocks is True
+    assert RequiredContextKey.LATEST_RUN_RESULT not in intent.required_context
+
+
+def test_build_turn_intent_keeps_clear_diagnose_on_blank_saved_workflow_with_browser_task_verb() -> None:
+    intent = build_turn_intent(
+        user_message="Open the failed page and tell me what went wrong.",
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_keeps_run_result_diagnose_with_build_keyword_on_existing_workflow() -> None:
+    existing_workflow_yaml = (
+        "title: Existing\nworkflow_definition:\n  blocks:\n    - block_type: navigation\n      label: nav_to_site\n"
+    )
+    intent = build_turn_intent(
+        user_message="Generate a report from the last result.",
+        workflow_yaml=existing_workflow_yaml,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_keeps_run_result_diagnose_when_no_browser_task_verb() -> None:
+    intent = build_turn_intent(
+        user_message="What is the result of the last run?",
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_keeps_diagnose_when_run_id_attached_on_blank_saved_workflow() -> None:
+    intent = build_turn_intent(
+        user_message="Open the result.",
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        workflow_run_id="wr_abc123",
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
+
+
+def test_build_turn_intent_routes_docs_question_with_browser_task_verb_on_blank_saved_workflow() -> None:
+    intent = build_turn_intent(
+        user_message="How do I navigate to my workflow?",
+        workflow_yaml=_BLANK_SAVED_WORKFLOW_YAML,
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_run_blocks is False
+
+
 def test_build_turn_intent_marks_run_context_for_diagnose() -> None:
     intent = build_turn_intent(
         user_message="Diagnose the failed run",
