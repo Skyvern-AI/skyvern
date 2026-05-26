@@ -34,6 +34,8 @@ _IMAGE_CONTENT_TYPES = {
     ".svg": "image/svg+xml",
     ".webp": "image/webp",
 }
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
 
 
 @dataclass(frozen=True)
@@ -77,15 +79,21 @@ def installed_ui_version() -> str:
         return str(getattr(module, "__version__", "unknown"))
 
 
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=_PRIVATE_DIR_MODE)
+    path.chmod(_PRIVATE_DIR_MODE)
+
+
 def _copy_resource_tree(source: Traversable, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(destination)
     for child in source.iterdir():
         child_destination = destination / child.name
         if child.is_dir():
             _copy_resource_tree(child, child_destination)
         else:
-            child_destination.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_private_dir(child_destination.parent)
             child_destination.write_bytes(child.read_bytes())
+            child_destination.chmod(_PRIVATE_FILE_MODE)
 
 
 def _ui_cache_root() -> Path:
@@ -108,6 +116,7 @@ def _replace_placeholders(dist_dir: Path, replacements: dict[str, str]) -> None:
             updated = updated.replace(placeholder, value)
         if updated != contents:
             asset.write_text(updated, encoding="utf-8")
+            asset.chmod(_PRIVATE_FILE_MODE)
 
 
 def prepare_installed_ui_dist(config: InstalledUiConfig) -> Path:
@@ -116,7 +125,12 @@ def prepare_installed_ui_dist(config: InstalledUiConfig) -> Path:
     if source_dist is None:
         raise FileNotFoundError('Prebuilt Skyvern UI assets are not installed. Run `pip install "skyvern[ui]"`.')
 
-    runtime_dist = _ui_cache_root() / installed_ui_version() / "runtime"
+    cache_root = _ui_cache_root()
+    version_cache_dir = cache_root / installed_ui_version()
+    _ensure_private_dir(cache_root)
+    _ensure_private_dir(version_cache_dir)
+
+    runtime_dist = version_cache_dir / "runtime"
     if runtime_dist.exists():
         shutil.rmtree(runtime_dist)
     _copy_resource_tree(source_dist, runtime_dist)
@@ -203,11 +217,8 @@ def _local_ui_origins(ui_port: int) -> tuple[str, str]:
 def _normalize_artifact_path(raw_path: str) -> str | None:
     if "\x00" in raw_path or "\r" in raw_path or "\n" in raw_path:
         return None
-    if raw_path.startswith("file://"):
-        parsed = urllib.parse.urlparse(raw_path)
-        if parsed.netloc not in {"", "localhost"}:
-            return None
-        raw_path = urllib.parse.unquote(parsed.path)
+    if urllib.parse.urlparse(raw_path).scheme.lower() == "file":
+        return None
     return os.path.realpath(os.path.expanduser(raw_path))
 
 
@@ -249,6 +260,7 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
+        self.send_header("Referrer-Policy", "no-referrer")
         super().end_headers()
 
     def do_OPTIONS(self) -> None:
@@ -287,8 +299,6 @@ class _ArtifactHandler(BaseHTTPRequestHandler):
             return localhost_origin
         if request_origin == loopback_origin:
             return loopback_origin
-        if request_origin is None:
-            return localhost_origin
         return None
 
     def _route_path(self, parsed_path: str) -> str | None:

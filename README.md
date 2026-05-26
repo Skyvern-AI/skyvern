@@ -136,6 +136,8 @@ uv pip install skyvern
 - Python SDK / cloud API: `pip install skyvern`
 - Local server + packaged UI: `pip install "skyvern[all]"` then run `skyvern quickstart`
 - Local server + packaged UI with Postgres: `pip install "skyvern[all]"` then run `skyvern quickstart --postgres`
+- Packaged UI for an existing API: `pip install "skyvern[ui]"` then run
+  `skyvern run ui --api-url <api-url> --api-key <api-key>`
 - TypeScript: `npm install @skyvern/client`
 
 ### AI-Powered Page Commands
@@ -208,6 +210,11 @@ summary = await page.prompt("Summarize what's on this page")
 skyvern run all
 ```
 Navigate to http://localhost:8080 to run tasks through the web interface. If the packaged UI is missing, `skyvern run ui` will offer to install the matching UI package. For non-interactive setup, use `skyvern run ui --install-ui` or `skyvern run all --install-ui`.
+
+To run only the packaged UI against an existing Skyvern API, install `skyvern[ui]` and pass
+`--api-url`; the CLI infers `--wss-url` from the API URL unless you override it. You can also set
+`VITE_API_BASE_URL`, `VITE_WSS_BASE_URL`, `VITE_ARTIFACT_API_BASE_URL`, `VITE_SKYVERN_API_KEY`,
+and `VITE_BROWSER_STREAMING_MODE` before running `skyvern run ui`.
 
 **Python SDK:**
 ```python

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import subprocess
 from pathlib import Path
 
@@ -41,6 +42,11 @@ def test_run_ui_can_install_packaged_assets_interactively(tmp_path, monkeypatch)
     monkeypatch.setattr(run_commands, "installed_ui_dist_available", lambda: next(availability))
     monkeypatch.setattr(run_commands, "is_interactive", lambda: True)
     monkeypatch.setattr(run_commands, "_ui_install_target", lambda: "skyvern-ui==1.0.36")
+    monkeypatch.setattr(
+        run_commands,
+        "_ui_install_command",
+        lambda install_target: [run_commands.sys.executable, "-m", "pip", "install", install_target],
+    )
     monkeypatch.setattr(
         run_commands.Confirm,
         "ask",
@@ -85,6 +91,11 @@ def test_run_ui_install_ui_flag_skips_interactive_prompt(tmp_path, monkeypatch) 
     monkeypatch.setattr(run_commands, "resolve_frontend_env_path", lambda: None)
     monkeypatch.setattr(run_commands, "installed_ui_dist_available", lambda: next(availability))
     monkeypatch.setattr(run_commands, "_ui_install_target", lambda: "skyvern-ui==1.0.36")
+    monkeypatch.setattr(
+        run_commands,
+        "_ui_install_command",
+        lambda install_target: [run_commands.sys.executable, "-m", "pip", "install", install_target],
+    )
     monkeypatch.setattr(
         run_commands.Confirm,
         "ask",
@@ -176,6 +187,24 @@ def test_run_all_without_install_ui_can_degrade_to_backend_only(monkeypatch) -> 
     assert calls == [("install", False), "start"]
 
 
+def test_install_packaged_ui_warns_when_non_interactive(monkeypatch, capsys, caplog) -> None:
+    monkeypatch.setattr(run_commands, "is_interactive", lambda: False)
+    monkeypatch.setattr(run_commands, "_ui_install_target", lambda: "skyvern-ui==1.0.36")
+    monkeypatch.setattr(
+        run_commands,
+        "_ui_install_command",
+        lambda install_target: [run_commands.sys.executable, "-m", "pip", "install", install_target],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        installed = run_commands._install_packaged_ui_if_requested()
+
+    captured = capsys.readouterr()
+    assert installed is False
+    assert "Automatic install was skipped" in captured.out
+    assert any(record.message == "packaged_ui_install_skipped_non_interactive" for record in caplog.records)
+
+
 def test_run_all_skips_ui_install_when_runtime_exists(monkeypatch) -> None:
     calls = []
 
@@ -227,6 +256,49 @@ def test_ui_install_target_falls_back_when_skyvern_metadata_is_missing(monkeypat
     assert run_commands._ui_install_target() == "skyvern-ui"
 
 
+def test_ui_install_command_prefers_uv_inside_virtualenv(monkeypatch) -> None:
+    monkeypatch.setenv("VIRTUAL_ENV", "/tmp/.venv")
+    monkeypatch.setattr(run_commands.shutil, "which", lambda binary: "/usr/local/bin/uv" if binary == "uv" else None)
+
+    assert run_commands._ui_install_command("skyvern-ui==1.0.36") == [
+        "/usr/local/bin/uv",
+        "pip",
+        "install",
+        "skyvern-ui==1.0.36",
+    ]
+
+
+def test_ui_install_command_uses_python_pip_without_uv_virtualenv(monkeypatch) -> None:
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    monkeypatch.setattr(run_commands.shutil, "which", lambda _binary: "/usr/local/bin/uv")
+
+    assert run_commands._ui_install_command("skyvern-ui==1.0.36") == [
+        run_commands.sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "skyvern-ui==1.0.36",
+    ]
+
+
+def test_installed_ui_config_accepts_frontend_env_vars(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("VITE_API_BASE_URL", "https://api.example.com/api/v1")
+    monkeypatch.delenv("VITE_WSS_BASE_URL", raising=False)
+    monkeypatch.setenv("VITE_ARTIFACT_API_BASE_URL", "https://artifacts.example.com")
+    monkeypatch.setenv("VITE_SKYVERN_API_KEY", "frontend-key")
+    monkeypatch.setenv("VITE_BROWSER_STREAMING_MODE", "cdp")
+    monkeypatch.setattr(run_commands, "resolve_backend_env_path", lambda **_kwargs: tmp_path / ".env")
+
+    config = run_commands._installed_ui_config()
+
+    assert config.api_base_url == "https://api.example.com/api/v1"
+    assert config.wss_base_url == "wss://api.example.com/api/v1"
+    assert config.artifact_api_base_url == "https://artifacts.example.com"
+    assert config.skyvern_api_key == "frontend-key"
+    assert config.browser_streaming_mode == "cdp"
+
+
 def test_run_ui_with_packaged_assets_serves_python_runtime(tmp_path, monkeypatch) -> None:
     port_checks: list[int] = []
     prepared_configs = []
@@ -264,5 +336,42 @@ def test_run_ui_with_packaged_assets_serves_python_runtime(tmp_path, monkeypatch
     assert config.wss_base_url == "ws://localhost:8765/api/v1"
     assert config.artifact_api_base_url == "http://localhost:9090/test-token"
     assert config.skyvern_api_key == "test-key"
+    assert config.browser_streaming_mode == "cdp"
+    assert served == [(tmp_path / "runtime", run_commands.UI_PORT, run_commands.ARTIFACT_PORT, "test-token")]
+
+
+def test_run_ui_with_packaged_assets_accepts_remote_api_options(tmp_path, monkeypatch) -> None:
+    prepared_configs = []
+    served = []
+
+    monkeypatch.setattr(run_commands, "resolve_frontend_env_path", lambda: None)
+    monkeypatch.setattr(run_commands, "installed_ui_dist_available", lambda: True)
+    monkeypatch.setattr(run_commands, "resolve_backend_env_path", lambda **_kwargs: tmp_path / ".env")
+    monkeypatch.setattr(run_commands.secrets, "token_urlsafe", lambda _size: "test-token")
+    monkeypatch.setattr(run_commands, "_handle_port_conflict", lambda _port, **_kwargs: True)
+
+    def fake_prepare(config):
+        prepared_configs.append(config)
+        return tmp_path / "runtime"
+
+    def fake_serve(dist_dir: Path, *, ui_port: int, artifact_port: int, artifact_token: str | None = None) -> None:
+        served.append((dist_dir, ui_port, artifact_port, artifact_token))
+
+    monkeypatch.setattr(run_commands, "prepare_installed_ui_dist", fake_prepare)
+    monkeypatch.setattr(run_commands, "serve_installed_ui", fake_serve)
+
+    run_commands.run_ui(
+        api_url="https://api.example.com/api/v1",
+        artifact_api_url="https://artifacts.example.com",
+        api_key="remote-key",
+        browser_streaming_mode="cdp",
+    )
+
+    assert len(prepared_configs) == 1
+    config = prepared_configs[0]
+    assert config.api_base_url == "https://api.example.com/api/v1"
+    assert config.wss_base_url == "wss://api.example.com/api/v1"
+    assert config.artifact_api_base_url == "https://artifacts.example.com/test-token"
+    assert config.skyvern_api_key == "remote-key"
     assert config.browser_streaming_mode == "cdp"
     assert served == [(tmp_path / "runtime", run_commands.UI_PORT, run_commands.ARTIFACT_PORT, "test-token")]

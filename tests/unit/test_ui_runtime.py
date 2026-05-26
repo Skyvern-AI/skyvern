@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import urllib.parse
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +56,12 @@ def test_prepare_installed_ui_dist_copies_assets_and_injects_runtime_values(tmp_
     assert (runtime_dist / "assets" / "app.js").read_text() == (
         "ws://localhost:8000/api/v1 http://localhost:9090 test-key cdp"
     )
+    assert (tmp_path / "cache").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "cache" / "test-version").stat().st_mode & 0o777 == 0o700
+    assert runtime_dist.stat().st_mode & 0o777 == 0o700
+    assert (runtime_dist / "assets").stat().st_mode & 0o777 == 0o700
+    assert (runtime_dist / "index.html").stat().st_mode & 0o777 == 0o600
+    assert (runtime_dist / "assets" / "app.js").stat().st_mode & 0o777 == 0o600
 
 
 def test_artifact_api_base_url_with_token() -> None:
@@ -83,7 +90,7 @@ def test_spa_fallback_only_handles_extensionless_routes() -> None:
     assert ui_runtime._should_serve_spa_index("/../outside.txt") is False
 
 
-def test_artifact_handler_options_includes_cors_headers() -> None:
+def test_artifact_handler_options_omits_cors_when_origin_is_missing() -> None:
     handler = ui_runtime._artifact_handler_class(
         artifact_token="token",
         artifact_roots=(),
@@ -99,8 +106,34 @@ def test_artifact_handler_options_includes_cors_headers() -> None:
         response = connection.getresponse()
 
         assert response.status == 204
-        assert response.getheader("Access-Control-Allow-Origin") == "http://localhost:8080"
+        assert response.getheader("Access-Control-Allow-Origin") is None
         assert "Range" in (response.getheader("Access-Control-Allow-Headers") or "")
+        assert response.getheader("Referrer-Policy") == "no-referrer"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_artifact_handler_options_allows_local_ui_origin() -> None:
+    handler = ui_runtime._artifact_handler_class(
+        artifact_token="token",
+        artifact_roots=(),
+        ui_port=8080,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request("OPTIONS", "/artifact/text", headers={"Origin": "http://localhost:8080"})
+        response = connection.getresponse()
+
+        assert response.status == 204
+        assert response.getheader("Access-Control-Allow-Origin") == "http://localhost:8080"
+        assert response.getheader("Referrer-Policy") == "no-referrer"
     finally:
         connection.close()
         server.shutdown()
@@ -205,6 +238,33 @@ def test_artifact_handler_rejects_traversal_that_starts_with_allowed_root(tmp_pa
         thread.join(timeout=5)
 
 
+def test_artifact_handler_rejects_file_url_paths_even_inside_allowed_roots(tmp_path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("secret")
+    handler = ui_runtime._artifact_handler_class(
+        artifact_token="token",
+        artifact_roots=(tmp_path.resolve(),),
+        ui_port=8080,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        file_url = urllib.parse.quote(f"file://{artifact}", safe="")
+        connection.request("GET", f"/token/artifact/text?path={file_url}")
+        response = connection.getresponse()
+
+        assert response.status == 400
+        assert response.getheader("Referrer-Policy") == "no-referrer"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_artifact_handler_serves_paths_inside_allowed_roots(tmp_path) -> None:
     artifact = tmp_path / "artifact.txt"
     artifact.write_text("hello")
@@ -229,6 +289,7 @@ def test_artifact_handler_serves_paths_inside_allowed_roots(tmp_path) -> None:
 
         assert response.status == 200
         assert response.getheader("Access-Control-Allow-Origin") == "http://localhost:8080"
+        assert response.getheader("Referrer-Policy") == "no-referrer"
         assert body == "hello"
     finally:
         connection.close()

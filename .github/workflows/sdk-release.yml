@@ -101,11 +101,16 @@ jobs:
           print(f"Building skyvern and skyvern-ui version {root_version}")
           PY
       - name: Build prebuilt UI package
-        run: scripts/build-skyvern-ui-package.sh dist
+        run: scripts/build-skyvern-ui-package.sh dist/skyvern-ui
       - name: Build Skyvern package
-        run: uv build --out-dir dist
-      - name: Publish to PyPI
+        run: uv build --out-dir dist/skyvern
+      - name: Publish skyvern-ui to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: uv run twine upload --repository pypi dist/*
+        run: uv run twine upload --repository pypi dist/skyvern-ui/*
+      - name: Publish skyvern to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: uv run twine upload --repository pypi dist/skyvern/*
