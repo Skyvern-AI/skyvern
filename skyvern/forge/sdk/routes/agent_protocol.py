@@ -32,6 +32,7 @@ from skyvern.config import settings
 from skyvern.exceptions import (
     MissingBrowserAddressError,
     SkyvernHTTPException,
+    WorkflowNotFound,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -510,7 +511,7 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agent", "Workflow Runs"],
+    tags=["Agent", "Workflow Runs", "Workflows"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
     summary="Get a run by id",
@@ -1887,7 +1888,7 @@ async def retry_run_webhook(
 
 @base_router.get(
     "/runs/{run_id}/timeline",
-    tags=["Agent", "Workflow Runs"],
+    tags=["Agent", "Workflow Runs", "Workflows"],
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
@@ -2268,6 +2269,208 @@ async def _continue_workflow_run(workflow_run_id: str, organization_id: str) -> 
         )
 
     await app.WORKFLOW_SERVICE.mark_workflow_run_as_running(workflow_run_id)
+
+
+def _workflow_request_body_from_existing_run(
+    workflow_run: WorkflowRun,
+    parameters: dict[str, Any] | None = None,
+    run_metadata: dict[str, str] | None = None,
+) -> WorkflowRequestBody:
+    return WorkflowRequestBody(
+        data=parameters,
+        proxy_location=workflow_run.proxy_location,
+        webhook_callback_url=workflow_run.webhook_callback_url,
+        totp_verification_url=workflow_run.totp_verification_url,
+        totp_identifier=workflow_run.totp_identifier,
+        browser_session_id=workflow_run.browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
+        max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
+        max_elapsed_time_minutes=getattr(workflow_run, "max_elapsed_time_minutes", None),
+        extra_http_headers=workflow_run.extra_http_headers,
+        cdp_connect_headers=workflow_run.cdp_connect_headers,
+        browser_address=workflow_run.browser_address,
+        run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
+        run_metadata=run_metadata,
+    )
+
+
+def _workflow_run_request_from_workflow_request(
+    *,
+    workflow_id: str,
+    title: str | None,
+    workflow_request: WorkflowRequestBody,
+) -> WorkflowRunRequest:
+    return WorkflowRunRequest(
+        workflow_id=workflow_id,
+        title=title,
+        parameters=workflow_request.data,
+        proxy_location=workflow_request.proxy_location,
+        webhook_url=workflow_request.webhook_callback_url,
+        totp_url=workflow_request.totp_verification_url,
+        totp_identifier=workflow_request.totp_identifier,
+        browser_session_id=workflow_request.browser_session_id,
+        browser_profile_id=workflow_request.browser_profile_id,
+        max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
+        max_elapsed_time_minutes=getattr(workflow_request, "max_elapsed_time_minutes", None),
+        extra_http_headers=workflow_request.extra_http_headers,
+        cdp_connect_headers=workflow_request.cdp_connect_headers,
+        browser_address=workflow_request.browser_address,
+        run_with=workflow_request.run_with,
+        ai_fallback=workflow_request.ai_fallback,
+        run_metadata=workflow_request.run_metadata,
+    )
+
+
+@base_router.post(
+    "/workflows/runs/{workflow_run_id}/retry",
+    tags=["Workflow Runs", "Workflows"],
+    response_model=WorkflowRunResponse,
+    openapi_extra={
+        "x-fern-sdk-method-name": "retry_workflow_run",
+    },
+    description="Retry a workflow run using the original run parameters.",
+    summary="Retry workflow run",
+    responses={
+        200: {"description": "Successfully retried workflow run"},
+        400: {"description": "Workflow run is not retryable"},
+        404: {"description": "Workflow run not found"},
+    },
+)
+@base_router.post("/workflows/runs/{workflow_run_id}/retry/", include_in_schema=False)
+async def retry_workflow_run(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    workflow_run_id: str = Path(..., description="The id of the workflow run to retry.", examples=["wr_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_api_key: Annotated[str | None, Header()] = None,
+    x_max_steps_override: Annotated[int | None, Header()] = None,
+    x_user_agent: Annotated[str | None, Header()] = None,
+) -> WorkflowRunResponse:
+    analytics.capture("skyvern-oss-agent-workflow-run-retry")
+    original_workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
+        workflow_run_id=workflow_run_id,
+        organization_id=current_org.organization_id,
+    )
+
+    if not original_workflow_run:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow run not found {workflow_run_id}",
+        )
+
+    if not original_workflow_run.status.is_final():
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Only terminal workflow runs can be retried",
+        )
+
+    is_block_scoped_run = await app.AGENT_FUNCTION.is_block_scoped_workflow_run(original_workflow_run)
+    if not is_block_scoped_run:
+        is_block_scoped_run = await app.DATABASE.debug.has_block_run_for_workflow_run(
+            organization_id=current_org.organization_id,
+            workflow_run_id=original_workflow_run.workflow_run_id,
+        )
+    if is_block_scoped_run:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="Block-scoped workflow runs cannot be retried with this endpoint",
+        )
+
+    await PermissionCheckerFactory.get_instance().check(
+        current_org, browser_session_id=original_workflow_run.browser_session_id
+    )
+    await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+
+    try:
+        original_workflow = await app.WORKFLOW_SERVICE.get_workflow(
+            workflow_id=original_workflow_run.workflow_id,
+            organization_id=None,
+        )
+    except WorkflowNotFound as e:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow not found for run {workflow_run_id}",
+        ) from e
+
+    template = original_workflow.organization_id != current_org.organization_id
+    original_workflow_run_parameter_tuples = await app.DATABASE.workflow_runs.get_workflow_run_parameters(
+        workflow_run_id=original_workflow_run.workflow_run_id,
+    )
+    original_workflow_run_parameters = {
+        workflow_parameter.key: workflow_run_parameter.value
+        for workflow_parameter, workflow_run_parameter in original_workflow_run_parameter_tuples
+    }
+    original_run_metadata = None
+    try:
+        original_run_metadata = await app.AGENT_FUNCTION.get_workflow_run_metadata(
+            workflow_run_id=original_workflow_run.workflow_run_id,
+            organization_id=current_org.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to fetch workflow run metadata for retry; continuing without metadata",
+            workflow_run_id=original_workflow_run.workflow_run_id,
+            organization_id=current_org.organization_id,
+            exc_info=True,
+        )
+    legacy_workflow_request = _workflow_request_body_from_existing_run(
+        workflow_run=original_workflow_run,
+        parameters=original_workflow_run_parameters,
+        run_metadata=original_run_metadata,
+    )
+
+    context = skyvern_context.ensure_context()
+    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
+    try:
+        workflow_run = await workflow_service.run_workflow(
+            workflow_id=original_workflow_run.workflow_permanent_id,
+            organization=current_org,
+            workflow_request=legacy_workflow_request,
+            template=template,
+            version=original_workflow.version,
+            max_steps=x_max_steps_override,
+            api_key=x_api_key,
+            request_id=context.request_id,
+            request=request,
+            background_tasks=background_tasks,
+            trigger_type=trigger_type,
+            ignore_inherited_workflow_system_prompt=original_workflow_run.ignore_inherited_workflow_system_prompt,
+        )
+    except MissingBrowserAddressError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if settings.OTEL_ENABLED:
+        span = trace.get_current_span()
+        if span:
+            if workflow_run.workflow_run_id:
+                span.set_attribute("workflow_run_id", workflow_run.workflow_run_id)
+            if workflow_run.workflow_id:
+                span.set_attribute("workflow_id", workflow_run.workflow_id)
+
+    workflow_run_request_hydrated = _workflow_run_request_from_workflow_request(
+        workflow_id=original_workflow_run.workflow_permanent_id,
+        title=original_workflow.title,
+        workflow_request=legacy_workflow_request,
+    )
+
+    return WorkflowRunResponse(
+        run_id=workflow_run.workflow_run_id,
+        run_type=RunType.workflow_run,
+        status=str(workflow_run.status),
+        output=None,
+        failure_reason=workflow_run.failure_reason,
+        created_at=workflow_run.created_at,
+        modified_at=workflow_run.modified_at,
+        run_request=workflow_run_request_hydrated,
+        downloaded_files=None,
+        recording_url=None,
+        app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}",
+        browser_session_id=workflow_run.browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
+        run_with=workflow_run.run_with,
+        ai_fallback=workflow_run.ai_fallback,
+    )
 
 
 @legacy_base_router.post(
@@ -2803,28 +3006,55 @@ async def get_workflow_runs(
     )
 
 
-@legacy_base_router.get(
+_WORKFLOW_RUNS_BY_ID_DESCRIPTION = (
+    "List runs for a specific workflow.\n\n"
+    "Supports filtering by **status**, **search_key**, and **error_code**. "
+    "All filters are combined with **AND** logic.\n\n"
+    "### search_key\n\n"
+    "Case-insensitive substring search across: workflow run ID, "
+    "parameter key, parameter description, run parameter value, "
+    "and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n"
+    "### error_code\n\n"
+    "Exact-match filter on the `error_code` field inside each task's `errors` JSON array. "
+    "A run matches if any of its tasks contains an error with a matching `error_code`."
+)
+
+
+async def _get_workflow_runs_by_id(
+    *,
+    workflow_id: str,
+    organization_id: str,
+    page: int,
+    page_size: int,
+    status: list[WorkflowRunStatus] | None,
+    search_key: str | None,
+    error_code: str | None,
+    exclude_child_runs: bool,
+) -> list[WorkflowRun]:
+    analytics.capture("skyvern-oss-agent-workflow-runs-get")
+    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id=workflow_id,
+        organization_id=organization_id,
+        page=page,
+        page_size=page_size,
+        status=status,
+        search_key=search_key,
+        error_code=error_code,
+        exclude_child_runs=exclude_child_runs,
+    )
+
+
+@base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
-    tags=["agent"],
-    description=(
-        "List runs for a specific workflow.\n\n"
-        "Supports filtering by **status**, **search_key**, and **error_code**. "
-        "All filters are combined with **AND** logic.\n\n"
-        "### search_key\n\n"
-        "Case-insensitive substring search across: workflow run ID, "
-        "parameter key, parameter description, run parameter value, "
-        "and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n"
-        "### error_code\n\n"
-        "Exact-match filter on the `error_code` field inside each task's `errors` JSON array. "
-        "A run matches if any of its tasks contains an error with a matching `error_code`."
-    ),
+    tags=["Workflow Runs", "Workflows"],
+    description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
     summary="List runs for a workflow",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
 )
-@legacy_base_router.get(
+@base_router.get(
     "/workflows/{workflow_id}/runs/",
     response_model=list[WorkflowRun],
     include_in_schema=False,
@@ -2860,33 +3090,78 @@ async def get_workflow_runs_by_id(
     """
     List runs for a specific workflow permanent id.
 
+    The public API excludes child workflow runs so workflow histories only show top-level runs.
     All filters (**status**, **search_key**, **error_code**) are combined with AND logic.
-
-    **search_key** performs a case-insensitive substring match across:
-    - `workflow_run_id` — the unique run identifier
-    - Parameter **key** and **description** from workflow parameter definitions (soft-deleted parameters excluded)
-    - Run parameter **value** — the actual value supplied when the run was created
-    - `extra_http_headers` — searched as raw JSON text
-
-    **error_code** performs an exact match against the `error_code` field in the `errors`
-    JSON array on each task. A run matches if *any* of its tasks has a matching error code.
-
-    **Examples:**
-    - All failed runs: `?status=failed`
-    - Failed runs with a specific error: `?status=failed&error_code=INVALID_CREDENTIALS`
-    - Runs matching a parameter value: `?search_key=https://example.com`
-    - Runs matching a run ID: `?search_key=wr_abc123`
-    - Combined: `?status=failed&error_code=LOGIN_FAILED&search_key=my_credential`
     """
-    analytics.capture("skyvern-oss-agent-workflow-runs-get")
-    return await app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id(
-        workflow_permanent_id=workflow_id,
+    return await _get_workflow_runs_by_id(
+        workflow_id=workflow_id,
         organization_id=current_org.organization_id,
         page=page,
         page_size=page_size,
         status=status,
         search_key=search_key,
         error_code=error_code,
+        exclude_child_runs=True,
+    )
+
+
+@legacy_base_router.get(
+    "/workflows/{workflow_id}/runs",
+    response_model=list[WorkflowRun],
+    tags=["agent"],
+    description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
+    summary="List runs for a workflow",
+    openapi_extra={
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id",
+    },
+)
+@legacy_base_router.get(
+    "/workflows/{workflow_id}/runs/",
+    response_model=list[WorkflowRun],
+    include_in_schema=False,
+)
+async def get_workflow_runs_by_id_legacy(
+    workflow_id: str,
+    page: int = Query(1, ge=1, description="Page number for pagination."),
+    page_size: int = Query(10, ge=1, description="Number of runs to return per page."),
+    status: Annotated[list[WorkflowRunStatus] | None, Query(description="Filter by one or more run statuses.")] = None,
+    search_key: str | None = Query(
+        None,
+        max_length=500,
+        description=(
+            "Case-insensitive substring search across: workflow run ID, "
+            "parameter key, parameter description, run parameter value, "
+            "and extra HTTP headers. A run is returned if any of these fields match. "
+            "Soft-deleted parameter definitions are excluded from key/description matching."
+        ),
+        examples=["login_url", "credential_value", "wr_abc123"],
+    ),
+    error_code: str | None = Query(
+        None,
+        max_length=500,
+        description=(
+            "Exact-match filter on the error_code field inside each task's errors JSON array. "
+            "A run matches if any of its tasks contains an error with a matching error_code. "
+            "Error codes are user-defined strings set during workflow execution."
+        ),
+        examples=["INVALID_CREDENTIALS", "LOGIN_FAILED", "CAPTCHA_DETECTED"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[WorkflowRun]:
+    """
+    List runs for a specific workflow permanent id using legacy endpoint behavior.
+
+    Legacy callers keep seeing child workflow runs to avoid changing existing API behavior.
+    """
+    return await _get_workflow_runs_by_id(
+        workflow_id=workflow_id,
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        status=status,
+        search_key=search_key,
+        error_code=error_code,
+        exclude_child_runs=False,
     )
 
 

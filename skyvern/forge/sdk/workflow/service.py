@@ -4207,6 +4207,7 @@ class WorkflowService:
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        exclude_child_runs: bool = False,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -4216,6 +4217,7 @@ class WorkflowService:
             status=status,
             search_key=search_key,
             error_code=error_code,
+            exclude_child_runs=exclude_child_runs,
         )
 
     async def get_workflow_runs_for_browser_session(

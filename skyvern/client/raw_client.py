@@ -463,6 +463,92 @@ class RawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[WorkflowRunResponse]:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[WorkflowRunResponse]
+            Successfully retried workflow run
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            method="POST",
+            headers={
+                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     def get_run(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> HttpResponse[GetRunResponse]:
@@ -1643,6 +1729,86 @@ class RawSkyvern:
         """
         _response = self._client_wrapper.httpx_client.request(
             "v1/workflows/runs",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "status": status,
+                "search_key": search_key,
+                "error_code": error_code,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[WorkflowRun],
+                    parse_obj_as(
+                        type_=typing.List[WorkflowRun],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return HttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> HttpResponse[typing.List[WorkflowRun]]:
+        """
+        List runs for a specific workflow.
+
+        Parameters
+        ----------
+        workflow_id : str
+            Workflow permanent ID. Workflow ID starts with `wpid_`.
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        HttpResponse[typing.List[WorkflowRun]]
+            Successful Response
+        """
+        _response = self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_id)}/runs",
             method="GET",
             params={
                 "page": page,
@@ -3872,6 +4038,92 @@ class AsyncRawSkyvern:
             raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
         raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
 
+    async def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[WorkflowRunResponse]:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[WorkflowRunResponse]
+            Successfully retried workflow run
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/runs/{jsonable_encoder(workflow_run_id)}/retry",
+            method="POST",
+            headers={
+                "x-max-steps-override": str(max_steps_override) if max_steps_override is not None else None,
+                "x-user-agent": str(user_agent) if user_agent is not None else None,
+            },
+            request_options=request_options,
+            omit=OMIT,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    WorkflowRunResponse,
+                    parse_obj_as(
+                        type_=WorkflowRunResponse,  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 400:
+                raise BadRequestError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 404:
+                raise NotFoundError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
     async def get_run(
         self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None
     ) -> AsyncHttpResponse[GetRunResponse]:
@@ -5052,6 +5304,86 @@ class AsyncRawSkyvern:
         """
         _response = await self._client_wrapper.httpx_client.request(
             "v1/workflows/runs",
+            method="GET",
+            params={
+                "page": page,
+                "page_size": page_size,
+                "status": status,
+                "search_key": search_key,
+                "error_code": error_code,
+            },
+            request_options=request_options,
+        )
+        try:
+            if 200 <= _response.status_code < 300:
+                _data = typing.cast(
+                    typing.List[WorkflowRun],
+                    parse_obj_as(
+                        type_=typing.List[WorkflowRun],  # type: ignore
+                        object_=_response.json(),
+                    ),
+                )
+                return AsyncHttpResponse(response=_response, data=_data)
+            if _response.status_code == 422:
+                raise UnprocessableEntityError(
+                    headers=dict(_response.headers),
+                    body=typing.cast(
+                        typing.Optional[typing.Any],
+                        parse_obj_as(
+                            type_=typing.Optional[typing.Any],  # type: ignore
+                            object_=_response.json(),
+                        ),
+                    ),
+                )
+            _response_json = _response.json()
+        except JSONDecodeError:
+            raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response.text)
+        raise ApiError(status_code=_response.status_code, headers=dict(_response.headers), body=_response_json)
+
+    async def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> AsyncHttpResponse[typing.List[WorkflowRun]]:
+        """
+        List runs for a specific workflow.
+
+        Parameters
+        ----------
+        workflow_id : str
+            Workflow permanent ID. Workflow ID starts with `wpid_`.
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        AsyncHttpResponse[typing.List[WorkflowRun]]
+            Successful Response
+        """
+        _response = await self._client_wrapper.httpx_client.request(
+            f"v1/workflows/{jsonable_encoder(workflow_id)}/runs",
             method="GET",
             params={
                 "page": page,
