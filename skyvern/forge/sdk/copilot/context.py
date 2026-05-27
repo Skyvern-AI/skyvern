@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -169,6 +170,8 @@ class AgentResult:
     proposal_disposition: ProposalDisposition = "auto_applicable"
     output_policy_diagnostics: dict[str, Any] | None = None
     turn_outcome: TurnOutcome | None = None
+    turn_id: str | None = None
+    narrative_summary: str | None = None
 
 
 @dataclass
@@ -329,3 +332,14 @@ class CopilotContext(AgentContext):
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None
+
+    # default_factory is the safety net — Python dataclass inheritance
+    # disallows non-default fields after default ones, and the parent
+    # ``AgentContext`` has many defaulted fields. The route generates the
+    # canonical turn_id and passes it as an explicit kwarg at every
+    # construction site, overriding this default.
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    turn_index: int = 0
+    design_start_emitted: bool = False
+    design_end_emitted: bool = False
+    narrative_summary: str | None = None

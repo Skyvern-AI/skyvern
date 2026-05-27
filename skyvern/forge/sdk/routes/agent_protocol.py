@@ -398,6 +398,26 @@ async def run_task(
     raise HTTPException(status_code=400, detail=f"Invalid agent engine: {run_request.engine}")
 
 
+def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunRequest) -> WorkflowRequestBody:
+    return WorkflowRequestBody(
+        data=workflow_run_request.parameters,
+        proxy_location=workflow_run_request.proxy_location,
+        webhook_callback_url=workflow_run_request.webhook_url,
+        totp_identifier=workflow_run_request.totp_identifier,
+        totp_verification_url=workflow_run_request.totp_url,
+        browser_session_id=workflow_run_request.browser_session_id,
+        browser_profile_id=workflow_run_request.browser_profile_id,
+        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
+        max_elapsed_time_minutes=workflow_run_request.max_elapsed_time_minutes,
+        extra_http_headers=workflow_run_request.extra_http_headers,
+        cdp_connect_headers=workflow_run_request.cdp_connect_headers,
+        browser_address=workflow_run_request.browser_address,
+        run_with=workflow_run_request.run_with,
+        ai_fallback=workflow_run_request.ai_fallback,
+        run_metadata=workflow_run_request.run_metadata,
+    )
+
+
 @base_router.post(
     "/run/workflows",
     tags=["Workflow Runs"],
@@ -438,22 +458,7 @@ async def run_workflow(
     workflow_id = workflow_run_request.workflow_id
     context = skyvern_context.ensure_context()
     request_id = context.request_id
-    legacy_workflow_request = WorkflowRequestBody(
-        data=workflow_run_request.parameters,
-        proxy_location=workflow_run_request.proxy_location,
-        webhook_callback_url=workflow_run_request.webhook_url,
-        totp_identifier=workflow_run_request.totp_identifier,
-        totp_verification_url=workflow_run_request.totp_url,
-        browser_session_id=workflow_run_request.browser_session_id,
-        browser_profile_id=workflow_run_request.browser_profile_id,
-        max_screenshot_scrolls=workflow_run_request.max_screenshot_scrolls,
-        extra_http_headers=workflow_run_request.extra_http_headers,
-        cdp_connect_headers=workflow_run_request.cdp_connect_headers,
-        browser_address=workflow_run_request.browser_address,
-        run_with=workflow_run_request.run_with,
-        ai_fallback=workflow_run_request.ai_fallback,
-        run_metadata=workflow_run_request.run_metadata,
-    )
+    legacy_workflow_request = _workflow_run_request_to_legacy_request(workflow_run_request)
 
     trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
