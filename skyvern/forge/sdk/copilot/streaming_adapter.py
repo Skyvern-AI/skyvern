@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -23,15 +24,22 @@ from skyvern.forge.sdk.copilot.narration import (
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotDesignEndUpdate,
+    WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
     WorkflowCopilotToolResultUpdate,
+    WorkflowCopilotTurnMode,
+    WorkflowCopilotTurnStartUpdate,
+    WorkflowCopilotWorkflowDraftUpdate,
 )
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
 
@@ -109,6 +117,16 @@ async def stream_to_sse(
             # is gone, but keep draining the SDK stream so the agent can
             # finish. stream.send below would drop the payload anyway.
             client_gone = await stream.is_disconnected()
+
+            # Edge-trigger DESIGN_START on the first user-visible agent event —
+            # message_output_created is the canonical signal, tool_called the
+            # fallback when the agent goes straight to a tool. Best-effort: a
+            # serialization failure here cannot abort the agent run.
+            if event.name in ("message_output_created", "tool_called") and not client_gone:
+                try:
+                    await maybe_emit_design_start(stream, ctx)
+                except Exception as emit_err:
+                    LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
 
             if event.name == "tool_called":
                 raw = event.item.raw_item
@@ -316,3 +334,57 @@ def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(redacted, dict):
         return redacted
     return trimmed
+
+
+async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    mode_value = ctx.turn_intent.mode.value if ctx.turn_intent is not None else WorkflowCopilotTurnMode.UNKNOWN.value
+    await stream.send(
+        WorkflowCopilotTurnStartUpdate(
+            turn_id=ctx.turn_id,
+            turn_index=ctx.turn_index,
+            mode=WorkflowCopilotTurnMode(mode_value),
+            timestamp=datetime.now(timezone.utc),
+        )
+    )
+
+
+async def maybe_emit_design_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    if ctx.design_start_emitted:
+        return
+    ctx.design_start_emitted = True
+    await stream.send(WorkflowCopilotDesignStartUpdate(timestamp=datetime.now(timezone.utc)))
+
+
+async def maybe_emit_design_end(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    # Guard: never emit DESIGN_END without a matching DESIGN_START. Both flags
+    # are turn-scoped, so a turn that exits before the streaming adapter sees
+    # its first user-visible event simply skips the design phase entirely.
+    if not ctx.design_start_emitted or ctx.design_end_emitted:
+        return
+    ctx.design_end_emitted = True
+    await stream.send(WorkflowCopilotDesignEndUpdate(timestamp=datetime.now(timezone.utc)))
+
+
+async def emit_workflow_draft(stream: EventSourceStream, ctx: CopilotContext, workflow: Workflow) -> None:
+    # Summary payload only: the full workflow definition is transported via
+    # terminal updated_workflow on RESPONSE or via the chat's proposed_workflow.
+    block_count = 0
+    block_labels: list[str] = []
+    try:
+        for block in workflow.workflow_definition.blocks:
+            block_count += 1
+            label = getattr(block, "label", None)
+            if isinstance(label, str) and label:
+                block_labels.append(label)
+    except AttributeError:
+        # Defensive: workflow without a blocks-bearing definition. Emit with
+        # whatever we could collect rather than skipping the event entirely.
+        pass
+    await stream.send(
+        WorkflowCopilotWorkflowDraftUpdate(
+            block_count=block_count,
+            block_labels=block_labels,
+            summary=None,
+            timestamp=datetime.now(timezone.utc),
+        )
+    )

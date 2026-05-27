@@ -107,8 +107,8 @@ async def test_copilot_turn_span_parents_inner_spans(
     assert attrs.get("skyvern.span.role") == "wrapper"
     assert attrs.get("copilot.session_id") == "chat_abc"
     assert attrs.get("workflow_permanent_id") == "wpid_xyz"
-    # one prior user msg in history + this turn = 2.
-    assert attrs.get("copilot.turn_index") == 2
+    # Zero-based: one prior user msg in history → this turn is index 1.
+    assert attrs.get("copilot.turn_index") == 1
     preview = attrs.get("copilot.user_message_preview")
     assert isinstance(preview, str) and preview.startswith("Hello")
 
