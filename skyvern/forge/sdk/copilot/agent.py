@@ -31,12 +31,18 @@ from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    assert_clean_user_facing_text,
+)
+from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
     CopilotContext,
+    ResponseType,
     StructuredContext,
     finalize_discovery_counter_in_global_llm_context,
 )
@@ -716,16 +722,20 @@ def _build_exit_result(
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason or ("cancel" if cancelled else None),
     )
-    return _make_agent_result(
+    return _finalize_result_with_blocker_override(
         ctx,
-        user_response=final_text,
-        updated_workflow=verified_workflow,
-        global_llm_context=global_llm_context,
-        workflow_yaml=verified_yaml,
-        workflow_was_persisted=ctx.workflow_persisted,
-        total_tokens=ctx.total_tokens_used,
-        cancelled=cancelled,
-        turn_outcome=outcome,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=verified_workflow,
+            global_llm_context=global_llm_context,
+            workflow_yaml=verified_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            cancelled=cancelled,
+            turn_outcome=outcome,
+        ),
+        exit_site="exit_result",
     )
 
 
@@ -803,6 +813,144 @@ _UNVALIDATED_PROPOSAL_AFFORDANCE = (
     "I have a draft workflow proposal. Use Review to inspect it, Accept to save it, or Reject to discard it. "
     "It has not been tested or verified end-to-end."
 )
+
+# Pre-validated safe string the finalization shim falls back to when the
+# rendered blocker reply somehow trips OutputPolicy. Asserted clean at module
+# load time so a future OutputPolicy regression doesn't silently land here.
+_FALLBACK_BLOCKER_REPLY = "I couldn't complete that on this turn. Tell me what you'd like me to try next."
+
+
+def _render_blocker_reply(
+    signal: CopilotToolBlockerSignal, *, exit_site: str = "unspecified"
+) -> tuple[str, ResponseType]:
+    resp_type: ResponseType = "ASK_QUESTION" if signal.recovery_hint == "ask_user_clarifying" else "REPLY"
+    user_response = signal.user_facing_reason
+    try:
+        assert_clean_user_facing_text(user_response, blocked_tool=signal.blocked_tool)
+    except ValueError as exc:
+        LOG.warning(
+            "copilot blocker renderer template leaked; falling back",
+            error=str(exc),
+            exit_site=exit_site,
+            **blocker_signal_to_trace_data(signal),
+        )
+        user_response = _FALLBACK_BLOCKER_REPLY
+    return user_response, resp_type
+
+
+# Log instead of assert so a regression on the fallback string still boots.
+try:
+    assert_clean_user_facing_text(_FALLBACK_BLOCKER_REPLY)
+except ValueError as _fallback_validation_error:
+    LOG.error(
+        "copilot _FALLBACK_BLOCKER_REPLY tripped the leak deny list at module load",
+        error=str(_fallback_validation_error),
+    )
+
+
+def _finalize_result_with_blocker_override(
+    ctx: CopilotContext, result: AgentResult, *, exit_site: str = "unspecified"
+) -> AgentResult:
+    # Idempotent + safe to wrap every turn-end exit. OutputPolicy stays the
+    # safety net: a hard-block verdict on the rendered text falls back to
+    # `_FALLBACK_BLOCKER_REPLY`. `_build_output_policy_blocked_result` skips
+    # the shim and enforces "blocker means no proposal" inline.
+    local_signal = getattr(ctx, "blocker_signal", None)
+    if not isinstance(local_signal, CopilotToolBlockerSignal):
+        return result
+
+    rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
+
+    rendered_kind = (
+        CopilotOutputKind.CLARIFICATION_REQUEST
+        if rendered_resp_type == "ASK_QUESTION"
+        else CopilotOutputKind.INFORMATIONAL_ANSWER
+    )
+    preserve_draft = local_signal.preserves_workflow_draft
+    preserved_workflow_yaml = result.workflow_yaml if preserve_draft else None
+    if preserve_draft and result.updated_workflow is not None:
+        rendered_reply = _ensure_unvalidated_proposal_affordance(rendered_reply)
+    rendered_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type=rendered_resp_type,
+        user_response=rendered_reply,
+        global_llm_context=None,
+        workflow_yaml=preserved_workflow_yaml,
+        has_workflow_proposal=preserve_draft and result.updated_workflow is not None,
+        workflow_was_persisted=False,
+        workflow_attempted=False,
+        unvalidated=preserve_draft,
+        output_kind=rendered_kind,
+    )
+    raw_verdict = _copy_output_policy_verdict(rendered_verdict)
+    final_verdict = rendered_verdict
+    if not rendered_verdict.allowed:
+        LOG.warning(
+            "copilot blocker renderer output failed output policy; falling back",
+            output_policy_reasons=[code.value for code in rendered_verdict.reason_codes],
+            exit_site=exit_site,
+            **blocker_signal_to_trace_data(local_signal),
+        )
+        rendered_reply = _FALLBACK_BLOCKER_REPLY
+        final_verdict = evaluate_output_policy(
+            request_policy=ctx.request_policy,
+            response_type=rendered_resp_type,
+            user_response=rendered_reply,
+            global_llm_context=None,
+            workflow_yaml=None,
+            has_workflow_proposal=False,
+            workflow_was_persisted=False,
+            workflow_attempted=False,
+            unvalidated=False,
+            output_kind=rendered_kind,
+        )
+        if not final_verdict.allowed:
+            LOG.error(
+                "copilot blocker fallback reply failed output policy; suppressing proposal",
+                fallback_reasons=[code.value for code in final_verdict.reason_codes],
+                exit_site=exit_site,
+                **blocker_signal_to_trace_data(local_signal),
+            )
+            preserve_draft = False
+
+    # ResponseKind has no "REPLY" member; CLARIFY matches the convention other
+    # turn-end exits (timeout, max-turns, cancel, non-retriable-nav) use.
+    final_text, turn_outcome = apply_repeated_reply_guard(
+        final_text=rendered_reply,
+        attempted_kind=ResponseKind.CLARIFY,
+        blocked_signatures=list(ctx.blocked_reply_signatures),
+        reason_code=local_signal.internal_reason_code or "copilot_blocker_renderer",
+    )
+
+    LOG.info(
+        "copilot blocker renderer finalization shim fired",
+        exit_site=exit_site,
+        **blocker_signal_to_trace_data(local_signal),
+    )
+    rendered_diagnostics = build_output_policy_diagnostics(
+        raw_verdict=raw_verdict,
+        final_verdict=final_verdict,
+        final_output_kind=rendered_kind,
+        hard_block_reason_codes=list(raw_verdict.reason_codes),
+        soft_rewrite_reason_codes=[],
+    )
+    # A blocker turn is never auto-applicable; even a preserved draft is surfaced as review_untested.
+    preserved_proposal = preserve_draft and result.updated_workflow is not None
+    return _make_agent_result(
+        ctx,
+        user_response=final_text,
+        updated_workflow=result.updated_workflow if preserve_draft else None,
+        global_llm_context=result.global_llm_context,
+        response_type=rendered_resp_type,
+        workflow_yaml=result.workflow_yaml if preserve_draft else None,
+        workflow_was_persisted=result.workflow_was_persisted,
+        clear_proposed_workflow=not preserve_draft,
+        total_tokens=result.total_tokens,
+        cancelled=result.cancelled,
+        proposal_disposition="review_untested" if preserved_proposal else "no_proposal",
+        output_policy_diagnostics=rendered_diagnostics,
+        turn_outcome=turn_outcome,
+    )
 
 
 def _workflow_block_count(ctx: CopilotContext) -> int | None:
@@ -1009,17 +1157,21 @@ def _build_wip_exit_result(
     ):
         reply = _last_good_failure_reply(ctx, tested_reply) if recorded_failure_reply else tested_reply
         final_text, outcome = _guard(reply)
-        return _make_agent_result(
+        return _finalize_result_with_blocker_override(
             ctx,
-            user_response=final_text,
-            updated_workflow=ctx.last_good_workflow,
-            global_llm_context=global_llm_context,
-            workflow_yaml=ctx.last_good_workflow_yaml,
-            workflow_was_persisted=ctx.workflow_persisted,
-            total_tokens=ctx.total_tokens_used,
-            proposal_disposition="review_tested",
-            cancelled=cancelled,
-            turn_outcome=outcome,
+            _make_agent_result(
+                ctx,
+                user_response=final_text,
+                updated_workflow=ctx.last_good_workflow,
+                global_llm_context=global_llm_context,
+                workflow_yaml=ctx.last_good_workflow_yaml,
+                workflow_was_persisted=ctx.workflow_persisted,
+                total_tokens=ctx.total_tokens_used,
+                proposal_disposition="review_tested",
+                cancelled=cancelled,
+                turn_outcome=outcome,
+            ),
+            exit_site="wip_last_good_workflow",
         )
     if (
         ctx.last_workflow is not None
@@ -1033,17 +1185,21 @@ def _build_wip_exit_result(
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
         final_text, outcome = _guard(reply)
-        return _make_agent_result(
+        return _finalize_result_with_blocker_override(
             ctx,
-            user_response=final_text,
-            updated_workflow=ctx.last_workflow,
-            global_llm_context=global_llm_context,
-            workflow_yaml=ctx.last_workflow_yaml,
-            workflow_was_persisted=ctx.workflow_persisted,
-            total_tokens=ctx.total_tokens_used,
-            proposal_disposition="review_untested" if unvalidated else "auto_applicable",
-            cancelled=cancelled,
-            turn_outcome=outcome,
+            _make_agent_result(
+                ctx,
+                user_response=final_text,
+                updated_workflow=ctx.last_workflow,
+                global_llm_context=global_llm_context,
+                workflow_yaml=ctx.last_workflow_yaml,
+                workflow_was_persisted=ctx.workflow_persisted,
+                total_tokens=ctx.total_tokens_used,
+                proposal_disposition="review_untested" if unvalidated else "auto_applicable",
+                cancelled=cancelled,
+                turn_outcome=outcome,
+            ),
+            exit_site="wip_last_workflow",
         )
     return _build_exit_result(
         ctx,
@@ -1173,6 +1329,20 @@ def _translate_to_agent_result(
     resp_type = normalized_scaffolding.response_type
     user_response = normalized_scaffolding.user_response or "Done."
 
+    # Bind the signal to a local so the proposal-cascade gating below can't
+    # desync from the inline override if ctx mutates mid-translate.
+    local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
+    blocker_active = local_blocker_signal is not None
+    if local_blocker_signal is not None:
+        # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
+        rendered_reply, rendered_resp_type = _render_blocker_reply(local_blocker_signal)
+        user_response = rendered_reply
+        resp_type = rendered_resp_type
+        LOG.info(
+            "copilot blocker renderer inline override",
+            **blocker_signal_to_trace_data(local_blocker_signal),
+        )
+
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
 
@@ -1249,7 +1419,10 @@ def _translate_to_agent_result(
     # ctx and invalidate any prior passing test: the REPLACE yaml itself was
     # never run, so a leftover ``last_test_ok is True`` from an earlier tested
     # (but different) yaml must not promote this untested one.
-    if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow:
+    # ``blocker_active`` should already have rewritten resp_type away from
+    # REPLACE_WORKFLOW above; explicit guard here defends against future
+    # refactors that re-emit REPLACE_WORKFLOW post-rendering.
+    if resp_type == "REPLACE_WORKFLOW" and last_workflow is not ctx.last_workflow and not blocker_active:
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
@@ -1264,6 +1437,7 @@ def _translate_to_agent_result(
         and ctx.last_workflow is not ctx.last_good_workflow
         and bool(ctx.last_failed_workflow_yaml or ctx.last_test_ok is False)
         and not ctx.last_test_suspicious_success
+        and not blocker_active
     )
 
     # ASK_QUESTION replies carry a specific clarifying question — often the
@@ -1271,7 +1445,7 @@ def _translate_to_agent_result(
     # cannot test. The generic rewrite would replace it with a vague
     # "Could you share more context", so skip it for ASK_QUESTION (and for
     # salvaged replies, which already describe the verified prefix).
-    if _should_surface_untested_draft_despite_question(ctx, resp_type):
+    if _should_surface_untested_draft_despite_question(ctx, resp_type) and not blocker_active:
         LOG.info(
             "Converting copilot clarification into untested draft proposal",
             workflow_permanent_id=ctx.workflow_permanent_id,
@@ -1279,10 +1453,14 @@ def _translate_to_agent_result(
         )
         resp_type = "REPLY"
 
-    if resp_type == "ASK_QUESTION":
-        user_response = _shape_ask_question_response(str(user_response), ctx)
-    elif not salvaged_reply:
-        user_response = _rewrite_failed_test_response(str(user_response), ctx)
+    # ``blocker_active`` short-circuits the salvage/failure rewrites — the
+    # renderer owns the final reply, so reshaping the agent's prose first
+    # would be wasted work the finalization shim discards.
+    if not blocker_active:
+        if resp_type == "ASK_QUESTION":
+            user_response = _shape_ask_question_response(str(user_response), ctx)
+        elif not salvaged_reply:
+            user_response = _rewrite_failed_test_response(str(user_response), ctx)
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
     # Default-true preserves backwards-compat with stale prompts and missing fields.
     agent_admits_incomplete = _is_explicit_false(action_data.get("goal_reached"))
@@ -1290,12 +1468,12 @@ def _translate_to_agent_result(
     last_workflow = None
     last_workflow_yaml = None
     unvalidated = False
-    if verified_workflow is not None and not agent_admits_incomplete:
+    if verified_workflow is not None and not agent_admits_incomplete and not blocker_active:
         last_workflow, last_workflow_yaml = verified_workflow, verified_yaml
     elif salvaged_reply:
         last_workflow, last_workflow_yaml = ctx.last_good_workflow, ctx.last_good_workflow_yaml
         unvalidated = True
-    elif resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml:
+    elif resp_type == "REPLY" and ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active:
         # Failures are often environmental (captcha, transient block); surface the draft so the user can keep iterating.
         last_workflow = ctx.last_workflow
         last_workflow_yaml = ctx.last_workflow_yaml
@@ -1343,34 +1521,36 @@ def _translate_to_agent_result(
     output_policy_verdict = _copy_output_policy_verdict(raw_output_policy_verdict)
     soft_rewrite_reasons: list[OutputPolicyReason] = []
     unbacked_workflow_delivery_rewritten = False
-    if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
-        user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
-        soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
-        output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
-    if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
-        user_response = (
-            _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
-            if last_workflow is not None
-            else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
-        )
-        soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
-        output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
-    # Preserve the unbacked-proposal correction when both soft rewrites apply:
-    # a reply must not imply a workflow exists when no proposal was produced.
-    if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
-        user_response = _unbacked_workflow_delivery_reply(ctx)
-        resp_type = "ASK_QUESTION"
-        output_policy_verdict.output_kind = CopilotOutputKind.CLARIFICATION_REQUEST
-        unbacked_workflow_delivery_rewritten = True
-        soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
-        output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
-    if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
-        soft_rewrite_reasons.append(OutputPolicyReason.MISSING_PROPOSAL_STATE)
-        output_policy_verdict.remove(OutputPolicyReason.MISSING_PROPOSAL_STATE)
-    if OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in output_policy_verdict.reason_codes:
-        user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
-        soft_rewrite_reasons.append(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
-        output_policy_verdict.remove(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+    # The finalization shim overwrites these on a blocker turn — skip the rewrites.
+    if not blocker_active:
+        if OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in output_policy_verdict.reason_codes:
+            user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
+            soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+            output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+        if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
+            user_response = (
+                _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
+                if last_workflow is not None
+                else _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL
+            )
+            soft_rewrite_reasons.append(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
+            output_policy_verdict.remove(OutputPolicyReason.WORKFLOW_YAML_IN_REPLY)
+        # Preserve the unbacked-proposal correction when both soft rewrites apply:
+        # a reply must not imply a workflow exists when no proposal was produced.
+        if OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM in output_policy_verdict.reason_codes:
+            user_response = _unbacked_workflow_delivery_reply(ctx)
+            resp_type = "ASK_QUESTION"
+            output_policy_verdict.output_kind = CopilotOutputKind.CLARIFICATION_REQUEST
+            unbacked_workflow_delivery_rewritten = True
+            soft_rewrite_reasons.append(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
+            output_policy_verdict.remove(OutputPolicyReason.UNBACKED_WORKFLOW_DELIVERY_CLAIM)
+        if OutputPolicyReason.MISSING_PROPOSAL_STATE in output_policy_verdict.reason_codes:
+            soft_rewrite_reasons.append(OutputPolicyReason.MISSING_PROPOSAL_STATE)
+            output_policy_verdict.remove(OutputPolicyReason.MISSING_PROPOSAL_STATE)
+        if OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE in output_policy_verdict.reason_codes:
+            user_response = _ensure_unvalidated_proposal_affordance(str(user_response))
+            soft_rewrite_reasons.append(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
+            output_policy_verdict.remove(OutputPolicyReason.MISSING_UNVALIDATED_PROPOSAL_AFFORDANCE)
     final_output_kind = (
         _blocked_final_output_kind(output_policy_verdict)
         if not output_policy_verdict.allowed
@@ -1423,25 +1603,29 @@ def _translate_to_agent_result(
         tool_calls=[name for name in tool_call_names if name],
     )
 
-    return _make_agent_result(
+    return _finalize_result_with_blocker_override(
         ctx,
-        user_response=final_user_response,
-        updated_workflow=last_workflow,
-        global_llm_context=enriched_context or None,
-        response_type=resp_type,
-        workflow_yaml=last_workflow_yaml,
-        workflow_was_persisted=ctx.workflow_persisted,
-        total_tokens=ctx.total_tokens_used,
-        clear_proposed_workflow=resp_type == "ASK_QUESTION",
-        proposal_disposition=(
-            "no_proposal"
-            if unbacked_workflow_delivery_rewritten and last_workflow is None
-            else "review_untested"
-            if unvalidated
-            else "auto_applicable"
+        _make_agent_result(
+            ctx,
+            user_response=final_user_response,
+            updated_workflow=last_workflow,
+            global_llm_context=enriched_context or None,
+            response_type=resp_type,
+            workflow_yaml=last_workflow_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            clear_proposed_workflow=resp_type == "ASK_QUESTION",
+            proposal_disposition=(
+                "no_proposal"
+                if unbacked_workflow_delivery_rewritten and last_workflow is None
+                else "review_untested"
+                if unvalidated
+                else "auto_applicable"
+            ),
+            output_policy_diagnostics=output_policy_diagnostics,
+            turn_outcome=turn_outcome,
         ),
-        output_policy_diagnostics=output_policy_diagnostics,
-        turn_outcome=turn_outcome,
+        exit_site="translate_to_agent_result",
     )
 
 
@@ -1473,16 +1657,20 @@ def _build_feasibility_clarification_result(
         blocked_signatures=list(ctx.blocked_reply_signatures),
         reason_code="feasibility_clarification",
     )
-    return _make_agent_result(
+    return _finalize_result_with_blocker_override(
         ctx,
-        user_response=final_text,
-        updated_workflow=None,
-        global_llm_context=enriched_context,
-        response_type="ASK_QUESTION",
-        workflow_yaml=prior_workflow_yaml or None,
-        workflow_was_persisted=False,
-        clear_proposed_workflow=True,
-        turn_outcome=outcome,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=None,
+            global_llm_context=enriched_context,
+            response_type="ASK_QUESTION",
+            workflow_yaml=prior_workflow_yaml or None,
+            workflow_was_persisted=False,
+            clear_proposed_workflow=True,
+            turn_outcome=outcome,
+        ),
+        exit_site="feasibility_clarification",
     )
 
 
@@ -1550,16 +1738,20 @@ def _build_request_policy_clarification_result(
         blocked_signatures=list(ctx.blocked_reply_signatures),
         reason_code="request_policy_clarification",
     )
-    return _make_agent_result(
+    return _finalize_result_with_blocker_override(
         ctx,
-        user_response=final_text,
-        updated_workflow=None,
-        global_llm_context=structured.to_json_str(),
-        response_type="ASK_QUESTION",
-        workflow_yaml=prior_workflow_yaml or None,
-        workflow_was_persisted=False,
-        clear_proposed_workflow=True,
-        turn_outcome=outcome,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=None,
+            global_llm_context=structured.to_json_str(),
+            response_type="ASK_QUESTION",
+            workflow_yaml=prior_workflow_yaml or None,
+            workflow_was_persisted=False,
+            clear_proposed_workflow=True,
+            turn_outcome=outcome,
+        ),
+        exit_site="request_policy_clarification",
     )
 
 
@@ -1797,7 +1989,13 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
 ) -> AgentResult:
-    preserved_workflow = ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml else None
+    # A blocker turn never ships a proposal; hard-block OUTPUT_POLICY + a
+    # set blocker_signal both drop the preserved draft.
+    local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
+    blocker_active = local_blocker_signal is not None
+    preserved_workflow = (
+        ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
+    )
     preserved_workflow_yaml = ctx.last_workflow_yaml if preserved_workflow is not None else None
     structured = StructuredContext.from_json_str(prior_global_llm_context)
     structured.decisions_made.append(
@@ -2353,15 +2551,19 @@ async def _run_copilot_turn_impl(
                     blocked_signatures=ctx.blocked_reply_signatures,
                     terminal_reason="non_retriable_nav",
                 )
-                return _make_agent_result(
+                return _finalize_result_with_blocker_override(
                     ctx,
-                    user_response=final_nav_text,
-                    updated_workflow=None,
-                    global_llm_context=global_llm_context,
-                    workflow_yaml=None,
-                    workflow_was_persisted=ctx.workflow_persisted,
-                    total_tokens=ctx.total_tokens_used,
-                    turn_outcome=nav_outcome,
+                    _make_agent_result(
+                        ctx,
+                        user_response=final_nav_text,
+                        updated_workflow=None,
+                        global_llm_context=global_llm_context,
+                        workflow_yaml=None,
+                        workflow_was_persisted=ctx.workflow_persisted,
+                        total_tokens=ctx.total_tokens_used,
+                        turn_outcome=nav_outcome,
+                    ),
+                    exit_site="non_retriable_nav",
                 )
     except Exception as e:
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
