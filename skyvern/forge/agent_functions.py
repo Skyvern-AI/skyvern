@@ -706,15 +706,6 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
-    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
-        """Release any proxy lease held by ``owner_id``.
-
-        OSS no-op. Cloud overrides this to release the lease back to the
-        proxy-session pool so workflow/task cleanup doesn't have to
-        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
-        """
-        return None
-
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page.
 

@@ -26,6 +26,7 @@ from skyvern.forge.sdk.db.repositories.organizations import OrganizationsReposit
 from skyvern.forge.sdk.db.repositories.otp import OTPRepository
 from skyvern.forge.sdk.db.repositories.schedules import SchedulesRepository
 from skyvern.forge.sdk.db.repositories.scripts import ScriptsRepository
+from skyvern.forge.sdk.db.repositories.tags import TagsRepository
 from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.repositories.workflow_runs import WorkflowRunsRepository
@@ -130,6 +131,7 @@ class AgentDB(BaseAlchemyDB):
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.scripts = ScriptsRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.tags = TagsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.browser_sessions = BrowserSessionsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.google_oauth = GoogleOAuthRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.schedules = SchedulesRepository(
