@@ -86,6 +86,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
@@ -1582,6 +1583,22 @@ async def _update_workflow(
             edited_by="copilot",
         )
         ctx.workflow_yaml = workflow_yaml
+        # Best-effort — narrative emit failures must never abort an
+        # otherwise-successful update_workflow tool call. ``isinstance``
+        # narrows the parameter's declared ``AgentContext`` to the
+        # envelope-aware ``CopilotContext`` for mypy.
+        if isinstance(ctx, CopilotContext) and ctx.stream is not None:
+            try:
+                await maybe_emit_design_end(ctx.stream, ctx)
+                await emit_workflow_draft(ctx.stream, ctx, workflow)
+            except Exception as emit_err:
+                LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
+            # Reset phase flags so a subsequent ``tool_called`` re-edge-triggers
+            # ``design_start`` and a subsequent ``update_workflow`` re-emits
+            # ``design_end`` — multi-iteration designs (draft → test → redraft)
+            # would otherwise collapse into a single phase.
+            ctx.design_start_emitted = False
+            ctx.design_end_emitted = False
         return {
             "ok": True,
             "data": {

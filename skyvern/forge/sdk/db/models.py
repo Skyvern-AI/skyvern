@@ -356,6 +356,10 @@ class WorkflowTagEventModel(Base):
             "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import')",
             name="ck_workflow_tag_events_source",
         ),
+        CheckConstraint(
+            "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
+            name="ck_workflow_tag_events_caller_type",
+        ),
         CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
     )
 
@@ -368,6 +372,7 @@ class WorkflowTagEventModel(Base):
     set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     set_by = Column(String, nullable=False)
     source = Column(String, nullable=False)
+    caller_type = Column(String, nullable=True)
     superseded_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -381,11 +386,9 @@ class WorkflowTagEventModel(Base):
 
 
 class TagKeyModel(Base):
-    """Org-scoped registry of tag keys and their descriptions.
-
-    Auto-upserted on first use of a new key via INSERT ... ON CONFLICT
-    (organization_id, key) WHERE deleted_at IS NULL DO UPDATE.
-    """
+    """Org-scoped registry of tag keys and their descriptions. Auto-registered
+    on first use; partial UNIQUE on (org, key) WHERE deleted_at IS NULL races
+    concurrent first-use writers — the losing writer surfaces IntegrityError to the caller."""
 
     __tablename__ = "tag_keys"
     __table_args__ = (
@@ -438,6 +441,7 @@ class WorkflowModel(SoftDeleteMixin, Base):
     proxy_location = Column(String)
     webhook_callback_url = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    max_elapsed_time_minutes = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     cdp_connect_headers = Column(JSON, nullable=True)
     totp_verification_url = Column(String)
@@ -557,6 +561,7 @@ class WorkflowRunModel(Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    max_elapsed_time_minutes = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
     cdp_connect_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True, index=True)

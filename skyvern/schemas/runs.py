@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.models.run_limits import (
+    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    reject_bool_max_elapsed_time_minutes,
+)
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
@@ -240,6 +244,12 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
+    max_elapsed_time_minutes: int | None = Field(
+        default=None,
+        ge=1,
+        le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+        description="Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.",
+    )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
         description="The extra HTTP headers for the requests in browser.",
@@ -278,6 +288,11 @@ class WorkflowRunRequest(BaseModel):
         if v is None:
             return None
         return normalize_run_with(v)
+
+    @field_validator("max_elapsed_time_minutes", mode="before")
+    @classmethod
+    def validate_max_elapsed_time_minutes(cls, value: object) -> object:
+        return reject_bool_max_elapsed_time_minutes(value)
 
     @field_validator("run_metadata")
     @classmethod

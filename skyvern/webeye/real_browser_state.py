@@ -43,14 +43,12 @@ class RealBrowserState(BrowserState):
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
-        allow_content_blocking_extensions: bool = True,
     ):
         self.__page = page
         self.pw = pw
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
-        self.allow_content_blocking_extensions = allow_content_blocking_extensions
 
     async def __assert_page(self) -> Page:
         page = await self.get_working_page()
@@ -108,7 +106,6 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
-                allow_content_blocking_extensions=self.allow_content_blocking_extensions,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts

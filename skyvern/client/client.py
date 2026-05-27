@@ -329,6 +329,7 @@ class Skyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
@@ -410,6 +411,9 @@ class Skyvern:
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
+        max_elapsed_time_minutes : typing.Optional[int]
+            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
@@ -461,6 +465,7 @@ class Skyvern:
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
+            max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
             ai_fallback=ai_fallback,
@@ -2887,6 +2892,7 @@ class AsyncSkyvern:
         browser_session_id: typing.Optional[str] = OMIT,
         browser_profile_id: typing.Optional[str] = OMIT,
         max_screenshot_scrolls: typing.Optional[int] = OMIT,
+        max_elapsed_time_minutes: typing.Optional[int] = OMIT,
         extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = OMIT,
         browser_address: typing.Optional[str] = OMIT,
         ai_fallback: typing.Optional[bool] = OMIT,
@@ -2968,6 +2974,9 @@ class AsyncSkyvern:
         max_screenshot_scrolls : typing.Optional[int]
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
+        max_elapsed_time_minutes : typing.Optional[int]
+            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
 
@@ -3027,6 +3036,7 @@ class AsyncSkyvern:
             browser_session_id=browser_session_id,
             browser_profile_id=browser_profile_id,
             max_screenshot_scrolls=max_screenshot_scrolls,
+            max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=extra_http_headers,
             browser_address=browser_address,
             ai_fallback=ai_fallback,
