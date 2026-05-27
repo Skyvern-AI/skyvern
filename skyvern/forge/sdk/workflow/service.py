@@ -5476,14 +5476,6 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             child_workflow_run_ids=child_workflow_run_ids,
         )
-        try:
-            await app.AGENT_FUNCTION.release_proxy_session_for_owner(workflow_run.workflow_run_id)
-        except Exception:
-            LOG.warning(
-                "Failed to release proxy session for workflow run",
-                exc_info=True,
-                workflow_run_id=workflow_run.workflow_run_id,
-            )
         if browser_state:
             await self.persist_video_data(
                 browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
