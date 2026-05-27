@@ -470,6 +470,53 @@ class Skyvern:
         )
         return _response.data
 
+    def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        from skyvern import Skyvern
+
+        client = Skyvern(
+            api_key="YOUR_API_KEY",
+        )
+        client.retry_workflow_run(
+            workflow_run_id="wr_123",
+        )
+        """
+        _response = self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
+        return _response.data
+
     def get_run(self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> GetRunResponse:
         """
         Get run information (task run, workflow run)
@@ -1250,6 +1297,59 @@ class Skyvern:
         )
         """
         _response = self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List runs for a specific workflow.
+
+        Parameters
+        ----------
+        workflow_id : str
+            Workflow permanent ID. Workflow ID starts with `wpid_`.
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+        """
+        _response = self._raw_client.get_workflow_runs_by_id(
+            workflow_id,
             page=page,
             page_size=page_size,
             status=status,
@@ -2936,6 +3036,61 @@ class AsyncSkyvern:
         )
         return _response.data
 
+    async def retry_workflow_run(
+        self,
+        workflow_run_id: str,
+        *,
+        max_steps_override: typing.Optional[int] = None,
+        user_agent: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> WorkflowRunResponse:
+        """
+        Retry a workflow run using the original run parameters.
+
+        Parameters
+        ----------
+        workflow_run_id : str
+            The id of the workflow run to retry.
+
+        max_steps_override : typing.Optional[int]
+
+        user_agent : typing.Optional[str]
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        WorkflowRunResponse
+            Successfully retried workflow run
+
+        Examples
+        --------
+        import asyncio
+
+        from skyvern import AsyncSkyvern
+
+        client = AsyncSkyvern(
+            api_key="YOUR_API_KEY",
+        )
+
+
+        async def main() -> None:
+            await client.retry_workflow_run(
+                workflow_run_id="wr_123",
+            )
+
+
+        asyncio.run(main())
+        """
+        _response = await self._raw_client.retry_workflow_run(
+            workflow_run_id,
+            max_steps_override=max_steps_override,
+            user_agent=user_agent,
+            request_options=request_options,
+        )
+        return _response.data
+
     async def get_run(self, run_id: str, *, request_options: typing.Optional[RequestOptions] = None) -> GetRunResponse:
         """
         Get run information (task run, workflow run)
@@ -3852,6 +4007,59 @@ class AsyncSkyvern:
         asyncio.run(main())
         """
         _response = await self._raw_client.get_workflow_runs(
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+            request_options=request_options,
+        )
+        return _response.data
+
+    async def get_workflow_runs_by_id(
+        self,
+        workflow_id: str,
+        *,
+        page: typing.Optional[int] = None,
+        page_size: typing.Optional[int] = None,
+        status: typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]] = None,
+        search_key: typing.Optional[str] = None,
+        error_code: typing.Optional[str] = None,
+        request_options: typing.Optional[RequestOptions] = None,
+    ) -> typing.List[WorkflowRun]:
+        """
+        List runs for a specific workflow.
+
+        Parameters
+        ----------
+        workflow_id : str
+            Workflow permanent ID. Workflow ID starts with `wpid_`.
+
+        page : typing.Optional[int]
+            Page number for pagination.
+
+        page_size : typing.Optional[int]
+            Number of runs to return per page.
+
+        status : typing.Optional[typing.Union[WorkflowRunStatus, typing.Sequence[WorkflowRunStatus]]]
+            Filter by one or more run statuses.
+
+        search_key : typing.Optional[str]
+            Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.
+
+        error_code : typing.Optional[str]
+            Exact-match filter on the error_code field inside each task's errors JSON array.
+
+        request_options : typing.Optional[RequestOptions]
+            Request-specific configuration.
+
+        Returns
+        -------
+        typing.List[WorkflowRun]
+            Successful Response
+        """
+        _response = await self._raw_client.get_workflow_runs_by_id(
+            workflow_id,
             page=page,
             page_size=page_size,
             status=status,

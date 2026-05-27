@@ -94,6 +94,61 @@ async def list_workflows_raw(
     return payload
 
 
+async def list_workflow_runs_raw(
+    workflow_id: str,
+    *,
+    page: int,
+    page_size: int,
+    status: list[str] | None,
+    search_key: str | None,
+    error_code: str | None,
+) -> list[dict[str, Any]]:
+    """GET /v1/workflows/{id}/runs — returns raw workflow run dicts for one workflow."""
+    skyvern = get_skyvern()
+    params: dict[str, Any] = {
+        "page": page,
+        "page_size": page_size,
+    }
+    if status:
+        params["status"] = status
+    if search_key is not None:
+        params["search_key"] = search_key
+    if error_code is not None:
+        params["error_code"] = error_code
+    response = await skyvern._client_wrapper.httpx_client.request(
+        f"{PUBLIC_WORKFLOW_ROUTE}/{workflow_id}/runs",
+        method="GET",
+        params=params,
+    )
+    if response.status_code == 404:
+        raise NotFoundError(body={"detail": f"Workflow {workflow_id!r} not found"})
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {extract_error_detail(response)}")
+    payload = _decode_success_payload(response, operation="workflow runs list")
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected workflow runs list payload: {type(payload).__name__}")
+    return payload
+
+
+async def retry_workflow_run_raw(workflow_run_id: str) -> dict[str, Any]:
+    """POST /v1/workflows/runs/{id}/retry — returns the new workflow run response."""
+    skyvern = get_skyvern()
+    response = await skyvern._client_wrapper.httpx_client.request(
+        f"{PUBLIC_WORKFLOW_ROUTE}/runs/{workflow_run_id}/retry",
+        method="POST",
+    )
+    if response.status_code == 404:
+        raise NotFoundError(body={"detail": f"Workflow run {workflow_run_id!r} not found"})
+    if response.status_code == 400:
+        raise BadRequestError(body={"detail": extract_error_detail(response)})
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {extract_error_detail(response)}")
+    payload = _decode_success_payload(response, operation="retry_workflow_run")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected retry_workflow_run payload: {type(payload).__name__}")
+    return payload
+
+
 async def create_workflow_raw(
     *,
     json_definition: dict[str, Any] | None,

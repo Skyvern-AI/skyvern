@@ -504,6 +504,19 @@ class AgentFunction:
         """Persist per-run analytics metadata. OSS builds have no sidecar table."""
         return None
 
+    async def get_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> dict[str, str] | None:
+        """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
+    async def is_block_scoped_workflow_run(self, workflow_run: "WorkflowRun") -> bool:
+        """Return whether this workflow run was created for scoped block execution."""
+        return workflow_run.debug_session_id is not None
+
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
     MAGIC_LINK_CLOSE_SIGNALS: tuple[str, ...] = (

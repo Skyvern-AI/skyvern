@@ -151,7 +151,9 @@ from .workflow import (
     skyvern_workflow_delete,
     skyvern_workflow_get,
     skyvern_workflow_list,
+    skyvern_workflow_retry,
     skyvern_workflow_run,
+    skyvern_workflow_run_list,
     skyvern_workflow_status,
     skyvern_workflow_update,
     skyvern_workflow_update_folder,
@@ -442,12 +444,14 @@ mcp.tool(tags={"folder"}, annotations=_dest("Delete Folder"))(skyvern_folder_del
 # -- Workflow management (CRUD + execution, no browser needed) --
 mcp.tool(tags={"workflow"}, annotations=_ro("List Workflows"))(size_capped(skyvern_workflow_list))
 mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow"))(size_capped(skyvern_workflow_get))
+mcp.tool(tags={"workflow"}, annotations=_ro("List Workflow Runs"))(size_capped(skyvern_workflow_run_list))
 mcp.tool(tags={"workflow"}, annotations=_mut("Create Workflow"))(skyvern_workflow_create)
 mcp.tool(tags={"workflow"}, annotations=_mut("Update Workflow"))(skyvern_workflow_update)
 mcp.tool(tags={"workflow"}, annotations=_mut("Move Workflow to Folder"))(skyvern_workflow_update_folder)
 mcp.tool(tags={"workflow"}, annotations=_dest("Delete Workflow"))(skyvern_workflow_delete)
 mcp.tool(tags={"workflow"}, annotations=_web_dest("Run Workflow"))(skyvern_workflow_run)
 mcp.tool(tags={"workflow"}, annotations=_ro("Get Workflow Run Status"))(skyvern_workflow_status)
+mcp.tool(tags={"workflow"}, annotations=_web_dest("Retry Workflow Run"))(skyvern_workflow_retry)
 mcp.tool(tags={"workflow"}, annotations=_dest("Cancel Workflow Run"))(skyvern_workflow_cancel)
 
 # -- Schedule management (no browser needed) --
@@ -554,12 +558,14 @@ __all__ = [
     # Workflow management
     "skyvern_workflow_list",
     "skyvern_workflow_get",
+    "skyvern_workflow_run_list",
     "skyvern_workflow_create",
     "skyvern_workflow_update",
     "skyvern_workflow_update_folder",
     "skyvern_workflow_delete",
     "skyvern_workflow_run",
     "skyvern_workflow_status",
+    "skyvern_workflow_retry",
     "skyvern_workflow_cancel",
     # Schedule management
     "skyvern_schedule_list",

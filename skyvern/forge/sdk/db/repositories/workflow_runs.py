@@ -966,6 +966,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        exclude_child_runs: bool = False,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -980,6 +981,8 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            if exclude_child_runs:
+                query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
             query = self._apply_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
             if status:

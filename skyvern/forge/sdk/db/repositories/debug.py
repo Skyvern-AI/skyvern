@@ -88,6 +88,23 @@ class DebugRepository(BaseRepository):
 
             return BlockRun.model_validate(model) if model else None
 
+    @db_operation("has_block_run_for_workflow_run")
+    async def has_block_run_for_workflow_run(
+        self,
+        *,
+        organization_id: str,
+        workflow_run_id: str,
+    ) -> bool:
+        async with self.Session() as session:
+            model = await session.scalar(
+                select(BlockRunModel.workflow_run_id)
+                .filter_by(organization_id=organization_id)
+                .filter_by(workflow_run_id=workflow_run_id)
+                .limit(1)
+            )
+
+            return model is not None
+
     @db_operation("create_block_run")
     async def create_block_run(
         self,

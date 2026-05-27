@@ -125,6 +125,7 @@ async def _run_workflow_and_build_response(
     tags=["Agent"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-excluded": True,
         "x-fern-sdk-method-name": "login",
         "x-fern-examples": [
             {
@@ -291,6 +292,7 @@ async def login(
     tags=["Agent"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-excluded": True,
         "x-fern-sdk-method-name": "download_files",
         "x-fern-examples": [
             {
