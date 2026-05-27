@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import re
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -79,6 +80,11 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_request_policy,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.streaming_adapter import (
+    emit_turn_start,
+    emit_workflow_draft,
+    maybe_emit_design_end,
+)
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import (
@@ -126,11 +132,12 @@ def _derive_turn_index(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     explicit: int | None,
 ) -> int:
-    # `chat_history` may be a truncated tail of the full message log, so this
+    # Zero-based to match the wire contract (``WorkflowCopilotTurnStartUpdate``).
+    # ``chat_history`` may be a truncated tail of the full message log, so this
     # fallback can undercount long sessions; prefer the explicit count.
     if explicit is not None:
         return explicit
-    return sum(1 for m in chat_history if m.sender == WorkflowCopilotChatSender.USER) + 1
+    return sum(1 for m in chat_history if m.sender == WorkflowCopilotChatSender.USER)
 
 
 @contextlib.contextmanager
@@ -139,11 +146,14 @@ def _copilot_turn_span(
     chat_request: WorkflowCopilotChatRequest,
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     turn_index: int | None,
+    turn_id: str | None = None,
 ) -> Iterator[Any]:
     tracer = otel_trace.get_tracer("skyvern")
     with tracer.start_as_current_span(_COPILOT_TURN_SPAN_NAME) as span:
         span.set_attribute("skyvern.span.role", "wrapper")
         span.set_attribute("copilot.turn_index", _derive_turn_index(chat_history, turn_index))
+        if turn_id is not None:
+            span.set_attribute("copilot.turn_id", turn_id)
         preview = _build_user_message_preview(chat_request.message)
         if preview:
             span.set_attribute("copilot.user_message_preview", preview)
@@ -734,6 +744,8 @@ def _build_exit_result(
             total_tokens=ctx.total_tokens_used,
             cancelled=cancelled,
             turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
         ),
         exit_site="exit_result",
     )
@@ -950,6 +962,8 @@ def _finalize_result_with_blocker_override(
         proposal_disposition="review_untested" if preserved_proposal else "no_proposal",
         output_policy_diagnostics=rendered_diagnostics,
         turn_outcome=turn_outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
     )
 
 
@@ -1170,6 +1184,8 @@ def _build_wip_exit_result(
                 proposal_disposition="review_tested",
                 cancelled=cancelled,
                 turn_outcome=outcome,
+                turn_id=ctx.turn_id,
+                narrative_summary=ctx.narrative_summary,
             ),
             exit_site="wip_last_good_workflow",
         )
@@ -1198,6 +1214,8 @@ def _build_wip_exit_result(
                 proposal_disposition="review_untested" if unvalidated else "auto_applicable",
                 cancelled=cancelled,
                 turn_outcome=outcome,
+                turn_id=ctx.turn_id,
+                narrative_summary=ctx.narrative_summary,
             ),
             exit_site="wip_last_workflow",
         )
@@ -1624,6 +1642,8 @@ def _translate_to_agent_result(
             ),
             output_policy_diagnostics=output_policy_diagnostics,
             turn_outcome=turn_outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
         ),
         exit_site="translate_to_agent_result",
     )
@@ -1669,6 +1689,8 @@ def _build_feasibility_clarification_result(
             workflow_was_persisted=False,
             clear_proposed_workflow=True,
             turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
         ),
         exit_site="feasibility_clarification",
     )
@@ -1750,6 +1772,8 @@ def _build_request_policy_clarification_result(
             workflow_was_persisted=False,
             clear_proposed_workflow=True,
             turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
         ),
         exit_site="request_policy_clarification",
     )
@@ -2070,6 +2094,8 @@ def _build_output_policy_blocked_result(
             soft_rewrite_reason_codes=[],
         ),
         turn_outcome=output_policy_outcome,
+        turn_id=ctx.turn_id,
+        narrative_summary=ctx.narrative_summary,
     )
 
 
@@ -2085,8 +2111,15 @@ async def run_copilot_agent(
     security_rules: str = "",
     config: CopilotConfig | None = None,
     turn_index: int | None = None,
+    turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
+    # One id per turn — passed to every downstream AgentResult and
+    # CopilotContext so the envelope and terminal frames correlate. The
+    # default_factory on CopilotContext is only the per-construction fallback.
+    if turn_id is None:
+        turn_id = uuid.uuid4().hex
+    normalized_turn_index = turn_index if turn_index is not None else 0
     try:
         # Initialize tracing before opening the turn span so Logfire's OTel provider
         # is installed; otherwise the very first turn lands the parent span on
@@ -2096,6 +2129,7 @@ async def run_copilot_agent(
             chat_request=chat_request,
             chat_history=chat_history,
             turn_index=turn_index,
+            turn_id=turn_id,
         ) as turn_span:
             try:
                 return await _run_copilot_turn_impl(
@@ -2109,6 +2143,8 @@ async def run_copilot_agent(
                     api_key=api_key,
                     security_rules=security_rules,
                     config=config,
+                    turn_id=turn_id,
+                    turn_index=normalized_turn_index,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                 )
             except Exception as exc:
@@ -2130,6 +2166,8 @@ async def run_copilot_agent(
                     api_key=api_key,
                     user_message=chat_request.message,
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+                    turn_id=turn_id,
+                    turn_index=normalized_turn_index,
                 )
                 return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
     except Exception as exc:
@@ -2150,6 +2188,8 @@ async def run_copilot_agent(
             api_key=api_key,
             user_message=chat_request.message,
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+            turn_id=turn_id,
+            turn_index=normalized_turn_index,
         )
         return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc)
 
@@ -2166,6 +2206,8 @@ async def _run_copilot_turn_impl(
     api_key: str | None,
     security_rules: str,
     config: CopilotConfig | None,
+    turn_id: str,
+    turn_index: int,
     prior_copilot_workflow_yaml: str | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
@@ -2211,6 +2253,7 @@ async def _run_copilot_turn_impl(
                 global_llm_context=global_llm_context,
                 workflow_yaml=chat_request.workflow_yaml or None,
                 turn_outcome=missing_sdk_outcome,
+                turn_id=turn_id,
             )
         raise
 
@@ -2224,7 +2267,17 @@ async def _run_copilot_turn_impl(
         api_key=api_key,
         user_message=chat_request.message,
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+        turn_id=turn_id,
+        turn_index=turn_index,
     )
+    # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
+    # the default_factory — the envelope and terminal frames would then carry
+    # different ids and correlation would silently break. Uses a real
+    # conditional so the check survives ``python -O``.
+    if ctx.turn_id != turn_id:
+        raise RuntimeError(
+            f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
+        )
     policy_inputs = RequestPolicyGuardrailInputs(
         user_message=chat_request.message,
         workflow_yaml=safe_workflow_yaml,
@@ -2253,6 +2306,14 @@ async def _run_copilot_turn_impl(
         chat_request.message,
         RunContextWrapper(context=ctx),
     )
+    # Emit TURN_START after the guardrail runs so the envelope carries an
+    # accurate ``mode`` when ``ctx.turn_intent`` is populated, and falls back
+    # to ``UNKNOWN`` defensively otherwise. Best-effort — an emission failure
+    # must not abort an otherwise-runnable turn.
+    try:
+        await emit_turn_start(stream, ctx)
+    except Exception as emit_err:
+        LOG.warning("copilot_narrative_turn_start_emit_failed", error=str(emit_err))
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     if request_policy is not None:
         _store_turn_context_packet_on_context(
@@ -2493,13 +2554,30 @@ async def _run_copilot_turn_impl(
                     )
                     ctx.supports_vision = fallback_supports_vision
                     result = await _run_attempt(fallback_model_name, fallback_run_config, fallback_resolved_key)
-                return _translate_to_agent_result(
+                agent_result = _translate_to_agent_result(
                     result,
                     ctx,
                     global_llm_context,
                     chat_request,
                     organization_id,
                 )
+                # Inline ``REPLACE_WORKFLOW`` bypasses the ``update_workflow``
+                # tool, so the envelope fires here instead — keeps the FE
+                # bubble identical regardless of which path produced the
+                # draft. Best-effort.
+                if (
+                    agent_result.response_type == "REPLACE_WORKFLOW"
+                    and agent_result.updated_workflow is not None
+                    and ctx.stream is not None
+                ):
+                    try:
+                        await maybe_emit_design_end(ctx.stream, ctx)
+                        await emit_workflow_draft(ctx.stream, ctx, agent_result.updated_workflow)
+                    except Exception as emit_err:
+                        LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
+                    ctx.design_start_emitted = False
+                    ctx.design_end_emitted = False
+                return agent_result
             except asyncio.CancelledError:
                 # Re-raising would leave the route with ``agent_result is None``
                 # and skip its ``workflow_was_persisted`` rollback decision.
@@ -2562,6 +2640,8 @@ async def _run_copilot_turn_impl(
                         workflow_was_persisted=ctx.workflow_persisted,
                         total_tokens=ctx.total_tokens_used,
                         turn_outcome=nav_outcome,
+                        turn_id=ctx.turn_id,
+                        narrative_summary=ctx.narrative_summary,
                     ),
                     exit_site="non_retriable_nav",
                 )
