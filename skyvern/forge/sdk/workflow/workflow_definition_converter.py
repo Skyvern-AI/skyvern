@@ -605,6 +605,8 @@ def block_yaml_to_block(
             task_type=TaskType.action,
             parameters=action_block_parameters,
             navigation_goal=block_yaml.navigation_goal,
+            selector=block_yaml.selector,
+            ai_fallback=block_yaml.ai_fallback,
             error_code_mapping=block_yaml.error_code_mapping,
             max_retries=block_yaml.max_retries,
             complete_on_download=block_yaml.complete_on_download,
