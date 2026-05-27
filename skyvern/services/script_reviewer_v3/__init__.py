@@ -1,7 +1,7 @@
 """v3 agentic script reviewer module: budget, decision, agent loops, skills.
 
 The v3 reviewer is an agentic alternative to the v2 prompt-based reviewer.
-Per-wpid cohort routing via the ``SCRIPT_REVIEWER_VERSION`` PostHog flag;
+Per-wpid cohort routing via the ``SCRIPT_REVIEWER_VERSION`` experimentation flag;
 default is v2 so this module is dormant until a wpid is opted in.
 """
 

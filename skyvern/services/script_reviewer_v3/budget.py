@@ -27,7 +27,7 @@ import structlog
 LOG = structlog.get_logger()
 
 
-# Per-review budget defaults. Tuned via PostHog SCRIPT_REVIEWER_V3_BUDGET payload.
+# Per-review budget defaults. Tuned via SCRIPT_REVIEWER_V3_BUDGET payload.
 DEFAULT_MIDRUN_MAX_CYCLES = 15
 DEFAULT_MIDRUN_MAX_TOKENS = 200_000
 DEFAULT_MIDRUN_MAX_COST_USD = 0.50

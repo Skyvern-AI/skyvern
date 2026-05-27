@@ -26,6 +26,7 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, is
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
+from skyvern.services.script_review_cap import is_script_review_cap_exceeded_v3
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.mint_audit import (
     SuspiciousLiteralFinding,
@@ -33,12 +34,8 @@ from skyvern.services.script_reviewer_v3.mint_audit import (
     find_suspicious_selector_literals,
 )
 from skyvern.services.script_reviewer_v3.mint_review import fire_and_forget_mint_review
+from skyvern.services.script_version_persist_bridge import register_script_version_persist_handlers
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
-
-# Deferred to call-site because ``skyvern.forge.sdk.workflow.service``
-# imports this module, creating a circular import at module-load time.
-# Hoisting upstream would require splitting the cap helpers out of
-# service.py into their own module (future cleanup).
 
 LOG = structlog.get_logger()
 jinja_sandbox_env = SandboxedEnvironment()
@@ -1132,9 +1129,6 @@ async def _log_mint_audit_findings(
     broken validator can't block legitimate script persistence.
     """
     try:
-        # See module-level comment on the deferred import.
-        from skyvern.forge.sdk.workflow.service import peek_script_review_cap_v3
-
         prompts: list[str] = []
         param_dict: dict[str, Any] = {}
         try:
@@ -1250,7 +1244,7 @@ async def _log_mint_audit_findings(
             return
 
         # Cap gate — read-only check; persist owns the atomic increment.
-        cap_exceeded = await peek_script_review_cap_v3(
+        cap_exceeded = await is_script_review_cap_exceeded_v3(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization_id=workflow.organization_id,
             fail_closed=True,
@@ -2264,3 +2258,9 @@ async def create_script_version_from_full_code(
             workflow_permanent_id=workflow_permanent_id,
         )
         return None
+
+
+register_script_version_persist_handlers(
+    create_from_review=create_script_version_from_review,
+    create_from_full_code=create_script_version_from_full_code,
+)
