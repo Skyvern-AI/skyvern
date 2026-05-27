@@ -443,6 +443,20 @@ class BlockType(StrEnum):
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
 
 
+class AIFallbackMode(StrEnum):
+    """Controls how an action block uses a CSS/XPath selector relative to AI.
+
+    - `fallback`: attempt the selector first; fall back to AI on failure.
+    - `proactive`: always use AI; the selector (if any) is a hint only.
+
+    When `selector` is None, both modes degrade to AI-only — the difference
+    is purely semantic (whether the author expected to have a selector here).
+    """
+
+    FALLBACK = "fallback"
+    PROACTIVE = "proactive"
+
+
 class BlockStatus(StrEnum):
     running = "running"
     completed = "completed"
@@ -922,6 +936,8 @@ class ActionBlockYAML(BlockYAML):
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     parameter_keys: list[str] | None = None

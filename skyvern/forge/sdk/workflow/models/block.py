@@ -124,6 +124,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import (
+    AIFallbackMode,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -5785,6 +5786,9 @@ class ActionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
 
 
 class NavigationBlock(BaseTaskBlock):
