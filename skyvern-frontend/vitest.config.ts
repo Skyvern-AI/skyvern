@@ -20,6 +20,7 @@ export default defineConfig({
       VITE_WSS_BASE_URL: "ws://localhost:8000/api/v1",
       VITE_ENVIRONMENT: "test",
     },
+    setupFiles: "./vitest.setup.ts",
   },
   resolve: {
     alias: {
