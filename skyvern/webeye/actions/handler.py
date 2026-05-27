@@ -138,6 +138,8 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
 
+UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
+
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
 
@@ -3453,6 +3455,9 @@ async def chain_click(
             for r in action_results:
                 if isinstance(r, ActionSuccess):
                     r.upload_file_triggered = is_filechooser_trigger
+                    if not is_filechooser_trigger:
+                        r.needs_followup = True
+                        r.followup_message = UPLOAD_PENDING_FOLLOWUP_MESSAGE
 
 
 @traced(name="skyvern.agent.dropdown.auto_completion")
