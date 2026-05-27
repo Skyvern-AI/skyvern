@@ -34,9 +34,9 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
     case "not_found":
       return {
-        title: "Workflow run not found",
+        title: "Agent run not found",
         detail:
-          "The backend could not find this workflow run for the current organization.",
+          "The backend could not find this agent run for the current organization.",
       };
     case "timeout":
       return {
@@ -49,8 +49,8 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
     case "failed":
     case "terminated":
       return {
-        title: "Workflow run is no longer live",
-        detail: `The workflow run status is ${status}.`,
+        title: "Agent run is no longer live",
+        detail: `The agent run status is ${status}.`,
       };
     default:
       return {
@@ -200,13 +200,13 @@ function WorkflowRunStream({
             ) {
               toast({
                 title: "Run Failed",
-                description: "The workflow run has failed.",
+                description: "The agent run has failed.",
                 variant: "destructive",
               });
             } else if (message.status === "completed") {
               toast({
                 title: "Run Completed",
-                description: "The workflow run has been completed.",
+                description: "The agent run has been completed.",
                 variant: "success",
               });
             }
@@ -259,16 +259,16 @@ function WorkflowRunStream({
   if (workflowRun?.status === Status.Created) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
-        <span>Workflow has been created.</span>
-        <span>Stream will start when the workflow is running.</span>
+        <span>Agent has been created.</span>
+        <span>Stream will start when the agent is running.</span>
       </div>
     );
   }
   if (workflowRun?.status === Status.Queued) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-8 rounded-md bg-slate-900 py-8 text-lg">
-        <span>Your workflow run is queued.</span>
-        <span>Stream will start when the workflow is running.</span>
+        <span>Your agent run is queued.</span>
+        <span>Stream will start when the agent is running.</span>
       </div>
     );
   }

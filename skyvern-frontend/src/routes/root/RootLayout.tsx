@@ -15,8 +15,8 @@ function RootLayout() {
   const isEmbedded = embed === "true";
   const debugStore = useDebugStore();
 
-  const horizontalPadding = cn("lg:pl-64", {
-    "lg:pl-28": collapsed,
+  const horizontalPadding = cn("lg:pl-60", {
+    "lg:pl-16": collapsed,
     "lg:pl-4": isEmbedded,
   });
 

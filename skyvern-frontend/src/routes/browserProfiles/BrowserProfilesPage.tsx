@@ -8,8 +8,7 @@ import { BrowserProfilesList } from "./BrowserProfilesList";
 import { CreateBrowserProfileButton } from "./CreateBrowserProfileButton";
 import { useBackgroundBrowserProfileCreate } from "./hooks/useBackgroundBrowserProfileCreate";
 
-const subHeaderText =
-  "Manage saved browser profiles used by your workflow runs.";
+const subHeaderText = "Manage saved browser profiles used by your agent runs.";
 
 function BrowserProfilesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -24,7 +23,9 @@ function BrowserProfilesPage() {
   return (
     <div className="space-y-5">
       <h1 className="text-2xl">Browser Profiles</h1>
-      <div className="w-96 text-sm text-slate-300">{subHeaderText}</div>
+      <div className="w-96 text-sm text-neutral-600 dark:text-slate-300">
+        {subHeaderText}
+      </div>
       <div className="flex items-center justify-between gap-4">
         <TableSearchInput
           value={search}

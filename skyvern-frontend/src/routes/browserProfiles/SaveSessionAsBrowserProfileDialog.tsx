@@ -73,7 +73,9 @@ function SaveSessionAsBrowserProfileDialog({
         <form onSubmit={handleSubmit}>
           <div className="grid gap-4 pb-4">
             <div className="rounded-md border border-slate-700 bg-slate-elevation2 px-3 py-2">
-              <div className="text-xs text-slate-400">Source session</div>
+              <div className="text-xs text-neutral-600 dark:text-slate-400">
+                Source session
+              </div>
               <div className="truncate font-mono text-xs text-slate-200">
                 {browserSessionId}
               </div>
@@ -92,7 +94,10 @@ function SaveSessionAsBrowserProfileDialog({
             </div>
             <div className="grid gap-2">
               <Label htmlFor="save-browser-profile-description">
-                Description <span className="text-slate-400">(optional)</span>
+                Description{" "}
+                <span className="text-neutral-600 dark:text-slate-400">
+                  (optional)
+                </span>
               </Label>
               <Textarea
                 id="save-browser-profile-description"

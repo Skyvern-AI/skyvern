@@ -21,7 +21,7 @@ function VerificationToastContent({ label, navigateUrl }: ToastContentProps) {
           to={navigateUrl}
           className="inline-flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
         >
-          Go to workflow
+          Go to agent
           <ExternalLinkIcon className="h-3 w-3" />
         </Link>
       )}

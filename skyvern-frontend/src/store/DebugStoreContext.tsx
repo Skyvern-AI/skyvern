@@ -1,11 +1,14 @@
 import React, { createContext, useMemo } from "react";
-import { useLocation } from "react-router-dom";
+import { useMatch } from "react-router-dom";
 
 function useIsDebugMode() {
-  const location = useLocation();
+  const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
+  const workflowBlockBuildMatch = useMatch(
+    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
+  );
   return useMemo(
-    () => location.pathname.includes("build"),
-    [location.pathname],
+    () => Boolean(workflowBuildMatch || workflowBlockBuildMatch),
+    [workflowBuildMatch, workflowBlockBuildMatch],
   );
 }
 

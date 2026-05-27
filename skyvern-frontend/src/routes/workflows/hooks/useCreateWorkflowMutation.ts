@@ -5,8 +5,26 @@ import { getClient } from "@/api/AxiosClient";
 import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowApiResponse } from "../types/workflowTypes";
+import { toast } from "@/components/ui/use-toast";
+import axios from "axios";
 
 type CreateWorkflowInput = WorkflowCreateYAMLRequest & { _via?: string };
+
+function getCreateWorkflowErrorMessage(error: unknown) {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    return error.message;
+  }
+
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "Please try again.";
+}
 
 function useCreateWorkflowMutation() {
   const queryClient = useQueryClient();
@@ -40,6 +58,13 @@ function useCreateWorkflowMutation() {
       navigate(
         `/workflows/${response.data.workflow_permanent_id}/build${search}`,
       );
+    },
+    onError: (error) => {
+      toast({
+        variant: "destructive",
+        title: "Could not create agent",
+        description: getCreateWorkflowErrorMessage(error),
+      });
     },
   });
 }

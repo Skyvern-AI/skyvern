@@ -320,21 +320,21 @@ describe("WorkflowTriggerBlockForm (SKY-9361)", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  test("renders WorkflowSelector + payload placeholder when no workflow selected", () => {
+  test("renders WorkflowSelector + payload placeholder when no agent selected", () => {
     setWorkflowTriggerNode("w1", { workflowPermanentId: "" });
     render(<WorkflowTriggerBlockForm blockId="w1" />);
 
-    expect(screen.getByText("Target Workflow")).toBeDefined();
+    expect(screen.getByText("Target Agent")).toBeDefined();
     expect(screen.getByTestId("workflow-selector")).toBeDefined();
     expect(
       screen.getByText(
-        "Select a target workflow to configure its input parameters here.",
+        "Select a target agent to configure its input parameters here.",
       ),
     ).toBeDefined();
     expect(screen.queryByTestId("payload-parameter-fields")).toBeNull();
   });
 
-  test("renders WorkflowSelector + PayloadParameterFields when workflow selected", () => {
+  test("renders WorkflowSelector + PayloadParameterFields when agent selected", () => {
     setWorkflowTriggerNode("w1", {
       workflowPermanentId: "wpid_target",
       payload: '{"foo":"bar"}',
@@ -344,7 +344,7 @@ describe("WorkflowTriggerBlockForm (SKY-9361)", () => {
     expect(screen.getByTestId("payload-parameter-fields")).toBeDefined();
     expect(
       screen.queryByText(
-        "Select a target workflow to configure its input parameters here.",
+        "Select a target agent to configure its input parameters here.",
       ),
     ).toBeNull();
     const payloadValue = screen.getByTestId("payload-value");
@@ -487,7 +487,7 @@ describe("WorkflowTriggerBlockForm (SKY-9361)", () => {
 
     expect(
       screen.getByText(
-        /Continue in the same session.*disabled because the parent workflow may close its browser/i,
+        /Continue in the same session.*disabled because the parent agent may close its browser/i,
       ),
     ).toBeDefined();
   });

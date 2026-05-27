@@ -88,8 +88,9 @@ function ActionCardCompact({
         className={cn(
           "group rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
           {
-            "ring-1 ring-white/40 hover:ring-white/40": active,
-            "hover:ring-white/25": !active,
+            "ring-1 ring-neutral-500/45 hover:ring-neutral-500/45 dark:ring-white/40 dark:hover:ring-white/40":
+              active,
+            "hover:ring-neutral-400/40 dark:hover:ring-white/25": !active,
           },
           cardClassName,
         )}
@@ -98,7 +99,7 @@ function ActionCardCompact({
           <button
             type="button"
             onClick={onSelect}
-            className="flex min-h-[40px] flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+            className="flex min-h-[40px] flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-neutral-500/45 dark:focus-visible:ring-white/40"
           >
             <span
               aria-hidden="true"
@@ -107,18 +108,23 @@ function ActionCardCompact({
                 "bg-destructive": !success,
               })}
             />
-            <span className="shrink-0 text-xs tabular-nums text-slate-500">
+            <span className="shrink-0 text-xs tabular-nums text-neutral-500 dark:text-slate-500">
               #{index}
             </span>
             {icon && (
-              <span className="shrink-0 text-slate-300" aria-hidden="true">
+              <span
+                className="shrink-0 text-neutral-600 dark:text-slate-300"
+                aria-hidden="true"
+              >
                 {icon}
               </span>
             )}
-            <span className="shrink-0 text-xs text-slate-300">{label}</span>
+            <span className="shrink-0 text-xs text-neutral-700 dark:text-slate-300">
+              {label}
+            </span>
             <span
               className={cn(
-                "min-w-0 flex-1 truncate text-xs text-slate-200",
+                "min-w-0 flex-1 truncate text-xs text-neutral-800 dark:text-slate-200",
                 reasoningPreview.length === 0 && "invisible",
               )}
             >
@@ -144,7 +150,7 @@ function ActionCardCompact({
             aria-label={expanded ? "Collapse details" : "Expand details"}
             aria-expanded={expanded}
             onClick={onToggleExpanded}
-            className="mr-2 shrink-0 rounded p-0.5 text-slate-400 outline-none hover:bg-slate-elevation3 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+            className="mr-2 shrink-0 rounded p-0.5 text-neutral-500 outline-none hover:bg-neutral-200 hover:text-neutral-900 focus-visible:ring-1 focus-visible:ring-neutral-500/45 dark:text-slate-400 dark:hover:bg-slate-elevation3 dark:hover:text-slate-200 dark:focus-visible:ring-white/40"
           >
             {expanded ? (
               <ChevronDownIcon className="h-4 w-4" />
@@ -153,33 +159,33 @@ function ActionCardCompact({
             )}
           </button>
         </div>
-        <CollapsibleContent className="space-y-2 px-3 pb-3 pt-1 text-xs text-slate-400">
+        <CollapsibleContent className="space-y-2 px-3 pb-3 pt-1 text-xs text-neutral-600 dark:text-slate-400">
           {action.reasoning && (
-            <div className="rounded bg-slate-elevation5 p-2">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+            <div className="rounded bg-neutral-200/80 p-2 dark:bg-slate-elevation5">
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
                 Reasoning
               </div>
-              <div className="whitespace-pre-wrap break-words text-slate-300">
+              <div className="whitespace-pre-wrap break-words text-neutral-700 dark:text-slate-300">
                 {action.reasoning}
               </div>
             </div>
           )}
           {inputValue != null && inputValue.length > 0 && (
-            <div className="rounded bg-slate-elevation5 p-2">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
+            <div className="rounded bg-neutral-200/80 p-2 dark:bg-slate-elevation5">
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
                 Input
               </div>
-              <div className="whitespace-pre-wrap break-words font-mono text-slate-300">
+              <div className="whitespace-pre-wrap break-words font-mono text-neutral-700 dark:text-slate-300">
                 {inputValue}
               </div>
             </div>
           )}
           {confidencePct != null && (
             <div className="flex items-center gap-2">
-              <span className="text-[10px] uppercase tracking-wide text-slate-500">
+              <span className="text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
                 Confidence
               </span>
-              <span className="tabular-nums text-slate-300">
+              <span className="tabular-nums text-neutral-700 dark:text-slate-300">
                 {confidencePct}%
               </span>
             </div>

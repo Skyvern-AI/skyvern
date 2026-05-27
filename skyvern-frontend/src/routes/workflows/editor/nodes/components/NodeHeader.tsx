@@ -338,13 +338,13 @@ function NodeHeader({
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",
-          title: `Workflow Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
           description: `Reason: ${workflowRun.failure_reason}`,
         });
       } else if (statusIsFinalized(workflowRun)) {
         toast({
           variant: "success",
-          title: `Workflow Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
         });
       }
     }
@@ -397,7 +397,7 @@ function NodeHeader({
         log.error("Run block: there is no workflowPermanentId");
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "There is no workflowPermanentId",
         });
         return;
@@ -411,7 +411,7 @@ function NodeHeader({
         log.error("Run block: there is no debug session, yet");
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "There is no debug session, yet",
         });
         return;
@@ -474,7 +474,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "Could not construct run payload",
         });
         return;
@@ -502,7 +502,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "No response",
         });
         return;
@@ -518,8 +518,8 @@ function NodeHeader({
 
       toast({
         variant: "success",
-        title: "Workflow block run started",
-        description: "The workflow block run has been started successfully",
+        title: "Agent block run started",
+        description: "The agent block run has been started successfully",
       });
 
       navigate(
@@ -543,7 +543,7 @@ function NodeHeader({
       });
       toast({
         variant: "destructive",
-        title: "Failed to start workflow block run",
+        title: "Failed to start agent block run",
         description: detail ?? error.message,
       });
     },
@@ -558,7 +558,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to cancel workflow block run",
+          title: "Failed to cancel agent block run",
           description: "Missing debug session",
         });
         return;
@@ -579,8 +579,8 @@ function NodeHeader({
       });
       toast({
         variant: "success",
-        title: "Workflow Canceled",
-        description: "The workflow has been successfully canceled.",
+        title: "Agent Canceled",
+        description: "The agent has been successfully canceled.",
       });
     },
     onError: (error: AxiosError) => {

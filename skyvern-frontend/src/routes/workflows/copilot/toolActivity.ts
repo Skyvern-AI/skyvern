@@ -18,7 +18,7 @@ export interface ToolActivity {
 
 export function getActivityDotClass(activity: ToolActivity): string {
   if (activity.status === "running") {
-    return "animate-pulse bg-blue-400";
+    return "animate-pulse bg-neutral-400 dark:bg-neutral-500";
   }
   if (activity.status === "success") {
     return "bg-green-400";

@@ -78,7 +78,7 @@ function BrowserSessionWorkflowRuns() {
         <div className="text-center">
           <div className="mb-2 text-lg text-gray-500">No runs available</div>
           <div className="text-sm text-gray-400">
-            No workflow runs on this browser session
+            No agent runs on this browser session
           </div>
         </div>
       </div>
@@ -91,7 +91,7 @@ function BrowserSessionWorkflowRuns() {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-1/4">Workflow</TableHead>
+              <TableHead className="w-1/4">Agent</TableHead>
               <TableHead className="w-1/4">Run ID</TableHead>
               <TableHead className="w-1/4">Status</TableHead>
               <TableHead className="w-1/4">Created At</TableHead>
@@ -127,7 +127,7 @@ function BrowserSessionWorkflowRuns() {
                   className="cursor-pointer"
                 >
                   <TableCell>
-                    {workflowRun.workflow_title ?? "Untitled workflow"}
+                    {workflowRun.workflow_title ?? "Untitled agent"}
                   </TableCell>
                   <TableCell className="font-mono text-xs">
                     {workflowRun.workflow_run_id}

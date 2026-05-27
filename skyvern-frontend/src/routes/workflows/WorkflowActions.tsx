@@ -97,7 +97,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete workflow",
+        title: "Failed to delete agent",
         description: error.message,
       });
     },
@@ -166,7 +166,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
             className="p-2"
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone Workflow
+            Clone Agent
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => {
@@ -215,7 +215,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
           <DialogTrigger>
             <DropdownMenuItem className="p-2">
               <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-              Delete Workflow
+              Delete Agent
             </DropdownMenuItem>
           </DialogTrigger>
         </DropdownMenuContent>
@@ -224,7 +224,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
           <DialogDescription>
-            The workflow{" "}
+            The agent{" "}
             <span className="font-semibold text-primary">{workflow.title}</span>{" "}
             will be deleted.
           </DialogDescription>
