@@ -82,6 +82,14 @@
   color: white;
 }
 
+/* TooltipTrigger wraps each ControlButton in a <div> that defaults to
+   display:block. Without flex, the div's hit area can diverge from the
+   button's visual bounds — the clickable region shifts upward and overlaps
+   the preceding button's tooltip zone. */
+.react-flow__controls > div {
+  display: flex;
+}
+
 /* Restore xyflow's between-button divider when a ControlButton is wrapped in a
    <TooltipTrigger asChild> div, since the wrapper makes the button :last-child
    of its parent and xyflow's default `:last-child { border-bottom: none }` zeros
