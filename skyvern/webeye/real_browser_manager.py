@@ -552,7 +552,8 @@ class RealBrowserManager(BrowserManager):
                     workflow_run_id=workflow_run_id,
                 )
             try:
-                await task_browser_state.close(close_browser_on_completion=effective_close)
+                # Cleanup runs once at the workflow level; skip here to avoid double-execution.
+                await task_browser_state.close(close_browser_on_completion=effective_close, skip_cleanup=True)
             except Exception:
                 LOG.info(
                     "Failed to close the browser state from the task block, might because it's already closed.",
