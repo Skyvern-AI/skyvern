@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import LLMVisionMode, SkyvernContext
 from skyvern.forge.sdk.prompting import NON_VISION_CONTEXT_HEADER, _with_non_vision_context
 from skyvern.webeye.scraper import non_vision_context
 
@@ -83,8 +83,22 @@ class LargeFakePage:
 
 
 @pytest.mark.asyncio
-async def test_build_non_vision_context_if_needed_respects_disable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(non_vision_context.skyvern_context, "current", lambda: SkyvernContext())
+@pytest.mark.parametrize(
+    "mode",
+    [
+        LLMVisionMode.CONTROL,
+        LLMVisionMode.FALLBACK_WITHOUT_A11Y,
+    ],
+)
+async def test_build_non_vision_context_if_needed_omits_accessibility_for_modes_without_a11y(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: LLMVisionMode,
+) -> None:
+    monkeypatch.setattr(
+        non_vision_context.skyvern_context,
+        "current",
+        lambda: SkyvernContext(llm_vision_mode=mode),
+    )
 
     rendered = await non_vision_context.build_non_vision_page_context_if_needed(page=FakePage())
 
@@ -92,11 +106,21 @@ async def test_build_non_vision_context_if_needed_respects_disable_flag(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_build_non_vision_context_includes_accessibility_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "mode",
+    [
+        LLMVisionMode.NO_IMAGES_WITH_A11Y,
+        LLMVisionMode.FALLBACK_WITH_A11Y,
+    ],
+)
+async def test_build_non_vision_context_includes_accessibility_tree_for_a11y_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: LLMVisionMode,
+) -> None:
     monkeypatch.setattr(
         non_vision_context.skyvern_context,
         "current",
-        lambda: SkyvernContext(disable_llm_screenshots=True),
+        lambda: SkyvernContext(llm_vision_mode=mode),
     )
     scraped_page = SimpleNamespace(url="https://fallback.test", extracted_text="Fallback text")
 
