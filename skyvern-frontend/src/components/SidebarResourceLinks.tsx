@@ -72,7 +72,7 @@ function SidebarResourceLinks({ collapsed }: Props) {
               {
                 "w-7 justify-center": collapsed,
                 "w-full gap-2.5 px-2": !collapsed,
-                "border border-cta/30 bg-cta/10 text-cta shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] hover:bg-cta/15 hover:text-cta-hover dark:border-cta/35 dark:bg-cta/15 dark:text-cta-foreground dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-cta/25 dark:hover:text-cta-foreground":
+                "border-cta/30 bg-cta/10 text-cta hover:bg-cta/15 hover:text-cta-hover dark:border-cta/35 dark:bg-cta/15 dark:text-cta-foreground dark:hover:bg-cta/25 dark:hover:text-cta-foreground border shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]":
                   link.cta,
               },
             )}
