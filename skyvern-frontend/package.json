@@ -62,7 +62,7 @@
     "cronstrue": "^3.13.0",
     "cross-spawn": "^7.0.6",
     "embla-carousel-react": "^8.0.0",
-    "express": "^4.21.2",
+    "express": "^4.22.2",
     "fetch-to-curl": "^0.6.0",
     "nanoid": "^5.0.7",
     "open": "^10.1.0",
