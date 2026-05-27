@@ -40,6 +40,11 @@ from skyvern.schemas.workflows import WorkflowStatus
 LOG = structlog.get_logger()
 
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 @dataclass(frozen=True)
 class WorkflowDispatchState:
     run_with: str | None
@@ -170,7 +175,7 @@ class WorkflowsRepository(BaseRepository):
                     raise ValueError(
                         f"Folder {folder_id} not found or does not belong to organization {organization_id}"
                     )
-                folder_model.modified_at = datetime.now(timezone.utc)
+                folder_model.modified_at = _utcnow()
 
             await session.commit()
             await session.refresh(workflow)
@@ -185,7 +190,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowModel.workflow_id == workflow_id)
                 .where(WorkflowModel.organization_id == organization_id)
                 .where(WorkflowModel.deleted_at.is_(None))
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
             await session.execute(update_deleted_at_query)
             await session.commit()
@@ -1046,7 +1051,7 @@ class WorkflowsRepository(BaseRepository):
             result = await session.execute(select_query)
             schedule_ids = list(result.scalars().all())
 
-            deleted_at = datetime.now(timezone.utc)
+            deleted_at = _utcnow()
             if schedule_ids:
                 update_schedules_query = (
                     update(WorkflowScheduleModel)
@@ -1106,7 +1111,7 @@ class WorkflowsRepository(BaseRepository):
                 .where(WorkflowTemplateModel.workflow_permanent_id == workflow_permanent_id)
                 .where(WorkflowTemplateModel.organization_id == organization_id)
                 .where(WorkflowTemplateModel.deleted_at.is_(None))
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
             await session.execute(update_deleted_at_query)
             await session.commit()

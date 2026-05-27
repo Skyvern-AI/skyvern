@@ -39,8 +39,13 @@ from skyvern.schemas.scripts import (
     WorkflowScript,
 )
 
-LOG = structlog.get_logger()
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+LOG = structlog.get_logger()
 
 def _script_status_value(status: ScriptStatus | str) -> str:
     return status.value if isinstance(status, ScriptStatus) else status
@@ -257,7 +262,7 @@ class ScriptsRepository(BaseRepository):
                 update(ScriptModel)
                 .filter_by(script_revision_id=script_revision_id)
                 .filter_by(organization_id=organization_id)
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
             await session.commit()
 
@@ -278,7 +283,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptFile:
         """Create a script file. Idempotent on (script_revision_id, file_path)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             stmt = (
                 insert(ScriptFileModel)
                 .values(
@@ -343,7 +348,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptBlock:
         """Create a script block. Idempotent on (script_revision_id, script_block_label)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             stmt = (
                 insert(ScriptBlockModel)
                 .values(
@@ -414,7 +419,7 @@ class ScriptsRepository(BaseRepository):
         calling this method.
         """
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             insert_values = {
                 "script_block_id": generate_script_block_id(),
                 "script_revision_id": script_revision_id,
@@ -691,7 +696,7 @@ class ScriptsRepository(BaseRepository):
     ) -> WorkflowScriptUpsertResult:
         """Create/update an active workflow-script mapping with sticky-pin semantics."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = _utcnow()
             status_value = status.value if isinstance(status, ScriptStatus) else status
             existing_rows = (
                 await session.scalars(
@@ -951,7 +956,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
 
             result = await session.execute(stmt)
@@ -979,7 +984,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
             result = await session.execute(stmt)
             await session.commit()
@@ -1050,7 +1055,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=_utcnow())
             )
 
             if statuses:
@@ -1286,7 +1291,7 @@ class ScriptsRepository(BaseRepository):
                 )
                 .values(
                     is_pinned=True,
-                    pinned_at=datetime.now(timezone.utc),
+                    pinned_at=_utcnow(),
                     pinned_by=pinned_by,
                 )
             )
@@ -1444,7 +1449,7 @@ class ScriptsRepository(BaseRepository):
             values["new_script_revision_id"] = new_script_revision_id
         if not values:
             return
-        values["modified_at"] = datetime.now(timezone.utc)
+        values["modified_at"] = _utcnow()
         async with self.Session() as session:
             await session.execute(
                 update(ScriptFallbackEpisodeModel)
@@ -1600,7 +1605,7 @@ class ScriptsRepository(BaseRepository):
                         new_script_revision_id, ScriptFallbackEpisodeModel.new_script_revision_id
                     ),
                     reviewer_version=func.coalesce(reviewer_version, ScriptFallbackEpisodeModel.reviewer_version),
-                    modified_at=datetime.now(timezone.utc),
+                    modified_at=_utcnow(),
                 )
             )
             await session.commit()
@@ -1690,7 +1695,7 @@ class ScriptsRepository(BaseRepository):
         branch_key: str,
     ) -> None:
         """Record a classify branch hit, upserting the hit count and last_hit_at."""
-        now = datetime.now(timezone.utc)
+        now = _utcnow()
         async with self.Session() as session:
             stmt = insert(ScriptBranchHitModel).values(
                 organization_id=organization_id,

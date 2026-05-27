@@ -24,8 +24,13 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
 )
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 
-LOG = structlog.get_logger()
 
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (for TIMESTAMP WITHOUT TIME ZONE columns)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+LOG = structlog.get_logger()
 
 class BrowserSessionsRepository(BaseRepository):
     """Database operations for browser profiles and persistent browser sessions."""
@@ -115,7 +120,7 @@ class BrowserSessionsRepository(BaseRepository):
             browser_profile = (await session.scalars(query)).first()
             if not browser_profile:
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
-            browser_profile.deleted_at = datetime.now(timezone.utc)
+            browser_profile.deleted_at = _utcnow()
             await session.commit()
 
     @db_operation("update_browser_profile")
@@ -334,7 +339,7 @@ class BrowserSessionsRepository(BaseRepository):
                 if browser_address:
                     persistent_browser_session.browser_address = browser_address
                     # once the address is set, the session is started
-                    persistent_browser_session.started_at = datetime.now(timezone.utc)
+                    persistent_browser_session.started_at = _utcnow()
                 if ip_address:
                     persistent_browser_session.ip_address = ip_address
                 if ecs_task_arn:
@@ -388,7 +393,7 @@ class BrowserSessionsRepository(BaseRepository):
                 )
             ).first()
             if persistent_browser_session:
-                persistent_browser_session.deleted_at = datetime.now(timezone.utc)
+                persistent_browser_session.deleted_at = _utcnow()
                 await session.commit()
                 await session.refresh(persistent_browser_session)
             else:
@@ -456,7 +461,7 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 if persistent_browser_session.completed_at:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
-                persistent_browser_session.completed_at = datetime.now(timezone.utc)
+                persistent_browser_session.completed_at = _utcnow()
                 persistent_browser_session.status = "completed"
                 await session.commit()
                 await session.refresh(persistent_browser_session)
