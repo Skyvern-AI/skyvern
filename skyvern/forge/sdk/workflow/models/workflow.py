@@ -21,7 +21,7 @@ from skyvern.forge.sdk.workflow.models.run_limits import (
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
-from skyvern.schemas.workflows import BlockType, WorkflowStatus
+from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
@@ -75,9 +75,6 @@ class WorkflowDefinition(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
-
-    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
-        return all(block.block_type != BlockType.LOGIN for block in get_all_blocks(self.blocks))
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -166,9 +163,6 @@ class Workflow(BaseModel):
             if parameter.key == key:
                 return parameter
         return None
-
-    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
-        return self.workflow_definition.allow_content_blocking_extensions_for_browser_launch()
 
 
 class WorkflowRunStatus(StrEnum):
