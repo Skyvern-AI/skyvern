@@ -18,6 +18,9 @@ down_revision: Union[str, None] = "8a7754a48701"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+_COLUMN_NAME = "max_elapsed_time_minutes"
+_LOCK_TIMEOUT = "250ms"
+
 
 def upgrade() -> None:
     op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
