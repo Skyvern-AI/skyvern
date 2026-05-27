@@ -31,8 +31,8 @@ class CallerType(StrEnum):
 
 @dataclass(frozen=True)
 class TagWriteContext:
-    """Attribution carried from a write call into the repository layer."""
+    """Attribution persisted on each tag event row. caller_type is nullable for backfill scripts."""
 
     caller_id: str
-    caller_type: CallerType
     source: TagSource
+    caller_type: CallerType | None = None

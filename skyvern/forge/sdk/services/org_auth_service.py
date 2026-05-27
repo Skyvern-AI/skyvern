@@ -1,3 +1,4 @@
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Annotated, Sequence
@@ -17,12 +18,14 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import TokenPayload
 from skyvern.forge.sdk.schemas.organizations import Organization, OrganizationAuthToken, OrganizationAuthTokenType
+from skyvern.forge.sdk.workflow.models.tags import CallerType
 
 LOG = structlog.get_logger()
 
 AUTHENTICATION_TTL = 60 * 60  # one hour
 CACHE_SIZE = 128
 ALGORITHM = "HS256"
+SKYVERN_UI_USER_AGENT = "skyvern-ui"
 _SAFE_JWT_ERROR_REASONS = {
     "Not enough segments",
     "Invalid payload padding",
@@ -160,36 +163,43 @@ async def get_current_org(
         )
     organization = None
     if x_api_key:
-        organization = await _get_current_org_cached(x_api_key, app.DATABASE)
+        organization = await get_current_org_cached(x_api_key, app.DATABASE)
     elif authorization:
-        organization = await _authenticate_helper(authorization)
+        organization = await authenticate_helper(authorization)
 
     if organization:
-        try:
-            # Set in context
-            curr_ctx = skyvern_context.current()
-            if curr_ctx:
-                curr_ctx.organization_id = organization.organization_id
-                curr_ctx.organization_name = organization.organization_name
-
-            # Set organization info on OTEL span for tracing
-            if settings.OTEL_ENABLED:
-                try:
-                    span = trace.get_current_span()
-                    if span:
-                        span.set_attribute("organization_id", organization.organization_id)
-                        if organization.organization_name:
-                            span.set_attribute("organization_name", organization.organization_name)
-                except Exception:
-                    pass  # Silently ignore OTEL errors
-        except Exception:
-            pass
-
+        apply_request_org_context(organization)
         return organization
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Invalid credentials",
     )
+
+
+def apply_request_org_context(organization: Organization) -> None:
+    """Populate skyvern_context + OTEL span with the resolved organization.
+
+    Shared by get_current_org and get_current_caller_context so the cached
+    helper paths (which short-circuit the per-helper context-setting on cache
+    hits) still leave a consistent request-scoped context for downstream routes.
+    """
+    try:
+        ctx = skyvern_context.current()
+        if ctx:
+            ctx.organization_id = organization.organization_id
+            ctx.organization_name = organization.organization_name
+    except Exception:
+        pass
+    if not settings.OTEL_ENABLED:
+        return
+    try:
+        span = trace.get_current_span()
+        if span:
+            span.set_attribute("organization_id", organization.organization_id)
+            if organization.organization_name:
+                span.set_attribute("organization_name", organization.organization_name)
+    except Exception:
+        pass  # OTEL must never fail auth.
 
 
 async def get_current_org_with_api_key(
@@ -200,7 +210,7 @@ async def get_current_org_with_api_key(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    return await _get_current_org_cached(x_api_key, app.DATABASE)
+    return await get_current_org_cached(x_api_key, app.DATABASE)
 
 
 async def get_current_org_with_authentication(
@@ -211,10 +221,10 @@ async def get_current_org_with_authentication(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    return await _authenticate_helper(authorization)
+    return await authenticate_helper(authorization)
 
 
-async def _authenticate_helper(authorization: str) -> Organization:
+async def authenticate_helper(authorization: str) -> Organization:
     parts = authorization.split(" ", 1)
     if len(parts) < 2 or not parts[1]:
         raise HTTPException(
@@ -250,11 +260,11 @@ async def get_current_user_id(
 ) -> str:
     # Try authorization header first, but only if the authentication function is configured
     if authorization and app.authenticate_user_function:
-        return await _authenticate_user_helper(authorization)
+        return await authenticate_user_helper(authorization)
 
     # Fall back to API key + skyvern-ui user agent
-    if x_api_key and x_user_agent == "skyvern-ui":
-        organization = await _get_current_org_cached(x_api_key, app.DATABASE)
+    if x_api_key and x_user_agent == SKYVERN_UI_USER_AGENT:
+        organization = await get_current_org_cached(x_api_key, app.DATABASE)
         if organization:
             return f"{organization.organization_id}_user"
 
@@ -272,10 +282,10 @@ async def get_current_user_id_with_authentication(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid credentials",
         )
-    return await _authenticate_user_helper(authorization)
+    return await authenticate_user_helper(authorization)
 
 
-async def _authenticate_user_helper(authorization: str) -> str:
+async def authenticate_user_helper(authorization: str) -> str:
     parts = authorization.split(" ", 1)
     if len(parts) < 2 or not parts[1]:
         raise HTTPException(
@@ -380,7 +390,7 @@ _current_org_cache: TTLCache = TTLCache(maxsize=CACHE_SIZE, ttl=AUTHENTICATION_T
 
 
 @cached(cache=_current_org_cache)
-async def _get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
+async def get_current_org_cached(x_api_key: str, db: AgentDB) -> Organization:
     """Authentication is cached for one hour."""
     validation = await resolve_org_from_api_key(x_api_key, db)
 
@@ -403,3 +413,59 @@ def invalidate_cached_org(organization_id: str) -> None:
     ]
     for key in keys_to_remove:
         _current_org_cache.pop(key, None)
+
+
+@dataclass(frozen=True)
+class CallerContext:
+    organization: Organization
+    caller_id: str
+    caller_type: CallerType
+
+
+async def get_current_caller_context(
+    x_api_key: Annotated[str | None, Header(include_in_schema=False)] = None,
+    authorization: Annotated[str | None, Header(include_in_schema=False)] = None,
+    x_user_agent: Annotated[str | None, Header(include_in_schema=False)] = None,
+) -> CallerContext:
+    """Resolve the caller identity for write-attribution. Mirrors get_current_org's
+    x-api-key-first precedence and OTEL side effects."""
+    # x-api-key path FIRST — mirrors get_current_org so clients with both
+    # headers (valid key + stale JWT) keep authenticating via the key.
+    if x_api_key:
+        organization = await get_current_org_cached(x_api_key, app.DATABASE)
+        apply_request_org_context(organization)
+        # x-user-agent is spoofable and is NOT an access-control check —
+        # it only flips set_by attribution from API_KEY to USER. Real auth
+        # is already validated by get_current_org_cached above.
+        if x_user_agent == SKYVERN_UI_USER_AGENT:
+            return CallerContext(
+                organization=organization,
+                caller_id=f"{organization.organization_id}_user",
+                caller_type=CallerType.USER,
+            )
+        return CallerContext(
+            organization=organization,
+            caller_id=organization.organization_id,
+            caller_type=CallerType.API_KEY,
+        )
+
+    # JWT path needs both callbacks; otherwise we'd accept user-auth then 403
+    # on org-auth, confusing the caller with a rejection on valid credentials.
+    if authorization and app.authenticate_user_function and app.authentication_function:
+        # Both helpers re-decode the same token independently — run them
+        # concurrently so JWT validation cost is paid in parallel, not serially.
+        user_id, organization = await asyncio.gather(
+            authenticate_user_helper(authorization),
+            authenticate_helper(authorization),
+        )
+        apply_request_org_context(organization)
+        return CallerContext(
+            organization=organization,
+            caller_id=user_id,
+            caller_type=CallerType.USER,
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid credentials",
+    )
