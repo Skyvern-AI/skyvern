@@ -61,6 +61,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1040,20 +1041,13 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
 
-                if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
-                    new_context.disable_llm_screenshots = True
-                else:
-                    try:
-                        new_context.disable_llm_screenshots = (
-                            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                                "DISABLE_LLM_SCREENSHOTS",
-                                workflow_run.workflow_run_id,
-                                properties={"organization_id": organization.organization_id},
-                            )
-                        )
-                    except Exception:
-                        LOG.warning("Failed to check DISABLE_LLM_SCREENSHOTS flag for workflow", exc_info=True)
-                        new_context.disable_llm_screenshots = False
+                await resolve_llm_vision_mode_for_context(
+                    new_context,
+                    workflow_run.workflow_run_id,
+                    organization.organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    log_context={"workflow_run_id": workflow_run.workflow_run_id},
+                )
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)

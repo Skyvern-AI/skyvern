@@ -265,6 +265,6 @@ async def build_non_vision_page_context_if_needed(
     max_chars: int = MAX_NON_VISION_CONTEXT_CHARS,
 ) -> str | None:
     context = skyvern_context.current()
-    if not context or not context.disable_llm_screenshots:
+    if not context or not context.llm_accessibility_context_enabled():
         return None
     return await build_non_vision_page_context(scraped_page=scraped_page, page=page, max_chars=max_chars)

@@ -43,7 +43,7 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import LLMVisionMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -174,10 +174,14 @@ def _llm_screenshots_for_call(
     llm_config: LLMConfig | LLMRouterConfig,
     context: SkyvernContext | None,
     prompt_name: str | None = None,
+    step: Step | None = None,
 ) -> list[bytes] | None:
     if not llm_config.supports_vision:
         return None
-    if context and context.disable_llm_screenshots and prompt_name not in VISION_FALLBACK_PROMPT_NAMES:
+    if context and not context.llm_screenshots_enabled_for_prompt(
+        is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES,
+        retry_index=step.retry_index if step else None,
+    ):
         return None
     return screenshots
 
@@ -186,12 +190,33 @@ def _llm_screenshots_enabled_metric(
     llm_config: LLMConfig | LLMRouterConfig,
     context: SkyvernContext | None,
     prompt_name: str | None = None,
+    step: Step | None = None,
 ) -> bool:
     if not llm_config.supports_vision:
         return False
-    if context and context.disable_llm_screenshots and prompt_name not in VISION_FALLBACK_PROMPT_NAMES:
+    if context and not context.llm_screenshots_enabled_for_prompt(
+        is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES,
+        retry_index=step.retry_index if step else None,
+    ):
         return False
     return True
+
+
+def _llm_vision_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
+    if context is None:
+        return {
+            "llm_vision_mode": LLMVisionMode.CONTROL.value,
+            "llm_vision_fallback_active": False,
+            "llm_accessibility_context_enabled": False,
+        }
+
+    return {
+        "llm_vision_mode": context.effective_llm_vision_mode().value,
+        "llm_vision_fallback_active": context.llm_vision_fallback_active(
+            retry_index=step.retry_index if step else None
+        ),
+        "llm_accessibility_context_enabled": context.llm_accessibility_context_enabled(),
+    }
 
 
 @runtime_checkable
@@ -974,8 +999,8 @@ class LLMAPIHandlerFactory:
                                     **artifact_targets,
                                 )
                             )
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1428,6 +1453,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_llm_vision_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -1639,8 +1665,8 @@ class LLMAPIHandlerFactory:
                                 )
                             )
 
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
 
                 model_name = llm_config.model_name
 
@@ -1969,6 +1995,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_llm_vision_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2276,8 +2303,8 @@ class LLMCaller:
                             )
                         )
 
-            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name)
-            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name)
+            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
+            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2444,6 +2471,7 @@ class LLMCaller:
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
                 llm_screenshots_enabled=llm_screenshots_enabled,
+                **_llm_vision_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
             )
 

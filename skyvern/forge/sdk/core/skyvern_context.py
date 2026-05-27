@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
@@ -33,6 +34,24 @@ class DialogEntry(TypedDict):
     type: str
     message: str
     count: int
+
+
+class LLMVisionMode(StrEnum):
+    CONTROL = "control"
+    NO_IMAGES_WITH_A11Y = "no_images_with_a11y"
+    FALLBACK_WITH_A11Y = "fallback_with_a11y"
+    FALLBACK_WITHOUT_A11Y = "fallback_without_a11y"
+
+
+def parse_llm_vision_mode(value: Any) -> LLMVisionMode:
+    if isinstance(value, LLMVisionMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return LLMVisionMode(value)
+        except ValueError:
+            LOG.warning("Unknown LLM vision mode value, defaulting to control", llm_vision_mode=value)
+    return LLMVisionMode.CONTROL
 
 
 @dataclass
@@ -97,6 +116,8 @@ class SkyvernContext:
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
     disable_llm_screenshots: bool = False
+    llm_vision_mode: LLMVisionMode = LLMVisionMode.CONTROL
+    step_retry_index: int = 0
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
@@ -176,6 +197,51 @@ class SkyvernContext:
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload
     # can be completed when a subsequent click triggers the actual file chooser.
     pending_file_chooser: PendingFileChooserListener | None = None
+
+    def set_llm_vision_mode(self, mode: Any) -> None:
+        self.llm_vision_mode = parse_llm_vision_mode(mode)
+        self.disable_llm_screenshots = self.llm_vision_mode == LLMVisionMode.NO_IMAGES_WITH_A11Y
+
+    def effective_llm_vision_mode(self) -> LLMVisionMode:
+        if self.disable_llm_screenshots:
+            return LLMVisionMode.NO_IMAGES_WITH_A11Y
+        return parse_llm_vision_mode(self.llm_vision_mode)
+
+    def llm_vision_fallback_active(self, *, retry_index: int | None = None) -> bool:
+        effective_retry_index = self.step_retry_index if retry_index is None else retry_index
+        return (
+            self.effective_llm_vision_mode()
+            in {
+                LLMVisionMode.FALLBACK_WITH_A11Y,
+                LLMVisionMode.FALLBACK_WITHOUT_A11Y,
+            }
+            and effective_retry_index > 0
+        )
+
+    def llm_screenshots_enabled_for_prompt(
+        self,
+        *,
+        is_vision_fallback_prompt: bool = False,
+        retry_index: int | None = None,
+    ) -> bool:
+        if is_vision_fallback_prompt:
+            return True
+
+        mode = self.effective_llm_vision_mode()
+        if mode == LLMVisionMode.CONTROL:
+            return True
+        if mode == LLMVisionMode.NO_IMAGES_WITH_A11Y:
+            return False
+
+        effective_retry_index = self.step_retry_index if retry_index is None else retry_index
+        # Fallback variants attach screenshots only on retries of the step being sent to the LLM.
+        return effective_retry_index > 0
+
+    def llm_accessibility_context_enabled(self) -> bool:
+        return self.effective_llm_vision_mode() in {
+            LLMVisionMode.NO_IMAGES_WITH_A11Y,
+            LLMVisionMode.FALLBACK_WITH_A11Y,
+        }
 
     def cleanup_pending_file_chooser(self) -> None:
         if self.pending_file_chooser is not None:
