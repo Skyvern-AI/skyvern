@@ -17,22 +17,26 @@ const STREAM_MODE_COPY: Record<
   cdp: {
     label: "Local stream",
     title: "Local browser streaming through the backend",
-    className: "border-cyan-500/40 bg-cyan-500/10 text-cyan-200",
+    className:
+      "border-cyan-600/30 bg-cyan-600/10 text-cyan-700 dark:border-cyan-500/40 dark:bg-cyan-500/10 dark:text-cyan-200",
   },
   vnc: {
     label: "VNC",
     title: "VNC browser streaming",
-    className: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+    className:
+      "border-emerald-600/30 bg-emerald-600/10 text-emerald-700 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-200",
   },
   fallback: {
     label: "VNC -> Local",
     title: "VNC disconnected; using local browser streaming fallback",
-    className: "border-amber-500/40 bg-amber-500/10 text-amber-200",
+    className:
+      "border-amber-600/30 bg-amber-600/10 text-amber-700 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200",
   },
   unavailable: {
     label: "Unavailable",
     title: "Browser streaming is unavailable for this session",
-    className: "border-slate-500/40 bg-slate-500/10 text-slate-300",
+    className:
+      "border-neutral-400/40 bg-neutral-500/10 text-neutral-600 dark:border-slate-500/40 dark:bg-slate-500/10 dark:text-slate-300",
   },
 };
 
@@ -70,20 +74,24 @@ function StreamStatusPanel({
   return (
     <div
       className={cn(
-        "flex h-full w-full items-center justify-center rounded-md bg-slate-900 p-6 text-slate-300",
+        "flex h-full w-full items-center justify-center rounded-md bg-white p-6 text-neutral-600 dark:bg-slate-900 dark:text-slate-300",
         className,
       )}
     >
       <div className="flex max-w-md flex-col gap-2 text-sm">
-        <div className="flex items-center gap-2 font-medium text-slate-100">
-          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-slate-400" />
+        <div className="flex items-center gap-2 font-medium text-neutral-900 dark:text-slate-100">
+          <InfoCircledIcon className="h-4 w-4 flex-shrink-0 text-neutral-500 dark:text-slate-400" />
           <span>{diagnostic.title}</span>
         </div>
         {diagnostic.detail && (
-          <div className="text-slate-400">{diagnostic.detail}</div>
+          <div className="text-neutral-600 dark:text-slate-400">
+            {diagnostic.detail}
+          </div>
         )}
         {diagnostic.hint && (
-          <div className="text-xs text-slate-500">{diagnostic.hint}</div>
+          <div className="text-xs text-neutral-500 dark:text-slate-500">
+            {diagnostic.hint}
+          </div>
         )}
         {children}
       </div>

@@ -77,7 +77,7 @@ function HumanInteractionEditorBody({
           nodeId={blockId}
           onChange={(next) => update({ instructions: next })}
           value={instructions}
-          placeholder="Please review and approve or reject to continue the workflow."
+          placeholder="Please review and approve or reject to continue the agent."
           className="nopan text-xs"
         />
       </div>
@@ -97,12 +97,13 @@ function HumanInteractionEditorBody({
           }}
         />
       </div>
-      <div className="flex items-center justify-center gap-2 rounded-md bg-slate-800 p-2">
-        <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
+      <div className="workflow-editor-tip flex items-center justify-center gap-2 rounded-md bg-slate-800 p-2">
+        <span className="workflow-editor-tip-icon rounded bg-slate-700 p-1 text-lg">
+          💡
+        </span>
         <div className="space-y-1 text-xs text-slate-400">
-          The workflow will pause and send an email notification to the
-          recipients. The workflow continues or terminates based on the user's
-          response.
+          The agent will pause and send an email notification to the recipients.
+          The agent continues or terminates based on the user's response.
         </div>
       </div>
       <div className="space-y-4 rounded-md bg-slate-800 p-4">
@@ -123,7 +124,7 @@ function HumanInteractionEditorBody({
             nodeId={blockId}
             onChange={(next) => update({ subject: next })}
             value={subject}
-            placeholder="Human interaction required for workflow run"
+            placeholder="Human interaction required for agent run"
             className="nopan text-xs"
           />
         </div>
@@ -134,7 +135,7 @@ function HumanInteractionEditorBody({
             nodeId={blockId}
             onChange={(next) => update({ body: next })}
             value={body}
-            placeholder="Your interaction is required for a workflow run!"
+            placeholder="Your interaction is required for an agent run!"
             className="nopan text-xs"
           />
         </div>

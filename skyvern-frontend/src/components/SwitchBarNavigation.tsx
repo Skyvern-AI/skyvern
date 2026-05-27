@@ -15,7 +15,7 @@ function SwitchBarNavigation({ options }: Props) {
   const [searchParams] = useSearchParams();
 
   return (
-    <div className="flex w-fit gap-2 rounded-sm border border-slate-700 p-2">
+    <div className="flex w-fit gap-2 rounded-sm border border-slate-300 p-2 dark:border-slate-700">
       {options.map((option) => {
         return (
           <NavLink
@@ -24,9 +24,10 @@ function SwitchBarNavigation({ options }: Props) {
             key={option.to}
             className={({ isActive }) => {
               return cn(
-                "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center hover:bg-slate-700",
+                "flex cursor-pointer items-center justify-center rounded-sm px-3 py-2 text-center text-slate-700 hover:bg-slate-100 hover:text-slate-950 dark:text-foreground dark:hover:bg-slate-700 dark:hover:text-foreground",
                 {
-                  "bg-slate-700": isActive,
+                  "bg-neutral-900 !text-white hover:bg-neutral-900 hover:!text-white dark:bg-slate-700 dark:!text-foreground dark:hover:bg-slate-700":
+                    isActive,
                 },
               );
             }}

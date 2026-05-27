@@ -146,7 +146,7 @@ function LoopValueCode({
         <TooltipTrigger asChild>
           <code
             ref={codeRef}
-            className="line-clamp-2 block min-w-0 break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300"
+            className="line-clamp-2 block min-w-0 break-all rounded bg-white px-1 py-0.5 font-mono text-neutral-700 dark:bg-slate-elevation1 dark:text-slate-300"
           >
             {collapsed}
           </code>
@@ -471,16 +471,16 @@ function WorkflowRunTimelineBlockItem({
     <div
       className={cn("min-w-0", {
         "ml-3 pl-3": depth > 0,
-        "border-l border-slate-700": depth > 0,
+        "border-l border-neutral-300 dark:border-slate-700": depth > 0,
       })}
     >
       <div
         data-slot="block-item"
         className={cn(
-          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
+          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-neutral-400/40 dark:[&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
           getBlockElevation(depth),
           {
-            "ring-2 ring-white/55 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/55":
+            "ring-2 ring-neutral-500/45 dark:ring-white/55 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-neutral-500/45 dark:[&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/55":
               isWorkflowRunBlock(activeItem) &&
               activeItem.workflow_run_block_id === block.workflow_run_block_id,
           },
@@ -495,14 +495,14 @@ function WorkflowRunTimelineBlockItem({
           <div className="space-y-2">
             <div className="flex justify-between">
               <div className="flex gap-3">
-                <div className="relative rounded bg-slate-800 p-2">
+                <div className="relative rounded border border-slate-300 bg-slate-50 p-2 text-slate-900 shadow-sm dark:border-0 dark:bg-slate-800 dark:text-foreground dark:shadow-none">
                   <WorkflowBlockIcon
                     workflowBlockType={block.block_type}
                     className="size-6"
                   />
                   {isRunning && (
-                    <div className="absolute -bottom-1 -left-1 rounded-full bg-slate-elevation3 p-0.5">
-                      <ReloadIcon className="size-3 animate-spin text-slate-400" />
+                    <div className="absolute -bottom-1 -left-1 rounded-full bg-white p-0.5 dark:bg-slate-elevation3">
+                      <ReloadIcon className="size-3 animate-spin text-slate-600 dark:text-slate-400" />
                     </div>
                   )}
                 </div>
@@ -513,7 +513,7 @@ function WorkflowRunTimelineBlockItem({
                   </span>
                   <span
                     ref={shimmerLabelRef}
-                    className="flex gap-2 text-xs text-slate-400"
+                    className="flex gap-2 text-xs text-neutral-600 dark:text-slate-400"
                   >
                     {block.label}
                   </span>
@@ -526,17 +526,17 @@ function WorkflowRunTimelineBlockItem({
               </div>
               <div className="flex gap-2">
                 {showFailureIndicator && (
-                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
+                  <div className="self-start rounded bg-neutral-200 px-2 py-1 dark:bg-slate-elevation5">
                     <CrossCircledIcon className="size-4 text-destructive" />
                   </div>
                 )}
                 {showSuccessIndicator && (
-                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
+                  <div className="self-start rounded bg-neutral-200 px-2 py-1 dark:bg-slate-elevation5">
                     <CheckCircledIcon className="size-4 text-success" />
                   </div>
                 )}
                 <div className="flex flex-col items-end gap-[1px]">
-                  <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
+                  <div className="flex gap-1 self-start rounded bg-neutral-200 px-2 py-1 text-neutral-800 dark:bg-slate-elevation5 dark:text-foreground">
                     {showDiagnosticLink ? (
                       <Link
                         to={`/tasks/${block.task_id}/diagnostics`}
@@ -563,15 +563,15 @@ function WorkflowRunTimelineBlockItem({
               </div>
             </div>
             {block.description ? (
-              <div className="break-words text-xs text-slate-400">
+              <div className="break-words text-xs text-neutral-600 dark:text-slate-400">
                 {block.description}
               </div>
             ) : null}
             {isForLoopBlock && (
-              <div className="min-w-0 space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
-                <div className="text-slate-300">
+              <div className="min-w-0 space-y-2 rounded bg-neutral-200/80 px-3 py-2 text-xs dark:bg-slate-elevation5">
+                <div className="text-neutral-600 dark:text-slate-300">
                   Iterable values:{" "}
-                  <span className="font-medium text-slate-200">
+                  <span className="font-medium text-neutral-800 dark:text-slate-200">
                     {loopValues.length}
                   </span>
                 </div>
@@ -583,9 +583,9 @@ function WorkflowRunTimelineBlockItem({
                       return (
                         <div
                           key={index}
-                          className="flex min-w-0 break-words text-slate-400"
+                          className="flex min-w-0 break-words text-neutral-700 dark:text-slate-400"
                         >
-                          <span className="mr-1 shrink-0 text-slate-500">
+                          <span className="mr-1 shrink-0 text-neutral-500 dark:text-slate-500">
                             [{index}]
                           </span>
                           <LoopValueCode
@@ -600,15 +600,15 @@ function WorkflowRunTimelineBlockItem({
               </div>
             )}
             {isWhileLoopBlock && (
-              <div className="min-w-0 rounded bg-slate-elevation5 px-3 py-2 text-xs text-slate-300">
+              <div className="min-w-0 rounded bg-neutral-200/80 px-3 py-2 text-xs text-neutral-600 dark:bg-slate-elevation5 dark:text-slate-300">
                 Iterations run:{" "}
-                <span className="font-medium text-slate-200">
+                <span className="font-medium text-neutral-800 dark:text-slate-200">
                   {loopIterationGroups.length}
                 </span>
               </div>
             )}
             {block.block_type === "conditional" && block.executed_branch_id && (
-              <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
+              <div className="space-y-2 rounded bg-neutral-200/80 px-3 py-2 text-xs dark:bg-slate-elevation5">
                 {hasEvaluations(block.output) && block.output.evaluations ? (
                   // New format: show all branch evaluations
                   <div className="space-y-2">
@@ -619,11 +619,11 @@ function WorkflowRunTimelineBlockItem({
                           "rounded border px-2 py-1.5",
                           evaluation.is_matched
                             ? "border-success/50 bg-success/10"
-                            : "border-slate-600 bg-slate-elevation3",
+                            : "border-neutral-300 bg-slate-elevation3 dark:border-slate-600",
                         )}
                       >
                         {evaluation.is_default ? (
-                          <div className="text-slate-300">
+                          <div className="text-neutral-700 dark:text-slate-300">
                             <span className="font-medium">Default branch</span>
                             {evaluation.is_matched && (
                               <span className="ml-2 text-success">
@@ -633,23 +633,23 @@ function WorkflowRunTimelineBlockItem({
                           </div>
                         ) : (
                           <div className="space-y-1">
-                            <div className="text-slate-400">
-                              <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
+                            <div className="text-neutral-600 dark:text-slate-400">
+                              <code className="break-all rounded bg-white px-1 py-0.5 font-mono text-neutral-700 dark:bg-slate-elevation1 dark:text-slate-300">
                                 {evaluation.original_expression}
                               </code>
                             </div>
                             {evaluation.rendered_expression &&
                               evaluation.rendered_expression !==
                                 evaluation.original_expression && (
-                                <div className="text-slate-400">
+                                <div className="text-neutral-600 dark:text-slate-400">
                                   → rendered to{" "}
-                                  <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
+                                  <code className="break-all rounded bg-white px-1 py-0.5 font-mono text-neutral-800 dark:bg-slate-elevation1 dark:text-slate-200">
                                     {evaluation.rendered_expression}
                                   </code>
                                 </div>
                               )}
                             <div className="flex items-center gap-2">
-                              <span className="text-slate-400">
+                              <span className="text-neutral-600 dark:text-slate-400">
                                 evaluated to
                               </span>
                               <span
@@ -670,9 +670,9 @@ function WorkflowRunTimelineBlockItem({
                         )}
                         {evaluation.is_matched &&
                           evaluation.next_block_label && (
-                            <div className="mt-1 text-slate-400">
+                            <div className="mt-1 text-neutral-600 dark:text-slate-400">
                               → Executing next block:{" "}
-                              <span className="font-medium text-slate-300">
+                              <span className="font-medium text-neutral-700 dark:text-slate-300">
                                 {evaluation.next_block_label}
                               </span>
                             </div>
@@ -685,23 +685,23 @@ function WorkflowRunTimelineBlockItem({
                   <>
                     {block.executed_branch_expression !== null &&
                     block.executed_branch_expression !== undefined ? (
-                      <div className="text-slate-300">
+                      <div className="text-neutral-700 dark:text-slate-300">
                         Condition{" "}
-                        <code className="break-all rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
+                        <code className="break-all rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-neutral-800 dark:text-slate-200">
                           {block.executed_branch_expression}
                         </code>{" "}
                         evaluated to{" "}
                         <span className="font-medium text-success">True</span>
                       </div>
                     ) : (
-                      <div className="text-slate-300">
+                      <div className="text-neutral-700 dark:text-slate-300">
                         No conditions matched, executing default branch
                       </div>
                     )}
                     {block.executed_branch_next_block && (
-                      <div className="text-slate-400">
+                      <div className="text-neutral-600 dark:text-slate-400">
                         → Executing next block:{" "}
-                        <span className="font-medium text-slate-300">
+                        <span className="font-medium text-neutral-700 dark:text-slate-300">
                           {block.executed_branch_next_block}
                         </span>
                       </div>
@@ -799,21 +799,21 @@ function WorkflowRunTimelineBlockItem({
                       });
                     }}
                   >
-                    <div className="rounded border border-slate-700 bg-slate-elevation4">
+                    <div className="rounded border border-neutral-300 bg-neutral-100 dark:border-slate-700 dark:bg-slate-elevation4">
                       <CollapsibleTrigger asChild>
                         <button
                           className="group flex w-full items-center justify-between gap-2 px-2 py-1 text-left"
                           onClick={(event) => event.stopPropagation()}
                         >
                           <div className="flex items-center gap-1.5">
-                            <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
-                            <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
+                            <ChevronRightIcon className="size-4 text-neutral-600 transition-transform group-data-[state=open]:rotate-90 dark:text-slate-300" />
+                            <span className="text-xs text-neutral-800 dark:text-slate-200">{`Iteration ${iterationNumber}`}</span>
                           </div>
                           {isWhileLoopBlock ? null : isValueTruncated ? (
                             <TooltipProvider delayDuration={300}>
                               <Tooltip>
                                 <TooltipTrigger asChild>
-                                  <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                                  <code className="min-w-0 truncate rounded bg-white px-1 py-0.5 text-[11px] text-neutral-700 dark:bg-slate-elevation1 dark:text-slate-300">
                                     current_value: {currentValuePreview}
                                   </code>
                                 </TooltipTrigger>
@@ -826,7 +826,7 @@ function WorkflowRunTimelineBlockItem({
                               </Tooltip>
                             </TooltipProvider>
                           ) : (
-                            <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
+                            <code className="min-w-0 truncate rounded bg-white px-1 py-0.5 text-[11px] text-neutral-700 dark:bg-slate-elevation1 dark:text-slate-300">
                               current_value: {currentValuePreview}
                             </code>
                           )}
@@ -853,13 +853,13 @@ function WorkflowRunTimelineBlockItem({
 
           {hasNestedChildren && isConditionalBlock && (
             <Collapsible open={childrenOpen} onOpenChange={setChildrenOpen}>
-              <div className="rounded border border-slate-700 bg-slate-elevation4 px-2 py-1.5">
+              <div className="rounded border border-neutral-300 bg-neutral-100 px-2 py-1.5 dark:border-slate-700 dark:bg-slate-elevation4">
                 <CollapsibleTrigger asChild>
                   <button
                     className="flex w-full items-center justify-between gap-2 text-left"
                     onClick={(event) => event.stopPropagation()}
                   >
-                    <div className="flex items-center gap-1.5 text-xs text-slate-200">
+                    <div className="flex items-center gap-1.5 text-xs text-neutral-800 dark:text-slate-200">
                       {childrenOpen ? (
                         <ChevronDownIcon className="size-4" />
                       ) : (
@@ -868,7 +868,7 @@ function WorkflowRunTimelineBlockItem({
                       <span>{`Executed branch blocks (${subItems.length})`}</span>
                     </div>
                     {block.executed_branch_next_block && (
-                      <span className="text-[11px] text-slate-400">
+                      <span className="text-[11px] text-neutral-600 dark:text-slate-400">
                         next: {block.executed_branch_next_block}
                       </span>
                     )}

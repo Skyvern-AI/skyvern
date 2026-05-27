@@ -66,7 +66,7 @@ function WorkflowRunParameters() {
           <h1 className="text-3xl">Parameters</h1>
           <h2 className="text-lg text-slate-400">
             Fill the placeholder values that you have linked throughout your
-            workflow.
+            agent.
           </h2>
         </header>
         <Skeleton className="h-96 w-full" />
@@ -75,7 +75,7 @@ function WorkflowRunParameters() {
   }
 
   if (!workflow || !workflowParameters || !initialValues) {
-    return <div>Workflow not found</div>;
+    return <div>Agent not found</div>;
   }
 
   return (

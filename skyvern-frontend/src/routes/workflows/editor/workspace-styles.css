@@ -2,9 +2,9 @@
   background: linear-gradient(
     to bottom,
     transparent 0%,
-    rgba(51, 65, 85, 0.1) 20%,
-    rgba(51, 65, 85, 0.5) 50%,
-    rgba(51, 65, 85, 0.1) 80%,
+    rgba(115, 115, 115, 0.1) 20%,
+    rgba(115, 115, 115, 0.5) 50%,
+    rgba(115, 115, 115, 0.1) 80%,
     transparent 100%
   );
 }
@@ -13,9 +13,9 @@
   background: linear-gradient(
     to bottom,
     transparent 0%,
-    rgba(51, 65, 85, 0.3) 20%,
-    rgba(51, 65, 85, 1) 50%,
-    rgba(51, 65, 85, 0.3) 80%,
+    rgba(115, 115, 115, 0.3) 20%,
+    rgba(115, 115, 115, 1) 50%,
+    rgba(115, 115, 115, 0.3) 80%,
     transparent 100%
   );
 }

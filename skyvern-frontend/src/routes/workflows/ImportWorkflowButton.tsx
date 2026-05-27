@@ -116,7 +116,7 @@ function ImportWorkflowButton({
       toast({
         variant: "destructive",
         title: `Error importing ${fileName}`,
-        description: getErrorMessage(error, "Failed to import workflow"),
+        description: getErrorMessage(error, "Failed to import agent"),
       });
       return false;
     }
@@ -194,12 +194,12 @@ function ImportWorkflowButton({
         variant: "success",
         title:
           successCount === 1
-            ? "Workflow imported"
-            : `${successCount} workflows imported`,
+            ? "Agent imported"
+            : `${successCount} agents imported`,
         description:
           successCount === files.length
-            ? "Successfully imported all workflows"
-            : `${successCount} of ${files.length} workflows imported successfully`,
+            ? "Successfully imported all agents"
+            : `${successCount} of ${files.length} agents imported successfully`,
       });
     }
   };
@@ -277,7 +277,7 @@ function ImportWorkflowButton({
             ? "Could not verify duplicate"
             : `Could not verify ${checkFailed.length} duplicates`,
         description:
-          "Network error checking if these workflows already exist. Review before importing.",
+          "Network error checking if these agents already exist. Review before importing.",
       });
     }
 
@@ -371,7 +371,7 @@ function ImportWorkflowButton({
             </Label>
           </TooltipTrigger>
           <TooltipContent>
-            Import one or more workflows from YAML, JSON, or PDF files
+            Import one or more agents from YAML, JSON, or PDF files
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
@@ -387,8 +387,8 @@ function ImportWorkflowButton({
           <DialogHeader>
             <DialogTitle>
               {pendingDuplicates.length === 1
-                ? "Duplicate workflow detected"
-                : "Duplicate workflows detected"}
+                ? "Duplicate agent detected"
+                : "Duplicate agents detected"}
             </DialogTitle>
             <DialogDescription asChild>
               <div className="space-y-3">
@@ -411,7 +411,7 @@ function ImportWorkflowButton({
                       </div>
                       <div className="text-xs text-muted-foreground">
                         {dup.duplicateReason?.kind === "existing" &&
-                          "A workflow with this title already exists"}
+                          "An agent with this title already exists"}
                         {dup.duplicateReason?.kind === "intra-batch" &&
                           "Another selected file has the same title"}
                         {dup.duplicateReason?.kind === "check-failed" &&

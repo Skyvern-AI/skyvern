@@ -372,7 +372,7 @@ function SchedulesPage() {
           <TableSearchInput
             value={search}
             onChange={setSearch}
-            placeholder="Search by workflow or schedule name..."
+            placeholder="Search by agent or schedule name..."
             className="w-64"
           />
           <DropdownMenu modal={false}>
@@ -441,7 +441,7 @@ function SchedulesPage() {
                   </TableHead>
                 )}
                 <TableHead className={showCheckbox ? "w-[28%]" : "w-[31%]"}>
-                  Workflow
+                  Agent
                 </TableHead>
                 <TableHead className="w-[20%]">Name</TableHead>
                 <TableHead className="w-[20%]">Schedule</TableHead>

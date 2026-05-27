@@ -282,8 +282,8 @@ function NavigationEditorBody({
           />
         </div>
         {!hasInteracted && (
-          <div className="rounded-md bg-slate-800 p-2">
-            <div className="space-y-1 text-xs text-slate-400">
+          <div className="rounded-md border border-neutral-200 bg-neutral-100 p-2 dark:border-slate-700/50 dark:bg-slate-800">
+            <div className="space-y-1 text-xs text-neutral-600 dark:text-slate-400">
               Tip: Try to phrase your prompt as a goal with an explicit
               completion criteria. While executing, Skyvern will take as many
               actions as necessary to accomplish the goal. Use words like

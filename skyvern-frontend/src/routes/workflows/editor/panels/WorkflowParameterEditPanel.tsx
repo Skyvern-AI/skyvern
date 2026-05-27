@@ -540,7 +540,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     URL Parameter Key
                   </Label>
-                  <HelpTooltip content="Optional. The workflow parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
+                  <HelpTooltip content="Optional. The agent parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
                 </div>
                 <Input
                   value={urlParameterKey}
@@ -552,7 +552,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports agent parameters." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -564,7 +564,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports workflow parameters." />
+                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports agent parameters." />
                 </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
@@ -625,7 +625,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Collection containing the credit card. Supports workflow parameters." />
+                  <HelpTooltip content="Collection containing the credit card. Supports agent parameters." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -637,7 +637,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Credit card item ID. Supports workflow parameters." />
+                  <HelpTooltip content="Credit card item ID. Supports agent parameters." />
                 </div>
                 <Input
                   value={sensitiveInformationItemId}
@@ -657,7 +657,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Vault ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password vault URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent parameters." />
                 </div>
                 <Input
                   value={opVaultId}
@@ -669,7 +669,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Item ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password item URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent parameters." />
                 </div>
                 <Input
                   value={opItemId}

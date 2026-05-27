@@ -141,8 +141,8 @@ function WorkflowRun() {
       });
       toast({
         variant: "success",
-        title: "Workflow Canceled",
-        description: "The workflow has been successfully canceled.",
+        title: "Agent Canceled",
+        description: "The agent has been successfully canceled.",
       });
     },
     onError: (error) => {
@@ -375,12 +375,14 @@ function WorkflowRun() {
                 />
               ) : null}
             </div>
-            <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
+              {workflowRunId}
+            </h2>
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||
                 isWorkflowDeleted) && (
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-400">
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-neutral-600 dark:text-slate-400">
                   {workflowRun.started_at && (
                     <span title={basicTimeFormat(workflowRun.started_at)}>
                       Started: {basicLocalTimeFormat(workflowRun.started_at)}
@@ -393,7 +395,7 @@ function WorkflowRun() {
                   )}
                   {isWorkflowDeleted && (
                     <span title={basicTimeFormat(workflow!.deleted_at!)}>
-                      Workflow deleted on{" "}
+                      Agent deleted on{" "}
                       {basicLocalTimeFormat(workflow!.deleted_at!)}
                     </span>
                   )}
@@ -401,7 +403,7 @@ function WorkflowRun() {
               )}
             {workflowRun?.browser_session_id && (
               <Link
-                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200"
                 to={`/browser-session/${workflowRun.browser_session_id}/stream`}
               >
                 Browser Session: {workflowRun.browser_session_id}
@@ -409,7 +411,7 @@ function WorkflowRun() {
             )}
             {workflowRun?.browser_profile_id && (
               <Link
-                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200"
                 to={`/browser-profiles/${workflowRun.browser_profile_id}`}
               >
                 Browser Profile: {workflowRun.browser_profile_id}
@@ -481,7 +483,7 @@ function WorkflowRun() {
                   <DialogHeader>
                     <DialogTitle>Are you sure?</DialogTitle>
                     <DialogDescription>
-                      Are you sure you want to cancel this workflow run?
+                      Are you sure you want to cancel this agent run?
                     </DialogDescription>
                   </DialogHeader>
                   <DialogFooter>
@@ -498,7 +500,7 @@ function WorkflowRun() {
                       {cancelWorkflowMutation.isPending && (
                         <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                       )}
-                      Cancel Workflow Run
+                      Cancel Agent Run
                     </Button>
                   </DialogFooter>
                 </DialogContent>

@@ -267,13 +267,13 @@ function RunHistory() {
               </Tip>
             )}
             {run.workflow_deleted && (
-              <Tip content="Source workflow deleted">
+              <Tip content="Source agent deleted">
                 <ExclamationTriangleIcon className="text-amber-400" />
               </Tip>
             )}
             <span
               className={cn(
-                run.workflow_deleted && "text-slate-400",
+                run.workflow_deleted && "text-neutral-600 dark:text-slate-400",
                 "truncate",
               )}
             >
@@ -305,7 +305,9 @@ function RunHistory() {
               {isKnownStatus(run.status) ? (
                 <StatusBadge status={run.status} />
               ) : (
-                <span className="text-sm text-slate-400">{run.status}</span>
+                <span className="text-sm text-neutral-600 dark:text-slate-400">
+                  {run.status}
+                </span>
               )}
             </TableCell>
             <TableCell
@@ -314,7 +316,7 @@ function RunHistory() {
             >
               {basicLocalTimeFormat(run.created_at)}
             </TableCell>
-            <TableCell className="text-slate-400">
+            <TableCell className="text-neutral-600 dark:text-slate-400">
               {executionTime ?? "-"}
             </TableCell>
             <TableCell>
@@ -383,7 +385,7 @@ function RunHistory() {
           data-testid="workflow-filter-banner"
         >
           <span className="truncate">
-            Filtering runs for workflow{" "}
+            Filtering runs for agent{" "}
             <span className="font-mono">{workflowPermanentIdFilter}</span>
           </span>
           <Button
@@ -407,7 +409,7 @@ function RunHistory() {
           }}
           placeholder={
             workflowPermanentIdFilter
-              ? "Clear the workflow filter above to search"
+              ? "Clear the agent filter above to search"
               : "Search by run ID or parameter..."
           }
           disabled={!!workflowPermanentIdFilter}
@@ -431,23 +433,31 @@ function RunHistory() {
         <Table className="sm:table-fixed">
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
+              <TableHead className="w-[20%] rounded-tl-lg text-neutral-600 dark:text-slate-400">
                 Run ID
               </TableHead>
-              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
-              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
-              <TableHead className="w-[27%] text-slate-400">
+              <TableHead className="w-[20%] text-neutral-600 dark:text-slate-400">
+                Detail
+              </TableHead>
+              <TableHead className="w-[16%] text-neutral-600 dark:text-slate-400">
+                Status
+              </TableHead>
+              <TableHead className="w-[27%] text-neutral-600 dark:text-slate-400">
                 Created At
               </TableHead>
-              <TableHead className="w-[8%] text-slate-400">Duration</TableHead>
-              <TableHead className="w-[8%] rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[8%] text-neutral-600 dark:text-slate-400">
+                Duration
+              </TableHead>
+              <TableHead className="w-[8%] rounded-tr-lg text-neutral-600 dark:text-slate-400"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+            <span className="text-neutral-600 dark:text-slate-400">
+              Items per page
+            </span>
             <Select
               value={String(itemsPerPage)}
               onValueChange={(size) => {
@@ -557,7 +567,7 @@ function WorkflowRunParametersInline({
 
   if (!hasParameters && !hasExtraHeaders) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
+      <div className="ml-8 py-4 text-sm text-neutral-600 dark:text-slate-400">
         No parameters for this run
       </div>
     );

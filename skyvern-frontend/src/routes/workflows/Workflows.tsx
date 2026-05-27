@@ -60,7 +60,6 @@ import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { convert } from "./editor/workflowEditorUtils";
 import { WorkflowApiResponse } from "./types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -69,6 +68,7 @@ import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
+import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
 
 // Utility function to create URL-safe folder slugs from folder names
 function slugifyFolderName(name: string): string {
@@ -108,19 +108,6 @@ function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
   // First folder (oldest) gets the base slug, others get numbered suffixes
   return index === 0 ? baseSlug : `${baseSlug}-${index + 1}`;
 }
-const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
-  title: "New Workflow",
-  description: "",
-  ai_fallback: true,
-  code_version: 2,
-  run_with: "agent",
-  workflow_definition: {
-    version: 2,
-    blocks: [],
-    parameters: [],
-  },
-};
-
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -373,7 +360,7 @@ function Workflows() {
     setParamPatch({ page: String(page + 1) });
   }
 
-  // Show importing workflows from polling hook (only on page 1)
+  // Show importing agents from polling hook (only on page 1)
   const displayWorkflows = useMemo(() => {
     const importingOnly = activeImports.filter(
       (imp) => imp.status === "importing",
@@ -391,10 +378,10 @@ function Workflows() {
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
-            <h1 className="text-2xl">Workflows</h1>
+            <h1 className="text-2xl">Agents</h1>
           </div>
-          <p className="text-slate-300">
-            Create your own complex workflows by connecting web agents together.
+          <p className="text-sm leading-6 text-muted-foreground">
+            Create your own complex agents by connecting web agents together.
             Define a series of actions, set it, and forget it.
           </p>
         </div>
@@ -462,12 +449,12 @@ function Workflows() {
               <div className="mx-auto max-w-md">
                 <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
                 <h3 className="mb-2 text-slate-900 dark:text-slate-100">
-                  Organize Your Workflows with Folders
+                  Organize Your Agents with Folders
                 </h3>
                 <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
-                  Keep your workflows organized by creating folders. Group
-                  related workflows together by project, team, or workflow type
-                  for easier management.
+                  Keep your agents organized by creating folders. Group related
+                  agents together by project, team, or agent type for easier
+                  management.
                 </p>
                 <Button
                   variant="link"
@@ -483,9 +470,9 @@ function Workflows() {
           )}
         </div>
 
-        {/* Workflows Section */}
+        {/* Agents Section */}
         <header className="flex items-center justify-between">
-          <h1 className="text-xl">My Flows</h1>
+          <h1 className="text-xl">My Agents</h1>
           {selectedFolderId && (
             <Button
               variant="link"
@@ -493,7 +480,7 @@ function Workflows() {
               className="h-auto p-0 text-blue-600 dark:text-blue-400"
               onClick={() => setSelectedFolderId(null)}
             >
-              View all workflows
+              View all agents
             </Button>
           )}
         </header>
@@ -510,7 +497,7 @@ function Workflows() {
           <div className="flex items-center gap-4">
             <Link
               to="/discover"
-              className="text-sm text-slate-400 hover:text-slate-200"
+              className="text-sm text-muted-foreground hover:text-foreground"
             >
               Or start from a description →
             </Link>
@@ -534,14 +521,14 @@ function Workflows() {
                 <DropdownMenuItem
                   onSelect={() => {
                     createWorkflowMutation.mutate({
-                      ...emptyWorkflowRequest,
+                      ...defaultWorkflowRequest,
                       folder_id: selectedFolderId,
                       _via: "blank",
                     });
                   }}
                 >
                   <PlusIcon className="mr-2 h-4 w-4" />
-                  Blank Workflow
+                  Blank Agent
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => setIsTemplateDialogOpen(true)}
@@ -599,7 +586,7 @@ function Workflows() {
                 ))
               ) : displayWorkflows?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>No workflows found</TableCell>
+                  <TableCell colSpan={5}>No agents found</TableCell>
                 </TableRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
@@ -617,7 +604,7 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id,
                   );
-                  // Check if this is an importing workflow
+                  // Check if this is an importing agent
                   const isUploading = workflow.status === "importing";
 
                   return (

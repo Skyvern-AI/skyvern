@@ -10,6 +10,7 @@ import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
   ReactNode,
+  SVGProps,
   TextareaHTMLAttributes,
 } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -112,9 +113,7 @@ vi.mock("@radix-ui/react-icons", () => ({
   GearIcon: () => null,
   Pencil1Icon: () => null,
   ReloadIcon: () => null,
-  PaperPlaneIcon: (props: ButtonHTMLAttributes<HTMLButtonElement>) => (
-    <button type="button" aria-label="submit-prompt" {...props} />
-  ),
+  PaperPlaneIcon: (props: SVGProps<SVGSVGElement>) => <svg {...props} />,
 }));
 
 vi.mock("@/components/icons/CartIcon", () => ({ CartIcon: () => null }));

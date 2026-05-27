@@ -96,7 +96,7 @@ function ImprovePrompt(props: Props) {
     <div
       className={`flex items-center overflow-hidden transition-all duration-300 ${
         props.isVisible
-          ? `${size === "large" ? "w-14" : "w-4"} opacity-100`
+          ? `${size === "large" ? "w-6" : "w-4"} opacity-100`
           : "pointer-events-none w-0 opacity-0"
       }`}
     >
