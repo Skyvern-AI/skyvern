@@ -7,6 +7,7 @@ persists them in a single batch insert, and that validation failures
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -58,6 +59,7 @@ def _make_service_with_mocks(
         extra_http_headers=None,
         cdp_connect_headers=None,
         browser_profile_id=None,
+        max_elapsed_time_minutes=None,
         run_with="agent",
         code_version=None,
         adaptive_caching=False,
@@ -83,7 +85,7 @@ def _make_service_with_mocks(
 
 
 @pytest.fixture(autouse=True)
-def reset_context() -> None:
+def reset_context() -> Generator[None]:
     skyvern_context.reset()
     yield
     skyvern_context.reset()

@@ -14,6 +14,12 @@ def test_workflow_run_request_accepts_run_metadata() -> None:
     assert request.run_metadata == {"customer": "acme"}
 
 
+def test_workflow_run_request_accepts_max_elapsed_time() -> None:
+    request = WorkflowRunRequest(workflow_id="wpid_123", max_elapsed_time_minutes=10)
+
+    assert request.max_elapsed_time_minutes == 10
+
+
 def test_run_workflow_sends_run_metadata() -> None:
     captured_bodies: list[dict[str, object]] = []
 
@@ -45,6 +51,41 @@ def test_run_workflow_sends_run_metadata() -> None:
         {
             "workflow_id": "wpid_123",
             "run_metadata": {"customer": "acme", "tier": "enterprise"},
+        }
+    ]
+
+
+def test_run_workflow_sends_max_elapsed_time() -> None:
+    captured_bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_bodies.append(json.loads(request.content))
+        return httpx.Response(
+            status_code=200,
+            json={
+                "run_id": "wr_123",
+                "status": "queued",
+                "created_at": datetime.now(UTC).isoformat(),
+                "modified_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    client = Skyvern(
+        base_url="https://api.example.test",
+        api_key="test-key",
+        httpx_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = client.run_workflow(
+        workflow_id="wpid_123",
+        max_elapsed_time_minutes=10,
+    )
+
+    assert response.run_id == "wr_123"
+    assert captured_bodies == [
+        {
+            "workflow_id": "wpid_123",
+            "max_elapsed_time_minutes": 10,
         }
     ]
 
