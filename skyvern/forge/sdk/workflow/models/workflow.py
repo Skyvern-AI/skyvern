@@ -15,9 +15,13 @@ from skyvern.forge.sdk.workflow.exceptions import (
 )
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
+from skyvern.forge.sdk.workflow.models.run_limits import (
+    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    reject_bool_max_elapsed_time_minutes,
+)
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.runs import ProxyLocationInput, ScriptRunResponse
-from skyvern.schemas.workflows import BlockType, WorkflowStatus
+from skyvern.schemas.workflows import WorkflowStatus
 from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
@@ -32,12 +36,18 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None
     run_with: str | None = None
     ai_fallback: bool | None = None
     run_metadata: dict[str, str] | None = None
+
+    @field_validator("max_elapsed_time_minutes", mode="before")
+    @classmethod
+    def validate_max_elapsed_time_minutes(cls, value: object) -> object:
+        return reject_bool_max_elapsed_time_minutes(value)
 
     @field_validator("webhook_callback_url", "totp_verification_url")
     @classmethod
@@ -65,9 +75,6 @@ class WorkflowDefinition(BaseModel):
     finally_block_label: str | None = None
     error_code_mapping: dict[str, str] | None = None
     workflow_system_prompt: str | None = None
-
-    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
-        return all(block.block_type != BlockType.LOGIN for block in get_all_blocks(self.blocks))
 
     def validate(self) -> None:
         all_labels: set[str] = set()
@@ -116,6 +123,7 @@ class Workflow(BaseModel):
     model: dict[str, Any] | None = None
     status: WorkflowStatus = WorkflowStatus.published
     max_screenshot_scrolls: int | None = None
+    max_elapsed_time_minutes: int | None = None
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     run_with: str = "agent"
@@ -155,9 +163,6 @@ class Workflow(BaseModel):
             if parameter.key == key:
                 return parameter
         return None
-
-    def allow_content_blocking_extensions_for_browser_launch(self) -> bool:
-        return self.workflow_definition.allow_content_blocking_extensions_for_browser_launch()
 
 
 class WorkflowRunStatus(StrEnum):
@@ -213,6 +218,7 @@ class WorkflowRun(BaseModel):
     parent_workflow_run_id: str | None = None
     workflow_title: str | None = None
     max_screenshot_scrolls: int | None = None
+    max_elapsed_time_minutes: int | None = None
     browser_address: str | None = None
     run_with: str | None = None
     script_run: ScriptRunResponse | None = None
