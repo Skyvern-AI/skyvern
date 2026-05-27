@@ -95,6 +95,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -620,6 +621,7 @@ class ForgeAgent:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
+        context.step_retry_index = step.retry_index
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
@@ -1339,25 +1341,15 @@ class ForgeAgent:
             context = skyvern_context.current()
             if context:
                 context.step_id = step.step_id
+                context.step_retry_index = step.retry_index
                 if not task.workflow_run_id and step.order == 0 and step.retry_index == 0:
-                    if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
-                        context.disable_llm_screenshots = True
-                    else:
-                        try:
-                            context.disable_llm_screenshots = (
-                                await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                                    "DISABLE_LLM_SCREENSHOTS",
-                                    task.task_id,
-                                    properties={"organization_id": task.organization_id},
-                                )
-                            )
-                        except Exception:
-                            LOG.warning(
-                                "Failed to check DISABLE_LLM_SCREENSHOTS feature flag",
-                                exc_info=True,
-                                task_id=task.task_id,
-                            )
-                            context.disable_llm_screenshots = False
+                    await resolve_llm_vision_mode_for_context(
+                        context,
+                        task.task_id,
+                        task.organization_id,
+                        task_url=task.url,
+                        log_context={"task_id": task.task_id},
+                    )
 
             step = await self.update_step(step=step, status=StepStatus.running)
             injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
