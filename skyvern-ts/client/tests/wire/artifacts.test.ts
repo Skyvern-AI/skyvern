@@ -69,6 +69,24 @@ describe("Artifacts", () => {
             .mockEndpoint()
             .get("/v1/artifacts/artifact_id/content")
             .respondWith()
+            .statusCode(416)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.artifacts.getArtifactContent("artifact_id");
+        }).rejects.toThrow(Skyvern.RangeNotSatisfiableError);
+    });
+
+    test("getArtifactContent (5)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/artifacts/artifact_id/content")
+            .respondWith()
             .statusCode(422)
             .jsonBody(rawResponseBody)
             .build();

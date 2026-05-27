@@ -3,10 +3,17 @@
 /**
  * @example
  *     {
- *         include_deleted: true
+ *         page: 1,
+ *         page_size: 1,
+ *         include_deleted: true,
+ *         search_key: "search_key"
  *     }
  */
 export interface ListBrowserProfilesRequest {
+    page?: number;
+    page_size?: number;
     /** Include deleted browser profiles */
     include_deleted?: boolean;
+    /** Case-insensitive substring search across: browser profile name and description. A profile is returned if either field matches. */
+    search_key?: string;
 }

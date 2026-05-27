@@ -5,11 +5,11 @@ import typing
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .run_engine import RunEngine
-from .task_run_request_data_extraction_schema import TaskRunRequestDataExtractionSchema
-from .task_run_request_proxy_location import TaskRunRequestProxyLocation
+from .task_run_request_output_data_extraction_schema import TaskRunRequestOutputDataExtractionSchema
+from .task_run_request_output_proxy_location import TaskRunRequestOutputProxyLocation
 
 
-class TaskRunRequest(UniversalBaseModel):
+class TaskRunRequestOutput(UniversalBaseModel):
     prompt: str = pydantic.Field()
     """
     
@@ -33,7 +33,7 @@ class TaskRunRequest(UniversalBaseModel):
     The title for the task
     """
 
-    proxy_location: typing.Optional[TaskRunRequestProxyLocation] = pydantic.Field(default=None)
+    proxy_location: typing.Optional[TaskRunRequestOutputProxyLocation] = pydantic.Field(default=None)
     """
     
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -50,6 +50,7 @@ class TaskRunRequest(UniversalBaseModel):
     - RESIDENTIAL_NZ: New Zealand
     - RESIDENTIAL_PH: Philippines
     - RESIDENTIAL_KR: South Korea
+    - RESIDENTIAL_SA: Saudi Arabia
     - RESIDENTIAL_ZA: South Africa
     - RESIDENTIAL_AR: Argentina
     - RESIDENTIAL_AU: Australia
@@ -66,10 +67,12 @@ class TaskRunRequest(UniversalBaseModel):
     - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
     - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
     - NONE: No proxy
+    
+    For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
      Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
     """
 
-    data_extraction_schema: typing.Optional[TaskRunRequestDataExtractionSchema] = pydantic.Field(default=None)
+    data_extraction_schema: typing.Optional[TaskRunRequestOutputDataExtractionSchema] = pydantic.Field(default=None)
     """
     
     The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
@@ -120,6 +123,11 @@ class TaskRunRequest(UniversalBaseModel):
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
     """
     The extra HTTP headers for the requests in browser.
+    """
+
+    cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    """
+    HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
     """
 
     publish_workflow: typing.Optional[bool] = pydantic.Field(default=None)

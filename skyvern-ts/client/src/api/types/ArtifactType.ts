@@ -30,5 +30,6 @@ export const ArtifactType = {
     Pdf: "pdf",
     StepArchive: "step_archive",
     TaskArchive: "task_archive",
+    Download: "download",
 } as const;
 export type ArtifactType = (typeof ArtifactType)[keyof typeof ArtifactType];

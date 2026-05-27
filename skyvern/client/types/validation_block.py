@@ -27,6 +27,7 @@ class ValidationBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -48,6 +49,7 @@ class ValidationBlock(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2

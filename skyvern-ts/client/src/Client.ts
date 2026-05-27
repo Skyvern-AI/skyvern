@@ -4,6 +4,8 @@ import * as Skyvern from "./api/index.js";
 import { Artifacts } from "./api/resources/artifacts/client/Client.js";
 import { Schedules } from "./api/resources/schedules/client/Client.js";
 import { Scripts } from "./api/resources/scripts/client/Client.js";
+import { Server } from "./api/resources/server/client/Client.js";
+import { Workflows } from "./api/resources/workflows/client/Client.js";
 import type { BaseClientOptions, BaseRequestOptions } from "./BaseClient.js";
 import { mergeHeaders, mergeOnlyDefinedHeaders } from "./core/headers.js";
 import * as core from "./core/index.js";
@@ -19,6 +21,8 @@ export declare namespace SkyvernClient {
 export class SkyvernClient {
     protected readonly _options: SkyvernClient.Options;
     protected _artifacts: Artifacts | undefined;
+    protected _server: Server | undefined;
+    protected _workflows: Workflows | undefined;
     protected _scripts: Scripts | undefined;
     protected _schedules: Schedules | undefined;
 
@@ -30,8 +34,8 @@ export class SkyvernClient {
                     "x-api-key": _options?.apiKey,
                     "X-Fern-Language": "JavaScript",
                     "X-Fern-SDK-Name": "@skyvern/client",
-                    "X-Fern-SDK-Version": "1.0.32",
-                    "User-Agent": "@skyvern/client/1.0.32",
+                    "X-Fern-SDK-Version": "1.0.37",
+                    "User-Agent": "@skyvern/client/1.0.37",
                     "X-Fern-Runtime": core.RUNTIME.type,
                     "X-Fern-Runtime-Version": core.RUNTIME.version,
                 },
@@ -42,6 +46,14 @@ export class SkyvernClient {
 
     public get artifacts(): Artifacts {
         return (this._artifacts ??= new Artifacts(this._options));
+    }
+
+    public get server(): Server {
+        return (this._server ??= new Server(this._options));
+    }
+
+    public get workflows(): Workflows {
+        return (this._workflows ??= new Workflows(this._options));
     }
 
     public get scripts(): Scripts {
@@ -55,7 +67,7 @@ export class SkyvernClient {
     /**
      * Run a task
      *
-     * @param {Skyvern.RunTaskRequest} request
+     * @param {Skyvern.TaskRunRequestInput} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.BadRequestError}
@@ -64,23 +76,21 @@ export class SkyvernClient {
      * @example
      *     await client.runTask({
      *         "x-user-agent": "x-user-agent",
-     *         body: {
-     *             prompt: "Find the top 3 posts on Hacker News."
-     *         }
+     *         prompt: "Find the top 3 posts on Hacker News."
      *     })
      */
     public runTask(
-        request: Skyvern.RunTaskRequest,
+        request: Skyvern.TaskRunRequestInput,
         requestOptions?: SkyvernClient.RequestOptions,
     ): core.HttpResponsePromise<Skyvern.TaskRunResponse> {
         return core.HttpResponsePromise.fromPromise(this.__runTask(request, requestOptions));
     }
 
     private async __runTask(
-        request: Skyvern.RunTaskRequest,
+        request: Skyvern.TaskRunRequestInput,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.TaskRunResponse>> {
-        const { "x-user-agent": userAgent, body: _body } = request;
+        const { "x-user-agent": userAgent, ..._body } = request;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({
@@ -145,7 +155,7 @@ export class SkyvernClient {
     /**
      * Run a workflow
      *
-     * @param {Skyvern.RunWorkflowRequest} request
+     * @param {Skyvern.WorkflowRunRequestInput} request
      * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
      *
      * @throws {@link Skyvern.BadRequestError}
@@ -156,23 +166,21 @@ export class SkyvernClient {
      *         "x-max-steps-override": 1,
      *         "x-user-agent": "x-user-agent",
      *         template: true,
-     *         body: {
-     *             workflow_id: "wpid_123"
-     *         }
+     *         workflow_id: "wpid_123"
      *     })
      */
     public runWorkflow(
-        request: Skyvern.RunWorkflowRequest,
+        request: Skyvern.WorkflowRunRequestInput,
         requestOptions?: SkyvernClient.RequestOptions,
     ): core.HttpResponsePromise<Skyvern.WorkflowRunResponse> {
         return core.HttpResponsePromise.fromPromise(this.__runWorkflow(request, requestOptions));
     }
 
     private async __runWorkflow(
-        request: Skyvern.RunWorkflowRequest,
+        request: Skyvern.WorkflowRunRequestInput,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
-        const { template, "x-max-steps-override": maxStepsOverride, "x-user-agent": userAgent, body: _body } = request;
+        const { template, "x-max-steps-override": maxStepsOverride, "x-user-agent": userAgent, ..._body } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
         if (template != null) {
             _queryParams.template = template.toString();
@@ -382,6 +390,86 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/runs/{run_id}/cancel.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Cancel multiple runs (tasks or workflows) in a single request
+     *
+     * @param {Skyvern.BulkCancelRunsRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.bulkCancelRuns({
+     *         run_ids: ["run_ids"]
+     *     })
+     */
+    public bulkCancelRuns(
+        request: Skyvern.BulkCancelRunsRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BulkCancelRunsResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__bulkCancelRuns(request, requestOptions));
+    }
+
+    private async __bulkCancelRuns(
+        request: Skyvern.BulkCancelRunsRequest,
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BulkCancelRunsResponse>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                "v1/runs/cancel",
+            ),
+            method: "POST",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BulkCancelRunsResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError("Timeout exceeded when calling POST /v1/runs/cancel.");
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -1406,7 +1494,7 @@ export class SkyvernClient {
         runId: string,
         request?: Skyvern.RetryRunWebhookRequest,
         requestOptions?: SkyvernClient.RequestOptions,
-    ): core.HttpResponsePromise<unknown> {
+    ): core.HttpResponsePromise<Skyvern.RunWebhookReplayResponse> {
         return core.HttpResponsePromise.fromPromise(this.__retryRunWebhook(runId, request, requestOptions));
     }
 
@@ -1414,7 +1502,7 @@ export class SkyvernClient {
         runId: string,
         request?: Skyvern.RetryRunWebhookRequest,
         requestOptions?: SkyvernClient.RequestOptions,
-    ): Promise<core.WithRawResponse<unknown>> {
+    ): Promise<core.WithRawResponse<Skyvern.RunWebhookReplayResponse>> {
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
             mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
@@ -1438,7 +1526,7 @@ export class SkyvernClient {
             abortSignal: requestOptions?.abortSignal,
         });
         if (_response.ok) {
-            return { data: _response.body, rawResponse: _response.rawResponse };
+            return { data: _response.body as Skyvern.RunWebhookReplayResponse, rawResponse: _response.rawResponse };
         }
 
         if (_response.error.reason === "status-code") {
@@ -1546,6 +1634,100 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/runs/{run_id}/timeline.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Retry a workflow run using the original run parameters.
+     *
+     * @param {string} workflowRunId - The id of the workflow run to retry.
+     * @param {Skyvern.RetryWorkflowRunRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.BadRequestError}
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.retryWorkflowRun("wr_123", {
+     *         "x-max-steps-override": 1,
+     *         "x-user-agent": "x-user-agent"
+     *     })
+     */
+    public retryWorkflowRun(
+        workflowRunId: string,
+        request: Skyvern.RetryWorkflowRunRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.WorkflowRunResponse> {
+        return core.HttpResponsePromise.fromPromise(this.__retryWorkflowRun(workflowRunId, request, requestOptions));
+    }
+
+    private async __retryWorkflowRun(
+        workflowRunId: string,
+        request: Skyvern.RetryWorkflowRunRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
+        const { "x-max-steps-override": maxStepsOverride, "x-user-agent": userAgent } = request;
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({
+                "x-max-steps-override": maxStepsOverride != null ? maxStepsOverride.toString() : undefined,
+                "x-user-agent": userAgent != null ? userAgent : undefined,
+                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
+            }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/workflows/runs/${core.url.encodePathParam(workflowRunId)}/retry`,
+            ),
+            method: "POST",
+            headers: _headers,
+            queryParameters: requestOptions?.queryParams,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.WorkflowRunResponse, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 400:
+                    throw new Skyvern.BadRequestError(_response.error.body as unknown, _response.rawResponse);
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling POST /v1/workflows/runs/{workflow_run_id}/retry.",
+                );
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -1778,6 +1960,127 @@ export class SkyvernClient {
                 });
             case "timeout":
                 throw new errors.SkyvernTimeoutError("Timeout exceeded when calling GET /v1/workflows/runs.");
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * List runs for a specific workflow.
+     *
+     * Supports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.
+     *
+     * ### search_key
+     *
+     * Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.
+     *
+     * ### error_code
+     *
+     * Exact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.
+     *
+     * @param {string} workflowId
+     * @param {Skyvern.GetWorkflowRunsByIdRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.getWorkflowRunsById("workflow_id", {
+     *         page: 1,
+     *         page_size: 1,
+     *         search_key: "search_key",
+     *         error_code: "error_code"
+     *     })
+     */
+    public getWorkflowRunsById(
+        workflowId: string,
+        request: Skyvern.GetWorkflowRunsByIdRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.WorkflowRun[]> {
+        return core.HttpResponsePromise.fromPromise(this.__getWorkflowRunsById(workflowId, request, requestOptions));
+    }
+
+    private async __getWorkflowRunsById(
+        workflowId: string,
+        request: Skyvern.GetWorkflowRunsByIdRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.WorkflowRun[]>> {
+        const { page, page_size: pageSize, status, search_key: searchKey, error_code: errorCode } = request;
+        const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (page != null) {
+            _queryParams.page = page.toString();
+        }
+
+        if (pageSize != null) {
+            _queryParams.page_size = pageSize.toString();
+        }
+
+        if (status != null) {
+            if (Array.isArray(status)) {
+                _queryParams.status = status.map((item) => item);
+            } else {
+                _queryParams.status = status;
+            }
+        }
+
+        if (searchKey != null) {
+            _queryParams.search_key = searchKey;
+        }
+
+        if (errorCode != null) {
+            _queryParams.error_code = errorCode;
+        }
+
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/workflows/${core.url.encodePathParam(workflowId)}/runs`,
+            ),
+            method: "GET",
+            headers: _headers,
+            queryParameters: { ..._queryParams, ...requestOptions?.queryParams },
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.WorkflowRun[], rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling GET /v1/workflows/{workflow_id}/runs.",
+                );
             case "unknown":
                 throw new errors.SkyvernError({
                     message: _response.error.errorMessage,
@@ -2062,7 +2365,10 @@ export class SkyvernClient {
      *
      * @example
      *     await client.listBrowserProfiles({
-     *         include_deleted: true
+     *         page: 1,
+     *         page_size: 1,
+     *         include_deleted: true,
+     *         search_key: "search_key"
      *     })
      */
     public listBrowserProfiles(
@@ -2076,10 +2382,22 @@ export class SkyvernClient {
         request: Skyvern.ListBrowserProfilesRequest = {},
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.BrowserProfile[]>> {
-        const { include_deleted: includeDeleted } = request;
+        const { page, page_size: pageSize, include_deleted: includeDeleted, search_key: searchKey } = request;
         const _queryParams: Record<string, string | string[] | object | object[] | null> = {};
+        if (page != null) {
+            _queryParams.page = page.toString();
+        }
+
+        if (pageSize != null) {
+            _queryParams.page_size = pageSize.toString();
+        }
+
         if (includeDeleted != null) {
             _queryParams.include_deleted = includeDeleted.toString();
+        }
+
+        if (searchKey != null) {
+            _queryParams.search_key = searchKey;
         }
 
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
@@ -2372,6 +2690,95 @@ export class SkyvernClient {
             case "timeout":
                 throw new errors.SkyvernTimeoutError(
                     "Timeout exceeded when calling DELETE /v1/browser_profiles/{profile_id}.",
+                );
+            case "unknown":
+                throw new errors.SkyvernError({
+                    message: _response.error.errorMessage,
+                    rawResponse: _response.rawResponse,
+                });
+        }
+    }
+
+    /**
+     * Update a browser profile's name and/or description
+     *
+     * @param {string} profileId - The ID of the browser profile to update. browser_profile_id starts with `bp_`
+     * @param {Skyvern.UpdateBrowserProfileRequest} request
+     * @param {SkyvernClient.RequestOptions} requestOptions - Request-specific configuration.
+     *
+     * @throws {@link Skyvern.NotFoundError}
+     * @throws {@link Skyvern.ConflictError}
+     * @throws {@link Skyvern.UnprocessableEntityError}
+     *
+     * @example
+     *     await client.updateBrowserProfile("bp_123456")
+     */
+    public updateBrowserProfile(
+        profileId: string,
+        request: Skyvern.UpdateBrowserProfileRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): core.HttpResponsePromise<Skyvern.BrowserProfile> {
+        return core.HttpResponsePromise.fromPromise(this.__updateBrowserProfile(profileId, request, requestOptions));
+    }
+
+    private async __updateBrowserProfile(
+        profileId: string,
+        request: Skyvern.UpdateBrowserProfileRequest = {},
+        requestOptions?: SkyvernClient.RequestOptions,
+    ): Promise<core.WithRawResponse<Skyvern.BrowserProfile>> {
+        const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
+            this._options?.headers,
+            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            requestOptions?.headers,
+        );
+        const _response = await core.fetcher({
+            url: core.url.join(
+                (await core.Supplier.get(this._options.baseUrl)) ??
+                    (await core.Supplier.get(this._options.environment)) ??
+                    environments.SkyvernEnvironment.Cloud,
+                `v1/browser_profiles/${core.url.encodePathParam(profileId)}`,
+            ),
+            method: "PATCH",
+            headers: _headers,
+            contentType: "application/json",
+            queryParameters: requestOptions?.queryParams,
+            requestType: "json",
+            body: request,
+            timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
+            maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
+            abortSignal: requestOptions?.abortSignal,
+        });
+        if (_response.ok) {
+            return { data: _response.body as Skyvern.BrowserProfile, rawResponse: _response.rawResponse };
+        }
+
+        if (_response.error.reason === "status-code") {
+            switch (_response.error.statusCode) {
+                case 404:
+                    throw new Skyvern.NotFoundError(_response.error.body as unknown, _response.rawResponse);
+                case 409:
+                    throw new Skyvern.ConflictError(_response.error.body as unknown, _response.rawResponse);
+                case 422:
+                    throw new Skyvern.UnprocessableEntityError(_response.error.body as unknown, _response.rawResponse);
+                default:
+                    throw new errors.SkyvernError({
+                        statusCode: _response.error.statusCode,
+                        body: _response.error.body,
+                        rawResponse: _response.rawResponse,
+                    });
+            }
+        }
+
+        switch (_response.error.reason) {
+            case "non-json":
+                throw new errors.SkyvernError({
+                    statusCode: _response.error.statusCode,
+                    body: _response.error.rawBody,
+                    rawResponse: _response.rawResponse,
+                });
+            case "timeout":
+                throw new errors.SkyvernTimeoutError(
+                    "Timeout exceeded when calling PATCH /v1/browser_profiles/{profile_id}.",
                 );
             case "unknown":
                 throw new errors.SkyvernError({
@@ -3216,6 +3623,7 @@ export class SkyvernClient {
      *
      * @example
      *     await client.login({
+     *         "x-user-agent": "x-user-agent",
      *         credential_type: "skyvern"
      *     })
      */
@@ -3230,9 +3638,13 @@ export class SkyvernClient {
         request: Skyvern.LoginRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
+        const { "x-user-agent": userAgent, ..._body } = request;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            mergeOnlyDefinedHeaders({
+                "x-user-agent": userAgent != null ? userAgent : undefined,
+                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
+            }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -3247,7 +3659,7 @@ export class SkyvernClient {
             contentType: "application/json",
             queryParameters: requestOptions?.queryParams,
             requestType: "json",
-            body: request,
+            body: _body,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,
@@ -3296,6 +3708,7 @@ export class SkyvernClient {
      *
      * @example
      *     await client.downloadFiles({
+     *         "x-user-agent": "x-user-agent",
      *         navigation_goal: "navigation_goal"
      *     })
      */
@@ -3310,9 +3723,13 @@ export class SkyvernClient {
         request: Skyvern.DownloadFilesRequest,
         requestOptions?: SkyvernClient.RequestOptions,
     ): Promise<core.WithRawResponse<Skyvern.WorkflowRunResponse>> {
+        const { "x-user-agent": userAgent, ..._body } = request;
         const _headers: core.Fetcher.Args["headers"] = mergeHeaders(
             this._options?.headers,
-            mergeOnlyDefinedHeaders({ "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey }),
+            mergeOnlyDefinedHeaders({
+                "x-user-agent": userAgent != null ? userAgent : undefined,
+                "x-api-key": requestOptions?.apiKey ?? this._options?.apiKey,
+            }),
             requestOptions?.headers,
         );
         const _response = await core.fetcher({
@@ -3327,7 +3744,7 @@ export class SkyvernClient {
             contentType: "application/json",
             queryParameters: requestOptions?.queryParams,
             requestType: "json",
-            body: request,
+            body: _body,
             timeoutMs: (requestOptions?.timeoutInSeconds ?? this._options?.timeoutInSeconds ?? 60) * 1000,
             maxRetries: requestOptions?.maxRetries ?? this._options?.maxRetries,
             abortSignal: requestOptions?.abortSignal,

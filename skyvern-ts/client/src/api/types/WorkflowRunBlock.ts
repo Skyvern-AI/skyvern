@@ -29,6 +29,7 @@ export interface WorkflowRunBlock {
     created_at: string;
     modified_at: string;
     include_action_history_in_verification?: boolean;
+    include_extracted_text?: boolean;
     duration?: number;
     loop_values?: unknown[];
     current_value?: string;

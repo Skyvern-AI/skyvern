@@ -41,9 +41,7 @@ import { SkyvernClient } from "@skyvern/client";
 const client = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await client.runTask({
     "x-user-agent": "x-user-agent",
-    body: {
-        prompt: "Find the top 3 posts on Hacker News."
-    }
+    prompt: "Find the top 3 posts on Hacker News."
 });
 ```
 

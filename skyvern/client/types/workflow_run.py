@@ -21,6 +21,7 @@ class WorkflowRun(UniversalBaseModel):
     debug_session_id: typing.Optional[str] = None
     status: WorkflowRunStatus
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     proxy_location: typing.Optional[WorkflowRunProxyLocation] = None
     webhook_callback_url: typing.Optional[str] = None
     webhook_failure_reason: typing.Optional[str] = None
@@ -31,6 +32,7 @@ class WorkflowRun(UniversalBaseModel):
     parent_workflow_run_id: typing.Optional[str] = None
     workflow_title: typing.Optional[str] = None
     max_screenshot_scrolls: typing.Optional[int] = None
+    max_elapsed_time_minutes: typing.Optional[int] = None
     browser_address: typing.Optional[str] = None
     run_with: typing.Optional[str] = None
     script_run: typing.Optional[ScriptRunResponse] = None
@@ -41,6 +43,10 @@ class WorkflowRun(UniversalBaseModel):
     code_gen: typing.Optional[bool] = None
     trigger_type: typing.Optional[WorkflowRunTriggerType] = None
     workflow_schedule_id: typing.Optional[str] = None
+    ignore_inherited_workflow_system_prompt: typing.Optional[bool] = None
+    copilot_session_id: typing.Optional[str] = None
+    credits_used: typing.Optional[int] = None
+    cached_credits_used: typing.Optional[int] = None
     queued_at: typing.Optional[dt.datetime] = None
     started_at: typing.Optional[dt.datetime] = None
     finished_at: typing.Optional[dt.datetime] = None

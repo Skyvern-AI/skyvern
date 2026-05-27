@@ -10,6 +10,10 @@ export interface FileInfo {
     checksum?: string;
     /** Original filename */
     filename?: string;
+    /** Size of the file in bytes */
+    file_size?: number;
     /** Modified time of the file */
     modified_at?: string;
+    /** Artifact row id for refresh-on-read */
+    artifact_id?: string;
 }

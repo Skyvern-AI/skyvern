@@ -15,6 +15,8 @@ class WorkflowDefinition(UniversalBaseModel):
     parameters: typing.List[WorkflowDefinitionParametersItem]
     blocks: typing.List[WorkflowDefinitionBlocksItem]
     finally_block_label: typing.Optional[str] = None
+    error_code_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    workflow_system_prompt: typing.Optional[str] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -28,5 +30,6 @@ class WorkflowDefinition(UniversalBaseModel):
 
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
 from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
+from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
 
 update_forward_refs(WorkflowDefinition)

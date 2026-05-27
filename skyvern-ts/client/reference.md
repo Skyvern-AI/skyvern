@@ -132,6 +132,126 @@ await client.artifacts.getArtifactContent("artifact_id");
 </dl>
 </details>
 
+## Server
+<details><summary><code>client.server.<a href="/src/api/resources/server/client/Client.ts">getVersion</a>() -> Record&lt;string, string&gt;</code></summary>
+<dl>
+<dd>
+
+#### 📝 Description
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+Returns the current Skyvern server version (git SHA for official builds).
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### 🔌 Usage
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+```typescript
+await client.server.getVersion();
+
+```
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### ⚙️ Parameters
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+**requestOptions:** `Server.RequestOptions` 
+    
+</dd>
+</dl>
+</dd>
+</dl>
+
+
+</dd>
+</dl>
+</details>
+
+## Workflows
+<details><summary><code>client.workflows.<a href="/src/api/resources/workflows/client/Client.ts">resetWorkflowBrowserProfile</a>(workflowPermanentId) -> void</code></summary>
+<dl>
+<dd>
+
+#### 📝 Description
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### 🔌 Usage
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+```typescript
+await client.workflows.resetWorkflowBrowserProfile("wpid_123");
+
+```
+</dd>
+</dl>
+</dd>
+</dl>
+
+#### ⚙️ Parameters
+
+<dl>
+<dd>
+
+<dl>
+<dd>
+
+**workflowPermanentId:** `string` — The permanent ID of the workflow. Starts with `wpid_`.
+    
+</dd>
+</dl>
+
+<dl>
+<dd>
+
+**requestOptions:** `Workflows.RequestOptions` 
+    
+</dd>
+</dl>
+</dd>
+</dl>
+
+
+</dd>
+</dl>
+</details>
+
 ## Scripts
 <details><summary><code>client.scripts.<a href="/src/api/resources/scripts/client/Client.ts">runScript</a>(scriptId) -> unknown</code></summary>
 <dl>
