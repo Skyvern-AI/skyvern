@@ -2,7 +2,7 @@
 
 Public API: :func:`v3_review_in_flight`. Invoked from the cohort-aware hook
 inside :class:`SkyvernPage`-family AI methods (``ai_click``, ``ai_input_text``)
-when the cached selector path fails AND PostHog routes the wpid to v3.
+when the cached selector path fails and the experimentation provider routes the wpid to v3.
 
 Lifecycle:
 

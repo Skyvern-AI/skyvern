@@ -9,8 +9,8 @@ Lifecycle:
 2. Run the agent loop with all post-run skills.
 3. Process per-episode terminals into ``mark_episode_reviewed`` /
    ``update_fallback_episode`` calls as appropriate.
-4. Update the cap counter via ``_check_and_increment_cap_v3`` (or v2's helper
-   — for now the post-run trigger reuses v2's bucketing semantics).
+4. Report whether a persist skill already consumed the v3 cap slot; the
+   workflow-service trigger handles the post-run no-persist increment.
 5. Return a :class:`V3PostRunResult`.
 """
 

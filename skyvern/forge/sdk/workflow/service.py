@@ -128,6 +128,15 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
+from skyvern.services.script_review_cap import (
+    check_and_increment_cap_v3,
+    increment_script_review_counter_v2,
+    is_script_review_cap_exceeded_v2,
+    is_script_review_cap_exceeded_v3,
+    try_increment_script_review_counter_v3,
+    v2_script_review_cap_key,
+    v3_script_review_cap_key,
+)
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
 from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
@@ -351,69 +360,6 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
                     queue.append(item)
 
     return workflow_dict
-
-
-def v3_script_review_cap_key(workflow_permanent_id: str) -> str:
-    """Build the Redis key for the v3 daily script-review counter.
-
-    Module-level (not instance) so the mint-audit trigger in
-    ``workflow_script_service.py:_log_mint_audit_findings`` can read the
-    cap without holding a ``WorkflowService`` instance.
-    """
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    return f"script_review_counter:v3:{workflow_permanent_id}:{today}"
-
-
-async def peek_script_review_cap_v3(
-    workflow_permanent_id: str,
-    organization_id: str | None = None,
-    *,
-    fail_closed: bool = False,
-) -> bool:
-    """Read-only check of the v3 daily cap. Returns True if cap exceeded.
-
-    Pass ``fail_closed=True`` (used by the mint-audit trigger) to treat
-    cache unavailability as "cap exceeded" so a Redis outage doesn't
-    cause LLM-cost runaway. The default ``fail_closed=False`` matches
-    the legacy post-run helper's behavior — cache errors fall through
-    and let the review proceed.
-    """
-    try:
-        cache = CacheFactory.get_cache()
-        if cache is None:
-            return fail_closed
-        cap_key = v3_script_review_cap_key(workflow_permanent_id)
-        raw_count = await cache.get(cap_key)
-        if raw_count is None:
-            return False
-        # Fetch cap (same PostHog lookup the instance method uses).
-        default_cap: int = settings.SCRIPT_REVIEW_DAILY_CAP
-        cap = default_cap
-        if organization_id and app.EXPERIMENTATION_PROVIDER:
-            try:
-                payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
-                    "script_review_daily_cap",
-                    organization_id,
-                    properties={"organization_id": organization_id},
-                )
-                if payload is not None:
-                    custom_cap = int(payload)
-                    if custom_cap > 0:
-                        cap = custom_cap
-            except Exception:
-                LOG.debug(
-                    "Failed to fetch script_review_daily_cap from PostHog, using default",
-                    organization_id=organization_id,
-                    exc_info=True,
-                )
-        return int(raw_count) >= cap
-    except Exception:
-        LOG.debug(
-            "Failed to check v3 script review cap",
-            workflow_permanent_id=workflow_permanent_id,
-            exc_info=True,
-        )
-        return fail_closed
 
 
 class WorkflowService:
@@ -6578,6 +6524,7 @@ class WorkflowService:
                     if not v3_persist_cap_consumed:
                         await self._increment_script_review_counter_v3(
                             workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
                         )
                 else:
                     await self._increment_script_review_counter(
@@ -6593,63 +6540,16 @@ class WorkflowService:
     @staticmethod
     def _script_review_cap_key(workflow_permanent_id: str) -> str:
         """Build the Redis key for the daily script-review counter (v2 cohort)."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
+        return v2_script_review_cap_key(workflow_permanent_id)
 
     @staticmethod
     def _v3_script_review_cap_key(workflow_permanent_id: str) -> str:
         """Build the Redis key for the daily script-review counter (v3 cohort).
 
         Separate from the v2 key so cohort comparisons stay clean and v3
-        traffic doesn't contaminate v2's counter. Thin wrapper around the module-level
-        ``v3_script_review_cap_key`` so non-WorkflowService callers (e.g.
-        the mint-audit trigger in workflow_script_service.py) can reach
-        the same key construction without holding an instance reference.
+        traffic doesn't contaminate v2's counter.
         """
         return v3_script_review_cap_key(workflow_permanent_id)
-
-    async def _get_script_review_cap(self, organization_id: str | None) -> int:
-        """Return the effective daily script-review cap for an organization.
-
-        Checks PostHog for a per-org override via the ``script_review_daily_cap``
-        feature flag payload.  Falls back to ``settings.SCRIPT_REVIEW_DAILY_CAP``
-        (default 5) when PostHog is unavailable, the flag is unset, or the
-        payload is not a valid integer.
-        """
-        default_cap: int = settings.SCRIPT_REVIEW_DAILY_CAP
-        if not organization_id or not app.EXPERIMENTATION_PROVIDER:
-            return default_cap
-
-        try:
-            # Use organization_id as distinct_id (not a run-level ID) because this
-            # is an org-level feature flag — same cap for all runs in this org.
-            payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
-                "script_review_daily_cap",
-                organization_id,
-                properties={"organization_id": organization_id},
-            )
-            if payload is not None:
-                custom_cap = int(payload)
-                if custom_cap > 0:
-                    LOG.info(
-                        "Using custom script review daily cap from PostHog",
-                        cap=custom_cap,
-                        organization_id=organization_id,
-                    )
-                    return custom_cap
-        except (ValueError, TypeError):
-            LOG.warning(
-                "Invalid script_review_daily_cap payload, using default",
-                organization_id=organization_id,
-                exc_info=True,
-            )
-        except Exception:
-            LOG.debug(
-                "Failed to fetch script_review_daily_cap from PostHog, using default",
-                organization_id=organization_id,
-                exc_info=True,
-            )
-        return default_cap
 
     async def _check_script_review_cap(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
         """Check if the daily script-review cap has been reached for this wpid (v2 cohort).
@@ -6657,32 +6557,17 @@ class WorkflowService:
         Returns True if the cap is exceeded and the review should be skipped.
         Uses Redis get/set to maintain a per-wpid daily counter.
         """
-        return await self._check_review_cap_for_key(
-            cap_key=self._script_review_cap_key(workflow_permanent_id),
+        return await is_script_review_cap_exceeded_v2(
+            workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
 
     async def _check_script_review_cap_v3(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
         """v3 cohort mirror of ``_check_script_review_cap`` reading the v3 key."""
-        return await self._check_review_cap_for_key(
-            cap_key=self._v3_script_review_cap_key(workflow_permanent_id),
+        return await is_script_review_cap_exceeded_v3(
+            workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
-
-    async def _check_review_cap_for_key(self, cap_key: str, organization_id: str | None) -> bool:
-        try:
-            cache = CacheFactory.get_cache()
-            if cache is None:
-                return False
-            raw_count = await cache.get(cap_key)
-            if raw_count is not None:
-                count = int(raw_count)
-                cap = await self._get_script_review_cap(organization_id)
-                if count >= cap:
-                    return True
-        except Exception:
-            LOG.debug("Failed to check script review cap, allowing review", cap_key=cap_key, exc_info=True)
-        return False
 
     async def _increment_script_review_counter(self, workflow_permanent_id: str) -> None:
         """Increment the daily script-review counter for this wpid (v2 cohort).
@@ -6694,25 +6579,18 @@ class WorkflowService:
         Acceptable because the cap is a spam guard, not a hard limit, and the
         repo restricts Redis to get/set/lock only.
         """
-        await self._increment_review_counter_for_key(self._script_review_cap_key(workflow_permanent_id))
+        await increment_script_review_counter_v2(workflow_permanent_id)
 
-    async def _increment_script_review_counter_v3(self, workflow_permanent_id: str) -> None:
+    async def _increment_script_review_counter_v3(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str | None = None,
+    ) -> None:
         """v3 cohort mirror of ``_increment_script_review_counter`` writing v3 key.
 
         Called from ``_trigger_script_reviewer`` after a successful v3 review_ran.
         """
-        await self._increment_review_counter_for_key(self._v3_script_review_cap_key(workflow_permanent_id))
-
-    async def _increment_review_counter_for_key(self, cap_key: str) -> None:
-        try:
-            cache = CacheFactory.get_cache()
-            if cache is None:
-                return
-            raw_count = await cache.get(cap_key)
-            new_count = (int(raw_count) + 1) if raw_count is not None else 1
-            await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
-        except Exception:
-            LOG.debug("Failed to increment script review counter", cap_key=cap_key, exc_info=True)
+        await try_increment_script_review_counter_v3(workflow_permanent_id, organization_id=organization_id)
 
     async def _check_and_increment_cap_v3(
         self,
@@ -6739,26 +6617,10 @@ class WorkflowService:
         v2 helpers above are intentionally unchanged; fixing v2's latent race is
         out of scope for this PR.
         """
-        try:
-            cache = CacheFactory.get_cache()
-            if cache is None:
-                return None
-            cap = await self._get_script_review_cap(organization_id)
-            # v3-specific key — separate from v2's shared key so cohort comparisons stay clean.
-            cap_key = self._v3_script_review_cap_key(workflow_permanent_id)
-            lock_name = f"v3_cap:{workflow_permanent_id}"
-            lock = cache.get_lock(lock_name, blocking_timeout=2, timeout=5)
-            async with lock:
-                raw_count = await cache.get(cap_key)
-                current = int(raw_count) if raw_count is not None else 0
-                if current >= cap:
-                    return None
-                new_count = current + 1
-                await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
-                return new_count
-        except Exception:
-            LOG.warning("v3 cap check_and_increment failed — failing closed", exc_info=True)
-            return None
+        return await check_and_increment_cap_v3(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
 
     async def _run_reviewer_locked(
         self,

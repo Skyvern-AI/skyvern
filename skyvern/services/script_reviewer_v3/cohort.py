@@ -16,9 +16,9 @@ Both flags are read via ``app.EXPERIMENTATION_PROVIDER`` — skyvern/ never
 imports cloud/ (OSS boundary enforced by pre-commit hook).
 
 **Local-test escape hatch**: the env var ``SKYVERN_V3_REVIEWER_FORCE``
-short-circuits PostHog resolution. Values ``"v3"`` or ``"true"`` force v3,
-``"v2"`` or ``"false"`` force v2. Empty / unset falls through to PostHog.
-This is intended for local benchmark runs that don't have a PostHog
+short-circuits provider resolution. Values ``"v3"`` or ``"true"`` force v3,
+``"v2"`` or ``"false"`` force v2. Empty / unset falls through to the provider.
+This is intended for local benchmark runs that don't have an experimentation
 allowlist for the test wpid — production never sets the env var.
 
 **PR 2 scope note**: this module defines the resolution helpers. Call sites
@@ -70,7 +70,7 @@ async def is_v3_cohort(
 
     Emits a ``script_reviewer_version_resolved`` structured log at INFO so the
     cohort distribution is observable from day 0. Subsequent calls with the
-    same wpid use PostHog's built-in cache (via ``get_value_cached``).
+    same wpid use the provider's cache (via ``get_value_cached``).
     """
     forced = (os.environ.get("SKYVERN_V3_REVIEWER_FORCE") or "").strip().lower()
     if forced in {"v3", "true", "1", "yes"}:
@@ -185,7 +185,7 @@ async def resolve_v3_budget_payload(
     for key, default_value in defaults.items():
         if key in payload:
             value = payload[key]
-            # Permissive type coercion: PostHog payloads come back as JSON types.
+            # Permissive type coercion: provider payloads come back as JSON types.
             try:
                 if isinstance(default_value, int):
                     merged[key] = int(value)
@@ -207,7 +207,7 @@ async def build_run_budget(
     workflow_permanent_id: str | None,
     organization_id: str | None = None,
 ) -> RunBudget:
-    """Construct a :class:`RunBudget` from the resolved PostHog payload.
+    """Construct a :class:`RunBudget` from the resolved budget payload.
 
     Called when a v3-cohort workflow run starts — the result lives on
     :attr:`SkyvernContext.v3_run_budget` for the duration of the run.

@@ -9,7 +9,7 @@ Two skills:
 
 Both share the same wrapping concerns:
 
-1. Daily per-wpid cap (atomic via ``WorkflowService._check_and_increment_cap_v3``).
+1. Daily per-wpid cap (atomic via ``script_review_cap.check_and_increment_cap_v3``).
 2. Redis lock ``v3_persist:{script_id}`` so concurrent agents don't race on
    the same script.
 3. Pinned-script handling — the underlying helpers return ``None`` rather than
@@ -30,8 +30,13 @@ import structlog
 from skyvern.forge import app
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
+from skyvern.services.script_review_cap import check_and_increment_cap_v3
 from skyvern.services.script_reviewer_v3.skills.base import Skill, SkillError, SkillResult
 from skyvern.services.script_reviewer_v3.types import PostRunContext
+from skyvern.services.script_version_persist_bridge import (
+    create_script_version_from_full_code,
+    create_script_version_from_review,
+)
 
 LOG = structlog.get_logger()
 
@@ -128,22 +133,14 @@ async def _enforce_v3_cap(
     workflow_permanent_id: str,
     organization_id: str | None = None,
 ) -> tuple[bool, int | None]:
-    """Atomic cap check + increment for v3 persist. Uses the helper defined in
-    workflow/service.py:_check_and_increment_cap_v3 to keep the cap semantics
-    identical between mid-run and post-run paths.
+    """Atomic cap check + increment for v3 persist.
 
-    ``organization_id`` is forwarded so org-specific cap overrides via PostHog
-    payload are honored. Without it, every org gets the global default cap.
+    ``organization_id`` is forwarded so org-specific cap overrides via the
+    experimentation provider are honored. Without it, every org gets the global default cap.
     Returns ``(acquired, new_counter)``.
     """
     try:
-        # ``WorkflowService`` is imported lazily because it imports
-        # ``workflow_script_service``, which (in the wiring layer) imports
-        # back into v3. The circular dep is broken at call time.
-        from skyvern.forge.sdk.workflow.service import WorkflowService
-
-        svc = WorkflowService()
-        counter = await svc._check_and_increment_cap_v3(
+        counter = await check_and_increment_cap_v3(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
         )
@@ -238,8 +235,6 @@ async def _handler_persist_block_edit(args: dict[str, Any], context: Any) -> Ski
 
 
 async def _do_persist_block(persist_ctx: dict[str, Any], block_label: str, code: str) -> Any:
-    from skyvern.services.workflow_script_service import create_script_version_from_review
-
     return await create_script_version_from_review(
         organization_id=persist_ctx["organization_id"],
         workflow_permanent_id=persist_ctx["workflow_permanent_id"],
@@ -324,8 +319,6 @@ async def _handler_persist_script_rewrite(args: dict[str, Any], context: Any) ->
 
 
 async def _do_persist_script(persist_ctx: dict[str, Any], full_main_py: str) -> Any:
-    from skyvern.services.workflow_script_service import create_script_version_from_full_code
-
     return await create_script_version_from_full_code(
         organization_id=persist_ctx["organization_id"],
         workflow_permanent_id=persist_ctx["workflow_permanent_id"],
