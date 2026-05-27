@@ -19,7 +19,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 _COLUMN_NAME = "max_elapsed_time_minutes"
-_LOCK_TIMEOUT = "250ms"
+_LOCK_TIMEOUT = "5s"
 
 
 def upgrade() -> None:
