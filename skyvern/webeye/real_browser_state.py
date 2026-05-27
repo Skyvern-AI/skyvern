@@ -402,7 +402,7 @@ class RealBrowserState(BrowserState):
             must_included_tags=must_included_tags,
         )
 
-    async def close(self, close_browser_on_completion: bool = True) -> None:
+    async def close(self, close_browser_on_completion: bool = True, skip_cleanup: bool = False) -> None:
         LOG.info("Closing browser state")
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
@@ -413,12 +413,13 @@ class RealBrowserState(BrowserState):
                     except Exception:
                         LOG.warning("Failed to close browser context", exc_info=True)
                     LOG.info("Main browser context and all its pages are closed")
-                    if self.browser_cleanup is not None:
-                        try:
-                            await self.browser_cleanup()
-                            LOG.info("Main browser cleanup is executed")
-                        except Exception:
-                            LOG.warning("Failed to execute browser cleanup", exc_info=True)
+
+                if self.browser_cleanup is not None and not skip_cleanup:
+                    try:
+                        await self.browser_cleanup()
+                        LOG.info("Main browser cleanup is executed")
+                    except Exception:
+                        LOG.warning("Failed to execute browser cleanup", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close browser context, going to stop playwright directly")
 
