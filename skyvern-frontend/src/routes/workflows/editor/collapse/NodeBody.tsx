@@ -33,10 +33,11 @@ export function NodeBody({ children, className, style }: Props) {
   const recompositeRef = useRef<HTMLDivElement>(null);
 
   const onAnimationEnd = (event: AnimationEvent<HTMLDivElement>) => {
-    if (
-      event.animationName !== "collapsible-down" ||
-      event.target !== event.currentTarget
-    ) {
+    const isOwnCollapse =
+      event.animationName === "collapsible-down" &&
+      event.target === event.currentTarget;
+    const isNestedAccordion = event.animationName === "accordion-down";
+    if (!isOwnCollapse && !isNestedAccordion) {
       return;
     }
 
