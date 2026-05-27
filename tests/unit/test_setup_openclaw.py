@@ -273,7 +273,7 @@ def test_setup_openclaw_does_not_warn_for_plain_json_urls(
                             "url": "https://api.skyvern.com/mcp/",
                             "transport": "streamable-http",
                             "headers": {"x-api-key": "old-key"},
-                            "description": "Marc's plain JSON config",
+                            "description": "Sam's plain JSON config",
                         }
                     }
                 }
@@ -324,7 +324,7 @@ def test_looks_like_json5_source_detects_single_quoted_strings() -> None:
 
 
 def test_looks_like_json5_source_ignores_apostrophes_in_standard_json_strings() -> None:
-    raw = json.dumps({"description": "Marc's plain JSON config"})
+    raw = json.dumps({"description": "Sam's plain JSON config"})
     assert _looks_like_json5_source(raw) is False
 
 
