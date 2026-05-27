@@ -17,7 +17,7 @@ function IgnoreWorkflowSystemPrompt({
         <Label className="truncate text-xs font-normal text-slate-300">
           Ignore System Prompt
         </Label>
-        <HelpTooltip content="When checked, this block ignores the workflow-level system prompt. Only relevant when the workflow has a workflow system prompt set." />
+        <HelpTooltip content="When checked, this block ignores the agent-level system prompt. Only relevant when the agent has an agent system prompt set." />
       </div>
       <div className="w-52 shrink-0">
         <Switch

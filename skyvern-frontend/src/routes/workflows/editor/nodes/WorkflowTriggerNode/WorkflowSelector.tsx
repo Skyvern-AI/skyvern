@@ -138,7 +138,7 @@ function WorkflowSelector({
             <span className="text-slate-300">{value}</span>
           ) : (
             <span className="text-muted-foreground">
-              Select a workflow to trigger...
+              Select an agent to trigger...
             </span>
           )}
         </div>
@@ -189,7 +189,7 @@ function WorkflowSelector({
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search workflows..."
+              placeholder="Search agents..."
               className="w-full bg-transparent text-xs text-slate-300 placeholder:text-muted-foreground focus-visible:outline-none"
             />
           </div>
@@ -219,7 +219,7 @@ function WorkflowSelector({
               </>
             ) : workflows.length === 0 ? (
               <div className="px-3 py-3 text-xs text-slate-500">
-                No workflows found.
+                No agents found.
               </div>
             ) : (
               <>

@@ -349,7 +349,7 @@ function WorkflowPostRunParameters() {
       ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
-          <h1 className="text-lg font-bold">Workflow Input Parameters</h1>
+          <h1 className="text-lg font-bold">Agent Input Parameters</h1>
           {getOrderedRunParameters(
             workflow?.workflow_definition.parameters,
             parameters,
@@ -377,9 +377,9 @@ function WorkflowPostRunParameters() {
             );
           })}
           {Object.keys(parameters).length === 0 ? (
-            <div>No input parameters found for this workflow</div>
+            <div>No input parameters found for this agent</div>
           ) : null}
-          <h1 className="text-lg font-bold">Other Workflow Parameters</h1>
+          <h1 className="text-lg font-bold">Other Agent Parameters</h1>
           <div className="flex gap-16">
             <div className="w-80">
               <h1 className="text-lg">Webhook Callback URL</h1>

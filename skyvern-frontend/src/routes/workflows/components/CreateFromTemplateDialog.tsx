@@ -51,7 +51,7 @@ function CreateFromTemplateDialog({
         <DialogHeader>
           <DialogTitle>Create from Template</DialogTitle>
           <DialogDescription>
-            Select a template to create a new workflow with pre-filled blocks.
+            Select a template to create a new agent with pre-filled blocks.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -81,7 +81,7 @@ function CreateFromTemplateDialog({
                       No templates yet
                     </p>
                     <p className="text-sm text-slate-400">
-                      Save a workflow as a template to see it here.
+                      Save an agent as a template to see it here.
                     </p>
                   </>
                 ) : (

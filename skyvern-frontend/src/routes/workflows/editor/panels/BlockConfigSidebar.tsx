@@ -139,7 +139,7 @@ function BlockConfigSidebarBody({
   const isStart = node ? isStartNode(node) : false;
   const blockType = node ? getBlockTypeFromNode(node) : null;
   const label = isStart
-    ? "Workflow Settings"
+    ? "Agent Settings"
     : typeof node?.data?.label === "string" && node.data.label.length > 0
       ? node.data.label
       : blockType

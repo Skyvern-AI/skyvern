@@ -92,6 +92,26 @@ describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
     expect(root).toMatch(/--warning-foreground:\s*[^;]+;/);
   });
 
+  it("defines --tertiary under :root", () => {
+    expect(root).toMatch(/--tertiary:\s*[^;]+;/);
+  });
+
+  it("defines --tertiary-foreground under :root", () => {
+    expect(root).toMatch(/--tertiary-foreground:\s*[^;]+;/);
+  });
+
+  it("defines --cta under :root", () => {
+    expect(root).toMatch(/--cta:\s*[^;]+;/);
+  });
+
+  it("defines --cta-hover under :root", () => {
+    expect(root).toMatch(/--cta-hover:\s*[^;]+;/);
+  });
+
+  it("defines --cta-foreground under :root", () => {
+    expect(root).toMatch(/--cta-foreground:\s*[^;]+;/);
+  });
+
   it("defines --success under .dark", () => {
     expect(dark).toMatch(/--success:\s*[^;]+;/);
   });
@@ -99,22 +119,61 @@ describe.each(CSS_FILES)("%s defines DS token vars", (file) => {
   it("defines --warning under .dark", () => {
     expect(dark).toMatch(/--warning:\s*[^;]+;/);
   });
+
+  it("defines --tertiary under .dark", () => {
+    expect(dark).toMatch(/--tertiary:\s*[^;]+;/);
+  });
+
+  it("defines --tertiary-foreground under .dark", () => {
+    expect(dark).toMatch(/--tertiary-foreground:\s*[^;]+;/);
+  });
+
+  it("defines --cta under .dark", () => {
+    expect(dark).toMatch(/--cta:\s*[^;]+;/);
+  });
+
+  it("defines --cta-hover under .dark", () => {
+    expect(dark).toMatch(/--cta-hover:\s*[^;]+;/);
+  });
+
+  it("defines --cta-foreground under .dark", () => {
+    expect(dark).toMatch(/--cta-foreground:\s*[^;]+;/);
+  });
 });
 
-describe("--ring is consistent across cloud/eval/src", () => {
-  function ringValue(css: string, selector: string): string {
+describe("shared semantic tokens are consistent across cloud/eval/src", () => {
+  function tokenValue(css: string, selector: string, token: string): string {
     const block = blockBetween(css, selector);
-    const m = block.match(/--ring:\s*([^;]+);/);
+    const m = block.match(new RegExp(`${token}:\\s*([^;]+);`));
     return (m?.[1] ?? "").trim();
   }
 
-  it("light-mode --ring is the same value in all 3 entrypoints", () => {
-    const values = CSS_FILES.map((f) => ringValue(load(f), ":root"));
+  function expectConsistentToken(token: string, selector: string) {
+    const values = CSS_FILES.map((f) => tokenValue(load(f), selector, token));
     expect(new Set(values).size).toBe(1);
+  }
+
+  it("light-mode --ring is the same value in all 3 entrypoints", () => {
+    expectConsistentToken("--ring", ":root");
   });
 
   it("dark-mode --ring is the same value in all 3 entrypoints", () => {
-    const values = CSS_FILES.map((f) => ringValue(load(f), ".dark"));
-    expect(new Set(values).size).toBe(1);
+    expectConsistentToken("--ring", ".dark");
+  });
+
+  it("light-mode --cta is the same value in all 3 entrypoints", () => {
+    expectConsistentToken("--cta", ":root");
+  });
+
+  it("light-mode --cta-hover is the same value in all 3 entrypoints", () => {
+    expectConsistentToken("--cta-hover", ":root");
+  });
+
+  it("dark-mode --cta is the same value in all 3 entrypoints", () => {
+    expectConsistentToken("--cta", ".dark");
+  });
+
+  it("dark-mode --cta-hover is the same value in all 3 entrypoints", () => {
+    expectConsistentToken("--cta-hover", ".dark");
   });
 });

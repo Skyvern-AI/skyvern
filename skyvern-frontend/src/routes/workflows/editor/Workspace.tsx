@@ -172,7 +172,9 @@ function bash(text: string, alternateText?: string) {
   return (
     <div className="flex items-center justify-start gap-1">
       <CopyText className="min-w-[2.25rem]" text={alternateText ?? text} />
-      <code className="text-xs text-[lightblue]">{text}</code>
+      <code className="text-xs text-neutral-600 dark:text-neutral-300">
+        {text}
+      </code>
     </div>
   );
 }
@@ -1746,7 +1748,6 @@ function Workspace({
                   })}
                 >
                   <FlowRenderer
-                    hideBackground={true}
                     showZoomControls={false}
                     nodes={nodes}
                     edges={edges}
@@ -1777,7 +1778,7 @@ function Workspace({
               </div>
             </div>
 
-            <div className="skyvern-split-right relative flex h-full items-end justify-center bg-[#020617] p-4 pl-6">
+            <div className="skyvern-split-right relative flex h-full items-end justify-center bg-neutral-50 p-4 pl-6 dark:bg-background">
               {/* node library sub panel */}
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
@@ -1790,8 +1791,8 @@ function Workspace({
                         data-testid="browser-rate-limit-message"
                         className="flex w-full flex-1 items-center justify-center"
                       >
-                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-slate-700 bg-slate-900 p-8 text-center">
-                          <p className="text-sm text-slate-300">
+                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-neutral-200 bg-white p-8 text-center dark:border-neutral-800 dark:bg-neutral-950">
+                          <p className="text-sm text-neutral-600 dark:text-neutral-300">
                             Failed to load a browser. We have a high demand for
                             browsers right now. The browser will become
                             available again automatically in ~30 minutes. If the
@@ -1828,13 +1829,13 @@ function Workspace({
                         ) : null}
                       </div>
                     )}
-                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-neutral-700 dark:text-neutral-300">
                       <WorkflowCopilotButton
                         ref={copilotButtonRef}
                         messageCount={copilotMessageCount}
                         onClick={() => setIsCopilotOpen((prev) => !prev)}
                       />
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
                         <GlobeIcon /> Live Browser
                         <StreamModeBadge mode="vnc" />
                       </div>
@@ -1882,13 +1883,13 @@ function Workspace({
                           />
                         ) : null}
                       </div>
-                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-neutral-700 dark:text-neutral-300">
                         <WorkflowCopilotButton
                           ref={copilotButtonRef}
                           messageCount={copilotMessageCount}
                           onClick={() => setIsCopilotOpen((prev) => !prev)}
                         />
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
                           <GlobeIcon /> Live Browser
                           <StreamModeBadge mode="cdp" />
                         </div>
@@ -1949,7 +1950,7 @@ function Workspace({
                 >
                   <div
                     className={cn(
-                      "group relative h-full w-[25rem] translate-x-[-20.5rem] bg-[#020617] transition-all",
+                      "group relative h-full w-[25rem] translate-x-[-20.5rem] bg-neutral-50 transition-all dark:bg-background",
                       {
                         "translate-x-[0rem]": timelineMode === "narrow",
                         group: timelineMode === "narrow",
@@ -1972,7 +1973,7 @@ function Workspace({
                     >
                       <div
                         className={cn(
-                          "pointer-events-none relative flex h-full w-full flex-col items-start overflow-hidden bg-[#020617]",
+                          "pointer-events-none relative flex h-full w-full flex-col items-start overflow-hidden bg-neutral-50 dark:bg-background",
                           { "pointer-events-auto": timelineMode === "wide" },
                         )}
                       >
@@ -2028,7 +2029,7 @@ function Workspace({
       )}
 
       <WorkflowCopilotChat
-        isOpen={isCopilotOpen}
+        isOpen={showBrowser && isCopilotOpen}
         onClose={() => setIsCopilotOpen(false)}
         onMessageCountChange={setCopilotMessageCount}
         buttonRef={copilotButtonRef}
@@ -2151,14 +2152,14 @@ function Workspace({
                   applyWorkflowUpdate(pendingWorkflow);
                 } catch (error) {
                   console.error(
-                    "Failed to apply copilot workflow",
+                    "Failed to apply copilot agent",
                     error,
                     pendingWorkflow,
                   );
                   toast({
                     title: "Update failed",
                     description:
-                      "Failed to apply workflow update. Please try again.",
+                      "Failed to apply agent update. Please try again.",
                     variant: "destructive",
                   });
                 }
@@ -2196,11 +2197,11 @@ function Workspace({
               },
             });
           } catch (error) {
-            console.error("Failed to prepare workflow comparison", error);
+            console.error("Failed to prepare agent comparison", error);
             toast({
               title: "Comparison failed",
               description:
-                "Failed to prepare workflow for comparison. Please try again.",
+                "Failed to prepare agent for comparison. Please try again.",
               variant: "destructive",
             });
           }
@@ -2210,13 +2211,13 @@ function Workspace({
             applyWorkflowUpdate(workflowData, options);
           } catch (error) {
             console.error(
-              "Failed to parse and apply workflow",
+              "Failed to parse and apply agent",
               error,
               workflowData,
             );
             toast({
               title: "Update failed",
-              description: "Failed to apply workflow update. Please try again.",
+              description: "Failed to apply agent update. Please try again.",
               variant: "destructive",
             });
           }

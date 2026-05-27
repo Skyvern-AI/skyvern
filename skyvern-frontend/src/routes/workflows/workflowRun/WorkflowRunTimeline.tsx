@@ -81,16 +81,16 @@ function WorkflowRunTimeline({
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   return (
-    <div className="min-w-0 space-y-4 overflow-hidden rounded bg-slate-elevation1 p-4">
+    <div className="min-w-0 space-y-4 overflow-hidden rounded bg-slate-elevation1 p-4 text-neutral-900 dark:text-foreground">
       <div className="grid grid-cols-3 gap-2">
-        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
+        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground">
           Actions: {numberOfActions}
         </div>
-        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
+        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground">
           Steps: {workflowRun.total_steps ?? 0}
         </div>
         <div
-          className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs"
+          className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground"
           title="Credits consumed by this run (live + cached)"
         >
           Credits:{" "}
@@ -107,7 +107,7 @@ function WorkflowRunTimeline({
               <div
                 key="stream"
                 className={cn(
-                  "flex cursor-pointer items-center gap-2 rounded-lg bg-gradient-to-r from-red-500/10 to-slate-elevation3 px-3 py-2 text-sm transition-colors duration-150 hover:from-red-500/20",
+                  "flex cursor-pointer items-center gap-2 rounded-lg bg-gradient-to-r from-red-500/10 to-slate-elevation3 px-3 py-2 text-sm text-neutral-800 transition-colors duration-150 hover:from-red-500/20 dark:text-foreground",
                   {
                     "bg-slate-elevation5 from-red-500/20":
                       activeItem === "stream",
@@ -120,12 +120,12 @@ function WorkflowRunTimeline({
               </div>
             )}
             {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-slate-400">
+              <div className="flex items-center justify-center py-8 text-sm text-neutral-500 dark:text-slate-400">
                 Formulating actions...
               </div>
             )}
             {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
-              <div>Workflow timeline is empty</div>
+              <div>Agent timeline is empty</div>
             )}
             {workflowRunTimeline?.map((timelineItem) => {
               const itemId = isBlockItem(timelineItem)

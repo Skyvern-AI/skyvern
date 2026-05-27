@@ -1,7 +1,10 @@
-import { cn } from "@/util/utils";
-import { Outlet, useMatch, useSearchParams } from "react-router-dom";
+import { useMatch, useSearchParams } from "react-router-dom";
 
-function WorkflowsPageLayout() {
+type Options = {
+  hideBrowserSessions?: boolean;
+};
+
+function useSidebarHidden({ hideBrowserSessions = false }: Options = {}) {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
   const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
@@ -13,22 +16,21 @@ function WorkflowsPageLayout() {
   const workflowBlockDebugMatch = useMatch(
     "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
   );
-  const match =
+  const browserSessionMatch = useMatch("/browser-session/:browserSessionId");
+  const nestedBrowserSessionMatch = useMatch(
+    "/browser-session/:browserSessionId/*",
+  );
+
+  return Boolean(
     workflowEditMatch ||
     workflowBuildMatch ||
     workflowBlockBuildMatch ||
     workflowDebugMatch ||
     workflowBlockDebugMatch ||
-    embed === "true";
-  return (
-    <main
-      className={cn({
-        "container mx-auto": !match,
-      })}
-    >
-      <Outlet />
-    </main>
+    (hideBrowserSessions &&
+      (browserSessionMatch || nestedBrowserSessionMatch)) ||
+    embed === "true",
   );
 }
 
-export { WorkflowsPageLayout };
+export { useSidebarHidden };

@@ -230,7 +230,7 @@ function WorkflowPage() {
                 </TableRow>
               ) : workflowRuns?.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5}>No workflow runs found</TableCell>
+                  <TableCell colSpan={5}>No agent runs found</TableCell>
                 </TableRow>
               ) : (
                 workflowRuns?.map((workflowRun) => {

@@ -192,14 +192,14 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
         <DialogHeader>
           <DialogTitle>Create Schedule</DialogTitle>
           <DialogDescription>
-            Choose a workflow and configure when it should run automatically.
+            Choose an agent and configure when it should run automatically.
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-6 py-4">
-          {/* Workflow Picker */}
+          {/* Agent Picker */}
           <div className="space-y-2">
-            <Label>Workflow</Label>
+            <Label>Agent</Label>
             {selectedWorkflow ? (
               <div className="flex items-center justify-between rounded-md border border-slate-700 bg-slate-elevation3 px-3 py-2">
                 <span className="text-sm">{selectedWorkflow.title}</span>
@@ -218,7 +218,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
                   value={workflowSearch}
                   onChange={(e) => setWorkflowSearch(e.target.value)}
                   onFocus={() => setWorkflowPickerOpen(true)}
-                  placeholder="Search workflows..."
+                  placeholder="Search agents..."
                 />
                 {workflowPickerOpen && (
                   <div className="max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-elevation3">
@@ -237,7 +237,7 @@ function CreateOrgScheduleDialog({ open, onOpenChange }: Readonly<Props>) {
                     ))}
                     {workflows.length === 0 && (
                       <div className="px-3 py-2 text-sm text-slate-500">
-                        No workflows found
+                        No agents found
                       </div>
                     )}
                   </div>

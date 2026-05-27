@@ -85,7 +85,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   if (isError) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-neutral-600 dark:text-slate-300">
         <div className="mb-3">Failed to load browser profiles.</div>
         <Button
           variant="secondary"
@@ -104,17 +104,17 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   if (pageItems.length === 0 && page === 1) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-slate-300">
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-neutral-600 dark:text-slate-300">
         {hasSearch ? (
           <>No browser profiles match &ldquo;{searchKey}&rdquo;.</>
         ) : (
           <div className="flex flex-col items-center gap-3 text-center">
-            <BrowserIcon className="size-10 text-slate-400" />
+            <BrowserIcon className="size-10 text-neutral-600 dark:text-slate-400" />
             <div className="space-y-1">
               <p className="text-base font-medium text-slate-100">
                 No browser profiles yet
               </p>
-              <p className="mx-auto max-w-md text-sm text-slate-400">
+              <p className="mx-auto max-w-md text-sm text-neutral-600 dark:text-slate-400">
                 Start a session, then click Save Profile on the session page to
                 capture it here.
               </p>
@@ -131,19 +131,19 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
         <Table className="w-full table-fixed">
           <TableHeader className="rounded-t-lg bg-slate-elevation2">
             <TableRow>
-              <TableHead className="w-1/4 truncate rounded-tl-lg text-slate-400">
+              <TableHead className="w-1/4 truncate rounded-tl-lg text-neutral-600 dark:text-slate-400">
                 Name
               </TableHead>
-              <TableHead className="w-1/3 truncate text-slate-400">
+              <TableHead className="w-1/3 truncate text-neutral-600 dark:text-slate-400">
                 Description
               </TableHead>
-              <TableHead className="w-1/6 truncate text-slate-400">
+              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
                 Source Browser
               </TableHead>
-              <TableHead className="w-1/6 truncate text-slate-400">
+              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
                 Created
               </TableHead>
-              <TableHead className="w-32 truncate rounded-tr-lg text-right text-slate-400">
+              <TableHead className="w-32 truncate rounded-tr-lg text-right text-neutral-600 dark:text-slate-400">
                 Actions
               </TableHead>
             </TableRow>
@@ -159,7 +159,9 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+            <span className="text-neutral-600 dark:text-slate-400">
+              Items per page
+            </span>
             <select
               className="h-9 rounded-md border border-slate-300 bg-background px-3"
               value={itemsPerPage}

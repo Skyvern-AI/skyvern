@@ -1015,7 +1015,7 @@ function CredentialsModal({
                 >
                   Save browser session for future logins
                 </Label>
-                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future workflow runs will skip the login form entirely because the saved session is already authenticated." />
+                <HelpTooltip content="Skyvern will log in using your credentials, verify success, and save the browser session. Future agent runs will skip the login form entirely because the saved session is already authenticated." />
               </div>
 
               {testAndSave && (
@@ -1063,7 +1063,7 @@ function CredentialsModal({
                 <div className="flex items-center gap-2 pl-7 text-sm text-green-400">
                   <CheckCircledIcon className="size-4" />
                   <span>
-                    {`Login test passed — saved browser session available for workflows using ${getHostname(testUrl) ?? testUrl}`}
+                    {`Login test passed — saved browser session available for agents using ${getHostname(testUrl) ?? testUrl}`}
                   </span>
                 </div>
               )}

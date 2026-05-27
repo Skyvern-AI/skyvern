@@ -544,7 +544,7 @@ function BrowserStream({
       return;
     }
 
-    const name = task ? "task" : workflow ? "workflow" : null;
+    const name = task ? "task" : workflow ? "agent" : null;
 
     if (!name) {
       return;
@@ -945,7 +945,7 @@ function BrowserStream({
           </div>
         )}
         {!isReady && (
-          <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-slate-800 text-sm text-slate-400">
+          <div className="absolute left-0 top-1/2 flex aspect-video max-h-full w-full -translate-y-1/2 flex-col items-center justify-center gap-2 rounded-md border border-neutral-200 bg-white text-sm text-neutral-600 dark:border-slate-800 dark:bg-transparent dark:text-slate-400">
             <StreamStatusPanel diagnostic={streamDiagnostic}>
               {isBrowserSessionBackendReady && (
                 <>

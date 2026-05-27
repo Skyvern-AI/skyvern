@@ -1,6 +1,6 @@
 import { create } from "zustand";
 
-const DEFAULT_WORKFLOW_TITLE = "New Workflow" as const;
+const DEFAULT_WORKFLOW_TITLE = "New Agent" as const;
 
 type WorkflowTitleStore = {
   title: string;

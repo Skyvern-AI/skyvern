@@ -48,18 +48,18 @@ function BrowserProfileItem({ profile }: Props) {
       <TableCell className="truncate">
         <span title={profile.name}>{profile.name}</span>
       </TableCell>
-      <TableCell className="truncate text-slate-400">
+      <TableCell className="truncate text-neutral-600 dark:text-slate-400">
         {profile.description ? (
           <span title={profile.description}>{profile.description}</span>
         ) : (
           <span className="opacity-50">—</span>
         )}
       </TableCell>
-      <TableCell className="truncate text-slate-400">
+      <TableCell className="truncate text-neutral-600 dark:text-slate-400">
         {profile.source_browser_type ?? <span className="opacity-50">—</span>}
       </TableCell>
       <TableCell
-        className="text-slate-400"
+        className="text-neutral-600 dark:text-slate-400"
         title={basicTimeFormat(profile.created_at)}
       >
         {basicLocalTimeFormat(profile.created_at)}

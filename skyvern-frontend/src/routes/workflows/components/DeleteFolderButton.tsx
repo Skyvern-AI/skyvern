@@ -82,7 +82,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
           <div className="flex items-center space-x-2">
             <RadioGroupItem value="folder_only" id="folder_only" />
             <Label htmlFor="folder_only" className="font-normal">
-              Delete folder only (workflows will be unassigned)
+              Delete folder only (agents will be unassigned)
             </Label>
           </div>
           <div className="flex items-center space-x-2">
@@ -91,7 +91,7 @@ function DeleteFolderButton({ folderId, folderTitle }: Props) {
               id="folder_and_workflows"
             />
             <Label htmlFor="folder_and_workflows" className="font-normal">
-              Delete folder and all workflows inside it
+              Delete folder and all agents inside it
             </Label>
           </div>
         </RadioGroup>

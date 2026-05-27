@@ -47,7 +47,7 @@ function DeleteWorkflowButton({ id }: Props) {
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete workflow",
+        title: "Failed to delete agent",
         description: error.message,
       });
     },
@@ -64,13 +64,13 @@ function DeleteWorkflowButton({ id }: Props) {
               </Button>
             </DialogTrigger>
           </TooltipTrigger>
-          <TooltipContent>Delete Workflow</TooltipContent>
+          <TooltipContent>Delete Agent</TooltipContent>
         </Tooltip>
       </TooltipProvider>
       <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
-          <DialogDescription>This workflow will be deleted.</DialogDescription>
+          <DialogDescription>This agent will be deleted.</DialogDescription>
         </DialogHeader>
         <DialogFooter>
           <DialogClose asChild>

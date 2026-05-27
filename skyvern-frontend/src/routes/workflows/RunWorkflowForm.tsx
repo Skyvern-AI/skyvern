@@ -378,8 +378,8 @@ function RunWorkflowForm({
     onSuccess: (response) => {
       toast({
         variant: "success",
-        title: "Workflow run started",
-        description: "The workflow run has been started successfully",
+        title: "Agent run started",
+        description: "The agent run has been started successfully",
       });
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
@@ -397,7 +397,7 @@ function RunWorkflowForm({
       const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         variant: "destructive",
-        title: "Failed to start workflow run",
+        title: "Failed to start agent run",
         description: detail ?? error.message,
       });
     },
@@ -558,7 +558,7 @@ function RunWorkflowForm({
   };
 
   if (!workflowPermanentId || !workflow) {
-    return <div>Invalid workflow</div>;
+    return <div>Invalid agent</div>;
   }
 
   return (
@@ -574,7 +574,7 @@ function RunWorkflowForm({
             </h1>
             <h2 className="text-lg text-slate-400">
               Fill the placeholder values that you have linked throughout your
-              workflow.
+              agent.
             </h2>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -618,7 +618,7 @@ function RunWorkflowForm({
               {!runWorkflowMutation.isPending && (
                 <PlayIcon className="mr-2 h-4 w-4" />
               )}
-              Run workflow
+              Run agent
             </Button>
           </div>
         </header>
@@ -626,7 +626,7 @@ function RunWorkflowForm({
         {hasLoginBlockValidationError && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
-            <AlertTitle>Cannot run workflow</AlertTitle>
+            <AlertTitle>Cannot run agent</AlertTitle>
             <AlertDescription>
               <p>
                 The following login block(s) need a credential selected before
@@ -790,7 +790,7 @@ function RunWorkflowForm({
             );
           })}
           {workflowParameters.length === 0 && (
-            <div>This workflow doesn't have any input parameters</div>
+            <div>This agent doesn't have any input parameters</div>
           )}
         </div>
 
@@ -828,7 +828,7 @@ function RunWorkflowForm({
                         </div>
                         <h2 className="text-sm text-slate-400">
                           The URL of a webhook endpoint to send the details of
-                          the workflow result.
+                          the agent result.
                         </h2>
                       </div>
                     </FormLabel>
@@ -914,17 +914,16 @@ function RunWorkflowForm({
               const descriptions: Record<string, ReactNode> = {
                 agent: hasCode ? (
                   <span>
-                    Run this workflow with AI. (Even though it has generated
-                    code.)
+                    Run this agent with AI. (Even though it has generated code.)
                   </span>
                 ) : (
-                  <span>Run this workflow with AI.</span>
+                  <span>Run this agent with AI.</span>
                 ),
                 code: hasCode ? (
-                  <span>Run this workflow with generated code.</span>
+                  <span>Run this agent with generated code.</span>
                 ) : (
                   <span>
-                    Run this workflow with generated code (after it is first
+                    Run this agent with generated code (after it is first
                     generated).
                   </span>
                 ),
@@ -1096,7 +1095,7 @@ function RunWorkflowForm({
                                 </div>
                                 <h2 className="text-sm text-slate-400">
                                   The address of the Browser server to use for
-                                  the workflow run.
+                                  the agent run.
                                 </h2>
                               </div>
                             </FormLabel>
