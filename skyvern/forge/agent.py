@@ -67,6 +67,7 @@ from skyvern.exceptions import (
     UnsupportedTaskType,
     get_user_facing_exception_message,
 )
+from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import classify_from_failure_reason
@@ -1681,6 +1682,11 @@ class ForgeAgent:
                 element_id_to_action_index[action.element_id] = action_idx
 
             element_id_to_last_action: dict[str, int] = dict()
+            try:
+                wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+                base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
+            except Exception:
+                base_delay = 0.5
             for action_idx, action_node in enumerate(action_linked_list):
                 await await_background_artifact_task()
 
@@ -1789,7 +1795,7 @@ class ForgeAgent:
                 )
 
                 # Determine wait time between actions
-                wait_time = random.uniform(0.5, 1.0)
+                wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
 
                 # For multi-field TOTP sequences, use zero delay between all digits for fast execution
                 if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
