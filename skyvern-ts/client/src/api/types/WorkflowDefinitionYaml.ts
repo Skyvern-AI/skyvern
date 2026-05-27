@@ -7,4 +7,6 @@ export interface WorkflowDefinitionYaml {
     parameters: Skyvern.WorkflowDefinitionYamlParametersItem[];
     blocks: Skyvern.WorkflowDefinitionYamlBlocksItem[];
     finally_block_label?: string;
+    error_code_mapping?: Record<string, string | undefined>;
+    workflow_system_prompt?: string;
 }

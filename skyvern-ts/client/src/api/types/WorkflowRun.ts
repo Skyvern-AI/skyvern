@@ -12,6 +12,7 @@ export interface WorkflowRun {
     debug_session_id?: string;
     status: Skyvern.WorkflowRunStatus;
     extra_http_headers?: Record<string, string | undefined>;
+    cdp_connect_headers?: Record<string, string | undefined>;
     proxy_location?: WorkflowRun.ProxyLocation;
     webhook_callback_url?: string;
     webhook_failure_reason?: string;
@@ -22,6 +23,7 @@ export interface WorkflowRun {
     parent_workflow_run_id?: string;
     workflow_title?: string;
     max_screenshot_scrolls?: number;
+    max_elapsed_time_minutes?: number;
     browser_address?: string;
     run_with?: string;
     script_run?: Skyvern.ScriptRunResponse;
@@ -32,6 +34,10 @@ export interface WorkflowRun {
     code_gen?: boolean;
     trigger_type?: Skyvern.WorkflowRunTriggerType;
     workflow_schedule_id?: string;
+    ignore_inherited_workflow_system_prompt?: boolean;
+    copilot_session_id?: string;
+    credits_used?: number;
+    cached_credits_used?: number;
     queued_at?: string;
     started_at?: string;
     finished_at?: string;

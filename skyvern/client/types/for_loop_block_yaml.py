@@ -22,6 +22,7 @@ class ForLoopBlockYaml(UniversalBaseModel):
 
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
     loop_over_parameter_key: typing.Optional[str] = None
@@ -39,6 +40,7 @@ class ForLoopBlockYaml(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
 from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
 
 update_forward_refs(ForLoopBlockYaml)

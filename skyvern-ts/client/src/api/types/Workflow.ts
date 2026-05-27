@@ -17,10 +17,13 @@ export interface Workflow {
     totp_verification_url?: string;
     totp_identifier?: string;
     persist_browser_session?: boolean;
+    browser_profile_id?: string;
     model?: Record<string, unknown>;
     status?: Skyvern.WorkflowStatus;
     max_screenshot_scrolls?: number;
+    max_elapsed_time_minutes?: number;
     extra_http_headers?: Record<string, string | undefined>;
+    cdp_connect_headers?: Record<string, string | undefined>;
     run_with?: string;
     ai_fallback?: boolean;
     cache_key?: string;
@@ -31,6 +34,8 @@ export interface Workflow {
     sequential_key?: string;
     folder_id?: string;
     import_error?: string;
+    created_by?: string;
+    edited_by?: string;
     created_at: string;
     modified_at: string;
     deleted_at?: string;

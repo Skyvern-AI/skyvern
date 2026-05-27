@@ -14,6 +14,7 @@ from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
+from .google_sheets_write_block_yaml_write_mode import GoogleSheetsWriteBlockYamlWriteMode
 from .pdf_format import PdfFormat
 from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
@@ -25,6 +26,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Task(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -62,8 +64,9 @@ class WhileLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockYamlLoopBlocksItem"]
+    loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
     loop_over_parameter_key: typing.Optional[str] = None
     loop_variable_reference: typing.Optional[str] = None
     complete_if_empty: typing.Optional[bool] = None
@@ -79,7 +82,29 @@ class WhileLoopBlockYamlLoopBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+class WhileLoopBlockYamlLoopBlocksItem_WhileLoop(UniversalBaseModel):
+    block_type: typing.Literal["while_loop"] = "while_loop"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    loop_blocks: typing.List["WhileLoopBlockYamlLoopBlocksItem"]
+    condition: BranchCriteriaYaml
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
 from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
+from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
 
 
 class WhileLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
@@ -88,6 +113,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Code(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
@@ -108,6 +134,7 @@ class WhileLoopBlockYamlLoopBlocksItem_TextPrompt(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
@@ -130,6 +157,7 @@ class WhileLoopBlockYamlLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
@@ -149,6 +177,7 @@ class WhileLoopBlockYamlLoopBlocksItem_UploadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
@@ -168,6 +197,7 @@ class WhileLoopBlockYamlLoopBlocksItem_FileUpload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
@@ -196,6 +226,7 @@ class WhileLoopBlockYamlLoopBlocksItem_SendEmail(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     smtp_host_secret_parameter_key: str
     smtp_port_secret_parameter_key: str
@@ -223,6 +254,7 @@ class WhileLoopBlockYamlLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: typing.Optional[FileType] = None
@@ -244,6 +276,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Validation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -267,6 +300,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Action(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -297,6 +331,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Navigation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
@@ -332,6 +367,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Extraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     data_extraction_goal: str
     url: typing.Optional[str] = None
@@ -359,6 +395,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Login(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -391,6 +428,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Wait(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: typing.Optional[int] = None
 
@@ -410,6 +448,7 @@ class WhileLoopBlockYamlLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
@@ -436,6 +475,7 @@ class WhileLoopBlockYamlLoopBlocksItem_FileDownload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
@@ -467,6 +507,7 @@ class WhileLoopBlockYamlLoopBlocksItem_GotoUrl(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
@@ -486,6 +527,7 @@ class WhileLoopBlockYamlLoopBlocksItem_PdfParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -506,6 +548,7 @@ class WhileLoopBlockYamlLoopBlocksItem_TaskV2(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
@@ -531,6 +574,7 @@ class WhileLoopBlockYamlLoopBlocksItem_HttpRequest(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -559,6 +603,7 @@ class WhileLoopBlockYamlLoopBlocksItem_Conditional(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
 
@@ -578,6 +623,7 @@ class WhileLoopBlockYamlLoopBlocksItem_PrintPage(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     include_timestamp: typing.Optional[bool] = None
     custom_filename: typing.Optional[str] = None
@@ -602,6 +648,7 @@ class WhileLoopBlockYamlLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     workflow_permanent_id: str
     payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -620,15 +667,48 @@ class WhileLoopBlockYamlLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-class WhileLoopBlockYamlLoopBlocksItem_WhileLoop(UniversalBaseModel):
-    block_type: typing.Literal["while_loop"] = "while_loop"
+class WhileLoopBlockYamlLoopBlocksItem_GoogleSheetsRead(UniversalBaseModel):
+    block_type: typing.Literal["google_sheets_read"] = "google_sheets_read"
     label: str
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockYamlLoopBlocksItem"]
-    condition: BranchCriteriaYaml
+    spreadsheet_url: str
+    sheet_name: typing.Optional[str] = None
+    range: typing.Optional[str] = None
+    credential_id: typing.Optional[str] = None
+    has_header_row: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WhileLoopBlockYamlLoopBlocksItem_GoogleSheetsWrite(UniversalBaseModel):
+    block_type: typing.Literal["google_sheets_write"] = "google_sheets_write"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    spreadsheet_url: str
+    sheet_name: typing.Optional[str] = None
+    range: typing.Optional[str] = None
+    credential_id: typing.Optional[str] = None
+    write_mode: typing.Optional[GoogleSheetsWriteBlockYamlWriteMode] = None
+    values: typing.Optional[str] = None
+    column_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    create_sheet_if_missing: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -643,6 +723,7 @@ class WhileLoopBlockYamlLoopBlocksItem_WhileLoop(UniversalBaseModel):
 WhileLoopBlockYamlLoopBlocksItem = typing.Union[
     WhileLoopBlockYamlLoopBlocksItem_Task,
     WhileLoopBlockYamlLoopBlocksItem_ForLoop,
+    WhileLoopBlockYamlLoopBlocksItem_WhileLoop,
     WhileLoopBlockYamlLoopBlocksItem_Code,
     WhileLoopBlockYamlLoopBlocksItem_TextPrompt,
     WhileLoopBlockYamlLoopBlocksItem_DownloadToS3,
@@ -664,8 +745,11 @@ WhileLoopBlockYamlLoopBlocksItem = typing.Union[
     WhileLoopBlockYamlLoopBlocksItem_HttpRequest,
     WhileLoopBlockYamlLoopBlocksItem_Conditional,
     WhileLoopBlockYamlLoopBlocksItem_PrintPage,
-    WhileLoopBlockYamlLoopBlocksItem_WhileLoop,
     WhileLoopBlockYamlLoopBlocksItem_WorkflowTrigger,
+    WhileLoopBlockYamlLoopBlocksItem_GoogleSheetsRead,
+    WhileLoopBlockYamlLoopBlocksItem_GoogleSheetsWrite,
 ]
+from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
+
 update_forward_refs(WhileLoopBlockYamlLoopBlocksItem_ForLoop)
 update_forward_refs(WhileLoopBlockYamlLoopBlocksItem_WhileLoop)

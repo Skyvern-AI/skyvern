@@ -12,6 +12,8 @@ export type WhileLoopBlockLoopBlocksItem =
     | Skyvern.WhileLoopBlockLoopBlocksItem.FileUpload
     | Skyvern.WhileLoopBlockLoopBlocksItem.FileUrlParser
     | Skyvern.WhileLoopBlockLoopBlocksItem.ForLoop
+    | Skyvern.WhileLoopBlockLoopBlocksItem.GoogleSheetsRead
+    | Skyvern.WhileLoopBlockLoopBlocksItem.GoogleSheetsWrite
     | Skyvern.WhileLoopBlockLoopBlocksItem.GotoUrl
     | Skyvern.WhileLoopBlockLoopBlocksItem.HttpRequest
     | Skyvern.WhileLoopBlockLoopBlocksItem.HumanInteraction
@@ -64,6 +66,14 @@ export namespace WhileLoopBlockLoopBlocksItem {
 
     export interface ForLoop extends Skyvern.ForLoopBlock {
         block_type: "for_loop";
+    }
+
+    export interface GoogleSheetsRead extends Skyvern.GoogleSheetsReadBlock {
+        block_type: "google_sheets_read";
+    }
+
+    export interface GoogleSheetsWrite extends Skyvern.GoogleSheetsWriteBlock {
+        block_type: "google_sheets_write";
     }
 
     export interface GotoUrl extends Skyvern.UrlBlock {

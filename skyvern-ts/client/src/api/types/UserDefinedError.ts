@@ -4,4 +4,5 @@ export interface UserDefinedError {
     error_code: string;
     reasoning: string;
     confidence_float: number;
+    error_type?: "USER_DEFINED_ERROR";
 }
