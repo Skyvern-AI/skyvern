@@ -349,6 +349,7 @@ class SkyvernBrowserPageAgent:
         webhook_url: str | None = None,
         totp_url: str | None = None,
         totp_identifier: str | None = None,
+        max_elapsed_time_minutes: int | None = None,
         run_metadata: dict[str, str] | None = None,
         timeout: float = DEFAULT_AGENT_TIMEOUT,
     ) -> WorkflowRunResponse:
@@ -362,6 +363,7 @@ class SkyvernBrowserPageAgent:
             webhook_url: URL to receive webhook notifications about workflow progress.
             totp_url: URL to fetch TOTP codes from.
             totp_identifier: Identifier for TOTP authentication.
+            max_elapsed_time_minutes: Timeout this workflow run after the configured elapsed runtime in minutes.
             run_metadata: String key/value metadata to attach to this workflow run.
             timeout: Maximum time in seconds to wait for workflow completion.
 
@@ -379,6 +381,7 @@ class SkyvernBrowserPageAgent:
             webhook_url=webhook_url,
             totp_url=totp_url,
             totp_identifier=totp_identifier,
+            max_elapsed_time_minutes=max_elapsed_time_minutes,
             run_metadata=run_metadata,
             browser_session_id=self._browser.browser_session_id,
             browser_address=self._browser.browser_address,

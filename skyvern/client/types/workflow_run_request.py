@@ -91,6 +91,11 @@ class WorkflowRunRequest(UniversalBaseModel):
     The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
     """
 
+    max_elapsed_time_minutes: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+    """
+
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
     """
     The extra HTTP headers for the requests in browser.
