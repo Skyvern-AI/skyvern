@@ -74,7 +74,11 @@ export type WorkflowCopilotStreamMessageType =
   | "tool_result"
   | "condensing"
   | "narration"
-  | "block_progress";
+  | "block_progress"
+  | "turn_start"
+  | "design_start"
+  | "design_end"
+  | "workflow_draft";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -91,11 +95,46 @@ export interface WorkflowCopilotStreamResponseUpdate {
   proposal_disposition: ProposalDisposition;
   // Cancel forces explicit review.
   cancelled?: boolean;
+  // Optional so the FE tolerates an older backend that does not emit the
+  // turn-narrative envelope.
+  turn_id?: string | null;
+  narrative_summary?: string | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+  turn_id?: string | null;
+  narrative_summary?: string | null;
+}
+
+export interface WorkflowCopilotTurnStartUpdate {
+  type: "turn_start";
+  turn_id: string;
+  turn_index: number;
+  mode: string;
+  timestamp: string;
+}
+
+export interface WorkflowCopilotDesignStartUpdate {
+  type: "design_start";
+  timestamp: string;
+}
+
+export interface WorkflowCopilotDesignEndUpdate {
+  type: "design_end";
+  timestamp: string;
+}
+
+// Summary-only payload — the full workflow definition is delivered via the
+// terminal response's updated_workflow or via the chat's proposed_workflow
+// field, not here.
+export interface WorkflowCopilotWorkflowDraftUpdate {
+  type: "workflow_draft";
+  block_count: number;
+  block_labels: string[];
+  summary: string | null;
+  timestamp: string;
 }
 
 export interface WorkflowCopilotToolCallUpdate {
