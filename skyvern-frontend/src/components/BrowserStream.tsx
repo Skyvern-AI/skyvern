@@ -4,7 +4,7 @@
 import _RFB from "@novnc/novnc/lib/rfb.js";
 type RFB = _RFB;
 const RFB = (_RFB as typeof _RFB & { default?: typeof _RFB }).default ?? _RFB;
-import { ExitIcon, HandIcon, InfoCircledIcon } from "@radix-ui/react-icons";
+import { InfoCircledIcon } from "@radix-ui/react-icons";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -826,33 +826,40 @@ function BrowserStream({
         {isReady && isVisible && (
           <div className="overlay z-10 flex items-center justify-center overflow-hidden">
             {showControlButtons && (
-              <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center">
+              <div className="control-buttons pointer-events-none relative flex h-full w-full items-center justify-center bg-[radial-gradient(circle_at_center,rgba(15,23,42,0.22)_0%,rgba(15,23,42,0.12)_18%,transparent_42%)]">
                 <Button
+                  aria-label="Take control of this browser session"
                   onClick={() => {
                     setUserIsControlling(true);
                   }}
-                  className={cn("control-button pointer-events-auto border", {
-                    hide: userIsControlling,
-                  })}
-                  size="sm"
+                  className={cn(
+                    "control-button group pointer-events-auto h-10 rounded-full border border-white/15 bg-slate-950/90 px-5 text-sm font-semibold text-white shadow-xl shadow-slate-950/25 ring-1 ring-slate-950/10 backdrop-blur-sm transition duration-200 ease-out hover:-translate-y-0.5 hover:bg-slate-900 hover:shadow-2xl focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 motion-reduce:transition-none motion-reduce:hover:translate-y-0",
+                    {
+                      hide: userIsControlling,
+                    },
+                  )}
                 >
-                  <HandIcon className="mr-2 h-4 w-4" />
-                  take control
+                  Take the wheel
+                  <span
+                    aria-hidden="true"
+                    className="ml-2 transition-transform duration-200 group-hover:translate-x-0.5 motion-reduce:transition-none"
+                  >
+                    →
+                  </span>
                 </Button>
                 <Button
+                  aria-label="Stop controlling this browser session"
                   onClick={() => {
                     setUserIsControlling(false);
                   }}
                   className={cn(
-                    "control-button pointer-events-auto absolute bottom-0 border",
+                    "control-button pointer-events-auto absolute bottom-0 h-9 rounded-full border border-white/15 bg-slate-950/90 px-4 text-sm font-semibold text-white shadow-xl shadow-slate-950/25 ring-1 ring-slate-950/10 backdrop-blur-sm transition duration-200 ease-out hover:-translate-y-0.5 hover:bg-slate-900 focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 motion-reduce:transition-none motion-reduce:hover:translate-y-0",
                     {
                       hide: !userIsControlling,
                     },
                   )}
-                  size="sm"
                 >
-                  <ExitIcon className="mr-2 h-4 w-4" />
-                  stop controlling
+                  Release control
                 </Button>
               </div>
             )}

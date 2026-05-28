@@ -22,6 +22,7 @@ type StreamMessage = {
   format?: string;
   viewport_width?: number;
   viewport_height?: number;
+  url?: string;
 };
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
@@ -93,6 +94,7 @@ function WorkflowRunStream({
   const [streamFormat, setStreamFormat] = useState<string>("png");
   const [viewportWidth, setViewportWidth] = useState(1280);
   const [viewportHeight, setViewportHeight] = useState(720);
+  const [currentUrl, setCurrentUrl] = useState("");
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const showStream =
@@ -114,8 +116,10 @@ function WorkflowRunStream({
     userIsControlling,
     setUserIsControlling,
     inputReady,
+    browserCommandError,
     containerRef,
     handlers,
+    browserControls,
   } = useCdpInput({
     inputWsUrl,
     interactive,
@@ -128,6 +132,7 @@ function WorkflowRunStream({
       return;
     }
     setDiagnostic(STARTING_DIAGNOSTIC);
+    setCurrentUrl("");
     hasFrameRef.current = false;
     let cancelled = false;
 
@@ -166,6 +171,9 @@ function WorkflowRunStream({
           }
           if (message.viewport_height) {
             setViewportHeight(message.viewport_height);
+          }
+          if (message.url !== undefined) {
+            setCurrentUrl(message.url);
           }
           if (!message.screenshot && message.status) {
             setDiagnostic(diagnosticForStatus(message.status));
@@ -289,9 +297,12 @@ function WorkflowRunStream({
         userIsControlling={userIsControlling}
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
+        browserCommandError={interactive ? browserCommandError : null}
         containerRef={containerRef}
         showControlButtons={showControlButtons}
         handlers={handlers}
+        browserControls={interactive ? browserControls : undefined}
+        currentUrl={currentUrl}
       />
     );
   }
