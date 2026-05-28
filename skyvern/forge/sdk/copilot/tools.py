@@ -44,6 +44,11 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_discovering,
     advance_to_testing,
 )
+from skyvern.forge.sdk.copilot.composition_evidence import (
+    merge_visual_composition_evidence,
+    page_evidence_needs_visual_fallback,
+    parse_composition_html,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
@@ -895,6 +900,7 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
+_CURRENT_PAGE_INSPECTION_TARGETS = frozenset({"", "current", "current_page", "__current_page__"})
 
 
 def _copilot_seconds_remaining(ctx: AgentContext) -> float | None:
@@ -4628,20 +4634,16 @@ async def update_and_run_blocks_tool(
     the inline value via `parameters`; stop and follow the CREDENTIAL
     HANDLING refusal rule in the system prompt.
 
-    Treat `goto_url` as a bootstrap for stateful search/result pages. If URL query
-    params encode dynamic page state, include a `code`, `validation`, or
-    `navigation` block before extraction that verifies every requested
-    constraint is active simultaneously from live page state, and only refine
-    URL params when they are grounded in observed DOM/link/form state or
-    observed URL deltas.
-
-    After a `goto_url` entry page for a stateful search, do not add one
-    click-driven `navigation` block per stable field (query terms, dates,
-    search-form inputs). Use observed current URL / form action / field
-    names / result links / URL deltas to bootstrap stable search state with
-    `goto_url`, or add a short `code`/`validation` block to inspect the DOM.
-    Do not bypass this by combining a URL and stable search setup in a
-    `navigation` block; split pure loading into `goto_url` first.
+    Use browser inspection and run evidence to fill knowledge gaps while
+    building, editing, or debugging the workflow. Do not invent URL params,
+    form fields, result affordances, or page structure from memory; ground
+    workflow blocks in observed MCP evidence or information the user supplied.
+    If `goto_url` is used with URL params for dynamic page state, ground the
+    state in observed evidence and use `code`, `validation`, or `navigation`
+    only for durable checks/actions the reusable workflow actually needs.
+    When inspected evidence shows an anti-bot challenge gating a disabled
+    submit/search control, account for challenge resolution before submit;
+    do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
@@ -4798,6 +4800,8 @@ _DISCOVERY_STEP_CAP = 8
 _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
 _DISCOVERY_CANDIDATE_FORM_FIELDS_MAX = 10
 _DISCOVERY_HTML_BYTES_MAX = 200_000
+_COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
+_COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
 _DISCOVERY_URL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
 # host + optional path/query/fragment — handles `example.com/login`,
@@ -4990,11 +4994,42 @@ def _discovery_resolve_href(base_url: str, href: str) -> str | None:
     return absolute
 
 
+def _discovery_origin_url(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _discovery_should_retry_from_origin(entry_url: str, current_url: str) -> bool:
+    try:
+        parsed_entry = urlparse(entry_url)
+        parsed_current = urlparse(current_url)
+    except Exception:
+        return False
+    if parsed_current.scheme not in {"http", "https"} or not parsed_current.netloc:
+        return False
+    if parsed_entry.netloc and parsed_entry.netloc != parsed_current.netloc:
+        return False
+    return bool(parsed_current.path not in {"", "/"} or parsed_current.query)
+
+
+def _discovery_anchor_selector(anchor: dict[str, str]) -> str | None:
+    href = (anchor.get("href") or "").strip()
+    if not href or any(char in href for char in {'"', "\\", "\n", "\r"}):
+        return None
+    return f'a[href="{href}"]'
+
+
 # Per-call timeout for each MCP primitive inside the discovery walker. The
 # walker also checks the cumulative 60s wall clock between steps, but without
 # a per-call cap a single hung navigate or get_html could block past the
 # cumulative cap (cumulative is only checked between awaits).
 _DISCOVERY_PER_CALL_TIMEOUT_SECONDS = 20.0
+_DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE = 0.2
 
 
 async def _discovery_navigate(ctx: CopilotContext, url: str) -> dict[str, Any]:
@@ -5008,6 +5043,22 @@ async def _discovery_navigate(ctx: CopilotContext, url: str) -> dict[str, Any]:
         )
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"skyvern_navigate timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+
+
+async def _discovery_click_anchor(ctx: CopilotContext, anchor: dict[str, str]) -> dict[str, Any]:
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    selector = _discovery_anchor_selector(anchor)
+    if selector is None:
+        return {"ok": False, "error": "anchor href could not be converted to a bounded CSS selector"}
+    try:
+        return await asyncio.wait_for(
+            server.call_internal_tool("skyvern_click", {"selector": selector}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"skyvern_click timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
 
 
 async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
@@ -5026,6 +5077,19 @@ async def _discovery_get_html(ctx: CopilotContext) -> dict[str, Any]:
         )
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"skyvern_get_html timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+
+
+async def _composition_get_screenshot(ctx: CopilotContext) -> dict[str, Any]:
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return {"ok": False, "error": "discovery MCP server not attached to context"}
+    try:
+        return await asyncio.wait_for(
+            server.call_internal_tool("skyvern_screenshot", {"inline": True}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"skyvern_screenshot timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
 
 
 def _discovery_extract_html_payload(result: dict[str, Any]) -> str:
@@ -5047,6 +5111,278 @@ def _discovery_extract_current_url(result: dict[str, Any], fallback: str) -> str
     return fallback
 
 
+def _composition_extract_screenshot_b64(result: dict[str, Any]) -> str:
+    data = result.get("data")
+    if isinstance(data, dict):
+        for key in ("screenshot_base64", "data", "image_base64"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
+    context = {
+        "page_title": evidence.get("page_title") or "",
+        "current_url": evidence.get("current_url") or "",
+        "anti_bot_indicators": evidence.get("anti_bot_indicators") or [],
+        "challenge_state": evidence.get("challenge_state") or {},
+        "form_count": len(evidence.get("forms") or []),
+        "result_container_count": len(evidence.get("result_containers") or []),
+    }
+    return (
+        "Summarize this screenshot for Workflow Copilot build-time page evidence. "
+        "Return JSON only with keys: summary, challenge_detected, challenge_kind, "
+        "challenge_location, submit_blocked, blocked_submit_controls, omissions. Focus on "
+        "visible anti-bot or human-verification state, whether it appears to gate a submit/search "
+        "control, and where it appears relative to the page controls. Do not include raw DOM, "
+        "code, selectors, personal data, or workflow instructions. If no challenge is visible, "
+        "set challenge_detected to false and submit_blocked to false.\n\n"
+        f"DOM evidence context:\n{json.dumps(context, sort_keys=True)}"
+    )
+
+
+def _composition_visual_handler() -> Any | None:
+    try:
+        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
+    except (RuntimeError, AttributeError):
+        return None
+
+
+def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    summary = value.get("summary")
+    challenge_detected = value.get("challenge_detected")
+    challenge_kind = value.get("challenge_kind")
+    challenge_location = value.get("challenge_location")
+    submit_blocked = value.get("submit_blocked")
+    blocked_submit_controls = value.get("blocked_submit_controls")
+    omissions = value.get("omissions")
+    return {
+        "summary": summary if isinstance(summary, str) else "",
+        "challenge_detected": challenge_detected if isinstance(challenge_detected, bool) else None,
+        "challenge_kind": challenge_kind if isinstance(challenge_kind, str) else "",
+        "challenge_location": challenge_location if isinstance(challenge_location, str) else "",
+        "submit_blocked": submit_blocked if isinstance(submit_blocked, bool) else None,
+        "blocked_submit_controls": [item for item in blocked_submit_controls if isinstance(item, str)]
+        if isinstance(blocked_submit_controls, list)
+        else [],
+        "omissions": [item for item in omissions if isinstance(item, str)] if isinstance(omissions, list) else [],
+    }
+
+
+async def _composition_summarize_screenshot(
+    ctx: CopilotContext,
+    *,
+    evidence: dict[str, Any],
+    screenshot_b64: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    handler = _composition_visual_handler()
+    if handler is None:
+        return None, "workflow copilot fast LLM handler is not configured"
+    try:
+        screenshot_bytes = base64.b64decode(screenshot_b64, validate=True)
+    except Exception:
+        return None, "screenshot payload was not valid base64"
+    try:
+        response = await asyncio.wait_for(
+            handler(
+                prompt=_composition_visual_prompt(evidence),
+                prompt_name=_COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME,
+                screenshots=[screenshot_bytes],
+                organization_id=getattr(ctx, "organization_id", None),
+                force_dict=True,
+            ),
+            timeout=_COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return None, f"visual summary timed out after {_COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS:g}s"
+    except Exception as exc:
+        LOG.warning("Composition screenshot visual summary failed", error=str(exc), exc_info=True)
+        return None, str(exc)
+    normalized = _normalize_visual_summary(response)
+    if normalized is None:
+        return None, "visual summary response was not a JSON object"
+    return normalized, None
+
+
+async def _augment_composition_evidence_with_visual_fallback(
+    ctx: CopilotContext,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    screenshot_result = await _composition_get_screenshot(ctx)
+    if not screenshot_result.get("ok"):
+        return _composition_add_evidence_omission(
+            evidence,
+            f"screenshot_capture_failed: {screenshot_result.get('error', 'unknown')}",
+        )
+    screenshot_b64 = _composition_extract_screenshot_b64(screenshot_result)
+    visual_summary, visual_error = await _composition_summarize_screenshot(
+        ctx,
+        evidence=evidence,
+        screenshot_b64=screenshot_b64,
+    )
+    return merge_visual_composition_evidence(evidence, visual_summary=visual_summary, visual_error=visual_error)
+
+
+def _composition_add_evidence_omission(evidence: dict[str, Any], message: str) -> dict[str, Any]:
+    merged = dict(evidence)
+    omissions = [item for item in merged.get("visual_evidence_omissions") or [] if isinstance(item, str)]
+    if message:
+        omissions.append(message[:160])
+    merged["visual_evidence_omissions"] = list(dict.fromkeys(omissions))[:5]
+    return merged
+
+
+def _composition_add_inspection_warning(evidence: dict[str, Any], message: str) -> dict[str, Any]:
+    merged = dict(evidence)
+    warnings = [item for item in merged.get("inspection_warnings") or [] if isinstance(item, str)]
+    if message:
+        warnings.append(message[:240])
+    merged["inspection_warnings"] = list(dict.fromkeys(warnings))[:5]
+    return merged
+
+
+async def _composition_evidence_after_navigation_failure(
+    ctx: CopilotContext,
+    *,
+    inspected_url: str,
+    navigation_error: str,
+) -> dict[str, Any] | None:
+    current_url, _ = await _fallback_page_info(ctx)
+    current_url = current_url or inspected_url
+    html_result = await _discovery_get_html(ctx)
+    if html_result.get("ok"):
+        html = _discovery_extract_html_payload(html_result)
+        evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        evidence = _composition_add_inspection_warning(
+            evidence,
+            f"navigation_error_before_html_capture: {navigation_error}",
+        )
+        if page_evidence_needs_visual_fallback(evidence):
+            evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
+        return evidence
+
+    evidence = parse_composition_html("", inspected_url=inspected_url, current_url=current_url)
+    evidence = _composition_add_inspection_warning(
+        evidence,
+        f"navigation_error_before_evidence_capture: {navigation_error}",
+    )
+    evidence = _composition_add_inspection_warning(
+        evidence,
+        f"html_capture_failed_after_navigation_error: {html_result.get('error', 'unknown')}",
+    )
+    evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
+    return evidence if evidence.get("screenshot_used") else None
+
+
+async def _inspect_page_for_composition_impl(
+    copilot_ctx: Any,
+    target_url: str,
+) -> dict[str, Any]:
+    """Inspect a known target page and store form/search evidence on ctx.
+
+    This is composition context, not workflow YAML. It is intentionally separate
+    from `discover_workflow_entrypoint`: discovery answers "which page?";
+    inspection answers "what fields and controls are actually on this page?".
+    """
+    arguments = {"target_url": target_url}
+    authority_error = _authority_tool_error(copilot_ctx, "inspect_page_for_composition")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
+    entry_url: str
+    kind: str
+    if use_current_page:
+        current_url, _ = await _fallback_page_info(copilot_ctx)
+        entry_url = current_url or "current_page"
+        kind = "current_page"
+    else:
+        resolved_entry_url, kind = _resolve_discovery_entry_url(target_url)
+        if resolved_entry_url is None:
+            result = {
+                "ok": False,
+                "data": None,
+                "error": "inspect_page_for_composition requires a URL, domain with an explicit path, or target_url='current_page'.",
+            }
+            record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+            return result
+        entry_url = resolved_entry_url
+
+    with copilot_span(
+        "inspect_page_for_composition",
+        data={"target_url_kind": kind},
+    ):
+        if use_current_page:
+            current_url = entry_url
+            html_result = await _discovery_get_html(copilot_ctx)
+            if not html_result.get("ok"):
+                result = {
+                    "ok": False,
+                    "data": None,
+                    "error": f"inspect_page_for_composition could not read page HTML: {html_result.get('error', 'unknown')}",
+                }
+                record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+                return result
+
+            html = _discovery_extract_html_payload(html_result)
+            evidence = parse_composition_html(html, inspected_url=entry_url, current_url=current_url)
+            if page_evidence_needs_visual_fallback(evidence):
+                evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+        else:
+            nav_result = await _discovery_navigate(copilot_ctx, entry_url)
+            if not nav_result.get("ok"):
+                nav_error = str(nav_result.get("error") or "unknown")
+                failure_evidence = await _composition_evidence_after_navigation_failure(
+                    copilot_ctx,
+                    inspected_url=entry_url,
+                    navigation_error=nav_error,
+                )
+                if failure_evidence is None:
+                    result = {
+                        "ok": False,
+                        "data": None,
+                        "error": f"inspect_page_for_composition could not navigate: {nav_error}",
+                    }
+                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+                    return result
+                evidence = failure_evidence
+                current_url = str(evidence.get("current_url") or entry_url)
+            else:
+                current_url = _discovery_extract_current_url(nav_result, entry_url)
+                html_result = await _discovery_get_html(copilot_ctx)
+                if not html_result.get("ok"):
+                    result = {
+                        "ok": False,
+                        "data": None,
+                        "error": f"inspect_page_for_composition could not read page HTML: {html_result.get('error', 'unknown')}",
+                    }
+                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+                    return result
+
+                html = _discovery_extract_html_payload(html_result)
+                evidence = parse_composition_html(html, inspected_url=entry_url, current_url=current_url)
+                if page_evidence_needs_visual_fallback(evidence):
+                    evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+
+    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+    if isinstance(run_id, str) and run_id:
+        evidence = {
+            **evidence,
+            "workflow_run_id": run_id,
+            "observed_after_workflow_run": True,
+        }
+
+    copilot_ctx.composition_page_evidence = evidence
+    result = {"ok": True, "data": evidence}
+    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+    return result
+
+
 async def _discovery_walk(
     ctx: CopilotContext,
     *,
@@ -5063,6 +5399,8 @@ async def _discovery_walk(
     intent_tokens = set(_DISCOVERY_TOKEN_RE.findall(intent_hint.lower())) if intent_hint else set()
     evidence_trail: list[dict[str, Any]] = []
     current_url = entry_url
+    current_page_loaded = False
+    retried_deep_link_from_origin = False
     started = ctx.discovery_started_monotonic or time.monotonic()
 
     for step in range(_DISCOVERY_STEP_CAP):
@@ -5077,24 +5415,31 @@ async def _discovery_walk(
                 failure_reason="wall_clock_limit",
             )
 
-        nav_result = await _discovery_navigate(ctx, current_url)
-        if not nav_result.get("ok"):
-            evidence_trail.append(
-                {
-                    "url": current_url,
-                    "page_title": "",
-                    "transition_reason": f"navigate_failed: {nav_result.get('error', 'unknown')}"[:240],
-                }
-            )
-            return _discovery_build_result(
-                candidate_url=None,
-                candidate_form_fields=[],
-                evidence_trail=evidence_trail,
-                confidence=0.0,
-                failure_reason="no_candidate",
-            )
+        if current_page_loaded:
+            current_page_loaded = False
+        else:
+            nav_result = await _discovery_navigate(ctx, current_url)
+            if not nav_result.get("ok"):
+                evidence_trail.append(
+                    {
+                        "url": current_url,
+                        "page_title": "",
+                        "transition_reason": f"navigate_failed: {nav_result.get('error', 'unknown')}"[:240],
+                    }
+                )
+                # A pre-composition browser/session failure is not evidence that
+                # the user omitted a page URL. Return the resolved entry URL so the
+                # agent can test a minimal goto_url block and gather real run/debug
+                # evidence before deciding whether to ask a follow-up.
+                return _discovery_build_result(
+                    candidate_url=current_url,
+                    candidate_form_fields=[],
+                    evidence_trail=evidence_trail,
+                    confidence=_DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE,
+                    failure_reason=None,
+                )
 
-        current_url = _discovery_extract_current_url(nav_result, current_url)
+            current_url = _discovery_extract_current_url(nav_result, current_url)
         html_result = await _discovery_get_html(ctx)
         html = _discovery_extract_html_payload(html_result) if html_result.get("ok") else ""
         page_title, anchors, form_fields = _discovery_parse_html(html)
@@ -5108,6 +5453,17 @@ async def _discovery_walk(
         )
 
         if _discovery_detect_anti_bot(html, page_title):
+            origin_url = _discovery_origin_url(current_url)
+            if (
+                not retried_deep_link_from_origin
+                and origin_url
+                and origin_url != current_url
+                and _discovery_should_retry_from_origin(entry_url, current_url)
+            ):
+                evidence_trail[-1]["transition_reason"] = "direct_deep_link_anti_bot"
+                current_url = origin_url
+                retried_deep_link_from_origin = True
+                continue
             return _discovery_build_result(
                 candidate_url=None,
                 candidate_form_fields=[],
@@ -5157,6 +5513,7 @@ async def _discovery_walk(
 
         best_score = 0
         best_href: str | None = None
+        best_anchor: dict[str, str] | None = None
         for anchor in anchors:
             score = _discovery_anchor_score(
                 anchor.get("text", ""),
@@ -5170,6 +5527,7 @@ async def _discovery_walk(
                     continue
                 best_score = score
                 best_href = resolved
+                best_anchor = anchor
 
         if best_score == 0 or best_href is None:
             return _discovery_build_result(
@@ -5178,6 +5536,22 @@ async def _discovery_walk(
                 evidence_trail=evidence_trail,
                 confidence=0.0,
                 failure_reason="no_candidate",
+            )
+
+        if retried_deep_link_from_origin and best_anchor is not None:
+            click_result = await _discovery_click_anchor(ctx, best_anchor)
+            if click_result.get("ok"):
+                current_url = _discovery_extract_current_url(click_result, best_href)
+                # The next loop should inspect the clicked page instead of
+                # navigating back to the original entry URL.
+                current_page_loaded = True
+                continue
+            evidence_trail.append(
+                {
+                    "url": best_href,
+                    "page_title": "",
+                    "transition_reason": f"anchor_click_failed: {click_result.get('error', 'unknown')}"[:240],
+                }
             )
 
         current_url = best_href
@@ -5326,6 +5700,34 @@ async def discover_workflow_entrypoint_tool(
     buttons, run JavaScript, or submit forms.
     """
     result = await _discover_workflow_entrypoint_impl(ctx.context, site_or_url, intent_hint)
+    return json.dumps(result)
+
+
+@function_tool(name_override="inspect_page_for_composition", strict_mode=False)
+async def inspect_page_for_composition_tool(
+    ctx: RunContextWrapper,
+    target_url: str,
+) -> str:
+    """Inspect a known page before composing form/search workflow blocks.
+
+    Use this after the entrypoint URL is known and before authoring blocks that
+    fill fields, submit searches, filter results, or expand result rows. Pass
+    target_url="current_page" after partial workflow runs to inspect the live
+    browser page without navigating away. It returns observed page evidence:
+    current URL, title, navigation targets, form fields with labels and selectors,
+    submit/search controls, result containers, anti-bot indicators, and bounded
+    visual challenge evidence when DOM evidence shows challenge state. Do NOT
+    paste the evidence into workflow YAML; use it to ground concise block prompts.
+    If a block run changes pages, inspect the reached page before authoring
+    downstream form/search/result blocks. If the evidence shows required fields
+    or controls that the user did not supply enough information for, ASK_QUESTION
+    with that observed missing input. If evidence is sufficient, compose and run
+    workflow blocks from the observed fields.
+    If challenge_state.gates_submit_controls is true, treat challenge resolution
+    as a prerequisite for submit/search; do not click a submit control while the
+    latest inspected evidence says it is disabled.
+    """
+    result = await _inspect_page_for_composition_impl(ctx.context, target_url)
     return json.dumps(result)
 
 
