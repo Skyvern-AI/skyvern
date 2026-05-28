@@ -1,5 +1,5 @@
 import { ActionsApiResponse, RunEngine, Status } from "@/api/types";
-import { WorkflowBlockType } from "./workflowTypes";
+import { WorkflowBlock, WorkflowBlockType } from "./workflowTypes";
 import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
 export const WorkflowRunTimelineItemTypes = {
@@ -144,6 +144,34 @@ export function countActionsInTimeline(
     }
     return total + count;
   }, 0);
+}
+
+export function countCompletedTopLevelBlocks(
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): number {
+  return timelineItems.reduce((total, item) => {
+    if (
+      isBlockItem(item) &&
+      (item.block.status === Status.Completed ||
+        item.block.status === Status.Skipped)
+    ) {
+      return total + 1;
+    }
+    return total;
+  }, 0);
+}
+
+export function findUnexecutedDefinedBlocks(
+  definedBlocks: Array<WorkflowBlock>,
+  timelineItems: Array<WorkflowRunTimelineItem>,
+): Array<WorkflowBlock> {
+  const executedLabels = new Set<string>();
+  for (const item of timelineItems) {
+    if (isBlockItem(item) && item.block.label !== null) {
+      executedLabels.add(item.block.label);
+    }
+  }
+  return definedBlocks.filter((block) => !executedLabels.has(block.label));
 }
 
 export function isWorkflowRunBlock(item: unknown): item is WorkflowRunBlock {
