@@ -288,6 +288,30 @@ class ArtifactManager:
         aio_task.add_done_callback(_discard)
 
     @staticmethod
+    def _mask_llm_prompt_artifact_data(data: bytes, artifact_type: ArtifactType) -> bytes:
+        if artifact_type != ArtifactType.LLM_PROMPT:
+            return data
+
+        try:
+            prompt = data.decode("utf-8")
+            context = skyvern_context.current()
+            if context and context.workflow_run_id:
+                workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(
+                    context.workflow_run_id
+                )
+                prompt = workflow_run_context.mask_secrets_in_data(prompt)
+
+            if context and context.sensitive_values:
+                for sensitive in sorted(context.sensitive_values, key=len, reverse=True):
+                    if sensitive:
+                        prompt = prompt.replace(sensitive, "*****")
+
+            return prompt.encode("utf-8")
+        except Exception:
+            LOG.warning("Failed to mask LLM prompt artifact; redacting prompt artifact")
+            return b"[LLM prompt artifact redacted: secret masking failed]"
+
+    @staticmethod
     def _build_artifact_model(
         artifact_id: str,
         artifact_type: ArtifactType,
@@ -1270,6 +1294,8 @@ class ArtifactManager:
         task_v2: TaskV2 | None = None,
         ai_suggestion: AISuggestion | None = None,
     ) -> BulkArtifactCreationRequest | None:
+        data = self._mask_llm_prompt_artifact_data(data, artifact_type)
+
         if step:
             return self._prepare_step_artifacts(
                 step=step,
@@ -1710,6 +1736,7 @@ class ArtifactManager:
         Returns the artifact_id (pre-generated or provided) so callers can link it
         in DB foreign keys (e.g. action.screenshot_artifact_id) before flush.
         """
+        data = self._mask_llm_prompt_artifact_data(data, artifact_type)
         acc.entries[filename] = _maybe_redact_artifact_data(artifact_type, data, workflow_run_id=acc.workflow_run_id)
         # Deduplicate by filename — update in place if it already exists
         for i, (_, fn, existing_id) in enumerate(acc.member_types):
