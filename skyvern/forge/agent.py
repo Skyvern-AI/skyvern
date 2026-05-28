@@ -118,7 +118,6 @@ from skyvern.utils.prompt_engine import (
     MaxStepsReasonResponse,
     enforce_prompt_ceiling_tracked,
     load_prompt_with_elements,
-    sanitize_prompt_input,
 )
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
 from skyvern.utils.token_counter import count_tokens
@@ -3444,23 +3443,17 @@ class ForgeAgent:
             element_tree_builder=scraped_page,
             prompt_engine=prompt_engine,
             template_name=template,
-            navigation_goal=sanitize_prompt_input(navigation_goal),
-            navigation_payload_str=sanitize_prompt_input(navigation_payload_str),
+            navigation_goal=navigation_goal,
+            navigation_payload_str=navigation_payload_str,
             starting_url=starting_url,
             current_url=current_url,
-            data_extraction_goal=sanitize_prompt_input(task.data_extraction_goal),
-            action_history=sanitize_prompt_input(actions_and_results_str),
-            error_code_mapping_str=sanitize_prompt_input(
-                json.dumps(task.error_code_mapping) if task.error_code_mapping else None
-            ),
+            data_extraction_goal=task.data_extraction_goal,
+            action_history=actions_and_results_str,
+            error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
             local_datetime=datetime.now(context.tz_info).isoformat(),
             verification_code_check=verification_code_check,
-            complete_criterion=sanitize_prompt_input(
-                task.complete_criterion.strip() if task.complete_criterion else None
-            ),
-            terminate_criterion=sanitize_prompt_input(
-                task.terminate_criterion.strip() if task.terminate_criterion else None
-            ),
+            complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
+            terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             parse_select_feature_enabled=context.enable_parse_select_in_extract,
             has_magic_link_page=context.has_magic_link_page(task.task_id),
         )

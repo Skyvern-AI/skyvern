@@ -12,22 +12,6 @@ from skyvern.webeye.scraper.scraped_page import ElementTreeBuilder
 LOG = structlog.get_logger()
 
 
-def sanitize_prompt_input(value: str | None, escape_quotes: bool = False) -> str | None:
-    """Sanitize untrusted strings before inserting them into LLM prompts.
-
-    Prevents indirect prompt injection by replacing delimiter sequences that
-    could break out of markdown code blocks or quoted strings in prompt
-    templates.
-    """
-    if not isinstance(value, str):
-        return value
-    # Break up triple-backticks so a malicious page cannot close a code block.
-    value = value.replace("```", "`` `")
-    if escape_quotes:
-        value = value.replace('"', "'")
-    return value
-
-
 class CheckPhoneNumberFormatResponse(BaseModel):
     page_info: str
     is_phone_number_input: bool
@@ -86,9 +70,7 @@ def load_prompt_with_elements_tracked(
     inputs for caching should use these values instead of the pre-drop kwargs
     so two requests that render to the same final prompt share a cache key.
     """
-    elements = sanitize_prompt_input(
-        element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
-    )
+    elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
     prompt = prompt_engine.load_prompt(
         template_name,
         elements=elements,
@@ -97,9 +79,7 @@ def load_prompt_with_elements_tracked(
     token_count = count_tokens(prompt)
     if token_count > DEFAULT_MAX_TOKENS and element_tree_builder.support_economy_elements_tree():
         # get rid of all the secondary elements like SVG, etc
-        elements = sanitize_prompt_input(
-            element_tree_builder.build_economy_elements_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
-        )
+        elements = element_tree_builder.build_economy_elements_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
         prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
         economy_token_count = count_tokens(prompt)
         LOG.warning(
@@ -112,11 +92,9 @@ def load_prompt_with_elements_tracked(
         if economy_token_count > DEFAULT_MAX_TOKENS:
             # !!! HACK alert
             # dump the last 1/3 of the html context and keep the first 2/3 of the html context
-            elements = sanitize_prompt_input(
-                element_tree_builder.build_economy_elements_tree(
-                    html_need_skyvern_attrs=html_need_skyvern_attrs,
-                    percent_to_keep=2 / 3,
-                )
+            elements = element_tree_builder.build_economy_elements_tree(
+                html_need_skyvern_attrs=html_need_skyvern_attrs,
+                percent_to_keep=2 / 3,
             )
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
             token_count_after_dump = count_tokens(prompt)
