@@ -1205,6 +1205,9 @@ class TaskRunModel(Base):
     memory_mb = Column(Integer, nullable=True)
     duration_ms = Column(BigInteger, nullable=True)
     compute_cost = Column(Numeric, nullable=True)
+    llm_cost = Column(Numeric, nullable=True)
+    proxy_cost = Column(Numeric, nullable=True)
+    captcha_cost = Column(Numeric, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
