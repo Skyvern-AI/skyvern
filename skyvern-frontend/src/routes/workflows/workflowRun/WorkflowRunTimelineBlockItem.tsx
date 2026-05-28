@@ -713,7 +713,7 @@ function WorkflowRunTimelineBlockItem({
       {/* Container body — always mounted so open/close transitions animate */}
       {isContainer && (
         <Collapsible open={expanded}>
-          <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
+          <CollapsibleContent className="motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade overflow-hidden">
             {hasActions && (
               <TimelineActionRows
                 block={block}
@@ -960,7 +960,7 @@ function LoopIterationRow({
         </div>
       </div>
       <Collapsible open={expanded}>
-        <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
+        <CollapsibleContent className="motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade overflow-hidden">
           <TimelineSubItems
             items={group.items}
             activeItem={activeItem}
