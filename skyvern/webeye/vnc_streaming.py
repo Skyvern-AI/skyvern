@@ -42,11 +42,7 @@ def browser_session_supports_vnc_streaming(
     browser_address: str | None = None,
     ip_address: str | None = None,
 ) -> bool:
-    return bool(
-        build_routed_vnc_url(browser_address)
-        or ip_address
-        or is_local_vnc_streaming_enabled()
-    )
+    return bool(build_routed_vnc_url(browser_address) or ip_address or is_local_vnc_streaming_enabled())
 
 
 def build_vnc_streaming_url(
