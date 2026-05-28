@@ -1,5 +1,5 @@
 import { ActionsApiResponse, RunEngine, Status } from "@/api/types";
-import { isTaskVariantBlock, WorkflowBlockType } from "./workflowTypes";
+import { WorkflowBlockType } from "./workflowTypes";
 import { ActionItem } from "../workflowRun/WorkflowRunOverview";
 
 export const WorkflowRunTimelineItemTypes = {
@@ -49,6 +49,9 @@ export type WorkflowRunBlock = {
   body?: string | null;
   prompt?: string | null;
   wait_sec?: number | null;
+  method?: string | null;
+  headers?: Record<string, string> | null;
+  request_body?: Record<string, unknown> | Array<unknown> | string | null;
   executed_branch_id?: string | null;
   executed_branch_expression?: string | null;
   executed_branch_result?: boolean | null;
@@ -124,16 +127,16 @@ export function isBlockItem(
   );
 }
 
-function isTaskVariantBlockItem(item: unknown) {
-  return isBlockItem(item) && isTaskVariantBlock(item.block);
-}
-
 export function countActionsInTimeline(
   timelineItems: Array<WorkflowRunTimelineItem>,
 ): number {
   return timelineItems.reduce((total, item) => {
     let count = 0;
-    if (isTaskVariantBlockItem(item)) {
+    if (isBlockItem(item)) {
+      // Workflow-run blocks can carry backend-generated actions outside the
+      // editor's task-variant taxonomy, e.g. conditional extraction actions.
+      // Count the API surface directly so the timeline header matches what
+      // users can expand and inspect in the run detail panel.
       count += item.block?.actions?.length ?? 0;
     }
     if (item.children.length > 0) {
