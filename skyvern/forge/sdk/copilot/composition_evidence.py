@@ -1,0 +1,690 @@
+"""Build-time page evidence contract for Workflow Copilot composition."""
+
+from __future__ import annotations
+
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import yaml
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection degrades gracefully.
+    BeautifulSoup = None  # type: ignore[assignment, misc]
+
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.utils.yaml_loader import safe_load_no_dates
+
+_BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
+_PAGE_SHAPING_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "login"})
+_RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
+_MAX_FORMS = 5
+_MAX_FIELDS_PER_FORM = 20
+_MAX_RESULT_CONTAINERS = 8
+_MAX_NAVIGATION_TARGETS = 20
+_MAX_SELECT_OPTIONS = 30
+_MAX_CHALLENGE_CONTROLS = 8
+DOM_EVIDENCE_SOURCE = "dom_html"
+SCREENSHOT_EVIDENCE_SOURCE = "screenshot"
+VISION_EVIDENCE_SOURCE = "vision_summary"
+_ANTI_BOT_PATTERNS = (
+    "just a moment",
+    "captcha",
+    "challenge",
+    "human-verification",
+    "human verification",
+    "verify you are human",
+    "access denied",
+    "are you a robot",
+)
+_MAX_VISUAL_SUMMARY_CHARS = 500
+_MAX_VISUAL_OMISSIONS = 5
+
+
+def _bounded_string(value: Any, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    # Bounded evidence text is for Copilot-readable summaries; selectors are
+    # built separately so whitespace-sensitive selector values are preserved.
+    return " ".join(value.split())[:max_chars]
+
+
+def _challenge_kind(indicators: list[str]) -> str:
+    indicator_text = " ".join(indicators).lower()
+    if "captcha" in indicator_text or "are you a robot" in indicator_text:
+        return "captcha"
+    if "access denied" in indicator_text:
+        return "access_denied"
+    if any(term in indicator_text for term in ("challenge", "human verification", "verify you are human")):
+        return "human_verification"
+    return "unknown" if indicators else "none"
+
+
+def _challenge_state(
+    indicators: list[str],
+    *,
+    source: str = DOM_EVIDENCE_SOURCE,
+    gated_submit_controls: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    detected = bool(indicators)
+    gated_controls = gated_submit_controls or []
+    return {
+        "detected": detected,
+        "kind": _challenge_kind(indicators),
+        "source": source if detected else "",
+        "indicators": indicators[:8],
+        "requires_human_verification": detected,
+        "visual_location": "",
+        "gates_submit_controls": bool(detected and gated_controls),
+        "gated_submit_controls": gated_controls[:5] if detected else [],
+    }
+
+
+def _control_disabled(node: Any) -> bool:
+    if not hasattr(node, "has_attr"):
+        return False
+    return bool(
+        node.has_attr("disabled")
+        or str(node.get("aria-disabled") or "").strip().lower() == "true"
+        or str(node.get("data-disabled") or "").strip().lower() == "true"
+    )
+
+
+def _gated_submit_controls(forms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        for control in form.get("submit_controls") or []:
+            if not isinstance(control, dict) or control.get("disabled") is not True:
+                continue
+            controls.append(
+                {
+                    "text": _bounded_string(control.get("text") or control.get("value"), 120),
+                    "id": _bounded_string(control.get("id"), 120),
+                    "name": _bounded_string(control.get("name"), 120),
+                    "selector": _bounded_string(control.get("selector"), 160),
+                    "disabled": True,
+                }
+            )
+    return controls[:5]
+
+
+def _evidence_metadata(
+    indicators: list[str] | None = None,
+    *,
+    forms: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    gated_controls = _gated_submit_controls(forms or [])
+    return {
+        "evidence_sources": [DOM_EVIDENCE_SOURCE],
+        "screenshot_used": False,
+        "visual_evidence_summary": "",
+        "visual_evidence_omissions": [],
+        "inspection_warnings": [],
+        "challenge_state": _challenge_state(
+            indicators or [],
+            gated_submit_controls=gated_controls,
+        ),
+    }
+
+
+def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
+    """Return True when DOM evidence should be augmented with visual evidence."""
+
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
+        return True
+    return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
+
+
+def merge_visual_composition_evidence(
+    evidence: dict[str, Any],
+    *,
+    visual_summary: dict[str, Any] | None = None,
+    visual_error: str | None = None,
+) -> dict[str, Any]:
+    """Add bounded screenshot/vision metadata to composition evidence.
+
+    The raw screenshot stays tool-internal. This helper records only compact,
+    typed facts that the main Copilot loop may use while composing.
+    """
+
+    merged = dict(evidence)
+    sources = [str(source) for source in merged.get("evidence_sources") or [] if isinstance(source, str)]
+    if SCREENSHOT_EVIDENCE_SOURCE not in sources:
+        sources.append(SCREENSHOT_EVIDENCE_SOURCE)
+    if visual_summary and VISION_EVIDENCE_SOURCE not in sources:
+        sources.append(VISION_EVIDENCE_SOURCE)
+    merged["evidence_sources"] = sources
+    merged["screenshot_used"] = True
+
+    omissions = [
+        _bounded_string(item, 160)
+        for item in (merged.get("visual_evidence_omissions") or [])
+        if _bounded_string(item, 160)
+    ][:_MAX_VISUAL_OMISSIONS]
+    if visual_error:
+        omissions.append(_bounded_string(f"visual_summary_error: {visual_error}", 160))
+
+    if isinstance(visual_summary, dict):
+        summary = _bounded_string(visual_summary.get("summary"), _MAX_VISUAL_SUMMARY_CHARS)
+        if summary:
+            merged["visual_evidence_summary"] = summary
+        for item in visual_summary.get("omissions") or []:
+            bounded = _bounded_string(item, 160)
+            if bounded:
+                omissions.append(bounded)
+        challenge_state = dict(merged.get("challenge_state") or {})
+        if visual_summary.get("challenge_detected") is True:
+            challenge_state["detected"] = True
+            challenge_state["requires_human_verification"] = True
+            challenge_state["source"] = (
+                "dom+screenshot" if challenge_state.get("source") else SCREENSHOT_EVIDENCE_SOURCE
+            )
+        challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
+        if challenge_kind:
+            challenge_state["kind"] = challenge_kind
+        challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
+        if challenge_location:
+            challenge_state["visual_location"] = challenge_location
+        if visual_summary.get("submit_blocked") is True:
+            challenge_state["gates_submit_controls"] = True
+        visual_blocked_controls = [
+            {
+                "text": _bounded_string(item, 120),
+                "disabled": True,
+            }
+            for item in visual_summary.get("blocked_submit_controls") or []
+            if _bounded_string(item, 120)
+        ]
+        if visual_blocked_controls:
+            existing_controls = [
+                item for item in challenge_state.get("gated_submit_controls") or [] if isinstance(item, dict)
+            ]
+            challenge_state["gated_submit_controls"] = (existing_controls + visual_blocked_controls)[:5]
+        merged["challenge_state"] = challenge_state
+    elif not merged.get("visual_evidence_summary"):
+        merged["visual_evidence_summary"] = "Screenshot captured because DOM evidence indicated challenge state."
+
+    merged["visual_evidence_omissions"] = list(dict.fromkeys(omissions))[:_MAX_VISUAL_OMISSIONS]
+    return merged
+
+
+def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
+    if not workflow_yaml:
+        return []
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return []
+    blocks = definition.get("blocks")
+    return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+
+
+def workflow_target_url(workflow_yaml: str | None) -> str | None:
+    for block in _parse_workflow_blocks(workflow_yaml):
+        url = block.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+    return None
+
+
+def _mode_requires_evidence(ctx: Any) -> bool:
+    mode_value = getattr(getattr(getattr(ctx, "turn_intent", None), "mode", None), "value", None)
+    phase = getattr(ctx, "build_phase", None)
+    return (
+        isinstance(mode_value, str)
+        and mode_value in _BUILD_MODE_VALUES
+        and phase
+        in (
+            BuildPhase.COMPOSING,
+            BuildPhase.TESTING,
+        )
+    )
+
+
+def _new_page_shaping_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
+    previous = {
+        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
+        for block in _parse_workflow_blocks(previous_workflow_yaml)
+    }
+    blocks: list[dict[str, str]] = []
+    for block in _parse_workflow_blocks(workflow_yaml):
+        block_type = str(block.get("block_type") or "").strip().lower()
+        if block_type not in _PAGE_SHAPING_BLOCK_TYPES:
+            continue
+        label = str(block.get("label") or "<missing label>")
+        if (label, block_type) in previous:
+            continue
+        blocks.append({"label": label, "block_type": block_type})
+    return blocks
+
+
+def _format_page_shaping_findings(blocks: list[dict[str, str]]) -> str:
+    return ", ".join(f"{block['label']} ({block['block_type']})" for block in blocks[:5])
+
+
+def _same_page(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    if not left_parsed.netloc or not right_parsed.netloc:
+        return False
+    if left_parsed.netloc.lower() != right_parsed.netloc.lower():
+        return False
+    left_path = (left_parsed.path or "/").rstrip("/") or "/"
+    right_path = (right_parsed.path or "/").rstrip("/") or "/"
+    return left_path == right_path
+
+
+def _same_origin(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    if not left_parsed.netloc or not right_parsed.netloc:
+        return False
+    return left_parsed.netloc.lower() == right_parsed.netloc.lower()
+
+
+def _evidence_matches_target(evidence: dict[str, Any] | None, target_url: str | None) -> bool:
+    if not evidence or not target_url:
+        return False
+    if evidence.get("source_tool") != "inspect_page_for_composition":
+        return False
+    current_url = evidence.get("current_url")
+    inspected_url = evidence.get("inspected_url")
+    return _same_page(current_url if isinstance(current_url, str) else None, target_url) or _same_page(
+        inspected_url if isinstance(inspected_url, str) else None,
+        target_url,
+    )
+
+
+def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
+    """Return a mutation error when a build adds page-dependent blocks before inspection.
+
+    This is deliberately structural rather than semantic: the contract says
+    page-shaping workflow blocks need inspected page evidence first. Grounding
+    quality is measured by evals and the page-evidence tool output, not by a
+    growing natural-language classifier in the mutation path.
+    """
+
+    if not _mode_requires_evidence(ctx):
+        return None
+    page_shaping_blocks = _new_page_shaping_blocks(workflow_yaml, getattr(ctx, "workflow_yaml", None))
+    if not page_shaping_blocks:
+        return None
+
+    target_url = workflow_target_url(workflow_yaml)
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if _evidence_matches_target(evidence, target_url):
+        return None
+    offending = _format_page_shaping_findings(page_shaping_blocks)
+    return (
+        "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
+        f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing navigation/login "
+        "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
+        f"Offending blocks: {offending}"
+    )
+
+
+def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
+    return {
+        "inspected_url": inspected_url,
+        "current_url": current_url,
+        "page_title": "",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "anti_bot_indicators": [],
+        "challenge_controls": [],
+        "evidence_confidence": 0.0,
+        "source_tool": "inspect_page_for_composition",
+        **_evidence_metadata([]),
+    }
+
+
+def _node_text(node: Any) -> str:
+    try:
+        return node.get_text(" ", strip=True)
+    except Exception:
+        return ""
+
+
+def _schema_text(value: str, max_chars: int) -> str:
+    return " ".join((value or "").split())[:max_chars]
+
+
+def _attr_value(node: Any, key: str) -> str:
+    value = node.get(key) if hasattr(node, "get") else None
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _classes_for(node: Any) -> list[str]:
+    class_value = node.get("class") if hasattr(node, "get") else None
+    if isinstance(class_value, list):
+        return [str(item).strip() for item in class_value if str(item).strip()]
+    if isinstance(class_value, str):
+        return [part for part in class_value.split() if part]
+    return []
+
+
+def _css_attr(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _simple_css_identifier(value: str) -> bool:
+    if not value:
+        return False
+    first = value[0]
+    if not (first.isalpha() or first in {"_", "-"}):
+        return False
+    return all(char.isalnum() or char in {"_", "-"} for char in value[1:])
+
+
+def _class_selector(classes: list[str]) -> str:
+    parts: list[str] = []
+    for class_name in classes[:3]:
+        if _simple_css_identifier(class_name):
+            parts.append(f".{class_name}")
+        else:
+            parts.append(f'[class~="{_css_attr(class_name)}"]')
+    return "".join(parts)
+
+
+def _selector_for(node: Any) -> str:
+    tag_name = getattr(node, "name", None) or "*"
+    node_id = _attr_value(node, "id")
+    if node_id:
+        return f"#{node_id}"
+    node_name = _attr_value(node, "name")
+    node_value = _attr_value(node, "value")
+    if node_name and node_value:
+        return f'{tag_name}[name="{_css_attr(node_name)}"][value="{_css_attr(node_value)}"]'
+    classes = _classes_for(node)
+    class_selector = _class_selector(classes)
+    if class_selector and node_value:
+        return f'{tag_name}{class_selector}[value="{_css_attr(node_value)}"]'
+    if node_name:
+        return f'{tag_name}[name="{_css_attr(node_name)}"]'
+    href = _attr_value(node, "href")
+    if tag_name == "a" and href:
+        return f'a[href="{_css_attr(href)}"]'
+    if class_selector:
+        return f"{tag_name}{class_selector}"
+    return str(tag_name)
+
+
+def _adjacent_text(field: Any) -> str:
+    for siblings in (getattr(field, "next_siblings", []), getattr(field, "previous_siblings", [])):
+        for index, sibling in enumerate(siblings):
+            if index >= 4:
+                break
+            sibling_name = str(getattr(sibling, "name", "") or "").lower()
+            if sibling_name in {"input", "select", "textarea", "button"}:
+                # Stop at the next control so labels are not borrowed from a neighboring field.
+                break
+            text = _node_text(sibling) if sibling_name else str(sibling).strip()
+            if text:
+                return text
+    return ""
+
+
+def _parent_text_label(field: Any) -> str:
+    for parent_name in ("td", "th", "li", "div", "span"):
+        parent = field.find_parent(parent_name) if hasattr(field, "find_parent") else None
+        if parent is None:
+            continue
+        text = _node_text(parent)
+        if 0 < len(text) <= 240:
+            return text
+    return ""
+
+
+def _select_options(node: Any) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for option in node.find_all("option")[:_MAX_SELECT_OPTIONS]:
+        options.append(
+            {
+                "text": _node_text(option)[:120],
+                "value": _attr_value(option, "value")[:160],
+                "selected": bool(option.has_attr("selected")),
+            }
+        )
+    return options
+
+
+def _field_label(soup: Any, field: Any) -> str:
+    field_id = _attr_value(field, "id")
+    if field_id:
+        label_tag = soup.find("label", attrs={"for": field_id})
+        if label_tag is not None:
+            label = _node_text(label_tag)
+            if label:
+                return label
+    parent_label = field.find_parent("label") if hasattr(field, "find_parent") else None
+    if parent_label is not None:
+        label = _node_text(parent_label).replace(_node_text(field), "").strip()
+        if label:
+            return label
+    for value in (
+        _attr_value(field, "aria-label"),
+        _adjacent_text(field),
+        _parent_text_label(field),
+        _attr_value(field, "title"),
+        _attr_value(field, "value"),
+    ):
+        if value:
+            return value
+    return ""
+
+
+def _page_title(soup: Any) -> str:
+    parts: list[str] = []
+    for tag_name in ("title", "h1"):
+        tag = soup.find(tag_name)
+        text = _node_text(tag) if tag is not None else ""
+        if text and text not in parts:
+            parts.append(text)
+    return " ".join(parts)[:240]
+
+
+def _result_container_entry(node: Any) -> dict[str, Any]:
+    tag_name = str(getattr(node, "name", "") or "").lower()
+    node_id = str(node.get("id") or "")
+    selector = _selector_for(node)[:160]
+    entry: dict[str, Any] = {"tag": tag_name, "id": node_id[:120], "selector": selector}
+    if tag_name == "table":
+        entry["row_selector"] = f"{selector} tbody tr"
+        entry["expand_toggle_candidates"] = [
+            f"{selector} tbody tr [aria-expanded]",
+            f'{selector} tbody tr [role="button"]',
+            f"{selector} tbody tr button",
+            f"{selector} tbody tr a",
+            f"{selector} tbody tr td:first-child",
+        ]
+    return entry
+
+
+def _challenge_identity(node: Any) -> str:
+    parts = [
+        str(getattr(node, "name", "") or ""),
+        _attr_value(node, "id"),
+        _attr_value(node, "name"),
+        " ".join(_classes_for(node)),
+        _attr_value(node, "src"),
+        # Standard anti-bot widgets commonly expose this attribute.
+        _attr_value(node, "data-sitekey"),
+        _attr_value(node, "aria-label"),
+        _attr_value(node, "title"),
+    ]
+    return " ".join(part for part in parts if part).lower()
+
+
+def _challenge_entry(node: Any) -> dict[str, Any]:
+    return {
+        "tag": str(getattr(node, "name", "") or "")[:40],
+        "id": _attr_value(node, "id")[:120],
+        "name": _attr_value(node, "name")[:120],
+        "class": " ".join(_classes_for(node)[:5])[:160],
+        "type": _attr_value(node, "type")[:40],
+        "selector": _selector_for(node)[:160],
+    }
+
+
+def _anti_bot_evidence(nodes: list[Any], html: str) -> tuple[list[str], list[dict[str, Any]]]:
+    indicators: list[str] = []
+
+    def add_indicator(value: str) -> None:
+        if value not in indicators:
+            indicators.append(value)
+
+    html_prefix = (html or "").lower()[:4096]
+    for pattern in _ANTI_BOT_PATTERNS:
+        if pattern in html_prefix:
+            add_indicator(pattern)
+
+    challenge_controls: list[dict[str, Any]] = []
+    for node in nodes:
+        identity = _challenge_identity(node)
+        matched = False
+        for pattern in _ANTI_BOT_PATTERNS:
+            if pattern in identity:
+                add_indicator(pattern)
+                matched = True
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        if matched and tag_name in {"div", "iframe", "input", "button", "textarea"}:
+            if len(challenge_controls) < _MAX_CHALLENGE_CONTROLS:
+                challenge_controls.append(_challenge_entry(node))
+
+    return indicators[:8], challenge_controls
+
+
+def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -> dict[str, Any]:
+    """Extract a compact page schema for build-time workflow composition."""
+
+    if BeautifulSoup is None:
+        return _empty_evidence(inspected_url, current_url)
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return _empty_evidence(inspected_url, current_url)
+
+    all_nodes = soup.find_all(True)
+
+    forms: list[dict[str, Any]] = []
+    for form in soup.find_all("form")[:_MAX_FORMS]:
+        fields: list[dict[str, Any]] = []
+        submit_controls: list[dict[str, Any]] = []
+        for node in form.find_all(["input", "select", "textarea", "button"]):
+            tag_name = str(getattr(node, "name", "") or "").lower()
+            field_type = str(node.get("type") or tag_name or "text").lower()
+            if tag_name == "input" and field_type in {"hidden", "reset"}:
+                continue
+            if tag_name == "button" or field_type in {"submit", "button"}:
+                submit_controls.append(
+                    {
+                        "text": _schema_text(_node_text(node) or str(node.get("value") or ""), 120),
+                        "name": str(node.get("name") or "")[:120],
+                        "id": str(node.get("id") or "")[:120],
+                        "value": _attr_value(node, "value")[:160],
+                        "class": " ".join(_classes_for(node)[:5])[:160],
+                        "type": field_type[:40],
+                        "disabled": _control_disabled(node),
+                        "selector": _selector_for(node)[:160],
+                    }
+                )
+                continue
+            if len(fields) >= _MAX_FIELDS_PER_FORM:
+                continue
+            fields.append(
+                {
+                    "name": str(node.get("name") or "")[:120],
+                    "id": str(node.get("id") or "")[:120],
+                    "label": _schema_text(_field_label(soup, node), 240),
+                    "type": field_type[:40],
+                    "value": _attr_value(node, "value")[:160],
+                    "class": " ".join(_classes_for(node)[:5])[:160],
+                    "placeholder": _schema_text(str(node.get("placeholder") or ""), 240),
+                    "required": bool(
+                        node.has_attr("required") or str(node.get("aria-required") or "").lower() == "true"
+                    ),
+                    "disabled": _control_disabled(node),
+                    "checked": bool(node.has_attr("checked")),
+                    "options": _select_options(node) if tag_name == "select" else [],
+                    "selector": _selector_for(node)[:160],
+                }
+            )
+        forms.append(
+            {
+                "id": str(form.get("id") or "")[:120],
+                "name": str(form.get("name") or "")[:120],
+                "action": str(form.get("action") or "")[:240],
+                "method": str(form.get("method") or "")[:20],
+                "fields": fields,
+                "submit_controls": submit_controls[:10],
+            }
+        )
+
+    navigation_targets: list[dict[str, Any]] = []
+    for link in soup.find_all("a", href=True):
+        if len(navigation_targets) >= _MAX_NAVIGATION_TARGETS:
+            break
+        href = str(link.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        resolved_href = urljoin(current_url or inspected_url, href)
+        if not _same_origin(resolved_href, current_url or inspected_url):
+            continue
+        text = _node_text(link)
+        navigation_targets.append(
+            {
+                "text": _schema_text(text, 160),
+                "href": resolved_href[:300],
+                "selector": _selector_for(link)[:160],
+            }
+        )
+
+    result_containers: list[dict[str, Any]] = []
+    for node in all_nodes:
+        if len(result_containers) >= _MAX_RESULT_CONTAINERS:
+            break
+        tag_name = str(getattr(node, "name", "") or "").lower()
+        node_id = str(node.get("id") or "")
+        class_value = node.get("class") or []
+        class_text = " ".join(class_value) if isinstance(class_value, list) else str(class_value)
+        result_identity = f"{node_id} {class_text}".lower()
+        if tag_name == "table" or any(hint in result_identity for hint in _RESULT_CONTAINER_HINTS):
+            result_containers.append(_result_container_entry(node))
+
+    field_count = sum(len(form.get("fields") or []) for form in forms)
+    control_count = sum(len(form.get("submit_controls") or []) for form in forms)
+    # Higher confidence means the parser saw a more complete form surface.
+    confidence = 0.85 if field_count and control_count else 0.6 if field_count else 0.3 if forms else 0.1
+    anti_bot_indicators, challenge_controls = _anti_bot_evidence(all_nodes, html)
+    return {
+        "inspected_url": inspected_url,
+        "current_url": current_url,
+        "page_title": _page_title(soup),
+        "forms": forms,
+        "navigation_targets": navigation_targets,
+        "result_containers": result_containers,
+        "anti_bot_indicators": anti_bot_indicators,
+        "challenge_controls": challenge_controls,
+        "evidence_confidence": confidence,
+        "source_tool": "inspect_page_for_composition",
+        **_evidence_metadata(anti_bot_indicators, forms=forms),
+    }
