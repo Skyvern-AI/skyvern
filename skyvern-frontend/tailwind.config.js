@@ -31,6 +31,11 @@ module.exports = {
           DEFAULT: "hsl(var(--primary))",
           foreground: "hsl(var(--primary-foreground))",
         },
+        cta: {
+          DEFAULT: "hsl(var(--cta))",
+          foreground: "hsl(var(--cta-foreground))",
+          hover: "hsl(var(--cta-hover))",
+        },
         secondary: {
           DEFAULT: "hsl(var(--secondary))",
           foreground: "hsl(var(--secondary-foreground))",
@@ -97,6 +102,28 @@ module.exports = {
           from: { height: "var(--radix-accordion-content-height)" },
           to: { height: "0" },
         },
+        "collapsible-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-collapsible-content-height)" },
+        },
+        "collapsible-up": {
+          from: { height: "var(--radix-collapsible-content-height)" },
+          to: { height: "0" },
+        },
+        "collapsible-down-fade": {
+          from: { height: "0", opacity: "0" },
+          to: {
+            height: "var(--radix-collapsible-content-height)",
+            opacity: "1",
+          },
+        },
+        "collapsible-up-fade": {
+          from: {
+            height: "var(--radix-collapsible-content-height)",
+            opacity: "1",
+          },
+          to: { height: "0", opacity: "0" },
+        },
         glow: {
           "0%, 100%": { boxShadow: "0 0 8px 2px rgba(234, 179, 8, 0.3)" },
           "50%": { boxShadow: "0 0 24px 8px rgba(234, 179, 8, 0.6)" },
@@ -105,6 +132,13 @@ module.exports = {
       animation: {
         "accordion-down": "accordion-down 0.2s ease-out",
         "accordion-up": "accordion-up 0.2s ease-out",
+        "collapsible-down":
+          "collapsible-down 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
+        "collapsible-up": "collapsible-up 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
+        "collapsible-down-fade":
+          "collapsible-down-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
+        "collapsible-up-fade":
+          "collapsible-up-fade 0.22s cubic-bezier(0.22, 1, 0.36, 1)",
         glow: "glow 2.5s ease-in-out infinite",
       },
     },
