@@ -149,7 +149,7 @@ This uses 5 blocks across 3 categories: browser automation, data and extraction,
     | Field | Value |
     |-------|-------|
     | **Label** | `process_each` |
-    | **Loop Value** | `{{ scrape_listings_output.listings }}` |
+    | **Loop Value** | `{{ scrape_listings_output.extracted_information.listings }}` |
 
     This iterates over the 5 listings extracted in the previous step. Now add a block *inside* the loop. Hover over the **+** inside the loop body, select **Add Block**, and choose **Text Prompt Block**.
 

@@ -55,7 +55,11 @@ describe("ActionCardCompact", () => {
     const onToggleExpanded = vi.fn();
     render(
       <ActionCardCompact
-        action={buildAction()}
+        // chevron only renders when there is hideable detail (input value)
+        action={buildAction({
+          action_type: "input_text",
+          text: "user@example.com",
+        })}
         index={1}
         active={false}
         expanded={false}
@@ -90,7 +94,7 @@ describe("ActionCardCompact", () => {
     expect(onToggleExpanded).not.toHaveBeenCalled();
   });
 
-  it("renders reasoning, input, and confidence in the expanded panel", () => {
+  it("renders reasoning inline, input in the expanded panel, and confidence as a chip", () => {
     render(
       <ActionCardCompact
         action={buildAction({
@@ -107,12 +111,12 @@ describe("ActionCardCompact", () => {
       />,
     );
 
-    expect(screen.getByText("Reasoning")).toBeDefined();
-    // reasoning appears in both the inline preview and the expanded panel
-    expect(screen.getAllByText("Type the email address").length).toBe(2);
+    // Reasoning is always inline now (not duplicated under a "Reasoning" heading)
+    expect(screen.getAllByText("Type the email address").length).toBe(1);
+    // Input value lives inside the expanded panel
     expect(screen.getByText("Input")).toBeDefined();
     expect(screen.getByText("user@example.com")).toBeDefined();
-    expect(screen.getByText("Confidence")).toBeDefined();
+    // Confidence renders as an inline chip in the top strip — no heading
     expect(screen.getByText("92%")).toBeDefined();
   });
 
