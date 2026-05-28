@@ -38,6 +38,33 @@ browser_session = await skyvern.get_browser_session(
 )
 ```
 
+## Connect to A Browser Session
+- using `playwright-python`
+
+```python
+from playwright.sync_api import sync_playwright
+
+browser_address = browser_session.browser_address # Use the browser_session created in the previous step
+download_path = browser_session.download_path # Use the browser_session created in the previous step
+
+with sync_playwright() as playwright:
+    browser = playwright.chromium.connect_over_cdp(browser_address)
+
+    # Required to avoid playwright overriding the location
+    cdp_session = browser.new_browser_cdp_session()
+    cdp_session.send(
+        "Browser.setDownloadBehavior",
+        {
+            "behavior": "allow",
+            "downloadPath": download_path,
+            "eventsEnabled": True,
+        },
+    )
+    context = browser.contexts[0]
+    page = context.pages[0]
+    page.goto("https://www.skyvern.com")
+```
+
 ## Close A Browser Session
 - [API doc](/api-reference/api-reference/browser-sessions/close-browser-session)
 
