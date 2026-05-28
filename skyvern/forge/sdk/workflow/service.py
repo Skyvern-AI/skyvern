@@ -378,6 +378,30 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
     return workflow_dict
 
 
+async def _precreate_script_browser(
+    block: BlockTypeVar,
+    workflow_run: "WorkflowRun",
+    browser_session_id: str | None,
+) -> None:
+    url = getattr(block, "url", None)
+    if not url:
+        return
+    try:
+        wrc = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run.workflow_run_id)
+    except Exception:
+        LOG.warning("Workflow run context unavailable for browser pre-creation", exc_info=True)
+        return
+    resolved_url = block.format_block_parameter_template_from_workflow_run_context(url, wrc)
+    if not resolved_url or not isinstance(resolved_url, str):
+        return
+    await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+        workflow_run=workflow_run,
+        url=resolved_url,
+        browser_session_id=browser_session_id,
+        browser_profile_id=workflow_run.browser_profile_id,
+    )
+
+
 class WorkflowService:
     # Prevent GC of fire-and-forget asyncio tasks (e.g. task_run sync).
     _background_tasks: set[asyncio.Task] = set()  # noqa: RUF012
@@ -2700,6 +2724,19 @@ class WorkflowService:
                         block_label=block.label,
                         exc_info=True,
                     )
+                try:
+                    await _precreate_script_browser(
+                        block=block,
+                        workflow_run=workflow_run,
+                        browser_session_id=browser_session_id,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to pre-create browser with block URL; script will create lazily",
+                        block_label=block.label,
+                        exc_info=True,
+                    )
+
                 block_exec_start = time.monotonic()
                 try:
                     vars_dict = vars(loaded_script_module) if loaded_script_module else {}
