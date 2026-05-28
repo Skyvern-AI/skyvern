@@ -494,6 +494,14 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def get_analytics_warmable_organization_ids(self, statement_timeout_seconds: int = 10) -> list[str]:
+        """Return org IDs whose analytics summary cache should be kept warm.
+
+        OSS returns all org IDs. Cloud overrides with enterprise pricing filter.
+        """
+        orgs = await app.DATABASE.organizations.get_all_organizations()
+        return [org.organization_id for org in orgs]
+
     async def record_workflow_run_metadata(
         self,
         *,

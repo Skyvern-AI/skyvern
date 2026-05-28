@@ -1062,7 +1062,7 @@ async def run_task_v2_helper(
             )
             break
         if block_result.success is True:
-            completion_screenshots = []
+            completion_screenshots: list[bytes] = []
             completion_scraped_page: ScrapedPage | None = None
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(

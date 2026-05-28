@@ -15,11 +15,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
   TableBody,
+  TableCell,
   TableHead,
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
 import { useBrowserProfilesQuery } from "@/routes/workflows/hooks/useBrowserProfilesQuery";
+import { useBrowserProfileCreateStore } from "@/store/useBrowserProfileCreateStore";
 import { cn } from "@/util/utils";
 
 import { BrowserProfileItem } from "./BrowserProfileItem";
@@ -73,6 +75,10 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   const isNextDisabled =
     isFetching || !nextPageProfiles || nextPageProfiles.length === 0;
 
+  const activeCreate = useBrowserProfileCreateStore((state) => state.active);
+  const hasSearch = Boolean(searchKey && searchKey.length > 0);
+  const showPlaceholderRow = Boolean(activeCreate && page === 1 && !hasSearch);
+
   if (isLoading) {
     return (
       <div className="space-y-3">
@@ -100,9 +106,8 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   }
 
   const pageItems = profiles ?? [];
-  const hasSearch = Boolean(searchKey && searchKey.length > 0);
 
-  if (pageItems.length === 0 && page === 1) {
+  if (pageItems.length === 0 && page === 1 && !showPlaceholderRow) {
     return (
       <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-neutral-600 dark:text-slate-300">
         {hasSearch ? (
@@ -149,6 +154,30 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
             </TableRow>
           </TableHeader>
           <TableBody>
+            {showPlaceholderRow && activeCreate ? (
+              <TableRow className="opacity-70">
+                <TableCell className="truncate">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+                    <span className="truncate" title={activeCreate.name}>
+                      {activeCreate.name}
+                    </span>
+                  </div>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell>
+                  <span className="opacity-50">—</span>
+                </TableCell>
+              </TableRow>
+            ) : null}
             {pageItems.map((profile) => (
               <BrowserProfileItem
                 key={profile.browser_profile_id}
