@@ -8,6 +8,8 @@ import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWork
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
   countActionsInTimeline,
+  countCompletedTopLevelBlocks,
+  findUnexecutedDefinedBlocks,
   isBlockItem,
   isObserverThought,
   isThoughtItem,
@@ -21,6 +23,7 @@ import {
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
+import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
@@ -151,11 +154,25 @@ function WorkflowRunTimeline({
     workflowRun.workflow?.workflow_definition?.finally_block_label ?? null;
 
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
+  const definedBlocks = workflowRun.workflow?.workflow_definition?.blocks ?? [];
+  const totalBlocks = definedBlocks.length;
+  const completedBlocks = countCompletedTopLevelBlocks(workflowRunTimeline);
+  const unexecutedBlocks = workflowRunIsFinalized
+    ? findUnexecutedDefinedBlocks(definedBlocks, workflowRunTimeline)
+    : [];
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
       <div className="flex shrink-0 items-center gap-2 border-b border-slate-700 px-3 py-2 text-xs">
         <span className="font-medium text-slate-200">Timeline</span>
+        {totalBlocks > 0 && (
+          <span
+            className="text-slate-500"
+            title="Top-level blocks completed out of the total defined for this workflow"
+          >
+            · {completedBlocks}/{totalBlocks} blocks
+          </span>
+        )}
         {numberOfActions > 0 && (
           <span className="text-slate-500">
             · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
@@ -264,6 +281,12 @@ function WorkflowRunTimeline({
               }
               return null;
             })}
+            {unexecutedBlocks.map((block) => (
+              <WorkflowRunTimelineUnexecutedBlockItem
+                key={`unexecuted-${block.label}`}
+                block={block}
+              />
+            ))}
           </div>
         </ScrollAreaViewport>
       </ScrollArea>
