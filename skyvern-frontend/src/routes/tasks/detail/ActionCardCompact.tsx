@@ -79,6 +79,10 @@ function ActionCardCompact({
       ? (action.text ?? action.response)
       : null;
 
+  // Only the input value is worth hiding behind a chevron — it can be long
+  // or sensitive. Confidence is short metadata so we render it inline.
+  const hasExpandableDetail = inputValue != null && inputValue.length > 0;
+
   return (
     <Collapsible open={expanded} asChild>
       <div
@@ -86,21 +90,25 @@ function ActionCardCompact({
         data-active={active ? "true" : "false"}
         data-status={success ? "success" : "failure"}
         className={cn(
-          "group rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
+          "group relative rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
           {
-            "ring-1 ring-neutral-500/45 hover:ring-neutral-500/45 dark:ring-white/40 dark:hover:ring-white/40":
-              active,
-            "hover:ring-neutral-400/40 dark:hover:ring-white/25": !active,
+            "ring-1 ring-white/40 hover:ring-white/40": active,
+            "hover:ring-white/25": !active,
           },
           cardClassName,
         )}
       >
-        <div className="flex items-center">
-          <button
-            type="button"
-            onClick={onSelect}
-            className="flex min-h-[40px] flex-1 cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-neutral-500/45 dark:focus-visible:ring-white/40"
-          >
+        <button
+          type="button"
+          onClick={onSelect}
+          className={cn(
+            "flex w-full cursor-pointer flex-col gap-1 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40",
+            // Reserve room for the absolutely-positioned chevron so the
+            // confidence chip doesn't end up under it.
+            hasExpandableDetail && "pr-10",
+          )}
+        >
+          <div className="flex min-h-[24px] items-center gap-2">
             <span
               aria-hidden="true"
               className={cn("h-2 w-2 shrink-0 rounded-full", {
@@ -108,49 +116,51 @@ function ActionCardCompact({
                 "bg-destructive": !success,
               })}
             />
-            <span className="shrink-0 text-xs tabular-nums text-neutral-500 dark:text-slate-500">
+            <span className="shrink-0 text-xs tabular-nums text-slate-500">
               #{index}
             </span>
             {icon && (
-              <span
-                className="shrink-0 text-neutral-600 dark:text-slate-300"
-                aria-hidden="true"
-              >
+              <span className="shrink-0 text-slate-300" aria-hidden="true">
                 {icon}
               </span>
             )}
-            <span className="shrink-0 text-xs text-neutral-700 dark:text-slate-300">
-              {label}
-            </span>
-            <span
-              className={cn(
-                "min-w-0 flex-1 truncate text-xs text-neutral-800 dark:text-slate-200",
-                reasoningPreview.length === 0 && "invisible",
-              )}
-            >
+            <span className="shrink-0 text-xs text-slate-300">{label}</span>
+            {fromScript && (
+              <TooltipProvider>
+                <Tooltip delayDuration={300}>
+                  <TooltipTrigger asChild>
+                    <span className="shrink-0" aria-label="Code Execution">
+                      <LightningBoltIcon className="h-4 w-4 text-[gold]" />
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[250px]">
+                    Code Execution
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
+            {confidencePct != null && (
+              <span className="ml-auto shrink-0 rounded bg-slate-elevation5 px-1.5 py-0.5 text-[10px] tabular-nums text-slate-400">
+                {confidencePct}%
+              </span>
+            )}
+          </div>
+          {reasoningPreview.length > 0 && (
+            <div className="whitespace-pre-wrap break-words text-xs text-slate-200">
               {reasoningPreview}
-            </span>
-          </button>
-          {fromScript && (
-            <TooltipProvider>
-              <Tooltip delayDuration={300}>
-                <TooltipTrigger asChild>
-                  <span className="shrink-0" aria-label="Code Execution">
-                    <LightningBoltIcon className="h-4 w-4 text-[gold]" />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-[250px]">
-                  Code Execution
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            </div>
           )}
+        </button>
+        {hasExpandableDetail && (
+          // Sibling button (not nested) so the outer select button doesn't
+          // contain interactive content. Absolute-positioned to keep the
+          // visual chevron in the top-right corner of the card.
           <button
             type="button"
+            onClick={onToggleExpanded}
             aria-label={expanded ? "Collapse details" : "Expand details"}
             aria-expanded={expanded}
-            onClick={onToggleExpanded}
-            className="mr-2 shrink-0 rounded p-0.5 text-neutral-500 outline-none hover:bg-neutral-200 hover:text-neutral-900 focus-visible:ring-1 focus-visible:ring-neutral-500/45 dark:text-slate-400 dark:hover:bg-slate-elevation3 dark:hover:text-slate-200 dark:focus-visible:ring-white/40"
+            className="absolute right-3 top-2.5 cursor-pointer rounded p-0.5 text-slate-400 outline-none hover:bg-slate-elevation3 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
           >
             {expanded ? (
               <ChevronDownIcon className="h-4 w-4" />
@@ -158,36 +168,16 @@ function ActionCardCompact({
               <ChevronRightIcon className="h-4 w-4" />
             )}
           </button>
-        </div>
-        <CollapsibleContent className="space-y-2 px-3 pb-3 pt-1 text-xs text-neutral-600 dark:text-slate-400">
-          {action.reasoning && (
-            <div className="rounded bg-neutral-200/80 p-2 dark:bg-slate-elevation5">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
-                Reasoning
-              </div>
-              <div className="whitespace-pre-wrap break-words text-neutral-700 dark:text-slate-300">
-                {action.reasoning}
-              </div>
-            </div>
-          )}
+        )}
+        <CollapsibleContent className="space-y-2 px-3 pb-3 pt-1 text-xs text-slate-400">
           {inputValue != null && inputValue.length > 0 && (
-            <div className="rounded bg-neutral-200/80 p-2 dark:bg-slate-elevation5">
-              <div className="mb-1 text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
+            <div className="rounded bg-slate-elevation5 p-2">
+              <div className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">
                 Input
               </div>
-              <div className="whitespace-pre-wrap break-words font-mono text-neutral-700 dark:text-slate-300">
+              <div className="whitespace-pre-wrap break-words font-mono text-slate-300">
                 {inputValue}
               </div>
-            </div>
-          )}
-          {confidencePct != null && (
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] uppercase tracking-wide text-neutral-500 dark:text-slate-500">
-                Confidence
-              </span>
-              <span className="tabular-nums text-neutral-700 dark:text-slate-300">
-                {confidencePct}%
-              </span>
             </div>
           )}
         </CollapsibleContent>

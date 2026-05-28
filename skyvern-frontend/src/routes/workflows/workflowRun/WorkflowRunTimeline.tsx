@@ -3,7 +3,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { statusIsFinalized, statusIsNotFinalized } from "@/routes/tasks/types";
 import { cn } from "@/util/utils";
 import { DotFilledIcon } from "@radix-ui/react-icons";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useWorkflowRunWithWorkflowQuery } from "../hooks/useWorkflowRunWithWorkflowQuery";
 import { useWorkflowRunTimelineQuery } from "../hooks/useWorkflowRunTimelineQuery";
 import {
@@ -13,34 +13,106 @@ import {
   isThoughtItem,
   ObserverThought,
   WorkflowRunBlock,
+  WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
-import { ThoughtCard } from "./ThoughtCard";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
+import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
+  activeIteration?: number | null;
   onLiveStreamSelected: () => void;
-  onObserverThoughtCardSelected: (item: ObserverThought) => void;
   onActionItemSelected: (item: ActionItem) => void;
   onBlockItemSelected: (item: WorkflowRunBlock) => void;
+  onThoughtItemSelected: (item: ObserverThought) => void;
+  onIterationSelected: (
+    loopBlock: WorkflowRunBlock,
+    iterationIndex: number,
+  ) => void;
 };
+
+function buildBlockOrderIndex(
+  items: Array<WorkflowRunTimelineItem>,
+): ReadonlyMap<string, number> {
+  const blocks: Array<{
+    id: string;
+    createdAt: number;
+    sequence: number;
+  }> = [];
+
+  function walk(timelineItems: Array<WorkflowRunTimelineItem>) {
+    for (const item of timelineItems) {
+      if (isBlockItem(item)) {
+        const createdAt = new Date(item.created_at).getTime();
+        blocks.push({
+          id: item.block.workflow_run_block_id,
+          createdAt: Number.isNaN(createdAt)
+            ? Number.MAX_SAFE_INTEGER
+            : createdAt,
+          sequence: blocks.length,
+        });
+      }
+      if (item.children.length > 0) {
+        walk(item.children);
+      }
+    }
+  }
+
+  walk(items);
+  blocks.sort(
+    (left, right) =>
+      left.createdAt - right.createdAt || left.sequence - right.sequence,
+  );
+
+  return new Map(blocks.map((block, index) => [block.id, index + 1]));
+}
+
+function toTimelineTime(value: string): number {
+  const time = new Date(value).getTime();
+  return Number.isNaN(time) ? Number.MAX_SAFE_INTEGER : time;
+}
+
+function sortTimelineTopDown(
+  items: Array<WorkflowRunTimelineItem>,
+): Array<WorkflowRunTimelineItem> {
+  if (items.length === 0) return items;
+  return items
+    .map((item) => ({
+      ...item,
+      children: sortTimelineTopDown(item.children),
+    }))
+    .sort(
+      (left, right) =>
+        toTimelineTime(left.created_at) - toTimelineTime(right.created_at),
+    );
+}
 
 function WorkflowRunTimeline({
   activeItem,
+  activeIteration = null,
   onLiveStreamSelected,
-  onObserverThoughtCardSelected,
   onActionItemSelected,
   onBlockItemSelected,
+  onThoughtItemSelected,
+  onIterationSelected,
 }: Props) {
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunWithWorkflowQuery();
 
   const { data: workflowRunTimeline, isLoading: workflowRunTimelineIsLoading } =
     useWorkflowRunTimelineQuery();
+  const displayTimeline = useMemo(
+    () => sortTimelineTopDown(workflowRunTimeline ?? []),
+    [workflowRunTimeline],
+  );
+  const blockOrder = useMemo(
+    () => buildBlockOrderIndex(workflowRunTimeline ?? []),
+    [workflowRunTimeline],
+  );
 
   // Track known item IDs so we can animate only newly-arrived items
   const knownItemIdsRef = useRef<Set<string>>(new Set());
@@ -52,7 +124,7 @@ function WorkflowRunTimeline({
   useEffect(() => {
     if (!workflowRunTimeline) return;
     const ids = new Set<string>();
-    for (const item of workflowRunTimeline) {
+    for (const item of displayTimeline) {
       if (isBlockItem(item)) {
         ids.add(item.block.workflow_run_block_id);
       } else if (isThoughtItem(item)) {
@@ -61,7 +133,7 @@ function WorkflowRunTimeline({
     }
     knownItemIdsRef.current = ids;
     isInitialRenderRef.current = false;
-  }, [workflowRunTimeline]);
+  }, [displayTimeline, workflowRunTimeline]);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
     return <Skeleton className="h-full w-full" />;
@@ -81,53 +153,58 @@ function WorkflowRunTimeline({
   const numberOfActions = countActionsInTimeline(workflowRunTimeline);
 
   return (
-    <div className="min-w-0 space-y-4 overflow-hidden rounded bg-slate-elevation1 p-4 text-neutral-900 dark:text-foreground">
-      <div className="grid grid-cols-3 gap-2">
-        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground">
-          Actions: {numberOfActions}
-        </div>
-        <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground">
-          Steps: {workflowRun.total_steps ?? 0}
-        </div>
-        <div
-          className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs text-neutral-800 dark:text-foreground"
+    <div className="flex h-full min-w-0 flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
+      <div className="flex shrink-0 items-center gap-2 border-b border-slate-700 px-3 py-2 text-xs">
+        <span className="font-medium text-slate-200">Timeline</span>
+        {numberOfActions > 0 && (
+          <span className="text-slate-500">
+            · {numberOfActions} {numberOfActions === 1 ? "action" : "actions"}
+          </span>
+        )}
+        <span className="text-slate-500">
+          · {workflowRun.total_steps ?? 0}{" "}
+          {(workflowRun.total_steps ?? 0) === 1 ? "step" : "steps"}
+        </span>
+        <span
+          className="text-slate-500"
           title="Credits consumed by this run (live + cached)"
         >
-          Credits:{" "}
+          ·{" "}
           {(
             (workflowRun.credits_used ?? 0) +
             (workflowRun.cached_credits_used ?? 0)
-          ).toLocaleString()}
-        </div>
-      </div>
-      <ScrollArea>
-        <ScrollAreaViewport className="h-[37rem] max-h-[37rem] [&>div]:!block [&>div]:!overflow-x-hidden">
-          <div className="space-y-4 p-1">
-            {workflowRunIsNotFinalized && (
-              <div
-                key="stream"
-                className={cn(
-                  "flex cursor-pointer items-center gap-2 rounded-lg bg-gradient-to-r from-red-500/10 to-slate-elevation3 px-3 py-2 text-sm text-neutral-800 transition-colors duration-150 hover:from-red-500/20 dark:text-foreground",
-                  {
-                    "bg-slate-elevation5 from-red-500/20":
-                      activeItem === "stream",
-                  },
-                )}
-                onClick={onLiveStreamSelected}
-              >
-                <DotFilledIcon className="h-5 w-5 animate-pulse text-destructive" />
-                Live
-              </div>
+          ).toLocaleString()}{" "}
+          credits
+        </span>
+        {workflowRunIsNotFinalized && (
+          <button
+            type="button"
+            onClick={onLiveStreamSelected}
+            aria-pressed={activeItem === "stream"}
+            aria-label="Jump to the live stream of the running workflow"
+            className={cn(
+              "ml-auto inline-flex shrink-0 cursor-pointer items-center gap-1 rounded bg-destructive/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-destructive ring-1 ring-transparent transition-all hover:bg-destructive/25",
+              activeItem === "stream" &&
+                "bg-destructive/25 ring-destructive/40",
             )}
+          >
+            <DotFilledIcon className="size-3 animate-pulse" />
+            <span>Live</span>
+          </button>
+        )}
+      </div>
+      <ScrollArea className="min-h-0 flex-1">
+        <ScrollAreaViewport className="h-full max-h-full [&>div]:!block [&>div]:!overflow-x-hidden">
+          <div className="p-2">
             {workflowRunIsNotFinalized && workflowRunTimeline.length === 0 && (
-              <div className="flex items-center justify-center py-8 text-sm text-neutral-500 dark:text-slate-400">
+              <div className="flex items-center justify-center py-8 text-sm text-slate-400">
                 Formulating actions...
               </div>
             )}
             {workflowRunIsFinalized && workflowRunTimeline.length === 0 && (
-              <div>Agent timeline is empty</div>
+              <div>Workflow timeline is empty</div>
             )}
-            {workflowRunTimeline?.map((timelineItem) => {
+            {displayTimeline.map((timelineItem) => {
               const itemId = isBlockItem(timelineItem)
                 ? timelineItem.block.workflow_run_block_id
                 : isThoughtItem(timelineItem)
@@ -150,10 +227,13 @@ function WorkflowRunTimeline({
                     <WorkflowRunTimelineBlockItem
                       subItems={timelineItem.children}
                       activeItem={activeItem}
+                      activeIteration={activeIteration}
                       block={timelineItem.block}
+                      blockOrder={blockOrder}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
-                      onThoughtCardClick={onObserverThoughtCardSelected}
+                      onIterationClick={onIterationSelected}
+                      onThoughtClick={onThoughtItemSelected}
                       finallyBlockLabel={finallyBlockLabel}
                       workflowRunIsFinalized={workflowRunIsFinalized}
                     />
@@ -164,10 +244,11 @@ function WorkflowRunTimeline({
                 return (
                   <div
                     key={timelineItem.thought.thought_id}
-                    className={cn({
-                      "duration-300 animate-in fade-in slide-in-from-top-3":
-                        isNew,
-                    })}
+                    className={cn(
+                      "py-1",
+                      isNew &&
+                        "duration-300 animate-in fade-in slide-in-from-top-3",
+                    )}
                   >
                     <ThoughtCard
                       active={
@@ -175,12 +256,13 @@ function WorkflowRunTimeline({
                         activeItem.thought_id ===
                           timelineItem.thought.thought_id
                       }
-                      onClick={onObserverThoughtCardSelected}
+                      onClick={onThoughtItemSelected}
                       thought={timelineItem.thought}
                     />
                   </div>
                 );
               }
+              return null;
             })}
           </div>
         </ScrollAreaViewport>
