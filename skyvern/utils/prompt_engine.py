@@ -7,10 +7,20 @@ from skyvern.constants import DEFAULT_MAX_TOKENS
 from skyvern.errors.errors import UserDefinedError
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.prompting import PromptEngine
+from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.token_counter import count_tokens
 from skyvern.webeye.scraper.scraped_page import ElementTreeBuilder
 
 LOG = structlog.get_logger()
+
+
+def _sanitize_elements_for_prompt(builder: Any, html: str) -> str:
+    # Mirror the sanitized form onto last_used_element_tree_html so the
+    # extraction cache key (which hashes that field) matches what the LLM saw.
+    sanitized = escape_code_fences(html)
+    if getattr(builder, "last_used_element_tree_html", None) is not None:
+        builder.last_used_element_tree_html = sanitized
+    return sanitized
 
 
 class CheckPhoneNumberFormatResponse(BaseModel):
@@ -83,16 +93,22 @@ def load_prompt_with_elements_tracked(
     """
     lean_any = lean_compress_long_href or lean_compress_image_src or lean_strip_url_query_strings
     if lean_any and element_tree_builder.support_lean_elements_tree():
-        elements = element_tree_builder.build_lean_elements_tree(
-            html_need_skyvern_attrs=html_need_skyvern_attrs,
-            compress_long_href=lean_compress_long_href,
-            compress_image_src=lean_compress_image_src,
-            strip_url_query_strings=lean_strip_url_query_strings,
+        elements = _sanitize_elements_for_prompt(
+            element_tree_builder,
+            element_tree_builder.build_lean_elements_tree(
+                html_need_skyvern_attrs=html_need_skyvern_attrs,
+                compress_long_href=lean_compress_long_href,
+                compress_image_src=lean_compress_image_src,
+                strip_url_query_strings=lean_strip_url_query_strings,
+            ),
         )
     else:
         # Builder doesn't implement lean (e.g. IncrementalScrapePage) or caller
         # asked for no transforms — fall back to the plain element tree.
-        elements = element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
+        elements = _sanitize_elements_for_prompt(
+            element_tree_builder,
+            element_tree_builder.build_element_tree(html_need_skyvern_attrs=html_need_skyvern_attrs),
+        )
     prompt = prompt_engine.load_prompt(
         template_name,
         elements=elements,
@@ -103,7 +119,10 @@ def load_prompt_with_elements_tracked(
         # get rid of all the secondary elements like SVG, etc
         # NOTE: economy fallback drops the lean recipe — context-overflow firefighting
         # path; we accept the lean savings loss in exchange for fitting under the cap.
-        elements = element_tree_builder.build_economy_elements_tree(html_need_skyvern_attrs=html_need_skyvern_attrs)
+        elements = _sanitize_elements_for_prompt(
+            element_tree_builder,
+            element_tree_builder.build_economy_elements_tree(html_need_skyvern_attrs=html_need_skyvern_attrs),
+        )
         prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
         economy_token_count = count_tokens(prompt)
         LOG.warning(
@@ -116,9 +135,12 @@ def load_prompt_with_elements_tracked(
         if economy_token_count > DEFAULT_MAX_TOKENS:
             # !!! HACK alert
             # dump the last 1/3 of the html context and keep the first 2/3 of the html context
-            elements = element_tree_builder.build_economy_elements_tree(
-                html_need_skyvern_attrs=html_need_skyvern_attrs,
-                percent_to_keep=2 / 3,
+            elements = _sanitize_elements_for_prompt(
+                element_tree_builder,
+                element_tree_builder.build_economy_elements_tree(
+                    html_need_skyvern_attrs=html_need_skyvern_attrs,
+                    percent_to_keep=2 / 3,
+                ),
             )
             prompt = prompt_engine.load_prompt(template_name, elements=elements, **kwargs)
             token_count_after_dump = count_tokens(prompt)

@@ -179,9 +179,10 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     lean_element_tree_cache: dict[tuple[bool, bool, bool], list[dict]] = {}
     last_used_element_tree: list[dict] | None = None
     # Last HTML variant built for the LLM (captures economy / truncation).
-    # None when the last build used fmt=JSON or no build has run yet. The
-    # extraction cache reads this to hash the exact HTML the LLM saw; JSON
-    # callers fall back to a fresh HTML rebuild at the cache callsite.
+    # When set via load_prompt_with_elements_tracked this holds the post-
+    # sanitization form so the extraction cache hashes the same bytes the
+    # LLM saw; direct build_element_tree callers see the raw HTML. None
+    # when the last build used fmt=JSON or no build has run yet.
     last_used_element_tree_html: str | None = None
     screenshots: list[bytes] = []
     url: str = ""

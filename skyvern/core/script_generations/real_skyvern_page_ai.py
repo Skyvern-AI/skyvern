@@ -1177,7 +1177,11 @@ class RealSkyvernPageAi(SkyvernPageAi):
             # doesn't carry navigation context.
             # Hash the post-ceiling values so two requests that differ only in
             # dropped fields (schema/extracted_text on oversized prompts) and
-            # render to the same final LLM prompt share a cache key.
+            # render to the same final LLM prompt share a cache key. Non-
+            # elements untrusted fields are hashed pre-filter while the
+            # template renders them post-filter; inputs that sanitize to
+            # identical prompts may hash differently — accepted cache-miss
+            # trade-off, not a correctness issue.
             cache_key = extraction_cache.compute_cache_key(
                 call_path="script",
                 element_tree=self.scraped_page.last_used_element_tree_html
