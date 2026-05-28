@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Sequence
 
 import structlog
@@ -1017,7 +1018,10 @@ class TasksRepository(BaseRepository):
         vcpu_millicores: int | None = None,
         memory_mb: int | None = None,
         duration_ms: int | None = None,
-        compute_cost: float | None = None,
+        compute_cost: Decimal | None = None,
+        llm_cost: Decimal | None = None,
+        proxy_cost: Decimal | None = None,
+        captcha_cost: Decimal | None = None,
     ) -> None:
         """Update compute cost metrics for a job run."""
         async with self.Session() as session:
@@ -1044,6 +1048,12 @@ class TasksRepository(BaseRepository):
                 task_run.duration_ms = duration_ms
             if compute_cost is not None:
                 task_run.compute_cost = compute_cost
+            if llm_cost is not None:
+                task_run.llm_cost = llm_cost
+            if proxy_cost is not None:
+                task_run.proxy_cost = proxy_cost
+            if captcha_cost is not None:
+                task_run.captcha_cost = captcha_cost
             await session.commit()
 
     @db_operation("cache_task_run")
