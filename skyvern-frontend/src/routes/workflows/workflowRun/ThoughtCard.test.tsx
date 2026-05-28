@@ -3,6 +3,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { basicLocalTimeFormat } from "@/util/timeFormat";
 import type { ObserverThought } from "../types/workflowRunTypes";
 import { ThoughtCard } from "./ThoughtCard";
 
@@ -37,6 +38,16 @@ describe("ThoughtCard", () => {
     expect(screen.getByText("Thought")).toBeDefined();
     expect(
       screen.getByText("Considering whether to scroll the page"),
+    ).toBeDefined();
+  });
+
+  it("renders the thought start timestamp", () => {
+    const thought = buildThought();
+
+    render(<ThoughtCard active={false} thought={thought} onClick={() => {}} />);
+
+    expect(
+      screen.getByText(`Started ${basicLocalTimeFormat(thought.created_at)}`),
     ).toBeDefined();
   });
 

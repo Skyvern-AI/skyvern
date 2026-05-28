@@ -25,6 +25,7 @@ import {
 } from "@/api/types";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
+import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
@@ -527,6 +528,8 @@ function WorkflowRunTimelineBlockItem({
   const blockName = block.label ?? block.title ?? blockTypeTitle;
   const blockIndex = blockOrder?.get(block.workflow_run_block_id);
   const descriptor = getTimelineDescriptor(block);
+  const startedAt = basicLocalTimeFormat(block.created_at);
+  const startedAtTitle = basicTimeFormat(block.created_at);
   const actions = block.actions ?? [];
   const actionCount = actions.length;
 
@@ -685,6 +688,12 @@ function WorkflowRunTimelineBlockItem({
             </span>
             <span className="min-w-0 flex-1 truncate text-slate-500">
               · {descriptor}
+            </span>
+            <span
+              className="shrink-0 text-[10px] tabular-nums text-slate-500"
+              title={startedAtTitle}
+            >
+              Started {startedAt}
             </span>
             {isFinallyBlock && (
               <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">

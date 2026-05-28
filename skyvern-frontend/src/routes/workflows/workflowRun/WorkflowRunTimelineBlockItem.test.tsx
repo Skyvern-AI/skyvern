@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status } from "@/api/types";
+import { basicLocalTimeFormat } from "@/util/timeFormat";
 import type {
   WorkflowRunBlock,
   WorkflowRunTimelineBlockItem as TimelineBlockItem,
@@ -125,6 +126,24 @@ describe("WorkflowRunTimelineBlockItem", () => {
       ),
     ).toBeDefined();
     expect(screen.getByText("2 actions")).toBeDefined();
+  });
+
+  it("renders the block start timestamp", () => {
+    const block = buildBlock();
+
+    render(
+      <WorkflowRunTimelineBlockItem
+        activeItem={block}
+        block={block}
+        subItems={[]}
+        onActionClick={noop}
+        onBlockItemClick={noop}
+      />,
+    );
+
+    expect(
+      screen.getByText(`Started ${basicLocalTimeFormat(block.created_at)}`),
+    ).toBeDefined();
   });
 
   it("omits the action count badge when a block has no actions", () => {
