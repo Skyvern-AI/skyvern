@@ -20,6 +20,8 @@ import { cn } from "@/util/utils";
 import {
   WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
+  WorkflowCopilotDesignEndUpdate,
+  WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -28,23 +30,24 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotTurnStartUpdate,
+  WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
 import {
-  ToolActivity,
-  applyBlockProgress,
-  applyToolCall,
-  applyToolResult,
-  getActivityDotClass,
-} from "./toolActivity";
-import {
   shouldQueuePromptForLiveBrowser,
   shouldWaitForLiveBrowser,
 } from "./browserReadiness";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
+import { NarrativeView } from "./NarrativeView";
+import {
+  EMPTY_NARRATIVE,
+  TurnNarrativeState,
+  applyNarrativeEvent,
+} from "./narrativeState";
 
 interface ChatMessage {
   id: string;
@@ -71,26 +74,11 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
-  | WorkflowCopilotBlockProgressUpdate;
-
-const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  update_workflow: "Updating agent",
-  update_and_run_blocks: "Updating & running blocks",
-  list_credentials: "Listing credentials",
-  get_block_schema: "Looking up block schema",
-  validate_block: "Validating block",
-  run_blocks_and_collect_debug: "Running blocks",
-  get_run_results: "Getting run results",
-  get_browser_screenshot: "Taking screenshot",
-  navigate_browser: "Navigating browser",
-  evaluate: "Inspecting the page",
-  click: "Clicking on the page",
-  type_text: "Filling a field",
-  scroll: "Scrolling",
-  console_messages: "Reading console",
-  select_option: "Selecting option",
-  press_key: "Pressing key",
-};
+  | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotTurnStartUpdate
+  | WorkflowCopilotDesignStartUpdate
+  | WorkflowCopilotDesignEndUpdate
+  | WorkflowCopilotWorkflowDraftUpdate;
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -221,9 +209,8 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
-  const [processingStatus, setProcessingStatus] = useState<string>("");
-  const [latestNarration, setLatestNarration] = useState<string>("");
-  const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
+  const [narrative, setNarrative] =
+    useState<TurnNarrativeState>(EMPTY_NARRATIVE);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
@@ -323,6 +310,7 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
+    setNarrative(EMPTY_NARRATIVE);
     hasScrolledOnLoad.current = false;
   };
 
@@ -535,6 +523,7 @@ export function WorkflowCopilotChat({
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
       return;
     }
@@ -597,9 +586,6 @@ export function WorkflowCopilotChat({
     pendingCancelToken.current = null;
     if (!cancelToken) return;
 
-    setProcessingStatus("Cancelling...");
-    setLatestNarration("");
-    setToolActivity([]);
     cancelInFlightController.current = controllerAtCancel;
 
     const appendCancelledBubble = () => {
@@ -612,6 +598,8 @@ export function WorkflowCopilotChat({
           timestamp: new Date().toISOString(),
         },
       ]);
+      // Otherwise the bubble freezes mid-state next to the Cancelled message.
+      setNarrative(EMPTY_NARRATIVE);
     };
 
     try {
@@ -638,7 +626,7 @@ export function WorkflowCopilotChat({
       controllerAtCancel.abort();
       appendCancelledBubble();
     }
-  }, [credentialGetter, setToolActivity]);
+  }, [credentialGetter]);
 
   const cancelQueuedPrompt = useCallback(() => {
     if (!queuedPrompt) {
@@ -746,9 +734,6 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       setIsLoading(true);
-      setProcessingStatus("Starting...");
-      setLatestNarration("");
-      setToolActivity([]);
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -832,10 +817,6 @@ export function WorkflowCopilotChat({
         const handleProcessingUpdate = (
           payload: WorkflowCopilotProcessingUpdate,
         ) => {
-          if (payload.status) {
-            setProcessingStatus(payload.status);
-          }
-
           const pendingId = pendingMessageId.current;
           if (!pendingId || !payload.timestamp) {
             return;
@@ -909,33 +890,33 @@ export function WorkflowCopilotChat({
               case "processing_update":
                 handleProcessingUpdate(payload);
                 return false;
+              // Legacy in-flight signals — the narrative bubble derives its
+              // state from turn_start/design_*/block_progress/workflow_draft
+              // instead, so these are intentionally dropped here.
               case "tool_call":
-                setProcessingStatus(
-                  TOOL_DISPLAY_NAMES[payload.tool_name] ??
-                    payload.tool_name + "...",
-                );
-                setToolActivity((prev) => applyToolCall(prev, payload));
-                return false;
               case "tool_result":
-                setToolActivity((prev) => applyToolResult(prev, payload));
-                return false;
               case "condensing":
-                if (payload.status === "started") {
-                  setProcessingStatus("Condensing context...");
-                }
-                return false;
               case "narration":
-                if (payload.narration) {
-                  setLatestNarration(payload.narration);
-                }
                 return false;
               case "block_progress":
-                setToolActivity((prev) => applyBlockProgress(prev, payload));
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                return false;
+              case "turn_start":
+                setNarrative(() =>
+                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
+                );
+                return false;
+              case "design_start":
+              case "design_end":
+              case "workflow_draft":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 return false;
               case "response":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleResponse(payload);
                 return true;
               case "error":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleError(payload);
                 return true;
               default:
@@ -969,9 +950,6 @@ export function WorkflowCopilotChat({
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
         setIsLoading(false);
-        setProcessingStatus("");
-        setLatestNarration("");
-        setToolActivity([]);
       }
     },
     [
@@ -1371,61 +1349,17 @@ export function WorkflowCopilotChat({
               />
             );
           })}
-          {(isLoading || isQueuedPromptWaiting) && (
-            <div className="flex items-start gap-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-neutral-950 text-xs font-bold text-white dark:bg-neutral-100 dark:text-neutral-950">
+          {narrative.turnId !== null && (
+            <div
+              className="flex items-start gap-3"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
                 AI
               </div>
-              <div className="flex-1 rounded-lg bg-neutral-100 p-3 dark:bg-neutral-900">
-                <div className="flex items-center gap-2 text-sm text-neutral-700 dark:text-neutral-300">
-                  <ReloadIcon className="h-4 w-4 animate-spin" />
-                  <span>
-                    {isQueuedPromptWaiting
-                      ? queuedPromptWaitingStatus
-                      : latestNarration || processingStatus || "Processing..."}
-                  </span>
-                </div>
-                {isQueuedPromptWaiting ? (
-                  <div className="mt-2 text-xs text-neutral-500">
-                    Copilot will start automatically once the browser is ready.
-                  </div>
-                ) : null}
-                {!isQueuedPromptWaiting && toolActivity.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity) => {
-                      const isRetrySuccess =
-                        activity.status === "success" &&
-                        activity.linkedRecovery === true;
-                      const tooltip = activity.detail ?? activity.summary;
-                      const displayName =
-                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                        activity.tool_name;
-                      const containerClass = cn(
-                        "flex items-start gap-1.5 text-xs text-neutral-500 dark:text-neutral-400",
-                        activity.linkedRecovery &&
-                          "border-l border-amber-400/40 pl-2",
-                      );
-                      return (
-                        <div
-                          key={activity.tool_call_id}
-                          className={containerClass}
-                        >
-                          <span
-                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
-                          />
-                          <span
-                            className="line-clamp-2 min-w-0 flex-1"
-                            title={tooltip}
-                          >
-                            {isRetrySuccess ? "↻ " : ""}
-                            {displayName}
-                            {activity.summary ? ` — ${activity.summary}` : ""}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+              <div className="flex-1 rounded-lg bg-slate-800 p-3">
+                <NarrativeView turn={narrative} />
               </div>
             </div>
           )}

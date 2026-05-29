@@ -124,6 +124,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import (
+    AIFallbackMode,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -264,6 +265,7 @@ def _format_payload_path_segment(key: str) -> str:
 
 # ForLoop constants
 DEFAULT_MAX_LOOP_ITERATIONS = 500
+MAX_LOOP_OVER_VALUE_LOG_CHARS = 2000
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
@@ -2232,7 +2234,13 @@ class ForLoopBlock(Block):
                     block_outputs=block_outputs,
                     last_block=current_block,
                 )
-            LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+            loop_over_value_repr = repr(loop_over_value)
+            if len(loop_over_value_repr) > MAX_LOOP_OVER_VALUE_LOG_CHARS:
+                loop_over_value_repr = (
+                    loop_over_value_repr[:MAX_LOOP_OVER_VALUE_LOG_CHARS]
+                    + f"...[truncated, original size: {len(loop_over_value_repr)}]"
+                )
+            LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
 
             # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
             loop_context = skyvern_context.current()
@@ -5785,6 +5793,9 @@ class ActionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
 
 
 class NavigationBlock(BaseTaskBlock):

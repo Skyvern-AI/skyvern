@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
+from typing import cast as typing_cast
 
 import structlog
 from sqlalchemy import Text, and_, cast, exists, func, literal, literal_column, or_, select, update
@@ -12,6 +13,7 @@ from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 
@@ -118,7 +120,7 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunStatus.running,
                 WorkflowRunStatus.paused,
             ]
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_threshold_hours)
+            stale_cutoff = naive_utc_now() - timedelta(hours=stale_threshold_hours)
 
             # Count active workflow runs (recently updated)
             active_query = (
@@ -242,11 +244,11 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    workflow_run.queued_at = datetime.now(timezone.utc)
+                    workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
-                    workflow_run.started_at = datetime.now(timezone.utc)
+                    workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
-                    workflow_run.finished_at = datetime.now(timezone.utc)
+                    workflow_run.finished_at = naive_utc_now()
                 if failure_reason:
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
@@ -293,11 +295,11 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_category = failure_category
                 # Explicit timestamp overrides (used when resetting workflow runs)
                 if started_at is not _UNSET:
-                    workflow_run.started_at = started_at
+                    workflow_run.started_at = to_naive_utc(typing_cast(datetime | None, started_at))
                 if queued_at is not _UNSET:
-                    workflow_run.queued_at = queued_at
+                    workflow_run.queued_at = to_naive_utc(typing_cast(datetime | None, queued_at))
                 if finished_at is not _UNSET:
-                    workflow_run.finished_at = finished_at
+                    workflow_run.finished_at = to_naive_utc(typing_cast(datetime | None, finished_at))
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -348,7 +350,7 @@ class WorkflowRunsRepository(BaseRepository):
         existing value via ``COALESCE``).
         """
         non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
-        now = datetime.now(timezone.utc)
+        now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
             values["finished_at"] = now

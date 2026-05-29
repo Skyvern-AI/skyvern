@@ -11,6 +11,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.schemas.workflows import BlockType
+from skyvern.webeye.actions.actions import ExtractAction
 
 
 def _block(
@@ -19,6 +20,7 @@ def _block(
     parent_id: str | None = None,
     created_at: datetime,
     block_type: BlockType = BlockType.TASK,
+    task_id: str | None = None,
 ) -> WorkflowRunBlock:
     return WorkflowRunBlock(
         workflow_run_block_id=block_id,
@@ -26,6 +28,7 @@ def _block(
         organization_id="o_test",
         parent_workflow_run_block_id=parent_id,
         block_type=block_type,
+        task_id=task_id,
         created_at=created_at,
         modified_at=created_at,
     )
@@ -101,6 +104,28 @@ async def test_timeline_preserves_deep_nesting(mock_db: AsyncMock) -> None:
     assert cond_node.block is not None and cond_node.block.workflow_run_block_id == "wrb_cond"
     child_ids = {child.block.workflow_run_block_id for child in cond_node.children if child.block is not None}
     assert child_ids == {"wrb_a", "wrb_b"}
+
+
+@pytest.mark.asyncio
+async def test_timeline_attaches_actions_to_conditional_blocks(mock_db: AsyncMock) -> None:
+    """Conditional prompt evaluation actions should appear on the conditional row."""
+    base = datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc)
+    conditional = _block(
+        "wrb_cond",
+        created_at=base,
+        block_type=BlockType.CONDITIONAL,
+        task_id="tsk_cond_eval",
+    )
+    action = ExtractAction(action_id="act_cond_extract", task_id="tsk_cond_eval")
+    mock_db.return_value = [conditional]
+    app.DATABASE.tasks.get_tasks_actions.return_value = [action]
+
+    service = WorkflowService()
+    timeline = await service.get_workflow_run_timeline(workflow_run_id="wr_test", organization_id="o_test")
+
+    assert len(timeline) == 1
+    assert timeline[0].block is not None
+    assert timeline[0].block.actions == [action]
 
 
 @pytest.mark.asyncio

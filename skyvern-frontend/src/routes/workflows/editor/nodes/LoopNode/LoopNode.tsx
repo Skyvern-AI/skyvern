@@ -155,7 +155,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
         />
         <div
           className={cn(
-            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-all motion-reduce:transition-none",
+            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
             {
               "pointer-events-none": thisBlockIsPlaying,
               "bg-slate-950 outline outline-2 outline-slate-300":
@@ -206,7 +206,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
           <div
             ref={headerRef}
             className={cn(
-              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all motion-reduce:transition-none",
+              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
               open ? "shadow-md" : "shadow-sm",
               {
                 "pointer-events-none": thisBlockIsPlaying,

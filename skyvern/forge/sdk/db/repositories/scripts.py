@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.id import generate_script_block_id, generate_script_file_id
 from skyvern.forge.sdk.db.models import (
@@ -257,7 +258,7 @@ class ScriptsRepository(BaseRepository):
                 update(ScriptModel)
                 .filter_by(script_revision_id=script_revision_id)
                 .filter_by(organization_id=organization_id)
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
             await session.commit()
 
@@ -278,7 +279,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptFile:
         """Create a script file. Idempotent on (script_revision_id, file_path)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             stmt = (
                 insert(ScriptFileModel)
                 .values(
@@ -343,7 +344,7 @@ class ScriptsRepository(BaseRepository):
     ) -> ScriptBlock:
         """Create a script block. Idempotent on (script_revision_id, script_block_label)."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             stmt = (
                 insert(ScriptBlockModel)
                 .values(
@@ -414,7 +415,7 @@ class ScriptsRepository(BaseRepository):
         calling this method.
         """
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             insert_values = {
                 "script_block_id": generate_script_block_id(),
                 "script_revision_id": script_revision_id,
@@ -691,7 +692,7 @@ class ScriptsRepository(BaseRepository):
     ) -> WorkflowScriptUpsertResult:
         """Create/update an active workflow-script mapping with sticky-pin semantics."""
         async with self.Session() as session:
-            now = datetime.now(timezone.utc)
+            now = naive_utc_now()
             status_value = status.value if isinstance(status, ScriptStatus) else status
             existing_rows = (
                 await session.scalars(
@@ -951,7 +952,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
 
             result = await session.execute(stmt)
@@ -979,7 +980,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
             result = await session.execute(stmt)
             await session.commit()
@@ -1050,7 +1051,7 @@ class ScriptsRepository(BaseRepository):
                         WorkflowScriptModel.deleted_at.is_(None),
                     )
                 )
-                .values(deleted_at=datetime.now(timezone.utc))
+                .values(deleted_at=naive_utc_now())
             )
 
             if statuses:
@@ -1286,7 +1287,7 @@ class ScriptsRepository(BaseRepository):
                 )
                 .values(
                     is_pinned=True,
-                    pinned_at=datetime.now(timezone.utc),
+                    pinned_at=naive_utc_now(),
                     pinned_by=pinned_by,
                 )
             )
@@ -1444,7 +1445,7 @@ class ScriptsRepository(BaseRepository):
             values["new_script_revision_id"] = new_script_revision_id
         if not values:
             return
-        values["modified_at"] = datetime.now(timezone.utc)
+        values["modified_at"] = naive_utc_now()
         async with self.Session() as session:
             await session.execute(
                 update(ScriptFallbackEpisodeModel)
@@ -1600,7 +1601,7 @@ class ScriptsRepository(BaseRepository):
                         new_script_revision_id, ScriptFallbackEpisodeModel.new_script_revision_id
                     ),
                     reviewer_version=func.coalesce(reviewer_version, ScriptFallbackEpisodeModel.reviewer_version),
-                    modified_at=datetime.now(timezone.utc),
+                    modified_at=naive_utc_now(),
                 )
             )
             await session.commit()
@@ -1690,7 +1691,7 @@ class ScriptsRepository(BaseRepository):
         branch_key: str,
     ) -> None:
         """Record a classify branch hit, upserting the hit count and last_hit_at."""
-        now = datetime.now(timezone.utc)
+        now = naive_utc_now()
         async with self.Session() as session:
             stmt = insert(ScriptBranchHitModel).values(
                 organization_id=organization_id,
@@ -1725,7 +1726,7 @@ class ScriptsRepository(BaseRepository):
         limit: int = 200,
     ) -> list[ScriptBranchHit]:
         """Get branches that haven't been accessed in stale_days days."""
-        cutoff = datetime.now(timezone.utc) - timedelta(days=stale_days)
+        cutoff = naive_utc_now() - timedelta(days=stale_days)
         async with self.Session() as session:
             query = (
                 select(ScriptBranchHitModel)

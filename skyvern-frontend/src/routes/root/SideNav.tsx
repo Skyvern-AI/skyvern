@@ -1,7 +1,6 @@
 import {
   BookmarkIcon,
   CalendarIcon,
-  Component1Icon,
   CounterClockwiseClockIcon,
   DesktopIcon,
   DotsHorizontalIcon,
@@ -26,6 +25,7 @@ import { HospitalIcon } from "@/components/icons/HospitalIcon";
 import { InboxIcon } from "@/components/icons/InboxIcon";
 import { KeyIcon } from "@/components/icons/KeyIcon";
 import { LogisticsIcon } from "@/components/icons/LogisticsIcon";
+import { N8nIcon } from "@/components/icons/N8nIcon";
 import { ReceiptIcon } from "@/components/icons/ReceiptIcon";
 import { RobotIcon } from "@/components/icons/RobotIcon";
 import {
@@ -205,7 +205,7 @@ function SideNav() {
         {
           label: "n8n",
           to: "/integrations?query=n8n",
-          icon: <Component1Icon className="size-3.5" />,
+          icon: <N8nIcon className="size-3.5" />,
         },
         {
           label: "More",
