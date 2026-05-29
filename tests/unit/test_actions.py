@@ -3,7 +3,14 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from skyvern.webeye.actions.actions import Action, ClickAction, KeypressAction, NullAction, WebAction
+from skyvern.webeye.actions.actions import (
+    Action,
+    ClickAction,
+    KeypressAction,
+    NullAction,
+    SelectOptionAction,
+    WebAction,
+)
 from skyvern.webeye.actions.parse_actions import parse_action
 
 
@@ -168,3 +175,53 @@ def test_parse_click_no_double_click_field() -> None:
     )
     assert isinstance(action, ClickAction)
     assert action.repeat == 1
+
+
+@pytest.mark.parametrize("download_value", [None, False, True])
+def test_parse_select_option_download_field(download_value: bool | None) -> None:
+    """SELECT_OPTION must parse successfully even when LLM returns download: null (SKY-10453)."""
+    action = parse_action(
+        action={
+            "action_type": "SELECT_OPTION",
+            "id": "1",
+            "reasoning": "test",
+            "download": download_value,
+            "option": {"label": "Yes", "index": 1, "value": "Yes"},
+        },
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, SelectOptionAction)
+    expected = download_value if download_value is not None else False
+    assert action.download is expected
+
+
+def test_parse_select_option_download_missing() -> None:
+    """SELECT_OPTION with no download key should default to False."""
+    action = parse_action(
+        action={
+            "action_type": "SELECT_OPTION",
+            "id": "1",
+            "reasoning": "test",
+            "option": {"label": "No", "index": 2, "value": "No"},
+        },
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, SelectOptionAction)
+    assert action.download is False
+
+
+@pytest.mark.parametrize("download_value", [None, False, True])
+def test_parse_click_download_field(download_value: bool | None) -> None:
+    """CLICK must parse successfully even when LLM returns download: null (SKY-10453)."""
+    action = parse_action(
+        action={
+            "action_type": "CLICK",
+            "id": "1",
+            "reasoning": "test",
+            "download": download_value,
+        },
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, ClickAction)
+    expected = download_value if download_value is not None else False
+    assert action.download is expected

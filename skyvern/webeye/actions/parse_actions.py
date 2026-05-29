@@ -149,7 +149,7 @@ def parse_action(
         return ClickAction(
             **base_action_dict,
             file_url=file_url,
-            download=action.get("download", False),
+            download=action.get("download") or False,
             click_context=click_context,
             repeat=2 if double_click else 1,
         )
@@ -200,7 +200,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
-            download=action.get("download", False),
+            download=action.get("download") or False,
         )
 
     if action_type == ActionType.CHECKBOX:
