@@ -108,6 +108,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
     OutputParameter,
+    Parameter,
     WorkflowParameter,
     WorkflowParameterType,
 )
@@ -1562,29 +1563,43 @@ async def _update_workflow(
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 
-        created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
-
-        await app.WORKFLOW_SERVICE.update_workflow_definition(
-            workflow_id=ctx.workflow_id,
-            organization_id=ctx.organization_id,
-            title=workflow.title,
-            description=workflow.description,
-            workflow_definition=workflow.workflow_definition,
-            proxy_location=workflow.proxy_location,
-            webhook_callback_url=workflow.webhook_callback_url,
-            persist_browser_session=workflow.persist_browser_session,
-            browser_profile_id=workflow.browser_profile_id,
-            model=workflow.model,
-            max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
-            extra_http_headers=workflow.extra_http_headers,
-            run_with=workflow.run_with,
-            ai_fallback=workflow.ai_fallback,
-            cache_key=workflow.cache_key,
-            run_sequentially=workflow.run_sequentially,
-            sequential_key=workflow.sequential_key,
-            created_by=created_by_stamp,
-            edited_by="copilot",
-        )
+        # Param / top-level setting changes go through canonical because
+        # prepare_workflow and the runtime parameter-row read consume canonical
+        # values; terminal handlers roll back on non-auto-accept.
+        prior_workflow = await _get_prior_workflow(ctx)
+        requires_canonical_persist = _workflow_requires_canonical_persist(prior_workflow, workflow)
+        if requires_canonical_persist:
+            created_by_stamp = await resolve_copilot_created_by_stamp(ctx.workflow_id, ctx.organization_id)
+            await app.WORKFLOW_SERVICE.update_workflow_definition(
+                workflow_id=ctx.workflow_id,
+                organization_id=ctx.organization_id,
+                title=workflow.title,
+                description=workflow.description,
+                workflow_definition=workflow.workflow_definition,
+                proxy_location=workflow.proxy_location,
+                webhook_callback_url=workflow.webhook_callback_url,
+                totp_verification_url=workflow.totp_verification_url,
+                totp_identifier=workflow.totp_identifier,
+                persist_browser_session=workflow.persist_browser_session,
+                browser_profile_id=workflow.browser_profile_id,
+                model=workflow.model,
+                max_screenshot_scrolling_times=workflow.max_screenshot_scrolls,
+                extra_http_headers=workflow.extra_http_headers,
+                cdp_connect_headers=workflow.cdp_connect_headers,
+                run_with=workflow.run_with,
+                ai_fallback=workflow.ai_fallback,
+                cache_key=workflow.cache_key,
+                adaptive_caching=workflow.adaptive_caching,
+                code_version=workflow.code_version,
+                run_sequentially=workflow.run_sequentially,
+                sequential_key=workflow.sequential_key,
+                created_by=created_by_stamp,
+                edited_by="copilot",
+            )
+            ctx.canonical_was_persisted_due_to_param_change = True
+        ctx.staged_workflow_yaml = workflow_yaml
+        ctx.staged_workflow = workflow
+        ctx.has_staged_proposal = True
         ctx.workflow_yaml = workflow_yaml
         # Best-effort — narrative emit failures must never abort an
         # otherwise-successful update_workflow tool call. ``isinstance``
@@ -1596,12 +1611,6 @@ async def _update_workflow(
                 await emit_workflow_draft(ctx.stream, ctx, workflow)
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
-            # Reset phase flags so a subsequent ``tool_called`` re-edge-triggers
-            # ``design_start`` and a subsequent ``update_workflow`` re-emits
-            # ``design_end`` — multi-iteration designs (draft → test → redraft)
-            # would otherwise collapse into a single phase.
-            ctx.design_start_emitted = False
-            ctx.design_end_emitted = False
         return {
             "ok": True,
             "data": {
@@ -2128,6 +2137,99 @@ async def _get_prior_workflow_definition(ctx: AgentContext) -> Any:
     return None
 
 
+async def _get_prior_workflow(ctx: AgentContext) -> Workflow | None:
+    """Return the prior Workflow; in-memory > re-parsed yaml > DB."""
+    last_workflow = ctx.last_workflow
+    if last_workflow is not None:
+        return last_workflow
+    last_yaml = ctx.last_workflow_yaml
+    if last_yaml:
+        try:
+            return _process_workflow_yaml(
+                workflow_id=ctx.workflow_id,
+                workflow_permanent_id=ctx.workflow_permanent_id,
+                organization_id=ctx.organization_id,
+                workflow_yaml=last_yaml,
+            )
+        except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+            pass
+    try:
+        return await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to fetch prior workflow for staging comparison; staging may skip a needed canonical write",
+            exc_info=True,
+        )
+    return None
+
+
+# Must stay in lockstep with the writers calling update_workflow_definition;
+# missing fields silently drop accepted settings on auto-accept.
+_CANONICAL_WORKFLOW_SETTING_FIELDS: tuple[str, ...] = (
+    "title",
+    "description",
+    "proxy_location",
+    "webhook_callback_url",
+    "totp_verification_url",
+    "totp_identifier",
+    "persist_browser_session",
+    "browser_profile_id",
+    "model",
+    "max_screenshot_scrolls",
+    "extra_http_headers",
+    "cdp_connect_headers",
+    "run_with",
+    "ai_fallback",
+    "cache_key",
+    "adaptive_caching",
+    "code_version",
+    "run_sequentially",
+    "sequential_key",
+)
+
+# convert_workflow_definition regenerates ids/timestamps per call; ignore
+# them when comparing parameters to react only to user intent.
+_PARAMETER_FINGERPRINT_VOLATILE_KEYS = frozenset(
+    {
+        "workflow_parameter_id",
+        "output_parameter_id",
+        "aws_secret_parameter_id",
+        "azure_secret_parameter_id",
+        "azure_vault_credential_parameter_id",
+        "bitwarden_credit_card_data_parameter_id",
+        "bitwarden_login_credential_parameter_id",
+        "bitwarden_sensitive_information_parameter_id",
+        "credential_parameter_id",
+        "onepassword_credential_parameter_id",
+        "created_at",
+        "modified_at",
+    }
+)
+
+
+def _stable_parameter_fingerprint(parameter: Parameter) -> dict[str, Any]:
+    dump = parameter.model_dump(mode="json")
+    return {k: v for k, v in dump.items() if k not in _PARAMETER_FINGERPRINT_VOLATILE_KEYS}
+
+
+def _workflow_requires_canonical_persist(prior: Workflow | None, new: Workflow) -> bool:
+    if prior is None:
+        return False
+    for field_name in _CANONICAL_WORKFLOW_SETTING_FIELDS:
+        if getattr(prior, field_name, None) != getattr(new, field_name, None):
+            return True
+    prior_params = prior.workflow_definition.parameters
+    new_params = new.workflow_definition.parameters
+    if len(prior_params) != len(new_params):
+        return True
+    prior_fingerprints = [_stable_parameter_fingerprint(p) for p in prior_params]
+    new_fingerprints = [_stable_parameter_fingerprint(p) for p in new_params]
+    return prior_fingerprints != new_fingerprints
+
+
 def _plan_frontier(
     ctx: Any,
     requested_labels: list[str],
@@ -2450,10 +2552,13 @@ async def _run_blocks_and_collect_debug(
     # right moment to drop stale outputs. Full success at the end of this
     # function updates verified state in place (overwriting re-run labels).
 
-    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
-        workflow_permanent_id=ctx.workflow_permanent_id,
-        organization_id=ctx.organization_id,
-    )
+    # Common-case staging leaves the canonical row stale; prefer the staged copy.
+    workflow = ctx.staged_workflow
+    if workflow is None:
+        workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+        )
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
@@ -2616,7 +2721,6 @@ async def _run_blocks_and_collect_debug(
     narrator_enabled = narrator_state is not None and narration_handler_available()
     seen_block_states: dict[str, str] = {}
     prior_block_ts: datetime | None = initial_block_ts
-    prior_step_ts: datetime | None = initial_step_ts
     last_block_fetch_monotonic = 0.0
 
     try:
@@ -2630,9 +2734,7 @@ async def _run_blocks_and_collect_debug(
                 tick_result = await narrator_poll_tick(
                     narrator_state,
                     current_block_ts=block_ts,
-                    current_step_ts=step_ts,
                     prior_block_ts=prior_block_ts,
-                    prior_step_ts=prior_step_ts,
                     last_block_fetch_monotonic=last_block_fetch_monotonic,
                     seen_block_states=seen_block_states,
                     fetch_block_statuses=lambda: app.DATABASE.observer.get_workflow_run_blocks(
@@ -2640,9 +2742,11 @@ async def _run_blocks_and_collect_debug(
                         organization_id=ctx.organization_id,
                     ),
                     stream=ctx.stream,
+                    block_state_map=ctx.block_state_map,
+                    block_started_at_map=ctx.block_started_at_map,
+                    block_ended_at_map=ctx.block_ended_at_map,
                 )
                 prior_block_ts = tick_result.prior_block_ts
-                prior_step_ts = tick_result.prior_step_ts
                 last_block_fetch_monotonic = tick_result.last_block_fetch_monotonic
 
             if run and WorkflowRunStatus(run.status).is_final():
@@ -3552,7 +3656,6 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     # to "verify the URL" for a URL they just corrected in the new draft.
     copilot_ctx.last_test_non_retriable_nav_error = None
     copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
-    copilot_ctx.workflow_persisted = True
 
     # Block-running failures keyed off (labels, parameters) go stale once the
     # workflow itself changes — without this clear, a user who fixes the bug

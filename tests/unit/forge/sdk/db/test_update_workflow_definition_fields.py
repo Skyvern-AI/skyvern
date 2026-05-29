@@ -1,13 +1,14 @@
 """Regression tests for ``WorkflowsRepository.update_workflow_and_reconcile_definition_params``.
 
-Covers the 12 workflow-level fields that were newly threaded through
+Covers the 16 workflow-level fields that were newly threaded through
 ``WorkflowService.update_workflow_definition`` in the copilot-v2 stack:
 
-- ``_UNSET``-guarded (7): ``proxy_location``, ``webhook_callback_url``,
+- ``_UNSET``-guarded (11): ``proxy_location``, ``webhook_callback_url``,
   ``model``, ``max_screenshot_scrolling_times``, ``extra_http_headers``,
-  ``sequential_key``, ``browser_profile_id``.  Omitting the kwarg must
+  ``sequential_key``, ``browser_profile_id``, ``totp_verification_url``,
+  ``totp_identifier``, ``adaptive_caching``, ``code_version``. Omitting the kwarg must
   leave the persisted value unchanged; passing explicit ``None`` clears
-  the column.
+  nullable columns.
 - bare-``None`` (5): ``persist_browser_session``, ``run_with``,
   ``ai_fallback``, ``cache_key``, ``run_sequentially``.  Both omitting
   the kwarg and passing ``None`` must leave the persisted value
@@ -51,7 +52,7 @@ async def agent_db(db_engine: Any) -> AsyncGenerator[AgentDB]:
 
 @pytest_asyncio.fixture
 async def seeded_workflow(agent_db: AgentDB) -> dict[str, str]:
-    """Create a workflow with every one of the 11 threaded fields pre-set.
+    """Create a workflow with every one of the threaded fields pre-set.
 
     Distinct, non-default values are chosen so a silent clobber to ``None``
     or the column default is observable in assertions.
@@ -67,6 +68,8 @@ async def seeded_workflow(agent_db: AgentDB) -> dict[str, str]:
         organization_id=org.organization_id,
         proxy_location=ProxyLocation.RESIDENTIAL,
         webhook_callback_url="https://example.com/webhook",
+        totp_verification_url="https://example.com/totp",
+        totp_identifier="seed-totp-identifier",
         max_screenshot_scrolling_times=7,
         extra_http_headers={"X-Seed": "yes"},
         persist_browser_session=True,
@@ -75,6 +78,8 @@ async def seeded_workflow(agent_db: AgentDB) -> dict[str, str]:
         run_with="agent",
         ai_fallback=False,
         cache_key="seed-cache-key",
+        adaptive_caching=True,
+        code_version=1,
         run_sequentially=True,
         sequential_key="seed-sequential-key",
     )
@@ -205,7 +210,7 @@ async def test_update_workflow_dispatch_state_if_latest_rejects_stale_version(ag
 async def test_omitting_all_workflow_level_fields_preserves_seed(
     agent_db: AgentDB, seeded_workflow: dict[str, str]
 ) -> None:
-    """Omitting every kwarg except title must leave all 11 fields intact."""
+    """Omitting every kwarg except title must leave all threaded fields intact."""
     await agent_db.workflows.update_workflow_and_reconcile_definition_params(
         workflow_id=seeded_workflow["workflow_id"],
         organization_id=seeded_workflow["organization_id"],
@@ -217,6 +222,8 @@ async def test_omitting_all_workflow_level_fields_preserves_seed(
     # Every threaded field survives the omit-kwargs call:
     assert workflow.proxy_location == ProxyLocation.RESIDENTIAL
     assert workflow.webhook_callback_url == "https://example.com/webhook"
+    assert workflow.totp_verification_url == "https://example.com/totp"
+    assert workflow.totp_identifier == "seed-totp-identifier"
     assert workflow.max_screenshot_scrolls == 7
     assert workflow.extra_http_headers == {"X-Seed": "yes"}
     assert workflow.persist_browser_session is True
@@ -225,6 +232,8 @@ async def test_omitting_all_workflow_level_fields_preserves_seed(
     assert workflow.run_with == "agent"
     assert workflow.ai_fallback is False
     assert workflow.cache_key == "seed-cache-key"
+    assert workflow.adaptive_caching is True
+    assert workflow.code_version == 1
     assert workflow.run_sequentially is True
     assert workflow.sequential_key == "seed-sequential-key"
 
@@ -268,21 +277,27 @@ async def test_passing_none_to_unset_guarded_fields_clears_them(
         organization_id=seeded_workflow["organization_id"],
         proxy_location=None,
         webhook_callback_url=None,
+        totp_verification_url=None,
+        totp_identifier=None,
         model=None,
         max_screenshot_scrolling_times=None,
         extra_http_headers=None,
         sequential_key=None,
         browser_profile_id=None,
+        code_version=None,
     )
     workflow = await _get(agent_db, seeded_workflow)
 
     assert workflow.proxy_location is None
     assert workflow.webhook_callback_url is None
+    assert workflow.totp_verification_url is None
+    assert workflow.totp_identifier is None
     assert workflow.model is None
     assert workflow.max_screenshot_scrolls is None
     assert workflow.extra_http_headers is None
     assert workflow.sequential_key is None
     assert workflow.browser_profile_id is None
+    assert workflow.code_version is None
 
 
 async def test_setting_new_values_persists_across_all_fields(
@@ -294,6 +309,8 @@ async def test_setting_new_values_persists_across_all_fields(
         organization_id=seeded_workflow["organization_id"],
         proxy_location=ProxyLocation.US_CA,
         webhook_callback_url="https://example.com/webhook/new",
+        totp_verification_url="https://example.com/totp/new",
+        totp_identifier="new-totp-identifier",
         max_screenshot_scrolling_times=12,
         extra_http_headers={"X-Updated": "yes"},
         persist_browser_session=False,
@@ -302,6 +319,8 @@ async def test_setting_new_values_persists_across_all_fields(
         run_with="code",
         ai_fallback=True,
         cache_key="new-cache-key",
+        adaptive_caching=False,
+        code_version=2,
         run_sequentially=False,
         sequential_key="new-sequential-key",
     )
@@ -309,6 +328,8 @@ async def test_setting_new_values_persists_across_all_fields(
 
     assert workflow.proxy_location == ProxyLocation.US_CA
     assert workflow.webhook_callback_url == "https://example.com/webhook/new"
+    assert workflow.totp_verification_url == "https://example.com/totp/new"
+    assert workflow.totp_identifier == "new-totp-identifier"
     assert workflow.max_screenshot_scrolls == 12
     assert workflow.extra_http_headers == {"X-Updated": "yes"}
     assert workflow.persist_browser_session is False
@@ -317,5 +338,7 @@ async def test_setting_new_values_persists_across_all_fields(
     assert workflow.run_with == "code"
     assert workflow.ai_fallback is True
     assert workflow.cache_key == "new-cache-key"
+    assert workflow.adaptive_caching is False
+    assert workflow.code_version == 2
     assert workflow.run_sequentially is False
     assert workflow.sequential_key == "new-sequential-key"

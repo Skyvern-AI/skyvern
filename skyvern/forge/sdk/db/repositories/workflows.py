@@ -626,11 +626,13 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
-        code_version: int | None = None,
+        code_version: int | None | object = _UNSET,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -639,6 +641,7 @@ class WorkflowsRepository(BaseRepository):
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
+        adaptive_caching: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -663,8 +666,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.run_with = run_with
                 if cache_key is not None:
                     workflow.cache_key = cache_key
-                if code_version is not None:
-                    workflow.code_version = code_version
+                if code_version is not _UNSET:
+                    workflow.code_version = cast(int | None, code_version)
                 if status is not None:
                     workflow.status = status
                 if import_error is not None:
@@ -673,6 +676,10 @@ class WorkflowsRepository(BaseRepository):
                     workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
                 if webhook_callback_url is not _UNSET:
                     workflow.webhook_callback_url = webhook_callback_url
+                if totp_verification_url is not _UNSET:
+                    workflow.totp_verification_url = cast(str | None, totp_verification_url)
+                if totp_identifier is not _UNSET:
+                    workflow.totp_identifier = cast(str | None, totp_identifier)
                 if persist_browser_session is not None:
                     workflow.persist_browser_session = persist_browser_session
                 if browser_profile_id is not _UNSET:
@@ -689,6 +696,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.cdp_connect_headers = cdp_connect_headers
                 if ai_fallback is not None:
                     workflow.ai_fallback = ai_fallback
+                if adaptive_caching is not _UNSET:
+                    workflow.adaptive_caching = cast(bool, adaptive_caching)
                 if run_sequentially is not None:
                     workflow.run_sequentially = run_sequentially
                 if sequential_key is not _UNSET:
@@ -927,10 +936,13 @@ class WorkflowsRepository(BaseRepository):
         version: int | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
+        code_version: int | None | object = _UNSET,
         status: str | None = None,
         import_error: str | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -939,6 +951,7 @@ class WorkflowsRepository(BaseRepository):
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
+        adaptive_caching: bool | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -999,6 +1012,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.run_with = run_with
             if cache_key is not None:
                 workflow.cache_key = cache_key
+            if code_version is not _UNSET:
+                workflow.code_version = cast(int | None, code_version)
             if status is not None:
                 workflow.status = status
             if import_error is not None:
@@ -1007,6 +1022,10 @@ class WorkflowsRepository(BaseRepository):
                 workflow.proxy_location = serialize_proxy_location(cast(ProxyLocationInput, proxy_location))
             if webhook_callback_url is not _UNSET:
                 workflow.webhook_callback_url = webhook_callback_url
+            if totp_verification_url is not _UNSET:
+                workflow.totp_verification_url = cast(str | None, totp_verification_url)
+            if totp_identifier is not _UNSET:
+                workflow.totp_identifier = cast(str | None, totp_identifier)
             if persist_browser_session is not None:
                 workflow.persist_browser_session = persist_browser_session
             if browser_profile_id is not _UNSET:
@@ -1023,6 +1042,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.cdp_connect_headers = cdp_connect_headers
             if ai_fallback is not None:
                 workflow.ai_fallback = ai_fallback
+            if adaptive_caching is not _UNSET:
+                workflow.adaptive_caching = cast(bool, adaptive_caching)
             if run_sequentially is not None:
                 workflow.run_sequentially = run_sequentially
             if sequential_key is not _UNSET:

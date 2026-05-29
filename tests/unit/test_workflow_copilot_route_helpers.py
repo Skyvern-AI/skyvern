@@ -32,6 +32,7 @@ def _agent_result(
     proposal_disposition: str = "auto_applicable",
     cancelled: bool = False,
     updated_workflow: Any = None,
+    canonical_was_persisted_due_to_param_change: bool = False,
     **kwargs: Any,
 ) -> MagicMock:
     """MagicMock with override flags explicitly set so a forgotten attr can't pass via MagicMock truthiness."""
@@ -40,6 +41,10 @@ def _agent_result(
     r.proposal_disposition = proposal_disposition
     r.cancelled = cancelled
     r.updated_workflow = updated_workflow
+    # SKY-10318: explicitly set the new staging flag so MagicMock truthiness
+    # doesn't accidentally trigger the degraded-path branch in
+    # `_should_restore_persisted_workflow`.
+    r.canonical_was_persisted_due_to_param_change = canonical_was_persisted_due_to_param_change
     for k, v in kwargs.items():
         setattr(r, k, v)
     return r
