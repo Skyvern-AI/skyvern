@@ -270,14 +270,14 @@ def test_phase_tool_error_returns_none_when_phase_attr_missing() -> None:
             BuildPhase.INITIAL,
             "build_phase_browser_blocked_pre_compose",
             "ask_user_clarifying",
-            frozenset(),
+            frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
         ),
         (
             "update_workflow",
             BuildPhase.INITIAL,
             "build_phase_mutation_blocked_pre_compose",
             "ask_user_clarifying",
-            frozenset(),
+            frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
         ),
     ],
 )

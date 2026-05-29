@@ -50,12 +50,12 @@ def test_recoverable_blocker_does_not_clear_on_unrelated_tool_success() -> None:
     assert ctx.blocker_signal is signal
 
 
-def test_loop_blocker_stays_sticky_on_any_success() -> None:
+def test_loop_blocker_clears_on_progress_tool_success() -> None:
     ctx = _ctx()
     signal = _signal(kind="loop_detected", cleared_by=frozenset(), reason="loop_detected_generic")
     ctx.blocker_signal = signal
     record_tool_step_result_for_ctx(ctx, "update_workflow", {"workflow_yaml": "y"}, {"ok": True})
-    assert ctx.blocker_signal is signal
+    assert ctx.blocker_signal is None
 
 
 def test_terminal_tool_error_stays_sticky_on_any_success() -> None:

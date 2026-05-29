@@ -101,8 +101,12 @@ class TestCopilotContext:
         frontier_fields = {
             "verified_block_outputs",
             "verified_prefix_labels",
+            "verified_prefix_current_url",
+            "last_run_blocks_workflow_run_id",
             "last_requested_block_labels",
             "last_executed_block_labels",
+            "last_full_workflow_test_ok",
+            "last_unverified_block_labels",
             "last_frontier_start_label",
             "last_frontier_fingerprint",
             "last_failure_signature",
@@ -126,8 +130,12 @@ class TestCopilotContext:
         )
         assert ctx.verified_block_outputs == {}
         assert ctx.verified_prefix_labels == []
+        assert ctx.verified_prefix_current_url is None
+        assert ctx.last_run_blocks_workflow_run_id is None
         assert ctx.last_requested_block_labels == []
         assert ctx.last_executed_block_labels == []
+        assert ctx.last_full_workflow_test_ok is False
+        assert ctx.last_unverified_block_labels == []
         assert ctx.last_frontier_start_label is None
         assert ctx.last_frontier_fingerprint is None
         assert ctx.last_failure_signature is None

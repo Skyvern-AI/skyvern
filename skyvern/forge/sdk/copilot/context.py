@@ -101,6 +101,7 @@ class StructuredContext(BaseModel):
     # AgentResult.global_llm_context — finalized deterministically at every
     # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
     discovery_calls_made: int = 0
+    page_inspection_calls_made: int = 0
 
     def to_json_str(self) -> str:
         return self.model_dump_json(indent=2)
@@ -185,10 +186,13 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     """
     prior = int(getattr(ctx, "prior_discovery_calls_made", 0) or 0)
     this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
-    if not raw_context and this_turn == 0:
+    prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
+    inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    if not raw_context and this_turn == 0 and inspections_this_turn == 0:
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
+    sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     return sc.to_json_str()
 
 
@@ -300,6 +304,13 @@ class CopilotContext(AgentContext):
     # retry" requests.
     pending_reconciliation_run_id: str | None = None
     pending_reconciliation_requires_user_input: bool = False
+    # Block-running tools make their own run context available for same-turn
+    # reporting. This is deliberately not persisted across turns. The
+    # successful variant is kept for "default to the last clean result"; the
+    # generic variant allows the agent to re-read the same failed/canceled run
+    # after a watchdog reconciliation read has cleared the retry guard.
+    last_run_blocks_workflow_run_id: str | None = None
+    last_successful_run_blocks_workflow_run_id: str | None = None
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck
@@ -321,6 +332,12 @@ class CopilotContext(AgentContext):
     # label away from navigation. Prevents rerunning the same oversized
     # navigation block unchanged.
     per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
+    # Armed when a PER_TOOL_BUDGET run leaves the browser on a meaningful page.
+    # The next block-running call must be preceded by page inspection so the
+    # agent recovers from observed state instead of replaying the same search.
+    post_budget_page_inspection_required: bool = False
+    post_budget_page_inspection_url: str | None = None
+    post_budget_page_inspection_run_id: str | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -329,8 +346,11 @@ class CopilotContext(AgentContext):
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
+    last_full_workflow_test_ok: bool = False
+    last_unverified_block_labels: list[str] = field(default_factory=list)
     last_frontier_start_label: str | None = None
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
@@ -382,6 +402,8 @@ class CopilotContext(AgentContext):
     # Hydrated from inbound StructuredContext.discovery_calls_made at turn start.
     prior_discovery_calls_made: int = 0
     discovery_calls_this_turn: int = 0
+    prior_page_inspection_calls_made: int = 0
+    page_inspection_calls_this_turn: int = 0
     discovery_step_count: int = 0
     discovery_started_monotonic: float | None = None
     discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)

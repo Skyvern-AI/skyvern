@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from skyvern.config import settings
 
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
-DEFAULT_MAX_TURNS = 25
+DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000
 
 SCREENSHOT_DROPPED_NUDGE = (
@@ -35,9 +35,10 @@ POST_NAVIGATE_NUDGE = (
 POST_INTERMEDIATE_SUCCESS_NUDGE = (
     "STOP — do NOT respond to the user yet. "
     "Your workflow only covers a subset of what the user asked for. "
-    "You MUST add the next block now: call update_and_run_blocks with the current "
-    "block chain. The tool preserves verified prefix state and reruns only the "
-    "invalidated frontier, so passing the full chain is cheap. "
+    "You MUST add the next block now: call update_and_run_blocks with the complete "
+    "workflow YAML, but pass only the next 1-2 unverified block labels when the "
+    "workflow has several page-changing stages. Keep later blocks in the YAML; "
+    "shrink only the block_labels test frontier. "
     "Only respond to the user when every distinct action they requested is covered "
     "by a workflow block, or you have clear evidence that continuing is infeasible."
 )
@@ -175,19 +176,24 @@ POST_PER_TOOL_BUDGET_NUDGE = (
     "Do NOT retry the same chain. Do NOT change navigation_goal wording or "
     "selectors hoping it will run faster.\n"
     "1. Call get_run_results for the budgeted run. If it shows a navigation "
-    "block was canceled or failed, do NOT run that same label again unchanged; "
-    "split or replace it first.\n"
-    "2. Shrink the requested block_labels list to the first 1-2 unverified "
+    "block was canceled or failed, do NOT run that same label again unchanged.\n"
+    "2. If get_run_results includes a current_url, inspect the current page "
+    'before running anything else. Use inspect_page_for_composition(target_url="current_page"), '
+    "evaluate, or get_browser_screenshot. If the requested answer or a no-results "
+    "state is visible, answer from that evidence instead of rerunning the search.\n"
+    "3. If inspection shows a real missing state change, split or replace the "
+    "oversized block and shrink the requested block_labels list to the first 1-2 unverified "
     "blocks. The verified-prefix optimization will replay any earlier blocks "
     "from cached state without re-running the browser, so passing a smaller "
     "frontier is cheap.\n"
-    "3. For page-state work, prefer a code or validation block to verify DOM "
-    "state, active chips, checked controls, field values, or URL deltas. Use a "
-    "navigation block only when missing state must be changed through the UI, "
-    "and keep it to one atomic action.\n"
-    "4. Test the smaller frontier. If it succeeds, extend by one block at a "
+    "4. For page-state work, inspect the live page evidence already gathered "
+    "or use browser inspection tools before deciding what is missing. Use a "
+    "validation block only when the reusable workflow needs a durable semantic "
+    "or visual check; use navigation only when missing state must be changed "
+    "through the UI.\n"
+    "5. Test the smaller frontier. If it succeeds, extend by one block at a "
     "time on subsequent calls.\n"
-    "5. If your workflow only has 1-2 blocks and one block is still hitting "
+    "6. If your workflow only has 1-2 blocks and one block is still hitting "
     "the budget, the single block is too ambitious — either narrow its scope, "
     "replace it with DOM/state verification plus smaller actions, or reply "
     "with a blocker explanation."

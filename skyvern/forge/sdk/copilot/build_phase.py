@@ -217,7 +217,7 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
             ),
             user_facing_reason="I need to know what site to work on before I can browse there. What URL should I use?",
             recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset(),
+            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
             internal_reason_code="build_phase_browser_blocked_pre_compose",
             blocked_tool=tool_name,
         )
@@ -232,7 +232,7 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
             ),
             user_facing_reason="I need to know what site to work on before I can build a workflow. What URL should I use?",
             recovery_hint="ask_user_clarifying",
-            cleared_by_tools=frozenset(),
+            cleared_by_tools=frozenset({"discover_workflow_entrypoint", "update_workflow", "update_and_run_blocks"}),
             internal_reason_code="build_phase_mutation_blocked_pre_compose",
             blocked_tool=tool_name,
         )

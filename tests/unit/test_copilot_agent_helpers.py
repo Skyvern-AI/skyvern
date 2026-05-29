@@ -293,7 +293,12 @@ class TestVerifiedWorkflowOrNone:
         from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 
         wf = self._wf()
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="foo: bar", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="foo: bar",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         assert _verified_workflow_or_none(ctx) == (wf, "foo: bar")
 
     def test_zeros_when_test_failed(self) -> None:
@@ -865,7 +870,12 @@ workflow_definition:
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", boom)
 
-        ctx = _ctx(last_workflow=tested_wf, last_workflow_yaml="tested: yaml", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=tested_wf,
+            last_workflow_yaml="tested: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "here", "workflow_yaml": "::: not yaml"}
         )
@@ -1185,6 +1195,7 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
@@ -1203,6 +1214,7 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
@@ -1370,7 +1382,12 @@ workflow_definition:
 
     def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
         wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="title: drafted", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
         agent_result = asyncio.run(
             agent_module._translate_to_agent_result(
