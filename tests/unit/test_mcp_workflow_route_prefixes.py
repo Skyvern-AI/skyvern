@@ -1,8 +1,8 @@
 """Guard test for MCP workflow raw-HTTP route prefix choices.
 
 Keeps public vs internal route prefix assignments stable:
-- list / create / update / update_folder → ``v1/workflows`` (public, mirrors the
-  Fern-generated raw client at ``skyvern/client/raw_client.py``).
+- list / create / update / update_folder / retry → ``v1/workflows`` (public,
+  mirrors the Fern-generated raw client at ``skyvern/client/raw_client.py``).
 - get / run-status → ``api/v1/workflows`` (internal, used only where no public
   Fern SDK equivalent exists yet).
 
@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import ast
 import inspect
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.cli.mcp_tools import _workflow_http
+from skyvern.cli.mcp_tools import workflow as workflow_tools
+from skyvern.client.errors import BadRequestError
 
 
 @pytest.fixture
@@ -81,6 +84,60 @@ async def test_update_workflow_uses_public_route(capture_request: MagicMock) -> 
 async def test_update_workflow_folder_uses_public_route(capture_request: MagicMock) -> None:
     await _workflow_http.update_workflow_folder_raw("wpid_x", folder_id=None)
     assert _route(capture_request).startswith(_workflow_http.PUBLIC_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_uses_public_route(capture_request: MagicMock) -> None:
+    await _workflow_http.retry_workflow_run_raw("wr_x")
+    assert _route(capture_request).startswith(_workflow_http.PUBLIC_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_bad_request_uses_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def raise_bad_request(workflow_run_id: str) -> dict[str, object]:
+        raise BadRequestError(body={"detail": f"Workflow run {workflow_run_id} is not terminal"})
+
+    monkeypatch.setattr(workflow_tools, "retry_workflow_run_raw", raise_bad_request)
+
+    result = await workflow_tools.skyvern_workflow_retry("wr_x")
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "Workflow run wr_x is not terminal"
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_list_fetches_extra_row_for_has_more(monkeypatch: pytest.MonkeyPatch) -> None:
+    list_mock = AsyncMock(
+        return_value=[
+            SimpleNamespace(workflow_run_id="wr_1", status="completed"),
+            SimpleNamespace(workflow_run_id="wr_2", status="completed"),
+            SimpleNamespace(workflow_run_id="wr_3", status="completed"),
+        ]
+    )
+    monkeypatch.setattr(workflow_tools, "list_workflow_runs_raw", list_mock)
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", page=1, page_size=2)
+
+    assert result["ok"] is True
+    list_mock.assert_awaited_once_with(
+        "wpid_x",
+        page=1,
+        page_size=3,
+        status=None,
+        search_key=None,
+        error_code=None,
+    )
+    assert result["data"]["count"] == 2
+    assert result["data"]["has_more"] is True
+    assert [run["run_id"] for run in result["data"]["runs"]] == ["wr_1", "wr_2"]
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_rejects_task_run_ids() -> None:
+    result = await workflow_tools.skyvern_workflow_retry("tsk_v2_x")
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "Invalid workflow_run_id format: 'tsk_v2_x'"
 
 
 @pytest.mark.asyncio

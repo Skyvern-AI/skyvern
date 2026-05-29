@@ -16,9 +16,12 @@ import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYaml
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
 import { getSseClient } from "@/api/sse";
+import { cn } from "@/util/utils";
 import {
   WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
+  WorkflowCopilotDesignEndUpdate,
+  WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -27,23 +30,24 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotTurnStartUpdate,
+  WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
 import {
-  ToolActivity,
-  applyBlockProgress,
-  applyToolCall,
-  applyToolResult,
-  getActivityDotClass,
-} from "./toolActivity";
-import {
   shouldQueuePromptForLiveBrowser,
   shouldWaitForLiveBrowser,
 } from "./browserReadiness";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
+import { NarrativeView } from "./NarrativeView";
+import {
+  EMPTY_NARRATIVE,
+  TurnNarrativeState,
+  applyNarrativeEvent,
+} from "./narrativeState";
 
 interface ChatMessage {
   id: string;
@@ -70,26 +74,11 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
-  | WorkflowCopilotBlockProgressUpdate;
-
-const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  update_workflow: "Updating workflow",
-  update_and_run_blocks: "Updating & running blocks",
-  list_credentials: "Listing credentials",
-  get_block_schema: "Looking up block schema",
-  validate_block: "Validating block",
-  run_blocks_and_collect_debug: "Running blocks",
-  get_run_results: "Getting run results",
-  get_browser_screenshot: "Taking screenshot",
-  navigate_browser: "Navigating browser",
-  evaluate: "Inspecting the page",
-  click: "Clicking on the page",
-  type_text: "Filling a field",
-  scroll: "Scrolling",
-  console_messages: "Reading console",
-  select_option: "Selecting option",
-  press_key: "Pressing key",
-};
+  | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotTurnStartUpdate
+  | WorkflowCopilotDesignStartUpdate
+  | WorkflowCopilotDesignEndUpdate
+  | WorkflowCopilotWorkflowDraftUpdate;
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -111,19 +100,22 @@ const MessageItem = memo(({ message, footer }: MessageItemProps) => {
   return (
     <div className="flex items-start gap-3">
       <div
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ${
-          message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
-        }`}
+        className={cn(
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold",
+          message.sender === "ai"
+            ? "bg-neutral-950 text-white dark:bg-neutral-100 dark:text-neutral-950"
+            : "bg-neutral-200 text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100",
+        )}
       >
         {message.sender === "ai" ? "AI" : "U"}
       </div>
-      <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
-        <p className="whitespace-pre-wrap pr-3 text-sm text-slate-200">
+      <div className="relative flex-1 rounded-lg bg-neutral-100 p-3 pr-12 dark:bg-neutral-900">
+        <p className="whitespace-pre-wrap pr-3 text-sm text-neutral-900 dark:text-neutral-100">
           {message.content}
         </p>
         {footer ? <div className="mt-3 flex gap-2">{footer}</div> : null}
         {message.timestamp ? (
-          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
+          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-white/80 px-1.5 py-0.5 text-[10px] text-neutral-500 dark:bg-neutral-950/70 dark:text-neutral-500">
             {formatChatTimestamp(message.timestamp)}
           </span>
         ) : null}
@@ -217,9 +209,8 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
-  const [processingStatus, setProcessingStatus] = useState<string>("");
-  const [latestNarration, setLatestNarration] = useState<string>("");
-  const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
+  const [narrative, setNarrative] =
+    useState<TurnNarrativeState>(EMPTY_NARRATIVE);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   const pendingMessageId = useRef<string | null>(null);
@@ -319,6 +310,7 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
+    setNarrative(EMPTY_NARRATIVE);
     hasScrolledOnLoad.current = false;
   };
 
@@ -337,7 +329,7 @@ export function WorkflowCopilotChat({
         console.error("Failed to update workflow:", updateError);
         toast({
           title: "Update failed",
-          description: "Failed to apply workflow changes. Please try again.",
+          description: "Failed to apply agent changes. Please try again.",
           variant: "destructive",
         });
         return false;
@@ -404,8 +396,7 @@ export function WorkflowCopilotChat({
       if (!applyWorkflowUpdate(workflow)) {
         toast({
           title: "Accept failed",
-          description:
-            "Could not apply the proposed workflow. Please try again.",
+          description: "Could not apply the proposed agent. Please try again.",
           variant: "destructive",
         });
         return;
@@ -492,7 +483,7 @@ export function WorkflowCopilotChat({
       toast({
         title: "Copilot update failed",
         description: autoAcceptValue
-          ? "Workflow was applied, but auto-accept did not update."
+          ? "Agent was applied, but auto-accept did not update."
           : "Failed to clear copilot proposal. Please try again.",
         variant: "destructive",
       });
@@ -532,6 +523,7 @@ export function WorkflowCopilotChat({
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
       return;
     }
@@ -594,9 +586,6 @@ export function WorkflowCopilotChat({
     pendingCancelToken.current = null;
     if (!cancelToken) return;
 
-    setProcessingStatus("Cancelling...");
-    setLatestNarration("");
-    setToolActivity([]);
     cancelInFlightController.current = controllerAtCancel;
 
     const appendCancelledBubble = () => {
@@ -609,6 +598,8 @@ export function WorkflowCopilotChat({
           timestamp: new Date().toISOString(),
         },
       ]);
+      // Otherwise the bubble freezes mid-state next to the Cancelled message.
+      setNarrative(EMPTY_NARRATIVE);
     };
 
     try {
@@ -635,7 +626,7 @@ export function WorkflowCopilotChat({
       controllerAtCancel.abort();
       appendCancelledBubble();
     }
-  }, [credentialGetter, setToolActivity]);
+  }, [credentialGetter]);
 
   const cancelQueuedPrompt = useCallback(() => {
     if (!queuedPrompt) {
@@ -684,8 +675,8 @@ export function WorkflowCopilotChat({
         return;
       if (!workflowPermanentId) {
         toast({
-          title: "Missing workflow",
-          description: "Workflow permanent ID is required to chat.",
+          title: "Missing agent",
+          description: "Agent permanent ID is required to chat.",
           variant: "destructive",
         });
         return;
@@ -743,9 +734,6 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       setIsLoading(true);
-      setProcessingStatus("Starting...");
-      setLatestNarration("");
-      setToolActivity([]);
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -758,8 +746,8 @@ export function WorkflowCopilotChat({
 
         if (!workflowId) {
           toast({
-            title: "Missing workflow",
-            description: "Workflow ID is required to chat.",
+            title: "Missing agent",
+            description: "Agent ID is required to chat.",
             variant: "destructive",
           });
           return;
@@ -829,10 +817,6 @@ export function WorkflowCopilotChat({
         const handleProcessingUpdate = (
           payload: WorkflowCopilotProcessingUpdate,
         ) => {
-          if (payload.status) {
-            setProcessingStatus(payload.status);
-          }
-
           const pendingId = pendingMessageId.current;
           if (!pendingId || !payload.timestamp) {
             return;
@@ -906,33 +890,33 @@ export function WorkflowCopilotChat({
               case "processing_update":
                 handleProcessingUpdate(payload);
                 return false;
+              // Legacy in-flight signals — the narrative bubble derives its
+              // state from turn_start/design_*/block_progress/workflow_draft
+              // instead, so these are intentionally dropped here.
               case "tool_call":
-                setProcessingStatus(
-                  TOOL_DISPLAY_NAMES[payload.tool_name] ??
-                    payload.tool_name + "...",
-                );
-                setToolActivity((prev) => applyToolCall(prev, payload));
-                return false;
               case "tool_result":
-                setToolActivity((prev) => applyToolResult(prev, payload));
-                return false;
               case "condensing":
-                if (payload.status === "started") {
-                  setProcessingStatus("Condensing context...");
-                }
-                return false;
               case "narration":
-                if (payload.narration) {
-                  setLatestNarration(payload.narration);
-                }
                 return false;
               case "block_progress":
-                setToolActivity((prev) => applyBlockProgress(prev, payload));
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                return false;
+              case "turn_start":
+                setNarrative(() =>
+                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
+                );
+                return false;
+              case "design_start":
+              case "design_end":
+              case "workflow_draft":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 return false;
               case "response":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleResponse(payload);
                 return true;
               case "error":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleError(payload);
                 return true;
               default:
@@ -966,9 +950,6 @@ export function WorkflowCopilotChat({
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
         setIsLoading(false);
-        setProcessingStatus("");
-        setLatestNarration("");
-        setToolActivity([]);
       }
     },
     [
@@ -1256,7 +1237,7 @@ export function WorkflowCopilotChat({
 
   return (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-slate-700 bg-slate-900 shadow-2xl"
+      className="fixed z-50 flex flex-col rounded-lg border border-neutral-200 bg-white text-neutral-900 shadow-2xl dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
       style={{
         left: `${position.x}px`,
         top: `${position.y}px`,
@@ -1266,28 +1247,30 @@ export function WorkflowCopilotChat({
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-slate-700 px-4 py-2"
+        className="flex cursor-move items-center justify-between border-b border-neutral-200 px-4 py-2 dark:border-neutral-800"
         onMouseDown={handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-slate-200">
-          Workflow Copilot (Beta)
+        <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
+          Agent Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={handleNewChat}
             onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+            className="rounded border border-neutral-300 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
           >
             New chat
           </button>
           <div className="h-2 w-2 rounded-full bg-green-500"></div>
-          <span className="text-xs text-slate-400">Active</span>
+          <span className="text-xs text-neutral-500 dark:text-neutral-400">
+            Active
+          </span>
           <button
             type="button"
             onClick={() => onClose?.()}
             onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+            className="ml-2 rounded p-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-900 dark:hover:text-neutral-100"
             title="Close"
           >
             <Cross2Icon className="h-4 w-4" />
@@ -1299,14 +1282,16 @@ export function WorkflowCopilotChat({
       <div className="flex-1 overflow-y-auto p-4">
         <div className="space-y-3">
           {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-            <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-300">
-              <p className="font-semibold text-slate-200">Start a new chat</p>
-              <p className="mt-2 text-slate-400">
-                Ask the copilot to draft or edit your workflow. Provide a goal,
-                the target site, and any credentials it should use.
+            <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300">
+              <p className="font-semibold text-neutral-900 dark:text-neutral-100">
+                Start a new chat
               </p>
-              <p className="mt-2 text-slate-400">
-                Example: "Build workflow to find the top post on hackernews
+              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                Ask the copilot to draft or edit your agent. Provide a goal, the
+                target site, and any credentials it should use.
+              </p>
+              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                Example: "Build an agent to find the top post on hackernews
                 today"
               </p>
             </div>
@@ -1322,7 +1307,7 @@ export function WorkflowCopilotChat({
                 message={message}
                 footer={
                   showQueuedFooter ? (
-                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
                       <ReloadIcon className="h-3 w-3 animate-spin" />
                       <span>{queuedPromptWaitingStatus}</span>
                     </div>
@@ -1331,7 +1316,7 @@ export function WorkflowCopilotChat({
                       <button
                         type="button"
                         onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                        className="rounded border border-blue-500/60 bg-blue-500/10 px-3 py-1 text-xs text-blue-100 hover:bg-blue-500/20"
+                        className="rounded border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-900 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:hover:bg-neutral-900"
                       >
                         Review
                       </button>
@@ -1364,61 +1349,17 @@ export function WorkflowCopilotChat({
               />
             );
           })}
-          {(isLoading || isQueuedPromptWaiting) && (
-            <div className="flex items-start gap-3">
+          {narrative.turnId !== null && (
+            <div
+              className="flex items-start gap-3"
+              role="status"
+              aria-live="polite"
+            >
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
                 AI
               </div>
               <div className="flex-1 rounded-lg bg-slate-800 p-3">
-                <div className="flex items-center gap-2 text-sm text-slate-300">
-                  <ReloadIcon className="h-4 w-4 animate-spin" />
-                  <span>
-                    {isQueuedPromptWaiting
-                      ? queuedPromptWaitingStatus
-                      : latestNarration || processingStatus || "Processing..."}
-                  </span>
-                </div>
-                {isQueuedPromptWaiting ? (
-                  <div className="mt-2 text-xs text-slate-500">
-                    Copilot will start automatically once the browser is ready.
-                  </div>
-                ) : null}
-                {!isQueuedPromptWaiting && toolActivity.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity) => {
-                      const isRetrySuccess =
-                        activity.status === "success" &&
-                        activity.linkedRecovery === true;
-                      const tooltip = activity.detail ?? activity.summary;
-                      const displayName =
-                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                        activity.tool_name;
-                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
-                        activity.linkedRecovery
-                          ? " border-l border-amber-400/40 pl-2"
-                          : ""
-                      }`;
-                      return (
-                        <div
-                          key={activity.tool_call_id}
-                          className={containerClass}
-                        >
-                          <span
-                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
-                          />
-                          <span
-                            className="line-clamp-2 min-w-0 flex-1"
-                            title={tooltip}
-                          >
-                            {isRetrySuccess ? "↻ " : ""}
-                            {displayName}
-                            {activity.summary ? ` — ${activity.summary}` : ""}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <NarrativeView turn={narrative} />
               </div>
             </div>
           )}
@@ -1427,9 +1368,11 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Input */}
-      <div className="border-t border-slate-700 p-3">
+      <div className="border-t border-neutral-200 p-3 dark:border-neutral-800">
         {browserStatusText ? (
-          <div className="mb-2 text-xs text-slate-400">{browserStatusText}</div>
+          <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
+            {browserStatusText}
+          </div>
         ) : null}
         <div className="flex items-end gap-2">
           <textarea
@@ -1446,7 +1389,7 @@ export function WorkflowCopilotChat({
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex-1 resize-none rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 placeholder-neutral-400 focus:border-neutral-700 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:border-neutral-400"
             style={{
               minHeight: "38px",
               maxHeight: "150px",
@@ -1464,7 +1407,7 @@ export function WorkflowCopilotChat({
           ) : (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+              className="rounded-md bg-neutral-950 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:bg-neutral-300"
             >
               Send
             </button>

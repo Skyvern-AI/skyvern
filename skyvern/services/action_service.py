@@ -54,6 +54,8 @@ async def get_action_history(
                     "exception_message",
                     "download_triggered",
                     "upload_file_triggered",
+                    "needs_followup",
+                    "followup_message",
                 },
             ),
         }

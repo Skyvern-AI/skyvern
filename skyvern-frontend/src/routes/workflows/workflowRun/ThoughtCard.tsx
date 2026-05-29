@@ -1,8 +1,7 @@
-import { StatusPill } from "@/components/ui/status-pill";
 import { QuestionMarkIcon } from "@radix-ui/react-icons";
-import { ObserverThought } from "../types/workflowRunTypes";
 import { BrainIcon } from "@/components/icons/BrainIcon";
-import { RunCard } from "./RunCard";
+import { cn } from "@/util/utils";
+import { ObserverThought } from "../types/workflowRunTypes";
 
 type Props = {
   active: boolean;
@@ -12,30 +11,39 @@ type Props = {
 };
 
 function ThoughtCard({ thought, onClick, active, cardClassName }: Props) {
+  const body = thought.answer || thought.thought;
+  const titleText = body ? "Thought" : "Thinking";
+
   return (
-    <RunCard
-      active={active}
-      onClick={() => onClick(thought)}
-      className={
-        cardClassName ? `space-y-3 p-4 ${cardClassName}` : "space-y-3 p-4"
-      }
-    >
-      <div className="flex justify-between">
-        <div className="flex gap-3">
-          <BrainIcon className="size-6" />
-          {(thought.answer || thought.thought) && <span>Thought</span>}
-          {!thought.answer && !thought.thought && <span>Thinking</span>}
-        </div>
-        <StatusPill icon={<QuestionMarkIcon className="size-4" />}>
-          Decision
-        </StatusPill>
-      </div>
-      {(thought.answer || thought.thought) && (
-        <div className="break-words text-xs text-slate-400">
-          {thought.answer || thought.thought}
-        </div>
+    <div
+      className={cn(
+        "group rounded-md bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
+        active
+          ? "ring-1 ring-white/40 hover:ring-white/40"
+          : "hover:ring-white/25",
+        cardClassName,
       )}
-    </RunCard>
+    >
+      <button
+        type="button"
+        onClick={() => onClick(thought)}
+        className="flex w-full cursor-pointer flex-col gap-1 rounded-md px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+      >
+        <div className="flex min-h-[24px] items-center gap-2">
+          <BrainIcon className="size-4 shrink-0 text-slate-300" />
+          <span className="shrink-0 text-xs text-slate-300">{titleText}</span>
+          <span className="ml-auto flex shrink-0 items-center gap-1 rounded bg-slate-elevation5 px-1.5 py-0.5 text-[10px] text-slate-400">
+            <QuestionMarkIcon className="size-3" />
+            Decision
+          </span>
+        </div>
+        {body && (
+          <div className="whitespace-pre-wrap break-words text-xs text-slate-200">
+            {body}
+          </div>
+        )}
+      </button>
+    </div>
   );
 }
 

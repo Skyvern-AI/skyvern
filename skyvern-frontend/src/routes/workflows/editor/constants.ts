@@ -35,12 +35,12 @@ export const GLOBAL_RESERVED_PARAMETERS = [
     description: "Merged summary of all block outputs",
   },
   { key: "workflow_run_id", description: "Unique ID of the current run" },
-  { key: "workflow_id", description: "The workflow's ID" },
+  { key: "workflow_id", description: "The agent's ID" },
   {
     key: "workflow_permanent_id",
-    description: "The workflow's permanent ID",
+    description: "The agent's permanent ID",
   },
-  { key: "workflow_title", description: "The workflow's title" },
+  { key: "workflow_title", description: "The agent's title" },
 ] as const;
 
 // Reserved parameters only available inside loop blocks

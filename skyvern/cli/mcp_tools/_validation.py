@@ -77,6 +77,30 @@ def validate_run_id(run_id: str, action: str) -> dict[str, Any] | None:
     return None
 
 
+def validate_workflow_run_id(workflow_run_id: str, action: str) -> dict[str, Any] | None:
+    if "/" in workflow_run_id or "\\" in workflow_run_id:
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                "workflow_run_id must not contain path separators",
+                "Provide a valid workflow run ID (starts with wr_)",
+            ),
+        )
+    if not workflow_run_id.startswith("wr_"):
+        return make_result(
+            action,
+            ok=False,
+            error=make_error(
+                ErrorCode.INVALID_INPUT,
+                f"Invalid workflow_run_id format: {workflow_run_id!r}",
+                "Workflow run IDs start with wr_. Use skyvern_workflow_run_list to find valid IDs.",
+            ),
+        )
+    return None
+
+
 def validate_schedule_id(workflow_schedule_id: str, action: str) -> dict[str, Any] | None:
     if "/" in workflow_schedule_id or "\\" in workflow_schedule_id:
         return make_result(

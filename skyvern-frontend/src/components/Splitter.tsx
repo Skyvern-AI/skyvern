@@ -15,49 +15,67 @@ function Handle({
   return (
     <div
       className={cn(
-        "absolute flex h-[1.25rem] w-[10px] flex-wrap items-center justify-center gap-[2px] bg-slate-800 pb-1 pt-1",
+        "absolute flex h-[1.25rem] w-[10px] flex-wrap items-center justify-center gap-[2px] bg-neutral-200 pb-1 pt-1 dark:bg-slate-800",
         {
           "cursor-col-resize": direction === "vertical",
           "cursor-row-resize": direction === "horizontal",
-          "bg-slate-700": isDragging,
+          "bg-neutral-300 dark:bg-slate-700": isDragging,
         },
       )}
       onDoubleClick={() => onDoubleClick?.()}
     >
       <div className="flex w-full items-center justify-center gap-[0.15rem]">
         <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
         />
         <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
-        />
-      </div>
-      <div className="flex w-full items-center justify-center gap-[0.15rem]">
-        <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
-        />
-        <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
         />
       </div>
       <div className="flex w-full items-center justify-center gap-[0.15rem]">
         <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
         />
         <div
-          className={cn("h-[2px] w-[2px] rounded-full bg-[#666]", {
-            "bg-[#222]": isDragging,
-          })}
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
+        />
+      </div>
+      <div className="flex w-full items-center justify-center gap-[0.15rem]">
+        <div
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
+        />
+        <div
+          className={cn(
+            "h-[2px] w-[2px] rounded-full bg-neutral-500 dark:bg-[#666]",
+            {
+              "bg-neutral-700 dark:bg-[#222]": isDragging,
+            },
+          )}
         />
       </div>
     </div>
@@ -430,8 +448,8 @@ function Splitter({
             onDoubleClick={snap}
           >
             <div
-              className={cn("h-full w-[2px] bg-slate-800", {
-                "bg-slate-700": isDragging,
+              className={cn("h-full w-[2px] bg-neutral-300 dark:bg-slate-800", {
+                "bg-neutral-400 dark:bg-slate-700": isDragging,
               })}
             />
             <Handle

@@ -103,7 +103,8 @@ function DebuggerRunTimeline({
                       block={timelineItem.block}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
-                      onThoughtCardClick={onObserverThoughtCardSelected}
+                      onThoughtClick={onObserverThoughtCardSelected}
+                      renderThoughts
                     />
                   </div>
                 );

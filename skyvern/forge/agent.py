@@ -67,6 +67,7 @@ from skyvern.exceptions import (
     UnsupportedTaskType,
     get_user_facing_exception_message,
 )
+from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.async_operations import AgentPhase, AsyncOperationPool
 from skyvern.forge.failure_classifier import classify_from_failure_reason
@@ -95,6 +96,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -620,6 +622,7 @@ class ForgeAgent:
         # set the step_id and task_id in the context
         context = skyvern_context.ensure_context()
         context.step_id = step.step_id
+        context.step_retry_index = step.retry_index
         context.task_id = task.task_id
         context.navigation_goal = task.navigation_goal
         context.navigation_payload = task.navigation_payload
@@ -1339,25 +1342,15 @@ class ForgeAgent:
             context = skyvern_context.current()
             if context:
                 context.step_id = step.step_id
+                context.step_retry_index = step.retry_index
                 if not task.workflow_run_id and step.order == 0 and step.retry_index == 0:
-                    if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
-                        context.disable_llm_screenshots = True
-                    else:
-                        try:
-                            context.disable_llm_screenshots = (
-                                await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                                    "DISABLE_LLM_SCREENSHOTS",
-                                    task.task_id,
-                                    properties={"organization_id": task.organization_id},
-                                )
-                            )
-                        except Exception:
-                            LOG.warning(
-                                "Failed to check DISABLE_LLM_SCREENSHOTS feature flag",
-                                exc_info=True,
-                                task_id=task.task_id,
-                            )
-                            context.disable_llm_screenshots = False
+                    await resolve_llm_vision_mode_for_context(
+                        context,
+                        task.task_id,
+                        task.organization_id,
+                        task_url=task.url,
+                        log_context={"task_id": task.task_id},
+                    )
 
             step = await self.update_step(step=step, status=StepStatus.running)
             injected_actions = await app.AGENT_FUNCTION.prepare_step_execution(
@@ -1689,6 +1682,11 @@ class ForgeAgent:
                 element_id_to_action_index[action.element_id] = action_idx
 
             element_id_to_last_action: dict[str, int] = dict()
+            try:
+                wait_config = await get_or_create_wait_config(task.task_id, task.workflow_run_id, task.organization_id)
+                base_delay = get_wait_time(wait_config, "inter_action_delay", default=0.5)
+            except Exception:
+                base_delay = 0.5
             for action_idx, action_node in enumerate(action_linked_list):
                 await await_background_artifact_task()
 
@@ -1797,7 +1795,7 @@ class ForgeAgent:
                 )
 
                 # Determine wait time between actions
-                wait_time = random.uniform(0.5, 1.0)
+                wait_time = random.uniform(base_delay, base_delay * 2) if base_delay > 0 else 0.0
 
                 # For multi-field TOTP sequences, use zero delay between all digits for fast execution
                 if action.action_type == ActionType.INPUT_TEXT and self._is_multi_field_totp_sequence(actions):
@@ -4378,14 +4376,6 @@ class ForgeAgent:
             apply_context_attrs(_cl_br_span)
             await self.cleanup_browser_and_create_artifacts(
                 close_browser_on_completion, last_step, task, browser_session_id=browser_session_id
-            )
-        try:
-            await app.AGENT_FUNCTION.release_proxy_session_for_owner(task.task_id)
-        except Exception:
-            LOG.warning(
-                "Failed to release proxy session for task",
-                exc_info=True,
-                task_id=task.task_id,
             )
 
         # Wait for all tasks to complete before generating the links for the artifacts

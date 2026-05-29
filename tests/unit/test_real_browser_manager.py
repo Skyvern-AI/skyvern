@@ -120,7 +120,6 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     """Non-PBS child runs must still inherit the parent's browser when no browser_session_id."""
     manager = RealBrowserManager()
     parent_state = MagicMock()
-    parent_state.allow_content_blocking_extensions = True
     manager.pages["wfr_parent"] = parent_state
 
     workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
@@ -133,56 +132,6 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
 
     assert result is parent_state
     # Both entries should be synced
-    assert manager.pages["wfr_child"] is parent_state
-    assert manager.pages["wfr_parent"] is parent_state
-
-
-@pytest.mark.asyncio
-async def test_child_workflow_does_not_inherit_parent_browser_when_extension_policy_is_stricter() -> None:
-    manager = RealBrowserManager()
-    parent_state = MagicMock()
-    parent_state.allow_content_blocking_extensions = True
-    manager.pages["wfr_parent"] = parent_state
-
-    child_state = MagicMock()
-    child_state.allow_content_blocking_extensions = False
-    child_state.get_or_create_page = AsyncMock()
-    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
-
-    with patch.object(manager, "_create_browser_state", new=AsyncMock(return_value=child_state)) as mock_create:
-        result = await manager.get_or_create_for_workflow_run(
-            workflow_run=workflow_run,
-            url=None,
-            browser_session_id=None,
-            allow_content_blocking_extensions=False,
-        )
-
-    assert result is child_state
-    assert result is not parent_state
-    assert manager.pages["wfr_child"] is child_state
-    assert manager.pages["wfr_parent"] is parent_state
-    mock_create.assert_awaited_once()
-    _, kwargs = mock_create.call_args
-    assert kwargs["allow_content_blocking_extensions"] is False
-
-
-@pytest.mark.asyncio
-async def test_child_workflow_can_inherit_parent_browser_when_extension_policy_matches() -> None:
-    manager = RealBrowserManager()
-    parent_state = MagicMock()
-    parent_state.allow_content_blocking_extensions = False
-    manager.pages["wfr_parent"] = parent_state
-
-    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
-
-    result = await manager.get_or_create_for_workflow_run(
-        workflow_run=workflow_run,
-        url=None,
-        browser_session_id=None,
-        allow_content_blocking_extensions=False,
-    )
-
-    assert result is parent_state
     assert manager.pages["wfr_child"] is parent_state
     assert manager.pages["wfr_parent"] is parent_state
 

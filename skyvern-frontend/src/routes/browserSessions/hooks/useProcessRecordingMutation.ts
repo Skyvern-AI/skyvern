@@ -42,7 +42,7 @@ const useProcessRecordingMutation = ({
 
       if (!workflowPermanentId) {
         throw new Error(
-          "Cannot process recording without a valid workflow permanent ID.",
+          "Cannot process recording without a valid agent permanent ID.",
         );
       }
 

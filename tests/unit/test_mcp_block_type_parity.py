@@ -82,7 +82,7 @@ class BlockDriftEntry:
         if not self.owner:
             raise ValueError(
                 f"BlockDriftEntry({self.block_type!r}).owner must name an accountable GitHub handle "
-                f"(e.g. '@marc'). See {_DOC_POINTER}."
+                f"(e.g. '@wintonzheng'). See {_DOC_POINTER}."
             )
         if not isinstance(self.added_at, date):
             raise TypeError(
@@ -98,14 +98,14 @@ _KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
     BlockDriftEntry(
         block_type="google_sheets_read",
         ticket="SKY-9227",
-        owner="@marc",
+        owner="@wintonzheng",
         added_at=date(2026, 4, 23),
         notes="Clears with `google_sheets_write` at the next Fern SDK regeneration.",
     ),
     BlockDriftEntry(
         block_type="google_sheets_write",
         ticket="SKY-9227",
-        owner="@marc",
+        owner="@wintonzheng",
         added_at=date(2026, 4, 23),
         notes="Clears with `google_sheets_read` at the next Fern SDK regeneration.",
     ),

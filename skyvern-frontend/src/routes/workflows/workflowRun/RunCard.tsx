@@ -36,10 +36,12 @@ function RunCard({
         "rounded-lg bg-slate-elevation4 ring-1 ring-transparent transition-all duration-200",
         status != null && "border-l-2 border-l-transparent",
         {
-          "cursor-pointer hover:ring-white/25": !!onClick,
+          "cursor-pointer hover:ring-neutral-400/40 dark:hover:ring-white/25":
+            !!onClick,
           "border-l-destructive": status === "failure" && !active,
           "border-l-success": status === "success" && !active,
-          "ring-2 ring-white/55 hover:ring-white/55": active,
+          "ring-2 ring-neutral-500/45 hover:ring-neutral-500/45 dark:ring-white/55 dark:hover:ring-white/55":
+            active,
         },
         className,
       )}

@@ -36,7 +36,7 @@ def test_smoke_test_contains_browser_tool_execution_model() -> None:
 
 def test_smoke_test_output_table_format() -> None:
     skill_text = BUNDLED_SMOKE_TEST_SKILL.read_text(encoding="utf-8")
-    assert "| Flow | Result | Evidence |" in skill_text
+    assert "| Flow | Result | Screenshot |" in skill_text
 
 
 def test_smoke_test_pr_evidence_markers_present() -> None:

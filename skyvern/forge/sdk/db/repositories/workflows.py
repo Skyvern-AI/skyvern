@@ -95,6 +95,7 @@ class WorkflowsRepository(BaseRepository):
         proxy_location: ProxyLocationInput = None,
         webhook_callback_url: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        max_elapsed_time_minutes: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         totp_verification_url: str | None = None,
@@ -129,6 +130,7 @@ class WorkflowsRepository(BaseRepository):
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 persist_browser_session=persist_browser_session,
@@ -613,6 +615,7 @@ class WorkflowsRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
+        max_elapsed_time_minutes: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
@@ -658,6 +661,8 @@ class WorkflowsRepository(BaseRepository):
                     workflow.model = model
                 if max_screenshot_scrolling_times is not _UNSET:
                     workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
+                if max_elapsed_time_minutes is not _UNSET:
+                    workflow.max_elapsed_time_minutes = max_elapsed_time_minutes
                 if extra_http_headers is not _UNSET:
                     workflow.extra_http_headers = extra_http_headers
                 if cdp_connect_headers is not _UNSET:
@@ -910,6 +915,7 @@ class WorkflowsRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
+        max_elapsed_time_minutes: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
         cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         ai_fallback: bool | None = None,
@@ -989,6 +995,8 @@ class WorkflowsRepository(BaseRepository):
                 workflow.model = model
             if max_screenshot_scrolling_times is not _UNSET:
                 workflow.max_screenshot_scrolling_times = max_screenshot_scrolling_times
+            if max_elapsed_time_minutes is not _UNSET:
+                workflow.max_elapsed_time_minutes = max_elapsed_time_minutes
             if extra_http_headers is not _UNSET:
                 workflow.extra_http_headers = extra_http_headers
             if cdp_connect_headers is not _UNSET:

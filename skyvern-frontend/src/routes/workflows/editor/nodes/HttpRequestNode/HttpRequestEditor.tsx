@@ -447,7 +447,7 @@ function HttpRequestEditorBody({
       </Accordion>
 
       {!hasInteracted && (
-        <div className="rounded-md bg-slate-800/50 p-3">
+        <div className="workflow-editor-tip rounded-md bg-slate-800/50 p-3">
           <div className="space-y-2 text-xs text-slate-400">
             <div className="flex items-center gap-2">
               <MagicWandIcon className="h-3 w-3" />

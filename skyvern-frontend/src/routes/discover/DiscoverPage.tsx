@@ -4,19 +4,7 @@ import { WorkflowTemplates } from "./WorkflowTemplates";
 import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
 import { ReloadIcon } from "@radix-ui/react-icons";
-
-const emptyWorkflowRequest = {
-  title: "New Workflow",
-  description: "",
-  ai_fallback: true,
-  code_version: 2 as const,
-  run_with: "agent" as const,
-  workflow_definition: {
-    version: 2 as const,
-    blocks: [],
-    parameters: [],
-  },
-};
+import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
 
 function DiscoverPage() {
   const enableCopilotHandoff =
@@ -35,7 +23,7 @@ function DiscoverPage() {
             disabled={createWorkflowMutation.isPending}
             onClick={() =>
               createWorkflowMutation.mutate({
-                ...emptyWorkflowRequest,
+                ...defaultWorkflowRequest,
                 _via: "blank",
               })
             }

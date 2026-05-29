@@ -6,7 +6,7 @@ import {
 
 function notificationLabel(req: VerificationRequest): string {
   if (req.task_id) return `Task "${req.task_id}"`;
-  if (req.workflow_run_id) return `Workflow run "${req.workflow_run_id}"`;
+  if (req.workflow_run_id) return `Agent run "${req.workflow_run_id}"`;
   return "Run";
 }
 

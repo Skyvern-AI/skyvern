@@ -81,7 +81,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Human Interaction Block",
-    description: "Pause workflow for human review and approval",
+    description: "Pause agent for human review and approval",
   },
   // {
   //   nodeType: "task",
@@ -266,8 +266,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Workflow Trigger Block",
-    description: "Trigger another workflow",
+    title: "Agent Trigger Block",
+    description: "Trigger another agent",
   },
   {
     nodeType: "googleSheetsRead",
@@ -410,7 +410,7 @@ function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
                       <span className="max-w-64 truncate text-base">
                         {item.title}
                       </span>
-                      <span className="text-xs text-slate-400">
+                      <span className="text-xs text-slate-600 dark:text-slate-400">
                         {item.description}
                       </span>
                     </div>

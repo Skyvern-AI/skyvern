@@ -15,6 +15,8 @@ class ActionResult(BaseModel):
     step_order: int | None = None
     download_triggered: bool | None = None
     upload_file_triggered: bool | None = None
+    needs_followup: bool | None = None
+    followup_message: str | None = None
     downloaded_files: list[str] | None = None  # Actual file names that were downloaded
     # None is used for old data so that we can differentiate between old and new data which only has boolean
     interacted_with_sibling: bool | None = None
@@ -37,6 +39,10 @@ class ActionResult(BaseModel):
             results.append(f"download_triggered={self.download_triggered}")
         if self.upload_file_triggered is not None:
             results.append(f"upload_file_triggered={self.upload_file_triggered}")
+        if self.needs_followup is not None:
+            results.append(f"needs_followup={self.needs_followup}")
+        if self.followup_message is not None:
+            results.append(f"followup_message={self.followup_message}")
         if self.downloaded_files is not None:
             results.append(f"downloaded_files={self.downloaded_files}")
         if self.interacted_with_sibling is not None:

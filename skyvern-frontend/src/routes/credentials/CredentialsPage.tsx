@@ -20,7 +20,7 @@ import { CredentialsTotpTab } from "./CredentialsTotpTab";
 import { useSearchParams } from "react-router-dom";
 
 const subHeaderText =
-  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes for your workflows.";
+  "Securely store your passwords, credit cards, secrets, and manage incoming 2FA codes for your agents.";
 
 const TAB_VALUES = [
   "passwords",
@@ -58,7 +58,9 @@ function CredentialsPage() {
     <div className="space-y-5">
       <h1 className="text-2xl">Credentials</h1>
       <div className="flex items-center justify-between">
-        <div className="w-96 text-sm text-slate-300">{subHeaderText}</div>
+        <div className="w-96 text-sm text-neutral-600 dark:text-slate-300">
+          {subHeaderText}
+        </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
             <Button>
@@ -141,7 +143,7 @@ function CredentialsPage() {
       {/* Footer note - only for Passwords and Credit Cards tabs */}
       {activeTab !== "twoFactor" && (
         <div className="mt-8 border-t border-slate-700 pt-4">
-          <div className="text-sm italic text-slate-400">
+          <div className="text-sm italic text-neutral-600 dark:text-slate-400">
             <strong>Note:</strong> This feature requires a Bitwarden-compatible
             server ({" "}
             <a

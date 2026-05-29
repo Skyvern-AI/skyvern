@@ -51,7 +51,7 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
         <DialogHeader>
           <DialogTitle>Create New Folder</DialogTitle>
           <DialogDescription>
-            Create a folder to organize your workflows.
+            Create a folder to organize your agents.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={handleSubmit}>
@@ -62,7 +62,7 @@ function CreateFolderDialog({ open, onOpenChange }: CreateFolderDialogProps) {
                 id="folder-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Production Workflows"
+                placeholder="e.g., Production Agents"
                 autoFocus
               />
             </div>

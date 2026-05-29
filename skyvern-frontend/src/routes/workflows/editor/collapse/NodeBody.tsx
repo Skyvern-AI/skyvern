@@ -33,10 +33,11 @@ export function NodeBody({ children, className, style }: Props) {
   const recompositeRef = useRef<HTMLDivElement>(null);
 
   const onAnimationEnd = (event: AnimationEvent<HTMLDivElement>) => {
-    if (
-      event.animationName !== "collapsible-down" ||
-      event.target !== event.currentTarget
-    ) {
+    const isOwnCollapse =
+      event.animationName === "collapsible-down" &&
+      event.target === event.currentTarget;
+    const isNestedAccordion = event.animationName === "accordion-down";
+    if (!isOwnCollapse && !isNestedAccordion) {
       return;
     }
 
@@ -63,7 +64,11 @@ export function NodeBody({ children, className, style }: Props) {
         className,
       )}
     >
-      <div ref={recompositeRef} data-node-body-recomposite="">
+      {/* p-1 keeps focused-input rings/shadows off the overflow-hidden clip
+          edge so they don't render clipped (SKY-10457). Padding lives on this
+          inner wrapper, not the height-animated CollapsibleContent, so the
+          collapsed state still measures to zero. */}
+      <div ref={recompositeRef} data-node-body-recomposite="" className="p-1">
         {children}
       </div>
     </CollapsibleContent>

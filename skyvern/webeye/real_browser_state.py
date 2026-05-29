@@ -43,14 +43,12 @@ class RealBrowserState(BrowserState):
         page: Page | None = None,
         browser_artifacts: BrowserArtifacts = BrowserArtifacts(),
         browser_cleanup: BrowserCleanupFunc = None,
-        allow_content_blocking_extensions: bool = True,
     ):
         self.__page = page
         self.pw = pw
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
         self.browser_cleanup = browser_cleanup
-        self.allow_content_blocking_extensions = allow_content_blocking_extensions
 
     async def __assert_page(self) -> Page:
         page = await self.get_working_page()
@@ -108,7 +106,6 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
-                allow_content_blocking_extensions=self.allow_content_blocking_extensions,
             )
             self.browser_context = browser_context
             self.browser_artifacts = browser_artifacts
@@ -402,7 +399,7 @@ class RealBrowserState(BrowserState):
             must_included_tags=must_included_tags,
         )
 
-    async def close(self, close_browser_on_completion: bool = True) -> None:
+    async def close(self, close_browser_on_completion: bool = True, skip_cleanup: bool = False) -> None:
         LOG.info("Closing browser state")
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
@@ -413,12 +410,13 @@ class RealBrowserState(BrowserState):
                     except Exception:
                         LOG.warning("Failed to close browser context", exc_info=True)
                     LOG.info("Main browser context and all its pages are closed")
-                    if self.browser_cleanup is not None:
-                        try:
-                            await self.browser_cleanup()
-                            LOG.info("Main browser cleanup is executed")
-                        except Exception:
-                            LOG.warning("Failed to execute browser cleanup", exc_info=True)
+
+                if self.browser_cleanup is not None and not skip_cleanup:
+                    try:
+                        await self.browser_cleanup()
+                        LOG.info("Main browser cleanup is executed")
+                    except Exception:
+                        LOG.warning("Failed to execute browser cleanup", exc_info=True)
         except asyncio.TimeoutError:
             LOG.error("Timeout to close browser context, going to stop playwright directly")
 

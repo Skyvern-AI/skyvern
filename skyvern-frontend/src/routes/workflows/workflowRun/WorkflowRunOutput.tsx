@@ -300,7 +300,7 @@ function WorkflowRunOutput() {
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
+            <h1 className="text-lg font-bold">Agent Run Outputs</h1>
             {outputs && (
               <SummarizeOutput
                 key={runContextKey}
@@ -338,7 +338,7 @@ function WorkflowRunOutput() {
             <h1 className="text-lg font-bold">
               {showBlockFiles
                 ? "Block Downloaded Files"
-                : "Workflow Run Downloaded Files"}
+                : "Agent Run Downloaded Files"}
             </h1>
             {userSelectedBlock ? (
               <Button
@@ -349,7 +349,7 @@ function WorkflowRunOutput() {
               >
                 {showAllFilesOverride
                   ? "Show block files"
-                  : "Show all workflow files"}
+                  : "Show all agent files"}
               </Button>
             ) : null}
           </div>

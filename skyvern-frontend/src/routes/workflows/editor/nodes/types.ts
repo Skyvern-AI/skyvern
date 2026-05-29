@@ -71,7 +71,7 @@ export const workflowBlockTitle: {
   goto_url: "Go to URL",
   http_request: "HTTP Request",
   print_page: "Print Page",
-  workflow_trigger: "Workflow Trigger",
+  workflow_trigger: "Agent Trigger",
   google_sheets_read: "Google Sheets Read",
   google_sheets_write: "Google Sheets Write",
 };

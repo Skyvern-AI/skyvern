@@ -26,6 +26,12 @@ async def tool_workflow_get(**kwargs: Any) -> dict[str, Any]:
     return await skyvern_workflow_get(**kwargs)
 
 
+async def tool_workflow_run_list(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_run_list  # noqa: PLC0415
+
+    return await skyvern_workflow_run_list(**kwargs)
+
+
 async def tool_workflow_create(**kwargs: Any) -> dict[str, Any]:
     from .mcp_tools.workflow import skyvern_workflow_create  # noqa: PLC0415
 
@@ -60,6 +66,12 @@ async def tool_workflow_cancel(**kwargs: Any) -> dict[str, Any]:
     from .mcp_tools.workflow import skyvern_workflow_cancel  # noqa: PLC0415
 
     return await skyvern_workflow_cancel(**kwargs)
+
+
+async def tool_workflow_retry(**kwargs: Any) -> dict[str, Any]:
+    from .mcp_tools.workflow import skyvern_workflow_retry  # noqa: PLC0415
+
+    return await skyvern_workflow_retry(**kwargs)
 
 
 @workflow_app.callback()
@@ -131,6 +143,37 @@ def workflow_get(
         hint_on_exception="Check your API key and workflow ID.",
         action="skyvern_workflow_get",
         telemetry_tool_name="skyvern_workflow_get",
+    )
+
+
+@workflow_app.command("runs")
+def workflow_runs(
+    workflow_id: str = typer.Option(..., "--id", help="Workflow permanent ID (wpid_...)."),
+    page: int = typer.Option(1, "--page", min=1, help="Page number (1-based)."),
+    page_size: int = typer.Option(10, "--page-size", min=1, max=100, help="Results per page."),
+    status: list[str] | None = typer.Option(None, "--status", help="Filter by workflow run status."),
+    search_key: str | None = typer.Option(None, "--search-key", help="Search run IDs, parameters, and headers."),
+    error_code: str | None = typer.Option(None, "--error-code", help="Filter by task error code."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List runs for a workflow."""
+
+    async def _run() -> dict[str, Any]:
+        return await tool_workflow_run_list(
+            workflow_id=workflow_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            search_key=search_key,
+            error_code=error_code,
+        )
+
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check your API key, workflow ID, and run filters.",
+        action="skyvern_workflow_run_list",
+        telemetry_tool_name="skyvern_workflow_run_list",
     )
 
 
@@ -305,4 +348,23 @@ def workflow_cancel(
         hint_on_exception="Check the run ID and API key.",
         action="skyvern_workflow_cancel",
         telemetry_tool_name="skyvern_workflow_cancel",
+    )
+
+
+@workflow_app.command("retry")
+def workflow_retry(
+    workflow_run_id: str = typer.Option(..., "--run-id", help="Workflow run ID to retry (wr_...)."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Retry a terminal workflow run."""
+
+    async def _run() -> dict[str, Any]:
+        return await tool_workflow_retry(workflow_run_id=workflow_run_id)
+
+    run_tool(
+        _run,
+        json_output=json_output,
+        hint_on_exception="Check the workflow run ID and API key.",
+        action="skyvern_workflow_retry",
+        telemetry_tool_name="skyvern_workflow_retry",
     )

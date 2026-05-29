@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import time
+import uuid
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -240,7 +241,11 @@ async def _watch_for_cancel(
             return
 
 
-async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: bool) -> None:
+async def _ensure_terminal_frame(
+    stream: EventSourceStream,
+    already_emitted: bool,
+    turn_id: str | None = None,
+) -> None:
     """Emit a fallback ERROR frame if the turn hasn't sent a terminal one.
 
     Shielded so cancellation on the outer scope doesn't abort the send;
@@ -254,6 +259,8 @@ async def _ensure_terminal_frame(stream: EventSourceStream, already_emitted: boo
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error="The assistant didn't finish this turn. Please try again.",
+                    turn_id=turn_id,
+                    narrative_summary=None,
                 )
             )
         )
@@ -309,6 +316,7 @@ def _build_recoverable_route_agent_result(
     workflow_modified: bool,
     clear_proposed_workflow: bool,
     global_llm_context: str | None,
+    turn_id: str | None = None,
 ) -> tuple[AgentResult, RecoverableFailure]:
     failure = build_recoverable_failure(error, workflow_modified=workflow_modified)
     agent_result = AgentResult(
@@ -318,6 +326,7 @@ def _build_recoverable_route_agent_result(
         workflow_was_persisted=False,
         proposal_disposition="no_proposal",
         clear_proposed_workflow=clear_proposed_workflow,
+        turn_id=turn_id,
     )
     _record_recoverable_failure_span_attrs(failure, proposal_disposition="no_proposal")
     return agent_result, failure
@@ -382,6 +391,7 @@ async def _persist_cancel_turn(
     original_workflow: Workflow | None,
     user_message: str,
     agent_result: AgentResult | None,
+    turn_id: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
 
@@ -449,6 +459,8 @@ async def _persist_cancel_turn(
                     proposal_disposition=proposal_disposition,
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
+                    turn_id=turn_id or getattr(agent_result, "turn_id", None),
+                    narrative_summary=getattr(agent_result, "narrative_summary", None),
                 )
             )
         )
@@ -524,6 +536,8 @@ async def _finalise_normal_turn(
             response_type=getattr(agent_result, "response_type", "REPLY"),
             proposal_disposition=proposal_disposition,
             output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
+            turn_id=getattr(agent_result, "turn_id", None),
+            narrative_summary=getattr(agent_result, "narrative_summary", None),
         )
     )
 
@@ -1344,6 +1358,11 @@ async def _new_copilot_chat_post(
             organization_id=organization.organization_id,
         )
 
+        # Canonical turn_id for the whole HTTP request. Generated before any
+        # try-block so route-level error paths and the agent's TURN_START
+        # envelope all carry the same identifier.
+        turn_id = uuid.uuid4().hex
+
         original_workflow: Workflow | None = None
         chat = None
         agent_result: AgentResult | None = None
@@ -1474,6 +1493,8 @@ async def _new_copilot_chat_post(
                     WorkflowCopilotStreamErrorUpdate(
                         type=WorkflowCopilotStreamMessageType.ERROR,
                         error="Copilot is not configured for this organization. Contact support.",
+                        turn_id=turn_id,
+                        narrative_summary=None,
                     )
                 )
                 return
@@ -1498,8 +1519,11 @@ async def _new_copilot_chat_post(
                         )
                     )
 
-            # Count from the full message log; chat_history below is truncated.
-            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER) + 1
+            # Zero-based turn ordinal. The current user message has not been
+            # appended to chat_messages at this point, so ``sum(...)`` already
+            # counts only prior user turns and equals the index of the
+            # about-to-start turn.
+            turn_index = sum(1 for m in chat_messages if m.sender == WorkflowCopilotChatSender.USER)
 
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
@@ -1513,6 +1537,7 @@ async def _new_copilot_chat_post(
                     api_key=api_key,
                     config=copilot_config,
                     turn_index=turn_index,
+                    turn_id=turn_id,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                 )
 
@@ -1526,6 +1551,7 @@ async def _new_copilot_chat_post(
                     original_workflow=original_workflow,
                     user_message=chat_request.message,
                     agent_result=agent_result,
+                    turn_id=turn_id,
                 )
                 terminal_frame_emitted = True
                 LOG.info(
@@ -1556,6 +1582,8 @@ async def _new_copilot_chat_post(
                 WorkflowCopilotStreamErrorUpdate(
                     type=WorkflowCopilotStreamMessageType.ERROR,
                     error=exc.detail,
+                    turn_id=turn_id,
+                    narrative_summary=None,
                 )
             )
         except LLMProviderError as exc:
@@ -1569,6 +1597,7 @@ async def _new_copilot_chat_post(
                     workflow_modified=workflow_modified,
                     clear_proposed_workflow=restored or workflow_modified,
                     global_llm_context=global_llm_context,
+                    turn_id=turn_id,
                 )
                 LOG.error(
                     "LLM provider error translated to recoverable workflow copilot v2 reply",
@@ -1602,6 +1631,8 @@ async def _new_copilot_chat_post(
                     WorkflowCopilotStreamErrorUpdate(
                         type=WorkflowCopilotStreamMessageType.ERROR,
                         error="Failed to process your request. Please try again.",
+                        turn_id=turn_id,
+                        narrative_summary=None,
                     )
                 )
         except asyncio.CancelledError:
@@ -1619,6 +1650,7 @@ async def _new_copilot_chat_post(
                         original_workflow=None,
                         user_message=chat_request.message,
                         agent_result=None,
+                        turn_id=turn_id,
                     )
                 )
                 terminal_frame_emitted = True
@@ -1650,6 +1682,7 @@ async def _new_copilot_chat_post(
                     workflow_modified=workflow_modified,
                     clear_proposed_workflow=restored or workflow_modified,
                     global_llm_context=global_llm_context,
+                    turn_id=turn_id,
                 )
                 LOG.error(
                     "Unexpected workflow copilot v2 error translated to recoverable reply",
@@ -1683,6 +1716,8 @@ async def _new_copilot_chat_post(
                     WorkflowCopilotStreamErrorUpdate(
                         type=WorkflowCopilotStreamMessageType.ERROR,
                         error="An error occurred. Please try again.",
+                        turn_id=turn_id,
+                        narrative_summary=None,
                     )
                 )
         finally:
@@ -1690,7 +1725,7 @@ async def _new_copilot_chat_post(
                 cancel_watcher.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await cancel_watcher
-            await _ensure_terminal_frame(stream, terminal_frame_emitted)
+            await _ensure_terminal_frame(stream, terminal_frame_emitted, turn_id=turn_id)
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 
