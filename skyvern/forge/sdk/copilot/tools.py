@@ -156,7 +156,7 @@ RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
 
 # Per-tool-call budget for active block runs — caps a single tool invocation
 # below the session-level wall clock (``enforcement.TOTAL_TIMEOUT_SECONDS``,
-# 600 s) so a long chain cannot consume the whole budget without giving the
+# 900 s) so a long chain cannot consume the whole budget without giving the
 # copilot a chance to issue a smaller chain. Quiet-block runs keep the longer
 # ``RUN_BLOCKS_SAFETY_CEILING_SECONDS`` above.
 PER_TOOL_CALL_BUDGET_SECONDS = 240
@@ -703,19 +703,98 @@ def _per_tool_budget_problem_rerun_signal(
     agent_steering = (
         "The prior PER_TOOL_BUDGET run's get_run_results showed navigation "
         f"block(s) [{labels}] were canceled or failed while applying page state. "
-        "Do NOT rerun those block label(s) unchanged with run_blocks_and_collect_debug. "
+        f"Do NOT rerun those block label(s) unchanged with {tool_name}. "
         "Update the workflow to split or replace the oversized navigation block first, "
-        "prefer a code or validation block for DOM/page-state verification, or run only "
-        "newly-created smaller block labels that apply one missing constraint at a time."
+        "use live-page inspection evidence to decide what state is actually missing, "
+        "or run only newly-created smaller block labels that apply one missing constraint at a time."
     )
-    user_facing = "The previous run hit the per-step time budget. I need a smaller scope before I can rerun."
+    user_facing = (
+        "The previous run hit the per-step time budget before I could finish. "
+        "I'll continue from the verified browser state instead of retrying blindly."
+    )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=agent_steering,
         user_facing_reason=user_facing,
         recovery_hint="retry_with_different_tool",
-        cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
+        cleared_by_tools=PAGE_INSPECTION_TOOLS
+        | frozenset({"get_run_results", "update_workflow", "update_and_run_blocks"}),
         internal_reason_code="tool_error_per_tool_budget_rerun",
+        blocked_tool=tool_name,
+    )
+
+
+def _workflow_yaml_ordered_labels(workflow_yaml: str | None) -> list[str]:
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+    labels: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        label = _block_label_from_yaml(block)
+        if label:
+            labels.append(label)
+    return labels
+
+
+def _post_budget_upstream_replay_signal(
+    ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
+    problem_labels = _per_tool_budget_problem_label_set(ctx)
+    if not problem_labels:
+        return None
+
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict) or evidence.get("observed_after_workflow_run") is not True:
+        return None
+
+    requested_labels = _requested_block_label_set(arguments)
+    if not requested_labels:
+        return None
+
+    workflow_yaml = arguments.get("workflow_yaml") if isinstance(arguments, dict) else None
+    ordered_labels = _workflow_yaml_ordered_labels(workflow_yaml if isinstance(workflow_yaml, str) else None)
+    if not ordered_labels:
+        ordered_labels = _current_workflow_block_labels(ctx)
+    if not ordered_labels:
+        return None
+
+    first_problem_index = min(
+        (ordered_labels.index(label) for label in problem_labels if label in ordered_labels),
+        default=None,
+    )
+    if first_problem_index is None:
+        return None
+
+    upstream_requested = [label for label in ordered_labels[:first_problem_index] if label in requested_labels]
+    if not upstream_requested:
+        return None
+
+    upstream = ", ".join(upstream_requested)
+    frontier = ", ".join(sorted(problem_labels))
+    agent_steering = (
+        "The prior PER_TOOL_BUDGET run advanced the live browser, and you already inspected that "
+        "post-run page state. Do NOT restart upstream label(s) "
+        f"[{upstream}] before the budgeted frontier [{frontier}]. "
+        "Answer from the observed page if it contains the requested result/no-result evidence. "
+        "If more workflow testing is still required, preserve the verified upstream blocks and run only "
+        "new or modified smaller labels at/after the missing frontier."
+    )
+    user_facing = (
+        "The previous run already reached a later browser state. I'll continue from that evidence "
+        "instead of restarting earlier steps."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=PAGE_INSPECTION_TOOLS
+        | frozenset({"get_run_results", "update_workflow", "update_and_run_blocks"}),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code="tool_error_post_budget_upstream_replay",
         blocked_tool=tool_name,
     )
 
@@ -906,6 +985,8 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
+PAGE_INSPECTION_TOOLS = frozenset({"inspect_page_for_composition", "evaluate", "get_browser_screenshot"})
+PAGE_SCHEMA_CONTEXT_TOOLS = frozenset({"inspect_page_for_composition"})
 _CURRENT_PAGE_INSPECTION_TARGETS = frozenset({"", "current", "current_page", "__current_page__"})
 
 
@@ -977,6 +1058,42 @@ def _late_block_running_call_signal(ctx: AgentContext, tool_name: str) -> Copilo
     )
 
 
+def _mark_page_inspected(ctx: AgentContext) -> None:
+    ctx.post_budget_page_inspection_required = False
+    ctx.post_budget_page_inspection_url = None
+    ctx.post_budget_page_inspection_run_id = None
+
+
+def _post_budget_page_inspection_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
+    if getattr(ctx, "post_budget_page_inspection_required", False) is not True:
+        return None
+
+    url = getattr(ctx, "post_budget_page_inspection_url", None)
+    run_id = getattr(ctx, "post_budget_page_inspection_run_id", None)
+    url_text = f" at {url}" if isinstance(url, str) and url else ""
+    run_text = f" for run {run_id}" if isinstance(run_id, str) and run_id else ""
+    agent_steering = (
+        f"The prior PER_TOOL_BUDGET run{run_text} advanced the live browser{url_text}. "
+        "Before another block-running tool, inspect the current browser page with "
+        'inspect_page_for_composition(target_url="current_page"), evaluate, or get_browser_screenshot. '
+        "If the observed page evidence already contains the requested result or a no-results state, "
+        "answer from that evidence instead of rerunning the search. If evidence shows a missing page-state "
+        "change, then run only the smaller missing block after that inspection."
+    )
+    user_facing = "I need to inspect the current page state before running more steps."
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="retry_with_different_tool",
+        cleared_by_tools=PAGE_INSPECTION_TOOLS,
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code="tool_error_post_budget_page_inspection_required",
+        blocked_tool=tool_name,
+    )
+
+
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
@@ -1020,10 +1137,17 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
                 _pending_reconciliation_no_input_signal(pending_run_id=pending_run_id, blocked_tool=tool_name),
             )
 
-        if tool_name == "run_blocks_and_collect_debug":
-            budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
-            if budget_signal is not None:
-                return _emit_tool_blocker_signal(ctx, budget_signal)
+        inspection_signal = _post_budget_page_inspection_signal(ctx, tool_name)
+        if inspection_signal is not None:
+            return _emit_tool_blocker_signal(ctx, inspection_signal)
+
+        budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
+        if budget_signal is not None:
+            return _emit_tool_blocker_signal(ctx, budget_signal)
+
+        upstream_replay_signal = _post_budget_upstream_replay_signal(ctx, arguments, tool_name)
+        if upstream_replay_signal is not None:
+            return _emit_tool_blocker_signal(ctx, upstream_replay_signal)
 
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
@@ -1261,6 +1385,9 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
 
     blocks_update = tool_name in WORKFLOW_MUTATION_TOOLS and not authority.may_update_workflow
     blocks_run = tool_name in BLOCK_RUNNING_TOOLS and not authority.may_run_blocks
+    blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and (
+        intent.mode in NO_MUTATION_TURN_INTENT_MODES or not authority.may_update_workflow
+    )
     # Two paths grant read access to ANSWER_ONLY_CONTEXT_TOOLS, both excluded for DOCS_ANSWER/REFUSE/CLARIFY:
     #  (1) authority.may_read_run_context — classifier-derived (DIAGNOSE turns)
     #  (2) pending_reconciliation_run_id — within-turn override anchored to the run-blocks watchdog
@@ -1273,10 +1400,19 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
         if isinstance(pending_run_id, str) and pending_run_id:
             blocks_context_read = False
             within_turn_read_override = True
+        else:
+            same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None) or getattr(
+                ctx,
+                "last_run_blocks_workflow_run_id",
+                None,
+            )
+            if isinstance(same_turn_run_id, str) and same_turn_run_id:
+                blocks_context_read = False
+                within_turn_read_override = True
 
     if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
         return None
-    if not blocks_update and not blocks_run and not blocks_context_read:
+    if not blocks_update and not blocks_run and not blocks_context_read and not blocks_page_inspection:
         if within_turn_read_override:
             LOG.info(
                 "copilot authority gate allowed tool via within-turn read override",
@@ -1295,6 +1431,8 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
         reason_code = "turn_intent_no_mutation_run_blocked"
     elif blocks_update:
         reason_code = "turn_intent_update_blocked"
+    elif blocks_page_inspection:
+        reason_code = "turn_intent_page_inspection_blocked"
     elif blocks_context_read:
         reason_code = "turn_intent_context_read_blocked"
     else:
@@ -1712,7 +1850,7 @@ _TEMPLATE_BUILTIN_ROOTS = (
 _BLOCK_METADATA_STOPWORDS = frozenset({"and", "for", "the", "with"})
 
 
-def _block_type_name(block: Any) -> str:
+def _block_type_name(block: object) -> str:
     """Lowercase string name of a block's type, for both YAML and runtime blocks."""
     bt = getattr(block, "block_type", None)
     if bt is None:
@@ -1721,9 +1859,9 @@ def _block_type_name(block: Any) -> str:
     return str(name).lower()
 
 
-def _blocks_by_label(workflow_definition: Any) -> dict[str, Any]:
+def _blocks_by_label(workflow_definition: object | None) -> dict[str, object]:
     blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
-    by_label: dict[str, Any] = {}
+    by_label: dict[str, object] = {}
     if not blocks:
         return by_label
     for block in blocks:
@@ -1731,6 +1869,44 @@ def _blocks_by_label(workflow_definition: Any) -> dict[str, Any]:
         if isinstance(label, str):
             by_label[label] = block
     return by_label
+
+
+def _workflow_definition_block_labels(workflow_definition: object | None) -> list[str]:
+    blocks = getattr(workflow_definition, "blocks", None) if workflow_definition else None
+    labels: list[str] = []
+    if not blocks:
+        return labels
+    for block in blocks:
+        label = getattr(block, "label", None)
+        if isinstance(label, str) and label:
+            labels.append(label)
+    return labels
+
+
+def _current_workflow_block_labels(ctx: object) -> list[str]:
+    workflow = getattr(ctx, "last_workflow", None)
+    labels = _workflow_definition_block_labels(getattr(workflow, "workflow_definition", None))
+    if labels:
+        return labels
+    workflow_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if not isinstance(workflow_yaml, str):
+        return []
+    blocks = _parse_workflow_blocks(workflow_yaml)
+    if not blocks:
+        return []
+    yaml_labels: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            label = _block_label_from_yaml(block)
+            if label:
+                yaml_labels.append(label)
+    return yaml_labels
+
+
+def _unverified_current_workflow_labels(ctx: object) -> list[str]:
+    labels = _current_workflow_block_labels(ctx)
+    verified = set(getattr(ctx, "verified_prefix_labels", []) or [])
+    return [label for label in labels if label not in verified]
 
 
 # Minimum length to apply the trailing-``s`` plural strip; below this we
@@ -1946,8 +2122,8 @@ def _stale_block_metadata_message(items: list[dict[str, Any]]) -> str:
 
 
 def _find_invalidated_labels(
-    old_definition: Any,
-    new_definition: Any,
+    old_definition: object | None,
+    new_definition: object | None,
     requested_labels: list[str],
 ) -> set[str]:
     """Return the set of requested labels whose behavior is invalidated.
@@ -1984,7 +2160,7 @@ def _earliest_invalidated(requested_labels: list[str], invalidated: set[str]) ->
 
 
 def _nearest_upstream_state_establisher(
-    requested_labels: list[str], target_label: str, new_definition: Any
+    requested_labels: list[str], target_label: str, new_definition: object | None
 ) -> str | None:
     by_label = _blocks_by_label(new_definition)
     try:
@@ -2000,7 +2176,28 @@ def _nearest_upstream_state_establisher(
     return None
 
 
-def _serialized_frontier_block_configs(frontier_labels: list[str], new_definition: Any) -> list[str]:
+def _block_can_start_browser_run(block: object) -> bool:
+    if _block_type_name(block) == BlockType.GOTO_URL.value:
+        return True
+    return _valid_runtime_anchor_url(getattr(block, "url", None)) is not None
+
+
+def _nearest_upstream_runnable_anchor(
+    workflow_labels: list[str], target_label: str, new_definition: object | None
+) -> str | None:
+    by_label = _blocks_by_label(new_definition)
+    try:
+        idx = workflow_labels.index(target_label)
+    except ValueError:
+        return None
+    for candidate in reversed(workflow_labels[:idx]):
+        block = by_label.get(candidate)
+        if block is not None and _block_can_start_browser_run(block):
+            return candidate
+    return workflow_labels[0] if workflow_labels[:idx] else None
+
+
+def _serialized_frontier_block_configs(frontier_labels: list[str], new_definition: object | None) -> list[str]:
     by_label = _blocks_by_label(new_definition)
     serialized_configs: list[str] = []
     for label in frontier_labels:
@@ -2014,7 +2211,7 @@ def _serialized_frontier_block_configs(frontier_labels: list[str], new_definitio
     return serialized_configs
 
 
-def _workflow_parameter_keys(definition: Any) -> set[str]:
+def _workflow_parameter_keys(definition: object | None) -> set[str]:
     parameters = getattr(definition, "parameters", None) if definition else None
     keys: set[str] = set()
     if not parameters:
@@ -2031,7 +2228,7 @@ _CREDENTIAL_REAL_VALUE_SUFFIXES = ("_real_username", "_real_password")
 
 def _classify_frontier_jinja_refs(
     frontier_labels: list[str],
-    new_definition: Any,
+    new_definition: object | None,
     serialized_configs: list[str] | None = None,
 ) -> tuple[set[str], set[str], set[str]]:
     """Single pass over frontier blocks; returns ``(suffix_form_refs, block_form_refs, unknown_roots)``."""
@@ -2069,7 +2266,7 @@ def _classify_frontier_jinja_refs(
 
 def _referenced_output_labels(
     frontier_labels: list[str],
-    new_definition: Any,
+    new_definition: object | None,
     serialized_configs: list[str] | None = None,
 ) -> set[str]:
     suffix_refs, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
@@ -2078,7 +2275,7 @@ def _referenced_output_labels(
 
 def _block_form_output_labels(
     frontier_labels: list[str],
-    new_definition: Any,
+    new_definition: object | None,
     serialized_configs: list[str] | None = None,
 ) -> set[str]:
     _, block_form_refs, _ = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
@@ -2087,7 +2284,7 @@ def _block_form_output_labels(
 
 def _unknown_jinja_roots(
     frontier_labels: list[str],
-    new_definition: Any,
+    new_definition: object | None,
     serialized_configs: list[str] | None = None,
 ) -> set[str]:
     _, _, unknown_roots = _classify_frontier_jinja_refs(frontier_labels, new_definition, serialized_configs)
@@ -2114,7 +2311,7 @@ def _summarize_action_trace(action_trace: list[dict[str, Any]] | None) -> list[s
     return summary
 
 
-async def _get_prior_workflow_definition(ctx: AgentContext) -> Any:
+async def _get_prior_workflow_definition(ctx: AgentContext) -> object | None:
     """Hybrid: prefer ctx.last_workflow, fall back to DB fetch on cold start."""
     last_workflow = getattr(ctx, "last_workflow", None)
     if last_workflow is not None:
@@ -2239,26 +2436,27 @@ def _workflow_requires_canonical_persist(prior: Workflow | None, new: Workflow) 
 
 
 def _plan_frontier(
-    ctx: Any,
+    ctx: AgentContext,
     requested_labels: list[str],
-    old_definition: Any,
-    new_definition: Any,
+    old_definition: object | None,
+    new_definition: object | None,
 ) -> tuple[list[str], dict[str, Any], str | None]:
     """Plan the frontier execution.
 
     Returns ``(labels_to_execute, block_outputs_to_seed, frontier_start_label)``.
 
     Falls back to the full requested list on any ambiguity. When there is no
-    workflow change (plain run path) the frontier is the first requested label
-    and we seed any verified outputs referenced by the suffix.
+    workflow change (plain run path) the frontier is the first requested label,
+    and we seed verified outputs referenced by the suffix plus prior
+    browser-state outputs needed to start a downstream frontier.
     """
     if not requested_labels:
         return requested_labels, {}, None
     if new_definition is None:
         return requested_labels, {}, requested_labels[0]
 
-    verified_outputs: dict[str, Any] = dict(getattr(ctx, "verified_block_outputs", {}) or {})
-    verified_prefix: list[str] = list(getattr(ctx, "verified_prefix_labels", []) or [])
+    verified_outputs: dict[str, Any] = dict(ctx.verified_block_outputs or {})
+    verified_prefix: list[str] = list(ctx.verified_prefix_labels or [])
     verified_prefix_set = set(verified_prefix)
 
     # No old definition (cold start or parse failure) OR no diff signal → plain path.
@@ -2274,9 +2472,29 @@ def _plan_frontier(
 
     earliest = _earliest_invalidated(requested_labels, invalidated)
     if earliest is None:
-        # No invalidation at all — unchanged request. Use first requested as frontier.
-        frontier = requested_labels[0]
-        return _seed_for_frontier(requested_labels, frontier, verified_outputs, new_definition)
+        # No invalidation at all — unchanged request. Continue from the
+        # first unverified requested label so a model may keep passing the
+        # complete chain while the tool advances the browser in small
+        # verified frontiers.
+        next_frontier = _first_unverified_requested_label(requested_labels, verified_prefix_set)
+        if next_frontier is not None:
+            return _seed_for_frontier(requested_labels, next_frontier, verified_outputs, new_definition)
+
+        # If the model accidentally asks to rerun an already-verified prefix,
+        # keep the browser moving forward instead of spending another tool call
+        # on work the current session has already covered.
+        workflow_labels = _workflow_definition_block_labels(new_definition)
+        next_workflow_frontier = _first_unverified_requested_label(workflow_labels, verified_prefix_set)
+        if next_workflow_frontier is not None:
+            frontier_idx = workflow_labels.index(next_workflow_frontier)
+            return _seed_for_frontier(
+                workflow_labels[: frontier_idx + 1],
+                next_workflow_frontier,
+                verified_outputs,
+                new_definition,
+            )
+
+        return _seed_for_frontier(requested_labels, requested_labels[0], verified_outputs, new_definition)
 
     # Ensure the prefix before the earliest invalidated label is all in the
     # verified prefix from a successful prior run. Otherwise we have no
@@ -2292,6 +2510,18 @@ def _plan_frontier(
         # Case A — append-after-success. The earliest invalidated label is a
         # new block that didn't exist in the prior definition, so the verified
         # prefix represents the browser state just before it. Start there.
+        workflow_labels = _workflow_definition_block_labels(new_definition)
+        if earliest in workflow_labels:
+            workflow_prefix = workflow_labels[: workflow_labels.index(earliest)]
+            if not all(label in verified_prefix_set for label in workflow_prefix):
+                anchor = _nearest_upstream_runnable_anchor(workflow_labels, earliest, new_definition)
+                if anchor is not None:
+                    return _seed_for_frontier(
+                        workflow_labels[workflow_labels.index(anchor) : workflow_labels.index(earliest) + 1],
+                        anchor,
+                        verified_outputs,
+                        new_definition,
+                    )
         return _seed_for_frontier(requested_labels, earliest, verified_outputs, new_definition)
 
     # Edit-in-place. We lack a browser-anchor signal, so we cannot safely
@@ -2305,18 +2535,29 @@ def _plan_frontier(
     return _seed_for_frontier(requested_labels, anchor, verified_outputs, new_definition)
 
 
+def _first_unverified_requested_label(requested_labels: list[str], verified_prefix_set: set[str]) -> str | None:
+    for label in requested_labels:
+        if label not in verified_prefix_set:
+            return label
+    return None
+
+
 def _seed_for_frontier(
     requested_labels: list[str],
     frontier: str,
     verified_outputs: dict[str, Any],
-    new_definition: Any,
+    new_definition: object | None,
 ) -> tuple[list[str], dict[str, Any], str]:
     try:
         idx = requested_labels.index(frontier)
     except ValueError:
         return requested_labels, {}, requested_labels[0]
     labels_to_execute = requested_labels[idx:]
-    prefix_labels = requested_labels[:idx]
+    workflow_labels = _workflow_definition_block_labels(new_definition)
+    if frontier in workflow_labels:
+        prefix_labels = workflow_labels[: workflow_labels.index(frontier)]
+    else:
+        prefix_labels = requested_labels[:idx]
     if not prefix_labels:
         return labels_to_execute, {}, frontier
     serialized_configs = _serialized_frontier_block_configs(labels_to_execute, new_definition)
@@ -2337,7 +2578,79 @@ def _seed_for_frontier(
         seed[label] = verified_outputs[label]
     if unknown_roots:
         return requested_labels, {}, requested_labels[0]
+    by_label = _blocks_by_label(new_definition)
+    for label in prefix_labels:
+        block = by_label.get(label)
+        if block is None or _block_type_name(block) not in _BLOCK_TYPES_STATE_ESTABLISHER:
+            continue
+        if label in verified_outputs:
+            seed.setdefault(label, verified_outputs[label])
     return labels_to_execute, seed, frontier
+
+
+_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS = 2
+_PAGE_CHANGING_FRONTIER_BLOCK_TYPES: frozenset[str] = frozenset(
+    {
+        BlockType.ACTION.value,
+        BlockType.FILE_DOWNLOAD.value,
+        BlockType.FILE_UPLOAD.value,
+        BlockType.LOGIN.value,
+        BlockType.NAVIGATION.value,
+    }
+)
+
+
+def _frontier_block_type_names(labels: list[str], workflow_definition: object | None) -> list[str]:
+    by_label = _blocks_by_label(workflow_definition)
+    type_names: list[str] = []
+    for label in labels:
+        block = by_label.get(label)
+        if block is None:
+            continue
+        type_name = _block_type_name(block)
+        if type_name:
+            type_names.append(type_name)
+    return type_names
+
+
+def _frontier_has_several_page_changing_stages(labels: list[str], workflow_definition: object | None) -> bool:
+    type_names = _frontier_block_type_names(labels, workflow_definition)
+    if len(type_names) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
+        return False
+    page_changing_count = sum(1 for type_name in type_names if type_name in _PAGE_CHANGING_FRONTIER_BLOCK_TYPES)
+    return page_changing_count >= 2 or (page_changing_count >= 1 and len(type_names) >= 4)
+
+
+def _frontier_includes_required_runtime_anchor(block_labels: list[str], labels_to_execute: list[str]) -> bool:
+    if not block_labels or len(labels_to_execute) <= len(block_labels):
+        return False
+    return labels_to_execute[-len(block_labels) :] == block_labels
+
+
+def _frontier_run_size_error(
+    copilot_ctx: object,
+    block_labels: list[str],
+    labels_to_execute: list[str],
+    workflow_definition: object | None,
+) -> str | None:
+    if len(labels_to_execute) <= _MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:
+        return None
+    if _frontier_includes_required_runtime_anchor(block_labels, labels_to_execute):
+        return None
+    if getattr(copilot_ctx, "build_phase", None) not in (BuildPhase.COMPOSING, BuildPhase.TESTING):
+        return None
+    if not _frontier_has_several_page_changing_stages(labels_to_execute, workflow_definition):
+        return None
+
+    suggested = labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]
+    remaining = labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]
+    return (
+        "Workflow validation failed: this browser test frontier is too long for a multi-stage "
+        "page-changing workflow. Keep the same complete workflow YAML, but shrink only the "
+        f"block_labels argument to the next 1-2 unverified labels: {suggested!r}. "
+        f"Do not remove later blocks from the YAML; test them after this frontier succeeds. "
+        f"Deferred labels: {remaining!r}. Requested labels: {block_labels!r}."
+    )
 
 
 # Watchdog exit reasons. ``success`` means the run reached a trustworthy
@@ -2472,7 +2785,11 @@ async def _watchdog_error_message(
             f"Run ID: {workflow_run_id}.\n"
             f"Next step: call get_run_results with this workflow_run_id to inspect what "
             f"the cancelled run actually completed (the in-flight block was cancelled "
-            f"mid-execution and may have left partial side effects). Then call "
+            f"mid-execution and may have left partial side effects). If the result "
+            f"includes a current_url, inspect that current page before any further "
+            f'block-running call. Use inspect_page_for_composition(target_url="current_page"), '
+            f"evaluate, or get_browser_screenshot to decide whether the answer is already "
+            f"visible or which page-state change is still missing. Only then call "
             f"update_and_run_blocks with a smaller chain — the first 1-2 unverified "
             f"blocks. Verified-prefix state is preserved, so the next call only re-runs "
             f"from the new frontier. Do NOT retry the same chain unchanged — a longer "
@@ -2530,6 +2847,21 @@ def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotCo
         LOG.warning("run_blocks invoked without block-goal context; using persisted workflow goals unchanged")
         return workflow
     return wrap_workflow_block_goals(workflow, block_goal_main_goal)
+
+
+def _valid_runtime_anchor_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or url in {"about:blank", ":"}:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
 
 
 async def _run_blocks_and_collect_debug(
@@ -2821,6 +3153,7 @@ async def _run_blocks_and_collect_debug(
             user_failure_reason = _watchdog_user_failure_reason(
                 exit_reason, workflow_run.workflow_run_id, budget_seconds, run
             )
+            current_url, page_title = await _fallback_page_info(ctx)
             result: dict[str, Any] = {
                 "ok": False,
                 "error": error_msg,
@@ -2828,6 +3161,8 @@ async def _run_blocks_and_collect_debug(
                     "workflow_run_id": workflow_run.workflow_run_id,
                     "overall_status": run.status if run is not None else None,
                     "failure_reason": user_failure_reason,
+                    "current_url": current_url,
+                    "page_title": page_title,
                 },
             }
             if exit_reason == "per_tool_budget":
@@ -2977,6 +3312,9 @@ async def _run_blocks_and_collect_debug(
                 existing_prefix.append(label)
                 existing_set.add(label)
         ctx.verified_prefix_labels = existing_prefix
+        verified_current_url = _valid_runtime_anchor_url(current_url)
+        if verified_current_url is not None:
+            ctx.verified_prefix_current_url = verified_current_url
 
     return build_run_blocks_response(run_ok, result_data)
 
@@ -2994,6 +3332,12 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
                 ),
             }
         workflow_run_id = pending_run_id
+    if not workflow_run_id:
+        same_turn_run_id = getattr(ctx, "last_successful_run_blocks_workflow_run_id", None)
+        if not isinstance(same_turn_run_id, str) or not same_turn_run_id:
+            same_turn_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+        if isinstance(same_turn_run_id, str) and same_turn_run_id:
+            workflow_run_id = same_turn_run_id
 
     if not workflow_run_id:
         # Include every final state so the agent can inspect failures via the
@@ -3052,6 +3396,10 @@ async def _get_run_results(params: dict[str, Any], ctx: AgentContext) -> dict[st
         "overall_status": run.status,
         "blocks": results,
     }
+    current_url, page_title = await _fallback_page_info(ctx)
+    if current_url:
+        result_data["current_url"] = current_url
+        result_data["page_title"] = page_title
     if getattr(run, "failure_reason", None):
         result_data["failure_reason"] = run.failure_reason
 
@@ -3221,29 +3569,36 @@ def _normalize_evaluate_page_schema(observed_data: object) -> dict[str, Any]:
     }
 
 
-def _record_browser_observation_evidence(
+def _record_composition_page_observation(
     ctx: AgentContext,
     *,
     source_tool: str,
-    current_url: str,
-    page_title: str = "",
+    url: str,
+    title: str = "",
     observed_data: object | None = None,
 ) -> None:
-    if not current_url:
+    if not url:
         return
     existing = ctx.composition_page_evidence
     if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
         return
+
     evidence: dict[str, Any] = {
-        "inspected_url": current_url,
-        "current_url": current_url,
-        "page_title": page_title,
+        "inspected_url": url,
+        "current_url": url,
+        "page_title": title[:240],
         "forms": [],
+        "navigation_targets": [],
         "result_containers": [],
         "anti_bot_indicators": [],
+        "evidence_confidence": 0.0,
         "source_tool": source_tool,
         "observed_after_workflow_run": False,
     }
+    if isinstance(observed_data, dict):
+        observed_title = observed_data.get("title")
+        if isinstance(observed_title, str) and observed_title and not evidence["page_title"]:
+            evidence["page_title"] = observed_title[:240]
     if source_tool == "get_browser_screenshot":
         evidence.update(
             {
@@ -3576,19 +3931,15 @@ async def _screenshot_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     if result.get("ok") and result.get("data"):
+        _mark_page_inspected(ctx)
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
+        _record_composition_page_observation(ctx, source_tool="get_browser_screenshot", url=url, title=title)
         result["data"] = {
             "screenshot_base64": data.get("data", ""),
             "url": url,
             "title": title,
         }
-        _record_browser_observation_evidence(
-            ctx,
-            source_tool="get_browser_screenshot",
-            current_url=url,
-            page_title=title,
-        )
     return result
 
 
@@ -3630,15 +3981,21 @@ async def _evaluate_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     if result.get("ok") and result.get("data"):
+        _mark_page_inspected(ctx)
         result["data"].pop("sdk_equivalent", None)
         if "url" not in result["data"]:
             url, _ = await _resolve_url_title(raw, ctx)
             if url:
                 result["data"]["url"] = url
-        _record_browser_observation_evidence(
+        url = str(result["data"].get("url") or "")
+        title = str(result["data"].get("title") or "")
+        if not title:
+            _, title = await _resolve_url_title(raw, ctx)
+        _record_composition_page_observation(
             ctx,
             source_tool="evaluate",
-            current_url=str(result["data"].get("url") or ""),
+            url=url,
+            title=title,
             observed_data=result["data"],
         )
     return result
@@ -3904,9 +4261,21 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
 
     # Collect texts for scanning and data-block stats in one pass
     texts_to_scan: list[str] = []
+    error = result.get("error")
+    if isinstance(error, str):
+        texts_to_scan.append(error)
     html = data.get("visible_elements_html")
     if isinstance(html, str):
         texts_to_scan.append(html)
+    failure_reason = data.get("failure_reason")
+    if isinstance(failure_reason, str):
+        texts_to_scan.append(failure_reason)
+    page_title = data.get("page_title")
+    if isinstance(page_title, str):
+        texts_to_scan.append(page_title)
+    action_trace_summary = data.get("action_trace_summary")
+    if isinstance(action_trace_summary, list):
+        texts_to_scan.extend(str(item) for item in action_trace_summary if isinstance(item, str))
 
     has_data_blocks = False
     any_data_output = False
@@ -3936,6 +4305,22 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
 
     empty_data_blocks = has_data_blocks and not any_data_output
     return anti_bot_match, empty_data_blocks, categories
+
+
+def _composition_anti_bot_reason(copilot_ctx: object) -> str | None:
+    evidence = getattr(copilot_ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return None
+    indicators = evidence.get("anti_bot_indicators")
+    challenge_controls = evidence.get("challenge_controls")
+    normalized_indicators = (
+        [str(item) for item in indicators if isinstance(item, str)] if isinstance(indicators, list) else []
+    )
+    control_count = len(challenge_controls) if isinstance(challenge_controls, list) else 0
+    if not normalized_indicators and control_count == 0:
+        return None
+    details = ", ".join(normalized_indicators[:4]) or f"{control_count} challenge control(s)"
+    return f"Observed anti-bot challenge evidence before the run: {details}"
 
 
 # Generic failure-reason template emitted by the shared agent when the
@@ -3990,11 +4375,17 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
 
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
+    copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
     # Watchdog cancels normally count as ok=False; only a coincident total
     # timeout softens to ``None`` to keep the unvalidated WIP rescue open.
     cancelled_by_watchdog = result.get(_INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY) is True
     timeout_latched = bool(copilot_ctx.copilot_total_timeout_exceeded)
     copilot_ctx.last_test_ok = None if (cancelled_by_watchdog and timeout_latched) else run_ok
+    copilot_ctx.last_full_workflow_test_ok = False
+    copilot_ctx.last_unverified_block_labels = _unverified_current_workflow_labels(copilot_ctx)
     copilot_ctx.last_test_failure_reason = None
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.suspicious_success_nudge_count = 0
@@ -4004,6 +4395,8 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     copilot_ctx.last_test_non_retriable_nav_error = None
 
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
+    if not anti_bot_match:
+        anti_bot_match = _composition_anti_bot_reason(copilot_ctx)
     if anti_bot_match:
         copilot_ctx.last_test_anti_bot = anti_bot_match
     if failure_categories:
@@ -4012,6 +4405,13 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             top_category = top.get("category")
             if isinstance(top_category, str):
                 copilot_ctx.last_failure_category_top = top_category
+
+    if copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY and isinstance(data, dict):
+        current_url = _valid_runtime_anchor_url(data.get("current_url"))
+        if current_url is not None:
+            copilot_ctx.post_budget_page_inspection_required = True
+            copilot_ctx.post_budget_page_inspection_url = current_url
+            copilot_ctx.post_budget_page_inspection_run_id = run_id if isinstance(run_id, str) else None
 
     # A fresh budget trip on a different chain should get the dedicated split
     # nudge again rather than falling through to the generic failed-test path,
@@ -4026,6 +4426,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             data["failure_categories"] = failure_categories
 
     if run_ok:
+        _mark_page_inspected(copilot_ctx)
         if empty_data_blocks:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
@@ -4047,8 +4448,17 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
         # Real success: clear the signature latch so a subsequent bad URL in
         # the same session can re-fire the stop nudge.
         copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
-        copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
-        copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+        unverified = _unverified_current_workflow_labels(copilot_ctx)
+        copilot_ctx.last_unverified_block_labels = unverified
+        if not unverified:
+            copilot_ctx.last_full_workflow_test_ok = True
+            copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
+            copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
+        else:
+            copilot_ctx.last_test_failure_reason = (
+                "The last run verified only the current browser frontier; unverified workflow blocks remain: "
+                + ", ".join(unverified[:8])
+            )
         update_repeated_failure_state(copilot_ctx, result)
         return
 
@@ -4121,11 +4531,10 @@ async def update_workflow_tool(
     reusable domain value the user supplies, not the page widget or action used
     to enter it.
 
-    Use browser inspection while building to fill knowledge gaps about page
-    controls, result layout, and current URLs. Only refine URL params when they
-    are grounded in observed DOM/link/form state or observed URL deltas.
-    Browser inspection is build-time context; add durable workflow blocks only
-    for the reusable actions/checks the workflow actually needs.
+    Use browser inspection and run evidence to fill knowledge gaps while
+    building or editing the workflow. Do not invent URL params, form fields,
+    result affordances, or page structure from memory; ground workflow blocks
+    in observed MCP evidence or information the user supplied.
     """
     copilot_ctx = ctx.context
     arguments = {"workflow_yaml": workflow_yaml}
@@ -4193,20 +4602,12 @@ async def list_credentials_tool(
     return json.dumps(sanitized)
 
 
-async def _frontier_plan_for_current_workflow(
-    ctx: AgentContext, block_labels: list[str]
-) -> tuple[list[str], dict[str, Any], str | None]:
-    """Plan execution for the plain (no YAML update) path."""
-    prior_definition = await _get_prior_workflow_definition(ctx)
-    return _plan_frontier(ctx, block_labels, prior_definition, prior_definition)
-
-
 def _run_blocks_span_data(
     block_labels: list[str],
     labels_to_execute: list[str],
     frontier_start_label: str | None,
     seeded_outputs: dict[str, Any],
-    ctx: Any,
+    ctx: object,
 ) -> dict[str, Any]:
     return {
         "requested_block_labels": block_labels,
@@ -4215,6 +4616,27 @@ def _run_blocks_span_data(
         "seeded_output_count": len(seeded_outputs or {}),
         "repeated_failure_streak_count": int(getattr(ctx, "repeated_failure_streak_count", 0) or 0),
         "block_count": len(block_labels),
+    }
+
+
+def _frontier_run_size_result(
+    error: str,
+    block_labels: list[str],
+    labels_to_execute: list[str],
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": error,
+        "data": {
+            "workflow_run_id": None,
+            "overall_status": "skipped",
+            "workflow_run_skipped": True,
+            "requested_block_labels": list(block_labels),
+            "executed_block_labels": [],
+            "planned_block_labels": list(labels_to_execute),
+            "suggested_block_labels": list(labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]),
+            "deferred_block_labels": list(labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]),
+        },
     }
 
 
@@ -4250,11 +4672,10 @@ async def run_blocks_tool(
     the inline value via `parameters`; stop and follow the CREDENTIAL
     HANDLING refusal rule in the system prompt.
 
-    When a prior `goto_url` used URL params for dynamic page state, the
-    blocks you run must include live-page verification before extraction. If
-    the visible state is uncertain or only partially applied, inspect it
-    through a `code` or `validation` block, or apply missing state through a
-    `navigation` block, instead of retrying guessed URL params.
+    Use browser inspection and run evidence to fill knowledge gaps before
+    changing the workflow. If visible state is uncertain, inspect the live
+    page and then compose the next normal workflow action from observed
+    evidence instead of retrying guessed URL params or page structure.
     """
     copilot_ctx = ctx.context
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
@@ -4266,9 +4687,20 @@ async def run_blocks_tool(
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "run_blocks_and_collect_debug", loop_error)
 
-    labels_to_execute, block_outputs_to_seed, frontier_start_label = await _frontier_plan_for_current_workflow(
-        copilot_ctx, block_labels
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
+    labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
+        copilot_ctx, block_labels, prior_definition, prior_definition
     )
+    frontier_error = _frontier_run_size_error(copilot_ctx, block_labels, labels_to_execute, prior_definition)
+    if frontier_error:
+        result = _frontier_run_size_result(frontier_error, block_labels, labels_to_execute)
+        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="run_blocks_and_collect_debug",
+            result=result,
+        )
+        return json.dumps(result)
 
     with copilot_span(
         "run_blocks",
@@ -4347,6 +4779,9 @@ async def update_and_run_blocks_tool(
     """Update the workflow YAML and immediately run the specified blocks in one step.
     Use this instead of calling update_workflow and run_blocks_and_collect_debug separately.
     The workflow must validate successfully before blocks are run.
+    `block_labels` may be a tested frontier subset of the full workflow YAML;
+    save the complete reusable workflow, then run only the next 1-2 unverified
+    blocks when a long form/search/result chain can be verified incrementally.
 
     Top-level workflow parameter keys appear in the run-input UI. When you
     add runtime inputs in `workflow_definition.parameters`, name keys for the
@@ -4491,6 +4926,20 @@ async def update_and_run_blocks_tool(
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, new_definition
     )
+    frontier_error = _frontier_run_size_error(copilot_ctx, block_labels, labels_to_execute, new_definition)
+    if frontier_error:
+        result = _frontier_run_size_result(frontier_error, block_labels, labels_to_execute)
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["workflow_updated"] = True
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=result,
+            workflow_updated=True,
+        )
+        return json.dumps(result)
 
     with copilot_span(
         "run_blocks",
@@ -4531,6 +4980,8 @@ async def update_and_run_blocks_tool(
 
 _DISCOVERY_PER_CHAT_BUDGET = 3
 _DISCOVERY_PER_TURN_BUDGET = 1
+_COMPOSITION_INSPECTION_PER_CHAT_BUDGET = 6
+_COMPOSITION_INSPECTION_PER_TURN_BUDGET = 4
 _DISCOVERY_WALL_CLOCK_SECONDS = 60.0
 _DISCOVERY_STEP_CAP = 8
 _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
@@ -5030,6 +5481,29 @@ async def _inspect_page_for_composition_impl(
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
 
+    if copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": (
+                "inspect_page_for_composition reached the page-inspection budget for this turn. "
+                "Compose from existing evidence or ask for clarification if inspection still cannot determine "
+                "required page inputs."
+            ),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
+    if cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": "inspect_page_for_composition has reached the page-inspection budget for this chat. Compose from existing evidence or ask for clarification.",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     entry_url: str
     kind: str
@@ -5113,7 +5587,9 @@ async def _inspect_page_for_composition_impl(
             "observed_after_workflow_run": True,
         }
 
+    copilot_ctx.page_inspection_calls_this_turn += 1
     copilot_ctx.composition_page_evidence = evidence
+    _mark_page_inspected(copilot_ctx)
     result = {"ok": True, "data": evidence}
     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
     return result
@@ -5218,7 +5694,25 @@ async def _discovery_walk(
 
         title_score = _discovery_title_score(page_title, intent_tokens)
 
-        if intent_tokens and title_score >= 2:
+        best_score = 0
+        best_href: str | None = None
+        best_anchor: dict[str, str] | None = None
+        for anchor in anchors:
+            score = _discovery_anchor_score(
+                anchor.get("text", ""),
+                anchor.get("title", ""),
+                anchor.get("href", ""),
+                intent_tokens,
+            )
+            if score > best_score:
+                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
+                if resolved is None:
+                    continue
+                best_score = score
+                best_href = resolved
+                best_anchor = anchor
+
+        if intent_tokens and title_score >= 2 and (form_fields or best_score <= title_score):
             confidence = min(1.0, title_score / max(1, len(intent_tokens)))
             return _discovery_build_result(
                 candidate_url=current_url,
@@ -5246,24 +5740,6 @@ async def _discovery_walk(
                 confidence=0.3,
                 failure_reason=None,
             )
-
-        best_score = 0
-        best_href: str | None = None
-        best_anchor: dict[str, str] | None = None
-        for anchor in anchors:
-            score = _discovery_anchor_score(
-                anchor.get("text", ""),
-                anchor.get("title", ""),
-                anchor.get("href", ""),
-                intent_tokens,
-            )
-            if score > best_score:
-                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
-                if resolved is None:
-                    continue
-                best_score = score
-                best_href = resolved
-                best_anchor = anchor
 
         if best_score == 0 or best_href is None:
             return _discovery_build_result(
@@ -5447,18 +5923,21 @@ async def inspect_page_for_composition_tool(
     """Inspect a known page before composing form/search workflow blocks.
 
     Use this after the entrypoint URL is known and before authoring blocks that
-    fill fields, submit searches, filter results, or expand result rows. Pass
-    target_url="current_page" after partial workflow runs to inspect the live
-    browser page without navigating away. It returns observed page evidence:
-    current URL, title, navigation targets, form fields with labels and selectors,
-    submit/search controls, result containers, anti-bot indicators, and bounded
-    visual challenge evidence when DOM evidence shows challenge state. Do NOT
-    paste the evidence into workflow YAML; use it to ground concise block prompts.
-    If a block run changes pages, inspect the reached page before authoring
-    downstream form/search/result blocks. If the evidence shows required fields
-    or controls that the user did not supply enough information for, ASK_QUESTION
-    with that observed missing input. If evidence is sufficient, compose and run
-    workflow blocks from the observed fields.
+    fill fields, submit searches, filter results, or expand result rows. It
+    can also inspect the current browser page after a run by passing
+    target_url="current_page"; use that after partial/budgeted runs so you do
+    not replay a search that already advanced the page.
+
+    Returns observed page evidence: current URL, title, navigation targets, form
+    fields with labels and selectors, submit/search controls, result containers,
+    compact visible text excerpts, anti-bot indicators, and bounded visual
+    challenge evidence when DOM evidence shows challenge state. Do NOT paste the
+    evidence into workflow YAML; use it to ground concise block prompts. If a
+    block run changes pages, inspect the reached page before authoring downstream
+    form/search/result blocks. If the
+    evidence shows required fields or controls that the user did not supply
+    enough information for, ASK_QUESTION with that observed missing input. If
+    evidence is sufficient, compose and run workflow blocks from the observed fields.
     If challenge_state.gates_submit_controls is true, treat challenge resolution
     as a prerequisite for submit/search; do not click a submit control while the
     latest inspected evidence says it is disabled.
