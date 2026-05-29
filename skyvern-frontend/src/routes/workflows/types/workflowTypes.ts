@@ -642,6 +642,7 @@ export type WorkflowApiResponse = {
   totp_verification_url: string | null;
   totp_identifier: string | null;
   max_screenshot_scrolls: number | null;
+  max_elapsed_time_minutes: number | null;
   status: string | null;
   created_at: string;
   modified_at: string;
@@ -664,6 +665,7 @@ export type WorkflowSettings = {
   browserProfileId: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
+  maxElapsedTimeMinutes: number | null;
   extraHttpHeaders: string | null;
   cdpConnectHeaders: string | null;
   runWith: string; // 'agent' or 'code'

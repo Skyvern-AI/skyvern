@@ -4,8 +4,6 @@ import { getCredentialParam } from "@/util/env";
 import { useClientIdStore } from "@/store/useClientIdStore";
 import {
   mouseButtonName,
-  buildKeyDownPayload,
-  buildKeyUpPayload,
   getModifiers,
   mapCoordinates,
   mapMouseCoordinates,
@@ -24,7 +22,6 @@ interface UseCdpInputReturn {
   userIsControlling: boolean;
   setUserIsControlling: (v: boolean) => void;
   inputReady: boolean;
-  browserCommandError: string | null;
   containerRef: React.RefObject<HTMLDivElement>;
   handlers: {
     handleMouseDown: (e: React.MouseEvent<HTMLImageElement>) => void;
@@ -32,12 +29,6 @@ interface UseCdpInputReturn {
     handleMouseMove: (e: React.MouseEvent<HTMLImageElement>) => void;
     handleKeyDown: (e: React.KeyboardEvent) => void;
     handleKeyUp: (e: React.KeyboardEvent) => void;
-  };
-  browserControls: {
-    navigate: (url: string) => void;
-    reload: () => void;
-    goBack: () => void;
-    goForward: () => void;
   };
 }
 
@@ -49,9 +40,6 @@ export function useCdpInput({
 }: UseCdpInputOptions): UseCdpInputReturn {
   const [userIsControlling, setUserIsControlling] = useState(false);
   const [inputReady, setInputReady] = useState(false);
-  const [browserCommandError, setBrowserCommandError] = useState<string | null>(
-    null,
-  );
   const credentialGetter = useCredentialGetter();
   const clientId = useClientIdStore((s) => s.clientId);
 
@@ -105,8 +93,6 @@ export function useCdpInput({
             if (userIsControllingRef.current) {
               ws.send(JSON.stringify({ kind: "take-control" }));
             }
-          } else if (msg.kind === "browserCommandResult") {
-            setBrowserCommandError(msg.ok ? null : String(msg.error || ""));
           }
         } catch {
           // ignore non-JSON messages
@@ -251,44 +237,6 @@ export function useCdpInput({
     ws.send(JSON.stringify(payload));
   }, []);
 
-  const sendBrowserCommand = useCallback((payload: Record<string, unknown>) => {
-    const ws = inputSocketRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setBrowserCommandError("Browser controls are not connected.");
-      return;
-    }
-    setBrowserCommandError(null);
-    ws.send(JSON.stringify({ type: "browserCommand", ...payload }));
-  }, []);
-
-  const navigate = useCallback(
-    (rawUrl: string) => {
-      const url = rawUrl.trim();
-      if (!url) {
-        setBrowserCommandError("URL must not be empty.");
-        return;
-      }
-      if (url.toLowerCase().startsWith("chrome://")) {
-        setBrowserCommandError("chrome:// URLs are not allowed.");
-        return;
-      }
-      sendBrowserCommand({ command: "navigate", url });
-    },
-    [sendBrowserCommand],
-  );
-
-  const reload = useCallback(() => {
-    sendBrowserCommand({ command: "reload" });
-  }, [sendBrowserCommand]);
-
-  const goBack = useCallback(() => {
-    sendBrowserCommand({ command: "goBack" });
-  }, [sendBrowserCommand]);
-
-  const goForward = useCallback(() => {
-    sendBrowserCommand({ command: "goForward" });
-  }, [sendBrowserCommand]);
-
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLImageElement>) => {
       if (!interactive || !userIsControlling) return;
@@ -368,7 +316,14 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent(buildKeyDownPayload(e.nativeEvent));
+      sendInputEvent({
+        type: "keyEvent",
+        eventType: "keyDown",
+        key: e.key,
+        code: e.code,
+        text: e.key.length === 1 ? e.key : "",
+        modifiers: getModifiers(e),
+      });
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -377,7 +332,13 @@ export function useCdpInput({
     (e: React.KeyboardEvent) => {
       if (!interactive || !userIsControlling) return;
       e.preventDefault();
-      sendInputEvent(buildKeyUpPayload(e.nativeEvent));
+      sendInputEvent({
+        type: "keyEvent",
+        eventType: "keyUp",
+        key: e.key,
+        code: e.code,
+        modifiers: getModifiers(e),
+      });
     },
     [interactive, userIsControlling, sendInputEvent],
   );
@@ -386,7 +347,6 @@ export function useCdpInput({
     userIsControlling,
     setUserIsControlling,
     inputReady,
-    browserCommandError,
     containerRef,
     handlers: {
       handleMouseDown,
@@ -394,12 +354,6 @@ export function useCdpInput({
       handleMouseMove,
       handleKeyDown,
       handleKeyUp,
-    },
-    browserControls: {
-      navigate,
-      reload,
-      goBack,
-      goForward,
     },
   };
 }

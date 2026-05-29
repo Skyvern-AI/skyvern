@@ -82,6 +82,7 @@ function WorkflowEditor() {
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
     maxScreenshotScrolls: workflow.max_screenshot_scrolls,
+    maxElapsedTimeMinutes: workflow.max_elapsed_time_minutes ?? null,
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
       : null,

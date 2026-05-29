@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS: WorkflowSettings = {
   browserProfileId: null,
   model: null,
   maxScreenshotScrolls: null,
+  maxElapsedTimeMinutes: null,
   extraHttpHeaders: null,
   cdpConnectHeaders: null,
   runWith: "code",

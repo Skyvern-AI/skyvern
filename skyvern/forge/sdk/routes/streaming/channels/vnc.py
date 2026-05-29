@@ -20,6 +20,7 @@ import asyncio
 import dataclasses
 import typing as t
 from enum import IntEnum
+from urllib.parse import urlparse
 
 import structlog
 import websockets
@@ -48,7 +49,6 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePer
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.utils.aio import collect
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
-from skyvern.webeye.vnc_streaming import build_vnc_streaming_url
 
 LOG = structlog.get_logger()
 
@@ -281,6 +281,43 @@ async def ask_for_clipboard(vnc_channel: VncChannel) -> None:
         LOG.exception(f"{class_name} Failed to ask for clipboard via CDP", **vnc_channel.identity)
 
 
+# TODO(benji): I hate this function. It's messy and gross. Once we remove v1,
+# we should clean this up.
+def _build_vnc_url_from_browser_address(browser_address: str) -> str | None:
+    """
+    Build a routed VNC URL from a V2 K8s routed browser_address.
+
+    V2 K8s routed browser_address format:
+        wss://{domain}/{session_id}/{token}/devtools/browser/{browser_id}
+
+    Returns VNC URL in format:
+        wss://{domain}/vnc/{session_id}/{token}
+
+    Returns None if browser_address is not a V2 routed URL.
+    """
+    if not browser_address:
+        return None
+
+    parsed = urlparse(browser_address)
+
+    # Check if this looks like a V2 routed URL (wss:// with token in path)
+    if parsed.scheme not in ("wss", "ws"):
+        return None
+
+    # Parse path: /{session_id}/{token}/devtools/browser/{browser_id}
+    path_parts = parsed.path.strip("/").split("/")
+    if len(path_parts) < 4 or path_parts[2] != "devtools":
+        return None
+
+    session_id = path_parts[0]
+    token = path_parts[1]
+    domain = parsed.netloc
+
+    # Build VNC URL with same domain and token
+    scheme = "wss" if parsed.scheme == "wss" else "ws"
+    return f"{scheme}://{domain}/vnc/{session_id}/{token}"
+
+
 async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     """
     Actually stream the VNC data between a frontend and a browser.
@@ -288,19 +325,32 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     Loops until the task is cleared or the websocket is closed.
     """
 
+    vnc_url: str = ""
     browser_session = vnc_channel.browser_session
     class_name = vnc_channel.class_name
 
     if not browser_session:
         raise Exception(f"{class_name} No browser session associated with vnc channel.")
 
-    vnc_url = build_vnc_streaming_url(
-        browser_address=browser_session.browser_address,
-        ip_address=browser_session.ip_address,
-        vnc_port=vnc_channel.vnc_port,
-    )
-    if not vnc_url:
-        raise Exception(f"{class_name} Browser session does not expose a VNC endpoint.")
+    # First, check if this is a V2 K8s routed session by examining browser_address
+    # V2 sessions have browser_address like: wss://{domain}/{session_id}/{token}/devtools/...
+    # For these, we need to route VNC through the same nginx proxy
+    routed_vnc_url = _build_vnc_url_from_browser_address(browser_session.browser_address)
+    if routed_vnc_url:
+        vnc_url = routed_vnc_url
+    elif browser_session.ip_address:
+        # V1 ECS sessions: Direct IP connection (ip_address is a public/reachable IP)
+        if ":" in browser_session.ip_address:
+            ip, _ = browser_session.ip_address.split(":")
+            vnc_url = f"ws://{ip}:{vnc_channel.vnc_port}"
+        else:
+            vnc_url = f"ws://{browser_session.ip_address}:{vnc_channel.vnc_port}"
+    else:
+        # Last resort: parse browser_address hostname
+        browser_address = browser_session.browser_address
+        parsed_browser_address = urlparse(browser_address)
+        host = parsed_browser_address.hostname
+        vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
 
     LOG.debug(
         f"{class_name} Connecting to vnc url.",
