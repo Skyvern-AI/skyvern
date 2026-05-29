@@ -23,6 +23,7 @@ import pytest
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PER_TOOL_BUDGET_NUDGES,
+    POST_ANTI_BOT_FAILED_TEST_NUDGE,
     POST_FAILED_TEST_NUDGE,
     POST_PER_TOOL_BUDGET_NUDGE,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
@@ -35,6 +36,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 )
 from skyvern.forge.sdk.copilot.tools import (
     WatchdogExitReason,
+    _mark_page_inspected,
     _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
     _record_per_tool_budget_problem_blocks_from_results,
@@ -80,8 +82,63 @@ def _budget_trip_result(workflow_run_id: str = "wr_1") -> dict:
 
 def test_record_sets_top_category_on_per_tool_budget_result() -> None:
     ctx = _fresh_context()
-    _record_run_blocks_result(ctx, _budget_trip_result())
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
     assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    assert ctx.last_run_blocks_workflow_run_id == "wr_budget"
+    assert ctx.last_successful_run_blocks_workflow_run_id is None
+
+
+def test_record_per_tool_budget_with_current_url_requires_page_inspection() -> None:
+    ctx = _fresh_context()
+    result = _budget_trip_result("wr_budget")
+    result["data"]["current_url"] = "https://example.com/results"
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.post_budget_page_inspection_required is True
+    assert ctx.post_budget_page_inspection_url == "https://example.com/results"
+    assert ctx.post_budget_page_inspection_run_id == "wr_budget"
+
+
+def test_record_preserves_pre_run_anti_bot_evidence_on_budget_trip() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["challenges.cloudflare.com", "cf-turnstile"],
+        "challenge_controls": [{"selector": "#turnstile-widget"}],
+    }
+
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
+
+    assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    assert ctx.last_test_anti_bot is not None
+    assert "cf-turnstile" in ctx.last_test_anti_bot
+
+
+def test_block_running_after_budget_current_url_requires_inspection_first() -> None:
+    ctx = _fresh_context()
+    ctx.post_budget_page_inspection_required = True
+    ctx.post_budget_page_inspection_url = "https://example.com/results"
+    ctx.post_budget_page_inspection_run_id = "wr_budget"
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["extract_results"]})
+
+    assert msg is not None
+    assert "inspect_page_for_composition" in msg
+    assert "current_page" in msg
+    assert "answer from that evidence" in msg
+
+
+def test_page_inspection_clears_post_budget_run_guard() -> None:
+    ctx = _fresh_context()
+    ctx.post_budget_page_inspection_required = True
+    ctx.post_budget_page_inspection_url = "https://example.com/results"
+    ctx.post_budget_page_inspection_run_id = "wr_budget"
+
+    _mark_page_inspected(ctx)
+
+    assert ctx.post_budget_page_inspection_required is False
+    assert ctx.post_budget_page_inspection_url is None
+    assert ctx.post_budget_page_inspection_run_id is None
 
 
 def test_record_uses_policy_failure_reason_not_llm_tool_instruction() -> None:
@@ -170,6 +227,21 @@ def test_check_enforcement_emits_budget_nudge_before_failed_test() -> None:
     nudge = _check_enforcement(ctx)
     assert nudge == POST_PER_TOOL_BUDGET_NUDGE
     assert ctx.per_tool_budget_nudge_count == 1
+
+
+def test_check_enforcement_emits_anti_bot_nudge_before_budget_when_challenge_observed() -> None:
+    ctx = _fresh_context()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_anti_bot = "Observed anti-bot challenge evidence before the run: cf-turnstile"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert ctx.failed_test_nudge_count == 1
+    assert ctx.per_tool_budget_nudge_count == 0
 
 
 def test_check_enforcement_emits_budget_nudge_before_repeated_frontier_warn() -> None:
@@ -419,7 +491,23 @@ def test_tool_loop_error_blocks_rerun_of_problem_navigation_label() -> None:
     assert msg is not None
     assert "apply_filters" in msg
     assert "Do NOT rerun" in msg
-    assert "code or validation" in msg
+    assert "live-page inspection evidence" in msg
+
+
+def test_tool_loop_error_blocks_update_and_run_rerun_of_problem_navigation_label() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {"workflow_yaml": "title: wf", "block_labels": ["apply_filters"], "parameters": {}},
+    )
+
+    assert msg is not None
+    assert "apply_filters" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_per_tool_budget_rerun"
 
 
 def test_tool_loop_error_treats_missing_labels_as_rerun_all() -> None:
@@ -441,6 +529,85 @@ def test_tool_loop_error_allows_new_smaller_label_after_budget_problem() -> None
             ctx,
             "run_blocks_and_collect_debug",
             {"block_labels": ["click_parking"], "parameters": {}},
+        )
+        is None
+    )
+
+
+def test_tool_loop_error_blocks_upstream_replay_after_post_budget_page_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    ctx.composition_page_evidence = {
+        "current_url": "https://example.com/results",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+    }
+    workflow_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_site
+      block_type: goto_url
+      url: https://example.com
+    - label: open_search
+      block_type: navigation
+      goal: Open search
+    - label: apply_filters
+      block_type: navigation
+      goal: Apply filters
+"""
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": workflow_yaml,
+            "block_labels": ["open_search"],
+            "parameters": {},
+        },
+    )
+
+    assert msg is not None
+    assert "Do NOT restart upstream" in msg
+    assert "open_search" in msg
+    assert "apply_filters" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_post_budget_upstream_replay"
+
+
+def test_tool_loop_error_allows_downstream_recovery_after_post_budget_page_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    ctx.composition_page_evidence = {
+        "current_url": "https://example.com/results",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+    }
+    workflow_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_site
+      block_type: goto_url
+      url: https://example.com
+    - label: open_search
+      block_type: navigation
+      goal: Open search
+    - label: apply_filters
+      block_type: navigation
+      goal: Apply filters
+    - label: expand_results
+      block_type: navigation
+      goal: Expand results
+"""
+
+    assert (
+        _tool_loop_error(
+            ctx,
+            "update_and_run_blocks",
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_labels": ["expand_results"],
+                "parameters": {},
+            },
         )
         is None
     )

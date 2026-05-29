@@ -11,10 +11,12 @@ from skyvern.forge.sdk.copilot.tools import _discovery_walk, _inspect_page_for_c
 
 
 class _Ctx:
-    def __init__(self, server: Any) -> None:
+    def __init__(self, server: object) -> None:
         self.discovery_mcp_server = server
         self.discovery_started_monotonic = None
         self.discovery_step_count = 0
+        self.prior_page_inspection_calls_made = 0
+        self.page_inspection_calls_this_turn = 0
 
 
 class _FailingNavigateServer:
@@ -214,7 +216,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: Any) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
