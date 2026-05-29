@@ -89,10 +89,10 @@ MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
-TOTAL_TIMEOUT_SECONDS = 600
+TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
 # already prevent individual branches from looping; this stops a brand-new
-# enforcement rule that forgets its own counter from spinning within 600s.
+# enforcement rule that forgets its own counter from spinning within 900s.
 MAX_ITERATIONS = 50
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
@@ -681,9 +681,16 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
-    # A budget-trip is a structural problem (chain too long), not a
-    # workflow-shape problem — emit the targeted "split the chain" advice
-    # before the generic repeated-frontier and failed-test paths can fire.
+    # If the last run had confirmed challenge evidence, do not misdiagnose a
+    # challenge-solving loop as a long-chain budgeting problem.
+    if _needs_failed_test_nudge(ctx) and getattr(ctx, "last_test_anti_bot", None):
+        ctx.failed_test_nudge_count += 1
+        return _nudge(config, "post_anti_bot_failed_test")
+
+    # A budget-trip without challenge evidence is a structural problem (chain
+    # too long), not a workflow-shape problem — emit the targeted "split the
+    # chain" advice before the generic repeated-frontier and failed-test paths
+    # can fire.
     if _needs_per_tool_budget_nudge(ctx):
         ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
         return _nudge(config, "post_per_tool_budget")
@@ -717,8 +724,6 @@ def _check_enforcement(
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
-        if getattr(ctx, "last_test_anti_bot", None):
-            return _nudge(config, "post_anti_bot_failed_test")
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION

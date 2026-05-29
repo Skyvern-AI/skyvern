@@ -946,8 +946,12 @@ def _late_block_running_call_signal(ctx: AgentContext, tool_name: str) -> Copilo
     elif isinstance(last_failed_workflow_yaml, str) and last_failed_workflow_yaml:
         agent_steering = (
             f"Less than {COPILOT_FINAL_REPLY_RESERVE_SECONDS} seconds remain in this Copilot turn "
-            "after the previous workflow run failed. Do NOT retry block-running tools; reply to the user "
-            "with the failure evidence gathered so far and make clear that any draft workflow is unverified."
+            "after the previous workflow run failed. Do NOT retry block-running tools. Use only existing "
+            "run evidence and quick browser inspection tools such as get_run_results, evaluate, or "
+            "get_browser_screenshot if one more read is needed. If the current page contains the requested "
+            "answer, answer from that observed page evidence. If evidence is incomplete, report exactly "
+            "which browser state was verified and which requested data remains unverified. Never repeat "
+            "this tool-error text as the user-facing answer."
         )
     else:
         agent_steering = (
@@ -967,6 +971,7 @@ def _late_block_running_call_signal(ctx: AgentContext, tool_name: str) -> Copilo
         # earlier in the turn should still surface — only the chat reply
         # is overridden by the renderer.
         preserves_workflow_draft=True,
+        renders_final_reply=False,
         internal_reason_code="tool_error_late_block_running",
         blocked_tool=tool_name,
     )

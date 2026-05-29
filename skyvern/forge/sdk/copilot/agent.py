@@ -694,7 +694,12 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     """Surface a proposal only when it passed a test this turn AND yaml is on hand."""
-    if ctx.last_workflow is not None and ctx.last_workflow_yaml and ctx.last_test_ok is True:
+    if (
+        ctx.last_workflow is not None
+        and ctx.last_workflow_yaml
+        and ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+    ):
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
 
@@ -824,6 +829,41 @@ def _build_exit_result(
         blocked_signatures=ctx.blocked_reply_signatures,
         terminal_reason=terminal_reason or ("cancel" if cancelled else None),
     )
+    workflow_attempted = ctx.last_update_block_count is not None or ctx.last_test_ok is not None
+    output_kind = derive_output_kind(
+        response_type="REPLY",
+        request_policy=ctx.request_policy,
+        updated_workflow=verified_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        unvalidated=False,
+    )
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type="REPLY",
+        user_response=final_text,
+        global_llm_context=global_llm_context,
+        workflow_yaml=verified_yaml,
+        has_workflow_proposal=verified_workflow is not None,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=workflow_attempted,
+        unvalidated=False,
+        output_kind=output_kind,
+    )
+    if not output_policy_verdict.allowed:
+        return _build_output_policy_blocked_result(
+            ctx,
+            output_policy_verdict,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=verified_yaml,
+            output_policy_diagnostics=build_output_policy_diagnostics(
+                raw_verdict=output_policy_verdict,
+                final_verdict=output_policy_verdict,
+                final_output_kind=_blocked_final_output_kind(output_policy_verdict),
+                hard_block_reason_codes=list(output_policy_verdict.reason_codes),
+                soft_rewrite_reason_codes=[],
+            ),
+        )
     return _finalize_result_with_blocker_override(
         ctx,
         _make_agent_result(
@@ -972,6 +1012,8 @@ def _finalize_result_with_blocker_override(
     local_signal = getattr(ctx, "blocker_signal", None)
     if not isinstance(local_signal, CopilotToolBlockerSignal):
         return result
+    if not local_signal.renders_final_reply:
+        return result
 
     rendered_reply, rendered_resp_type = _render_blocker_reply(local_signal, exit_site=exit_site)
 
@@ -1087,7 +1129,18 @@ def _workflow_block_count(ctx: CopilotContext) -> int | None:
 
 def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
     # Caller-owned sentence templates add punctuation around these fragments.
-    return clean_recorded_failure_text(value, max_chars=max_chars).rstrip(".")
+    text = clean_recorded_failure_text(value, max_chars=max_chars).rstrip(".")
+    if not text:
+        return ""
+    verdict = evaluate_output_policy(
+        request_policy=None,
+        response_type="REPLY",
+        user_response=text,
+        output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+    )
+    if OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes:
+        return "The previous workflow run did not finish before the turn budget expired"
+    return text
 
 
 def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
@@ -1101,6 +1154,30 @@ def _recorded_failure_summary(ctx: CopilotContext) -> tuple[str, str]:
     run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80)
     status_sentence = f" Last run status: {run_status}." if run_status else ""
     return reason, status_sentence
+
+
+def _recorded_failure_is_internal_tool_instruction(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    if contract is None:
+        candidates: tuple[object, ...] = (ctx.last_test_failure_reason,)
+    else:
+        candidates = (
+            contract.verification_result.remaining_blocker,
+            contract.diagnosis_result.root_cause_summary,
+            ctx.last_test_failure_reason,
+        )
+    for value in candidates:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        verdict = evaluate_output_policy(
+            request_policy=None,
+            response_type="REPLY",
+            user_response=value,
+            output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
+        )
+        if OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes:
+            return True
+    return False
 
 
 def _specific_missing_context_question(value: Any) -> str:
@@ -1191,7 +1268,9 @@ def _last_good_failure_reply(ctx: CopilotContext, tested_reply: str) -> str:
     return f"{tested_reply} The latest attempted change did not verify: {reason}.{status_sentence}"
 
 
-def _recorded_failure_reply(ctx: CopilotContext, *, cancelled: bool = False) -> str | None:
+def _recorded_failure_reply(
+    ctx: CopilotContext, *, cancelled: bool = False, internal_tool_instruction_failure: bool | None = None
+) -> str | None:
     if cancelled or ctx.last_test_ok is True:
         return None
 
@@ -1222,7 +1301,9 @@ def _recorded_failure_reply(ctx: CopilotContext, *, cancelled: bool = False) -> 
         or getattr(ctx, "last_test_ok", None) is not None
         or getattr(diagnosis_input, "workflow_run_id", None)
     )
-    test_failed = ctx.last_test_ok is False or run_status == "failed"
+    if internal_tool_instruction_failure is None:
+        internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
+    test_failed = (ctx.last_test_ok is False or run_status == "failed") and not internal_tool_instruction_failure
     unrecoverable_stop = next_action == "stop" or failure_type == "unrecoverable_tool_error"
 
     if getattr(ctx, "last_workflow", None) is not None:
@@ -1258,7 +1339,10 @@ def _build_wip_exit_result(
     terminal_reason: str | None = None,
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
-    recorded_failure_reply = _recorded_failure_reply(ctx, cancelled=cancelled)
+    internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
+    recorded_failure_reply = _recorded_failure_reply(
+        ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
+    )
     effective_terminal = terminal_reason or ("cancel" if cancelled else None)
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
@@ -1310,12 +1394,15 @@ def _build_wip_exit_result(
     if (
         ctx.last_workflow is not None
         and ctx.last_workflow_yaml
-        and ctx.last_test_ok is not False
+        and (ctx.last_test_ok is not False or internal_tool_instruction_failure)
         and not ctx.last_test_suspicious_success
     ):
-        unvalidated = ctx.last_test_ok is not True
+        full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
+        unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
             reply = recorded_failure_reply
+            if internal_tool_instruction_failure:
+                reply = _ensure_unvalidated_proposal_affordance(reply)
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
         final_text, outcome = _guard(reply)
@@ -1478,8 +1565,9 @@ async def _translate_to_agent_result(
     # Bind the signal to a local so the proposal-cascade gating below can't
     # desync from the inline override if ctx mutates mid-translate.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    blocker_active = local_blocker_signal is not None
-    if local_blocker_signal is not None:
+    render_blocker_reply = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
+    blocker_active = render_blocker_reply
+    if local_blocker_signal is not None and render_blocker_reply:
         # Override only user-visible text + resp_type so REPLACE_WORKFLOW and ASK_QUESTION gating skip the model's side-effect path; the shim is the sole renderer.
         rendered_reply, rendered_resp_type = _render_blocker_reply(local_blocker_signal)
         user_response = rendered_reply
@@ -1526,6 +1614,8 @@ async def _translate_to_agent_result(
                 _record_banned_block_reject_span,
                 _stale_block_metadata_message,
                 _timing_only_challenge_wait_reject_message,
+                composition_page_evidence_error,
+                workflow_target_url,
             )
 
             wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
@@ -1541,6 +1631,16 @@ async def _translate_to_agent_result(
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
                 user_response = f"{user_response}\n\n(Note: {_stale_block_metadata_message(stale_metadata)})"
+                ctx.last_test_ok = None
+                workflow_yaml = ""
+            composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
+            if composition_evidence_error:
+                LOG.info(
+                    "copilot inline composition page evidence rejected workflow",
+                    workflow_permanent_id=ctx.workflow_permanent_id,
+                    target_url=workflow_target_url(workflow_yaml),
+                )
+                user_response = f"{user_response}\n\n(Note: {composition_evidence_error})"
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:
@@ -2174,10 +2274,11 @@ def _build_output_policy_blocked_result(
     prior_workflow_yaml: str | None,
     output_policy_diagnostics: dict[str, Any] | None = None,
 ) -> AgentResult:
-    # A blocker turn never ships a proposal; hard-block OUTPUT_POLICY + a
-    # set blocker_signal both drop the preserved draft.
+    # A blocker turn whose signal owns final rendering never ships a proposal;
+    # steering-only blockers should still flow through normal output-policy
+    # salvage so internal tool text is scrubbed and saved drafts can surface.
     local_blocker_signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else None
-    blocker_active = local_blocker_signal is not None
+    blocker_active = local_blocker_signal is not None and local_blocker_signal.renders_final_reply
     preserved_workflow = (
         ctx.last_workflow if ctx.last_workflow is not None and ctx.last_workflow_yaml and not blocker_active else None
     )
@@ -2522,6 +2623,7 @@ async def _run_copilot_turn_impl(
     # and `update_and_run_blocks`, never from a model emission.
     prior_structured_context = StructuredContext.from_json_str(global_llm_context)
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
+    ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
@@ -2533,6 +2635,7 @@ async def _run_copilot_turn_impl(
         build_phase=ctx.build_phase.value,
         workflow_permanent_id=chat_request.workflow_permanent_id,
         prior_discovery_calls_made=ctx.prior_discovery_calls_made,
+        prior_page_inspection_calls_made=ctx.prior_page_inspection_calls_made,
     )
 
     # Preflight feasibility classifier — fires on every turn so mid-session pivots

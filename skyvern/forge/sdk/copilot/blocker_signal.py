@@ -76,6 +76,7 @@ class CopilotToolBlockerSignal(BaseModel):
     recovery_hint: RecoveryHint
     cleared_by_tools: frozenset[str] = Field(default_factory=frozenset)
     preserves_workflow_draft: bool = False
+    renders_final_reply: bool = True
 
     internal_reason_code: str | None = None
     blocked_tool: str | None = None
@@ -105,6 +106,7 @@ def to_trace_data(signal: CopilotToolBlockerSignal) -> dict[str, Any]:
         "blocker_kind": signal.blocker_kind,
         "recovery_hint": signal.recovery_hint,
         "cleared_by_tools": sorted(signal.cleared_by_tools),
+        "renders_final_reply": signal.renders_final_reply,
         "internal_reason_code": signal.internal_reason_code,
         "blocked_tool": signal.blocked_tool,
         "classifier_mode": signal.classifier_mode,
@@ -117,9 +119,41 @@ class _BlockerSignalCtx(Protocol):
     blocker_signal: CopilotToolBlockerSignal | None
 
 
+_LOOP_PROGRESS_TOOL_SUCCESS_REASON_CODES = frozenset(
+    {
+        "loop_detected_credential_or_parameter_misconfig",
+        "loop_detected_repeated_failed_step",
+        "loop_detected_generic",
+    }
+)
+_LOOP_PROGRESS_TOOLS = frozenset(
+    {
+        "discover_workflow_entrypoint",
+        "evaluate",
+        "get_browser_screenshot",
+        "get_run_results",
+        "inspect_page_for_composition",
+        "navigate_browser",
+        "run_blocks_and_collect_debug",
+        "update_and_run_blocks",
+        "update_workflow",
+    }
+)
+
+
+def _tool_success_clears_signal(signal: CopilotToolBlockerSignal, succeeded_tool_name: str) -> bool:
+    if succeeded_tool_name in signal.cleared_by_tools:
+        return True
+    if signal.internal_reason_code == "loop_detected_consecutive_same_tool":
+        return True
+    if signal.internal_reason_code in _LOOP_PROGRESS_TOOL_SUCCESS_REASON_CODES:
+        return succeeded_tool_name in _LOOP_PROGRESS_TOOLS
+    return False
+
+
 def maybe_clear_blocker_signal_on_tool_success(ctx: _BlockerSignalCtx, succeeded_tool_name: str) -> None:
     signal = getattr(ctx, "blocker_signal", None)
-    if isinstance(signal, CopilotToolBlockerSignal) and succeeded_tool_name in signal.cleared_by_tools:
+    if isinstance(signal, CopilotToolBlockerSignal) and _tool_success_clears_signal(signal, succeeded_tool_name):
         ctx.blocker_signal = None
 
 

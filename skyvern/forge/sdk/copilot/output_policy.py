@@ -42,6 +42,10 @@ _INTERNAL_TOOL_INSTRUCTION_MARKERS = (
 )
 _INTERNAL_TOOL_RETRY_PHRASES = ("do not retry", "do not re-invoke")
 _INTERNAL_TOOL_RETRY_CONTEXT_MARKERS = (
+    "block running tool",
+    "block running tools",
+    "block-running tool",
+    "block-running tools",
     "get_run_results",
     "update_and_run_blocks",
     "tool call",
