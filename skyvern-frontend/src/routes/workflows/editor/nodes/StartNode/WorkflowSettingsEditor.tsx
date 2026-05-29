@@ -400,10 +400,34 @@ function WorkflowSettingsEditorBody({
         <Input
           value={data.maxScreenshotScrolls ?? ""}
           placeholder={`Default: ${MAX_SCREENSHOT_SCROLLS_DEFAULT}`}
+          type="number"
           onChange={(event) => {
             const value =
               event.target.value === "" ? null : Number(event.target.value);
             update({ maxScreenshotScrolls: value });
+          }}
+        />
+      </div>
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label>Max Run Time (minutes)</Label>
+          <HelpTooltip content="Times out this workflow after the configured elapsed runtime. Maximum runtime is 4 hours (240 minutes)." />
+        </div>
+        <Input
+          value={data.maxElapsedTimeMinutes ?? ""}
+          placeholder="Default: 4 hours"
+          type="number"
+          min={1}
+          max={240}
+          step={1}
+          onChange={(event) => {
+            const rawValue = event.target.value;
+            const parsedValue = Number(rawValue);
+            const value =
+              rawValue === "" || !Number.isFinite(parsedValue)
+                ? null
+                : Math.min(240, Math.max(1, Math.trunc(parsedValue)));
+            update({ maxElapsedTimeMinutes: value });
           }}
         />
       </div>

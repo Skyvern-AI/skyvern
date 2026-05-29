@@ -13,6 +13,7 @@ export type WorkflowCreateYAMLRequest = {
   workflow_definition: WorkflowDefinitionYAML;
   is_saved_task?: boolean;
   max_screenshot_scrolls?: number | null;
+  max_elapsed_time_minutes?: number | null;
   extra_http_headers?: Record<string, string> | null;
   cdp_connect_headers?: Record<string, string> | null;
   status?: string | null;

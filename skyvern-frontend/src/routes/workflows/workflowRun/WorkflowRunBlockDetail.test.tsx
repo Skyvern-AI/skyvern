@@ -15,6 +15,7 @@ vi.mock("./WorkflowRunHumanInteraction", () => ({
 }));
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ActionTypes, Status, type ActionsApiResponse } from "@/api/types";
@@ -135,6 +136,26 @@ describe("WorkflowRunBlockDetail router", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Inputs" }));
     expect(screen.getByText("URL")).toBeDefined();
     expect(screen.getByText("https://example.test/report")).toBeDefined();
+  });
+
+  it("shows a diagnostics link in the inspector for any block with a task id", () => {
+    const block = buildBlock({
+      block_type: "file_download",
+      task_id: "tsk_123",
+    });
+
+    render(
+      <MemoryRouter>
+        <WorkflowRunBlockDetail activeItem={block} timeline={[]} />
+      </MemoryRouter>,
+    );
+
+    const diagnosticsLink = screen.getByRole("link", {
+      name: /diagnostics/i,
+    });
+    expect(diagnosticsLink.getAttribute("href")).toBe(
+      "/tasks/tsk_123/diagnostics",
+    );
   });
 
   it("renders the conditional detail (branch evaluation) for a conditional block", () => {

@@ -106,6 +106,7 @@ function getWorkflowElements(version: WorkflowVersion) {
     browserProfileId: version.browser_profile_id ?? null,
     model: version.model,
     maxScreenshotScrolls: version.max_screenshot_scrolls || 3,
+    maxElapsedTimeMinutes: version.max_elapsed_time_minutes ?? null,
     extraHttpHeaders: version.extra_http_headers
       ? JSON.stringify(version.extra_http_headers)
       : null,

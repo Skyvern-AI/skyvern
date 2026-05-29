@@ -1,5 +1,10 @@
-import { ChevronDownIcon, ChevronRightIcon } from "@radix-ui/react-icons";
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ExternalLinkIcon,
+} from "@radix-ui/react-icons";
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -410,6 +415,20 @@ function BlockInspector({ block }: { block: WorkflowRunBlock }) {
           >
             Outputs
           </TabsTrigger>
+          {block.task_id && (
+            <Link
+              to={`/tasks/${block.task_id}/diagnostics`}
+              title="Go to diagnostics"
+              onClick={(event) => event.stopPropagation()}
+              className={cn(
+                triggerClassName,
+                "inline-flex items-center gap-1.5",
+              )}
+            >
+              <ExternalLinkIcon className="size-3.5" />
+              <span>Diagnostics</span>
+            </Link>
+          )}
         </TabsList>
         <TabsContent value="summary" className="m-0">
           <FieldList

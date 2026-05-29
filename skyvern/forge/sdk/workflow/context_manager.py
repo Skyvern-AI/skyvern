@@ -412,12 +412,75 @@ class WorkflowRunContext:
             return None
         if isinstance(secret_id_or_value, str):
             if secret_id_or_value.startswith(RANDOM_SECRET_ID_PREFIX):
-                if secret_id_or_value not in self.secrets:
-                    raise ImaginarySecretValue(secret_id_or_value)
-                return self.secrets[secret_id_or_value]
+                if secret_id_or_value in self.secrets:
+                    return self.secrets[secret_id_or_value]
+                resolved = self._resolve_embedded_placeholders(secret_id_or_value)
+                if resolved is not None:
+                    return resolved
+                raise ImaginarySecretValue(secret_id_or_value)
             else:
-                return self.secrets.get(secret_id_or_value)
+                direct = self.secrets.get(secret_id_or_value)
+                if direct is not None:
+                    return direct
+                if RANDOM_SECRET_ID_PREFIX in secret_id_or_value:
+                    resolved = self._resolve_embedded_placeholders(secret_id_or_value)
+                    if resolved is not None:
+                        return resolved
+                    remaining = secret_id_or_value
+                    for key in self.secrets:
+                        remaining = remaining.replace(key, "")
+                    if RANDOM_SECRET_ID_PREFIX in remaining:
+                        raise ImaginarySecretValue(secret_id_or_value)
+                return None
         return None
+
+    def _scan_placeholder_tokens(self, text: str) -> list[str]:
+        """Scan *text* for registered placeholder keys, longest-first.
+
+        TODO: Define placeholder token boundaries before changing this to
+        reject prefix matches such as ``placeholder_AAAA_month_extra``; cases
+        like ``placeholder_AAAA_month-extra`` need an explicit grammar.
+        """
+        known_keys = sorted(
+            (k for k in self.secrets if k.startswith(RANDOM_SECRET_ID_PREFIX)),
+            key=len,
+            reverse=True,
+        )
+        tokens: list[str] = []
+        scan = text
+        while scan:
+            matched = False
+            for key in known_keys:
+                if scan.startswith(key):
+                    tokens.append(key)
+                    scan = scan[len(key) :]
+                    matched = True
+                    break
+            if not matched:
+                scan = scan[1:]
+        return tokens
+
+    def _resolve_embedded_placeholders(self, text: str) -> str | None:
+        """Resolve a string containing multiple embedded placeholder tokens.
+
+        Returns the substituted string, or None if fewer than 2 registered
+        tokens were found. Raises ImaginarySecretValue if any ``placeholder_``
+        substring remains after substitution (unknown token).
+        """
+        tokens_found = self._scan_placeholder_tokens(text)
+        if len(tokens_found) < 2:
+            return None
+
+        result = text
+        for token in tokens_found:
+            result = result.replace(token, self.secrets[token], 1)
+        if RANDOM_SECRET_ID_PREFIX in result:
+            raise ImaginarySecretValue(text)
+        return result
+
+    def find_embedded_placeholder_tokens(self, text: str) -> list[str]:
+        """Extract registered placeholder tokens found in *text*, longest-first."""
+        return self._scan_placeholder_tokens(text)
 
     def mask_secrets_in_data(self, data: Any, mask: str = "*****") -> Any:
         """

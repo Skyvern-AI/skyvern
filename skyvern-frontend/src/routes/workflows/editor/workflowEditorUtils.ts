@@ -1959,6 +1959,7 @@ function getElements(
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
+      maxElapsedTimeMinutes: settings.maxElapsedTimeMinutes ?? null,
       extraHttpHeaders: settings.extraHttpHeaders,
       cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
@@ -3335,6 +3336,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     webhookCallbackUrl: null,
     model: null,
     maxScreenshotScrolls: null,
+    maxElapsedTimeMinutes: null,
     extraHttpHeaders: null,
     cdpConnectHeaders: null,
     runWith: "code",
@@ -3362,6 +3364,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
+      maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
       extraHttpHeaders:
         data.extraHttpHeaders && typeof data.extraHttpHeaders === "object"
           ? JSON.stringify(data.extraHttpHeaders)
@@ -4457,6 +4460,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
+    max_elapsed_time_minutes: workflow.max_elapsed_time_minutes,
     extra_http_headers: workflow.extra_http_headers,
     workflow_definition: {
       version: workflowDefinitionVersion,

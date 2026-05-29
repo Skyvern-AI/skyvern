@@ -40,6 +40,7 @@ function WorkflowSettingsBlockFormBody({
       persistBrowserSession: data.persistBrowserSession,
       extraHttpHeaders: data.extraHttpHeaders,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
+      maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
       finallyBlockLabel: data.finallyBlockLabel,
       workflowSystemPrompt: data.workflowSystemPrompt,
     };

@@ -1240,6 +1240,7 @@ function Workspace({
       browserProfileId: workflowData.browser_profile_id ?? null,
       model: workflowData.model ?? null,
       maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
+      maxElapsedTimeMinutes: workflowData.max_elapsed_time_minutes ?? null,
       extraHttpHeaders: workflowData.extra_http_headers
         ? JSON.stringify(workflowData.extra_http_headers)
         : null,
@@ -1308,6 +1309,7 @@ function Workspace({
       browserProfileId: selectedVersion.browser_profile_id ?? null,
       model: selectedVersion.model,
       maxScreenshotScrolls: selectedVersion.max_screenshot_scrolls || 3,
+      maxElapsedTimeMinutes: selectedVersion.max_elapsed_time_minutes ?? null,
       extraHttpHeaders: selectedVersion.extra_http_headers
         ? JSON.stringify(selectedVersion.extra_http_headers)
         : null,
@@ -2121,6 +2123,8 @@ function Workspace({
               totp_verification_url: saveData.workflow.totp_verification_url,
               totp_identifier: null,
               max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+              max_elapsed_time_minutes:
+                saveData.settings.maxElapsedTimeMinutes ?? null,
               status: saveData.workflow.status,
               created_at: new Date().toISOString(),
               modified_at: new Date().toISOString(),
