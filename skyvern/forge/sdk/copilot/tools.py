@@ -45,9 +45,11 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    composition_page_evidence_error,
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
+    workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -1556,6 +1558,16 @@ async def _update_workflow(
     if stable_search_drips:
         _record_goto_url_stable_search_drip_reject_span("_update_workflow", stable_search_drips)
         return {"ok": False, "error": _goto_url_stable_search_drip_message(stable_search_drips)}
+
+    composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
+    if composition_evidence_error:
+        LOG.info(
+            "copilot composition page evidence rejected workflow",
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            target_url=workflow_target_url(workflow_yaml),
+        )
+        return {"ok": False, "error": composition_evidence_error}
+
     try:
         workflow = _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
