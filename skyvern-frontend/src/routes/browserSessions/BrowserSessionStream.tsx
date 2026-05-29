@@ -109,8 +109,10 @@ function BrowserSessionStream({
     userIsControlling,
     setUserIsControlling,
     inputReady,
+    browserCommandError,
     containerRef,
     handlers,
+    browserControls,
   } = useCdpInput({
     inputWsUrl,
     interactive,
@@ -236,9 +238,11 @@ function BrowserSessionStream({
         userIsControlling={userIsControlling}
         setUserIsControlling={setUserIsControlling}
         inputReady={inputReady}
+        browserCommandError={interactive ? browserCommandError : null}
         containerRef={containerRef}
         showControlButtons={showControlButtons}
         handlers={handlers}
+        browserControls={interactive ? browserControls : undefined}
         currentUrl={currentUrl}
       />
     );
