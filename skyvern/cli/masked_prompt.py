@@ -136,7 +136,7 @@ def _read_masked_tty_unix(output: TextIO, *, mask: str) -> str:
 def _read_masked_tty_windows(output: TextIO, *, mask: str) -> str:
     import msvcrt
 
-    get_wide_char: Callable[[], str] = getattr(msvcrt, "getwch")
+    get_wide_char: Callable[[], str] = msvcrt.getwch  # type: ignore[attr-defined]
 
     def read_char() -> str:
         char = get_wide_char()

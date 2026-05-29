@@ -32,8 +32,8 @@ def _resolve_generation_defaults(config: object, max_tokens: object, temperature
             object.__setattr__(config, "temperature", settings.LLM_CONFIG_TEMPERATURE)
 
     _assert_settings_defaults_resolved(
-        getattr(config, "max_tokens"),
-        getattr(config, "temperature"),
+        config.max_tokens,  # type: ignore[attr-defined]
+        config.temperature,  # type: ignore[attr-defined]
     )
 
 
