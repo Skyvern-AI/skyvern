@@ -69,43 +69,14 @@ class TestVerifyBrowserSessionLocalShortCircuit:
         with (
             patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
             patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
-            patch("skyvern.webeye.vnc_streaming.settings") as vnc_settings_mock,
         ):
             app_mock.PERSISTENT_SESSIONS_MANAGER = manager
-            settings_mock.BROWSER_STREAMING_MODE = "remote"
-            vnc_settings_mock.BROWSER_STREAMING_MODE = "remote"
+            settings_mock.BROWSER_STREAMING_MODE = "vnc"
             result = await verify_browser_session("bs_test", "o_test")
 
         assert result is not None
         assert result.browser_address == "ws://remote:9222"
         manager.get_browser_address.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_short_circuits_in_vnc_mode_with_no_address(self) -> None:
-        session = _make_session(
-            browser_address=None,
-            status=PersistentBrowserSessionStatus.running,
-        )
-
-        manager = MagicMock()
-        manager.get_session = AsyncMock(return_value=session)
-        manager.get_browser_address = AsyncMock(
-            side_effect=AssertionError("must not wait for address in local vnc mode"),
-        )
-
-        with (
-            patch("skyvern.forge.sdk.routes.streaming.verify.app") as app_mock,
-            patch("skyvern.forge.sdk.routes.streaming.verify.settings") as settings_mock,
-            patch("skyvern.webeye.vnc_streaming.settings") as vnc_settings_mock,
-        ):
-            app_mock.PERSISTENT_SESSIONS_MANAGER = manager
-            settings_mock.BROWSER_STREAMING_MODE = "vnc"
-            vnc_settings_mock.BROWSER_STREAMING_MODE = "vnc"
-            result = await verify_browser_session("bs_test", "o_test")
-
-        assert result is not None
-        assert result.browser_address == ""
-        manager.get_browser_address.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_uses_existing_address_without_polling(self) -> None:
