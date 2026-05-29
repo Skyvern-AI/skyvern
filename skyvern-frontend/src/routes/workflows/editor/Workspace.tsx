@@ -87,6 +87,7 @@ import {
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
+import { useWorkflowTitleStore } from "@/store/WorkflowTitleStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
 import { copyText } from "@/util/copyText";
@@ -148,6 +149,22 @@ const Constants = {
 
 // How long to poll before recording one rate-limit attempt (60s)
 const POLL_ATTEMPT_THRESHOLD_MS = 60_000;
+
+// Marker class for the copilot's gold-ring block-highlight flash. Kept off
+// React Flow's `.selected` so a normal editor node click (which sets
+// `selected` to open the sidebar) doesn't trigger the flash. Must match the
+// selector in reactFlowOverrideStyles.css.
+const COPILOT_BLOCK_HIGHLIGHT_CLASS = "sk-copilot-block-highlight";
+
+function setBlockHighlightClass(node: AppNode, on: boolean): AppNode {
+  const tokens = (node.className ?? "")
+    .split(/\s+/)
+    .filter((token) => token && token !== COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  if (on) tokens.push(COPILOT_BLOCK_HIGHLIGHT_CLASS);
+  const next = tokens.join(" ") || undefined;
+  if ((node.className ?? undefined) === next) return node;
+  return { ...node, className: next };
+}
 
 type Props = Pick<FlowRendererProps, "initialTitle" | "workflow"> & {
   initialNodes: Array<AppNode>;
@@ -1275,6 +1292,12 @@ function Workspace({
     const initialParameters = getInitialParameters(workflowData);
     useWorkflowParametersStore.getState().setParameters(initialParameters);
 
+    // Sync title so snap-back on Reject reverts the editor's title bar
+    // alongside the canvas blocks.
+    if (typeof workflowData.title === "string") {
+      useWorkflowTitleStore.getState().setTitle(workflowData.title);
+    }
+
     if (options?.persisted) {
       // Atomic accept: server wrote a new version; treat as clean baseline and refresh cached workflow.
       workflowChangesStore.setHasChanges(false);
@@ -2042,6 +2065,22 @@ function Workspace({
         isLiveBrowserReady={copilotLiveBrowserReady}
         initialMessage={initialCopilotMessage ?? undefined}
         onInitialMessageConsumed={handleInitialCopilotMessageConsumed}
+        onBlockSelect={(blockLabel) => {
+          const matches = (node: AppNode) =>
+            (node.data as { label?: string } | undefined)?.label === blockLabel;
+          setNodes((prev) =>
+            prev.map((node) => setBlockHighlightClass(node, matches(node))),
+          );
+          // Auto-clear so the gold-ring flash animation re-triggers on the
+          // next select instead of the highlight sticking.
+          setTimeout(() => {
+            setNodes((prev) =>
+              prev.map((node) =>
+                matches(node) ? setBlockHighlightClass(node, false) : node,
+              ),
+            );
+          }, 1500);
+        }}
         onReviewWorkflow={async (pendingWorkflow, clearPending) => {
           const saveData = workflowChangesStore.getSaveData?.();
           if (!saveData) return;

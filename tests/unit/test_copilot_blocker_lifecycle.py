@@ -58,6 +58,14 @@ def test_loop_blocker_clears_on_progress_tool_success() -> None:
     assert ctx.blocker_signal is None
 
 
+def test_loop_blocker_stays_sticky_on_metadata_only_success() -> None:
+    ctx = _ctx()
+    signal = _signal(kind="loop_detected", cleared_by=frozenset(), reason="loop_detected_generic")
+    ctx.blocker_signal = signal
+    record_tool_step_result_for_ctx(ctx, "list_credentials", None, {"ok": True})
+    assert ctx.blocker_signal is signal
+
+
 def test_terminal_tool_error_stays_sticky_on_any_success() -> None:
     ctx = _ctx()
     signal = _signal(kind="tool_error", cleared_by=frozenset(), reason="tool_error_repeated_action_abort")
@@ -88,6 +96,61 @@ def test_per_tool_budget_blocker_clears_on_update_and_run_blocks_success() -> No
     ctx.blocker_signal = signal
     record_tool_step_result_for_ctx(ctx, "update_and_run_blocks", {"workflow_yaml": "y"}, {"ok": True})
     assert ctx.blocker_signal is None
+
+
+def test_per_tool_budget_blocker_clears_on_live_page_evidence_success() -> None:
+    from skyvern.forge.sdk.copilot.tools import _per_tool_budget_problem_rerun_signal, _tool_loop_error
+
+    ctx = _ctx()
+    ctx.per_tool_budget_problem_block_labels = ["heavy_navigation"]
+    signal = _per_tool_budget_problem_rerun_signal(ctx, None, "update_and_run_blocks")
+    assert signal is not None
+    assert "evaluate" in signal.cleared_by_tools
+    ctx.blocker_signal = signal
+
+    record_tool_step_result_for_ctx(ctx, "evaluate", {"script": "document.body.innerText"}, {"ok": True})
+
+    assert ctx.blocker_signal is None
+    assert ctx.per_tool_budget_problem_block_labels == ["heavy_navigation"]
+    rerun_msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["heavy_navigation"]})
+    assert rerun_msg is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_per_tool_budget_rerun"
+
+
+def test_per_tool_budget_blocker_clears_on_run_results_read_success() -> None:
+    from skyvern.forge.sdk.copilot.tools import _per_tool_budget_problem_rerun_signal
+
+    ctx = _ctx()
+    ctx.per_tool_budget_problem_block_labels = ["heavy_navigation"]
+    signal = _per_tool_budget_problem_rerun_signal(ctx, None, "update_and_run_blocks")
+    assert signal is not None
+    assert "get_run_results" in signal.cleared_by_tools
+    ctx.blocker_signal = signal
+
+    record_tool_step_result_for_ctx(ctx, "get_run_results", {"workflow_run_id": "wr_1"}, {"ok": True})
+
+    assert ctx.blocker_signal is None
+    assert ctx.per_tool_budget_problem_block_labels == ["heavy_navigation"]
+
+
+def test_per_tool_budget_blocker_stays_on_failed_inspection() -> None:
+    from skyvern.forge.sdk.copilot.tools import _per_tool_budget_problem_rerun_signal
+
+    ctx = _ctx()
+    ctx.per_tool_budget_problem_block_labels = ["heavy_navigation"]
+    signal = _per_tool_budget_problem_rerun_signal(ctx, None, "update_and_run_blocks")
+    assert signal is not None
+    ctx.blocker_signal = signal
+
+    record_tool_step_result_for_ctx(
+        ctx,
+        "inspect_page_for_composition",
+        {"target_url": "current_page"},
+        {"ok": False, "error": "inspection budget reached"},
+    )
+
+    assert ctx.blocker_signal is signal
 
 
 def test_reconciliation_canceled_status_replaces_no_input_signal_with_requires_input() -> None:
@@ -177,3 +240,52 @@ def test_reconciliation_signal_steering_text_does_not_leak_through_user_facing_c
     # If a future refactor pipes steering text into the renderer, this fails.
     with pytest.raises(ValueError):
         assert_clean_user_facing_text(ctx.blocker_signal.agent_steering_text)
+
+
+def test_reconciliation_requires_input_clears_after_direct_browser_progress() -> None:
+    from skyvern.forge.sdk.copilot.tools import _maybe_clear_reconciliation_flag
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+    ctx = _ctx()
+    ctx.pending_reconciliation_run_id = "wr_pending"
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_pending",
+            "overall_status": WorkflowRunStatus.canceled.value,
+        },
+    }
+    _maybe_clear_reconciliation_flag(ctx, result)
+
+    assert ctx.pending_reconciliation_requires_user_input is True
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_pending_reconciliation_requires_input"
+
+    record_tool_step_result_for_ctx(ctx, "type_text", {"selector": "#id-first_name"}, {"ok": True})
+
+    assert ctx.pending_reconciliation_requires_user_input is False
+    assert ctx.pending_reconciliation_run_id is None
+    assert ctx.blocker_signal is None
+
+
+def test_reconciliation_requires_input_does_not_clear_after_metadata_only_success() -> None:
+    from skyvern.forge.sdk.copilot.tools import _maybe_clear_reconciliation_flag
+    from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
+
+    ctx = _ctx()
+    ctx.pending_reconciliation_run_id = "wr_pending"
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_pending",
+            "overall_status": WorkflowRunStatus.canceled.value,
+        },
+    }
+    _maybe_clear_reconciliation_flag(ctx, result)
+
+    record_tool_step_result_for_ctx(ctx, "list_credentials", {}, {"ok": True})
+
+    assert ctx.pending_reconciliation_requires_user_input is True
+    assert ctx.pending_reconciliation_run_id == "wr_pending"
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_pending_reconciliation_requires_input"

@@ -4,6 +4,7 @@ import {
   EMPTY_NARRATIVE,
   TurnNarrativeState,
   applyNarrativeEvent,
+  effectiveMode,
 } from "./narrativeState";
 import {
   WorkflowCopilotBlockProgressUpdate,
@@ -110,12 +111,29 @@ describe("applyNarrativeEvent — turn_start", () => {
       turnStart({ turn_id: "t2", turn_index: 1, mode: "edit" }),
     );
 
-    expect(s).toEqual({
-      ...EMPTY_NARRATIVE,
+    expect(s).toMatchObject({
       turnId: "t2",
       turnIndex: 1,
       mode: "edit",
+      blocks: [],
+      draft: null,
+      designStarted: false,
+      designEnded: false,
+      terminal: null,
     });
+  });
+
+  it("captures prior_block_count on turn_start", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      turnStart({ prior_block_count: 3 }),
+    );
+    expect(s.priorBlockCount).toBe(3);
+  });
+
+  it("treats missing prior_block_count as null (cold-start)", () => {
+    const s = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    expect(s.priorBlockCount).toBeNull();
   });
 });
 
@@ -173,6 +191,9 @@ describe("applyNarrativeEvent — block_progress", () => {
         blockType: "task",
         state: "running",
         lastSeenIteration: 0,
+        activity: [],
+        startedAt: "2026-05-25T00:00:04Z",
+        endedAt: null,
       },
     ]);
   });
@@ -238,6 +259,65 @@ describe("applyNarrativeEvent — block_progress", () => {
     );
     expect(s.blocks[0]?.state).toBe(expected);
   });
+
+  it("clears endedAt on retry-back-to-running so stale elapsed disappears", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      blockProgress({ block_label: "b", status: "running" }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        block_label: "b",
+        status: "failed",
+        timestamp: "2026-05-25T00:01:00Z",
+      }),
+    );
+    expect(s.blocks[0]?.endedAt).toBe("2026-05-25T00:01:00Z");
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        block_label: "b",
+        status: "running",
+        timestamp: "2026-05-25T00:01:30Z",
+      }),
+    );
+    expect(s.blocks[0]?.state).toBe("running");
+    expect(s.blocks[0]?.endedAt).toBeNull();
+  });
+
+  it("overwrites endedAt with the latest terminal wall clock", () => {
+    let s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      blockProgress({ block_label: "b", status: "running" }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        block_label: "b",
+        status: "failed",
+        timestamp: "2026-05-25T00:01:00Z",
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        block_label: "b",
+        status: "running",
+        timestamp: "2026-05-25T00:01:30Z",
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      blockProgress({
+        block_label: "b",
+        status: "completed",
+        timestamp: "2026-05-25T00:02:15Z",
+      }),
+    );
+    expect(s.blocks[0]?.state).toBe("completed");
+    expect(s.blocks[0]?.endedAt).toBe("2026-05-25T00:02:15Z");
+  });
 });
 
 describe("applyNarrativeEvent — terminal", () => {
@@ -286,5 +366,58 @@ describe("applyNarrativeEvent — terminal", () => {
       errorUpdate({ narrative_summary: "refused: too risky" }),
     );
     expect(s.narrativeSummary).toBe("refused: too risky");
+  });
+});
+
+describe("effectiveMode", () => {
+  it("reports build when classifier said unknown but blocks were drafted from empty prior", () => {
+    const s: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      mode: "unknown",
+      draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
+      terminal: "response",
+    };
+    expect(effectiveMode(s)).toBe("build");
+  });
+
+  it("reports edit when prior_block_count > 0 and turn drafted blocks", () => {
+    const s: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      mode: "unknown",
+      draft: { blockCount: 2, blockLabels: ["a", "b"], summary: null },
+      terminal: "response",
+      priorBlockCount: 2,
+    };
+    expect(effectiveMode(s)).toBe("edit");
+  });
+
+  it("reports clarify when classifier said draft_only but no blocks were drafted", () => {
+    const s: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      mode: "draft_only",
+      draft: null,
+      terminal: "response",
+    };
+    expect(effectiveMode(s)).toBe("clarify");
+  });
+
+  it("preserves docs_answer / diagnose / refuse when terminal has no blocks", () => {
+    for (const mode of ["docs_answer", "diagnose", "refuse"]) {
+      const s: TurnNarrativeState = {
+        ...EMPTY_NARRATIVE,
+        mode,
+        terminal: "response",
+      };
+      expect(effectiveMode(s)).toBe(mode);
+    }
+  });
+
+  it("falls back to classifier mode while turn is still in-flight (no terminal)", () => {
+    const s: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      mode: "build",
+      terminal: null,
+    };
+    expect(effectiveMode(s)).toBe("build");
   });
 });
