@@ -44,6 +44,7 @@ def _ctx(
     ctx.last_workflow = last_workflow
     ctx.last_workflow_yaml = last_workflow_yaml
     ctx.last_test_ok = last_test_ok
+    ctx.last_full_workflow_test_ok = last_test_ok is True
     ctx.last_test_suspicious_success = last_test_suspicious_success
     ctx.copilot_total_timeout_exceeded = False
     ctx.workflow_persisted = last_workflow is not None
@@ -296,6 +297,27 @@ class TestBuildUnexpectedErrorExitResult:
             "I built a 3-block draft and tested it, but the test couldn't finish: "
             "Browser session was no longer reachable. Last run status: running."
         )
+
+    def test_failed_test_scrubs_recorded_internal_tool_instruction(self) -> None:
+        wf = MagicMock(name="wf")
+        ctx = _ctx(last_workflow=wf, last_workflow_yaml="version: '1.0'", last_test_ok=False)
+        ctx.last_update_block_count = 3
+        ctx.latest_diagnosis_repair_contract = _blocker_contract(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools. Use only existing run evidence and quick browser inspection.",
+            run_status="canceled",
+        )
+
+        result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
+
+        assert result.user_response.startswith(
+            "I built a 3-block draft and tested it, but the test couldn't finish: "
+            "The previous workflow run did not finish before the turn budget expired. "
+            "Last run status: canceled."
+        )
+        assert "draft workflow proposal" in result.user_response
+        assert "Do NOT" not in result.user_response
+        assert "block-running tools" not in result.user_response
 
     def test_aborted_test_surfaces_unvalidated_draft_with_recorded_blocker_reply(self) -> None:
         wf = MagicMock(name="wf")

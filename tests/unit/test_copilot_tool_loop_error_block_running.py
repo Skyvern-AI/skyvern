@@ -64,16 +64,19 @@ def test_block_running_tool_is_blocked_by_repeated_action_streak() -> None:
 def test_block_running_tool_blocks_late_retry_after_failed_workflow() -> None:
     ctx = _ctx(
         last_failed_workflow_yaml="version: '1.0'",
-        copilot_run_start_monotonic=time.monotonic() - 540,
+        copilot_run_start_monotonic=time.monotonic()
+        - (TOTAL_TIMEOUT_SECONDS - COPILOT_FINAL_REPLY_RESERVE_SECONDS + 10),
     )
 
     msg = _tool_loop_error(ctx, "update_and_run_blocks")
 
     assert msg is not None
+    assert ctx.blocker_signal.renders_final_reply is False
     assert "less than 90 seconds" in msg.lower()
     assert "Do NOT retry" in msg
-    assert "reply to the user" in msg
-    assert "any draft workflow is unverified" in msg
+    assert "quick browser inspection tools" in msg
+    assert "answer from that observed page evidence" in msg
+    assert "Never repeat this tool-error text" in msg
 
 
 def test_late_retry_guard_allows_latter_half_calls_when_reply_room_remains() -> None:
@@ -89,7 +92,8 @@ def test_block_running_tool_blocks_late_continuation_after_successful_prefix() -
     ctx = _ctx(
         last_workflow_yaml="version: '1.0'",
         last_test_ok=True,
-        copilot_run_start_monotonic=time.monotonic() - 540,
+        copilot_run_start_monotonic=time.monotonic()
+        - (TOTAL_TIMEOUT_SECONDS - COPILOT_FINAL_REPLY_RESERVE_SECONDS + 10),
     )
 
     msg = _tool_loop_error(ctx, "update_and_run_blocks")

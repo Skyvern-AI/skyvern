@@ -240,6 +240,33 @@ def test_shim_preserves_workflow_draft_when_signal_opts_in() -> None:
     assert overridden.user_response != ctx.blocker_signal.user_facing_reason
 
 
+def test_shim_keeps_model_reply_when_signal_opts_out_of_final_rendering() -> None:
+    """Some tool guards are steering-only: they block a tool call but still let
+    the model answer from evidence already gathered in the turn."""
+    ctx = _ctx()
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="Stop tool use and answer from gathered evidence.",
+        user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
+        recovery_hint="stop",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code="tool_error_late_block_running",
+        blocked_tool="update_and_run_blocks",
+    )
+    result = AgentResult(
+        user_response="Observed result: TEST-CRED-123 expired on 01/01/2030.",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+    )
+
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+
+    assert overridden is result
+
+
 def test_preserved_draft_forces_review_untested_even_when_input_was_auto_applicable() -> None:
     """A blocker turn must never auto-apply the draft, even if the pre-override
     result was tagged ``auto_applicable``. The user has to explicitly accept."""

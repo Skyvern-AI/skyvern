@@ -315,6 +315,8 @@ class TestMCPFailedStepLoopDetection:
         browser_context = SimpleNamespace(
             pages=[raw_page],
             on=MagicMock(),
+            _impl_obj=SimpleNamespace(_close_was_called=False, _closed=False),
+            browser=SimpleNamespace(is_connected=lambda: True),
         )
         browser_state = SimpleNamespace(browser_context=browser_context)
         persistent_session_manager = SimpleNamespace(

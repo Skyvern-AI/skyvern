@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
@@ -1220,6 +1221,82 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
     assert agent_result.proposal_disposition == "no_proposal"
     assert "hunter2" not in agent_result.user_response
     assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in agent_result.user_response
+
+
+def test_output_policy_blocks_late_block_running_instruction_leak() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=(
+            "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+            "Do NOT retry block-running tools."
+        ),
+    )
+
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+
+
+def test_translate_scrubs_late_block_running_leak_and_preserves_draft() -> None:
+    ctx = _ctx()
+    saved_workflow = object()
+    ctx.last_workflow = saved_workflow
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="Stop tool use and answer from gathered evidence.",
+        user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
+        recovery_hint="stop",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code="tool_error_late_block_running",
+        blocked_tool="update_and_run_blocks",
+    )
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            _fake_run_result(
+                {
+                    "type": "REPLY",
+                    "user_response": (
+                        "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+                        "Do NOT retry block-running tools."
+                    ),
+                }
+            ),
+            ctx,
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert agent_result.updated_workflow is saved_workflow
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "review_untested"
+    assert "Do NOT retry" not in agent_result.user_response
+    assert "workflow draft is still saved" in agent_result.user_response
+
+
+def test_timeout_exit_scrubs_recorded_late_block_running_leak_and_preserves_draft() -> None:
+    ctx = _ctx()
+    saved_workflow = object()
+    ctx.last_workflow = saved_workflow
+    ctx.last_workflow_yaml = "workflow_definition:\n  blocks: []\n"
+    ctx.last_update_block_count = 5
+    ctx.last_test_ok = False
+    ctx.last_test_failure_reason = (
+        "Less than 90 seconds remain in this Copilot turn after the previous workflow run failed. "
+        "Do NOT retry block-running tools."
+    )
+
+    agent_result = agent_module._build_timeout_exit_result(ctx, global_llm_context=None)
+
+    assert agent_result.updated_workflow is saved_workflow
+    assert agent_result.clear_proposed_workflow is False
+    assert agent_result.proposal_disposition == "review_untested"
+    assert "Do NOT retry" not in agent_result.user_response
+    assert "draft workflow proposal" in agent_result.user_response
 
 
 def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
