@@ -101,7 +101,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           <h1 className="text-lg">Parameters</h1>
           <span className="text-sm text-slate-400">
             Create placeholder values that you can link in nodes. You will be
-            prompted to fill them in before running your workflow.
+            prompted to fill them in before running your agent.
           </span>
         </header>
         <Button

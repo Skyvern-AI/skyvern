@@ -494,6 +494,14 @@ class AgentFunction:
     ) -> bool:
         return True
 
+    async def get_analytics_warmable_organization_ids(self, statement_timeout_seconds: int = 10) -> list[str]:
+        """Return org IDs whose analytics summary cache should be kept warm.
+
+        OSS returns all org IDs. Cloud overrides with enterprise pricing filter.
+        """
+        orgs = await app.DATABASE.organizations.get_all_organizations()
+        return [org.organization_id for org in orgs]
+
     async def record_workflow_run_metadata(
         self,
         *,
@@ -503,6 +511,19 @@ class AgentFunction:
     ) -> None:
         """Persist per-run analytics metadata. OSS builds have no sidecar table."""
         return None
+
+    async def get_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> dict[str, str] | None:
+        """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
+    async def is_block_scoped_workflow_run(self, workflow_run: "WorkflowRun") -> bool:
+        """Return whether this workflow run was created for scoped block execution."""
+        return workflow_run.debug_session_id is not None
 
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
@@ -692,15 +713,6 @@ class AgentFunction:
 
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
-
-    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
-        """Release any proxy lease held by ``owner_id``.
-
-        OSS no-op. Cloud overrides this to release the lease back to the
-        proxy-session pool so workflow/task cleanup doesn't have to
-        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
-        """
-        return None
 
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page.

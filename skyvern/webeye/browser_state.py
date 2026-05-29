@@ -16,7 +16,6 @@ class BrowserState(Protocol):
     browser_context: BrowserContext | None
     browser_artifacts: BrowserArtifacts
     browser_cleanup: BrowserCleanupFunc
-    allow_content_blocking_extensions: bool
     pw: Playwright
 
     async def check_and_fix_state(
@@ -75,7 +74,7 @@ class BrowserState(Protocol):
 
     async def reload_page(self) -> None: ...
 
-    async def close(self, close_browser_on_completion: bool = True) -> None: ...
+    async def close(self, close_browser_on_completion: bool = True, skip_cleanup: bool = False) -> None: ...
 
     async def take_fullpage_screenshot(self, file_path: str | None = None) -> bytes: ...
 

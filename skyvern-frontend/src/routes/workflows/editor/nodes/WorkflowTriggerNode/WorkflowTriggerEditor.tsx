@@ -40,13 +40,13 @@ import {
 } from "../../workflowEditorUtils";
 
 const workflowPermanentIdTooltip =
-  "Select the workflow to trigger when this block runs.";
+  "Select the agent to trigger when this block runs.";
 const payloadTooltip =
-  "Parameters to pass to the triggered workflow. Values support Jinja2 templates like {{ some_parameter }}.";
+  "Parameters to pass to the triggered agent. Values support Jinja2 templates like {{ some_parameter }}.";
 const waitForCompletionTooltip =
-  "If enabled, this block will wait for the triggered workflow to complete before continuing to the next block. If disabled, the workflow is triggered asynchronously and the parent continues immediately. When disabled, the triggered workflow cannot continue in the same session because the parent may close it before the child finishes.";
+  "If enabled, this block will wait for the triggered agent to complete before continuing to the next block. If disabled, the agent is triggered asynchronously and the parent continues immediately. When disabled, the triggered agent cannot continue in the same session because the parent may close it before the child finishes.";
 const browserSessionTooltip =
-  "Choose which browser session the triggered workflow should use. Continuing in the same session shares tabs, cookies, and login state. Creating a new browser gives the triggered workflow a fresh browser.";
+  "Choose which browser session the triggered agent should use. Continuing in the same session shares tabs, cookies, and login state. Creating a new browser gives the triggered agent a fresh browser.";
 
 function WorkflowTriggerEditor({ blockId }: { blockId: string }) {
   // Subscribe to the node's data slice. The sidebar mount lives outside
@@ -177,7 +177,7 @@ function WorkflowTriggerEditorBody({
     <div data-testid="workflow-trigger-block-form" className="space-y-4">
       <div className="space-y-2">
         <div className="flex gap-2">
-          <Label className="text-xs text-slate-300">Target Workflow</Label>
+          <Label className="text-xs text-slate-300">Target Agent</Label>
           <HelpTooltip content={workflowPermanentIdTooltip} />
         </div>
         <WorkflowSelector
@@ -208,7 +208,7 @@ function WorkflowTriggerEditorBody({
           />
         ) : (
           <p className="text-xs text-slate-500">
-            Select a target workflow to configure its input parameters here.
+            Select a target agent to configure its input parameters here.
           </p>
         )}
       </div>
@@ -272,7 +272,7 @@ function WorkflowTriggerEditorBody({
       {!waitForCompletion && !useDynamicBrowserSession && (
         <p className="text-xs text-slate-400">
           &quot;Continue in the same session&quot; is disabled because the
-          parent workflow may close its browser before the triggered workflow
+          parent agent may close its browser before the triggered agent
           finishes.
         </p>
       )}

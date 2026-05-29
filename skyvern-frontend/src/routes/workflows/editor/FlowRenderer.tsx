@@ -1570,7 +1570,7 @@ function FlowRenderer({
   return (
     <WorkflowScopeContext.Provider value={workflowScopeValue}>
       <div
-        className={cn("relative h-full w-full", {
+        className={cn("workflow-editor-shell relative h-full w-full", {
           "react-flow--pre-layout": layoutPhase === "pre-layout",
           "react-flow--initial-load":
             layoutPhase === "initial-load" || layoutPhase === "pre-layout",
@@ -1814,7 +1814,7 @@ function FlowRenderer({
                 {!hideBackground && (
                   <Background
                     variant={BackgroundVariant.Dots}
-                    bgColor="#020617"
+                    bgColor="hsl(var(--background))"
                   />
                 )}
                 {!readOnly && (

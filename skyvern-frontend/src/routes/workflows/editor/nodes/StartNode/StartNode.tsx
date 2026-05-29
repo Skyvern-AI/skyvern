@@ -197,8 +197,10 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       <div className="w-[30rem] rounded-lg bg-slate-elevation4 px-6 py-4 text-center text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
         Start
         {loopParent ? (
-          <div className="mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
-            <span className="rounded bg-slate-700 p-1 text-lg">💡</span>
+          <div className="workflow-editor-tip mt-4 flex gap-3 rounded-md bg-slate-800 p-3 normal-case tracking-normal">
+            <span className="workflow-editor-tip-icon rounded bg-slate-700 p-1 text-lg">
+              💡
+            </span>
             <div className="space-y-1 text-left font-normal text-slate-400">
               {loopParent.data.loopKind === "while" ? (
                 <>

@@ -100,7 +100,7 @@ function WorkflowHistoryPanel({
       {/* Header */}
       <div className="flex-shrink-0 p-4 pb-3">
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Workflow History</h2>
+          <h2 className="text-lg font-semibold">Agent History</h2>
           <div className="flex items-center gap-2">
             <div className="text-sm text-muted-foreground">
               {selectedVersions.size}/2 selected

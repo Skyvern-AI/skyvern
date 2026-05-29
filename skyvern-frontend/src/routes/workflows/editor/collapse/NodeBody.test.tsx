@@ -115,6 +115,114 @@ describe("NodeBody", () => {
     expect(recomposedElement).not.toBe(body);
   });
 
+  test("recomposes on accordion-down from a nested accordion", () => {
+    const { container } = render(
+      <Collapsible open>
+        <NodeBody>
+          <div data-testid="accordion-content">accordion child</div>
+        </NodeBody>
+      </Collapsible>,
+    );
+
+    const body = container
+      .querySelector("[data-testid='accordion-content']")!
+      .closest("[data-state]") as HTMLElement;
+    const recompositeWrapper = body.querySelector(
+      "[data-node-body-recomposite]",
+    ) as HTMLElement;
+    const accordionChild = container.querySelector(
+      "[data-testid='accordion-content']",
+    ) as HTMLElement;
+
+    const originalOffsetHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "offsetHeight",
+    );
+    let recomposedElement: HTMLElement | null = null;
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get() {
+        recomposedElement = this as HTMLElement;
+        return 0;
+      },
+    });
+
+    try {
+      const event = new Event("webkitAnimationEnd", {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "animationName", {
+        value: "accordion-down",
+      });
+      fireEvent(accordionChild, event);
+    } finally {
+      if (originalOffsetHeight) {
+        Object.defineProperty(
+          HTMLElement.prototype,
+          "offsetHeight",
+          originalOffsetHeight,
+        );
+      } else {
+        delete (HTMLElement.prototype as { offsetHeight?: number })
+          .offsetHeight;
+      }
+    }
+
+    expect(recomposedElement).toBe(recompositeWrapper);
+  });
+
+  test("ignores unrelated animation names", () => {
+    const { container } = render(
+      <Collapsible open>
+        <NodeBody>
+          <div data-testid="inner">inner</div>
+        </NodeBody>
+      </Collapsible>,
+    );
+
+    const body = container
+      .querySelector("[data-testid='inner']")!
+      .closest("[data-state]") as HTMLElement;
+
+    const originalOffsetHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "offsetHeight",
+    );
+    let recomposedElement: HTMLElement | null = null;
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get() {
+        recomposedElement = this as HTMLElement;
+        return 0;
+      },
+    });
+
+    try {
+      const event = new Event("webkitAnimationEnd", {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "animationName", {
+        value: "fade-in",
+      });
+      fireEvent(body, event);
+    } finally {
+      if (originalOffsetHeight) {
+        Object.defineProperty(
+          HTMLElement.prototype,
+          "offsetHeight",
+          originalOffsetHeight,
+        );
+      } else {
+        delete (HTMLElement.prototype as { offsetHeight?: number })
+          .offsetHeight;
+      }
+    }
+
+    expect(recomposedElement).toBeNull();
+  });
+
   test("keeps the outer body empty when a child component renders null", () => {
     const { container } = render(
       <Collapsible open>

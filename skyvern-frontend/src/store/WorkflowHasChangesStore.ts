@@ -296,11 +296,11 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           .join("; ");
       } else {
         description =
-          "Failed to save workflow. Please check your workflow configuration and try again.";
+          "Failed to save agent. Please check your agent configuration and try again.";
       }
 
       toast({
-        title: "Failed to save workflow",
+        title: "Failed to save agent",
         description,
         variant: "destructive",
       });

@@ -130,13 +130,11 @@ function setHumanInteractionNode(
     data: {
       instructions:
         overrides.instructions ??
-        "Please review and approve or reject to continue the workflow.",
+        "Please review and approve or reject to continue the agent.",
       timeoutSeconds: overrides.timeoutSeconds ?? 7200,
       recipients: overrides.recipients ?? "",
-      subject:
-        overrides.subject ?? "Human interaction required for workflow run",
-      body:
-        overrides.body ?? "Your interaction is required for a workflow run!",
+      subject: overrides.subject ?? "Human interaction required for agent run",
+      body: overrides.body ?? "Your interaction is required for an agent run!",
       negativeDescriptor: overrides.negativeDescriptor ?? "Reject",
       positiveDescriptor: overrides.positiveDescriptor ?? "Approve",
       editable: overrides.editable ?? true,
@@ -187,7 +185,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
     expect(
       (
         screen.getByPlaceholderText(
-          "Please review and approve or reject to continue the workflow.",
+          "Please review and approve or reject to continue the agent.",
         ) as HTMLInputElement
       ).value,
     ).toBe("Please confirm.");
@@ -204,14 +202,14 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
     expect(
       (
         screen.getByPlaceholderText(
-          "Human interaction required for workflow run",
+          "Human interaction required for agent run",
         ) as HTMLInputElement
       ).value,
     ).toBe("Hi");
     expect(
       (
         screen.getByPlaceholderText(
-          "Your interaction is required for a workflow run!",
+          "Your interaction is required for an agent run!",
         ) as HTMLTextAreaElement
       ).value,
     ).toBe("Body content");
@@ -229,7 +227,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
 
     fireEvent.change(
       screen.getByPlaceholderText(
-        "Please review and approve or reject to continue the workflow.",
+        "Please review and approve or reject to continue the agent.",
       ),
       { target: { value: "Please double-check." } },
     );
@@ -271,9 +269,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
     render(<HumanInteractionBlockForm blockId="h1" />);
 
     fireEvent.change(
-      screen.getByPlaceholderText(
-        "Human interaction required for workflow run",
-      ),
+      screen.getByPlaceholderText("Human interaction required for agent run"),
       { target: { value: "New subject" } },
     );
 
@@ -288,7 +284,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
 
     fireEvent.change(
       screen.getByPlaceholderText(
-        "Your interaction is required for a workflow run!",
+        "Your interaction is required for an agent run!",
       ),
       { target: { value: "Updated body" } },
     );
@@ -333,7 +329,7 @@ describe("HumanInteractionBlockForm (SKY-9361)", () => {
     });
     fireEvent.change(
       screen.getByPlaceholderText(
-        "Please review and approve or reject to continue the workflow.",
+        "Please review and approve or reject to continue the agent.",
       ),
       { target: { value: "blocked" } },
     );

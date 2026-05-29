@@ -32,5 +32,8 @@ class Run(BaseModel):
     vcpu_millicores: int | None = None
     duration_ms: int | None = None
     compute_cost: float | None = None
+    llm_cost: float | None = None
+    proxy_cost: float | None = None
+    captcha_cost: float | None = None
     created_at: datetime
     modified_at: datetime

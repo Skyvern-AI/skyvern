@@ -88,10 +88,10 @@ function DebuggerBlockRuns() {
   }
 
   return (
-    <div className="relative flex w-full items-center justify-center gap-2 opacity-80 hover:opacity-100">
+    <div className="relative flex items-center justify-center gap-2 opacity-80 hover:opacity-100">
       <div
         ref={scrollContainerRef}
-        className="flex max-w-[7rem] gap-2 overflow-x-auto rounded-full bg-[#020617] p-2 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="flex max-w-[7rem] gap-2 overflow-x-auto rounded-full bg-[#050505] p-2 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {[...(debugSessionRuns?.runs ?? [])].reverse().map((run) => {
           const dt = toDate(run.created_at ?? "", null);

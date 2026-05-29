@@ -102,9 +102,9 @@ function WorkflowRunStatusAlert({ status, title, visible }: Props) {
     if (Notification.permission === "granted") {
       try {
         const notification = new Notification(
-          `Workflow Run Status Change: ${status}`,
+          `Agent Run Status Change: ${status}`,
           {
-            body: `The workflow run "${title ?? "unknown"}" has changed to status: ${status}`,
+            body: `The agent run "${title ?? "unknown"}" has changed to status: ${status}`,
             icon: "/favicon.png",
             tag: `workflow-${title ?? "unknown"}-${status}`,
             requireInteraction: false,
@@ -258,7 +258,7 @@ function WorkflowRunStatusAlert({ status, title, visible }: Props) {
             </div>
           )}
         </Button>
-        <HelpTooltip content="When this workflow changes to a particular status, notify me via OS notifications and a sound." />
+        <HelpTooltip content="When this agent changes to a particular status, notify me via OS notifications and a sound." />
       </div>
     </div>
   );

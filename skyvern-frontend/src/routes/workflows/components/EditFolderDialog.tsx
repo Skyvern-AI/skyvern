@@ -69,7 +69,7 @@ function EditFolderDialog({
                 id="edit-folder-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                placeholder="e.g., Production Workflows"
+                placeholder="e.g., Production Agents"
                 autoFocus
               />
             </div>

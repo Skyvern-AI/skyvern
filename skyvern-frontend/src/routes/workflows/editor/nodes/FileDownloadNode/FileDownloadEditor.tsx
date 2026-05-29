@@ -156,7 +156,7 @@ function FileDownloadEditorBody({
           </div>
         </div>
         {!hasInteracted && (
-          <div className="rounded-md bg-slate-800 p-2 text-xs text-slate-400">
+          <div className="workflow-editor-tip rounded-md bg-slate-800 p-2 text-xs text-slate-400">
             Once the file is downloaded, this block will complete.
           </div>
         )}

@@ -3,34 +3,32 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   CrossCircledIcon,
-  CubeIcon,
-  ExternalLinkIcon,
+  CursorArrowIcon,
+  Cross2Icon,
+  DoubleArrowDownIcon,
+  DropdownMenuIcon,
+  FileTextIcon,
+  HandIcon,
+  InputIcon,
+  KeyboardIcon,
+  MagicWandIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
-import { useShimmerText } from "./useShimmerText";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Status } from "@/api/types";
 import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { useWorkflowRunViewingV2 } from "@/hooks/useWorkflowRunViewingV2";
-import { ActionCardCompact } from "@/routes/tasks/detail/ActionCardCompact";
+  type ActionsApiResponse,
+  type ActionType,
+  ActionTypes,
+  ReadableActionTypes,
+  Status,
+} from "@/api/types";
+import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { formatDuration, toDuration } from "@/routes/workflows/utils";
 import { cn } from "@/util/utils";
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import {
-  hasEvaluations,
   isAction,
   isBlockItem,
   isObserverThought,
@@ -40,23 +38,28 @@ import {
   WorkflowRunBlock,
   WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
-import { isTaskVariantBlock } from "../types/workflowTypes";
-import { ActionCard } from "./ActionCard";
-import { WorkflowRunHumanInteraction } from "./WorkflowRunHumanInteraction";
 import {
   ActionItem,
   WorkflowRunOverviewActiveElement,
 } from "./WorkflowRunOverview";
 import { ThoughtCard } from "./ThoughtCard";
+import { aggregateIterationStatus } from "./workflowTimelineUtils";
 
 type Props = {
   activeItem: WorkflowRunOverviewActiveElement;
+  activeIteration?: number | null;
   block: WorkflowRunBlock;
   subItems: Array<WorkflowRunTimelineItem>;
   depth?: number;
+  blockOrder?: ReadonlyMap<string, number>;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
+  onIterationClick?: (
+    loopBlock: WorkflowRunBlock,
+    iterationIndex: number,
+  ) => void;
   onActionClick: (action: ActionItem) => void;
-  onThoughtCardClick: (thought: ObserverThought) => void;
+  onThoughtClick?: (thought: ObserverThought) => void;
+  renderThoughts?: boolean;
   finallyBlockLabel?: string | null;
   workflowRunIsFinalized?: boolean;
 };
@@ -67,101 +70,182 @@ type LoopIterationGroup = {
   items: Array<WorkflowRunTimelineItem>;
 };
 
-const blockElevationByDepth = [
-  "bg-slate-elevation3",
-  "bg-slate-elevation4",
-  "bg-slate-elevation5",
-];
+const INDENT_PX = 14;
+const RAIL_HIGHLIGHT_OFFSET_PX = INDENT_PX / 2;
+const RAIL_CONTENT_PADDING_PX = INDENT_PX - 1;
 
-const cardElevationByDepth = [
-  "bg-slate-elevation4",
-  "bg-slate-elevation5",
-  "bg-slate-elevation5",
-];
+const railHighlightStyle = {
+  marginLeft: `-${RAIL_HIGHLIGHT_OFFSET_PX}px`,
+  paddingLeft: `${RAIL_CONTENT_PADDING_PX}px`,
+};
 
-function getBlockElevation(depth: number): string {
-  return blockElevationByDepth[
-    Math.min(depth, blockElevationByDepth.length - 1)
-  ]!;
-}
+const timelineActionIcons: Record<ActionType, React.ReactNode> = {
+  [ActionTypes.Click]: (
+    <WorkflowBlockIcon workflowBlockType="action" className="size-3.5" />
+  ),
+  [ActionTypes.Hover]: <HandIcon className="size-3.5" />,
+  [ActionTypes.InputText]: <InputIcon className="size-3.5" />,
+  [ActionTypes.DownloadFile]: (
+    <WorkflowBlockIcon workflowBlockType="file_download" className="size-3.5" />
+  ),
+  [ActionTypes.UploadFile]: (
+    <WorkflowBlockIcon workflowBlockType="file_upload" className="size-3.5" />
+  ),
+  [ActionTypes.SelectOption]: <DropdownMenuIcon className="size-3.5" />,
+  [ActionTypes.complete]: <CheckCircledIcon className="size-3.5" />,
+  [ActionTypes.wait]: (
+    <WorkflowBlockIcon workflowBlockType="wait" className="size-3.5" />
+  ),
+  [ActionTypes.terminate]: <CrossCircledIcon className="size-3.5" />,
+  [ActionTypes.SolveCaptcha]: <MagicWandIcon className="size-3.5" />,
+  [ActionTypes.extract]: (
+    <WorkflowBlockIcon workflowBlockType="extraction" className="size-3.5" />
+  ),
+  [ActionTypes.ReloadPage]: <ReloadIcon className="size-3.5" />,
+  [ActionTypes.Scroll]: <DoubleArrowDownIcon className="size-3.5" />,
+  [ActionTypes.KeyPress]: <KeyboardIcon className="size-3.5" />,
+  [ActionTypes.Move]: <CursorArrowIcon className="size-3.5" />,
+  [ActionTypes.NullAction]: <FileTextIcon className="size-3.5" />,
+  [ActionTypes.VerificationCode]: <KeyboardIcon className="size-3.5" />,
+  [ActionTypes.Drag]: <HandIcon className="size-3.5" />,
+  [ActionTypes.LeftMouse]: (
+    <WorkflowBlockIcon workflowBlockType="action" className="size-3.5" />
+  ),
+  [ActionTypes.GotoUrl]: (
+    <WorkflowBlockIcon workflowBlockType="goto_url" className="size-3.5" />
+  ),
+  [ActionTypes.ClosePage]: <Cross2Icon className="size-3.5" />,
+};
 
-function getCardElevation(depth: number): string {
-  return cardElevationByDepth[
-    Math.min(depth, cardElevationByDepth.length - 1)
-  ]!;
-}
-
-function stringifyTimelineValue(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "null";
-  }
-
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return String(value);
-  }
-
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function truncateValue(value: string, maxLength = 120): string {
-  const collapsed = value.replace(/\s+/g, " ").trim();
-  if (collapsed.length <= maxLength) {
-    return collapsed;
-  }
-  return `${collapsed.slice(0, maxLength - 3)}...`;
-}
-
-/**
- * Renders a loop value with line-clamp-2.  Shows a tooltip with the full
- * value only when the CSS clamp actually truncates the visible text.
- */
-function LoopValueCode({
-  collapsed,
-  fullValue,
-}: {
-  collapsed: string;
-  fullValue: string;
-}) {
-  const codeRef = useRef<HTMLElement>(null);
-  const [isClamped, setIsClamped] = useState(false);
-
-  useEffect(() => {
-    const el = codeRef.current;
-    if (el) {
-      setIsClamped(el.scrollHeight > el.clientHeight + 1);
-    }
-  }, [collapsed]);
-
+function IndentRails({ depth }: { depth: number }) {
+  // Render guide rails only for nested rows. Top-level rows should start with
+  // content, not a phantom outer timeline rail.
+  const rails = depth;
   return (
-    <TooltipProvider delayDuration={300}>
-      <Tooltip open={isClamped ? undefined : false}>
-        <TooltipTrigger asChild>
-          <code
-            ref={codeRef}
-            className="line-clamp-2 block min-w-0 break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300"
-          >
-            {collapsed}
-          </code>
-        </TooltipTrigger>
-        {isClamped && (
-          <TooltipContent
-            side="top"
-            className="max-w-xs break-all font-mono text-[11px]"
-          >
-            {fullValue}
-          </TooltipContent>
-        )}
-      </Tooltip>
-    </TooltipProvider>
+    <>
+      {Array.from({ length: rails }).map((_, i) => (
+        <div
+          key={i}
+          className="relative shrink-0 self-stretch"
+          style={{ width: `${INDENT_PX}px` }}
+        >
+          <div className="absolute inset-y-0 left-1/2 w-px bg-slate-700" />
+        </div>
+      ))}
+    </>
   );
+}
+
+function StatusDot({
+  status,
+  isFinalized,
+}: {
+  status: Status | null;
+  isFinalized: boolean;
+}) {
+  const isCompleted = status === Status.Completed;
+  const isFailure =
+    status === Status.Failed ||
+    status === Status.Terminated ||
+    status === Status.TimedOut ||
+    status === Status.Canceled;
+  const isRunning = status === Status.Running && !isFinalized;
+
+  if (isCompleted) {
+    return <CheckCircledIcon className="size-3.5 shrink-0 text-success" />;
+  }
+  if (isFailure) {
+    return <CrossCircledIcon className="size-3.5 shrink-0 text-destructive" />;
+  }
+  if (isRunning) {
+    return (
+      <ReloadIcon className="size-3.5 shrink-0 animate-spin text-sky-400" />
+    );
+  }
+  return <div className="size-2 shrink-0 rounded-full bg-slate-600" />;
+}
+
+function normalizeInlineText(value: string | null | undefined): string | null {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  return normalized ? normalized : null;
+}
+
+function getActionSummary(action: ActionsApiResponse): string | null {
+  return (
+    normalizeInlineText(action.reasoning) ??
+    normalizeInlineText(action.text) ??
+    normalizeInlineText(action.response)
+  );
+}
+
+function countSchemaFields(value: WorkflowRunBlock["data_schema"]): number {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return 0;
+  const properties = "properties" in value ? value.properties : null;
+  if (
+    properties &&
+    typeof properties === "object" &&
+    !Array.isArray(properties)
+  ) {
+    return Object.keys(properties).length;
+  }
+  return Object.keys(value).length;
+}
+
+function getTimelineDescriptor(block: WorkflowRunBlock): string {
+  const explicit =
+    normalizeInlineText(block.description) ??
+    normalizeInlineText(block.navigation_goal) ??
+    normalizeInlineText(block.data_extraction_goal) ??
+    normalizeInlineText(block.prompt) ??
+    normalizeInlineText(block.instructions) ??
+    normalizeInlineText(block.url);
+
+  if (explicit) return explicit;
+
+  if (block.block_type === "extraction") {
+    const fieldCount = countSchemaFields(block.data_schema);
+    if (fieldCount > 0) {
+      return `Extract ${fieldCount} ${fieldCount === 1 ? "field" : "fields"}`;
+    }
+  }
+
+  if (block.block_type === "for_loop") {
+    const valueCount = Array.isArray(block.loop_values)
+      ? block.loop_values.length
+      : 0;
+    return valueCount > 0
+      ? `Loop over ${valueCount} ${valueCount === 1 ? "value" : "values"}`
+      : "Loop over values";
+  }
+
+  if (block.block_type === "while_loop") {
+    return "Repeat while condition passes";
+  }
+
+  if (block.block_type === "conditional") {
+    const expression = normalizeInlineText(block.executed_branch_expression);
+    return expression ? `Branch on ${expression}` : "Branch on a condition";
+  }
+
+  return `${workflowBlockTitle[block.block_type]} block`;
+}
+
+function getTimelineTypeLabel(block: WorkflowRunBlock): string {
+  switch (block.block_type) {
+    case "conditional":
+      return "Condition";
+    case "for_loop":
+    case "while_loop":
+      return "Loop";
+    case "navigation":
+    case "task":
+    case "task_v2":
+      return "Task";
+    case "http_request":
+      return "HTTP";
+    default:
+      return workflowBlockTitle[block.block_type];
+  }
 }
 
 function getLoopIterationGroups(
@@ -170,7 +254,6 @@ function getLoopIterationGroups(
   const groupsByKey = new Map<string, LoopIterationGroup>();
   const unknownItems: Array<WorkflowRunTimelineItem> = [];
 
-  // First pass: group items with known indexes, collect unknown items separately
   items.forEach((item) => {
     const currentIndex = isBlockItem(item) ? item.block.current_index : null;
     const currentValue = isBlockItem(item) ? item.block.current_value : null;
@@ -188,7 +271,6 @@ function getLoopIterationGroups(
         items: [],
       });
     }
-
     const group = groupsByKey.get(groupKey)!;
     if (!group.currentValue && currentValue) {
       group.currentValue = currentValue;
@@ -196,9 +278,6 @@ function getLoopIterationGroups(
     group.items.push(item);
   });
 
-  // Second pass: merge unknown items into the highest-index group.
-  // During streaming, these are blocks whose current_index hasn't been
-  // populated yet — they belong to the currently-executing iteration.
   if (unknownItems.length > 0) {
     if (groupsByKey.size > 0) {
       let maxIndex = -1;
@@ -213,8 +292,6 @@ function getLoopIterationGroups(
         unknownItems.forEach((item) => maxGroup!.items.push(item));
       }
     } else {
-      // No known groups exist yet — all items are unknown.
-      // The first iteration must be running.
       groupsByKey.set("index-0", {
         index: 0,
         currentValue: null,
@@ -224,24 +301,13 @@ function getLoopIterationGroups(
   }
 
   return Array.from(groupsByKey.values()).sort((left, right) => {
-    if (left.index === null && right.index === null) {
-      return 0;
-    }
-    if (left.index === null) {
-      return 1;
-    }
-    if (right.index === null) {
-      return -1;
-    }
-    return right.index - left.index;
+    if (left.index === null && right.index === null) return 0;
+    if (left.index === null) return -1;
+    if (right.index === null) return 1;
+    return left.index - right.index;
   });
 }
 
-/**
- * Check whether any block, action, or thought within `items` (recursively)
- * matches the currently-active element.  Uses an iterative stack to avoid
- * deep nesting — same pattern as `findActiveItem` in workflowTimelineUtils.
- */
 function timelineItemsContainActiveElement(
   items: Array<WorkflowRunTimelineItem>,
   activeItem: WorkflowRunOverviewActiveElement,
@@ -259,7 +325,6 @@ function timelineItemsContainActiveElement(
     ) {
       return true;
     }
-
     if (
       isBlockItem(item) &&
       isAction(activeItem) &&
@@ -267,7 +332,6 @@ function timelineItemsContainActiveElement(
     ) {
       return true;
     }
-
     if (
       isThoughtItem(item) &&
       isObserverThought(activeItem) &&
@@ -275,7 +339,6 @@ function timelineItemsContainActiveElement(
     ) {
       return true;
     }
-
     stack.push(...item.children);
   }
   return false;
@@ -284,10 +347,17 @@ function timelineItemsContainActiveElement(
 type TimelineSubItemsProps = {
   items: Array<WorkflowRunTimelineItem>;
   activeItem: WorkflowRunOverviewActiveElement;
+  activeIteration?: number | null;
   depth: number;
+  blockOrder?: ReadonlyMap<string, number>;
   onBlockItemClick: (block: WorkflowRunBlock) => void;
+  onIterationClick?: (
+    loopBlock: WorkflowRunBlock,
+    iterationIndex: number,
+  ) => void;
   onActionClick: (action: ActionItem) => void;
-  onThoughtCardClick: (thought: ObserverThought) => void;
+  onThoughtClick?: (thought: ObserverThought) => void;
+  renderThoughts?: boolean;
   finallyBlockLabel?: string | null;
   workflowRunIsFinalized?: boolean;
 };
@@ -295,15 +365,19 @@ type TimelineSubItemsProps = {
 function TimelineSubItems({
   items,
   activeItem,
+  activeIteration = null,
   depth,
+  blockOrder,
   onBlockItemClick,
+  onIterationClick,
   onActionClick,
-  onThoughtCardClick,
+  onThoughtClick,
+  renderThoughts = false,
   finallyBlockLabel,
   workflowRunIsFinalized,
 }: TimelineSubItemsProps) {
   return (
-    <div className="space-y-3">
+    <div>
       {items.map((item) => {
         if (isBlockItem(item)) {
           return (
@@ -311,31 +385,119 @@ function TimelineSubItems({
               key={item.block.workflow_run_block_id}
               subItems={item.children}
               activeItem={activeItem}
+              activeIteration={activeIteration}
               block={item.block}
               depth={depth}
+              blockOrder={blockOrder}
               onActionClick={onActionClick}
               onBlockItemClick={onBlockItemClick}
-              onThoughtCardClick={onThoughtCardClick}
+              onIterationClick={onIterationClick}
+              onThoughtClick={onThoughtClick}
+              renderThoughts={renderThoughts}
               finallyBlockLabel={finallyBlockLabel}
               workflowRunIsFinalized={workflowRunIsFinalized}
             />
           );
         }
-
-        if (isThoughtItem(item)) {
+        if (renderThoughts && isThoughtItem(item) && onThoughtClick) {
           return (
-            <ThoughtCard
-              key={item.thought.thought_id}
-              active={
-                isObserverThought(activeItem) &&
-                activeItem.thought_id === item.thought.thought_id
-              }
-              onClick={onThoughtCardClick}
-              thought={item.thought}
-              cardClassName={getCardElevation(depth)}
-            />
+            <div key={item.thought.thought_id} className="py-1 pl-7">
+              <ThoughtCard
+                active={
+                  isObserverThought(activeItem) &&
+                  activeItem.thought_id === item.thought.thought_id
+                }
+                onClick={onThoughtClick}
+                thought={item.thought}
+              />
+            </div>
           );
         }
+        // Thoughts are no longer rendered as cards in the compact timeline
+        // rail; the block detail panel surfaces them inside the owning
+        // block's view alongside its actions.
+        return null;
+      })}
+    </div>
+  );
+}
+
+type TimelineActionRowsProps = {
+  block: WorkflowRunBlock;
+  activeItem: WorkflowRunOverviewActiveElement;
+  depth: number;
+  onActionClick: (action: ActionItem) => void;
+  workflowRunIsFinalized?: boolean;
+};
+
+function TimelineActionRows({
+  block,
+  activeItem,
+  depth,
+  onActionClick,
+  workflowRunIsFinalized,
+}: TimelineActionRowsProps) {
+  const actions = block.actions ?? [];
+  const actionsTopDown = [...actions].reverse();
+
+  if (actions.length === 0) return null;
+
+  return (
+    <div className="space-y-1 py-1">
+      {actionsTopDown.map((action, index) => {
+        const isActive =
+          isAction(activeItem) && activeItem.action_id === action.action_id;
+        const displayIndex = index + 1;
+        const icon = timelineActionIcons[action.action_type];
+        const label = ReadableActionTypes[action.action_type];
+        const summary = getActionSummary(action);
+
+        return (
+          <div
+            key={action.action_id}
+            className="flex min-h-[24px] items-stretch text-xs"
+          >
+            <IndentRails depth={depth} />
+            <div
+              className={cn(
+                "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+                "hover:bg-slate-800/60",
+                isActive && "bg-slate-800",
+              )}
+              style={railHighlightStyle}
+            >
+              <div className="size-4 shrink-0" />
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onActionClick({ block, action });
+                }}
+                aria-pressed={isActive}
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+              >
+                <StatusDot
+                  status={action.status}
+                  isFinalized={!!workflowRunIsFinalized}
+                />
+                <span className="shrink-0 text-slate-400" aria-hidden="true">
+                  {icon}
+                </span>
+                <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
+                  #{displayIndex}
+                </span>
+                <span className="shrink-0 rounded border border-slate-700 px-1.5 py-0.5 text-[10px] font-medium text-slate-400">
+                  {label}
+                </span>
+                {summary && (
+                  <span className="min-w-0 flex-1 truncate text-slate-500">
+                    · {summary}
+                  </span>
+                )}
+              </button>
+            </div>
+          </div>
+        );
       })}
     </div>
   );
@@ -343,567 +505,478 @@ function TimelineSubItems({
 
 function WorkflowRunTimelineBlockItem({
   activeItem,
+  activeIteration = null,
   block,
+  blockOrder,
   subItems,
   depth = 0,
   onBlockItemClick,
+  onIterationClick,
   onActionClick,
-  onThoughtCardClick,
+  onThoughtClick,
+  renderThoughts = false,
   finallyBlockLabel,
   workflowRunIsFinalized = false,
 }: Props) {
-  const isViewingV2 = useWorkflowRunViewingV2();
-  const [expandedActionId, setExpandedActionId] = useState<string | null>(null);
-  const actions = block.actions ?? [];
   const isFinallyBlock = finallyBlockLabel && block.label === finallyBlockLabel;
-
-  const showDiagnosticLink =
-    isTaskVariantBlock(block) &&
-    block.task_id !== null &&
-    block.task_id !== undefined;
-
-  const refCallback = useCallback((element: HTMLDivElement | null) => {
-    if (
-      element &&
-      isWorkflowRunBlock(activeItem) &&
-      activeItem.workflow_run_block_id === block.workflow_run_block_id
-    ) {
-      element.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-    }
-    // this should only run once at mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const isRunning = block.status === Status.Running && !workflowRunIsFinalized;
-  const shimmerTitleRef = useShimmerText<HTMLSpanElement>(isRunning);
-  const shimmerLabelRef = useShimmerText<HTMLSpanElement>(isRunning);
-  const showStatusIndicator = block.status !== null;
-
-  const showSuccessIndicator =
-    showStatusIndicator && block.status === Status.Completed;
-  const showFailureIndicator =
-    showStatusIndicator &&
-    (block.status === Status.Failed ||
-      block.status === Status.Terminated ||
-      block.status === Status.TimedOut ||
-      block.status === Status.Canceled);
-
   const duration =
     block.duration !== null ? formatDuration(toDuration(block.duration)) : null;
+  const blockTypeTitle = workflowBlockTitle[block.block_type];
+  const blockTypeLabel = getTimelineTypeLabel(block);
+  const blockName = block.label ?? block.title ?? blockTypeTitle;
+  const blockIndex = blockOrder?.get(block.workflow_run_block_id);
+  const descriptor = getTimelineDescriptor(block);
+  const actions = block.actions ?? [];
+  const actionCount = actions.length;
 
-  // NOTE(jdo): want to put this back; await for now
-  const showDuration = false as const;
-  const hasNestedChildren = subItems.length > 0;
+  const hasActions = actionCount > 0;
   const isForLoopBlock = block.block_type === "for_loop";
   const isWhileLoopBlock = block.block_type === "while_loop";
   const isLoopBlock = isForLoopBlock || isWhileLoopBlock;
-  const isConditionalBlock = block.block_type === "conditional";
-  const [childrenOpen, setChildrenOpen] = useState(true);
-
   const loopIterationGroups = useMemo(
-    () => getLoopIterationGroups(subItems),
-    [subItems],
+    () => (isLoopBlock ? getLoopIterationGroups(subItems) : []),
+    [isLoopBlock, subItems],
   );
+  const hasRenderableNestedChildren = subItems.some(
+    (item) => isBlockItem(item) || (renderThoughts && isThoughtItem(item)),
+  );
+  // Only treat as a container when there are actual children to reveal.
+  // Conditionals and loops can be defined as containers structurally, but if
+  // the runtime didn't model any child blocks under them (e.g. conditionals
+  // whose "next" block is a flat sibling), showing a chevron that reveals
+  // nothing is worse than no chevron at all.
+  const isContainer = hasRenderableNestedChildren || hasActions;
 
-  // Track which loop iteration groups are expanded (controlled state).
-  // Initialise with the most-recent group (index 0) plus any group that
-  // contains the currently-active element so it is visible on first render.
-  const [openLoopGroups, setOpenLoopGroups] = useState<Set<number>>(() => {
-    const initial = new Set<number>();
-    if (loopIterationGroups.length > 0) {
-      initial.add(0);
-    }
-    loopIterationGroups.forEach((group, idx) => {
-      if (timelineItemsContainActiveElement(group.items, activeItem)) {
-        initial.add(idx);
-      }
-    });
-    return initial;
-  });
+  // The loop block itself is only "active" when no specific iteration is
+  // selected — otherwise the iteration row owns the highlight.
+  //
+  // When an action inside this block is the selection, the owning block stays
+  // highlighted — mirrors the loop-iteration pattern so the user never loses
+  // the parent context after drilling into Panel B's action cards.
+  const ownsSelectedAction =
+    isAction(activeItem) &&
+    (block.actions ?? []).some((a) => a.action_id === activeItem.action_id);
+  const hasResolvedActiveIteration =
+    activeIteration !== null &&
+    loopIterationGroups.some((group) => group.index === activeIteration);
+  const isActiveBlock =
+    ((isWorkflowRunBlock(activeItem) &&
+      activeItem.workflow_run_block_id === block.workflow_run_block_id) ||
+      ownsSelectedAction) &&
+    !(isLoopBlock && hasResolvedActiveIteration);
+  const hasActiveDescendant = useMemo(
+    () => timelineItemsContainActiveElement(subItems, activeItem),
+    [subItems, activeItem],
+  );
+  // Deep-link case: `?active=<loopId>&iteration=N`. The loop block is the
+  // selected item, but `isActiveBlock` is intentionally suppressed (the
+  // iteration row owns the highlight) and `hasActiveDescendant` is false
+  // (the loop isn't its own child). Without this, the loop stays collapsed
+  // and the targeted iteration row is hidden.
+  const isLoopWithSelectedIteration =
+    isLoopBlock &&
+    hasResolvedActiveIteration &&
+    isWorkflowRunBlock(activeItem) &&
+    activeItem.workflow_run_block_id === block.workflow_run_block_id;
 
-  // When the active element changes (or loop groups load for the first time),
-  // auto-expand the group that contains it. Also ensure the most-recent group
-  // (index 0) is open — this covers the edge case where subItems loads after
-  // the initial mount so the useState initializer missed it.
+  const [expanded, setExpanded] = useState(
+    isRunning ||
+      isActiveBlock ||
+      hasActions ||
+      hasActiveDescendant ||
+      isLoopWithSelectedIteration ||
+      !hasRenderableNestedChildren,
+  );
+  const userToggledRef = useRef(false);
+
   useEffect(() => {
-    setOpenLoopGroups((prev) => {
-      let next = prev;
-      // Ensure most-recent group is open (covers late-loading data).
-      if (loopIterationGroups.length > 0 && !prev.has(0)) {
-        next = new Set(next);
-        next.add(0);
-      }
-      // Find and expand the group containing the active item.
-      for (let idx = 0; idx < loopIterationGroups.length; idx++) {
-        const group = loopIterationGroups[idx];
-        if (
-          group &&
-          timelineItemsContainActiveElement(group.items, activeItem)
-        ) {
-          if (!next.has(idx)) {
-            if (next === prev) next = new Set(next);
-            next.add(idx);
-          }
-          break; // active item can only be in one group
-        }
-      }
-      return next;
-    });
-  }, [activeItem, loopIterationGroups]);
+    userToggledRef.current = false;
+  }, [block.workflow_run_block_id]);
 
-  // Auto-expand conditional children when the active element is inside them.
+  // Auto-expand when actions appear, an active descendant appears, or this
+  // block starts running.
+  // Skip once the user has explicitly toggled the chevron — their choice wins.
   useEffect(() => {
+    if (userToggledRef.current) return;
     if (
-      isConditionalBlock &&
-      hasNestedChildren &&
-      timelineItemsContainActiveElement(subItems, activeItem)
+      hasActions ||
+      hasActiveDescendant ||
+      isRunning ||
+      isLoopWithSelectedIteration
     ) {
-      setChildrenOpen(true);
+      setExpanded(true);
     }
-  }, [activeItem, isConditionalBlock, hasNestedChildren, subItems]);
+  }, [hasActions, hasActiveDescendant, isRunning, isLoopWithSelectedIteration]);
 
   const loopValues = Array.isArray(block.loop_values) ? block.loop_values : [];
 
+  // Loop inline counter (e.g. 3/8).
+  const loopCounter = isForLoopBlock
+    ? loopValues.length > 0
+      ? `${loopIterationGroups.length}/${loopValues.length}`
+      : null
+    : isWhileLoopBlock
+      ? `${loopIterationGroups.length}`
+      : null;
+
   return (
-    <div
-      className={cn("min-w-0", {
-        "ml-3 pl-3": depth > 0,
-        "border-l border-slate-700": depth > 0,
-      })}
-    >
-      <div
-        data-slot="block-item"
-        className={cn(
-          "cursor-pointer rounded-lg ring-1 ring-transparent transition-all duration-200 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/30",
-          getBlockElevation(depth),
-          {
-            "ring-2 ring-white/55 [&:hover:not(:has([data-slot=runcard]:hover,[data-slot=block-item]:hover))]:ring-white/55":
-              isWorkflowRunBlock(activeItem) &&
-              activeItem.workflow_run_block_id === block.workflow_run_block_id,
-          },
-        )}
-        onClick={(event) => {
-          event.stopPropagation();
-          onBlockItemClick(block);
-        }}
-        ref={refCallback}
-      >
-        <div className="min-w-0 space-y-4 p-4">
-          <div className="space-y-2">
-            <div className="flex justify-between">
-              <div className="flex gap-3">
-                <div className="relative rounded bg-slate-800 p-2">
-                  <WorkflowBlockIcon
-                    workflowBlockType={block.block_type}
-                    className="size-6"
-                  />
-                  {isRunning && (
-                    <div className="absolute -bottom-1 -left-1 rounded-full bg-slate-elevation3 p-0.5">
-                      <ReloadIcon className="size-3 animate-spin text-slate-400" />
-                    </div>
-                  )}
-                </div>
-
-                <div className="flex flex-col gap-1">
-                  <span ref={shimmerTitleRef} className="text-sm">
-                    {workflowBlockTitle[block.block_type]}
-                  </span>
-                  <span
-                    ref={shimmerLabelRef}
-                    className="flex gap-2 text-xs text-slate-400"
-                  >
-                    {block.label}
-                  </span>
-                  {isFinallyBlock && (
-                    <span className="w-fit rounded bg-amber-500 px-1.5 py-0.5 text-[10px] font-medium text-black">
-                      Execute on any outcome
-                    </span>
-                  )}
-                </div>
-              </div>
-              <div className="flex gap-2">
-                {showFailureIndicator && (
-                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
-                    <CrossCircledIcon className="size-4 text-destructive" />
-                  </div>
-                )}
-                {showSuccessIndicator && (
-                  <div className="self-start rounded bg-slate-elevation5 px-2 py-1">
-                    <CheckCircledIcon className="size-4 text-success" />
-                  </div>
-                )}
-                <div className="flex flex-col items-end gap-[1px]">
-                  <div className="flex gap-1 self-start rounded bg-slate-elevation5 px-2 py-1">
-                    {showDiagnosticLink ? (
-                      <Link
-                        to={`/tasks/${block.task_id}/diagnostics`}
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <div className="flex gap-1">
-                          <ExternalLinkIcon className="size-4" />
-                          <span className="text-xs">Diagnostics</span>
-                        </div>
-                      </Link>
-                    ) : (
-                      <>
-                        <CubeIcon className="size-4" />
-                        <span className="text-xs">Block</span>
-                      </>
-                    )}
-                  </div>
-                  {duration && showDuration && (
-                    <div className="pr-[5px] text-xs text-[#00ecff]">
-                      {duration}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-            {block.description ? (
-              <div className="break-words text-xs text-slate-400">
-                {block.description}
-              </div>
-            ) : null}
-            {isForLoopBlock && (
-              <div className="min-w-0 space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
-                <div className="text-slate-300">
-                  Iterable values:{" "}
-                  <span className="font-medium text-slate-200">
-                    {loopValues.length}
-                  </span>
-                </div>
-                {loopValues.length > 0 && (
-                  <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
-                    {loopValues.map((value, index) => {
-                      const fullValue = stringifyTimelineValue(value);
-                      const collapsed = fullValue.replace(/\s+/g, " ").trim();
-                      return (
-                        <div
-                          key={index}
-                          className="flex min-w-0 break-words text-slate-400"
-                        >
-                          <span className="mr-1 shrink-0 text-slate-500">
-                            [{index}]
-                          </span>
-                          <LoopValueCode
-                            collapsed={collapsed}
-                            fullValue={fullValue}
-                          />
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            )}
-            {isWhileLoopBlock && (
-              <div className="min-w-0 rounded bg-slate-elevation5 px-3 py-2 text-xs text-slate-300">
-                Iterations run:{" "}
-                <span className="font-medium text-slate-200">
-                  {loopIterationGroups.length}
-                </span>
-              </div>
-            )}
-            {block.block_type === "conditional" && block.executed_branch_id && (
-              <div className="space-y-2 rounded bg-slate-elevation5 px-3 py-2 text-xs">
-                {hasEvaluations(block.output) && block.output.evaluations ? (
-                  // New format: show all branch evaluations
-                  <div className="space-y-2">
-                    {block.output.evaluations.map((evaluation, index) => (
-                      <div
-                        key={evaluation.branch_id || index}
-                        className={cn(
-                          "rounded border px-2 py-1.5",
-                          evaluation.is_matched
-                            ? "border-success/50 bg-success/10"
-                            : "border-slate-600 bg-slate-elevation3",
-                        )}
-                      >
-                        {evaluation.is_default ? (
-                          <div className="text-slate-300">
-                            <span className="font-medium">Default branch</span>
-                            {evaluation.is_matched && (
-                              <span className="ml-2 text-success">
-                                ✓ Matched
-                              </span>
-                            )}
-                          </div>
-                        ) : (
-                          <div className="space-y-1">
-                            <div className="text-slate-400">
-                              <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-300">
-                                {evaluation.original_expression}
-                              </code>
-                            </div>
-                            {evaluation.rendered_expression &&
-                              evaluation.rendered_expression !==
-                                evaluation.original_expression && (
-                                <div className="text-slate-400">
-                                  → rendered to{" "}
-                                  <code className="break-all rounded bg-slate-elevation1 px-1 py-0.5 font-mono text-slate-200">
-                                    {evaluation.rendered_expression}
-                                  </code>
-                                </div>
-                              )}
-                            <div className="flex items-center gap-2">
-                              <span className="text-slate-400">
-                                evaluated to
-                              </span>
-                              <span
-                                className={cn(
-                                  "font-medium",
-                                  evaluation.result
-                                    ? "text-success"
-                                    : "text-red-400",
-                                )}
-                              >
-                                {evaluation.result ? "True" : "False"}
-                              </span>
-                              {evaluation.is_matched && (
-                                <span className="text-success">✓ Matched</span>
-                              )}
-                            </div>
-                          </div>
-                        )}
-                        {evaluation.is_matched &&
-                          evaluation.next_block_label && (
-                            <div className="mt-1 text-slate-400">
-                              → Executing next block:{" "}
-                              <span className="font-medium text-slate-300">
-                                {evaluation.next_block_label}
-                              </span>
-                            </div>
-                          )}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  // Fallback: old format without evaluations array
-                  <>
-                    {block.executed_branch_expression !== null &&
-                    block.executed_branch_expression !== undefined ? (
-                      <div className="text-slate-300">
-                        Condition{" "}
-                        <code className="break-all rounded bg-slate-elevation3 px-1.5 py-0.5 font-mono text-slate-200">
-                          {block.executed_branch_expression}
-                        </code>{" "}
-                        evaluated to{" "}
-                        <span className="font-medium text-success">True</span>
-                      </div>
-                    ) : (
-                      <div className="text-slate-300">
-                        No conditions matched, executing default branch
-                      </div>
-                    )}
-                    {block.executed_branch_next_block && (
-                      <div className="text-slate-400">
-                        → Executing next block:{" "}
-                        <span className="font-medium text-slate-300">
-                          {block.executed_branch_next_block}
-                        </span>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-
-          {block.block_type === "human_interaction" && (
-            <WorkflowRunHumanInteraction workflowRunBlock={block} />
+    <div className="min-w-0">
+      <div className="flex min-h-[28px] items-stretch text-xs">
+        <IndentRails depth={depth} />
+        <div
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-1 pr-1.5",
+            "hover:bg-slate-800/60",
+            isActiveBlock && "bg-slate-800",
           )}
-
-          {actions.map((action, index) => {
-            const isActive =
-              isAction(activeItem) && activeItem.action_id === action.action_id;
-            const displayIndex = actions.length - index;
-            if (isViewingV2) {
-              return (
-                <div
-                  key={action.action_id}
-                  onClick={(event) => event.stopPropagation()}
-                >
-                  <ActionCardCompact
-                    action={action}
-                    active={isActive}
-                    index={displayIndex}
-                    expanded={expandedActionId === action.action_id}
-                    onToggleExpanded={() => {
-                      setExpandedActionId((prev) =>
-                        prev === action.action_id ? null : action.action_id,
-                      );
-                    }}
-                    onSelect={() => {
-                      onActionClick({ block, action });
-                    }}
-                    cardClassName={getCardElevation(depth)}
-                  />
-                </div>
-              );
-            }
-            return (
-              <ActionCard
-                key={action.action_id}
-                action={action}
-                active={isActive}
-                index={displayIndex}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  const actionItem: ActionItem = {
-                    block,
-                    action,
-                  };
-                  onActionClick(actionItem);
-                }}
-                cardClassName={getCardElevation(depth)}
+          style={railHighlightStyle}
+        >
+          {isContainer ? (
+            <button
+              type="button"
+              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-slate-400 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+              onClick={(event) => {
+                event.stopPropagation();
+                userToggledRef.current = true;
+                setExpanded((prev) => !prev);
+              }}
+              aria-label={expanded ? "Collapse" : "Expand"}
+              aria-expanded={expanded}
+            >
+              {expanded ? (
+                <ChevronDownIcon className="size-4" />
+              ) : (
+                <ChevronRightIcon className="size-4" />
+              )}
+            </button>
+          ) : (
+            <div className="size-4 shrink-0" />
+          )}
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onBlockItemClick(block);
+            }}
+            aria-pressed={isActiveBlock}
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+          >
+            <StatusDot
+              status={block.status}
+              isFinalized={!!workflowRunIsFinalized}
+            />
+            <span title={blockTypeTitle} className="shrink-0">
+              <WorkflowBlockIcon
+                workflowBlockType={block.block_type}
+                className="size-3.5 text-slate-300"
               />
-            );
-          })}
+            </span>
+            {blockIndex !== undefined && (
+              <span className="w-7 shrink-0 text-[10px] tabular-nums text-slate-500">
+                #{blockIndex}
+              </span>
+            )}
+            <span className="inline-flex min-w-[6rem] max-w-[8rem] shrink-0 justify-center truncate rounded bg-slate-700/70 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+              {blockTypeLabel}
+            </span>
+            <span className="min-w-0 max-w-[12rem] truncate text-slate-200">
+              {blockName}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-slate-500">
+              · {descriptor}
+            </span>
+            {isFinallyBlock && (
+              <span className="shrink-0 rounded bg-amber-500/80 px-1 text-[9px] font-medium text-black">
+                finally
+              </span>
+            )}
+            {hasActions && (
+              <span className="shrink-0 rounded bg-slate-800 px-1 text-[10px] tabular-nums text-slate-400">
+                {actionCount} {actionCount === 1 ? "action" : "actions"}
+              </span>
+            )}
+            {loopCounter && (
+              <span className="shrink-0 rounded bg-slate-700 px-1 text-[10px] tabular-nums text-slate-300">
+                {loopCounter}
+              </span>
+            )}
+            {duration && (
+              <span className="shrink-0 text-[10px] tabular-nums text-slate-500">
+                {duration}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
 
-          {hasNestedChildren && isLoopBlock && (
-            <div className="space-y-2">
-              {loopIterationGroups.map((group, groupIndex) => {
-                const loopValueFromIterable =
-                  group.index !== null
-                    ? (loopValues[group.index] ?? null)
-                    : null;
-                const iterationNumber =
-                  group.index !== null ? group.index + 1 : groupIndex + 1;
-                const currentValueFull = stringifyTimelineValue(
-                  loopValueFromIterable ?? group.currentValue,
-                );
-                const currentValuePreview = truncateValue(
-                  currentValueFull,
-                  140,
-                );
-                const isValueTruncated =
-                  currentValuePreview !==
-                  currentValueFull.replace(/\s+/g, " ").trim();
-
-                return (
-                  <Collapsible
-                    key={`${group.index ?? "unknown"}-${groupIndex}`}
-                    open={openLoopGroups.has(groupIndex)}
-                    onOpenChange={(open) => {
-                      setOpenLoopGroups((prev) => {
-                        const next = new Set(prev);
-                        if (open) {
-                          next.add(groupIndex);
-                        } else {
-                          next.delete(groupIndex);
-                        }
-                        return next;
-                      });
-                    }}
-                  >
-                    <div className="rounded border border-slate-700 bg-slate-elevation4">
-                      <CollapsibleTrigger asChild>
-                        <button
-                          className="group flex w-full items-center justify-between gap-2 px-2 py-1 text-left"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          <div className="flex items-center gap-1.5">
-                            <ChevronRightIcon className="size-4 text-slate-300 transition-transform group-data-[state=open]:rotate-90" />
-                            <span className="text-xs text-slate-200">{`Iteration ${iterationNumber}`}</span>
-                          </div>
-                          {isWhileLoopBlock ? null : isValueTruncated ? (
-                            <TooltipProvider delayDuration={300}>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
-                                    current_value: {currentValuePreview}
-                                  </code>
-                                </TooltipTrigger>
-                                <TooltipContent
-                                  side="top"
-                                  className="max-w-xs break-all font-mono text-[11px]"
-                                >
-                                  {currentValueFull}
-                                </TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                          ) : (
-                            <code className="min-w-0 truncate rounded bg-slate-elevation1 px-1 py-0.5 text-[11px] text-slate-300">
-                              current_value: {currentValuePreview}
-                            </code>
-                          )}
-                        </button>
-                      </CollapsibleTrigger>
-                    </div>
-                    <CollapsibleContent className="min-w-0 px-2 pb-2 pt-2">
-                      <TimelineSubItems
-                        items={group.items}
-                        activeItem={activeItem}
-                        depth={depth + 1}
-                        onActionClick={onActionClick}
-                        onBlockItemClick={onBlockItemClick}
-                        onThoughtCardClick={onThoughtCardClick}
-                        finallyBlockLabel={finallyBlockLabel}
-                        workflowRunIsFinalized={workflowRunIsFinalized}
-                      />
-                    </CollapsibleContent>
-                  </Collapsible>
-                );
-              })}
-            </div>
-          )}
-
-          {hasNestedChildren && isConditionalBlock && (
-            <Collapsible open={childrenOpen} onOpenChange={setChildrenOpen}>
-              <div className="rounded border border-slate-700 bg-slate-elevation4 px-2 py-1.5">
-                <CollapsibleTrigger asChild>
-                  <button
-                    className="flex w-full items-center justify-between gap-2 text-left"
-                    onClick={(event) => event.stopPropagation()}
-                  >
-                    <div className="flex items-center gap-1.5 text-xs text-slate-200">
-                      {childrenOpen ? (
-                        <ChevronDownIcon className="size-4" />
-                      ) : (
-                        <ChevronRightIcon className="size-4" />
-                      )}
-                      <span>{`Executed branch blocks (${subItems.length})`}</span>
-                    </div>
-                    {block.executed_branch_next_block && (
-                      <span className="text-[11px] text-slate-400">
-                        next: {block.executed_branch_next_block}
-                      </span>
-                    )}
-                  </button>
-                </CollapsibleTrigger>
-              </div>
-              <CollapsibleContent className="space-y-2 pt-2">
+      {/* Container body — always mounted so open/close transitions animate */}
+      {isContainer && (
+        <Collapsible open={expanded}>
+          <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
+            {hasActions && (
+              <TimelineActionRows
+                block={block}
+                activeItem={activeItem}
+                depth={depth + 1}
+                onActionClick={onActionClick}
+                workflowRunIsFinalized={workflowRunIsFinalized}
+              />
+            )}
+            {isLoopBlock && loopIterationGroups.length > 0 ? (
+              <LoopIterationRows
+                loopBlock={block}
+                groups={loopIterationGroups}
+                activeItem={activeItem}
+                activeIteration={activeIteration}
+                depth={depth + 1}
+                blockOrder={blockOrder}
+                onBlockItemClick={onBlockItemClick}
+                onIterationClick={onIterationClick}
+                onActionClick={onActionClick}
+                onThoughtClick={onThoughtClick}
+                renderThoughts={renderThoughts}
+                finallyBlockLabel={finallyBlockLabel}
+                workflowRunIsFinalized={workflowRunIsFinalized}
+              />
+            ) : (
+              hasRenderableNestedChildren && (
                 <TimelineSubItems
                   items={subItems}
                   activeItem={activeItem}
+                  activeIteration={activeIteration}
                   depth={depth + 1}
+                  blockOrder={blockOrder}
                   onActionClick={onActionClick}
                   onBlockItemClick={onBlockItemClick}
-                  onThoughtCardClick={onThoughtCardClick}
+                  onIterationClick={onIterationClick}
+                  onThoughtClick={onThoughtClick}
+                  renderThoughts={renderThoughts}
                   finallyBlockLabel={finallyBlockLabel}
                   workflowRunIsFinalized={workflowRunIsFinalized}
                 />
-              </CollapsibleContent>
-            </Collapsible>
-          )}
+              )
+            )}
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </div>
+  );
+}
 
-          {hasNestedChildren && !isLoopBlock && !isConditionalBlock && (
-            <TimelineSubItems
-              items={subItems}
-              activeItem={activeItem}
-              depth={depth + 1}
-              onActionClick={onActionClick}
-              onBlockItemClick={onBlockItemClick}
-              onThoughtCardClick={onThoughtCardClick}
-              finallyBlockLabel={finallyBlockLabel}
-              workflowRunIsFinalized={workflowRunIsFinalized}
-            />
+type LoopIterationRowsProps = {
+  loopBlock: WorkflowRunBlock;
+  groups: Array<LoopIterationGroup>;
+  activeItem: WorkflowRunOverviewActiveElement;
+  activeIteration?: number | null;
+  depth: number;
+  blockOrder?: ReadonlyMap<string, number>;
+  onBlockItemClick: (block: WorkflowRunBlock) => void;
+  onIterationClick?: (
+    loopBlock: WorkflowRunBlock,
+    iterationIndex: number,
+  ) => void;
+  onActionClick: (action: ActionItem) => void;
+  onThoughtClick?: (thought: ObserverThought) => void;
+  renderThoughts?: boolean;
+  finallyBlockLabel?: string | null;
+  workflowRunIsFinalized?: boolean;
+};
+
+function LoopIterationRows({
+  loopBlock,
+  groups,
+  activeItem,
+  activeIteration = null,
+  depth,
+  blockOrder,
+  onBlockItemClick,
+  onIterationClick,
+  onActionClick,
+  onThoughtClick,
+  renderThoughts = false,
+  finallyBlockLabel,
+  workflowRunIsFinalized,
+}: LoopIterationRowsProps) {
+  return (
+    <div>
+      {groups.map((group, groupIndex) => (
+        // Key by group.index alone so existing iteration rows keep their
+        // identity (and useState) when a new iteration arrives at the top
+        // of the DESC-sorted list. Including groupIndex would shift every
+        // existing row's key and remount the whole stack on each update.
+        <LoopIterationRow
+          key={group.index ?? "unknown"}
+          loopBlock={loopBlock}
+          group={group}
+          groupIndex={groupIndex}
+          groupCount={groups.length}
+          activeItem={activeItem}
+          activeIteration={activeIteration}
+          depth={depth}
+          blockOrder={blockOrder}
+          onBlockItemClick={onBlockItemClick}
+          onIterationClick={onIterationClick}
+          onActionClick={onActionClick}
+          onThoughtClick={onThoughtClick}
+          renderThoughts={renderThoughts}
+          finallyBlockLabel={finallyBlockLabel}
+          workflowRunIsFinalized={workflowRunIsFinalized}
+        />
+      ))}
+    </div>
+  );
+}
+
+type LoopIterationRowProps = {
+  loopBlock: WorkflowRunBlock;
+  group: LoopIterationGroup;
+  groupIndex: number;
+  groupCount: number;
+  activeItem: WorkflowRunOverviewActiveElement;
+  activeIteration?: number | null;
+  depth: number;
+  blockOrder?: ReadonlyMap<string, number>;
+  onBlockItemClick: (block: WorkflowRunBlock) => void;
+  onIterationClick?: (
+    loopBlock: WorkflowRunBlock,
+    iterationIndex: number,
+  ) => void;
+  onActionClick: (action: ActionItem) => void;
+  onThoughtClick?: (thought: ObserverThought) => void;
+  renderThoughts?: boolean;
+  finallyBlockLabel?: string | null;
+  workflowRunIsFinalized?: boolean;
+};
+
+function LoopIterationRow({
+  loopBlock,
+  group,
+  groupIndex,
+  groupCount,
+  activeItem,
+  activeIteration = null,
+  depth,
+  blockOrder,
+  onBlockItemClick,
+  onIterationClick,
+  onActionClick,
+  onThoughtClick,
+  renderThoughts = false,
+  finallyBlockLabel,
+  workflowRunIsFinalized,
+}: LoopIterationRowProps) {
+  const hasActiveDescendant = useMemo(
+    () => timelineItemsContainActiveElement(group.items, activeItem),
+    [group.items, activeItem],
+  );
+  const status = useMemo(
+    () => aggregateIterationStatus(group.items),
+    [group.items],
+  );
+
+  // Default open: latest group, running, or has active.
+  const [expanded, setExpanded] = useState(
+    groupIndex === groupCount - 1 ||
+      hasActiveDescendant ||
+      status === Status.Running,
+  );
+  const userToggledRef = useRef(false);
+
+  useEffect(() => {
+    userToggledRef.current = false;
+  }, [loopBlock.workflow_run_block_id, group.index]);
+
+  // Mirror the block-row pattern: auto-expand when status flips to running
+  // or an active descendant appears, unless the user has explicitly
+  // collapsed this row.
+  useEffect(() => {
+    if (userToggledRef.current) return;
+    if (hasActiveDescendant || status === Status.Running) {
+      setExpanded(true);
+    }
+  }, [hasActiveDescendant, status]);
+
+  const iterationIndex = group.index !== null ? group.index : groupIndex;
+  const iterationNumber = iterationIndex + 1;
+  const currentValuePreview = normalizeInlineText(group.currentValue);
+  const isActiveIteration =
+    isWorkflowRunBlock(activeItem) &&
+    activeItem.workflow_run_block_id === loopBlock.workflow_run_block_id &&
+    activeIteration === iterationIndex;
+
+  return (
+    <div className="min-w-0">
+      <div className="flex min-h-[24px] items-stretch text-[11px] text-slate-300">
+        <IndentRails depth={depth} />
+        <div
+          className={cn(
+            "flex min-w-0 flex-1 items-center gap-1.5 rounded-r py-0.5 pr-1.5",
+            "hover:bg-slate-800/60",
+            isActiveIteration && "bg-slate-800",
           )}
+          style={railHighlightStyle}
+        >
+          <button
+            type="button"
+            className="-ml-0.5 size-3.5 shrink-0 rounded text-slate-500 outline-none hover:bg-slate-700 hover:text-slate-200 focus-visible:ring-1 focus-visible:ring-white/40"
+            onClick={(event) => {
+              event.stopPropagation();
+              userToggledRef.current = true;
+              setExpanded((prev) => !prev);
+            }}
+            aria-label={expanded ? "Collapse iteration" : "Expand iteration"}
+            aria-expanded={expanded}
+          >
+            {expanded ? (
+              <ChevronDownIcon className="size-3.5" />
+            ) : (
+              <ChevronRightIcon className="size-3.5" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              if (onIterationClick) {
+                onIterationClick(loopBlock, iterationIndex);
+              } else {
+                setExpanded((prev) => !prev);
+              }
+            }}
+            aria-pressed={isActiveIteration}
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded text-left outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+          >
+            <StatusDot status={status} isFinalized={!!workflowRunIsFinalized} />
+            <span className="shrink-0 text-slate-400">
+              Iteration {iterationNumber}
+            </span>
+            {currentValuePreview && (
+              <span className="min-w-0 flex-1 truncate text-slate-500">
+                · {currentValuePreview}
+              </span>
+            )}
+          </button>
         </div>
       </div>
+      <Collapsible open={expanded}>
+        <CollapsibleContent className="overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up-fade motion-safe:data-[state=open]:animate-collapsible-down-fade">
+          <TimelineSubItems
+            items={group.items}
+            activeItem={activeItem}
+            activeIteration={activeIteration}
+            depth={depth + 1}
+            blockOrder={blockOrder}
+            onActionClick={onActionClick}
+            onBlockItemClick={onBlockItemClick}
+            onIterationClick={onIterationClick}
+            onThoughtClick={onThoughtClick}
+            renderThoughts={renderThoughts}
+            finallyBlockLabel={finallyBlockLabel}
+            workflowRunIsFinalized={workflowRunIsFinalized}
+          />
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   );
 }

@@ -52,10 +52,10 @@ import {
 } from "./types";
 
 const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
-  "Queues new runs of this workflow until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
+  "Queues new runs of this agent until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
 
 const SEQUENTIAL_KEY_TOOLTIP =
-  "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against workflow parameters, for example {{ account_id }} to serialize per account.";
+  "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent parameters, for example {{ account_id }} to serialize per account.";
 
 function WorkflowSettingsEditor({ blockId }: { blockId: string }) {
   // Subscribe to the start node's data slice. The sidebar mount lives
@@ -132,7 +132,7 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label>Model</Label>
-          <HelpTooltip content="The default LLM used for every block in this workflow that doesn't override it." />
+          <HelpTooltip content="The default LLM used for every block in this agent that doesn't override it." />
         </div>
         <ModelSelector
           className="nopan w-52 text-xs"
@@ -143,13 +143,13 @@ function WorkflowSettingsEditorBody({
       <Accordion type="single" collapsible>
         <AccordionItem value="systemPrompt" className="border-b-0">
           <AccordionTrigger className="py-0 text-xs text-slate-300">
-            Workflow System Prompt
+            Agent System Prompt
           </AccordionTrigger>
           <AccordionContent className="pt-2">
             <div className="space-y-2">
               <div className="flex items-center gap-2">
-                <Label>Workflow System Prompt</Label>
-                <HelpTooltip content="Applied to every LLM call in this workflow, including any sub-agents." />
+                <Label>Agent System Prompt</Label>
+                <HelpTooltip content="Applied to every LLM call in this agent, including any sub-agents." />
               </div>
               <WorkflowBlockInputTextarea
                 nodeId={blockId}
@@ -169,7 +169,7 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label>Webhook Callback URL</Label>
-          <HelpTooltip content="The URL of a webhook endpoint to send the workflow results" />
+          <HelpTooltip content="The URL of a webhook endpoint to send the agent results" />
         </div>
         <div className="flex flex-col gap-2">
           <Input
@@ -214,7 +214,7 @@ function WorkflowSettingsEditorBody({
           <div className="flex justify-between">
             <div className="flex items-center gap-2">
               <Label>Run With</Label>
-              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the workflow. To avoid using code, set this to 'Skyvern Agent'." />
+              <HelpTooltip content="If code has been generated and saved from a previously successful run, set this to 'Code' to use that code when executing the agent. To avoid using code, set this to 'Skyvern Agent'." />
             </div>
             <Select
               value={data.runWith || "agent"}
@@ -299,7 +299,7 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Save &amp; Reuse Session</Label>
-          <HelpTooltip content="Persist session information across workflow runs" />
+          <HelpTooltip content="Persist session information across agent runs" />
           <Switch
             className="ml-auto"
             checked={data.persistBrowserSession}
@@ -328,9 +328,9 @@ function WorkflowSettingsEditorBody({
               <DialogHeader>
                 <DialogTitle>Reset saved profile?</DialogTitle>
                 <DialogDescription>
-                  Clears the saved browser profile for this workflow. The next
-                  run will start from a fresh browser state. Use this if the
-                  saved profile is stuck or producing errors.
+                  Clears the saved browser profile for this agent. The next run
+                  will start from a fresh browser state. Use this if the saved
+                  profile is stuck or producing errors.
                 </DialogDescription>
               </DialogHeader>
               <DialogFooter>
@@ -355,7 +355,7 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Default Browser Profile</Label>
-          <HelpTooltip content="The default browser profile used when running this workflow. Can be overridden per run." />
+          <HelpTooltip content="The default browser profile used when running this agent. Can be overridden per run." />
         </div>
         <BrowserProfileSelector
           value={data.browserProfileId}
@@ -410,7 +410,7 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Execute on Any Outcome</Label>
-          <HelpTooltip content="Select a block that will always run after the workflow completes, whether it succeeds, fails, or terminates early. Useful for cleanup tasks like logging out." />
+          <HelpTooltip content="Select a block that will always run after the agent completes, whether it succeeds, fails, or terminates early. Useful for cleanup tasks like logging out." />
         </div>
         <Select
           value={data.finallyBlockLabel ?? "none"}

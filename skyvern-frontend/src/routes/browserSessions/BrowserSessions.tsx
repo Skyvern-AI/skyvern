@@ -59,13 +59,13 @@ function sessionIsOpen(browserSession: BrowserSession): boolean {
 }
 
 const No = () => (
-  <Badge className="flex h-7 w-12 justify-center bg-gray-800 text-orange-50 hover:bg-gray-900">
+  <Badge className="flex h-7 w-12 justify-center border border-neutral-200 bg-neutral-100 text-neutral-600 shadow-none hover:bg-neutral-100 dark:border-white/10 dark:bg-white/[0.06] dark:text-neutral-300 dark:hover:bg-white/[0.08]">
     No
   </Badge>
 );
 
 const Yes = () => (
-  <Badge className="flex h-7 w-12 justify-center bg-green-900 text-green-50 hover:bg-green-900/80">
+  <Badge className="flex h-7 w-12 justify-center border-green-900/20 bg-green-900/10 text-green-800 shadow-none hover:bg-green-900/15 dark:border-transparent dark:bg-green-900 dark:text-green-50 dark:hover:bg-green-900/80">
     Yes
   </Badge>
 );
@@ -185,9 +185,9 @@ function BrowserSessions() {
           <GlobeIcon className="size-6" />
           <h1 className="text-2xl">Browsers</h1>
         </div>
-        <p className="text-slate-300">
-          Create your own live browsers to interact with websites, or run
-          workflows in.
+        <p className="text-sm leading-6 text-neutral-600 dark:text-neutral-400">
+          Create your own live browsers to interact with websites, or run agents
+          in.
         </p>
       </div>
 
@@ -224,7 +224,7 @@ function BrowserSessions() {
                   <span className="mr-2">Occupied</span>
                   <HelpTooltip
                     className="inline"
-                    content="Browser is busy running a task or workflow"
+                    content="Browser is busy running a task or agent"
                   />
                 </TableHead>
                 <TableHead className="w-1/6 truncate text-slate-400">
@@ -381,7 +381,7 @@ function BrowserSessions() {
             <DrawerTitle>Create Browser Session</DrawerTitle>
             <DrawerDescription>
               Create a new browser session to interact with websites, or run
-              workflows in.
+              agents in.
               <div className="mt-8 flex flex-col gap-4">
                 <div className="space-y-2">
                   <div className="flex gap-2">

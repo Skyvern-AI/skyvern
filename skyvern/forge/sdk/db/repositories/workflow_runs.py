@@ -154,6 +154,7 @@ class WorkflowRunsRepository(BaseRepository):
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        max_elapsed_time_minutes: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
@@ -185,6 +186,7 @@ class WorkflowRunsRepository(BaseRepository):
                 totp_identifier=totp_identifier,
                 parent_workflow_run_id=parent_workflow_run_id,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
                 extra_http_headers=extra_http_headers,
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
@@ -966,6 +968,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        exclude_child_runs: bool = False,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -980,6 +983,8 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            if exclude_child_runs:
+                query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
             query = self._apply_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
             if status:

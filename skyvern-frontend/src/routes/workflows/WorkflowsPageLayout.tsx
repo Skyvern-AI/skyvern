@@ -4,10 +4,21 @@ import { Outlet, useMatch, useSearchParams } from "react-router-dom";
 function WorkflowsPageLayout() {
   const [searchParams] = useSearchParams();
   const embed = searchParams.get("embed");
+  const workflowEditMatch = useMatch("/workflows/:workflowPermanentId/edit");
+  const workflowBuildMatch = useMatch("/workflows/:workflowPermanentId/build");
+  const workflowBlockBuildMatch = useMatch(
+    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/build",
+  );
+  const workflowDebugMatch = useMatch("/workflows/:workflowPermanentId/debug");
+  const workflowBlockDebugMatch = useMatch(
+    "/workflows/:workflowPermanentId/:workflowRunId/:blockLabel/debug",
+  );
   const match =
-    useMatch("/workflows/:workflowPermanentId/edit") ||
-    location.pathname.includes("build") ||
-    location.pathname.includes("debug") ||
+    workflowEditMatch ||
+    workflowBuildMatch ||
+    workflowBlockBuildMatch ||
+    workflowDebugMatch ||
+    workflowBlockDebugMatch ||
     embed === "true";
   return (
     <main

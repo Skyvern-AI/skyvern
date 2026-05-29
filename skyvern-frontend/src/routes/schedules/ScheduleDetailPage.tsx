@@ -276,7 +276,7 @@ function ScheduleDetailPage() {
                 onClick={startEditing}
                 disabled={!workflowLoaded}
                 title={
-                  workflowLoaded ? undefined : "Loading workflow definition..."
+                  workflowLoaded ? undefined : "Loading agent definition..."
                 }
               >
                 <Pencil1Icon className="size-3" />
@@ -496,9 +496,7 @@ function ScheduleDetailPage() {
 
           {hasUserFacingParameters(workflowParameters) && (
             <div className="rounded-lg border border-slate-700 p-4">
-              <h3 className="mb-4 text-sm text-slate-400">
-                Workflow Parameters
-              </h3>
+              <h3 className="mb-4 text-sm text-slate-400">Agent Parameters</h3>
               <div className="space-y-2">
                 {workflowParameters
                   .filter(isScheduleParameter)

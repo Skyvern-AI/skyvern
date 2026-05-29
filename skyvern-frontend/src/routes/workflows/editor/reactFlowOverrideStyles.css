@@ -78,8 +78,70 @@
 }
 
 .react-flow__attribution {
-  background-color: rgb(2 6 23);
-  color: white;
+  background-color: hsl(var(--background));
+  border: 1px solid hsl(var(--border));
+  border-radius: 4px;
+  color: hsl(var(--muted-foreground));
+}
+
+/* TooltipTrigger wraps each ControlButton in a <div> that defaults to
+   display:block. Without flex, the div's hit area can diverge from the
+   button's visual bounds — the clickable region shifts upward and overlaps
+   the preceding button's tooltip zone. */
+.react-flow__controls > div {
+  display: flex;
+}
+
+.dark .react-flow__attribution {
+  background-color: hsl(var(--slate-elevation-2));
+  color: hsl(var(--foreground));
+}
+
+html:not(.dark) .workflow-editor-shell .text-slate-300 {
+  color: rgb(51 65 85);
+}
+
+html:not(.dark) .workflow-editor-shell .text-slate-400 {
+  color: rgb(71 85 105);
+}
+
+html:not(.dark)
+  .workflow-editor-shell
+  :is(
+    .bg-slate-800,
+    .bg-slate-800\/50,
+    .bg-slate-900\/30,
+    .bg-slate-900\/40
+  ):not(.workflow-editor-tip)
+  .text-slate-300 {
+  color: rgb(203 213 225);
+}
+
+html:not(.dark)
+  .workflow-editor-shell
+  :is(
+    .bg-slate-800,
+    .bg-slate-800\/50,
+    .bg-slate-900\/30,
+    .bg-slate-900\/40
+  ):not(.workflow-editor-tip)
+  .text-slate-400 {
+  color: rgb(148 163 184);
+}
+
+html:not(.dark) .workflow-editor-shell .workflow-editor-tip {
+  background-color: rgb(248 250 252);
+  border: 1px solid rgb(226 232 240);
+  color: rgb(71 85 105);
+}
+
+html:not(.dark) .workflow-editor-shell .workflow-editor-tip-icon {
+  background-color: rgb(226 232 240);
+  color: rgb(51 65 85);
+}
+
+html:not(.dark) .workflow-editor-shell .workflow-editor-tip code {
+  color: rgb(15 23 42);
 }
 
 /* Restore xyflow's between-button divider when a ControlButton is wrapped in a
@@ -105,7 +167,7 @@
    to --muted instead of xyflow's near-white default. */
 .react-flow__controls .react-flow__controls-button {
   --xy-controls-button-background-color: hsl(var(--slate-elevation-3));
-  --xy-controls-button-color: theme("colors.slate.400");
+  --xy-controls-button-color: hsl(var(--muted-foreground));
   --xy-controls-button-background-color-hover: hsl(var(--muted));
-  --xy-controls-button-color-hover: theme("colors.slate.200");
+  --xy-controls-button-color-hover: hsl(var(--foreground));
 }

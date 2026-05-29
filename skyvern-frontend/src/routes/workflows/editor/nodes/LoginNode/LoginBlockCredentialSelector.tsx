@@ -205,17 +205,22 @@ function LoginBlockCredentialSelector({
     (option) => option.type === "parameter" && option.value === value,
   );
 
+  // Always pass a defined string so Radix Select stays controlled; uncontrolled
+  // mode caches the picked value and silently skips re-firing onValueChange.
+  let selectValue: string;
+  if (isCredentialMissing) {
+    selectValue = "";
+  } else if (valueIsParameterOption) {
+    selectValue = value ?? "";
+  } else {
+    selectValue = selectedCredentialId ?? value ?? "";
+  }
+
   return (
     <>
       <Select
         key={value ?? "no-credential"}
-        value={
-          isCredentialMissing
-            ? undefined
-            : valueIsParameterOption
-              ? value
-              : (selectedCredentialId ?? value)
-        }
+        value={selectValue}
         onValueChange={(newValue) => {
           if (newValue === "new") {
             setIsOpen(true);

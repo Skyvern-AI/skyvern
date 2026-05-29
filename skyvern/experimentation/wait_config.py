@@ -26,6 +26,7 @@ WAIT_VARIANTS = {
         "empty_page_retry_wait": 3.0,
         "mouse_movement_delay_min": 0.2,
         "mouse_movement_delay_max": 0.3,
+        "inter_action_delay": 0.5,
     },
     "moderate": {
         "post_click_delay": 0.15,
@@ -36,6 +37,7 @@ WAIT_VARIANTS = {
         "empty_page_retry_wait": 2.0,
         "mouse_movement_delay_min": 0.1,
         "mouse_movement_delay_max": 0.15,
+        "inter_action_delay": 0.1,
     },
     "aggressive": {
         "post_click_delay": 0.05,
@@ -46,6 +48,7 @@ WAIT_VARIANTS = {
         "empty_page_retry_wait": 1.0,
         "mouse_movement_delay_min": 0.05,
         "mouse_movement_delay_max": 0.1,
+        "inter_action_delay": 0.0,
     },
 }
 

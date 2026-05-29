@@ -31,13 +31,13 @@ export type HumanInteractionNode = Node<
 
 export const humanInteractionNodeDefaultData: HumanInteractionNodeData = {
   debuggable: debuggableWorkflowBlockTypes.has("human_interaction"),
-  instructions: "Please review and approve or reject to continue the workflow.",
+  instructions: "Please review and approve or reject to continue the agent.",
   positiveDescriptor: "Approve",
   negativeDescriptor: "Reject",
   timeoutSeconds: 60 * 60 * 2, // two hours
   recipients: "",
-  subject: "Human interaction required for workflow run",
-  body: "Your interaction is required for a workflow run!",
+  subject: "Human interaction required for agent run",
+  body: "Your interaction is required for an agent run!",
   editable: true,
   label: "",
   sender: EMAIL_BLOCK_SENDER,

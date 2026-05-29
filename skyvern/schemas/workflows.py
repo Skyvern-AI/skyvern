@@ -11,6 +11,10 @@ from skyvern.config import settings
 from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
+from skyvern.forge.sdk.workflow.models.run_limits import (
+    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    reject_bool_max_elapsed_time_minutes,
+)
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
 from skyvern.schemas.runs import GeoTarget, ProxyLocation, RunEngine
 from skyvern.utils.secret_headers import mask_header_values
@@ -437,6 +441,20 @@ class BlockType(StrEnum):
     WORKFLOW_TRIGGER = "workflow_trigger"
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
+
+
+class AIFallbackMode(StrEnum):
+    """Controls how an action block uses a CSS/XPath selector relative to AI.
+
+    - `fallback`: attempt the selector first; fall back to AI on failure.
+    - `proactive`: always use AI; the selector (if any) is a hint only.
+
+    When `selector` is None, both modes degrade to AI-only — the difference
+    is purely semantic (whether the author expected to have a selector here).
+    """
+
+    FALLBACK = "fallback"
+    PROACTIVE = "proactive"
 
 
 class BlockStatus(StrEnum):
@@ -918,6 +936,8 @@ class ActionBlockYAML(BlockYAML):
     title: str = ""
     engine: RunEngine = RunEngine.skyvern_v1
     navigation_goal: str | None = None
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
     error_code_mapping: dict[str, str] | None = None
     max_retries: int = 0
     parameter_keys: list[str] | None = None
@@ -1198,6 +1218,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     max_screenshot_scrolls: int | None = None
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published
@@ -1210,6 +1231,11 @@ class WorkflowCreateYAMLRequest(BaseModel):
     run_sequentially: bool = Field(default=False, title="Prevent Overlapping Runs")
     sequential_key: str | None = None
     folder_id: str | None = None
+
+    @field_validator("max_elapsed_time_minutes", mode="before")
+    @classmethod
+    def validate_max_elapsed_time_minutes(cls, value: object) -> object:
+        return reject_bool_max_elapsed_time_minutes(value)
 
     @field_validator("run_with", mode="before")
     @classmethod

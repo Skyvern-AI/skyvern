@@ -125,7 +125,7 @@ function CreateScheduleDialog({
         <DialogHeader>
           <DialogTitle>Create Schedule</DialogTitle>
           <DialogDescription>
-            Configure when this workflow should run automatically.
+            Configure when this agent should run automatically.
           </DialogDescription>
         </DialogHeader>
 

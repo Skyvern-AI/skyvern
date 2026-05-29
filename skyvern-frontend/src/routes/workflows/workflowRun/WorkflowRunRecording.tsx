@@ -31,7 +31,7 @@ function WorkflowRunRecording() {
         </div>
       );
     }
-    return <div>No recording available for this workflow</div>;
+    return <div>No recording available for this agent</div>;
   }
 
   const run = workflowRun;

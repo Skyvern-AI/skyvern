@@ -17,7 +17,7 @@ from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
+from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -124,6 +124,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import (
+    AIFallbackMode,
     BlockResult,
     BlockStatus,
     BlockType,
@@ -140,9 +141,6 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
-
-if TYPE_CHECKING:
-    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 
 
 # SKY-8818: observability threshold for under-configured file_download blocks.
@@ -438,13 +436,6 @@ class Block(BaseModel, abc.ABC):
             is_synthetic_loop_failure=is_synthetic_loop_failure,
         )
 
-    def allow_content_blocking_extensions_for_browser_launch(
-        self, workflow: Workflow | WorkflowDefinition | None = None
-    ) -> bool:
-        if workflow is not None:
-            return workflow.allow_content_blocking_extensions_for_browser_launch()
-        return self.block_type != BlockType.LOGIN
-
     async def get_or_create_browser_state(
         self,
         workflow_run_id: str,
@@ -472,36 +463,11 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
             try:
-                workflow_run_context = self.get_workflow_run_context(workflow_run_id)
-                workflow = workflow_run_context.workflow
-                if workflow is None:
-                    LOG.warning(
-                        "Workflow missing from context while resolving browser launch extension policy; fetching workflow",
-                        workflow_run_id=workflow_run_id,
-                        workflow_id=workflow_run.workflow_id,
-                        organization_id=workflow_run.organization_id,
-                    )
-                    workflow = await app.WORKFLOW_SERVICE.get_workflow(
-                        workflow_id=workflow_run.workflow_id,
-                        organization_id=workflow_run.organization_id,
-                    )
-                    workflow_run_context.set_workflow(workflow)
-                if workflow is None:
-                    LOG.warning(
-                        "Workflow unavailable while resolving browser launch extension policy; using block-level fallback",
-                        workflow_run_id=workflow_run_id,
-                        workflow_id=workflow_run.workflow_id,
-                        organization_id=workflow_run.organization_id,
-                        block_type=self.block_type,
-                    )
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
                     url=None,
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
-                    allow_content_blocking_extensions=self.allow_content_blocking_extensions_for_browser_launch(
-                        workflow=workflow
-                    ),
                 )
                 await browser_state.check_and_fix_state(
                     url=None,
@@ -1204,9 +1170,6 @@ class BaseTaskBlock(Block):
                         url=_bm_url,
                         browser_session_id=browser_session_id,
                         browser_profile_id=workflow_run.browser_profile_id,
-                        allow_content_blocking_extensions=self.allow_content_blocking_extensions_for_browser_launch(
-                            workflow=workflow
-                        ),
                     )
                     working_page = await browser_state.get_working_page()
                     if not working_page:
@@ -5823,6 +5786,9 @@ class ActionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
 
 
 class NavigationBlock(BaseTaskBlock):

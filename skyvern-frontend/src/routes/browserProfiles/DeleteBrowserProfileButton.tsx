@@ -50,10 +50,10 @@ function DeleteBrowserProfileButton({ profile, onDeleted }: Props) {
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
         </DialogHeader>
-        <div className="text-sm text-slate-400">
+        <div className="text-sm text-neutral-600 dark:text-slate-400">
           The browser profile{" "}
           <span className="font-bold text-primary">{profile.name}</span> will be
-          deleted. Workflows referencing this profile will no longer find it.
+          deleted. Agents referencing this profile will no longer find it.
         </div>
         <DialogFooter>
           <DialogClose asChild>

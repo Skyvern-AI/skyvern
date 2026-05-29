@@ -48,7 +48,6 @@ def _patch_clean_up_deps(monkeypatch: pytest.MonkeyPatch, browser_state: MagicMo
     monkeypatch.setattr(app.STORAGE, "save_downloaded_files", AsyncMock())
     monkeypatch.setattr(app.BROWSER_MANAGER, "cleanup_for_workflow_run", AsyncMock(return_value=browser_state))
     monkeypatch.setattr(app.ARTIFACT_MANAGER, "wait_for_upload_aiotasks", AsyncMock())
-    monkeypatch.setattr(app.AGENT_FUNCTION, "release_proxy_session_for_owner", AsyncMock())
     monkeypatch.setattr(
         app.DATABASE.workflow_runs,
         "get_workflow_runs_by_parent_workflow_run_id",
