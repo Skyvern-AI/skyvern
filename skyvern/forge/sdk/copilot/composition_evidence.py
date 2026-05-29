@@ -17,6 +17,9 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 _BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
 _PAGE_SHAPING_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "login"})
+_PAGE_READING_BLOCK_TYPES: frozenset[str] = frozenset({"extraction"})
+_SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
+_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition"})
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
@@ -39,6 +42,7 @@ _ANTI_BOT_PATTERNS = (
 )
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
+_ANTI_BOT_SCAN_BYTES = 250_000
 
 
 def _bounded_string(value: Any, max_chars: int) -> str:
@@ -235,6 +239,27 @@ def workflow_target_url(workflow_yaml: str | None) -> str | None:
     return None
 
 
+def _workflow_target_url_for_new_page_block(
+    workflow_yaml: str | None, previous_workflow_yaml: str | None
+) -> str | None:
+    previous = {
+        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
+        for block in _parse_workflow_blocks(previous_workflow_yaml)
+    }
+    last_url: str | None = None
+    for block in _parse_workflow_blocks(workflow_yaml):
+        url = block.get("url")
+        if isinstance(url, str) and url.strip():
+            last_url = url.strip()
+        block_type = str(block.get("block_type") or "").strip().lower()
+        if block_type not in _PAGE_SHAPING_BLOCK_TYPES | _PAGE_READING_BLOCK_TYPES:
+            continue
+        label = str(block.get("label") or "")
+        if (label, block_type) not in previous:
+            return last_url
+    return workflow_target_url(workflow_yaml)
+
+
 def _mode_requires_evidence(ctx: Any) -> bool:
     mode_value = getattr(getattr(getattr(ctx, "turn_intent", None), "mode", None), "value", None)
     phase = getattr(ctx, "build_phase", None)
@@ -266,7 +291,24 @@ def _new_page_shaping_blocks(workflow_yaml: str | None, previous_workflow_yaml: 
     return blocks
 
 
-def _format_page_shaping_findings(blocks: list[dict[str, str]]) -> str:
+def _new_page_reading_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
+    previous = {
+        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
+        for block in _parse_workflow_blocks(previous_workflow_yaml)
+    }
+    blocks: list[dict[str, str]] = []
+    for block in _parse_workflow_blocks(workflow_yaml):
+        block_type = str(block.get("block_type") or "").strip().lower()
+        if block_type not in _PAGE_READING_BLOCK_TYPES:
+            continue
+        label = str(block.get("label") or "<missing label>")
+        if (label, block_type) in previous:
+            continue
+        blocks.append({"label": label, "block_type": block_type})
+    return blocks
+
+
+def _format_page_block_findings(blocks: list[dict[str, str]]) -> str:
     return ", ".join(f"{block['label']} ({block['block_type']})" for block in blocks[:5])
 
 
@@ -300,17 +342,29 @@ def _same_origin(left: str | None, right: str | None) -> bool:
     return left_parsed.netloc.lower() == right_parsed.netloc.lower()
 
 
-def _evidence_matches_target(evidence: dict[str, Any] | None, target_url: str | None) -> bool:
+def _evidence_matches_target(
+    evidence: dict[str, Any] | None,
+    target_url: str | None,
+    *,
+    allow_post_run_browser_observation: bool = False,
+) -> bool:
     if not evidence or not target_url:
         return False
-    if evidence.get("source_tool") != "inspect_page_for_composition":
-        return False
+    source_tool = evidence.get("source_tool")
     current_url = evidence.get("current_url")
     inspected_url = evidence.get("inspected_url")
-    return _same_page(current_url if isinstance(current_url, str) else None, target_url) or _same_page(
-        inspected_url if isinstance(inspected_url, str) else None,
-        target_url,
-    )
+    current_url = current_url if isinstance(current_url, str) else None
+    inspected_url = inspected_url if isinstance(inspected_url, str) else None
+    if source_tool == _SCHEMA_EVIDENCE_TOOL:
+        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+            return True
+    if (
+        allow_post_run_browser_observation
+        and source_tool in _POST_RUN_CONTINUATION_EVIDENCE_TOOLS
+        and evidence.get("observed_after_workflow_run") is True
+    ):
+        return _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
+    return False
 
 
 def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
@@ -324,21 +378,33 @@ def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str 
 
     if not _mode_requires_evidence(ctx):
         return None
-    page_shaping_blocks = _new_page_shaping_blocks(workflow_yaml, getattr(ctx, "workflow_yaml", None))
-    if not page_shaping_blocks:
+    previous_workflow_yaml = getattr(ctx, "workflow_yaml", None)
+    page_shaping_blocks = _new_page_shaping_blocks(workflow_yaml, previous_workflow_yaml)
+    page_reading_blocks = _new_page_reading_blocks(workflow_yaml, previous_workflow_yaml)
+    if not page_shaping_blocks and not page_reading_blocks:
         return None
 
-    target_url = workflow_target_url(workflow_yaml)
+    target_url = _workflow_target_url_for_new_page_block(workflow_yaml, previous_workflow_yaml)
     evidence = getattr(ctx, "composition_page_evidence", None)
-    if _evidence_matches_target(evidence, target_url):
-        return None
-    offending = _format_page_shaping_findings(page_shaping_blocks)
-    return (
-        "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
-        f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing navigation/login "
-        "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
-        f"Offending blocks: {offending}"
-    )
+    allow_post_run_browser_observation = bool(previous_workflow_yaml)
+    if not _evidence_matches_target(
+        evidence,
+        target_url,
+        allow_post_run_browser_observation=allow_post_run_browser_observation,
+    ):
+        offending = _format_page_block_findings(page_shaping_blocks + page_reading_blocks)
+        return (
+            "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
+            f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
+            "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
+            f"Offending blocks: {offending}"
+        )
+
+    # Matched page evidence may ground a multi-block mutation. This gate enforces
+    # inspection before page-dependent composition; it does not prescribe a
+    # one-block-per-observation workflow construction style.
+
+    return None
 
 
 def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
@@ -506,7 +572,11 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
     tag_name = str(getattr(node, "name", "") or "").lower()
     node_id = str(node.get("id") or "")
     selector = _selector_for(node)[:160]
-    entry: dict[str, Any] = {"tag": tag_name, "id": node_id[:120], "selector": selector}
+    entry: dict[str, Any] = {
+        "tag": tag_name,
+        "id": node_id[:120],
+        "selector": selector,
+    }
     if tag_name == "table":
         entry["row_selector"] = f"{selector} tbody tr"
         entry["expand_toggle_candidates"] = [
@@ -519,58 +589,60 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
     return entry
 
 
-def _challenge_identity(node: Any) -> str:
-    parts = [
-        str(getattr(node, "name", "") or ""),
-        _attr_value(node, "id"),
-        _attr_value(node, "name"),
-        " ".join(_classes_for(node)),
-        _attr_value(node, "src"),
-        # Standard anti-bot widgets commonly expose this attribute.
-        _attr_value(node, "data-sitekey"),
-        _attr_value(node, "aria-label"),
-        _attr_value(node, "title"),
-    ]
-    return " ".join(part for part in parts if part).lower()
-
-
-def _challenge_entry(node: Any) -> dict[str, Any]:
-    return {
-        "tag": str(getattr(node, "name", "") or "")[:40],
+def _challenge_control_entry(node: Any) -> dict[str, Any]:
+    tag_name = str(getattr(node, "name", "") or "").lower()
+    entry: dict[str, Any] = {
+        "tag": tag_name,
         "id": _attr_value(node, "id")[:120],
         "name": _attr_value(node, "name")[:120],
         "class": " ".join(_classes_for(node)[:5])[:160],
         "type": _attr_value(node, "type")[:40],
         "selector": _selector_for(node)[:160],
+        "text": _schema_text(_node_text(node) or _attr_value(node, "aria-label"), 200),
     }
+    for key in ("src", "title", "data-sitekey", "data-callback", "data-expired-callback", "data-error-callback"):
+        value = _attr_value(node, key)
+        if value:
+            entry[key.replace("-", "_")] = value[:300]
+    return {key: value for key, value in entry.items() if value}
 
 
-def _anti_bot_evidence(nodes: list[Any], html: str) -> tuple[list[str], list[dict[str, Any]]]:
-    indicators: list[str] = []
+def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    seen_selectors: set[str] = set()
+    for node in soup.find_all(True):
+        if len(controls) >= _MAX_CHALLENGE_CONTROLS:
+            break
+        identity = " ".join(
+            str(value or "")
+            for value in (
+                getattr(node, "name", ""),
+                _attr_value(node, "id"),
+                _attr_value(node, "name"),
+                _attr_value(node, "class"),
+                _attr_value(node, "src"),
+                _attr_value(node, "type"),
+                _attr_value(node, "data-sitekey"),
+                _attr_value(node, "data-callback"),
+                _attr_value(node, "data-expired-callback"),
+                _attr_value(node, "data-error-callback"),
+                _attr_value(node, "aria-label"),
+                _attr_value(node, "title"),
+            )
+        ).lower()
+        if not any(pattern in identity for pattern in _ANTI_BOT_PATTERNS):
+            continue
+        selector = _selector_for(node)[:160]
+        if selector in seen_selectors:
+            continue
+        seen_selectors.add(selector)
+        controls.append(_challenge_control_entry(node))
+    return controls
 
-    def add_indicator(value: str) -> None:
-        if value not in indicators:
-            indicators.append(value)
 
-    html_prefix = (html or "").lower()[:4096]
-    for pattern in _ANTI_BOT_PATTERNS:
-        if pattern in html_prefix:
-            add_indicator(pattern)
-
-    challenge_controls: list[dict[str, Any]] = []
-    for node in nodes:
-        identity = _challenge_identity(node)
-        matched = False
-        for pattern in _ANTI_BOT_PATTERNS:
-            if pattern in identity:
-                add_indicator(pattern)
-                matched = True
-        tag_name = str(getattr(node, "name", "") or "").lower()
-        if matched and tag_name in {"div", "iframe", "input", "button", "textarea"}:
-            if len(challenge_controls) < _MAX_CHALLENGE_CONTROLS:
-                challenge_controls.append(_challenge_entry(node))
-
-    return indicators[:8], challenge_controls
+def _anti_bot_indicators(html: str, page_title: str) -> list[str]:
+    haystack = f"{page_title}\n{html[:_ANTI_BOT_SCAN_BYTES]}".lower()
+    return [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in haystack]
 
 
 def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -> dict[str, Any]:
@@ -582,6 +654,12 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         soup = BeautifulSoup(html or "", "html.parser")
     except Exception:
         return _empty_evidence(inspected_url, current_url)
+    page_title = _page_title(soup)
+    challenge_controls = _challenge_controls(soup)
+    anti_bot_indicators = _anti_bot_indicators(html or "", page_title)
+
+    for node in soup.find_all(["script", "style", "noscript"]):
+        node.decompose()
 
     all_nodes = soup.find_all(True)
 
@@ -674,11 +752,10 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
     control_count = sum(len(form.get("submit_controls") or []) for form in forms)
     # Higher confidence means the parser saw a more complete form surface.
     confidence = 0.85 if field_count and control_count else 0.6 if field_count else 0.3 if forms else 0.1
-    anti_bot_indicators, challenge_controls = _anti_bot_evidence(all_nodes, html)
     return {
         "inspected_url": inspected_url,
         "current_url": current_url,
-        "page_title": _page_title(soup),
+        "page_title": page_title,
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
