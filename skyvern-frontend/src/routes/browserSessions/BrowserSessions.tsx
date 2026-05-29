@@ -65,7 +65,7 @@ const No = () => (
 );
 
 const Yes = () => (
-  <Badge className="flex h-7 w-12 justify-center border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-none hover:bg-emerald-50 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-300 dark:hover:bg-emerald-500/15">
+  <Badge className="flex h-7 w-12 justify-center border-green-900/20 bg-green-900/10 text-green-800 shadow-none hover:bg-green-900/15 dark:border-transparent dark:bg-green-900 dark:text-green-50 dark:hover:bg-green-900/80">
     Yes
   </Badge>
 );
