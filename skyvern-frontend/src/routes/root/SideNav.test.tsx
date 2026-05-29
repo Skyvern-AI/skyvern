@@ -170,4 +170,24 @@ describe("SideNav", () => {
     ).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Agents" })).toBeTruthy();
   });
+
+  it("uses the n8n logo in the collapsed integrations popout", async () => {
+    useSidebarStore.setState({ collapsed: true });
+
+    render(
+      <MemoryRouter>
+        <SideNav />
+      </MemoryRouter>,
+    );
+
+    fireEvent.pointerDown(screen.getByTitle("Integrations"), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    const n8nMenuItem = await screen.findByRole("menuitem", { name: "n8n" });
+    expect(
+      n8nMenuItem.querySelector('svg[viewBox="0 0 304 160"]'),
+    ).toBeTruthy();
+  });
 });
