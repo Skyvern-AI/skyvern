@@ -47,6 +47,7 @@ export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
   created_at: string;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
@@ -114,6 +115,10 @@ export interface WorkflowCopilotTurnStartUpdate {
   turn_index: number;
   mode: string;
   timestamp: string;
+  // Block count of the canonical workflow at turn entry. Drives the FE's
+  // edit-vs-build chip; the snap-back source is captured client-side at
+  // submit time so unsaved local canvas edits survive.
+  prior_block_count?: number | null;
 }
 
 export interface WorkflowCopilotDesignStartUpdate {
@@ -135,6 +140,7 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
   block_labels: string[];
   summary: string | null;
   timestamp: string;
+  workflow?: WorkflowApiResponse | null;
 }
 
 export interface WorkflowCopilotToolCallUpdate {
