@@ -123,6 +123,8 @@
     "vitest": {
       "vite": "^7.3.2"
     },
-    "@types/node": "$@types/node"
+    "@types/node": "$@types/node",
+    "protobufjs": ">=7.5.8",
+    "qs": ">=6.15.2"
   }
 }
