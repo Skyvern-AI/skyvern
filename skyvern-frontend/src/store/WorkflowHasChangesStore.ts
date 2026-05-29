@@ -183,6 +183,8 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         browser_profile_id: saveData.settings.browserProfileId,
         model: saveData.settings.model,
         max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+        max_elapsed_time_minutes:
+          saveData.settings.maxElapsedTimeMinutes ?? null,
         totp_verification_url: saveData.workflow.totp_verification_url,
         extra_http_headers: extraHttpHeaders,
         cdp_connect_headers: cdpConnectHeaders,
