@@ -860,6 +860,63 @@
         }
       }
     },
+    "/v1/workflows/{workflow_permanent_id}/browser_session/refresh": {
+      "post": {
+        "tags": [
+          "Workflows"
+        ],
+        "summary": "Refresh persisted browser session",
+        "description": "Clear the persisted browser session for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved session is corrupted.",
+        "operationId": "refresh_workflow_browser_session_v1_workflows__workflow_permanent_id__browser_session_refresh_post",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The permanent ID of the workflow. Starts with `wpid_`.",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "The permanent ID of the workflow. Starts with `wpid_`."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successfully cleared persisted browser session"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to clear the persisted browser session. Please retry the refresh operation."
+          }
+        }
+      }
+    },
     "/v1/artifacts/{artifact_id}": {
       "get": {
         "tags": [
