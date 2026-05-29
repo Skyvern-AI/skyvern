@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skyvern.forge.sdk.db._error_handling import db_operation, register_passthrough_exception
@@ -137,20 +138,27 @@ class TagsRepository(BaseRepository):
             await session.flush()
 
             # Auto-register TagKeyModel rows only for keys whose SET actually
-            # wrote a new event — idempotent no-op SETs don't need to re-touch
-            # the registry. Partial UNIQUE on (org, key) WHERE deleted_at IS
-            # NULL races concurrent first-use writers; the loser surfaces
-            # IntegrityError to the caller.
+            # wrote a new event. The partial UNIQUE on (org, key) WHERE
+            # deleted_at IS NULL races concurrent first-use writers, so we use
+            # an INSERT ... ON CONFLICT DO NOTHING to swallow the race instead
+            # of letting it surface as a 5xx. postgresql and sqlite need their
+            # own insert() construct to compile ON CONFLICT, but share the
+            # on_conflict_do_nothing signature. Both require index_where to
+            # match the partial unique index or ON CONFLICT inference fails.
             changed_set_keys = {c.key for c in changes if c.event_type == TagEventType.SET}
             if changed_set_keys:
-                existing_keys_stmt = select(TagKeyModel.key).where(
-                    TagKeyModel.organization_id == organization_id,
-                    TagKeyModel.key.in_(changed_set_keys),
-                    TagKeyModel.deleted_at.is_(None),
+                rows = [{"organization_id": organization_id, "key": key} for key in changed_set_keys]
+                dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+                insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
+                insert_stmt = (
+                    insert(TagKeyModel.__table__)
+                    .values(rows)
+                    .on_conflict_do_nothing(
+                        index_elements=["organization_id", "key"],
+                        index_where=text("deleted_at IS NULL"),
+                    )
                 )
-                existing_keys = set((await session.execute(existing_keys_stmt)).scalars().all())
-                for key in changed_set_keys - existing_keys:
-                    session.add(TagKeyModel(organization_id=organization_id, key=key))
+                await session.execute(insert_stmt)
 
             await session.commit()
             return changes
@@ -203,12 +211,31 @@ class TagsRepository(BaseRepository):
                 result[key] = row.value
             return result
 
+    @db_operation("get_active_tag_events_for_workflow")
+    async def get_active_tag_events_for_workflow(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str,
+    ) -> list[WorkflowTagEventModel]:
+        """Active SET event rows for a workflow. Carries full attribution
+        (source/set_at/set_by) so callers can surface per-tag provenance —
+        ``get_active_tags_for_workflow`` returns just key→value."""
+        async with self.Session() as session:
+            rows = await self._get_current_active_set_events(
+                session,
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+            )
+            return list(rows.values())
+
     @db_operation("get_tag_event_history")
     async def get_tag_event_history(
         self,
         workflow_permanent_id: str,
         organization_id: str,
         limit: int = 100,
+        since: datetime | None = None,
+        key: str | None = None,
     ) -> list[WorkflowTagEventModel]:
         """Return tag events newest-first for a workflow. Includes DELETE and superseded SET rows."""
         async with self.Session() as session:
@@ -217,8 +244,100 @@ class TagsRepository(BaseRepository):
                 .where(WorkflowTagEventModel.organization_id == organization_id)
                 .where(WorkflowTagEventModel.workflow_permanent_id == workflow_permanent_id)
                 .where(WorkflowTagEventModel.deleted_at.is_(None))
-                .order_by(WorkflowTagEventModel.set_at.desc(), WorkflowTagEventModel.tag_event_id.desc())
-                .limit(limit)
+            )
+            if since is not None:
+                stmt = stmt.where(WorkflowTagEventModel.set_at >= since)
+            if key is not None:
+                stmt = stmt.where(WorkflowTagEventModel.key == key)
+            stmt = stmt.order_by(WorkflowTagEventModel.set_at.desc(), WorkflowTagEventModel.tag_event_id.desc()).limit(
+                limit
             )
             result = await session.execute(stmt)
             return list(result.scalars().all())
+
+    @db_operation("get_active_tags_for_workflows")
+    async def get_active_tags_for_workflows(
+        self,
+        workflow_permanent_ids: list[str],
+        organization_id: str,
+    ) -> dict[str, dict[str, str]]:
+        """Batch read of current SET tags for many workflows. Cross-org isolation
+        is enforced by the organization_id filter — wpids that don't belong to
+        the org are silently absent from the result (no rows match)."""
+        if not workflow_permanent_ids:
+            return {}
+
+        async with self.Session() as session:
+            stmt = select(WorkflowTagEventModel).where(
+                and_(
+                    WorkflowTagEventModel.organization_id == organization_id,
+                    WorkflowTagEventModel.workflow_permanent_id.in_(workflow_permanent_ids),
+                    WorkflowTagEventModel.superseded_at.is_(None),
+                    WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                    WorkflowTagEventModel.deleted_at.is_(None),
+                )
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+
+        result: dict[str, dict[str, str]] = {}
+        for row in rows:
+            if row.value is None:
+                LOG.warning(
+                    "active SET tag row has null value; skipping",
+                    tag_event_id=row.tag_event_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=row.workflow_permanent_id,
+                    key=row.key,
+                )
+                continue
+            result.setdefault(row.workflow_permanent_id, {})[row.key] = row.value
+        return result
+
+    @db_operation("list_tag_keys")
+    async def list_tag_keys(self, organization_id: str) -> list[TagKeyModel]:
+        """Active tag-key registry entries for the org, ordered by key for stable
+        autocomplete output."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagKeyModel)
+                .where(TagKeyModel.organization_id == organization_id)
+                .where(TagKeyModel.deleted_at.is_(None))
+                .order_by(TagKeyModel.key.asc())
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    @db_operation("get_tag_key")
+    async def get_tag_key(self, organization_id: str, key: str) -> TagKeyModel | None:
+        async with self.Session() as session:
+            stmt = (
+                select(TagKeyModel)
+                .where(TagKeyModel.organization_id == organization_id)
+                .where(TagKeyModel.key == key)
+                .where(TagKeyModel.deleted_at.is_(None))
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
+    @db_operation("update_tag_key_description")
+    async def update_tag_key_description(
+        self,
+        organization_id: str,
+        key: str,
+        description: str | None,
+    ) -> TagKeyModel | None:
+        """Update description on an existing tag-key row. Returns None when the
+        key is not registered for the org (caller should 404)."""
+        async with self.Session() as session:
+            stmt = (
+                select(TagKeyModel)
+                .where(TagKeyModel.organization_id == organization_id)
+                .where(TagKeyModel.key == key)
+                .where(TagKeyModel.deleted_at.is_(None))
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            row.description = description
+            await session.commit()
+            await session.refresh(row)
+            return row

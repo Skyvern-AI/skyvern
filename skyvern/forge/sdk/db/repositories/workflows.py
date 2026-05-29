@@ -379,6 +379,26 @@ class WorkflowsRepository(BaseRepository):
                 for workflow in workflows
             ]
 
+    @db_operation("get_existing_permanent_ids")
+    async def get_existing_permanent_ids(
+        self,
+        workflow_permanent_ids: list[str],
+        organization_id: str,
+    ) -> set[str]:
+        """Return the subset of ``workflow_permanent_ids`` that exist as
+        non-deleted workflows in the org, filtering out soft-deleted workflows."""
+        if not workflow_permanent_ids:
+            return set()
+        async with self.Session() as session:
+            stmt = (
+                select(WorkflowModel.workflow_permanent_id)
+                .where(WorkflowModel.organization_id == organization_id)
+                .where(WorkflowModel.workflow_permanent_id.in_(workflow_permanent_ids))
+                .where(WorkflowModel.deleted_at.is_(None))
+                .distinct()
+            )
+            return set((await session.execute(stmt)).scalars().all())
+
     @db_operation("get_workflows_by_organization_id")
     async def get_workflows_by_organization_id(
         self,
