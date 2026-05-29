@@ -1,7 +1,9 @@
 import asyncio
 import json
+import random
 import time
 import unicodedata
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -24,6 +26,7 @@ from fastapi import status as http_status
 from fastapi.responses import ORJSONResponse
 from opentelemetry import trace
 from pydantic import TypeAdapter, ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from skyvern import analytics
 from skyvern._version import __version__
@@ -109,6 +112,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
     InvalidTemplateWorkflowPermanentId,
     WorkflowDefinitionValidationException,
 )
+from skyvern.forge.sdk.workflow.models.tags import TagSource, TagWriteContext
 from skyvern.forge.sdk.workflow.models.workflow import (
     RunWorkflowResponse,
     Workflow,
@@ -136,6 +140,18 @@ from skyvern.schemas.runs import (
     UploadFileResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
+)
+from skyvern.schemas.tags import (
+    TagApplyRequest,
+    TagHistoryItem,
+    TagHistoryResponse,
+    TagKey,
+    TagKeyUpdate,
+    TagResponse,
+    TagsResponse,
+    WorkflowTagsBatchRequest,
+    WorkflowTagsBatchResponse,
+    _assert_user_key_writable,
 )
 from skyvern.schemas.webhooks import RetryRunWebhookRequest, RunWebhookReplayResponse
 from skyvern.schemas.workflows import (
@@ -1454,6 +1470,432 @@ async def update_workflow_folder(
         return workflow
     except ValueError as e:
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+async def _assert_workflow_in_org(workflow_permanent_id: str, organization_id: str) -> None:
+    """404 when the wpid does not belong to the caller's org. Centralizes the
+    existence/isolation check across the tag routes."""
+    workflow = await app.DATABASE.workflows.get_workflow_by_permanent_id(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    if workflow is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Workflow {workflow_permanent_id} not found",
+        )
+
+
+def _tag_event_to_response(row: Any) -> TagResponse:
+    return TagResponse(value=row.value, source=row.source, set_at=row.set_at, set_by=row.set_by)
+
+
+def _validate_path_key(key: str) -> None:
+    """Apply the same reserved-namespace + shape rules to a URL-path tag key
+    that ``normalize_tags`` applies to SET-body keys. Path violations surface
+    as 400 (vs 422 for body — the offending value comes from the URL, not the
+    request body)."""
+    try:
+        _assert_user_key_writable(key)
+    except ValueError as e:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+async def _apply_tag_changes_with_retry(
+    *,
+    workflow_permanent_id: str,
+    organization_id: str,
+    sets: dict[str, str],
+    deletes: set[str],
+    context: TagWriteContext,
+) -> None:
+    """Wrap ``apply_tag_changes`` with a single IntegrityError retry. The
+    Phase 2 repo documents that same-workflow/same-key concurrent SET writers
+    race the partial UNIQUE on ``workflow_tag_events_active_set_unique`` and
+    the loser surfaces an IntegrityError. Last-write-wins is the right
+    semantics here — the retry re-reads current state and either no-ops (same
+    value) or supersedes the winner. If the second attempt also conflicts,
+    surface as 409 Conflict instead of an unstructured 5xx."""
+    for attempt in range(2):
+        try:
+            await app.DATABASE.tags.apply_tag_changes(
+                workflow_permanent_id=workflow_permanent_id,
+                organization_id=organization_id,
+                sets=sets,
+                deletes=deletes,
+                context=context,
+            )
+            return
+        except IntegrityError:
+            if attempt == 0:
+                await asyncio.sleep(random.uniform(0.01, 0.05))
+                continue
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT,
+                detail="Tag write conflicted with a concurrent update; please retry",
+            )
+
+
+@legacy_base_router.post(
+    "/workflows/{workflow_permanent_id}/tags",
+    response_model=TagsResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.post(
+    "/workflows/{workflow_permanent_id}/tags/", response_model=TagsResponse, include_in_schema=False
+)
+@base_router.post(
+    "/workflows/{workflow_permanent_id}/tags",
+    response_model=TagsResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
+    description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
+    "same-key collisions resolve set-wins.",
+    summary="Apply workflow tags",
+    responses={
+        200: {"description": "Successfully applied tag changes"},
+        404: {"description": "Workflow not found"},
+        422: {"description": "Invalid tag key or value"},
+    },
+)
+@base_router.post("/workflows/{workflow_permanent_id}/tags/", response_model=TagsResponse, include_in_schema=False)
+async def apply_workflow_tags(
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    data: TagApplyRequest = Body(...),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+) -> TagsResponse:
+    analytics.capture("skyvern-oss-workflow-tags-apply")
+    organization_id = caller.organization.organization_id
+    await _assert_workflow_in_org(workflow_permanent_id, organization_id)
+
+    write_ctx = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    try:
+        await _apply_tag_changes_with_retry(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+            sets=data.tags,
+            deletes=set(data.tags_to_delete),
+            context=write_ctx,
+        )
+    except ValueError as e:
+        # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
+        raise HTTPException(status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    return await _build_tags_response(workflow_permanent_id, organization_id)
+
+
+@legacy_base_router.delete(
+    "/workflows/{workflow_permanent_id}/tags/{key}",
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.delete("/workflows/{workflow_permanent_id}/tags/{key}/", include_in_schema=False)
+@base_router.delete(
+    "/workflows/{workflow_permanent_id}/tags/{key}",
+    response_model=TagsResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
+    description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
+    summary="Delete workflow tag",
+    responses={
+        200: {"description": "Successfully deleted tag (or no-op if absent)"},
+        404: {"description": "Workflow not found"},
+    },
+)
+@base_router.delete(
+    "/workflows/{workflow_permanent_id}/tags/{key}/", response_model=TagsResponse, include_in_schema=False
+)
+async def delete_workflow_tag(
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    key: str = Path(..., description="Tag key to delete", examples=["env"]),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+) -> TagsResponse:
+    analytics.capture("skyvern-oss-workflow-tags-delete")
+    organization_id = caller.organization.organization_id
+    _validate_path_key(key)
+    await _assert_workflow_in_org(workflow_permanent_id, organization_id)
+
+    write_ctx = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    await _apply_tag_changes_with_retry(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+        sets={},
+        deletes={key},
+        context=write_ctx,
+    )
+    return await _build_tags_response(workflow_permanent_id, organization_id)
+
+
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/tags",
+    response_model=TagsResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/tags/", response_model=TagsResponse, include_in_schema=False
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/tags",
+    response_model=TagsResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
+    description="Get the current tag state for a workflow.",
+    summary="Get workflow tags",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        404: {"description": "Workflow not found"},
+    },
+)
+@base_router.get("/workflows/{workflow_permanent_id}/tags/", response_model=TagsResponse, include_in_schema=False)
+async def get_workflow_tags(
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TagsResponse:
+    organization_id = current_org.organization_id
+    await _assert_workflow_in_org(workflow_permanent_id, organization_id)
+    return await _build_tags_response(workflow_permanent_id, organization_id)
+
+
+async def _build_tags_response(workflow_permanent_id: str, organization_id: str) -> TagsResponse:
+    """Read active SET event rows and project them into the response shape."""
+    rows = await app.DATABASE.tags.get_active_tag_events_for_workflow(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+    )
+    tags: dict[str, TagResponse] = {}
+    for row in rows:
+        if row.value is None:
+            continue
+        tags[row.key] = _tag_event_to_response(row)
+    return TagsResponse(workflow_permanent_id=workflow_permanent_id, tags=tags)
+
+
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/tags/history",
+    response_model=TagHistoryResponse,
+    tags=["agent"],
+    include_in_schema=False,
+)
+@legacy_base_router.get(
+    "/workflows/{workflow_permanent_id}/tags/history/",
+    response_model=TagHistoryResponse,
+    include_in_schema=False,
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/tags/history",
+    response_model=TagHistoryResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
+    description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
+    summary="Get workflow tag history",
+    responses={
+        200: {"description": "Successfully retrieved tag history"},
+        404: {"description": "Workflow not found"},
+    },
+)
+@base_router.get(
+    "/workflows/{workflow_permanent_id}/tags/history/",
+    response_model=TagHistoryResponse,
+    include_in_schema=False,
+)
+async def get_workflow_tag_history(
+    workflow_permanent_id: str = Path(..., description="Workflow permanent ID", examples=["wpid_123"]),
+    limit: int = Query(100, ge=1, le=500, description="Max events to return"),
+    since: datetime | None = Query(None, description="Only return events at or after this timestamp"),
+    key: str | None = Query(None, description="Filter to events for a single tag key"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TagHistoryResponse:
+    organization_id = current_org.organization_id
+    await _assert_workflow_in_org(workflow_permanent_id, organization_id)
+    rows = await app.DATABASE.tags.get_tag_event_history(
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization_id,
+        limit=limit,
+        since=since,
+        key=key,
+    )
+    return TagHistoryResponse(
+        workflow_permanent_id=workflow_permanent_id,
+        events=[TagHistoryItem.model_validate(r) for r in rows],
+    )
+
+
+@legacy_base_router.get("/tag-keys", response_model=list[TagKey], tags=["agent"], include_in_schema=False)
+@legacy_base_router.get("/tag-keys/", response_model=list[TagKey], include_in_schema=False)
+@base_router.get(
+    "/tag-keys",
+    response_model=list[TagKey],
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
+    description="List all tag keys registered for the organization with their descriptions.",
+    summary="List tag keys",
+    responses={200: {"description": "Successfully retrieved tag keys"}},
+)
+@base_router.get("/tag-keys/", response_model=list[TagKey], include_in_schema=False)
+async def list_tag_keys(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[TagKey]:
+    rows = await app.DATABASE.tags.list_tag_keys(organization_id=current_org.organization_id)
+    return [TagKey.model_validate(r) for r in rows]
+
+
+@legacy_base_router.patch("/tag-keys/{key}", response_model=TagKey, tags=["agent"], include_in_schema=False)
+@legacy_base_router.patch("/tag-keys/{key}/", response_model=TagKey, include_in_schema=False)
+@base_router.patch(
+    "/tag-keys/{key}",
+    response_model=TagKey,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
+    description="Update the description for a tag key.",
+    summary="Update tag key",
+    responses={
+        200: {"description": "Successfully updated tag key"},
+        404: {"description": "Tag key not found"},
+        422: {"description": "Description too long"},
+    },
+)
+@base_router.patch("/tag-keys/{key}/", response_model=TagKey, include_in_schema=False)
+async def update_tag_key(
+    key: str = Path(..., description="Tag key to update"),
+    data: TagKeyUpdate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> TagKey:
+    _validate_path_key(key)
+    row = await app.DATABASE.tags.update_tag_key_description(
+        organization_id=current_org.organization_id,
+        key=key,
+        description=data.description,
+    )
+    if row is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    return TagKey.model_validate(row)
+
+
+_BATCH_TAGS_MAX_WPIDS = 200
+
+
+def _parse_batch_wpids(raw: str | None) -> list[str]:
+    """Parse the comma-separated wpid list from the GET query string."""
+    if not raw:
+        return []
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _build_batch_response(requested_wpids: list[str], tag_map: dict[str, dict[str, str]]) -> WorkflowTagsBatchResponse:
+    """Echo every requested wpid in the response (empty dict if no tags). Tag
+    values themselves are already org-filtered by the repo query, so this only
+    surfaces wpids the caller already supplied."""
+    workflow_tags: dict[str, dict[str, str]] = {wpid: tag_map.get(wpid, {}) for wpid in requested_wpids}
+    return WorkflowTagsBatchResponse(workflow_tags=workflow_tags)
+
+
+async def _resolve_active_batch_wpids(requested_wpids: list[str], organization_id: str) -> dict[str, dict[str, str]]:
+    """Return the org-filtered, soft-delete-filtered tag map for the requested
+    wpids. Two existence checks bracket the tag read so a workflow soft-deleted
+    *between* the lookup and the tag query doesn't leak stale tag values: the
+    second check intersects the result keys and drops any wpid that disappeared.
+    The residual race window is the gap between the two SELECTs (sub-ms).
+    Fully eliminating it would require a JOIN that couples ``TagsRepository``
+    to ``WorkflowModel``, which contradicts the Phase 2 boundary decision.
+
+    Costs up to three SELECTs (pre-existence, tag read, post-existence); the
+    bracketing existence checks are the safety mechanism — don't collapse them
+    to save a query."""
+    if not requested_wpids:
+        return {}
+    active_wpids_pre = await app.DATABASE.workflows.get_existing_permanent_ids(
+        workflow_permanent_ids=requested_wpids,
+        organization_id=organization_id,
+    )
+    if not active_wpids_pre:
+        return {}
+    tag_map = await app.DATABASE.tags.get_active_tags_for_workflows(
+        workflow_permanent_ids=list(active_wpids_pre),
+        organization_id=organization_id,
+    )
+    if not tag_map:
+        return {}
+    active_wpids_post = await app.DATABASE.workflows.get_existing_permanent_ids(
+        workflow_permanent_ids=list(tag_map.keys()),
+        organization_id=organization_id,
+    )
+    return {wpid: tags for wpid, tags in tag_map.items() if wpid in active_wpids_post}
+
+
+@legacy_base_router.get(
+    "/workflow-tags", response_model=WorkflowTagsBatchResponse, tags=["agent"], include_in_schema=False
+)
+@legacy_base_router.get("/workflow-tags/", response_model=WorkflowTagsBatchResponse, include_in_schema=False)
+@base_router.get(
+    "/workflow-tags",
+    response_model=WorkflowTagsBatchResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "batch_get_workflow_tags"},
+    description="Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
+    summary="Batch get workflow tags",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        400: {"description": "Too many workflow IDs requested"},
+    },
+)
+@base_router.get("/workflow-tags/", response_model=WorkflowTagsBatchResponse, include_in_schema=False)
+async def batch_get_workflow_tags(
+    workflow_permanent_ids: str | None = Query(
+        None,
+        description="Comma-separated workflow permanent IDs",
+        examples=["wpid_123,wpid_456"],
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowTagsBatchResponse:
+    wpids = _parse_batch_wpids(workflow_permanent_ids)
+    if len(wpids) > _BATCH_TAGS_MAX_WPIDS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {_BATCH_TAGS_MAX_WPIDS} workflow IDs may be requested at once",
+        )
+    tag_map = await _resolve_active_batch_wpids(wpids, current_org.organization_id)
+    return _build_batch_response(wpids, tag_map)
+
+
+@legacy_base_router.post(
+    "/workflow-tags", response_model=WorkflowTagsBatchResponse, tags=["agent"], include_in_schema=False
+)
+@legacy_base_router.post("/workflow-tags/", response_model=WorkflowTagsBatchResponse, include_in_schema=False)
+@base_router.post(
+    "/workflow-tags",
+    response_model=WorkflowTagsBatchResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "batch_get_workflow_tags_post"},
+    description="Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
+    summary="Batch get workflow tags (POST)",
+    responses={
+        200: {"description": "Successfully retrieved tags"},
+        400: {"description": "Too many workflow IDs requested"},
+    },
+)
+@base_router.post("/workflow-tags/", response_model=WorkflowTagsBatchResponse, include_in_schema=False)
+async def batch_get_workflow_tags_post(
+    data: WorkflowTagsBatchRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowTagsBatchResponse:
+    wpids = [wpid.strip() for wpid in data.workflow_permanent_ids if wpid and wpid.strip()]
+    if len(wpids) > _BATCH_TAGS_MAX_WPIDS:
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {_BATCH_TAGS_MAX_WPIDS} workflow IDs may be requested at once",
+        )
+    tag_map = await _resolve_active_batch_wpids(wpids, current_org.organization_id)
+    return _build_batch_response(wpids, tag_map)
 
 
 @legacy_base_router.post(

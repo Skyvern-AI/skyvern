@@ -157,7 +157,7 @@ async def _resolve_run_parameter_values(context: Any) -> dict[str, str]:
     """
     workflow_run_id = None
     if hasattr(context, "workflow_run_id"):
-        workflow_run_id = getattr(context, "workflow_run_id")
+        workflow_run_id = context.workflow_run_id
     elif hasattr(context, "context") and hasattr(context.context, "workflow_run_id"):
         workflow_run_id = context.context.workflow_run_id
     if not workflow_run_id:
@@ -185,9 +185,9 @@ async def _resolve_parameter_keys(context: Any) -> list[str]:
         if obj is None:
             continue
         if not org_id and hasattr(obj, "organization_id"):
-            org_id = getattr(obj, "organization_id")
+            org_id = obj.organization_id
         if not wpid and hasattr(obj, "workflow_permanent_id"):
-            wpid = getattr(obj, "workflow_permanent_id")
+            wpid = obj.workflow_permanent_id
         if org_id and wpid:
             break
     if not (org_id and wpid):

@@ -645,7 +645,7 @@ def _record_per_tool_budget_problem_blocks_from_results(copilot_ctx: Any, result
         label = block.get("label")
         if isinstance(label, str) and label:
             labels.add(label)
-    setattr(copilot_ctx, "per_tool_budget_problem_block_labels", sorted(labels))
+    copilot_ctx.per_tool_budget_problem_block_labels = sorted(labels)
 
 
 def _navigation_labels_in_workflow(workflow: Any) -> set[str]:
@@ -669,7 +669,7 @@ def _clear_resolved_per_tool_budget_problem_labels(copilot_ctx: Any, workflow: A
     if not problem_labels:
         return
     remaining = sorted(problem_labels & _navigation_labels_in_workflow(workflow))
-    setattr(copilot_ctx, "per_tool_budget_problem_block_labels", remaining)
+    copilot_ctx.per_tool_budget_problem_block_labels = remaining
 
 
 def _requested_block_label_set(arguments: dict[str, Any] | None) -> set[str] | None:

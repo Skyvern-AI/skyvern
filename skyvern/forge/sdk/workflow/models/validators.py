@@ -18,7 +18,7 @@ TAG_DESCRIPTION_MAX_LENGTH = 500
 SKYVERN_TAG_NAMESPACE = "skyvern."
 # Anchored regex: keys must be URL-safe so they round-trip through path
 # (`DELETE .../tags/{key}`) and query (`?tags=k:v`) without escaping.
-_TAG_KEY_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+TAG_KEY_REGEX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # `,` separates pairs in the `?tags=k:v,k2:v2` filter encoding, so it may not
 # appear inside a value. `:` is allowed: the parser splits on the first `:` only.
 _TAG_VALUE_FORBIDDEN_CHARS = (",",)
@@ -106,7 +106,7 @@ def normalize_tags(v: dict[str, str] | None) -> dict[str, str] | None:
     for key, value in normalized.items():
         if key.startswith(SKYVERN_TAG_NAMESPACE):
             raise ValueError(f"tags keys must not start with the reserved '{SKYVERN_TAG_NAMESPACE}' prefix")
-        if not _TAG_KEY_REGEX.match(key):
+        if not TAG_KEY_REGEX.match(key):
             raise ValueError(
                 "tags keys must match '^[A-Za-z0-9][A-Za-z0-9_.-]*$' "
                 "(alphanumeric, underscore, dot, hyphen; must start with alphanumeric)"
