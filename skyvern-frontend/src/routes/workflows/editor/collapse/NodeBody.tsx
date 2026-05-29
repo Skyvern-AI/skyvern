@@ -64,7 +64,11 @@ export function NodeBody({ children, className, style }: Props) {
         className,
       )}
     >
-      <div ref={recompositeRef} data-node-body-recomposite="">
+      {/* p-1 keeps focused-input rings/shadows off the overflow-hidden clip
+          edge so they don't render clipped (SKY-10457). Padding lives on this
+          inner wrapper, not the height-animated CollapsibleContent, so the
+          collapsed state still measures to zero. */}
+      <div ref={recompositeRef} data-node-body-recomposite="" className="p-1">
         {children}
       </div>
     </CollapsibleContent>

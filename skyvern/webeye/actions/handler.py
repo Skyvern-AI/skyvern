@@ -3083,11 +3083,25 @@ def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
     if secret_value is not None:
         credential_parameter_key = workflow_run_context.find_credential_parameter_key_for_secret(parameter)
+        if credential_parameter_key is None and secret_value != parameter:
+            credential_parameter_key = _find_credential_key_for_embedded_placeholders(workflow_run_context, parameter)
         if credential_parameter_key is not None:
             current_context = skyvern_context.current()
             if current_context is not None:
                 current_context.active_credential_parameter_key = credential_parameter_key
     return secret_value if secret_value is not None else parameter
+
+
+def _find_credential_key_for_embedded_placeholders(workflow_run_context: Any, parameter: str) -> str | None:
+    tokens = workflow_run_context.find_embedded_placeholder_tokens(parameter)
+    if not tokens:
+        return None
+    keys: set[str | None] = set()
+    for token in tokens:
+        key = workflow_run_context.find_credential_parameter_key_for_secret(token)
+        keys.add(key)
+    keys.discard(None)
+    return keys.pop() if len(keys) == 1 else None
 
 
 def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str) -> Any:

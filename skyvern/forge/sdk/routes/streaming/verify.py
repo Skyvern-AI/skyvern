@@ -26,6 +26,7 @@ from skyvern.forge import app
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import AddressablePersistentBrowserSession, is_final_status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.webeye.vnc_streaming import browser_session_supports_vnc_streaming
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.message import MessageChannel
@@ -80,7 +81,10 @@ async def verify_browser_session(
     browser_address = browser_session.browser_address
 
     if not browser_address:
-        if settings.BROWSER_STREAMING_MODE == "cdp":
+        if settings.BROWSER_STREAMING_MODE == "cdp" or browser_session_supports_vnc_streaming(
+            browser_address=browser_session.browser_address,
+            ip_address=browser_session.ip_address,
+        ):
             browser_address = ""
         else:
             LOG.info(

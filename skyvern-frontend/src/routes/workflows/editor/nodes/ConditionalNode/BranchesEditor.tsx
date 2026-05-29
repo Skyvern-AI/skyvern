@@ -20,6 +20,7 @@ import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { useUpdate } from "../../useUpdate";
 import { AppNode, isWorkflowBlockNode } from "..";
 import { updateNodeAndDescendantsVisibility } from "../../workflowEditorUtils";
+import { applyEdgeVisibility } from "./applyEdgeVisibility";
 import {
   ConditionalNodeData,
   createBranchCondition,
@@ -166,54 +167,11 @@ function BranchesEditor({ nodeId, data }: Props) {
       return updatedNodes;
     });
 
-    // Toggle edge visibility using callback (needs updated nodes)
     setEdges((currentEdges) => {
-      return currentEdges.map((edge) => {
-        const edgeData = edge.data as
-          | {
-              conditionalNodeId?: string;
-              conditionalBranchId?: string;
-            }
-          | undefined;
-
-        // Only affect edges that belong to this conditional and have branch metadata
-        if (
-          edgeData?.conditionalNodeId === id &&
-          edgeData?.conditionalBranchId
-        ) {
-          const shouldHide = edgeData.conditionalBranchId !== activeBranchId;
-          return { ...edge, hidden: shouldHide };
-        }
-
-        // Hide edges connected to hidden nodes
-        const sourceNode = updatedNodesSnapshot.find(
-          (n: AppNode) => n.id === edge.source,
-        );
-        const targetNode = updatedNodesSnapshot.find(
-          (n: AppNode) => n.id === edge.target,
-        );
-        if (sourceNode?.hidden || targetNode?.hidden) {
-          return { ...edge, hidden: true };
-        }
-
-        // Unhide edges when both nodes are visible, but ONLY if they're not conditional branch edges
-        // (Conditional branch edges should stay hidden if they're for inactive branches)
-        if (
-          sourceNode &&
-          targetNode &&
-          !sourceNode.hidden &&
-          !targetNode.hidden
-        ) {
-          const isConditionalBranchEdge =
-            edgeData?.conditionalNodeId && edgeData?.conditionalBranchId;
-          if (!isConditionalBranchEdge) {
-            // Regular edge (e.g., loop's START → adder) - unhide when nodes are visible
-            return { ...edge, hidden: false };
-          }
-        }
-
-        return edge;
-      });
+      const nodeMap = new Map(updatedNodesSnapshot.map((n) => [n.id, n]));
+      return currentEdges.map((edge) =>
+        applyEdgeVisibility(edge, nodeMap, id, activeBranchId),
+      );
     });
 
     // Trigger layout recalculation after visibility changes
