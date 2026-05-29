@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -70,6 +71,9 @@ class _FakeDefinition:
 class _FakeWorkflow:
     def __init__(self, definition: _FakeDefinition) -> None:
         self.workflow_definition = definition
+
+    def model_copy(self, *, deep: bool = False) -> _FakeWorkflow:
+        return copy.deepcopy(self) if deep else _FakeWorkflow(self.workflow_definition)
 
 
 class _FakeStream:
@@ -236,6 +240,133 @@ def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -
         "search": {"current_url": "https://example.com/search/results"},
     }
     assert frontier == "expand"
+
+
+def test_runtime_frontier_anchor_keeps_url_empty_to_preserve_live_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+def test_runtime_frontier_anchor_requires_verified_prefix() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+def test_runtime_frontier_anchor_does_not_override_explicit_block_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": "https://example.com/explicit"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/explicit"
+
+
+def test_runtime_frontier_anchor_clears_same_page_url_to_preserve_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"url": None}),
+            _FakeBlock("submit_search", "navigation", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["submit_search"],
+        frontier_start_label="submit_search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is not workflow
+    assert anchored.workflow_definition.blocks[2].url is None
+    assert workflow.workflow_definition.blocks[2].url == "https://example.com/search"
+
+
+def test_runtime_frontier_anchor_does_not_clear_same_page_goto_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("refresh", "goto_url", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["refresh"],
+        frontier_start_label="refresh",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/search"
 
 
 def test_frontier_run_size_error_limits_long_page_changing_frontier() -> None:
