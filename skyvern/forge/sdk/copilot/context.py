@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
+from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -16,6 +17,52 @@ from skyvern.forge.sdk.workflow.models.workflow import Workflow
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+
+class NarrativeDraft(TypedDict):
+    blockCount: int
+    blockLabels: list[str]
+    summary: str | None
+
+
+# Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
+# present only for tool_call/tool_result and success only for tool_result.
+class NarrativeActivityEntry(TypedDict):
+    kind: str
+    text: str
+    iteration: int
+    toolName: NotRequired[str]
+    success: NotRequired[bool]
+    id: str
+
+
+class NarrativeBlock(TypedDict):
+    label: str
+    blockType: str
+    state: str
+    lastSeenIteration: int
+    activity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
+
+# Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class TurnNarrativePayload(TypedDict):
+    turnId: str | None
+    turnIndex: int
+    mode: str
+    designStarted: bool
+    designEnded: bool
+    draft: NarrativeDraft | None
+    blocks: list[NarrativeBlock]
+    terminal: str
+    terminalMessage: str | None
+    narrativeSummary: str | None
+    priorBlockCount: int | None
+    designActivity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
@@ -172,6 +219,14 @@ class AgentResult:
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None
     narrative_summary: str | None = None
+    # Persisted on the assistant chat message so the bubble survives a reload.
+    narrative_payload: TurnNarrativePayload | None = None
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
 
 
 @dataclass
@@ -227,6 +282,7 @@ class CopilotContext(AgentContext):
     # Workflow state
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
+    # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None
     last_test_ok: bool | None = None
@@ -343,3 +399,16 @@ class CopilotContext(AgentContext):
     design_start_emitted: bool = False
     design_end_emitted: bool = False
     narrative_summary: str | None = None
+
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
+    prior_block_count: int | None = None
+    block_state_map: dict[str, str] = field(default_factory=dict)
+    block_started_at_map: dict[str, str] = field(default_factory=dict)
+    block_ended_at_map: dict[str, str] = field(default_factory=dict)
+    turn_started_at: str | None = None
+    turn_ended_at: str | None = None

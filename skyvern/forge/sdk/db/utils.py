@@ -1,6 +1,6 @@
 import json
 import typing
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pydantic
 import pydantic.json
@@ -99,6 +99,9 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 
 LOG = structlog.get_logger()
 
@@ -375,6 +378,10 @@ def convert_to_workflow_copilot_chat_message(
                 exc_info=exc,
             )
             parsed_outcome = None
+    raw_narrative = message_model.narrative_payload
+    parsed_narrative = typing.cast(
+        "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
+    )
     return WorkflowCopilotChatMessageSchema(
         workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
@@ -382,6 +389,7 @@ def convert_to_workflow_copilot_chat_message(
         content=message_model.content,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
+        narrative_payload=parsed_narrative,
         created_at=message_model.created_at,
         modified_at=message_model.modified_at,
     )

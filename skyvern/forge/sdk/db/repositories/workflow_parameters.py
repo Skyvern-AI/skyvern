@@ -521,6 +521,7 @@ class WorkflowParametersRepository(BaseRepository):
         content: str,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
+        narrative_payload: dict | None = None,
     ) -> WorkflowCopilotChatMessage:
         async with self.Session() as session:
             new_message = WorkflowCopilotChatMessageModel(
@@ -530,6 +531,7 @@ class WorkflowParametersRepository(BaseRepository):
                 content=content,
                 global_llm_context=global_llm_context,
                 turn_outcome=turn_outcome.model_dump(mode="json") if turn_outcome is not None else None,
+                narrative_payload=narrative_payload,
             )
             session.add(new_message)
             await session.commit()

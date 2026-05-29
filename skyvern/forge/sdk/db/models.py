@@ -1437,6 +1437,7 @@ class WorkflowCopilotChatMessageModel(Base):
     content = Column(UnicodeText, nullable=False)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
+    narrative_payload = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

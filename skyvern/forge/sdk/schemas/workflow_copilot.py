@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType
+from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -49,6 +49,10 @@ class WorkflowCopilotChatMessage(BaseModel):
     content: str = Field(..., description="Message content")
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
     created_at: datetime = Field(..., description="When the message was created")
     modified_at: datetime = Field(..., description="When the message was last modified")
 
@@ -94,6 +98,10 @@ class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Persisted narrative bubble snapshot; lets a reload re-render per-block cards.",
+    )
     created_at: datetime = Field(..., description="When the message was created")
 
 
@@ -247,6 +255,10 @@ class WorkflowCopilotTurnStartUpdate(BaseModel):
     turn_index: int = Field(..., description="Zero-based ordinal of this turn within the chat")
     mode: WorkflowCopilotTurnMode = Field(..., description="TurnIntent mode for this turn")
     timestamp: datetime = Field(..., description="Server timestamp")
+    prior_block_count: int | None = Field(
+        None,
+        description="Block count of the canonical workflow at turn entry; drives the FE edit-vs-build chip.",
+    )
 
 
 class WorkflowCopilotDesignStartUpdate(BaseModel):
@@ -264,10 +276,6 @@ class WorkflowCopilotDesignEndUpdate(BaseModel):
 
 
 class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
-    # Summary-only payload. The staged/persisted workflow definition is
-    # transported elsewhere (terminal `updated_workflow` on RESPONSE, or
-    # the chat's `proposed_workflow` field); this event signals only that a
-    # draft was produced and what shape it has.
     type: WorkflowCopilotStreamMessageType = Field(
         WorkflowCopilotStreamMessageType.WORKFLOW_DRAFT, description="Message type"
     )
@@ -275,6 +283,10 @@ class WorkflowCopilotWorkflowDraftUpdate(BaseModel):
     block_labels: list[str] = Field(default_factory=list, description="Ordered block labels in the drafted workflow")
     summary: str | None = Field(None, description="Optional one-line description; populated by a follow-up PR")
     timestamp: datetime = Field(..., description="Server timestamp")
+    workflow: dict | None = Field(
+        None,
+        description="Staged workflow API response (same shape as terminal RESPONSE.updated_workflow). Drives mid-turn canvas updates.",
+    )
 
 
 class WorkflowYAMLConversionRequest(BaseModel):

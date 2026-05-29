@@ -15,6 +15,8 @@ from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.copilot.narration import (
     NarratorState,
     TransitionKind,
+    build_tool_call_activity,
+    build_tool_result_activity,
     cancel_in_flight,
     detect_transitions,
     extract_tool_details,
@@ -133,6 +135,7 @@ async def stream_to_sse(
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
                 call_id_to_name[call_id] = tool_name
+                narrator_state.record_activity(build_tool_call_activity(tool_name, iteration, call_id))
 
                 if not client_gone:
                     raw_args = _get_raw_field(raw, "arguments")
@@ -176,6 +179,9 @@ async def stream_to_sse(
                 summary = format_tool_result_for_user(tool_name, parsed)
                 success = parsed.get("ok", True)
                 detail = summarize_tool_result_detail(parsed)
+                narrator_state.record_activity(
+                    build_tool_result_activity(tool_name, summary, success, iteration, call_id)
+                )
 
                 if not client_gone:
                     await stream.send(
@@ -338,12 +344,16 @@ def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
 
 async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
     mode_value = ctx.turn_intent.mode.value if ctx.turn_intent is not None else WorkflowCopilotTurnMode.UNKNOWN.value
+    now = datetime.now(timezone.utc)
+    if ctx.turn_started_at is None:
+        ctx.turn_started_at = now.isoformat()
     await stream.send(
         WorkflowCopilotTurnStartUpdate(
             turn_id=ctx.turn_id,
             turn_index=ctx.turn_index,
             mode=WorkflowCopilotTurnMode(mode_value),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now,
+            prior_block_count=ctx.prior_block_count,
         )
     )
 
@@ -365,9 +375,16 @@ async def maybe_emit_design_end(stream: EventSourceStream, ctx: CopilotContext) 
     await stream.send(WorkflowCopilotDesignEndUpdate(timestamp=datetime.now(timezone.utc)))
 
 
-async def emit_workflow_draft(stream: EventSourceStream, ctx: CopilotContext, workflow: Workflow) -> None:
-    # Summary payload only: the full workflow definition is transported via
-    # terminal updated_workflow on RESPONSE or via the chat's proposed_workflow.
+async def emit_workflow_draft(
+    stream: EventSourceStream,
+    ctx: CopilotContext,
+    workflow: Workflow,
+    *,
+    include_workflow: bool = True,
+) -> None:
+    """Emit a WORKFLOW_DRAFT envelope; ``include_workflow=False`` suppresses
+    the canvas auto-render for untested paths (inline REPLACE_WORKFLOW).
+    """
     block_count = 0
     block_labels: list[str] = []
     try:
@@ -377,14 +394,19 @@ async def emit_workflow_draft(stream: EventSourceStream, ctx: CopilotContext, wo
             if isinstance(label, str) and label:
                 block_labels.append(label)
     except AttributeError:
-        # Defensive: workflow without a blocks-bearing definition. Emit with
-        # whatever we could collect rather than skipping the event entirely.
         pass
+    workflow_dump: dict | None = None
+    if include_workflow:
+        try:
+            workflow_dump = workflow.model_dump(mode="json")
+        except Exception as dump_err:
+            LOG.warning("copilot_workflow_draft_serialization_failed", error=str(dump_err))
     await stream.send(
         WorkflowCopilotWorkflowDraftUpdate(
             block_count=block_count,
             block_labels=block_labels,
             summary=None,
             timestamp=datetime.now(timezone.utc),
+            workflow=workflow_dump,
         )
     )

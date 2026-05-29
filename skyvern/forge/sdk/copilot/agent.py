@@ -43,8 +43,12 @@ from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
     CopilotContext,
+    NarrativeActivityEntry,
+    NarrativeBlock,
+    NarrativeDraft,
     ResponseType,
     StructuredContext,
+    TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -717,6 +721,94 @@ def _make_agent_result(
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
 
 
+_BLOCK_STATUS_TO_UI_STATE: dict[str, str] = {
+    "running": "running",
+    "completed": "completed",
+    "skipped": "skipped",
+    "failed": "failed",
+    "terminated": "failed",
+    "timed_out": "failed",
+    "canceled": "failed",
+    "queued": "queued",
+}
+
+
+def _block_ui_state(raw_status: str | None, *, drafted_fallback: bool) -> str:
+    # No status + drafted_fallback => stage-only block, distinct from "queued".
+    if raw_status is None:
+        return "drafted" if drafted_fallback else "queued"
+    return _BLOCK_STATUS_TO_UI_STATE.get(raw_status, "queued")
+
+
+def _build_narrative_payload(
+    ctx: CopilotContext,
+    *,
+    terminal: str,
+    terminal_message: str | None,
+    narrative_summary: str | None,
+) -> TurnNarrativePayload:
+    mode_value = ctx.turn_intent.mode.value if ctx.turn_intent is not None else "unknown"
+    narrator_state = ctx.narrator_state
+    block_activity: dict[str, list[NarrativeActivityEntry]] = (
+        narrator_state.block_activity if narrator_state is not None else {}
+    )
+    design_activity: list[NarrativeActivityEntry] = narrator_state.design_activity if narrator_state is not None else []
+    block_labels: list[str] = []
+    blocks: list[NarrativeBlock] = []
+    staged = ctx.staged_workflow
+    if staged is not None and getattr(staged, "workflow_definition", None) is not None:
+        for block in staged.workflow_definition.blocks:
+            label = getattr(block, "label", None)
+            if not isinstance(label, str) or not label:
+                continue
+            block_labels.append(label)
+            block_type_value = getattr(block, "block_type", None)
+            if block_type_value is not None and hasattr(block_type_value, "value"):
+                block_type = block_type_value.value
+            else:
+                block_type = str(block_type_value or "task")
+            raw_status = ctx.block_state_map.get(label)
+            blocks.append(
+                {
+                    "label": label,
+                    "blockType": block_type,
+                    "state": _block_ui_state(
+                        raw_status,
+                        drafted_fallback=ctx.has_staged_proposal,
+                    ),
+                    "lastSeenIteration": 0,
+                    "activity": list(block_activity.get(label, [])),
+                    "startedAt": ctx.block_started_at_map.get(label),
+                    "endedAt": ctx.block_ended_at_map.get(label),
+                }
+            )
+    draft: NarrativeDraft | None = (
+        {"blockCount": len(block_labels), "blockLabels": block_labels, "summary": None}
+        if ctx.has_staged_proposal
+        else None
+    )
+    # First terminal builder to reach here seals the turn-level end time;
+    # later exit paths reuse it so the persisted elapsed matches the live one.
+    if ctx.turn_ended_at is None:
+        ctx.turn_ended_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "turnId": ctx.turn_id,
+        "turnIndex": ctx.turn_index,
+        "mode": mode_value,
+        "designStarted": True,
+        "designEnded": True,
+        "draft": draft,
+        "blocks": blocks,
+        "terminal": terminal,
+        "terminalMessage": terminal_message,
+        "narrativeSummary": narrative_summary or terminal_message,
+        "priorBlockCount": ctx.prior_block_count,
+        "designActivity": list(design_activity),
+        "startedAt": ctx.turn_started_at,
+        "endedAt": ctx.turn_ended_at,
+    }
+
+
 def _build_exit_result(
     ctx: CopilotContext,
     user_response: str,
@@ -741,11 +833,21 @@ def _build_exit_result(
             global_llm_context=global_llm_context,
             workflow_yaml=verified_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
+            has_staged_proposal=ctx.has_staged_proposal,
+            staged_workflow_yaml=ctx.staged_workflow_yaml,
+            staged_workflow=ctx.staged_workflow,
+            canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
             total_tokens=ctx.total_tokens_used,
             cancelled=cancelled,
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="error" if cancelled else "response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="exit_result",
     )
@@ -964,6 +1066,12 @@ def _finalize_result_with_blocker_override(
         turn_outcome=turn_outcome,
         turn_id=ctx.turn_id,
         narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_text,
+            narrative_summary=ctx.narrative_summary,
+        ),
     )
 
 
@@ -1180,12 +1288,22 @@ def _build_wip_exit_result(
                 global_llm_context=global_llm_context,
                 workflow_yaml=ctx.last_good_workflow_yaml,
                 workflow_was_persisted=ctx.workflow_persisted,
+                has_staged_proposal=ctx.has_staged_proposal,
+                staged_workflow_yaml=ctx.staged_workflow_yaml,
+                staged_workflow=ctx.staged_workflow,
+                canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
                 total_tokens=ctx.total_tokens_used,
                 proposal_disposition="review_tested",
                 cancelled=cancelled,
                 turn_outcome=outcome,
                 turn_id=ctx.turn_id,
                 narrative_summary=ctx.narrative_summary,
+                narrative_payload=_build_narrative_payload(
+                    ctx,
+                    terminal="error",
+                    terminal_message=final_text,
+                    narrative_summary=ctx.narrative_summary,
+                ),
             ),
             exit_site="wip_last_good_workflow",
         )
@@ -1210,12 +1328,22 @@ def _build_wip_exit_result(
                 global_llm_context=global_llm_context,
                 workflow_yaml=ctx.last_workflow_yaml,
                 workflow_was_persisted=ctx.workflow_persisted,
+                has_staged_proposal=ctx.has_staged_proposal,
+                staged_workflow_yaml=ctx.staged_workflow_yaml,
+                staged_workflow=ctx.staged_workflow,
+                canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
                 total_tokens=ctx.total_tokens_used,
                 proposal_disposition="review_untested" if unvalidated else "auto_applicable",
                 cancelled=cancelled,
                 turn_outcome=outcome,
                 turn_id=ctx.turn_id,
                 narrative_summary=ctx.narrative_summary,
+                narrative_payload=_build_narrative_payload(
+                    ctx,
+                    terminal="error",
+                    terminal_message=final_text,
+                    narrative_summary=ctx.narrative_summary,
+                ),
             ),
             exit_site="wip_last_workflow",
         )
@@ -1323,7 +1451,7 @@ def _build_cancel_exit_result(ctx: CopilotContext, global_llm_context: str | Non
     )
 
 
-def _translate_to_agent_result(
+async def _translate_to_agent_result(
     result: RunResultStreaming,
     ctx: CopilotContext,
     global_llm_context: str | None,
@@ -1444,6 +1572,17 @@ def _translate_to_agent_result(
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
+        # Inline REPLACE_WORKFLOW is untested by construction; emit a draft
+        # envelope without staging onto ctx so terminal auto-accept can't fire,
+        # and suppress the workflow payload so the canvas does not render it.
+        if last_workflow is not None and ctx.stream is not None:
+            try:
+                await maybe_emit_design_end(ctx.stream, ctx)
+                await emit_workflow_draft(ctx.stream, ctx, last_workflow, include_workflow=False)
+            except Exception as emit_err:
+                LOG.warning("copilot_narrative_inline_replace_emit_failed", error=str(emit_err))
+            ctx.design_start_emitted = False
+            ctx.design_end_emitted = False
 
     # An unverified edit/run sits in ``last_workflow`` after a recorded
     # failure — surface the verified prior shape and skip the failure rewrite
@@ -1631,6 +1770,10 @@ def _translate_to_agent_result(
             response_type=resp_type,
             workflow_yaml=last_workflow_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
+            has_staged_proposal=ctx.has_staged_proposal,
+            staged_workflow_yaml=ctx.staged_workflow_yaml,
+            staged_workflow=ctx.staged_workflow,
+            canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
             total_tokens=ctx.total_tokens_used,
             clear_proposed_workflow=resp_type == "ASK_QUESTION",
             proposal_disposition=(
@@ -1644,6 +1787,12 @@ def _translate_to_agent_result(
             turn_outcome=turn_outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_user_response,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="translate_to_agent_result",
     )
@@ -1691,6 +1840,12 @@ def _build_feasibility_clarification_result(
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="feasibility_clarification",
     )
@@ -1774,6 +1929,12 @@ def _build_request_policy_clarification_result(
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="request_policy_clarification",
     )
@@ -2076,6 +2237,10 @@ def _build_output_policy_blocked_result(
         response_type="ASK_QUESTION",
         workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
         workflow_was_persisted=ctx.workflow_persisted,
+        has_staged_proposal=ctx.has_staged_proposal,
+        staged_workflow_yaml=ctx.staged_workflow_yaml,
+        staged_workflow=ctx.staged_workflow,
+        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
         total_tokens=ctx.total_tokens_used,
         clear_proposed_workflow=False,
         proposal_disposition=(
@@ -2096,6 +2261,12 @@ def _build_output_policy_blocked_result(
         turn_outcome=output_policy_outcome,
         turn_id=ctx.turn_id,
         narrative_summary=ctx.narrative_summary,
+        narrative_payload=_build_narrative_payload(
+            ctx,
+            terminal="response",
+            terminal_message=final_user_response,
+            narrative_summary=ctx.narrative_summary,
+        ),
     )
 
 
@@ -2113,6 +2284,7 @@ async def run_copilot_agent(
     turn_index: int | None = None,
     turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
+    prior_block_count: int | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -2146,6 +2318,7 @@ async def run_copilot_agent(
                     turn_id=turn_id,
                     turn_index=normalized_turn_index,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
+                    prior_block_count=prior_block_count,
                 )
             except Exception as exc:
                 LOG.error(
@@ -2209,6 +2382,7 @@ async def _run_copilot_turn_impl(
     turn_id: str,
     turn_index: int,
     prior_copilot_workflow_yaml: str | None = None,
+    prior_block_count: int | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -2269,6 +2443,7 @@ async def _run_copilot_turn_impl(
         workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
         turn_id=turn_id,
         turn_index=turn_index,
+        prior_block_count=prior_block_count,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
@@ -2554,7 +2729,7 @@ async def _run_copilot_turn_impl(
                     )
                     ctx.supports_vision = fallback_supports_vision
                     result = await _run_attempt(fallback_model_name, fallback_run_config, fallback_resolved_key)
-                agent_result = _translate_to_agent_result(
+                agent_result = await _translate_to_agent_result(
                     result,
                     ctx,
                     global_llm_context,
@@ -2638,10 +2813,20 @@ async def _run_copilot_turn_impl(
                         global_llm_context=global_llm_context,
                         workflow_yaml=None,
                         workflow_was_persisted=ctx.workflow_persisted,
+                        has_staged_proposal=ctx.has_staged_proposal,
+                        staged_workflow_yaml=ctx.staged_workflow_yaml,
+                        staged_workflow=ctx.staged_workflow,
+                        canonical_was_persisted_due_to_param_change=ctx.canonical_was_persisted_due_to_param_change,
                         total_tokens=ctx.total_tokens_used,
                         turn_outcome=nav_outcome,
                         turn_id=ctx.turn_id,
                         narrative_summary=ctx.narrative_summary,
+                        narrative_payload=_build_narrative_payload(
+                            ctx,
+                            terminal="response",
+                            terminal_message=final_nav_text,
+                            narrative_summary=ctx.narrative_summary,
+                        ),
                     ),
                     exit_site="non_retriable_nav",
                 )
