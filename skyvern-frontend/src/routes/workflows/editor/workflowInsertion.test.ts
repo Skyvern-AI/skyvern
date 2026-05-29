@@ -196,4 +196,59 @@ describe("findBranchContextForInsertion", () => {
       ),
     ).toEqual(branch);
   });
+
+  it("uses the inner conditional's active branch when inserting into a nested conditional", () => {
+    // SKY-10460: a conditional nested inside another conditional carries its
+    // own membership metadata (conditionalNodeId/conditionalBranchId pointing
+    // at the OUTER conditional). Inserting into the inner conditional's empty
+    // branch starts from its START node and walks up to the inner conditional;
+    // the context must be the inner conditional's active branch, not its
+    // membership in the outer conditional, or the inserted block is orphaned.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "outer-conditional",
+            type: "conditional",
+            data: {
+              activeBranchId: "outer-branch-a",
+              branches: [{ id: "outer-branch-a" }, { id: "outer-branch-b" }],
+              label: "outer",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "inner-conditional",
+            parentId: "outer-conditional",
+            type: "conditional",
+            data: {
+              // Membership in the OUTER conditional.
+              conditionalNodeId: "outer-conditional",
+              conditionalBranchId: "outer-branch-a",
+              conditionalLabel: "outer",
+              conditionalMergeLabel: null,
+              // The inner conditional's own branch state.
+              activeBranchId: "inner-branch-a",
+              branches: [{ id: "inner-branch-a" }, { id: "inner-branch-b" }],
+              label: "inner",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "inner-start",
+            parentId: "inner-conditional",
+            type: "start",
+            data: {},
+          },
+        ],
+        "inner-start",
+        "inner-conditional",
+      ),
+    ).toEqual({
+      branchId: "inner-branch-a",
+      conditionalLabel: "inner",
+      conditionalNodeId: "inner-conditional",
+      mergeLabel: null,
+    });
+  });
 });

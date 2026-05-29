@@ -76,6 +76,8 @@ export function Flippable({
           style={{
             backfaceVisibility: "hidden",
             WebkitBackfaceVisibility: "hidden",
+            transformStyle: "flat",
+            WebkitTransformStyle: "flat",
           }}
         >
           {front}
@@ -87,6 +89,8 @@ export function Flippable({
             backfaceVisibility: "hidden",
             WebkitBackfaceVisibility: "hidden",
             transform: "rotateY(180deg)",
+            transformStyle: "flat",
+            WebkitTransformStyle: "flat",
           }}
         >
           {back}
