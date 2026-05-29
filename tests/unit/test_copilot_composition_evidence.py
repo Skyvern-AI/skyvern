@@ -238,6 +238,24 @@ def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() 
     assert "search_lookup" in error
 
 
+def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_results", "url": "https://example.com/results"},
+        {
+            "block_type": "extraction",
+            "label": "extract_results",
+            "data_extraction_goal": "Extract the visible result rows.",
+        },
+    )
+
+    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
+
+    assert error is not None
+    assert "page-dependent blocks" in error
+    assert "navigation/login" not in error
+    assert "extract_results (extraction)" in error
+
+
 def test_composition_gate_rejects_stale_page_evidence_from_another_origin() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
@@ -302,6 +320,343 @@ def test_composition_gate_rejects_untyped_browser_observation_evidence() -> None
     assert "inspect_page_for_composition" in error
 
 
+def test_composition_gate_rejects_precompose_screenshot_evidence_outside_inspection_tool() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed first-name and last-name fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/lookup",
+        "current_url": "https://example.com/lookup",
+        "forms": [],
+        "source_tool": "get_browser_screenshot",
+        "evidence_sources": ["screenshot", "vision_summary"],
+        "screenshot_used": True,
+        "visual_evidence_summary": "A search form is visible.",
+    }
+
+    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+
+    assert error is not None
+    assert "inspect_page_for_composition" in error
+
+
+def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed first-name and last-name fields and submit.",
+        },
+    )
+    evidence = {
+        **_first_last_evidence(),
+        "evidence_sources": ["dom_html", "screenshot", "vision_summary"],
+        "screenshot_used": True,
+        "visual_evidence_summary": "A challenge is visible below the search form.",
+    }
+
+    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_rejects_post_run_browser_observation_outside_inspection_tool() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "expand_result",
+            "navigation_goal": "Click the observed result-row expansion control.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/results?id=123",
+        "current_url": "https://example.com/results?id=123",
+        "forms": [],
+        "source_tool": "get_browser_screenshot",
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "inspect_page_for_composition" in error
+
+
+def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_continuation() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "expand_result",
+            "navigation_goal": "Click the observed result-row expansion control.",
+        },
+    )
+    evidence = {
+        "inspected_url": "current_page",
+        "current_url": "https://example.com/results?id=123",
+        "forms": [],
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_observation() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "open_form",
+            "navigation_goal": "Open the observed lookup form.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "open_form",
+            "navigation_goal": "Open the observed lookup form.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "submit_search",
+            "navigation_goal": "Fill the observed first-name and last-name fields and submit.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "expand_result",
+            "navigation_goal": "Click the result-row expansion control.",
+        },
+    )
+    evidence = {
+        "inspected_url": "current_page",
+        "current_url": "https://example.com/lookup",
+        "forms": [],
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_allows_extraction_added_with_new_page_changing_block() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "submit_search",
+            "navigation_goal": "Fill the observed search form and submit.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "submit_search",
+            "navigation_goal": "Fill the observed search form and submit.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "expand_result",
+            "navigation_goal": "Click the observed result-row expansion control.",
+        },
+        {
+            "block_type": "extraction",
+            "label": "extract_expanded_result",
+            "data_extraction_goal": "Extract the values visible in the expanded row.",
+        },
+    )
+    evidence = {
+        "inspected_url": "current_page",
+        "current_url": "https://example.com/results",
+        "result_containers": [{"selector": "#results"}],
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_allows_extraction_after_matching_current_page_evidence() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "submit_search",
+            "navigation_goal": "Fill the observed search form and submit.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "submit_search",
+            "navigation_goal": "Fill the observed search form and submit.",
+        },
+        {
+            "block_type": "extraction",
+            "label": "extract_visible_results",
+            "data_extraction_goal": "Extract the values visible on the observed results page.",
+        },
+    )
+    evidence = {
+        "inspected_url": "current_page",
+        "current_url": "https://example.com/results",
+        "result_containers": [{"selector": "#results"}],
+        "source_tool": "inspect_page_for_composition",
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {
+            "block_type": "goto_url",
+            "label": "open_find_record",
+            "url": "https://example.com/registry/",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {
+            "block_type": "goto_url",
+            "label": "open_find_record",
+            "url": "https://example.com/registry/",
+        },
+        {
+            "block_type": "navigation",
+            "label": "search_standard_record",
+            "url": "https://example.com/registry/search",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/registry/search",
+        "current_url": "https://example.com/registry/search",
+        "forms": [],
+        "source_tool": "inspect_page_for_composition",
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_error_names_nearest_url_before_new_page_block() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {
+            "block_type": "goto_url",
+            "label": "open_find_record",
+            "url": "https://example.com/registry/",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {
+            "block_type": "goto_url",
+            "label": "open_find_record",
+            "url": "https://example.com/registry/",
+        },
+        {
+            "block_type": "navigation",
+            "label": "search_standard_record",
+            "url": "https://example.com/registry/search",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    ctx = _Ctx(composition_page_evidence=None)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "target_url='https://example.com/registry/search'" in error
+
+
+def test_composition_gate_rejects_same_origin_browser_observation_before_run_continuation() -> None:
+    existing_yaml = _yaml({"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"})
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/lookup",
+        "current_url": "https://example.com/lookup",
+        "forms": [],
+        "source_tool": "get_browser_screenshot",
+        "observed_after_workflow_run": False,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "inspect_page_for_composition" in error
+
+
 def test_composition_gate_applies_to_edit_turns_that_add_page_dependent_blocks() -> None:
     existing_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
@@ -348,9 +703,37 @@ def test_composition_gate_allows_navigation_after_matching_evidence() -> None:
             "block_type": "navigation",
             "label": "search_lookup",
             "navigation_goal": (
-                "Enter the first name into the observed First Name field, enter the last name into the "
-                "observed Last Name field, then click the observed Search button."
+                "Enter the observed First Name and Last Name fields, then click the observed Search button."
             ),
+            "complete_criterion": "The search results table is visible.",
+        },
+    )
+
+    error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_observation() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "prepare_lookup",
+            "navigation_goal": (
+                "Enter the observed First Name and Last Name fields. Stop with the Search button visible; "
+                "do not submit the form."
+            ),
+        },
+        {
+            "block_type": "navigation",
+            "label": "submit_lookup",
+            "navigation_goal": "Click the observed Search button and wait for the result page.",
+        },
+        {
+            "block_type": "extraction",
+            "label": "extract_results",
+            "data_extraction_goal": "Extract the credential rows from the result page.",
         },
     )
 
