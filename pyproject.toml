@@ -191,7 +191,7 @@ dev = [
     "isort>=5.13.2",
     "mypy>=1.18.2,<2",
     "types-requests>=2.31.0.2,<3",
-    "pytest>=7.4.0,<8",
+    "pytest>=9.0.3,<10",
     "pytest-asyncio>=0.21.1,<0.22",
     "pytest-split>=0.10.0,<1",
     # Needed by tests/unit/test_llm_handler_tracing.py which exercises the LLM
