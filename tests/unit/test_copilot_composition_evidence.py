@@ -366,6 +366,58 @@ def test_composition_gate_accepts_screenshot_evidence_from_inspection_tool() -> 
     assert error is None
 
 
+def test_composition_gate_accepts_structured_evaluate_evidence_on_target_page() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/lookup",
+        "current_url": "https://example.com/lookup",
+        "source_tool": "evaluate",
+        "evidence_sources": ["mcp_evaluate"],
+        "forms": [
+            {
+                "fields": [_field("First Name", "firstName"), _field("Last Name", "lastName")],
+                "submit_controls": [{"text": "Search", "selector": "#search"}],
+            }
+        ],
+    }
+
+    error = composition_page_evidence_error(_Ctx(composition_page_evidence=evidence), workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_accepts_structured_evaluate_same_origin_after_initial_block() -> None:
+    existing_yaml = _yaml({"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"})
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/lookup?s=1&firstSubmit=1",
+        "current_url": "https://example.com/lookup?s=1&firstSubmit=1",
+        "source_tool": "evaluate",
+        "evidence_sources": ["mcp_evaluate"],
+        "forms": [{"fields": [_field("First Name", "firstName")], "submit_controls": []}],
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
 def test_composition_gate_rejects_post_run_browser_observation_outside_inspection_tool() -> None:
     existing_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
@@ -402,6 +454,44 @@ def test_composition_gate_rejects_post_run_browser_observation_outside_inspectio
 
     assert error is not None
     assert "inspect_page_for_composition" in error
+
+
+def test_composition_gate_allows_structured_evaluate_evidence_for_same_origin_continuation() -> None:
+    existing_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields and submit.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "expand_result",
+            "navigation_goal": "Click the observed result-row expansion control.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/results?id=123",
+        "current_url": "https://example.com/results?id=123",
+        "source_tool": "evaluate",
+        "evidence_sources": ["mcp_evaluate"],
+        "result_containers": [{"tag": "table", "selector": "#results"}],
+        "observed_after_workflow_run": True,
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml  # type: ignore[attr-defined]
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
 
 
 def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_continuation() -> None:

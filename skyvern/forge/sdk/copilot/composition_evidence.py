@@ -19,7 +19,8 @@ _BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "
 _PAGE_SHAPING_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "login"})
 _PAGE_READING_BLOCK_TYPES: frozenset[str] = frozenset({"extraction"})
 _SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
-_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition"})
+_STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
+_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition", "evaluate"})
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
@@ -342,6 +343,15 @@ def _same_origin(left: str | None, right: str | None) -> bool:
     return left_parsed.netloc.lower() == right_parsed.netloc.lower()
 
 
+def _has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
+    for key in ("forms", "navigation_targets", "result_containers", "challenge_controls"):
+        value = evidence.get(key)
+        if isinstance(value, list) and value:
+            return True
+    challenge_state = evidence.get("challenge_state")
+    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+
+
 def _evidence_matches_target(
     evidence: dict[str, Any] | None,
     target_url: str | None,
@@ -358,9 +368,17 @@ def _evidence_matches_target(
     if source_tool == _SCHEMA_EVIDENCE_TOOL:
         if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
             return True
+    if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and _has_bounded_page_schema(evidence):
+        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+            return True
+        if allow_post_run_browser_observation and (
+            _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
+        ):
+            return True
     if (
         allow_post_run_browser_observation
         and source_tool in _POST_RUN_CONTINUATION_EVIDENCE_TOOLS
+        and (source_tool == _SCHEMA_EVIDENCE_TOOL or _has_bounded_page_schema(evidence))
         and evidence.get("observed_after_workflow_run") is True
     ):
         return _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)

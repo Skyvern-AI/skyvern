@@ -8,6 +8,7 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
@@ -179,6 +180,8 @@ RUN_BLOCKS_POLL_INTERVAL_SECONDS = 5.0
 # exceptions and removes itself from this set.
 _DETACHED_CLEANUP_TASKS: set[asyncio.Task] = set()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+_EVALUATE_EVIDENCE_CONFIDENCE_WITH_SCHEMA = 0.75
+_EVALUATE_EVIDENCE_CONFIDENCE_ANTIBOT_ONLY = 0.4
 
 
 async def _cancel_run_task_if_not_final(
@@ -3083,6 +3086,175 @@ async def _resolve_url_title(raw: dict[str, Any], ctx: AgentContext) -> tuple[st
     return url, title
 
 
+def _bounded_observation_text(value: object, limit: int = 240) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+@dataclass(frozen=True)
+class _ObservedFieldEvidence:
+    name: str
+    id: str
+    label: str
+    type: str
+    placeholder: str
+    required: bool
+    selector: str
+
+    @classmethod
+    def from_raw(cls, raw_field: dict[str, Any]) -> _ObservedFieldEvidence:
+        label = raw_field.get("label")
+        if not label and isinstance(raw_field.get("labels"), list):
+            label = " ".join(str(item) for item in raw_field["labels"][:2])
+        return cls(
+            name=_bounded_observation_text(raw_field.get("name"), 120),
+            id=_bounded_observation_text(raw_field.get("id"), 120),
+            label=_bounded_observation_text(label, 240),
+            type=_bounded_observation_text(raw_field.get("type"), 40),
+            placeholder=_bounded_observation_text(raw_field.get("placeholder"), 240),
+            required=bool(raw_field.get("required")),
+            selector=_bounded_observation_text(raw_field.get("selector"), 160),
+        )
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "id": self.id,
+            "label": self.label,
+            "type": self.type,
+            "placeholder": self.placeholder,
+            "required": self.required,
+            "selector": self.selector,
+        }
+
+
+def _normalize_observed_fields(raw_fields: object) -> list[dict[str, Any]]:
+    if not isinstance(raw_fields, list):
+        return []
+    fields: list[dict[str, Any]] = []
+    for raw_field in raw_fields[:20]:
+        if not isinstance(raw_field, dict):
+            continue
+        fields.append(_ObservedFieldEvidence.from_raw(raw_field).as_evidence())
+    return fields
+
+
+def _normalize_observed_forms(observed_data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_forms = observed_data.get("forms")
+    forms: list[dict[str, Any]] = []
+    if isinstance(raw_forms, list):
+        for raw_form in raw_forms[:5]:
+            if not isinstance(raw_form, dict):
+                continue
+            fields = _normalize_observed_fields(raw_form.get("fields") or raw_form.get("inputs"))
+            submit_controls = _normalize_observed_fields(
+                raw_form.get("submit_controls") or raw_form.get("buttons") or raw_form.get("submits")
+            )
+            forms.append(
+                {
+                    "id": _bounded_observation_text(raw_form.get("id"), 120),
+                    "name": _bounded_observation_text(raw_form.get("name"), 120),
+                    "action": _bounded_observation_text(raw_form.get("action"), 240),
+                    "method": _bounded_observation_text(raw_form.get("method"), 20),
+                    "fields": fields,
+                    "submit_controls": submit_controls[:10],
+                }
+            )
+    if forms:
+        return forms
+    fields = _normalize_observed_fields(observed_data.get("inputs") or observed_data.get("fields"))
+    if not fields:
+        return []
+    return [{"id": "", "name": "", "action": "", "method": "", "fields": fields, "submit_controls": []}]
+
+
+def _normalize_observed_result_containers(observed_data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_results = observed_data.get("result_containers") or observed_data.get("tables")
+    containers: list[dict[str, Any]] = []
+    if isinstance(raw_results, list):
+        for item in raw_results[:8]:
+            if isinstance(item, dict):
+                containers.append(
+                    {
+                        "tag": _bounded_observation_text(item.get("tag") or item.get("type"), 40),
+                        "id": _bounded_observation_text(item.get("id"), 120),
+                        "selector": _bounded_observation_text(item.get("selector"), 160),
+                    }
+                )
+    if containers:
+        return containers
+    table = observed_data.get("table")
+    if table:
+        return [{"tag": "table", "id": "", "selector": ""}]
+    return []
+
+
+def _normalize_evaluate_page_schema(observed_data: object) -> dict[str, Any]:
+    if not isinstance(observed_data, dict):
+        return {}
+    text_parts = [
+        observed_data.get("body"),
+        observed_data.get("bodyText"),
+        observed_data.get("text"),
+        observed_data.get("html"),
+    ]
+    text = " ".join(part for part in text_parts if isinstance(part, str)).lower()[:4096]
+    anti_bot = [pattern for pattern in _DISCOVERY_ANTI_BOT_PATTERNS if pattern in text]
+    forms = _normalize_observed_forms(observed_data)
+    result_containers = _normalize_observed_result_containers(observed_data)
+    if not forms and not result_containers and not anti_bot:
+        return {}
+    return {
+        "forms": forms,
+        "result_containers": result_containers,
+        "anti_bot_indicators": anti_bot,
+        "evidence_sources": ["mcp_evaluate"],
+        "evidence_confidence": (
+            _EVALUATE_EVIDENCE_CONFIDENCE_WITH_SCHEMA
+            if forms or result_containers
+            else _EVALUATE_EVIDENCE_CONFIDENCE_ANTIBOT_ONLY
+        ),
+    }
+
+
+def _record_browser_observation_evidence(
+    ctx: AgentContext,
+    *,
+    source_tool: str,
+    current_url: str,
+    page_title: str = "",
+    observed_data: object | None = None,
+) -> None:
+    if not current_url:
+        return
+    existing = ctx.composition_page_evidence
+    if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
+        return
+    evidence: dict[str, Any] = {
+        "inspected_url": current_url,
+        "current_url": current_url,
+        "page_title": page_title,
+        "forms": [],
+        "result_containers": [],
+        "anti_bot_indicators": [],
+        "source_tool": source_tool,
+        "observed_after_workflow_run": False,
+    }
+    if source_tool == "get_browser_screenshot":
+        evidence.update(
+            {
+                "evidence_sources": ["screenshot"],
+                "screenshot_used": True,
+            }
+        )
+    elif source_tool == "evaluate":
+        evidence.update(_normalize_evaluate_page_schema(observed_data))
+    run_id = ctx.last_run_blocks_workflow_run_id
+    if isinstance(run_id, str) and run_id:
+        evidence["workflow_run_id"] = run_id
+        evidence["observed_after_workflow_run"] = True
+    ctx.composition_page_evidence = evidence
+
+
 # Block types the copilot must never emit. They delegate the entire goal to
 # a separate agent, which bypasses copilot-level block decomposition and
 # obfuscates issues the copilot should surface/handle directly.
@@ -3406,6 +3578,12 @@ async def _screenshot_post_hook(
             "url": url,
             "title": title,
         }
+        _record_browser_observation_evidence(
+            ctx,
+            source_tool="get_browser_screenshot",
+            current_url=url,
+            page_title=title,
+        )
     return result
 
 
@@ -3452,6 +3630,12 @@ async def _evaluate_post_hook(
             url, _ = await _resolve_url_title(raw, ctx)
             if url:
                 result["data"]["url"] = url
+        _record_browser_observation_evidence(
+            ctx,
+            source_tool="evaluate",
+            current_url=str(result["data"].get("url") or ""),
+            observed_data=result["data"],
+        )
     return result
 
 

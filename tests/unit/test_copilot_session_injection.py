@@ -275,6 +275,8 @@ class TestScreenshotAdapter:
         assert adapted["data"]["screenshot_base64"] == "iVBOR..."
         assert adapted["data"]["url"] == "https://example.com"
         assert adapted["data"]["title"] == "Example"
+        assert ctx.composition_page_evidence["source_tool"] == "get_browser_screenshot"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com"
 
 
 class TestNavigateAdapter:
@@ -347,6 +349,78 @@ class TestEvaluateAdapter:
         }
         result = mcp_to_copilot(mcp_result)
         assert result["data"]["result"] == {"title": "Test"}
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_marks_browser_observation_as_composition_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {
+            "ok": True,
+            "data": {
+                "rows": [{"name": "Test User", "credential": "RBT"}],
+                "text": "Test User RBT",
+            },
+        }
+
+        adapted = await _evaluate_post_hook(result, raw, ctx)
+
+        assert adapted["data"]["url"] == "https://example.com/results"
+        assert ctx.composition_page_evidence["source_tool"] == "evaluate"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com/results"
+        assert ctx.composition_page_evidence["result_containers"] == []
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_lifts_bounded_page_schema_from_mcp_observation(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        raw = {"browser_context": {"url": "https://example.com/lookup", "title": "Lookup"}}
+        result = {
+            "ok": True,
+            "data": {
+                "forms": [
+                    {
+                        "id": "search",
+                        "fields": [
+                            {"label": "First Name", "name": "first_name", "type": "text"},
+                            {"labels": ["Last", "Name"], "name": "last_name", "type": "text", "required": True},
+                        ],
+                        "submit_controls": [{"text": "Search", "selector": "#searchButton"}],
+                    }
+                ],
+                "bodyText": "credential lookup search",
+            },
+        }
+
+        await _evaluate_post_hook(result, raw, ctx)
+
+        assert ctx.composition_page_evidence["source_tool"] == "evaluate"
+        assert ctx.composition_page_evidence["evidence_sources"] == ["mcp_evaluate"]
+        assert ctx.composition_page_evidence["forms"][0]["fields"][0]["label"] == "First Name"
+        assert ctx.composition_page_evidence["forms"][0]["fields"][1]["label"] == "Last Name"
+        assert ctx.composition_page_evidence["forms"][0]["fields"][1]["required"] is True
+        assert ctx.composition_page_evidence["forms"][0]["submit_controls"][0]["selector"] == "#searchButton"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_does_not_overwrite_typed_composition_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        ctx.composition_page_evidence = {
+            "inspected_url": "https://example.com/search",
+            "current_url": "https://example.com/search",
+            "source_tool": "inspect_page_for_composition",
+            "forms": [{"fields": [{"label": "Name"}], "submit_controls": [{"text": "Search"}]}],
+        }
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {"ok": True, "data": {"text": "Test User RBT"}}
+
+        await _evaluate_post_hook(result, raw, ctx)
+
+        assert ctx.composition_page_evidence["source_tool"] == "inspect_page_for_composition"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com/search"
 
 
 class TestUpdateWorkflowDirect:
