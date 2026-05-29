@@ -26,7 +26,6 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.cdp_ports import _release_cdp_port
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
-from skyvern.webeye.vnc_streaming import is_local_vnc_streaming_enabled
 
 LOG = structlog.get_logger()
 
@@ -301,11 +300,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         # screencast/CDP input endpoints can connect. Triggered both by the
         # in-process CDP streaming mode and by cdp-connect, which forwards to a
         # remote browser and still needs a registered BrowserState locally.
-        should_launch = (
-            settings.BROWSER_STREAMING_MODE == "cdp"
-            or is_local_vnc_streaming_enabled()
-            or settings.BROWSER_TYPE == "cdp-connect"
-        )
+        should_launch = settings.BROWSER_STREAMING_MODE == "cdp" or settings.BROWSER_TYPE == "cdp-connect"
         if should_launch and runnable_id is None:
             session_id = session.persistent_browser_session_id
             task = asyncio.create_task(
@@ -513,7 +508,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     async def cleanup_stale_sessions(self) -> None:
         """Close sessions left active by a previous process."""
-        if settings.BROWSER_STREAMING_MODE != "cdp" and not is_local_vnc_streaming_enabled():
+        if settings.BROWSER_STREAMING_MODE != "cdp":
             return
         stale_sessions = await self.database.browser_sessions.get_uncompleted_persistent_browser_sessions()
         for db_session in stale_sessions:

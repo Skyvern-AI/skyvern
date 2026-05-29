@@ -16,7 +16,6 @@ from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.schemas.runs import ProxyLocation
-from skyvern.webeye.vnc_streaming import browser_session_supports_vnc_streaming
 
 LOG = structlog.get_logger()
 
@@ -246,10 +245,9 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
-        vnc_streaming_supported=browser_session_supports_vnc_streaming(
-            browser_address=new_browser_session.browser_address,
-            ip_address=new_browser_session.ip_address,
-        ),
+        vnc_streaming_supported=True if new_browser_session.ip_address else False,
+        # NOTE(jdo:streaming-local-dev)
+        # vnc_streaming_supported=True,
     )
 
     LOG.info(

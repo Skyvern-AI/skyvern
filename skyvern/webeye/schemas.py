@@ -15,7 +15,6 @@ from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
     PersistentBrowserSession,
     PersistentBrowserType,
 )
-from skyvern.webeye.vnc_streaming import browser_session_supports_vnc_streaming
 
 LOG = structlog.get_logger()
 
@@ -141,10 +140,7 @@ class BrowserSessionResponse(BaseModel):
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
             browser_address=browser_session.browser_address,
-            vnc_streaming_supported=browser_session_supports_vnc_streaming(
-                browser_address=browser_session.browser_address,
-                ip_address=browser_session.ip_address,
-            ),
+            vnc_streaming_supported=True if browser_session.ip_address else False,
             app_url=app_url,
             started_at=browser_session.started_at,
             completed_at=browser_session.completed_at,

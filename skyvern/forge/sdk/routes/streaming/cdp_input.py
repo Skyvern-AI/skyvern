@@ -5,17 +5,14 @@ CDP input channel for interactive browser control via Chrome DevTools Protocol.
 import asyncio
 import dataclasses
 import json
-import re
 import time
 import typing as t
-from urllib.parse import urlparse
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
-from playwright.async_api import CDPSession, Page
+from playwright.async_api import CDPSession
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
 from skyvern.forge.sdk.routes.streaming.auth import auth, require_client_id
@@ -40,8 +37,6 @@ _MAX_KEY_LEN = 32
 _MAX_CODE_LEN = 32
 _MODIFIER_MASK = 0xF
 _MAX_VK_CODE = 0xFE
-_MAX_NAVIGATION_URL_LEN = 2048
-_BARE_HOST_PORT_RE = re.compile(r"^[A-Za-z0-9.-]+:\d+(?:[/?#].*)?$")
 
 
 @dataclasses.dataclass
@@ -201,86 +196,10 @@ async def _dispatch_event(
         )
 
 
-def _normalize_navigation_url(raw_url: str) -> str:
-    candidate = raw_url.strip()
-    if not candidate:
-        raise ValueError("URL must not be empty")
-    if len(candidate) > _MAX_NAVIGATION_URL_LEN:
-        raise ValueError("URL is too long")
-    if candidate.lower().startswith("chrome://"):
-        raise ValueError("chrome:// URLs are not allowed")
-    if candidate.startswith("//"):
-        raise ValueError("URL must include an explicit http(s) scheme or host")
-    if _BARE_HOST_PORT_RE.match(candidate):
-        return f"http://{candidate}"
-
-    parsed = urlparse(candidate)
-    if parsed.scheme in ("http", "https"):
-        return candidate
-    if parsed.scheme:
-        raise ValueError(f"refusing to navigate to non-http(s) scheme: {parsed.scheme}")
-    return f"https://{candidate}"
-
-
-async def _dispatch_browser_command(
-    websocket: WebSocket,
-    page: Page,
-    msg: dict,
-    log_id_key: str,
-    log_id_value: str,
-) -> None:
-    command = msg.get("command")
-    try:
-        if command == "reload":
-            await page.reload(wait_until="domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-        elif command == "goBack":
-            await page.go_back(wait_until="domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-        elif command == "goForward":
-            await page.go_forward(wait_until="domcontentloaded", timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
-        elif command == "navigate":
-            raw_url = msg.get("url")
-            if not isinstance(raw_url, str):
-                raise ValueError("URL must be a string")
-            await page.goto(
-                _normalize_navigation_url(raw_url),
-                wait_until="domcontentloaded",
-                timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
-            )
-        else:
-            raise ValueError("unsupported browser command")
-    except Exception as exc:
-        LOG.warning(
-            "CDP input: browser command failed",
-            **{log_id_key: log_id_value},
-            command=command,
-            error=str(exc),
-        )
-        await websocket.send_json(
-            {
-                "kind": "browserCommandResult",
-                "ok": False,
-                "command": command,
-                "error": str(exc),
-                "url": page.url,
-            }
-        )
-        return
-
-    await websocket.send_json(
-        {
-            "kind": "browserCommandResult",
-            "ok": True,
-            "command": command,
-            "url": page.url,
-        }
-    )
-
-
 async def _run_input_loop(
     websocket: WebSocket,
     channel: CdpInputChannel,
     cdp_session: CDPSession,
-    page: Page,
     log_id_key: str,
     log_id_value: str,
 ) -> None:
@@ -306,9 +225,6 @@ async def _run_input_loop(
         if kind == "cede-control":
             channel.interactor = "agent"
             LOG.info("CDP input: cede-control received", **{log_id_key: log_id_value}, client_id=channel.client_id)
-            continue
-        if kind == "browserCommand":
-            await _dispatch_browser_command(websocket, page, msg, log_id_key, log_id_value)
             continue
 
         if channel.interactor != "user":
@@ -398,7 +314,7 @@ async def cdp_input_stream(
         LOG.info("CDP input channel ready", workflow_run_id=workflow_run_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, cdp_session, page, "workflow_run_id", workflow_run_id)
+        await _run_input_loop(websocket, channel, cdp_session, "workflow_run_id", workflow_run_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", workflow_run_id=workflow_run_id)
@@ -474,7 +390,7 @@ async def cdp_input_browser_session_stream(
         LOG.info("CDP input channel ready", browser_session_id=browser_session_id, client_id=client_id)
         await websocket.send_json({"kind": "ready"})
 
-        await _run_input_loop(websocket, channel, cdp_session, page, "browser_session_id", browser_session_id)
+        await _run_input_loop(websocket, channel, cdp_session, "browser_session_id", browser_session_id)
 
     except ConnectionClosedOK:
         LOG.info("CDP input: WS closed cleanly", browser_session_id=browser_session_id)
