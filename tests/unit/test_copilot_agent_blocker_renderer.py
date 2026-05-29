@@ -132,6 +132,18 @@ def test_shim_no_op_when_no_signal() -> None:
     assert overridden is result
 
 
+def test_shim_persists_narrative_payload_for_blocker_terminal() -> None:
+    ctx = _ctx()
+    ctx.turn_id = "turn-1"
+    ctx.blocker_signal = _signal()
+    result = _agent_result()
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+    assert overridden.narrative_payload is not None
+    assert overridden.narrative_payload["turnId"] == "turn-1"
+    assert overridden.narrative_payload["terminal"] == "response"
+    assert overridden.narrative_payload["terminalMessage"] == overridden.user_response
+
+
 def test_shim_overrides_proposal_even_when_pre_override_result_carries_workflow() -> None:
     ctx = _ctx()
     ctx.blocker_signal = _signal()

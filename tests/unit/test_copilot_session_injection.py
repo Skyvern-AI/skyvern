@@ -541,7 +541,14 @@ workflow_definition:
 
 
 class TestWorkflowUpdatePersistence:
-    def test_record_marks_persisted_even_when_workflow_has_zero_blocks(self) -> None:
+    def test_record_marks_last_workflow_but_not_legacy_persisted(self) -> None:
+        """SKY-10318: ``_record_workflow_update_result`` no longer flips the
+        legacy ``workflow_persisted`` flag (canonical write is now gated by
+        ``_update_workflow``'s degraded-path check, not by tool success). The
+        staging-aware signal is ``ctx.has_staged_proposal``, assigned inside
+        ``_update_workflow`` itself rather than this bookkeeping helper. The
+        helper still records ``last_workflow`` and ``last_workflow_yaml`` for
+        downstream callers (e.g. frontier diff, terminal AgentResult)."""
         from skyvern.forge.sdk.copilot.tools import _record_workflow_update_result
 
         ctx = MagicMock()
@@ -563,4 +570,4 @@ class TestWorkflowUpdatePersistence:
 
         assert ctx.last_workflow is workflow
         assert ctx.last_workflow_yaml == "title: Empty workflow"
-        assert ctx.workflow_persisted is True
+        assert ctx.workflow_persisted is False

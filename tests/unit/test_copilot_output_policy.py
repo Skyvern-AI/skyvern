@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1074,18 +1075,20 @@ workflow_definition:
         - azure_credentials
 """
 
-    result = agent_module._translate_to_agent_result(
-        _fake_run_result(
-            {
-                "type": "ASK_QUESTION",
-                "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
-                "global_llm_context": "{}",
-            }
-        ),
-        ctx,
-        "{}",
-        _chat_request(),
-        "org-1",
+    result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            _fake_run_result(
+                {
+                    "type": "ASK_QUESTION",
+                    "user_response": "I found cred_unrelated in an internal tool observation. Should I use it?",
+                    "global_llm_context": "{}",
+                }
+            ),
+            ctx,
+            "{}",
+            _chat_request(),
+            "org-1",
+        )
     )
 
     assert result.response_type == "REPLY"
@@ -1181,12 +1184,14 @@ workflow_definition:
         }
     )
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        _ctx(),
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert agent_result.response_type == "ASK_QUESTION"
@@ -1199,12 +1204,14 @@ workflow_definition:
 def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
     result = _fake_run_result({"type": "REPLY", "user_response": "I used password: hunter2."})
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        _ctx(),
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert agent_result.response_type == "ASK_QUESTION"
@@ -1218,12 +1225,14 @@ def test_translate_to_agent_result_blocks_raw_secret_final_text() -> None:
 def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
     result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        _ctx(),
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
@@ -1254,12 +1263,14 @@ def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
     )
 
     with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
-        agent_result = agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result,
+                _ctx(),
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
         )
 
     assert "task_v2" not in agent_result.user_response
@@ -1296,12 +1307,14 @@ def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxo
         }
     )
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        _ctx(),
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert "wasn't able to produce a workflow proposal" in agent_result.user_response
@@ -1326,12 +1339,14 @@ def test_translate_to_agent_result_rewrites_block_yaml_pasted_in_reply() -> None
     result = _fake_run_result({"type": "REPLY", "user_response": leak})
 
     with patch("skyvern.forge.sdk.copilot.agent.LOG.info") as log_info:
-        agent_result = agent_module._translate_to_agent_result(
-            result,
-            _ctx(),
-            global_llm_context=None,
-            chat_request=_chat_request(),
-            organization_id="org-1",
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result,
+                _ctx(),
+                global_llm_context=None,
+                chat_request=_chat_request(),
+                organization_id="org-1",
+            )
         )
 
     assert "block_type" not in agent_result.user_response
@@ -1364,12 +1379,14 @@ def test_translate_to_agent_result_rewrites_block_yaml_when_workflow_attached() 
     ctx.last_workflow_yaml = _workflow_yaml()
     ctx.last_test_ok = True
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        ctx,
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            ctx,
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert "block_type" not in agent_result.user_response
@@ -1384,12 +1401,14 @@ def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:
     workflow = SimpleNamespace(name="draft")
     result = _fake_run_result({"type": "REPLY", "user_response": "I drafted the workflow."})
 
-    agent_result = agent_module._translate_to_agent_result(
-        result,
-        _ctx(last_workflow=workflow, last_workflow_yaml="title: draft", last_test_ok=None),
-        global_llm_context=None,
-        chat_request=_chat_request(),
-        organization_id="org-1",
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(last_workflow=workflow, last_workflow_yaml="title: draft", last_test_ok=None),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
     )
 
     assert agent_result.updated_workflow is workflow

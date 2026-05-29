@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -562,6 +563,7 @@ class TestShouldRestorePersistedWorkflow:
     def _result(self, *, persisted: bool, updated_workflow: object | None):
         r = MagicMock()
         r.workflow_was_persisted = persisted
+        r.canonical_was_persisted_due_to_param_change = False
         r.updated_workflow = updated_workflow
         r.proposal_disposition = "auto_applicable"
         r.cancelled = False
@@ -763,8 +765,10 @@ class TestTranslateToAgentResultGating:
         ctx = _ctx()
         result = SimpleNamespace(final_output="ASK_QUESTION\nWhich account should I use?", new_items=[])
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.response_type == "ASK_QUESTION"
@@ -790,8 +794,10 @@ class TestTranslateToAgentResultGating:
                 "workflow_yaml": "new: yaml",
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert ctx.last_test_ok is None
@@ -835,8 +841,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         process_mock.assert_not_called()
@@ -861,8 +869,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "here", "workflow_yaml": "::: not yaml"}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert ctx.last_workflow is tested_wf
@@ -884,8 +894,10 @@ workflow_definition:
         )
         specific_question = "I need credentials for site.example — can you link one in Settings?"
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": specific_question})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.user_response == specific_question
@@ -911,8 +923,10 @@ workflow_definition:
         )
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": verbose_response})
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.response_type == "ASK_QUESTION"
@@ -1036,8 +1050,10 @@ workflow_definition:
             last_failure_category_top="NAVIGATION_FAILURE",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All done — your workflow is ready."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "test failed" in agent_result.user_response.lower()
@@ -1055,8 +1071,10 @@ workflow_definition:
             last_test_failure_reason="A verification challenge is preventing submission.",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1075,8 +1093,10 @@ workflow_definition:
             last_test_suspicious_success=True,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1095,8 +1115,10 @@ workflow_definition:
             last_test_ok=None,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Please provide credentials before I continue."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1118,8 +1140,10 @@ workflow_definition:
         )
         response = "I have a draft proposal. Use Review to inspect it, Accept to save it, or Reject it."
         result = _fake_run_result({"type": "REPLY", "user_response": response})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert response in agent_result.user_response
@@ -1143,8 +1167,10 @@ workflow_definition:
                 "goal_reached": False,
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1162,8 +1188,10 @@ workflow_definition:
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1178,8 +1206,10 @@ workflow_definition:
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1198,8 +1228,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLY", "user_response": "Cookie modal blocked the form.", "goal_reached": "false"}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1213,8 +1245,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLY", "user_response": "I couldn't find the form.", "goal_reached": False}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1224,8 +1258,10 @@ workflow_definition:
     def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
         ctx = _ctx(last_test_ok=None)
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "here's the workflow" not in agent_result.user_response.lower()
@@ -1250,8 +1286,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "here's the workflow" not in agent_result.user_response.lower()
@@ -1269,8 +1307,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "Required context was unavailable: the workflow run ID and the block run results." in (
@@ -1300,8 +1340,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "Required context was unavailable: the current browser tab or page state." in agent_result.user_response
@@ -1314,8 +1356,10 @@ workflow_definition:
                 "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "initial part of your workflow" not in agent_result.user_response.lower()
@@ -1328,8 +1372,10 @@ workflow_definition:
         wf = SimpleNamespace(name="drafted")
         ctx = _ctx(last_workflow=wf, last_workflow_yaml="title: drafted", last_test_ok=True)
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.user_response == "Here's the workflow."
@@ -1348,8 +1394,10 @@ workflow_definition:
             last_test_failure_reason="A verification challenge is preventing submission.",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Tried but blocked.", "goal_reached": False})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1370,8 +1418,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
         )
-        agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert captured["yaml"] == "raw: yaml"
@@ -1393,8 +1443,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
         )
-        agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert captured["yaml"] == "raw: yaml"
@@ -1405,8 +1457,10 @@ workflow_definition:
         verified_wf = SimpleNamespace(name="verified-partial")
         ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="verified: yaml", last_test_ok=True)
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Need credentials before I can continue."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1419,8 +1473,10 @@ workflow_definition:
         # prior persisted proposal so reload stays coherent.
         ctx = _ctx()
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which site?"})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1432,8 +1488,10 @@ workflow_definition:
         verified_wf = SimpleNamespace(name="final")
         ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="final: yaml", last_test_ok=True)
         result = _fake_run_result({"type": "REPLY", "user_response": "Here you go."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is verified_wf
@@ -2508,8 +2566,10 @@ workflow_definition:
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
