@@ -5203,6 +5203,15 @@
   },
   "components": {
     "schemas": {
+      "AIFallbackMode": {
+        "type": "string",
+        "enum": [
+          "fallback",
+          "proactive"
+        ],
+        "title": "AIFallbackMode",
+        "description": "Controls how an action block uses a CSS/XPath selector relative to AI.\n\n- `fallback`: attempt the selector first; fall back to AI on failure.\n- `proactive`: always use AI; the selector (if any) is a hint only.\n\nWhen `selector` is None, both modes degrade to AI-only — the difference\nis purely semantic (whether the author expected to have a selector here)."
+      },
       "AWSSecretParameter": {
         "properties": {
           "parameter_type": {
@@ -6105,6 +6114,21 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector"
+          },
+          "ai_fallback": {
+            "$ref": "#/components/schemas/AIFallbackMode",
+            "default": "fallback"
           }
         },
         "type": "object",
@@ -6196,6 +6220,21 @@
               }
             ],
             "title": "Navigation Goal"
+          },
+          "selector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selector"
+          },
+          "ai_fallback": {
+            "$ref": "#/components/schemas/AIFallbackMode",
+            "default": "fallback"
           },
           "error_code_mapping": {
             "anyOf": [
