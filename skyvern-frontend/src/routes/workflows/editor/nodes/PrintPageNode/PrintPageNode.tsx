@@ -46,7 +46,7 @@ function PrintPageNode({ id, data }: NodeProps<PrintPageNode>) {
       />
       <div
         className={cn(
-          "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all motion-reduce:transition-none",
+          "w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
           open ? "shadow-md" : "shadow-sm",
           {
             "pointer-events-none": thisBlockIsPlaying,
