@@ -31,30 +31,11 @@ ORG_ID = "o_test"
 WPID = "wpid_alpha"
 
 
-async def _enable_partial_unique_indexes(engine: AsyncEngine) -> None:
-    """SQLite ignores postgresql_where, so the model's partial unique indexes
-    become full unique indexes. Drop them and re-create with WHERE clauses so
-    test behavior matches Postgres semantics.
-    """
-    async with engine.begin() as conn:
-        await conn.exec_driver_sql("DROP INDEX IF EXISTS workflow_tag_events_active_set_unique")
-        await conn.exec_driver_sql(
-            "CREATE UNIQUE INDEX workflow_tag_events_active_set_unique "
-            "ON workflow_tag_events (organization_id, workflow_permanent_id, key) "
-            "WHERE superseded_at IS NULL AND event_type = 'set'"
-        )
-        await conn.exec_driver_sql("DROP INDEX IF EXISTS ix_tag_keys_org_key_active")
-        await conn.exec_driver_sql(
-            "CREATE UNIQUE INDEX ix_tag_keys_org_key_active ON tag_keys (organization_id, key) WHERE deleted_at IS NULL"
-        )
-
-
 @pytest_asyncio.fixture
 async def engine() -> AsyncGenerator[AsyncEngine]:
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    await _enable_partial_unique_indexes(eng)
     yield eng
     await eng.dispose()
 
@@ -406,3 +387,122 @@ async def test_value_can_contain_colons(repo: TagsRepository) -> None:
         "jira_ticket": "PROJ-1234:bugfix",
         "captured_at": "2026-05-25T18:30:00Z",
     }
+
+
+# ---------------------------- Phase 3 read helpers ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_active_tags_for_workflows_batch(repo: TagsRepository) -> None:
+    """Batch read groups rows by wpid and applies the org filter."""
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_beta", ORG_ID, sets={"team": "growth"}, deletes=set(), context=_ctx())
+    # Different org for the same wpid — must not bleed across.
+    await repo.apply_tag_changes(WPID, "o_other", sets={"secret": "leak"}, deletes=set(), context=_ctx("other"))
+
+    result = await repo.get_active_tags_for_workflows([WPID, "wpid_beta", "wpid_missing"], ORG_ID)
+    assert result == {WPID: {"env": "prod"}, "wpid_beta": {"team": "growth"}}
+
+
+@pytest.mark.asyncio
+async def test_get_active_tags_for_workflows_empty_input(repo: TagsRepository) -> None:
+    assert await repo.get_active_tags_for_workflows([], ORG_ID) == {}
+
+
+@pytest.mark.asyncio
+async def test_list_tag_keys_orders_alphabetically(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"zeta": "1", "alpha": "2", "mu": "3"}, deletes=set(), context=_ctx()
+    )
+    rows = await repo.list_tag_keys(ORG_ID)
+    assert [r.key for r in rows] == ["alpha", "mu", "zeta"]
+
+
+@pytest.mark.asyncio
+async def test_list_tag_keys_excludes_other_orgs(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"a": "1"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes(WPID, "o_other", sets={"b": "2"}, deletes=set(), context=_ctx("other"))
+    rows = await repo.list_tag_keys(ORG_ID)
+    assert [r.key for r in rows] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_update_tag_key_description_sets_value(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    row = await repo.update_tag_key_description(ORG_ID, "env", "deployment environment")
+    assert row is not None
+    assert row.description == "deployment environment"
+
+
+@pytest.mark.asyncio
+async def test_update_tag_key_description_unknown_returns_none(repo: TagsRepository) -> None:
+    row = await repo.update_tag_key_description(ORG_ID, "never_seen", "x")
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_update_tag_key_description_org_scoped(repo: TagsRepository) -> None:
+    """Updating in one org must not match a same-keyed row in another org."""
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    row = await repo.update_tag_key_description("o_other", "env", "shouldn't find")
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_get_tag_event_history_filters_by_since(repo: TagsRepository) -> None:
+    """`since` is inclusive; events earlier than the cutoff are excluded."""
+    from datetime import datetime, timezone
+
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    cutoff = datetime.now(timezone.utc)
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "stage"}, deletes=set(), context=_ctx())
+
+    events = await repo.get_tag_event_history(WPID, ORG_ID, since=cutoff)
+    # Only the second SET is at-or-after cutoff.
+    assert len(events) == 1
+    assert events[0].value == "stage"
+
+
+@pytest.mark.asyncio
+async def test_get_tag_event_history_filters_by_key(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod", "team": "growth"}, deletes=set(), context=_ctx())
+    events = await repo.get_tag_event_history(WPID, ORG_ID, key="team")
+    assert {e.key for e in events} == {"team"}
+
+
+# ---------------------------- Race-safe TagKeyModel registration (RISK-2) ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_changes_idempotent_when_tag_key_already_exists(repo: TagsRepository) -> None:
+    """A concurrent first-use writer that beat us to registering the TagKey
+    must not surface IntegrityError. Simulated by pre-inserting the row out
+    of band, then running apply_tag_changes for the same key — the
+    ON CONFLICT DO NOTHING path swallows the conflict."""
+    async with repo.Session() as session:
+        session.add(TagKeyModel(organization_id=ORG_ID, key="env"))
+        await session.commit()
+
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    # Still exactly one TagKeyModel row — the duplicate insert was swallowed.
+    async with repo.Session() as session:
+        keys = (
+            (
+                await session.execute(
+                    select(TagKeyModel).where(TagKeyModel.organization_id == ORG_ID).where(TagKeyModel.key == "env")
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(keys) == 1
+    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
+
+
+@pytest.mark.asyncio
+async def test_apply_tag_changes_registers_new_key_when_absent(repo: TagsRepository) -> None:
+    """Same code path, normal case: no existing TagKey row, INSERT proceeds
+    and the registry gets the new entry."""
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    assert await _registered_keys(repo) == ["env"]
