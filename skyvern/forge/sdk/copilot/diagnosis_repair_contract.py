@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 _TEXT_MAX = 240
 _SUMMARY_MAX = 180
@@ -103,7 +106,7 @@ def build_diagnosis_repair_contract(
     *,
     source_tool: str,
     result: dict[str, Any],
-    ctx: Any,
+    ctx: CopilotContext,
     workflow_updated: bool = False,
 ) -> DiagnosisRepairContract:
     data = _dict(result.get("data")) if isinstance(result, dict) else {}
@@ -320,7 +323,7 @@ def _failure_type(
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
 
 
-def _next_action(failure_type: DiagnosisFailureType, ctx: Any, data: dict[str, Any]) -> RepairNextAction:
+def _next_action(failure_type: DiagnosisFailureType, ctx: CopilotContext, data: dict[str, Any]) -> RepairNextAction:
     if failure_type == DiagnosisFailureType.NO_FAILURE:
         return RepairNextAction.NO_CHANGE
     if (
@@ -330,7 +333,13 @@ def _next_action(failure_type: DiagnosisFailureType, ctx: Any, data: dict[str, A
         return RepairNextAction.ASK
     if failure_type == DiagnosisFailureType.UNRECOVERABLE_TOOL_ERROR:
         return RepairNextAction.STOP
-    if getattr(ctx, "last_test_non_retriable_nav_error", None):
+    if ctx.last_test_non_retriable_nav_error:
+        return RepairNextAction.STOP
+    if getattr(ctx, "last_test_anti_bot", None) and failure_type in {
+        DiagnosisFailureType.FAILED_RUN,
+        DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE,
+        DiagnosisFailureType.SUSPICIOUS_SUCCESS,
+    }:
         return RepairNextAction.STOP
     authority = getattr(getattr(ctx, "turn_intent", None), "authority", None)
     if getattr(authority, "requires_user_input", False) or getattr(authority, "may_update_workflow", True) is False:

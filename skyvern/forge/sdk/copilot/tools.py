@@ -855,6 +855,96 @@ def _pending_reconciliation_no_input_signal(*, pending_run_id: str, blocked_tool
 # repeated-frontier streak in failure_tracking.py uses STOP_AT=3 for the same
 # shape of escalation.
 REPEATED_ACTION_STREAK_ABORT_AT = 3
+MAX_CHALLENGE_GATED_PROXY_RETRIES = 1
+
+_STRUCTURED_BLOCKER_KEY_TERMS: frozenset[str] = frozenset(
+    {
+        "blocker",
+        "blocked",
+        "captcha",
+        "challenge",
+        "human_verification",
+        "verification",
+    }
+)
+_STRUCTURED_BLOCKER_MESSAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "blocker_message",
+        "blocked_message",
+        "captcha_message",
+        "challenge_message",
+        "human_verification_message",
+    }
+)
+_ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
+    "access denied",
+    "anti-bot",
+    "bot block",
+    "captcha",
+    "challenge",
+    "human verification",
+    "verify you are human",
+)
+
+
+def _normalize_structured_key(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _looks_like_anti_bot_blocker(text: str) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in _ANTI_BOT_BLOCKER_TERMS)
+
+
+def _structured_blocker_message(value: object, *, depth: int = 0) -> str | None:
+    if depth > 5:
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = _normalize_structured_key(key)
+            if not isinstance(item, str) or not item.strip():
+                continue
+            has_blocker_key = normalized_key in _STRUCTURED_BLOCKER_MESSAGE_KEYS or any(
+                term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS
+            )
+            if has_blocker_key or (
+                normalized_key in {"message", "error", "failure_reason", "reason"}
+                and _looks_like_anti_bot_blocker(item)
+            ):
+                return item.strip()[:240]
+        for item in value.values():
+            nested = _structured_blocker_message(item, depth=depth + 1)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for item in value:
+            nested = _structured_blocker_message(item, depth=depth + 1)
+            if nested:
+                return nested
+    return None
+
+
+def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return None
+    direct = _structured_blocker_message({key: value for key, value in data.items() if key != "blocks"})
+    if direct:
+        return direct
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("block_type")
+        if block_type not in _DATA_PRODUCING_BLOCK_TYPES or block.get("status") != "completed":
+            continue
+        payload = _block_data_payload(block.get("extracted_data"), block_type)
+        blocker = _structured_blocker_message(payload)
+        if blocker:
+            return blocker
+    return None
 
 
 def _is_meaningful_extracted_data(extracted: Any) -> bool:
@@ -1065,6 +1155,27 @@ def _mark_page_inspected(ctx: AgentContext) -> None:
     ctx.post_budget_page_inspection_run_id = None
 
 
+def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
+    run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    if not isinstance(run_id, str) or not run_id:
+        return
+    ctx.post_run_page_observation_tool = source_tool
+    ctx.post_run_page_observation_url = url
+    ctx.post_run_page_observation_workflow_run_id = run_id
+    ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+
+
+def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
+    if not use_current_page:
+        return False
+    run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    if not isinstance(run_id, str) or not run_id:
+        return False
+    if getattr(ctx, "last_test_ok", None) is None:
+        return False
+    return getattr(ctx, "post_run_current_page_inspection_workflow_run_id", None) != run_id
+
+
 def _post_budget_page_inspection_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
     if getattr(ctx, "post_budget_page_inspection_required", False) is not True:
         return None
@@ -1076,10 +1187,11 @@ def _post_budget_page_inspection_signal(ctx: AgentContext, tool_name: str) -> Co
     agent_steering = (
         f"The prior PER_TOOL_BUDGET run{run_text} advanced the live browser{url_text}. "
         "Before another block-running tool, inspect the current browser page with "
-        'inspect_page_for_composition(target_url="current_page"), evaluate, or get_browser_screenshot. '
-        "If the observed page evidence already contains the requested result or a no-results state, "
-        "answer from that evidence instead of rerunning the search. If evidence shows a missing page-state "
-        "change, then run only the smaller missing block after that inspection."
+        'inspect_page_for_composition(target_url="current_page"). Generic screenshot/evaluate reads can '
+        "help answer the user, but they do not satisfy the bounded page-evidence contract for workflow "
+        "mutations. If the observed page evidence already contains the requested result or a no-results "
+        "state, answer from that evidence instead of rerunning the search. If evidence shows a missing "
+        "page-state change, then run only the smaller missing block after that inspection."
     )
     user_facing = "I need to inspect the current page state before running more steps."
     return CopilotToolBlockerSignal(
@@ -1087,10 +1199,105 @@ def _post_budget_page_inspection_signal(ctx: AgentContext, tool_name: str) -> Co
         agent_steering_text=agent_steering,
         user_facing_reason=user_facing,
         recovery_hint="retry_with_different_tool",
-        cleared_by_tools=PAGE_INSPECTION_TOOLS,
+        cleared_by_tools=PAGE_SCHEMA_CONTEXT_TOOLS,
         preserves_workflow_draft=True,
         renders_final_reply=False,
         internal_reason_code="tool_error_post_budget_page_inspection_required",
+        blocked_tool=tool_name,
+    )
+
+
+def _proxy_value_signature(value: object) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _anti_bot_retry_changes_proxy(ctx: AgentContext, arguments: dict[str, Any] | None) -> bool:
+    if not isinstance(arguments, dict):
+        return False
+    workflow_yaml = arguments.get("workflow_yaml")
+    if not isinstance(workflow_yaml, str) or not workflow_yaml.strip():
+        return False
+
+    prior_yaml = getattr(ctx, "last_failed_workflow_yaml", None) or getattr(ctx, "workflow_yaml", None)
+    if not isinstance(prior_yaml, str) or not prior_yaml.strip():
+        return False
+
+    new_proxy_present, new_proxy = _raw_yaml_proxy_location(workflow_yaml)
+    if not new_proxy_present:
+        return False
+    old_proxy_present, old_proxy = _raw_yaml_proxy_location(prior_yaml)
+    return (not old_proxy_present) or _proxy_value_signature(new_proxy) != _proxy_value_signature(old_proxy)
+
+
+def _challenge_gated_proxy_retry_allowed(ctx: AgentContext, arguments: dict[str, Any] | None) -> bool:
+    if not _anti_bot_retry_changes_proxy(ctx, arguments):
+        return False
+    retry_count = getattr(ctx, "challenge_gated_proxy_retry_count", 0)
+    if not isinstance(retry_count, int):
+        retry_count = 0
+    if retry_count >= MAX_CHALLENGE_GATED_PROXY_RETRIES:
+        return False
+    ctx.challenge_gated_proxy_retry_count = retry_count + 1
+    return True
+
+
+def _last_run_has_terminal_anti_bot_blocker(ctx: AgentContext) -> bool:
+    anti_bot_reason = getattr(ctx, "last_test_anti_bot", None)
+    if not isinstance(anti_bot_reason, str) or not anti_bot_reason.strip():
+        return False
+    failure_reason = getattr(ctx, "last_test_failure_reason", None)
+    if not isinstance(failure_reason, str) or not failure_reason.strip():
+        return False
+    lowered = failure_reason.lower()
+    if "blocker" in lowered and _looks_like_anti_bot_blocker(lowered):
+        return True
+
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    challenge_state = evidence.get("challenge_state") if isinstance(evidence, dict) else None
+    challenge_gates_submit = isinstance(challenge_state, dict) and challenge_state.get("gates_submit_controls") is True
+    if not (challenge_gates_submit or "challenge-gated disabled submit/search control" in anti_bot_reason):
+        return False
+
+    return "disabled" in lowered and any(
+        term in lowered for term in ("submit", "search", "button", "control", "element")
+    )
+
+
+def _challenge_gated_anti_bot_rerun_signal(
+    ctx: AgentContext,
+    arguments: dict[str, Any] | None,
+    tool_name: str,
+) -> CopilotToolBlockerSignal | None:
+    if not _last_run_has_terminal_anti_bot_blocker(ctx):
+        return None
+    if tool_name == "update_and_run_blocks" and _challenge_gated_proxy_retry_allowed(ctx, arguments):
+        return None
+
+    failure_reason = getattr(ctx, "last_test_failure_reason", "")
+    agent_steering = (
+        "The prior run confirmed an anti-bot challenge or blocker on the submit/search path, "
+        f"and the latest failure_reason was: {str(failure_reason)[:240]}. Do NOT call "
+        f"{tool_name} again with the same workflow/browser path. REPLY now with a blocker "
+        "explanation that names the observed challenge/blocker or disabled submit/search control "
+        "and describes what was tried. "
+        "Ask whether to try a materially different proxy/location, entrypoint, or alternate source."
+    )
+    user_facing = (
+        "The site's verification challenge is still keeping the search control disabled, so I need to stop "
+        "instead of retrying the same workflow path."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=False,
+        internal_reason_code="tool_error_challenge_gated_submit_disabled",
         blocked_tool=tool_name,
     )
 
@@ -1149,6 +1356,10 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         upstream_replay_signal = _post_budget_upstream_replay_signal(ctx, arguments, tool_name)
         if upstream_replay_signal is not None:
             return _emit_tool_blocker_signal(ctx, upstream_replay_signal)
+
+        challenge_signal = _challenge_gated_anti_bot_rerun_signal(ctx, arguments, tool_name)
+        if challenge_signal is not None:
+            return _emit_tool_blocker_signal(ctx, challenge_signal)
 
         streak_raw = getattr(ctx, "repeated_action_fingerprint_streak_count", 0)
         streak = streak_raw if isinstance(streak_raw, int) else 0
@@ -2788,12 +2999,17 @@ async def _watchdog_error_message(
             f"the cancelled run actually completed (the in-flight block was cancelled "
             f"mid-execution and may have left partial side effects). If the result "
             f"includes a current_url, inspect that current page before any further "
-            f'block-running call. Use inspect_page_for_composition(target_url="current_page"), '
-            f"evaluate, or get_browser_screenshot to decide whether the answer is already "
-            f"visible or which page-state change is still missing. Only then call "
-            f"update_and_run_blocks with a smaller chain — the first 1-2 unverified "
-            f"blocks. Verified-prefix state is preserved, so the next call only re-runs "
-            f"from the new frontier. Do NOT retry the same chain unchanged — a longer "
+            f'block-running call with inspect_page_for_composition(target_url="current_page"). '
+            f"Generic screenshot/evaluate reads can help answer the user, but they do not "
+            f"satisfy the bounded page-evidence contract for workflow mutations. Use the "
+            f"bounded evidence to decide whether the answer is already visible, whether "
+            f"a challenge-gated submit/search control is still disabled, or which page-state "
+            f"change is still missing. If challenge_state.gates_submit_controls=true and "
+            f"the requested answer is not visible, stop and report the observed anti-bot "
+            f"blocker instead of retrying the same solve/wait/submit chain. Only then call "
+            f"update_and_run_blocks with a smaller chain — the first 1-2 unverified blocks. "
+            f"Verified-prefix state is preserved, so the next call only re-runs from the new frontier. "
+            f"Do NOT retry the same chain unchanged — a longer "
             f"run won't fit either."
         )
         current_url, _ = await _fallback_page_info(ctx)
@@ -3732,6 +3948,7 @@ def _record_composition_page_observation(
 ) -> None:
     if not url:
         return
+    _mark_post_run_page_observed(ctx, source_tool=source_tool, url=url)
     existing = ctx.composition_page_evidence
     if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
         return
@@ -3924,7 +4141,7 @@ def _detect_new_banned_blocks(
 
 
 _CHALLENGE_WAIT_PATTERN = re.compile(
-    r"\b(anti[-_\s]?bot|bot[-_\s]?block|captcha|challenge|cloudflare|ip[-_\s]?block|waf)\b",
+    r"\b(anti[-_\s]?bot|bot[-_\s]?block|captcha|challenge|human[-_\s]?verification|ip[-_\s]?block|waf)\b",
     re.IGNORECASE,
 )
 
@@ -4362,9 +4579,23 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
 
 
+def _last_update_is_single_goto_bootstrap(copilot_ctx: CopilotContext) -> bool:
+    last_workflow = copilot_ctx.last_workflow
+    definition = _workflow_definition_as_dict(last_workflow.workflow_definition if last_workflow is not None else None)
+    blocks = definition.get("blocks")
+    if not isinstance(blocks, list) or len(blocks) != 1:
+        return False
+    block = blocks[0]
+    if not isinstance(block, dict):
+        return False
+    return str(block.get("block_type") or "").strip().lower() == "goto_url"
+
+
 def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
     block_count = getattr(copilot_ctx, "last_update_block_count", None)
     if not isinstance(block_count, int):
+        return None
+    if block_count == 1 and _last_update_is_single_goto_bootstrap(copilot_ctx):
         return None
 
     user_message = getattr(copilot_ctx, "user_message", "")
@@ -4445,6 +4676,9 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
             if block_type in _DATA_PRODUCING_BLOCK_TYPES and block.get("status") == "completed":
                 has_data_blocks = True
                 payload = _block_data_payload(block.get("extracted_data"), block_type)
+                structured_blocker = _structured_blocker_message(payload)
+                if structured_blocker:
+                    texts_to_scan.append(structured_blocker)
                 if _is_meaningful_extracted_data(payload):
                     any_data_output = True
 
@@ -4466,13 +4700,38 @@ def _composition_anti_bot_reason(copilot_ctx: object) -> str | None:
         return None
     indicators = evidence.get("anti_bot_indicators")
     challenge_controls = evidence.get("challenge_controls")
+    challenge_state = evidence.get("challenge_state")
     normalized_indicators = (
         [str(item) for item in indicators if isinstance(item, str)] if isinstance(indicators, list) else []
     )
     control_count = len(challenge_controls) if isinstance(challenge_controls, list) else 0
-    if not normalized_indicators and control_count == 0:
+    challenge_detected = isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+    if not normalized_indicators and control_count == 0 and not challenge_detected:
         return None
-    details = ", ".join(normalized_indicators[:4]) or f"{control_count} challenge control(s)"
+    detail_parts = normalized_indicators[:4]
+    if isinstance(challenge_state, dict):
+        state_indicators = challenge_state.get("indicators")
+        if isinstance(state_indicators, list):
+            detail_parts.extend(str(item) for item in state_indicators if isinstance(item, str))
+        challenge_kind = challenge_state.get("kind")
+        if isinstance(challenge_kind, str) and challenge_kind and challenge_kind != "none":
+            detail_parts.append(challenge_kind)
+        gated_controls = challenge_state.get("gated_submit_controls")
+        if challenge_state.get("gates_submit_controls") is True:
+            gated_control_items = gated_controls if isinstance(gated_controls, list) else []
+            control_labels = [
+                str(item.get("text") or item.get("value") or item.get("id") or item.get("name") or item.get("selector"))
+                for item in gated_control_items
+                if isinstance(item, dict)
+                and (
+                    item.get("text") or item.get("value") or item.get("id") or item.get("name") or item.get("selector")
+                )
+            ]
+            labels = ", ".join(list(dict.fromkeys(control_labels))[:3]) or "submit/search control"
+            detail_parts.append(f"challenge-gated disabled submit/search control: {labels}")
+    if control_count:
+        detail_parts.append(f"{control_count} challenge control(s)")
+    details = ", ".join(list(dict.fromkeys(detail_parts))[:6])
     return f"Observed anti-bot challenge evidence before the run: {details}"
 
 
@@ -4546,7 +4805,13 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
     copilot_ctx.last_failure_category_top = None
     copilot_ctx.last_test_non_retriable_nav_error = None
+    copilot_ctx.post_run_page_observation_tool = None
+    copilot_ctx.post_run_page_observation_url = None
+    copilot_ctx.post_run_page_observation_workflow_run_id = None
+    copilot_ctx.post_run_page_observation_after_failed_test = False
+    copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
 
+    structured_blocker = _run_blocks_structured_blocker_message(result)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
     if not anti_bot_match:
         anti_bot_match = _composition_anti_bot_reason(copilot_ctx)
@@ -4580,6 +4845,26 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
+        if structured_blocker:
+            failure_reason = f"Run completed, but extracted data reported a blocker: {structured_blocker}"
+            copilot_ctx.last_test_ok = False
+            copilot_ctx.last_test_suspicious_success = True
+            copilot_ctx.last_test_failure_reason = failure_reason
+            copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+            if not copilot_ctx.last_test_anti_bot and _looks_like_anti_bot_blocker(structured_blocker):
+                copilot_ctx.last_test_anti_bot = f"Extracted data reported anti-bot blocker: {structured_blocker[:160]}"
+            data = result.get("data")
+            if isinstance(data, dict):
+                data.setdefault("failure_reason", failure_reason)
+                if copilot_ctx.last_test_anti_bot and not failure_categories:
+                    anti_bot_category = {
+                        "category": "ANTI_BOT_DETECTION",
+                        "confidence_float": 0.7,
+                        "reasoning": "Structured extracted data reported an anti-bot blocker.",
+                    }
+                    data["failure_categories"] = [anti_bot_category]
+            update_repeated_failure_state(copilot_ctx, result)
+            return
         if empty_data_blocks:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
@@ -5158,12 +5443,13 @@ _DISCOVERY_PASSWORD_INPUT_RE = re.compile(
     re.IGNORECASE,
 )
 _DISCOVERY_ANTI_BOT_PATTERNS = (
-    "cloudflare",
     "just a moment",
     "captcha",
+    "challenge",
+    "human-verification",
+    "human verification",
     "verify you are human",
     "access denied",
-    "akamai",
     "are you a robot",
 )
 
@@ -5634,7 +5920,16 @@ async def _inspect_page_for_composition_impl(
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
 
-    if copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET:
+    use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
+    bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
+        copilot_ctx,
+        use_current_page=use_current_page,
+    )
+
+    if (
+        not bypass_budget_for_post_run_current_page
+        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
+    ):
         result = {
             "ok": False,
             "data": None,
@@ -5648,7 +5943,7 @@ async def _inspect_page_for_composition_impl(
         return result
 
     cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
+    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
         result = {
             "ok": False,
             "data": None,
@@ -5657,7 +5952,6 @@ async def _inspect_page_for_composition_impl(
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
 
-    use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     entry_url: str
     kind: str
     if use_current_page:
@@ -5739,8 +6033,11 @@ async def _inspect_page_for_composition_impl(
             "workflow_run_id": run_id,
             "observed_after_workflow_run": True,
         }
+        _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
 
     copilot_ctx.page_inspection_calls_this_turn += 1
+    if bypass_budget_for_post_run_current_page:
+        copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence
     _mark_page_inspected(copilot_ctx)
     result = {"ok": True, "data": evidence}
@@ -6093,7 +6390,9 @@ async def inspect_page_for_composition_tool(
     evidence is sufficient, compose and run workflow blocks from the observed fields.
     If challenge_state.gates_submit_controls is true, treat challenge resolution
     as a prerequisite for submit/search; do not click a submit control while the
-    latest inspected evidence says it is disabled.
+    latest inspected evidence says it is disabled. If a later test still leaves
+    that submit/search control disabled after a challenge-resolution attempt,
+    report the observed anti-bot blocker rather than retrying the same flow.
     """
     result = await _inspect_page_for_composition_impl(ctx.context, target_url)
     return json.dumps(result)
