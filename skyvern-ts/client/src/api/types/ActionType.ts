@@ -18,10 +18,13 @@ export const ActionType = {
     Extract: "extract",
     VerificationCode: "verification_code",
     GotoUrl: "goto_url",
+    GoBack: "go_back",
+    GoForward: "go_forward",
     Scroll: "scroll",
     Keypress: "keypress",
     Move: "move",
     Drag: "drag",
     LeftMouse: "left_mouse",
+    ExecuteJs: "execute_js",
 } as const;
 export type ActionType = (typeof ActionType)[keyof typeof ActionType];

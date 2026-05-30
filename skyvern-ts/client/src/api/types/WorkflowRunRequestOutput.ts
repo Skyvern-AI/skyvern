@@ -2,20 +2,12 @@
 
 import type * as Skyvern from "../index.js";
 
-export interface TaskRunRequest {
-    /**
-     * The goal or task description for Skyvern to accomplish
-     */
-    prompt: string;
-    /**
-     * The starting URL for the task. If not provided, Skyvern will attempt to determine an appropriate URL
-     */
-    url?: string;
-    /**
-     * The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
-     */
-    engine?: Skyvern.RunEngine;
-    /** The title for the task */
+export interface WorkflowRunRequestOutput {
+    /** ID of the workflow to run. Workflow ID starts with `wpid_`. */
+    workflow_id: string;
+    /** Parameters to pass to the workflow */
+    parameters?: Record<string, unknown>;
+    /** The title for this workflow run */
     title?: string;
     /**
      * Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -32,6 +24,7 @@ export interface TaskRunRequest {
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_KR: South Korea
+     * - RESIDENTIAL_SA: Saudi Arabia
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
@@ -48,56 +41,44 @@ export interface TaskRunRequest {
      * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
      * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
+     *
+     * For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
      *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */
-    proxy_location?: TaskRunRequest.ProxyLocation;
-    /**
-     * The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
-     */
-    data_extraction_schema?: TaskRunRequest.DataExtractionSchema;
-    /**
-     * Custom mapping of error codes to error messages if Skyvern encounters an error.
-     */
-    error_code_mapping?: Record<string, string | undefined>;
-    /**
-     * Maximum number of steps the task can take. Task will fail if it exceeds this number. Cautions: you are charged per step so please set this number to a reasonable value. Contact sales@skyvern.com for custom pricing.
-     */
-    max_steps?: number;
-    /**
-     * After a run is finished, send an update to this URL. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for more details.
-     */
+    proxy_location?: WorkflowRunRequestOutput.ProxyLocation;
+    /** URL to send workflow status updates to after a run is finished. Refer to https://www.skyvern.com/docs/running-tasks/webhooks-faq for webhook questions. */
     webhook_url?: string;
-    /**
-     * Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
-     */
-    totp_identifier?: string;
     /**
      * URL that serves TOTP/2FA/MFA codes for Skyvern to use during the workflow run. Refer to https://www.skyvern.com/docs/credentials/totp#option-2-get-code-from-your-endpoint for more details.
      */
     totp_url?: string;
     /**
-     * Run the task or workflow in the specific Skyvern browser session. Having a browser session can persist the real-time state of the browser, so that the next run can continue from where the previous run left off.
+     * Identifier for the TOTP/2FA/MFA code when the code is pushed to Skyvern. Refer to https://www.skyvern.com/docs/credentials/totp#option-3-push-code-to-skyvern for more details.
      */
+    totp_identifier?: string;
+    /** ID of a Skyvern browser session to reuse, having it continue from the current screen state */
     browser_session_id?: string;
-    /**
-     * Optional model configuration.
-     */
-    model?: Record<string, unknown>;
-    /** The extra HTTP headers for the requests in browser. */
-    extra_http_headers?: Record<string, string | undefined>;
-    /** Whether to publish this task as a reusable workflow. Only available for skyvern-2.0. */
-    publish_workflow?: boolean;
-    /** Whether to include action history when verifying that the task is complete */
-    include_action_history_in_verification?: boolean;
+    /** ID of a browser profile to reuse for this workflow run */
+    browser_profile_id?: string;
     /** The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot. */
     max_screenshot_scrolls?: number;
-    /** The CDP address for the task. */
+    /** Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours. */
+    max_elapsed_time_minutes?: number;
+    /** The extra HTTP headers for the requests in browser. */
+    extra_http_headers?: Record<string, string | undefined>;
+    /** HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites. */
+    cdp_connect_headers?: Record<string, string | undefined>;
+    /** The CDP address for the workflow run. */
     browser_address?: string;
-    /** Whether to run the task with agent or code. Null means use the default. */
+    /** Whether to fallback to AI if the workflow run fails. */
+    ai_fallback?: boolean;
+    /** Whether to run the workflow with agent or code. Null inherits from the workflow setting. */
     run_with?: string;
+    /** String key/value metadata to attach to this workflow run for analytics tag filtering. */
+    run_metadata?: Record<string, string | undefined>;
 }
 
-export namespace TaskRunRequest {
+export namespace WorkflowRunRequestOutput {
     /**
      *
      * Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -114,6 +95,7 @@ export namespace TaskRunRequest {
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_KR: South Korea
+     * - RESIDENTIAL_SA: Saudi Arabia
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
@@ -130,12 +112,9 @@ export namespace TaskRunRequest {
      * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
      * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
+     *
+     * For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
      *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
      */
     export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
-    /**
-     *
-     * The schema for data to be extracted from the webpage. If you're looking for consistent data schema being returned by the agent, it's highly recommended to use https://json-schema.org/.
-     */
-    export type DataExtractionSchema = Record<string, unknown> | unknown[] | string;
 }

@@ -21,6 +21,9 @@ from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .for_loop_block_data_schema import ForLoopBlockDataSchema
 from .for_loop_block_loop_over import ForLoopBlockLoopOver
+from .google_sheets_read_block_parameters_item import GoogleSheetsReadBlockParametersItem
+from .google_sheets_write_block_parameters_item import GoogleSheetsWriteBlockParametersItem
+from .google_sheets_write_block_write_mode import GoogleSheetsWriteBlockWriteMode
 from .http_request_block_parameters_item import HttpRequestBlockParametersItem
 from .human_interaction_block_data_schema import HumanInteractionBlockDataSchema
 from .human_interaction_block_parameters_item import HumanInteractionBlockParametersItem
@@ -51,6 +54,7 @@ class WhileLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -72,6 +76,7 @@ class WhileLoopBlockLoopBlocksItem_Action(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -91,6 +96,7 @@ class WhileLoopBlockLoopBlocksItem_Code(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameters: typing.Optional[typing.List[CodeBlockParametersItem]] = None
@@ -113,6 +119,7 @@ class WhileLoopBlockLoopBlocksItem_Conditional(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     branch_conditions: typing.Optional[typing.List[BranchCondition]] = None
 
@@ -134,6 +141,7 @@ class WhileLoopBlockLoopBlocksItem_DownloadToS3(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
@@ -155,6 +163,7 @@ class WhileLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -176,6 +185,7 @@ class WhileLoopBlockLoopBlocksItem_Extraction(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -195,6 +205,7 @@ class WhileLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -216,6 +227,7 @@ class WhileLoopBlockLoopBlocksItem_FileDownload(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -235,6 +247,7 @@ class WhileLoopBlockLoopBlocksItem_FileUpload(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
@@ -264,6 +277,7 @@ class WhileLoopBlockLoopBlocksItem_FileUrlParser(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: typing.Optional[FileType] = None
@@ -287,8 +301,9 @@ class WhileLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
+    loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
     loop_variable_reference: typing.Optional[str] = None
     complete_if_empty: typing.Optional[bool] = None
@@ -304,7 +319,61 @@ class WhileLoopBlockLoopBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
-from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
+class WhileLoopBlockLoopBlocksItem_GoogleSheetsRead(UniversalBaseModel):
+    block_type: typing.Literal["google_sheets_read"] = "google_sheets_read"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    spreadsheet_url: str
+    sheet_name: typing.Optional[str] = None
+    range: typing.Optional[str] = None
+    credential_id: typing.Optional[str] = None
+    has_header_row: typing.Optional[bool] = None
+    parameters: typing.Optional[typing.List[GoogleSheetsReadBlockParametersItem]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WhileLoopBlockLoopBlocksItem_GoogleSheetsWrite(UniversalBaseModel):
+    block_type: typing.Literal["google_sheets_write"] = "google_sheets_write"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    spreadsheet_url: str
+    sheet_name: typing.Optional[str] = None
+    range: typing.Optional[str] = None
+    credential_id: typing.Optional[str] = None
+    write_mode: typing.Optional[GoogleSheetsWriteBlockWriteMode] = None
+    values: typing.Optional[str] = None
+    column_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
+    create_sheet_if_missing: typing.Optional[bool] = None
+    parameters: typing.Optional[typing.List[GoogleSheetsWriteBlockParametersItem]] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
 
 
 class WhileLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
@@ -315,6 +384,7 @@ class WhileLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: str
@@ -336,6 +406,7 @@ class WhileLoopBlockLoopBlocksItem_GotoUrl(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -355,6 +426,7 @@ class WhileLoopBlockLoopBlocksItem_HttpRequest(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -385,6 +457,7 @@ class WhileLoopBlockLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -406,6 +479,7 @@ class WhileLoopBlockLoopBlocksItem_HumanInteraction(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None
@@ -433,6 +507,7 @@ class WhileLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -454,6 +529,7 @@ class WhileLoopBlockLoopBlocksItem_Login(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -473,6 +549,7 @@ class WhileLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -494,6 +571,7 @@ class WhileLoopBlockLoopBlocksItem_Navigation(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -513,6 +591,7 @@ class WhileLoopBlockLoopBlocksItem_PdfParser(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -535,6 +614,7 @@ class WhileLoopBlockLoopBlocksItem_PrintPage(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     include_timestamp: typing.Optional[bool] = None
     custom_filename: typing.Optional[str] = None
@@ -561,6 +641,7 @@ class WhileLoopBlockLoopBlocksItem_SendEmail(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     smtp_host: AwsSecretParameter
     smtp_port: AwsSecretParameter
@@ -590,6 +671,7 @@ class WhileLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -611,6 +693,7 @@ class WhileLoopBlockLoopBlocksItem_Task(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -630,6 +713,7 @@ class WhileLoopBlockLoopBlocksItem_TaskV2(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
@@ -656,6 +740,7 @@ class WhileLoopBlockLoopBlocksItem_TextPrompt(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
@@ -680,6 +765,7 @@ class WhileLoopBlockLoopBlocksItem_UploadToS3(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
@@ -701,6 +787,7 @@ class WhileLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -722,6 +809,7 @@ class WhileLoopBlockLoopBlocksItem_Validation(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
+    include_extracted_text: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -741,35 +829,10 @@ class WhileLoopBlockLoopBlocksItem_Wait(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: int
     parameters: typing.Optional[typing.List[WaitBlockParametersItem]] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-class WhileLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
-    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    output_parameter: OutputParameter
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    disable_cache: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    workflow_permanent_id: str
-    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    wait_for_completion: typing.Optional[bool] = None
-    browser_session_id: typing.Optional[str] = None
-    use_parent_browser_session: typing.Optional[bool] = None
-    parameters: typing.Optional[typing.List[WorkflowTriggerBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -789,9 +852,41 @@ class WhileLoopBlockLoopBlocksItem_WhileLoop(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["WhileLoopBlockLoopBlocksItem"]
     condition: WhileLoopBlockCondition
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+from .for_loop_block import ForLoopBlock  # noqa: E402, F401, I001
+from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
+
+
+class WhileLoopBlockLoopBlocksItem_WorkflowTrigger(UniversalBaseModel):
+    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    output_parameter: OutputParameter
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    workflow_permanent_id: str
+    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    wait_for_completion: typing.Optional[bool] = None
+    browser_session_id: typing.Optional[str] = None
+    use_parent_browser_session: typing.Optional[bool] = None
+    parameters: typing.Optional[typing.List[WorkflowTriggerBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -815,6 +910,8 @@ WhileLoopBlockLoopBlocksItem = typing.Union[
     WhileLoopBlockLoopBlocksItem_FileUpload,
     WhileLoopBlockLoopBlocksItem_FileUrlParser,
     WhileLoopBlockLoopBlocksItem_ForLoop,
+    WhileLoopBlockLoopBlocksItem_GoogleSheetsRead,
+    WhileLoopBlockLoopBlocksItem_GoogleSheetsWrite,
     WhileLoopBlockLoopBlocksItem_GotoUrl,
     WhileLoopBlockLoopBlocksItem_HttpRequest,
     WhileLoopBlockLoopBlocksItem_HumanInteraction,
@@ -832,11 +929,15 @@ WhileLoopBlockLoopBlocksItem = typing.Union[
     WhileLoopBlockLoopBlocksItem_WhileLoop,
     WhileLoopBlockLoopBlocksItem_WorkflowTrigger,
 ]
+from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
+
 update_forward_refs(WhileLoopBlockLoopBlocksItem_Action)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_Code)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_Extraction)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_FileDownload)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_ForLoop)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GoogleSheetsRead)
+update_forward_refs(WhileLoopBlockLoopBlocksItem_GoogleSheetsWrite)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_GotoUrl)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_HttpRequest)
 update_forward_refs(WhileLoopBlockLoopBlocksItem_HumanInteraction)

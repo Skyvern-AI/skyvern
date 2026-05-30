@@ -24,6 +24,7 @@ export interface CreateBrowserSessionRequest {
      * - RESIDENTIAL_NZ: New Zealand
      * - RESIDENTIAL_PH: Philippines
      * - RESIDENTIAL_KR: South Korea
+     * - RESIDENTIAL_SA: Saudi Arabia
      * - RESIDENTIAL_ZA: South Africa
      * - RESIDENTIAL_AR: Argentina
      * - RESIDENTIAL_AU: Australia
@@ -40,12 +41,56 @@ export interface CreateBrowserSessionRequest {
      * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
      * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
      * - NONE: No proxy
+     *
+     * For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
      */
-    proxy_location?: Skyvern.ProxyLocation;
+    proxy_location?: CreateBrowserSessionRequest.ProxyLocation;
     /** A list of extensions to install in the browser session. */
     extensions?: Skyvern.Extensions[];
     /** The type of browser to use for the session. */
     browser_type?: Skyvern.PersistentBrowserType;
     /** ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`. */
     browser_profile_id?: string;
+}
+
+export namespace CreateBrowserSessionRequest {
+    /**
+     *
+     * Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
+     *
+     * Available geotargeting options:
+     * - RESIDENTIAL: the default value. Skyvern Cloud uses a random US residential proxy.
+     * - RESIDENTIAL_ES: Spain
+     * - RESIDENTIAL_IE: Ireland
+     * - RESIDENTIAL_GB: United Kingdom
+     * - RESIDENTIAL_IN: India
+     * - RESIDENTIAL_JP: Japan
+     * - RESIDENTIAL_FR: France
+     * - RESIDENTIAL_DE: Germany
+     * - RESIDENTIAL_NZ: New Zealand
+     * - RESIDENTIAL_PH: Philippines
+     * - RESIDENTIAL_KR: South Korea
+     * - RESIDENTIAL_SA: Saudi Arabia
+     * - RESIDENTIAL_ZA: South Africa
+     * - RESIDENTIAL_AR: Argentina
+     * - RESIDENTIAL_AU: Australia
+     * - RESIDENTIAL_BR: Brazil
+     * - RESIDENTIAL_TR: Turkey
+     * - RESIDENTIAL_CA: Canada
+     * - RESIDENTIAL_MX: Mexico
+     * - RESIDENTIAL_IT: Italy
+     * - RESIDENTIAL_NL: Netherlands
+     * - RESIDENTIAL_ISP: ISP proxy
+     * - US-CA: California (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-NY: New York (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-TX: Texas (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
+     * - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
+     * - NONE: No proxy
+     *
+     * For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
+     *  Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}, or a custom proxy URL dict for self-hosted deployments: {"url": "http://user:password@proxy.example.com:8080"}
+     */
+    export type ProxyLocation = Skyvern.ProxyLocation | Skyvern.GeoTarget | Record<string, unknown>;
 }

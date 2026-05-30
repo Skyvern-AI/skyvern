@@ -10,9 +10,9 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .file_info import FileInfo
 from .run_status import RunStatus
 from .script_run_response import ScriptRunResponse
-from .task_run_request import TaskRunRequest
+from .task_run_request_output import TaskRunRequestOutput
 from .task_run_response_output import TaskRunResponseOutput
-from .workflow_run_request import WorkflowRunRequest
+from .workflow_run_request_output import WorkflowRunRequestOutput
 from .workflow_run_response_output import WorkflowRunResponseOutput
 
 
@@ -23,6 +23,7 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -37,7 +38,7 @@ class GetRunResponse_TaskV1(UniversalBaseModel):
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     step_count: typing.Optional[int] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -56,6 +57,7 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -70,7 +72,7 @@ class GetRunResponse_TaskV2(UniversalBaseModel):
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     step_count: typing.Optional[int] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -89,6 +91,7 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -103,7 +106,7 @@ class GetRunResponse_OpenaiCua(UniversalBaseModel):
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     step_count: typing.Optional[int] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -122,6 +125,7 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -136,7 +140,7 @@ class GetRunResponse_AnthropicCua(UniversalBaseModel):
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     step_count: typing.Optional[int] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -155,6 +159,7 @@ class GetRunResponse_UiTars(UniversalBaseModel):
     output: typing.Optional[TaskRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -169,7 +174,41 @@ class GetRunResponse_UiTars(UniversalBaseModel):
     script_run: typing.Optional[ScriptRunResponse] = None
     errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
     step_count: typing.Optional[int] = None
-    run_request: typing.Optional[TaskRunRequest] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class GetRunResponse_YutoriNavigator(UniversalBaseModel):
+    run_type: typing.Literal["yutori_navigator"] = "yutori_navigator"
+    run_id: str
+    status: RunStatus
+    output: typing.Optional[TaskRunResponseOutput] = None
+    downloaded_files: typing.Optional[typing.List[FileInfo]] = None
+    recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
+    screenshot_urls: typing.Optional[typing.List[str]] = None
+    failure_reason: typing.Optional[str] = None
+    created_at: dt.datetime
+    modified_at: dt.datetime
+    queued_at: typing.Optional[dt.datetime] = None
+    started_at: typing.Optional[dt.datetime] = None
+    finished_at: typing.Optional[dt.datetime] = None
+    app_url: typing.Optional[str] = None
+    browser_session_id: typing.Optional[str] = None
+    browser_profile_id: typing.Optional[str] = None
+    max_screenshot_scrolls: typing.Optional[int] = None
+    script_run: typing.Optional[ScriptRunResponse] = None
+    errors: typing.Optional[typing.List[typing.Dict[str, typing.Optional[typing.Any]]]] = None
+    step_count: typing.Optional[int] = None
+    run_request: typing.Optional[TaskRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -188,6 +227,7 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     output: typing.Optional[WorkflowRunResponseOutput] = None
     downloaded_files: typing.Optional[typing.List[FileInfo]] = None
     recording_url: typing.Optional[str] = None
+    recording_archived: typing.Optional[bool] = None
     screenshot_urls: typing.Optional[typing.List[str]] = None
     failure_reason: typing.Optional[str] = None
     created_at: dt.datetime
@@ -204,7 +244,8 @@ class GetRunResponse_WorkflowRun(UniversalBaseModel):
     step_count: typing.Optional[int] = None
     run_with: typing.Optional[str] = None
     ai_fallback: typing.Optional[bool] = None
-    run_request: typing.Optional[WorkflowRunRequest] = None
+    script_id: typing.Optional[str] = None
+    run_request: typing.Optional[WorkflowRunRequestOutput] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -222,5 +263,6 @@ GetRunResponse = typing.Union[
     GetRunResponse_OpenaiCua,
     GetRunResponse_AnthropicCua,
     GetRunResponse_UiTars,
+    GetRunResponse_YutoriNavigator,
     GetRunResponse_WorkflowRun,
 ]
