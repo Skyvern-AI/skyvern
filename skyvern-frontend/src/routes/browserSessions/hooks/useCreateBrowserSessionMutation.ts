@@ -40,10 +40,15 @@ function useCreateBrowserSessionMutation() {
       );
     },
     onSuccess: (response) => {
+      const session = response.data;
+      queryClient.setQueryData(
+        ["browserSession", session.browser_session_id],
+        session,
+      );
       queryClient.invalidateQueries({
         queryKey: ["browser_sessions"],
       });
-      navigate(`/browser-session/${response.data.browser_session_id}`);
+      navigate(`/browser-session/${session.browser_session_id}`);
     },
     onError: (error: unknown) => {
       let errorMessage =
