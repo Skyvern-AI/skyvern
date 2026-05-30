@@ -155,6 +155,52 @@ def test_streaming_smoke_test_requires_api_key(monkeypatch: pytest.MonkeyPatch) 
     assert "No API key" in result.detail
 
 
+def test_llm_provider_check_reports_qianfan_missing_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "ENABLE_QIANFAN=true",
+                "LLM_KEY=QIANFAN_ERNIE_5_0",
+                "",
+            ]
+        )
+    )
+    monkeypatch.delenv("QIANFAN_API_KEY", raising=False)
+
+    result = doctor_module._check_llm_config()
+
+    assert result.status == "error"
+    assert "Enabled: QIANFAN" in result.detail
+    assert "QIANFAN_API_KEY" in result.detail
+
+
+def test_llm_provider_check_accepts_qianfan_with_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "ENABLE_QIANFAN=true",
+                "QIANFAN_API_KEY=test-key",
+                "LLM_KEY=QIANFAN_ERNIE_5_0",
+                "",
+            ]
+        )
+    )
+
+    result = doctor_module._check_llm_config()
+
+    assert result.status == "ok"
+    assert "LLM_KEY=QIANFAN_ERNIE_5_0" in result.detail
+    assert "enabled: QIANFAN" in result.detail
+
+
 def test_compose_database_connection_can_satisfy_database_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -947,6 +947,33 @@ if settings.ENABLE_VOLCENGINE:
         ),
     )
 
+if settings.ENABLE_QIANFAN:
+    qianfan_models = {
+        "QIANFAN_ERNIE_5_1": ("ernie-5.1", False, 65536),
+        "QIANFAN_ERNIE_5_0": ("ernie-5.0", True, 65536),
+        "QIANFAN_ERNIE_4_5_TURBO_128K": ("ernie-4.5-turbo-128k", False, 12288),
+        "QIANFAN_ERNIE_4_5_TURBO_VL": ("ernie-4.5-turbo-vl", True, 16384),
+    }
+
+    for llm_key, (model, supports_vision, max_completion_tokens) in qianfan_models.items():
+        model_name = f"openai/{model}"
+        LLMConfigRegistry.register_config(
+            llm_key,
+            LLMConfig(
+                model_name,
+                ["QIANFAN_API_KEY"],
+                litellm_params=LiteLLMParams(
+                    api_key=settings.QIANFAN_API_KEY,
+                    api_base=settings.QIANFAN_API_BASE,
+                    api_version=None,
+                    model_info={"model_name": model_name},
+                ),
+                supports_vision=supports_vision,
+                add_assistant_prefix=False,
+                max_completion_tokens=max_completion_tokens,
+            ),
+        )
+
 if settings.ENABLE_YUTORI:
     LLMConfigRegistry.register_config(
         "YUTORI_NAVIGATOR",
