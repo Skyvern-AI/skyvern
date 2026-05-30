@@ -253,7 +253,7 @@ async def run_task(
         data_extraction_schema = run_request.data_extraction_schema
         navigation_goal = run_request.prompt
         navigation_payload = None
-        if not url:
+        if not url and not run_request.use_current_page:
             task_generation = await task_v1_service.generate_task(
                 user_prompt=run_request.prompt,
                 organization=current_org,
@@ -286,6 +286,7 @@ async def run_task(
             extra_http_headers=run_request.extra_http_headers,
             cdp_connect_headers=run_request.cdp_connect_headers,
             browser_address=run_request.browser_address,
+            use_current_page=run_request.use_current_page,
         )
         task_v1_response = await task_v1_service.run_task(
             task=task_v1_request,

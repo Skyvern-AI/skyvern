@@ -86,6 +86,7 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        use_current_page: bool = False,
     ) -> None:
         if self.browser_context is None:
             LOG.info("creating browser context")
@@ -127,7 +128,7 @@ class RealBrowserState(BrowserState):
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url and page.url.rstrip("/") != url.rstrip("/"):
+            if url and not use_current_page and page.url.rstrip("/") != url.rstrip("/"):
                 await self.navigate_to_url(page=page, url=url)
 
     async def _wait_for_settle(self) -> None:
@@ -257,6 +258,7 @@ class RealBrowserState(BrowserState):
         cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
+        use_current_page: bool = False,
     ) -> Page:
         page = await self.get_working_page()
         if page is not None:
@@ -275,6 +277,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                use_current_page=use_current_page,
             )
         except Exception as e:
             error_message = e.error_message if isinstance(e, FailedToNavigateToUrl) else str(e)
@@ -297,6 +300,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                use_current_page=use_current_page,
             )
         page = await self.__assert_page()
 
@@ -316,6 +320,7 @@ class RealBrowserState(BrowserState):
                 cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
+                use_current_page=use_current_page,
             )
             page = await self.__assert_page()
         return page
