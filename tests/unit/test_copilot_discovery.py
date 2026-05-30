@@ -116,6 +116,50 @@ class _DeepLinkAntiBotRecoveryServer:
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
+class _EmbeddedChallengeUsefulPageServer:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            if self.urls[-1] == "https://certboard.test":
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Certification Board</title></head>
+                        <body><a href="/registry/search">Find a Certificant</a></body></html>
+                        """
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html>
+                      <head>
+                        <title>Certificant Registry</title>
+                        <script src="https://challenges.example.test/turnstile/api.js"></script>
+                      </head>
+                      <body>
+                        <form>
+                          <label for="first-name">First Name</label>
+                          <input id="first-name" name="first_name">
+                          <label for="last-name">Last Name</label>
+                          <input id="last-name" name="last_name">
+                        </form>
+                      </body>
+                    </html>
+                    """
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
 class _CurrentPageServer:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -206,6 +250,25 @@ async def test_discovery_recovers_from_deep_link_anti_bot_by_clicking_from_origi
         "direct_deep_link_anti_bot",
         "anchor_match",
         "anchor_match",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_keeps_candidate_when_challenge_markup_is_embedded_in_useful_page() -> None:
+    server = _EmbeddedChallengeUsefulPageServer()
+
+    result = await _discovery_walk(
+        _Ctx(server),
+        entry_url="https://certboard.test",
+        intent_hint="find certificant lookup page",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://certboard.test/registry/search"
+    assert result["data"]["failure_reason"] is None
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "First Name", "name": "first_name", "type": "input", "value_hint": ""},
+        {"label": "Last Name", "name": "last_name", "type": "input", "value_hint": ""},
     ]
 
 
