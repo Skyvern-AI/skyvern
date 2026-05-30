@@ -112,6 +112,30 @@ class TestFailedTestResponseNormalization:
         assert _pre_run_workflow_coverage_error(ctx) is None
         assert ctx.coverage_nudge_count == 0
 
+    def test_pre_run_coverage_guard_allows_single_goto_bootstrap(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Go to example.com, fill the search form, and extract the results.",
+            request_policy=SimpleNamespace(completion_contract="complete when result rows are extracted"),
+            last_update_block_count=1,
+            last_workflow=SimpleNamespace(
+                workflow_definition={
+                    "blocks": [
+                        {
+                            "label": "open_search_page",
+                            "block_type": "goto_url",
+                            "url": "https://example.com/search",
+                        }
+                    ]
+                }
+            ),
+            coverage_nudge_count=0,
+        )
+
+        assert _pre_run_workflow_coverage_error(ctx) is None
+        assert ctx.coverage_nudge_count == 0
+
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
 

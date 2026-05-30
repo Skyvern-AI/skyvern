@@ -55,6 +55,8 @@ def test_agent_prompt_accounts_for_observed_challenges_without_blind_waits() -> 
     assert "Use `get_browser_screenshot` when DOM evidence identifies a challenge" in rendered
     assert "Prefer explicit challenge handling available to Skyvern over blind waits" in rendered
     assert "report the observed blocker instead of retrying the same flow" in rendered
+    assert "challenge_state.gates_submit_controls=true" in rendered
+    assert "submit/search control disabled" in rendered
 
 
 def test_agent_prompt_continues_from_observed_state_after_budgeted_runs() -> None:
