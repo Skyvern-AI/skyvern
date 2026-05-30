@@ -29,6 +29,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         max_steps_override: int | None,
         api_key: str | None,
         browser_session_id: str | None,
+        llm_api_key: str | None = None,
         **kwargs: dict,
     ) -> None:
         LOG.info("Executing task using background task executor", task_id=task_id)
@@ -68,6 +69,7 @@ class BackgroundTaskExecutor(AsyncExecutor):
         context.organization_id = organization_id
         context.max_steps_override = max_steps_override
         context.max_screenshot_scrolls = task.max_screenshot_scrolls
+        context.llm_api_key = llm_api_key
 
         if background_tasks:
             await initialize_skyvern_state_file(task_id=task_id, organization_id=organization_id)

@@ -942,6 +942,8 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            if context and context.llm_api_key:
+                parameters["api_key"] = context.llm_api_key
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -1607,6 +1609,9 @@ class LLMAPIHandlerFactory:
                 )
 
             context = skyvern_context.current()
+            if context and context.llm_api_key:
+                parameters["api_key"] = context.llm_api_key
+                active_parameters["api_key"] = context.llm_api_key
             is_speculative_step = step.is_speculative if step else False
             should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
                 step, is_speculative_step, task_v2, thought, ai_suggestion
@@ -2220,6 +2225,8 @@ class LLMCaller:
             active_parameters.update(self.llm_config.litellm_params)  # type: ignore
 
         context = skyvern_context.current()
+        if context and context.llm_api_key:
+            active_parameters["api_key"] = context.llm_api_key
         is_speculative_step = step.is_speculative if step else False
         should_persist_llm_artifacts, artifact_targets = _get_artifact_targets_and_persist_flag(
             step, is_speculative_step, task_v2, thought, ai_suggestion
