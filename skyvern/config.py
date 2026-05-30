@@ -439,6 +439,7 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str | None = None
     GROQ_API_BASE: str = "https://api.groq.com/openai/v1"
+    GROQ_SUPPORTS_VISION: bool = False
 
     # MOONSHOT AI
     ENABLE_MOONSHOT: bool = False

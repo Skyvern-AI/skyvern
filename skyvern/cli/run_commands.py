@@ -209,7 +209,14 @@ def run_ui(
 
     try:
         console.print("📦 [bold blue]Running npm install...[/bold blue]")
-        subprocess.run("npm install --silent", shell=True, check=True)
+        npm_result = subprocess.run("npm install", shell=True, capture_output=True, text=True)
+        if npm_result.returncode != 0:
+            if npm_result.stdout:
+                console.print(npm_result.stdout)
+            if npm_result.stderr:
+                console.print(f"[red]{npm_result.stderr}[/red]")
+            console.print("[bold red]Error running UI server: npm install failed[/bold red]")
+            return
         console.print("✅ [green]npm install complete.[/green]")
         console.print("🚀 [bold blue]Starting npm UI server...[/bold blue]")
         subprocess.run("npm run start", shell=True, check=True)

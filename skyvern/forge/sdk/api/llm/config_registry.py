@@ -1870,7 +1870,7 @@ if settings.ENABLE_GROQ:
             LLMConfig(
                 f"groq/{groq_model_name}",
                 ["GROQ_API_KEY", "GROQ_MODEL"],
-                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                supports_vision=settings.GROQ_SUPPORTS_VISION,
                 add_assistant_prefix=False,
                 max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
                 litellm_params=LiteLLMParams(
