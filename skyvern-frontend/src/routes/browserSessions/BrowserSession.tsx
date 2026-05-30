@@ -32,6 +32,7 @@ import {
   type StreamMode,
 } from "@/routes/streaming/StreamDiagnostics";
 
+import { getBrowserSessionRefetchIntervalMs } from "./browserSessionQueryUtils";
 import { BrowserSessionDownloads } from "./BrowserSessionDownloads";
 import { BrowserSessionVideo } from "./BrowserSessionVideo";
 import { BrowserSessionStream } from "./BrowserSessionStream";
@@ -72,7 +73,7 @@ function BrowserSession() {
       return response.data;
     },
     refetchInterval: (query) =>
-      query.state.data?.status === "running" ? 5000 : false,
+      getBrowserSessionRefetchIntervalMs(query.state.data?.status),
   });
 
   const browserSession = query.data;
