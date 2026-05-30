@@ -27,7 +27,7 @@ spec:
                 name: skyvern-backend
                 port:
                   number: 8000
-          - path: /artifacts
+          - path: /artifact
             pathType: Prefix
             backend:
               service:
