@@ -391,38 +391,33 @@ def _switch_target_specs() -> list[SwitchTargetSpec]:
 
 
 def _entry_kind(entry: dict | None) -> str:
-    if not entry:
-        return "missing"
+    if entry is None:
+        return "unsupported"
 
-    command_name = Path(str(entry.get("command", ""))).name.lower()
+    entry_type = entry.get("type")
+
+    command = entry.get("command", "")
+    command_name = Path(command).name if command else ""
     args = entry.get("args", [])
     if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
         return "mcp-remote bridge"
 
-  entry_type = entry.get("type")
+    if entry_type == "local":
+        return "local stdio"
 
-if entry_type == "local":
-    return "local stdio"
+    if entry_type in {"http", "remote"}:
+        return "remote http"
 
-if entry_type in {"http", "remote"}:
-    return "remote http"
+    if entry.get("type") == "http" or "url" in entry or isinstance(entry.get("http_headers"), dict):
+        return "remote http"
 
-entry_type = entry.get("type")
+    if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
+        return "local stdio"
 
-if entry_type == "local":
-    return "local stdio"
-
-if entry_type in {"http", "remote"}:
-    return "remote http"
-
-if isinstance(entry.get("env"), dict) or isinstance(entry.get("environment"), dict):
-    return "local stdio"
-
-if "url" in entry or isinstance(entry.get("http_headers"), dict):
-    return "remote http"
+    if "url" in entry or isinstance(entry.get("http_headers"), dict):
+        return "remote http"
 
     return "unsupported"
-
 
 def _extract_entry_api_key(entry: dict) -> str:
     headers = entry.get("headers", {})
@@ -437,8 +432,9 @@ def _extract_entry_api_key(entry: dict) -> str:
         if isinstance(api_key, str):
             return api_key
 
-    env = entry.get("environment")
-    if env is None:
+    if entry.get("type") == "local":
+        env = entry.get("environment") or entry.get("env", {})
+    else:
         env = entry.get("env", {})
 
     if isinstance(env, dict):
@@ -579,12 +575,11 @@ def _select_profile(profile_name: str | None, discovered: list[SwitchTarget]) ->
 def _entry_location(entry: dict) -> str:
     kind = _entry_kind(entry)
     if kind == "local stdio":
-    env = entry.get("environment")
-    if env is None:
-        env = entry.get("env", {})
-
-    if isinstance(env, dict):
-        return str(env.get("SKYVERN_BASE_URL", ""))
+        env = entry.get("environment")
+        if env is None:
+            env = entry.get("env", {})
+        if isinstance(env, dict):              
+            return str(env.get("SKYVERN_BASE_URL", ""))
 
     if kind == "remote http":
         return str(entry.get("url", ""))
