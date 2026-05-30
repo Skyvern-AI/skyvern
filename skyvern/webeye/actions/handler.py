@@ -120,7 +120,6 @@ from skyvern.webeye.cdp_download_interceptor import (
     is_download_response,
     normalize_download_filename,
 )
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -1405,10 +1404,6 @@ async def handle_sequential_click_for_dropdown(
         without_screenshots=True,
         action_history=action_history_str,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        non_vision_page_context=await build_non_vision_page_context_if_needed(
-            scraped_page=scraped_page_after_open,
-            page=page,
-        ),
         lean_compress_long_href=lean_enabled,
         lean_compress_image_src=lean_enabled,
         lean_strip_url_query_strings=lean_enabled,
@@ -4170,7 +4165,6 @@ async def sequentially_select_from_dropdown(
             elements="".join(json_to_html(element) for element in secondary_increment_element),
             select_history=json.dumps(build_sequential_select_history(select_history)),
             local_datetime=datetime.now(ensure_context().tz_info).isoformat(),
-            non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
         )
         llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
         json_response = await llm_api_handler(
@@ -4757,7 +4751,6 @@ async def locate_dropdown_menu(
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
         dropdown_confirm_prompt = prompt_engine.load_prompt(
             "opened-dropdown-confirm",
-            non_vision_page_context=await build_non_vision_page_context_if_needed(page=skyvern_frame.get_frame()),
         )
         LOG.debug(
             "Confirm if it's an opened dropdown menu",
@@ -5187,7 +5180,6 @@ async def extract_information_for_navigation_goal(
         extracted_text=extracted_text_for_prompt,
         error_code_mapping_str=error_code_mapping_str,
         local_datetime=local_datetime_str,
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page_refreshed),
     )
 
     # Self-heal guard: on the second retry onward (``retry_index > 1``) the
@@ -5235,7 +5227,6 @@ async def extract_information_for_navigation_goal(
             previous_extracted_information=post_ceiling_kwargs["previous_extracted_information"],
             llm_key=llm_key_override,
             workflow_system_prompt=task.workflow_system_prompt,
-            non_vision_page_context=post_ceiling_kwargs.get("non_vision_page_context"),
         )
         if is_retry_step:
             # Proactively evict the in-run entry. The cross-run tier will be
@@ -5685,7 +5676,6 @@ async def extract_user_defined_errors(
         error_code_mapping_str=json.dumps(task.error_code_mapping) if task.error_code_mapping else "{}",
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         reasoning=reasoning,
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page_refreshed),
     )
     json_response = await app.EXTRACTION_LLM_API_HANDLER(
         prompt=prompt,

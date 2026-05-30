@@ -43,7 +43,7 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import LLMVisionMode, SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -202,20 +202,19 @@ def _llm_screenshots_enabled_metric(
     return True
 
 
-def _llm_vision_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
+def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
     if context is None:
         return {
-            "llm_vision_mode": LLMVisionMode.CONTROL.value,
-            "llm_vision_fallback_active": False,
-            "llm_accessibility_context_enabled": False,
+            "enrich_tree_mode": EnrichTreeMode.CONTROL.value,
+            "enrich_tree_fallback_active": False,
+            "enriched_tree_enabled": False,
         }
 
+    retry_index = step.retry_index if step else None
     return {
-        "llm_vision_mode": context.effective_llm_vision_mode().value,
-        "llm_vision_fallback_active": context.llm_vision_fallback_active(
-            retry_index=step.retry_index if step else None
-        ),
-        "llm_accessibility_context_enabled": context.llm_accessibility_context_enabled(),
+        "enrich_tree_mode": context.enrich_tree_mode.value,
+        "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
+        "enriched_tree_enabled": context.enriched_tree_enabled(),
     }
 
 
@@ -1453,7 +1452,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
-                    **_llm_vision_log_fields(context, step),
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -1995,7 +1994,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
-                    **_llm_vision_log_fields(context, step),
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2471,7 +2470,7 @@ class LLMCaller:
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
                 llm_screenshots_enabled=llm_screenshots_enabled,
-                **_llm_vision_log_fields(context, step),
+                **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
             )
 

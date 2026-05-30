@@ -4,14 +4,14 @@ from typing import Any
 import structlog
 
 from skyvern.forge import app
-from skyvern.forge.sdk.core.skyvern_context import LLMVisionMode, SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 
 LOG = structlog.get_logger()
 
-LLM_VISION_MODE_FLAG = "llm_vision_mode"
+ENRICH_TREE_FLAG = "enrich_tree"
 
 
-async def resolve_llm_vision_mode_for_context(
+async def resolve_enrich_tree_for_context(
     context: SkyvernContext,
     distinct_id: str,
     organization_id: str | None,
@@ -21,7 +21,11 @@ async def resolve_llm_vision_mode_for_context(
     log_context: dict[str, Any] | None = None,
 ) -> None:
     if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
-        context.set_llm_vision_mode(LLMVisionMode.NO_IMAGES_WITH_A11Y)
+        LOG.info(
+            "FORCE_DISABLE_LLM_SCREENSHOTS is set; using enriched_tree_no_images mode",
+            distinct_id=distinct_id,
+        )
+        context.set_enrich_tree_mode(EnrichTreeMode.ENRICHED_TREE_NO_IMAGES)
         return
 
     properties: dict[str, str] = {}
@@ -34,16 +38,16 @@ async def resolve_llm_vision_mode_for_context(
 
     try:
         flag_value = await app.EXPERIMENTATION_PROVIDER.get_value_cached(
-            LLM_VISION_MODE_FLAG,
+            ENRICH_TREE_FLAG,
             distinct_id,
             properties=properties,
         )
-        context.set_llm_vision_mode(flag_value)
+        context.set_enrich_tree_mode(flag_value)
     except Exception:
         LOG.warning(
-            "Failed to check llm_vision_mode feature flag",
+            "Failed to check enrich_tree feature flag",
             exc_info=True,
             distinct_id=distinct_id,
             **(log_context or {}),
         )
-        context.set_llm_vision_mode(LLMVisionMode.CONTROL)
+        context.set_enrich_tree_mode(EnrichTreeMode.CONTROL)

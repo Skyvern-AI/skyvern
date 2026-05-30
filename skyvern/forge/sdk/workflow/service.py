@@ -61,7 +61,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
-from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
+from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1085,7 +1085,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
 
-                await resolve_llm_vision_mode_for_context(
+                await resolve_enrich_tree_for_context(
                     new_context,
                     workflow_run.workflow_run_id,
                     organization.organization_id,
