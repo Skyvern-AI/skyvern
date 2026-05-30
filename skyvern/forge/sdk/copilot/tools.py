@@ -8,6 +8,7 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -103,6 +104,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentMode,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -613,6 +615,45 @@ def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> 
     copilot_ctx.pending_reconciliation_requires_user_input = False
 
 
+def _workflow_verification_evidence(ctx: AgentContext) -> WorkflowVerificationEvidence:
+    return ctx.workflow_verification_evidence
+
+
+def _run_result_label_list(data: Mapping[str, object], key: str) -> list[str]:
+    values = data.get(key)
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _run_result_blocks(data: Mapping[str, object]) -> list[Mapping[str, object]]:
+    blocks = data.get("blocks")
+    return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+
+
+def _completed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) == WorkflowRunStatus.completed.value
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    return labels or _run_result_label_list(data, "executed_block_labels")
+
+
+def _failed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) in _FAILED_BLOCK_STATUSES
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    if labels:
+        return labels
+    frontier = data.get("frontier_start_label")
+    return [frontier] if isinstance(frontier, str) and frontier.strip() else []
+
+
 def _enum_or_string_name(value: Any) -> str:
     raw = getattr(value, "value", value)
     if not isinstance(raw, str):
@@ -796,6 +837,108 @@ def _post_budget_upstream_replay_signal(
         preserves_workflow_draft=True,
         renders_final_reply=False,
         internal_reason_code="tool_error_post_budget_upstream_replay",
+        blocked_tool=tool_name,
+    )
+
+
+def _composition_control_label(control: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("text", "name", "id", "selector"):
+        value = control.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    unique = list(dict.fromkeys(parts))
+    return " / ".join(unique[:2])[:160] if unique else "submit/search control"
+
+
+def _disabled_submit_controls_from_evidence(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    forms = evidence.get("forms")
+    if not isinstance(forms, list):
+        return controls
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        for control in form.get("submit_controls") or []:
+            if isinstance(control, dict) and control.get("disabled") is True:
+                controls.append(control)
+    return controls[:5]
+
+
+def _post_run_terminal_challenge_reason(evidence: dict[str, Any]) -> str | None:
+    if evidence.get("observed_after_workflow_run") is not True:
+        return None
+
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict):
+        gated_controls = [
+            control for control in challenge_state.get("gated_submit_controls") or [] if isinstance(control, dict)
+        ]
+        if challenge_state.get("gates_submit_controls") is True:
+            kind = str(challenge_state.get("kind") or "anti-bot challenge").replace("_", " ")
+            labels = ", ".join(_composition_control_label(control) for control in gated_controls[:3])
+            controls_text = f" ({labels})" if labels else ""
+            return f"{kind} is still gating disabled submit/search control(s){controls_text}"
+        if challenge_state.get("detected") is True and challenge_state.get("requires_human_verification") is True:
+            disabled_controls = _disabled_submit_controls_from_evidence(evidence)
+            if disabled_controls:
+                labels = ", ".join(_composition_control_label(control) for control in disabled_controls[:3])
+                return f"human-verification challenge remains while submit/search control(s) are disabled ({labels})"
+
+    indicators = evidence.get("anti_bot_indicators")
+    has_indicators = isinstance(indicators, list) and any(isinstance(item, str) and item.strip() for item in indicators)
+    if has_indicators:
+        disabled_controls = _disabled_submit_controls_from_evidence(evidence)
+        if disabled_controls:
+            labels = ", ".join(_composition_control_label(control) for control in disabled_controls[:3])
+            return f"anti-bot evidence remains while submit/search control(s) are disabled ({labels})"
+    return None
+
+
+def _post_budget_terminal_challenge_signal(
+    ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return None
+
+    # A failed run with post-run page evidence can prove the same terminal
+    # challenge state even when the top-level failure category was not budget.
+    prior_budget_or_failed_run = (
+        getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+        or getattr(ctx, "last_test_ok", None) is False
+        or getattr(ctx, "post_run_page_observation_after_failed_test", False) is True
+        or bool(_per_tool_budget_problem_label_set(ctx))
+    )
+    if not prior_budget_or_failed_run:
+        return None
+
+    reason = _post_run_terminal_challenge_reason(evidence)
+    if not reason:
+        return None
+
+    requested_labels = _requested_block_label_set(arguments)
+    labels_text = f" Requested labels: {', '.join(sorted(requested_labels))}." if requested_labels else ""
+    agent_steering = (
+        "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
+        f"now shows: {reason}.{labels_text} Do NOT call "
+        f"{tool_name} again in this turn, do NOT try another proxy/location from this evidence state, and "
+        "do NOT claim registry results or no-results were verified. REPLY now with a blocker explanation "
+        "that names the observed challenge/disabled control and summarizes the tested workflow state."
+    )
+    user_facing = (
+        "The site's verification challenge is still blocking the submit/search control after live-page inspection, "
+        "so I stopped without claiming results."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="tool_error_post_budget_challenge_blocker",
         blocked_tool=tool_name,
     )
 
@@ -1163,6 +1306,14 @@ def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: st
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
     ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    evidence = _workflow_verification_evidence(ctx)
+    evidence.live_page_state_verified = True
+    evidence.verified_from_current_browser_state = True
+    evidence.workflow_run_id = run_id
+    if url:
+        evidence.current_url = url
+        evidence.current_url_observed_after_workflow_run = True
+        evidence.current_url_may_encode_runtime_state = bool(urlparse(url).query)
 
 
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
@@ -1286,7 +1437,7 @@ def _challenge_gated_anti_bot_rerun_signal(
         "Ask whether to try a materially different proxy/location, entrypoint, or alternate source."
     )
     user_facing = (
-        "The site's verification challenge is still keeping the search control disabled, so I need to stop "
+        "The site's verification challenge is still keeping the submit/search control disabled, so I stopped "
         "instead of retrying the same workflow path."
     )
     return CopilotToolBlockerSignal(
@@ -1296,7 +1447,7 @@ def _challenge_gated_anti_bot_rerun_signal(
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,
-        renders_final_reply=False,
+        renders_final_reply=True,
         internal_reason_code="tool_error_challenge_gated_submit_disabled",
         blocked_tool=tool_name,
     )
@@ -1348,6 +1499,12 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         inspection_signal = _post_budget_page_inspection_signal(ctx, tool_name)
         if inspection_signal is not None:
             return _emit_tool_blocker_signal(ctx, inspection_signal)
+
+        # Terminal anti-bot evidence should produce the final user-facing reply
+        # before the generic budget rerun path can ask for another attempt.
+        post_budget_challenge_signal = _post_budget_terminal_challenge_signal(ctx, arguments, tool_name)
+        if post_budget_challenge_signal is not None:
+            return _emit_tool_blocker_signal(ctx, post_budget_challenge_signal)
 
         budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
         if budget_signal is not None:
@@ -1893,6 +2050,10 @@ async def _update_workflow(
     wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
     if wait_block_error:
         return {"ok": False, "error": wait_block_error}
+
+    challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
+    if challenge_http_error:
+        return {"ok": False, "error": challenge_http_error}
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -3949,6 +4110,8 @@ def _record_composition_page_observation(
     if not url:
         return
     _mark_post_run_page_observed(ctx, source_tool=source_tool, url=url)
+    if title:
+        _workflow_verification_evidence(ctx).page_title = title[:160]
     existing = ctx.composition_page_evidence
     if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
         return
@@ -4181,6 +4344,56 @@ def _detect_timing_only_challenge_wait_blocks(submitted_yaml: str | None) -> lis
         if _CHALLENGE_WAIT_PATTERN.search(_block_challenge_wait_text(block)):
             labels.append(label)
     return labels
+
+
+def _composition_evidence_has_challenge(ctx: AgentContext) -> bool:
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"):
+        return True
+    challenge_state = evidence.get("challenge_state")
+    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+
+
+def _detect_new_http_request_blocks(submitted_yaml: str | None, prior_workflow_yaml: str | None) -> list[str]:
+    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
+    if submitted_blocks is None:
+        return []
+    prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
+    prior_labels: set[str] = set()
+    for block in _iter_yaml_blocks(prior_blocks or []):
+        if str(block.get("block_type") or "").strip().lower() != "http_request":
+            continue
+        label = block.get("label")
+        if isinstance(label, str):
+            prior_labels.add(label)
+    labels: list[str] = []
+    for block in _iter_yaml_blocks(submitted_blocks):
+        if str(block.get("block_type") or "").strip().lower() != "http_request":
+            continue
+        label = block.get("label")
+        if isinstance(label, str) and label not in prior_labels:
+            labels.append(label)
+    return labels
+
+
+def _challenge_http_request_reject_message(
+    ctx: AgentContext, submitted_yaml: str | None, prior_workflow_yaml: str | None
+) -> str | None:
+    if not _composition_evidence_has_challenge(ctx):
+        return None
+    labels = _detect_new_http_request_blocks(submitted_yaml, prior_workflow_yaml)
+    if not labels:
+        return None
+    labels_text = ", ".join(sorted(set(labels)))
+    return (
+        "Workflow validation failed: raw http_request blocks are not allowed for a page with observed "
+        "anti-bot or human-verification challenge evidence. "
+        f"Offending labels: [{labels_text}]. "
+        "Use browser workflow blocks grounded in the observed page, include challenge handling only when visible, "
+        "or stop and report the observed challenge blocker if it cannot be completed."
+    )
 
 
 def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | None) -> str | None:
@@ -4785,6 +4998,48 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
     return next((reason for reason in iter_failure_reasons(result) if is_skip_inner_retry_error(reason)), None)
 
 
+def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, result: Mapping[str, object]) -> None:
+    evidence = _workflow_verification_evidence(copilot_ctx)
+    data_value = result.get("data")
+    data: Mapping[str, object] = data_value if isinstance(data_value, dict) else {}
+    run_ok = bool(result.get("ok", False))
+    full_workflow_verified = run_ok and copilot_ctx.last_full_workflow_test_ok is True
+    evidence.full_workflow_verified = full_workflow_verified
+    evidence.test_attempted_but_incomplete = not full_workflow_verified
+
+    run_id = data.get("workflow_run_id")
+    if isinstance(run_id, str) and run_id.strip():
+        evidence.workflow_run_id = run_id.strip()
+    current_url = _valid_runtime_anchor_url(data.get("current_url"))
+    if current_url is not None:
+        evidence.current_url = current_url
+        evidence.live_page_state_verified = True
+        if data.get("observed_after_workflow_run") is True:
+            evidence.current_url_observed_after_workflow_run = True
+            evidence.current_url_may_encode_runtime_state = bool(urlparse(current_url).query)
+    page_title = data.get("page_title")
+    if isinstance(page_title, str) and page_title.strip():
+        evidence.page_title = " ".join(page_title.split())[:160]
+
+    if run_ok:
+        evidence.merge_verified_blocks(_completed_run_block_labels(data))
+        unverified = list(copilot_ctx.last_unverified_block_labels or [])
+        evidence.unverified_block_labels = list(dict.fromkeys(str(label) for label in unverified if str(label)))
+        evidence.failed_block_labels = []
+        evidence.failure_reason = None
+        if evidence.unverified_block_labels:
+            evidence.verified_from_current_browser_state = True
+        return
+
+    failed_labels = _failed_run_block_labels(data)
+    evidence.failed_block_labels = failed_labels
+    if copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        evidence.merge_per_tool_budget_blocks(failed_labels)
+    failure_reason = copilot_ctx.last_test_failure_reason or result.get("error")
+    if isinstance(failure_reason, str) and failure_reason.strip():
+        evidence.failure_reason = " ".join(failure_reason.split())[:240]
+
+
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
@@ -4864,6 +5119,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                     }
                     data["failure_categories"] = [anti_bot_category]
             update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
             return
         if empty_data_blocks:
             copilot_ctx.last_test_ok = None
@@ -4878,6 +5134,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             # Clean-ish success (no scrape-fail pattern): reset the streak.
             copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
             return
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
@@ -4898,6 +5155,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 + ", ".join(unverified[:8])
             )
         update_repeated_failure_state(copilot_ctx, result)
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
         return
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
@@ -4920,6 +5178,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     if result.get("error") and copilot_ctx.last_test_failure_reason is None:
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
+    _update_verification_evidence_from_run_result(copilot_ctx, result)
 
 
 def _record_diagnosis_repair_contract(
@@ -5437,6 +5696,7 @@ _DISCOVERY_DOMAIN_WITH_PATH_RE = re.compile(
 )
 _DISCOVERY_BARE_WORD_RE = re.compile(r"^[a-z0-9-]{2,32}$", re.IGNORECASE)
 _DISCOVERY_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS = frozenset({"a", "an", "and", "for", "in", "of", "on", "or", "the", "to"})
 _DISCOVERY_LOGIN_TITLE_RE = re.compile(r"\b(sign\s*in|log\s*in|login)\b", re.IGNORECASE)
 _DISCOVERY_PASSWORD_INPUT_RE = re.compile(
     r"<input[^>]*type\s*=\s*[\"']password[\"']",
@@ -5494,6 +5754,14 @@ def _discovery_title_score(page_title: str, intent_tokens: set[str]) -> int:
         return 0
     lowered = page_title.lower()
     return sum(1 for token in intent_tokens if token in lowered)
+
+
+def _discovery_candidate_evidence_tokens(intent_tokens: set[str]) -> set[str]:
+    return {
+        token
+        for token in intent_tokens
+        if len(token) > 2 and token.lower() not in _DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS
+    }
 
 
 def _discovery_detect_login_wall(html: str, page_title: str) -> bool:
@@ -6034,6 +6302,9 @@ async def _inspect_page_for_composition_impl(
             "observed_after_workflow_run": True,
         }
         _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
+        page_title = evidence.get("page_title")
+        if isinstance(page_title, str) and page_title:
+            _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
 
     copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
@@ -6114,7 +6385,45 @@ async def _discovery_walk(
             }
         )
 
-        if _discovery_detect_anti_bot(html, page_title):
+        title_score = _discovery_title_score(page_title, intent_tokens)
+
+        best_score = 0
+        best_href: str | None = None
+        best_anchor: dict[str, str] | None = None
+        for anchor in anchors:
+            score = _discovery_anchor_score(
+                anchor.get("text", ""),
+                anchor.get("title", ""),
+                anchor.get("href", ""),
+                intent_tokens,
+            )
+            if score > best_score:
+                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
+                if resolved is None:
+                    continue
+                best_score = score
+                best_href = resolved
+                best_anchor = anchor
+
+        evidence_tokens = _discovery_candidate_evidence_tokens(intent_tokens)
+        candidate_title_score = _discovery_title_score(page_title, evidence_tokens)
+        candidate_anchor_score = 0
+        for anchor in anchors:
+            candidate_anchor_score = max(
+                candidate_anchor_score,
+                _discovery_anchor_score(
+                    anchor.get("text", ""),
+                    anchor.get("title", ""),
+                    anchor.get("href", ""),
+                    evidence_tokens,
+                ),
+            )
+
+        anti_bot_detected = _discovery_detect_anti_bot(html, page_title)
+        anti_bot_has_no_candidate_evidence = (
+            not form_fields and candidate_title_score == 0 and candidate_anchor_score == 0
+        )
+        if anti_bot_detected and anti_bot_has_no_candidate_evidence:
             origin_url = _discovery_origin_url(current_url)
             if (
                 not retried_deep_link_from_origin
@@ -6141,26 +6450,6 @@ async def _discovery_walk(
                 confidence=0.0,
                 failure_reason="login_wall",
             )
-
-        title_score = _discovery_title_score(page_title, intent_tokens)
-
-        best_score = 0
-        best_href: str | None = None
-        best_anchor: dict[str, str] | None = None
-        for anchor in anchors:
-            score = _discovery_anchor_score(
-                anchor.get("text", ""),
-                anchor.get("title", ""),
-                anchor.get("href", ""),
-                intent_tokens,
-            )
-            if score > best_score:
-                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
-                if resolved is None:
-                    continue
-                best_score = score
-                best_href = resolved
-                best_anchor = anchor
 
         if intent_tokens and title_score >= 2 and (form_fields or best_score <= title_score):
             confidence = min(1.0, title_score / max(1, len(intent_tokens)))
@@ -6405,4 +6694,5 @@ NATIVE_TOOLS = [
     get_run_results_tool,
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
+    inspect_page_for_composition_tool,
 ]

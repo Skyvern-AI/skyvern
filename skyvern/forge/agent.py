@@ -95,8 +95,8 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
-from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -159,7 +159,6 @@ from skyvern.webeye.actions.parse_actions import (
 )
 from skyvern.webeye.actions.responses import ActionResult, ActionSuccess
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat, ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -1344,7 +1343,7 @@ class ForgeAgent:
                 context.step_id = step.step_id
                 context.step_retry_index = step.retry_index
                 if not task.workflow_run_id and step.order == 0 and step.retry_index == 0:
-                    await resolve_llm_vision_mode_for_context(
+                    await resolve_enrich_tree_for_context(
                         context,
                         task.task_id,
                         task.organization_id,
@@ -2781,10 +2780,7 @@ class ForgeAgent:
         # no new_elements_ids threading — so we also drop Skyvern IDs.
         _ctx = skyvern_context.current()
         lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
-        non_vision_page_context = await build_non_vision_page_context_if_needed(
-            scraped_page=scraped_page_refreshed,
-            page=page,
-        )
+        llm_screenshots_enabled = bool(_ctx and _ctx.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index))
         verification_prompt = load_prompt_with_elements(
             element_tree_builder=scraped_page_refreshed,
             prompt_engine=prompt_engine,
@@ -2795,7 +2791,7 @@ class ForgeAgent:
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-            non_vision_page_context=non_vision_page_context,
+            without_screenshots=not llm_screenshots_enabled,
             html_need_skyvern_attrs=False,
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
@@ -3488,7 +3484,8 @@ class ForgeAgent:
         verification_code_check: bool,
         show_close_page_action: bool,
         complete_criterion: str | None,
-        non_vision_enabled: bool = False,
+        enriched_tree_enabled: bool = False,
+        llm_screenshots_enabled: bool = True,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
@@ -3500,8 +3497,10 @@ class ForgeAgent:
             variant_parts.append("vc")
         if show_close_page_action:
             variant_parts.append("cp")
-        if non_vision_enabled:
-            variant_parts.append("nv")
+        if enriched_tree_enabled:
+            variant_parts.append("et")
+        if enriched_tree_enabled and not llm_screenshots_enabled:
+            variant_parts.append("ni")
         if complete_criterion:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
@@ -3773,10 +3772,8 @@ class ForgeAgent:
 
         open_tabs_context = await _build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
-        non_vision_page_context = await build_non_vision_page_context_if_needed(
-            scraped_page=scraped_page,
-            page=page,
-        )
+        llm_screenshots_enabled = context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
+        enriched_tree_enabled = context.enriched_tree_enabled()
 
         # Format-then-clear so a render failure can't drop the signal permanently;
         # gate on extract-action template since other task types don't render it.
@@ -3804,13 +3801,15 @@ class ForgeAgent:
                     "show_close_page_action": show_close_page_action,
                     "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
-                    "non_vision_page_context": non_vision_page_context,
+                    "llm_screenshots_enabled": llm_screenshots_enabled,
+                    "enriched_tree_enabled": enriched_tree_enabled,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
                     show_close_page_action=show_close_page_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
-                    non_vision_enabled=bool(non_vision_page_context),
+                    enriched_tree_enabled=enriched_tree_enabled,
+                    llm_screenshots_enabled=llm_screenshots_enabled,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3898,12 +3897,8 @@ class ForgeAgent:
             show_close_page_action=show_close_page_action,
             open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
-            non_vision_page_context=non_vision_page_context,
-            # SKY-9718 Layer 1: planner non-cached fallback. Keep Skyvern IDs
-            # (default html_need_skyvern_attrs=True) — the planner emits
-            # `click(id=...)` references. Gate lean on the PostHog flag.
-            # `lean_compress_long_href` intentionally stays OFF — the planner
-            # reads the href to decide whether to click a link.
+            llm_screenshots_enabled=llm_screenshots_enabled,
+            enriched_tree_enabled=enriched_tree_enabled,
             lean_compress_long_href=False,
             lean_compress_image_src=context.enable_lean_element_tree,
             lean_strip_url_query_strings=context.enable_lean_element_tree,
@@ -5297,7 +5292,6 @@ class ForgeAgent:
                 steps=steps_results,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.LLM_API_HANDLER(
                 prompt=prompt,
@@ -5443,7 +5437,6 @@ class ForgeAgent:
                 max_retries=max_retries,
                 error_code_mapping_str=(json.dumps(task.error_code_mapping) if task.error_code_mapping else None),
                 local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
             )
             json_response = await app.SECONDARY_LLM_API_HANDLER(
                 prompt=prompt,

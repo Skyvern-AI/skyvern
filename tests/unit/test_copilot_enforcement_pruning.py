@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
@@ -328,6 +329,7 @@ def _fresh_ctx_for_record() -> SimpleNamespace:
         last_action_sequence_fingerprint=None,
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
+        workflow_verification_evidence=WorkflowVerificationEvidence(),
     )
 
 

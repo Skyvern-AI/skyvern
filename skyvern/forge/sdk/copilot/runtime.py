@@ -27,6 +27,7 @@ from skyvern.cli.core.session_manager import (
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
@@ -124,6 +125,7 @@ class AgentContext:
     verified_prefix_labels: list[str] = field(default_factory=list)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
     # failure_tracking; declared here so _check_enforcement can read them on a
@@ -149,6 +151,7 @@ class AgentContext:
     last_failed_workflow_yaml: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
@@ -176,7 +179,6 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
-    challenge_gated_proxy_retry_count: int = 0
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at

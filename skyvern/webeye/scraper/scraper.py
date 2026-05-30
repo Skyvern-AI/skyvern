@@ -96,6 +96,28 @@ RESERVED_ATTRIBUTES = {
     "value",
 }
 
+ENRICHED_ONLY_ATTRIBUTES = {
+    "aria-describedby",
+    "aria-errormessage",
+    "aria-expanded",
+    "aria-haspopup",
+    "aria-invalid",
+    "aria-labelledby",
+    "errorText",
+    "invalid",
+    "validationMessage",
+}
+
+ENRICHED_RESERVED_ATTRIBUTES = RESERVED_ATTRIBUTES | ENRICHED_ONLY_ATTRIBUTES
+
+
+def _reserved_attributes_for_context() -> set[str]:
+    context = skyvern_context.current()
+    if context and context.enriched_tree_enabled():
+        return ENRICHED_RESERVED_ATTRIBUTES
+    return RESERVED_ATTRIBUTES
+
+
 BASE64_INCLUDE_ATTRIBUTES = {
     "href",
     "src",
@@ -863,11 +885,12 @@ def _trimmed_base64_data(attributes: dict) -> dict:
 
 def _trimmed_attributes(attributes: dict, *, keep_class: bool = False) -> dict:
     new_attributes: dict = {}
+    reserved_attributes = _reserved_attributes_for_context()
 
     for key in attributes:
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
-        if key in RESERVED_ATTRIBUTES:
+        if key in reserved_attributes:
             new_attributes[key] = attributes[key]
 
     if keep_class and "class" in attributes:

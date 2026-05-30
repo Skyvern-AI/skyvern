@@ -15,7 +15,16 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisInput,
+    DiagnosisRepairContract,
+    DiagnosisResult,
+    RepairDecision,
+    RepairNextAction,
+    VerificationResult,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotGoalSatisfied,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
@@ -30,6 +39,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -62,6 +72,18 @@ def _ctx(**overrides):
     )
     defaults.update(overrides)
     return CopilotContext(**defaults)
+
+
+def _verified_goal_contract(*, next_action: RepairNextAction = RepairNextAction.NO_CHANGE) -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=next_action),
+        verification_result=VerificationResult(
+            user_goal_satisfied=True,
+            completion_contract_satisfied=True,
+        ),
+    )
 
 
 class TestFailedTestResponseNormalization:
@@ -163,6 +185,90 @@ class TestFailedTestResponseNormalization:
         assert ctx.last_workflow is sentinel_workflow
         assert ctx.last_test_ok is False
         assert ctx.last_test_failure_reason == "net::ERR_NAME_NOT_RESOLVED"
+
+    def test_per_tool_budget_run_records_structured_verification_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
+
+        ctx = _ctx(
+            last_workflow_yaml="""
+workflow_definition:
+  blocks:
+    - label: search_registry
+      block_type: navigation
+    - label: extract_results
+      block_type: extraction
+""",
+        )
+
+        _record_run_blocks_result(
+            ctx,
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_budget",
+                    "overall_status": "canceled",
+                    "current_url": "https://example.com/lookup",
+                    "page_title": "Example Lookup Registry",
+                    "executed_block_labels": ["search_registry"],
+                    "frontier_start_label": "search_registry",
+                    "failure_categories": [{"category": PER_TOOL_BUDGET_FAILURE_CATEGORY}],
+                    "blocks": [
+                        {
+                            "label": "search_registry",
+                            "status": "canceled",
+                            "failure_reason": "Per-tool-call budget exceeded while making progress.",
+                        }
+                    ],
+                },
+            },
+        )
+
+        evidence = ctx.workflow_verification_evidence
+        assert evidence.full_workflow_verified is False
+        assert evidence.test_attempted_but_incomplete is True
+        assert evidence.per_tool_budget_on_block == ["search_registry"]
+        assert evidence.live_page_state_verified is True
+        assert evidence.current_url == "https://example.com/lookup"
+        assert evidence.workflow_run_id == "wr_budget"
+
+    def test_current_state_block_run_records_partial_verification_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
+
+        ctx = _ctx(
+            last_workflow_yaml="""
+workflow_definition:
+  blocks:
+    - label: search_registry
+      block_type: navigation
+    - label: extract_results
+      block_type: extraction
+    - label: expand_results
+      block_type: navigation
+""",
+            verified_prefix_labels=["search_registry", "extract_results"],
+        )
+
+        _record_run_blocks_result(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_extract",
+                    "overall_status": "completed",
+                    "current_url": "https://example.com/lookup",
+                    "executed_block_labels": ["extract_results"],
+                    "frontier_start_label": "extract_results",
+                    "blocks": [{"label": "extract_results", "status": "completed"}],
+                },
+            },
+        )
+
+        evidence = ctx.workflow_verification_evidence
+        assert evidence.full_workflow_verified is False
+        assert evidence.block_verified == ["extract_results"]
+        assert evidence.verified_from_current_browser_state is True
+        assert evidence.unverified_block_labels == ["expand_results"]
 
     def test_rewrite_includes_navigation_follow_up_when_category_matches(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -307,6 +413,56 @@ class TestFailedTestResponseNormalization:
         assert "test failed" in rewritten.lower()
         assert "keep the draft" in rewritten.lower()
 
+    def test_partial_verification_rewrite_uses_structured_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_results"],
+                live_page_state_verified=True,
+                verified_from_current_browser_state=True,
+                per_tool_budget_on_block=["search_registry"],
+                unverified_block_labels=["search_registry"],
+                page_title="Example Lookup Registry",
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I created and tested the workflow end-to-end.", ctx)
+
+        assert "created and tested" not in rewritten.lower()
+        assert "full workflow chain has not been verified end-to-end" in rewritten
+        assert "verified block(s): extract_results" in rewritten
+        assert "per-tool budget hit on: search_registry" in rewritten
+
+    def test_runtime_verification_evidence_prompt_surfaces_state_for_agent(self) -> None:
+        ctx = _ctx(
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_results"],
+                live_page_state_verified=True,
+                test_attempted_but_incomplete=True,
+                per_tool_budget_on_block=["search_registry"],
+                verified_from_current_browser_state=True,
+                current_url_observed_after_workflow_run=True,
+                current_url_may_encode_runtime_state=True,
+                unverified_block_labels=["search_registry"],
+                current_url="https://example.com/lookup",
+            )
+        )
+
+        prompt = agent_module._runtime_verification_evidence_prompt(ctx)
+
+        assert "RUNTIME VERIFICATION EVIDENCE" in prompt
+        assert "full_workflow_verified: false" in prompt
+        assert "test_attempted_but_incomplete: true" in prompt
+        assert "current_url_observed_after_workflow_run: true" in prompt
+        assert "current_url_may_encode_runtime_state: true" in prompt
+        assert "per_tool_budget_on_block:" in prompt
+        assert "run only missing block labels" in prompt
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""
@@ -371,6 +527,95 @@ class TestVerifiedWorkflowOrNone:
             last_test_suspicious_success=True,
         )
         assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+class TestVerifiedGoalSatisfiedStop:
+    @pytest.mark.asyncio
+    async def test_block_run_hook_stops_after_verified_goal_satisfied(self) -> None:
+        from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+        hook = CopilotRunHooks(ctx)
+        result = json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_1",
+                    "blocks": [{"label": "search", "output": {"status": "found"}}],
+                },
+            }
+        )
+
+        with pytest.raises(CopilotGoalSatisfied):
+            await hook.on_tool_end(
+                context=MagicMock(),
+                agent=MagicMock(),
+                tool=SimpleNamespace(name="update_and_run_blocks"),
+                result=result,
+            )
+
+        assert ctx.tool_activity[-1]["tool"] == "update_and_run_blocks"
+
+    def test_wrapped_goal_satisfied_error_context_is_recognized(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+
+        assert verified_goal_satisfied_context(ctx)
+
+    def test_wrapped_goal_satisfied_error_context_requires_no_change(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(next_action=RepairNextAction.REPAIR),
+        )
+
+        assert not verified_goal_satisfied_context(ctx)
+
+    def test_verified_goal_satisfied_context_rejects_undercovered_workflow(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_update_block_count=1,
+            user_message=(
+                "go to https://example.com/lookup and check the requested credential "
+                "type for any sample record. I want to grab the credential name, id, expiration"
+            ),
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+
+        assert not verified_goal_satisfied_context(ctx)
+
+    def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+
+        result = _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is workflow
+        assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
+        assert result.proposal_disposition == "auto_applicable"
+        assert "tested" in result.user_response.lower()
 
 
 class TestSupersededAgentIntentGates:
@@ -1653,6 +1898,13 @@ class TestCredentialRefusalReachesAgent:
 
 
 class TestNativeToolSurface:
+    def test_page_composition_evidence_repair_tool_is_native(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
+
+        names = {tool.name for tool in NATIVE_TOOLS}
+
+        assert "inspect_page_for_composition" in names
+
     @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
     def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy

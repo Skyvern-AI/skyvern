@@ -69,7 +69,6 @@ from skyvern.services.webhook_delivery import deliver_webhook_with_retries
 from skyvern.utils.prompt_engine import load_prompt_with_elements
 from skyvern.utils.strings import generate_random_string
 from skyvern.webeye.browser_state import BrowserState
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -140,7 +139,6 @@ async def _summarize_max_steps_failure_reason(
             navigation_goal=task_v2.prompt,
             history=history,
             local_datetime=datetime.now(context.tz_info).isoformat(),
-            non_vision_page_context=await build_non_vision_page_context_if_needed(page=page),
         )
 
         json_response = await app.LLM_API_HANDLER(
@@ -823,10 +821,6 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(
-                    scraped_page=scraped_page,
-                    page=page,
-                ),
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -889,10 +883,6 @@ async def run_task_v2_helper(
                     task_history=task_history,
                     context=context,
                     screenshots=scraped_page.screenshots,
-                    non_vision_page_context=await build_non_vision_page_context_if_needed(
-                        scraped_page=scraped_page,
-                        page=page,
-                    ),
                 )
                 if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
@@ -1086,9 +1076,6 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
-                non_vision_page_context=await build_non_vision_page_context_if_needed(
-                    scraped_page=completion_scraped_page
-                ),
             )
             thought = await app.DATABASE.observer.create_thought(
                 task_v2_id=task_v2_id,
@@ -1140,9 +1127,6 @@ async def run_task_v2_helper(
                     task_history=task_history,
                     context=context,
                     screenshots=completion_screenshots,
-                    non_vision_page_context=await build_non_vision_page_context_if_needed(
-                        scraped_page=completion_scraped_page
-                    ),
                 )
                 if task_v2.run_with == "code":
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
@@ -1479,7 +1463,6 @@ async def _generate_loop_task(
         local_datetime=datetime.now(context.tz_info).isoformat(),
         is_link=is_loop_value_link,
         loop_values=loop_values,
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page),
     )
     thought_task_in_loop = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -1590,7 +1573,6 @@ async def _generate_extraction_task(
         current_url=current_url,
         data_extraction_goal=data_extraction_goal,
         local_datetime=datetime.now(context.tz_info).isoformat(),
-        non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page),
     )
 
     max_retries = 3
@@ -1981,7 +1963,6 @@ async def _summarize_task_v2(
     task_history: list[dict],
     context: SkyvernContext,
     screenshots: list[bytes] | None = None,
-    non_vision_page_context: str | None = None,
 ) -> TaskV2:
     thought = await app.DATABASE.observer.create_thought(
         task_v2_id=task_v2.observer_cruise_id,
@@ -1999,7 +1980,6 @@ async def _summarize_task_v2(
         task_history=task_history,
         extracted_information_schema=task_v2.extracted_information_schema,
         local_datetime=datetime.now(context.tz_info).isoformat(),
-        non_vision_page_context=non_vision_page_context,
     )
     task_v2_summary_resp = await app.LLM_API_HANDLER(
         prompt=task_v2_summary_prompt,
