@@ -8,6 +8,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.tools import _discovery_walk, _inspect_page_for_composition_impl
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
@@ -17,6 +18,7 @@ class _Ctx:
         self.discovery_step_count = 0
         self.prior_page_inspection_calls_made = 0
         self.page_inspection_calls_this_turn = 0
+        self.workflow_verification_evidence = WorkflowVerificationEvidence()
 
 
 class _FailingNavigateServer:
