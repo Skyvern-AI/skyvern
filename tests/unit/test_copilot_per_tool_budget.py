@@ -302,6 +302,10 @@ def test_final_reply_after_post_run_observation_bypasses_stale_budget_and_anti_b
         observed_data={"text": "Credential Number: CRED-000123"},
     )
 
+    evidence = ctx.workflow_verification_evidence
+    assert evidence.current_url_observed_after_workflow_run is True
+    assert evidence.current_url_may_encode_runtime_state is True
+
     assert _check_enforcement(ctx, _reply_result("Observed result: CRED-000123 expires 01/31/2030.")) is None
 
 
