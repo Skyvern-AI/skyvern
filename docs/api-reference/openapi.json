@@ -10768,6 +10768,12 @@
             "title": "Recording Url",
             "description": "URL to the recording of the run"
           },
+          "recording_archived": {
+            "type": "boolean",
+            "title": "Recording Archived",
+            "description": "True when the recording exists but has been archived to cold storage and is not currently accessible.",
+            "default": false
+          },
           "screenshot_urls": {
             "items": {
               "type": "string"
@@ -13984,6 +13990,12 @@
             "nullable": true,
             "title": "Recording Url",
             "description": "URL to the recording of the run"
+          },
+          "recording_archived": {
+            "type": "boolean",
+            "title": "Recording Archived",
+            "description": "True when the recording exists but has been archived to cold storage and is not currently accessible.",
+            "default": false
           },
           "screenshot_urls": {
             "items": {
