@@ -8,6 +8,7 @@ import json
 import re
 import time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -103,6 +104,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     TurnIntent,
     TurnIntentMode,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
@@ -611,6 +613,45 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
 def _mark_pending_reconciliation_run(copilot_ctx: Any, workflow_run_id: str) -> None:
     copilot_ctx.pending_reconciliation_run_id = workflow_run_id
     copilot_ctx.pending_reconciliation_requires_user_input = False
+
+
+def _workflow_verification_evidence(ctx: AgentContext) -> WorkflowVerificationEvidence:
+    return ctx.workflow_verification_evidence
+
+
+def _run_result_label_list(data: Mapping[str, object], key: str) -> list[str]:
+    values = data.get(key)
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _run_result_blocks(data: Mapping[str, object]) -> list[Mapping[str, object]]:
+    blocks = data.get("blocks")
+    return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+
+
+def _completed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) == WorkflowRunStatus.completed.value
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    return labels or _run_result_label_list(data, "executed_block_labels")
+
+
+def _failed_run_block_labels(data: Mapping[str, object]) -> list[str]:
+    labels = [
+        str(block.get("label") or "").strip()
+        for block in _run_result_blocks(data)
+        if _enum_or_string_name(block.get("status")) in _FAILED_BLOCK_STATUSES
+    ]
+    labels = list(dict.fromkeys(label for label in labels if label))
+    if labels:
+        return labels
+    frontier = data.get("frontier_start_label")
+    return [frontier] if isinstance(frontier, str) and frontier.strip() else []
 
 
 def _enum_or_string_name(value: Any) -> str:
@@ -1265,6 +1306,14 @@ def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: st
     ctx.post_run_page_observation_url = url
     ctx.post_run_page_observation_workflow_run_id = run_id
     ctx.post_run_page_observation_after_failed_test = getattr(ctx, "last_test_ok", None) is False
+    evidence = _workflow_verification_evidence(ctx)
+    evidence.live_page_state_verified = True
+    evidence.verified_from_current_browser_state = True
+    evidence.workflow_run_id = run_id
+    if url:
+        evidence.current_url = url
+        evidence.current_url_observed_after_workflow_run = True
+        evidence.current_url_may_encode_runtime_state = bool(urlparse(url).query)
 
 
 def _allows_post_run_current_page_inspection_budget_bypass(ctx: AgentContext, *, use_current_page: bool) -> bool:
@@ -4061,6 +4110,8 @@ def _record_composition_page_observation(
     if not url:
         return
     _mark_post_run_page_observed(ctx, source_tool=source_tool, url=url)
+    if title:
+        _workflow_verification_evidence(ctx).page_title = title[:160]
     existing = ctx.composition_page_evidence
     if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
         return
@@ -4947,6 +4998,48 @@ def _detect_non_retriable_nav_error(result: dict[str, Any]) -> str | None:
     return next((reason for reason in iter_failure_reasons(result) if is_skip_inner_retry_error(reason)), None)
 
 
+def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, result: Mapping[str, object]) -> None:
+    evidence = _workflow_verification_evidence(copilot_ctx)
+    data_value = result.get("data")
+    data: Mapping[str, object] = data_value if isinstance(data_value, dict) else {}
+    run_ok = bool(result.get("ok", False))
+    full_workflow_verified = run_ok and copilot_ctx.last_full_workflow_test_ok is True
+    evidence.full_workflow_verified = full_workflow_verified
+    evidence.test_attempted_but_incomplete = not full_workflow_verified
+
+    run_id = data.get("workflow_run_id")
+    if isinstance(run_id, str) and run_id.strip():
+        evidence.workflow_run_id = run_id.strip()
+    current_url = _valid_runtime_anchor_url(data.get("current_url"))
+    if current_url is not None:
+        evidence.current_url = current_url
+        evidence.live_page_state_verified = True
+        if data.get("observed_after_workflow_run") is True:
+            evidence.current_url_observed_after_workflow_run = True
+            evidence.current_url_may_encode_runtime_state = bool(urlparse(current_url).query)
+    page_title = data.get("page_title")
+    if isinstance(page_title, str) and page_title.strip():
+        evidence.page_title = " ".join(page_title.split())[:160]
+
+    if run_ok:
+        evidence.merge_verified_blocks(_completed_run_block_labels(data))
+        unverified = list(copilot_ctx.last_unverified_block_labels or [])
+        evidence.unverified_block_labels = list(dict.fromkeys(str(label) for label in unverified if str(label)))
+        evidence.failed_block_labels = []
+        evidence.failure_reason = None
+        if evidence.unverified_block_labels:
+            evidence.verified_from_current_browser_state = True
+        return
+
+    failed_labels = _failed_run_block_labels(data)
+    evidence.failed_block_labels = failed_labels
+    if copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        evidence.merge_per_tool_budget_blocks(failed_labels)
+    failure_reason = copilot_ctx.last_test_failure_reason or result.get("error")
+    if isinstance(failure_reason, str) and failure_reason.strip():
+        evidence.failure_reason = " ".join(failure_reason.split())[:240]
+
+
 def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
@@ -5026,6 +5119,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                     }
                     data["failure_categories"] = [anti_bot_category]
             update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
             return
         if empty_data_blocks:
             copilot_ctx.last_test_ok = None
@@ -5040,6 +5134,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
             # Clean-ish success (no scrape-fail pattern): reset the streak.
             copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
+            _update_verification_evidence_from_run_result(copilot_ctx, result)
             return
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
@@ -5060,6 +5155,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
                 + ", ".join(unverified[:8])
             )
         update_repeated_failure_state(copilot_ctx, result)
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
         return
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
@@ -5082,6 +5178,7 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
     if result.get("error") and copilot_ctx.last_test_failure_reason is None:
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
+    _update_verification_evidence_from_run_result(copilot_ctx, result)
 
 
 def _record_diagnosis_repair_contract(
@@ -6205,6 +6302,9 @@ async def _inspect_page_for_composition_impl(
             "observed_after_workflow_run": True,
         }
         _mark_post_run_page_observed(copilot_ctx, source_tool="inspect_page_for_composition", url=current_url)
+        page_title = evidence.get("page_title")
+        if isinstance(page_title, str) and page_title:
+            _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
 
     copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
@@ -6594,4 +6694,5 @@ NATIVE_TOOLS = [
     get_run_results_tool,
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
+    inspect_page_for_composition_tool,
 ]

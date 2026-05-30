@@ -10,11 +10,11 @@ import contextlib
 import json
 import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opentelemetry import trace as otel_trace
 
@@ -122,6 +122,11 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
 _USER_MESSAGE_PREVIEW_MAX_CHARS = 40
+
+
+@runtime_checkable
+class _AgentInstructionsContext(Protocol):
+    context: object
 
 
 def _build_user_message_preview(message: str) -> str:
@@ -390,12 +395,32 @@ def _build_system_prompt(
     )
 
 
-def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Any:
+def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
+    if ctx is None:
+        return ""
+    evidence = ctx.workflow_verification_evidence
+    rendered = evidence.render_prompt_block()
+    if not rendered:
+        return ""
+    return (
+        "\n\nRUNTIME VERIFICATION EVIDENCE:\n```yaml\n" + escape_code_fences(rendered) + "\n```\n"
+        "Use this structured state before choosing the next action. If "
+        "`full_workflow_verified` is false, choose an evidence-grounded next step: split an oversized block, "
+        "continue from observed current browser state, run only missing block labels, or report partial verification. "
+        "Do not claim end-to-end verification unless `full_workflow_verified` is true."
+    )
+
+
+def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
     base_system_prompt = _build_system_prompt(tool_usage_guide=tool_usage_guide, config=config)
 
-    def instructions(context: Any, _agent: Any) -> str:
-        ctx = getattr(context, "context", None)
-        policy = getattr(ctx, "request_policy", None)
+    def instructions(context: object, _agent: object) -> str:
+        if not isinstance(context, _AgentInstructionsContext):
+            return base_system_prompt
+        ctx = context.context
+        if not isinstance(ctx, CopilotContext):
+            return base_system_prompt
+        policy = ctx.request_policy
         if not isinstance(policy, RequestPolicy):
             return base_system_prompt
         policy_summary = escape_code_fences(redact_raw_secrets_for_prompt(policy.prompt_summary()))
@@ -412,7 +437,7 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "and tell the user to store the redacted secret as a saved credential before testing. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
-        return prompt + _docs_answer_turn_directive(getattr(ctx, "turn_intent", None))
+        return prompt + _runtime_verification_evidence_prompt(ctx) + _docs_answer_turn_directive(ctx.turn_intent)
 
     return instructions
 
@@ -623,6 +648,36 @@ _FAILURE_FOLLOW_UP = {
 }
 
 
+def _partial_verification_response(ctx: CopilotContext) -> str | None:
+    evidence = ctx.workflow_verification_evidence
+    if not evidence.has_evidence():
+        return None
+    if evidence.full_workflow_verified:
+        return None
+
+    detail_parts: list[str] = []
+    if evidence.block_verified:
+        detail_parts.append("verified block(s): " + ", ".join(evidence.block_verified[:6]))
+    if evidence.live_page_state_verified:
+        page = evidence.page_title or evidence.current_url or "the current browser page"
+        detail_parts.append(f"verified current browser state: {page}")
+    if evidence.per_tool_budget_on_block:
+        detail_parts.append("per-tool budget hit on: " + ", ".join(evidence.per_tool_budget_on_block[:6]))
+    if evidence.unverified_block_labels:
+        detail_parts.append("unverified block(s): " + ", ".join(evidence.unverified_block_labels[:6]))
+
+    details = " ".join(detail_parts)
+    if details:
+        return (
+            "I saved a draft workflow and verified part of it, but the full workflow chain has not been "
+            f"verified end-to-end. {details}. Keep the draft to iterate on, or discard."
+        )
+    return (
+        "I saved a draft workflow, but the full workflow chain has not been verified end-to-end. "
+        "Keep the draft to iterate on, or discard."
+    )
+
+
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
     has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
@@ -658,6 +713,11 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
             f"I created {draft_phrase} and tested it, but the test failed. "
             f"Failure: {failure_summary}.{follow_up}{keep_draft_affordance}"
         )
+
+    if ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is False and has_keepable_draft:
+        partial_reply = _partial_verification_response(ctx)
+        if partial_reply is not None:
+            return partial_reply
 
     if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
         if policy is not None and policy.raw_secret_handling == "redacted_draft":
@@ -890,6 +950,80 @@ def _build_exit_result(
             ),
         ),
         exit_site="exit_result",
+    )
+
+
+def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+    # Bypass one extra LLM turn after a full workflow test already satisfies
+    # the diagnosis contract.
+    verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
+    user_response = "I created and tested the workflow successfully."
+    final_text, outcome = apply_repeated_reply_guard(
+        final_text=user_response,
+        attempted_kind=derive_response_kind(ctx.turn_intent),
+        blocked_signatures=ctx.blocked_reply_signatures,
+        terminal_reason="verified_goal_satisfied",
+        turn_intent=ctx.turn_intent,
+        tool_calls=[
+            str(entry.get("tool") or entry.get("name") or "")
+            for entry in ctx.tool_activity
+            if isinstance(entry, dict) and (entry.get("tool") or entry.get("name"))
+        ],
+    )
+    structured = StructuredContext.from_json_str(global_llm_context)
+    structured.merge_turn_summary(ctx.tool_activity)
+    enriched_context = structured.to_json_str()
+    output_kind = derive_output_kind(
+        response_type="REPLY",
+        request_policy=ctx.request_policy,
+        updated_workflow=verified_workflow,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+    )
+    output_policy_verdict = evaluate_output_policy(
+        request_policy=ctx.request_policy,
+        response_type="REPLY",
+        user_response=final_text,
+        global_llm_context=enriched_context,
+        workflow_yaml=verified_yaml,
+        has_workflow_proposal=verified_workflow is not None,
+        workflow_was_persisted=ctx.workflow_persisted,
+        workflow_attempted=True,
+        unvalidated=False,
+        output_kind=output_kind,
+    )
+    if not output_policy_verdict.allowed:
+        return _build_output_policy_blocked_result(
+            ctx,
+            output_policy_verdict,
+            prior_global_llm_context=global_llm_context,
+            prior_workflow_yaml=verified_yaml,
+            output_policy_diagnostics=build_output_policy_diagnostics(
+                raw_verdict=output_policy_verdict,
+                final_verdict=output_policy_verdict,
+                final_output_kind=_blocked_final_output_kind(output_policy_verdict),
+                hard_block_reason_codes=list(output_policy_verdict.reason_codes),
+                soft_rewrite_reason_codes=[],
+            ),
+        )
+    return _finalize_result_with_blocker_override(
+        ctx,
+        _make_agent_result(
+            ctx,
+            user_response=final_text,
+            updated_workflow=verified_workflow,
+            global_llm_context=enriched_context or None,
+            response_type="REPLY",
+            workflow_yaml=verified_yaml,
+            workflow_was_persisted=ctx.workflow_persisted,
+            total_tokens=ctx.total_tokens_used,
+            proposal_disposition="auto_applicable",
+            turn_outcome=outcome,
+            turn_id=ctx.turn_id,
+            narrative_summary=ctx.narrative_summary,
+        ),
+        exit_site="verified_goal_satisfied",
     )
 
 
@@ -2661,10 +2795,12 @@ async def _run_copilot_turn_impl(
 
     from skyvern.cli.mcp_tools import mcp as skyvern_mcp
     from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotGoalSatisfied,
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
         run_with_enforcement,
+        verified_goal_satisfied_context,
     )
     from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -2876,6 +3012,13 @@ async def _run_copilot_turn_impl(
                     prior_workflow_yaml=chat_request.workflow_yaml,
                     output_policy_diagnostics=_output_policy_diagnostics_from_guardrail_exception(exc),
                 )
+            except CopilotGoalSatisfied:
+                LOG.info(
+                    "Copilot run stopped after verified goal satisfaction",
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+                )
+                return _build_goal_satisfied_exit_result(ctx, global_llm_context)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
@@ -2934,5 +3077,20 @@ async def _run_copilot_turn_impl(
                     exit_site="non_retriable_nav",
                 )
     except Exception as e:
+        try:
+            goal_satisfied = verified_goal_satisfied_context(ctx)
+        except Exception:
+            LOG.error("Copilot agent error", error=str(e), exc_info=True)
+            return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        if goal_satisfied:
+            # The Agents SDK can wrap exceptions raised from hooks; keep this
+            # fallback so a verified-goal stop is not rendered as a generic error.
+            LOG.info(
+                "Copilot run stopped after verified goal satisfaction from wrapped exception",
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
+                error_type=type(e).__name__,
+            )
+            return _build_goal_satisfied_exit_result(ctx, global_llm_context)
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
         return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
