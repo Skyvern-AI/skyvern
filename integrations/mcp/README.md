@@ -68,6 +68,10 @@ skyvern setup opencode
 
 This writes `~/.config/opencode/opencode.json` with `"oauth": false` and your `x-api-key` header. Do not run `opencode mcp auth` afterward.
 
+> **Note:** The remote `/mcp` endpoint is stateless. Call `skyvern_browser_session_create` first
+> and pass `browser_session_id` on every browser tool call, or browser tools will return
+> `BrowserNotAvailable`.
+
 Use the following config if you want to set up Skyvern for any other MCP-enabled application
 ```json
 {
