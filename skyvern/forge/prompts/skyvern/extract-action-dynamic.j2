@@ -40,12 +40,6 @@ Open browser tabs (CLOSE_PAGE always closes the tab marked [current] — other t
 {{ open_tabs_context }}
 ```
 {% endif %}
-{% if non_vision_page_context %}
-Non-vision page context and accessibility tree:
-```json
-{{ non_vision_page_context }}
-```
-{% endif %}
 Clickable elements from `{{ current_url }}`:
 ```
 {{ elements }}

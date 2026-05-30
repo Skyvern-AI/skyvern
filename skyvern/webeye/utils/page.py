@@ -15,6 +15,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 
@@ -697,6 +698,15 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
+    async def _set_enriched_element_tree_flag(self) -> None:
+        context = skyvern_context.current()
+        enriched_enabled = bool(context and context.enriched_tree_enabled())
+        await self.evaluate(
+            frame=self.frame,
+            expression="([enabled]) => { window.GlobalEnableEnrichedElementTree = enabled; }",
+            arg=[enriched_enabled],
+        )
+
     @traced(name="skyvern.browser.element_tree_from_body")
     async def build_tree_from_body(
         self,
@@ -706,6 +716,7 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         must_included_tags = must_included_tags or []
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
         return await self.evaluate(
             frame=self.frame,
@@ -720,6 +731,7 @@ class SkyvernFrame:
         wait_until_finished: bool = True,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
@@ -733,6 +745,7 @@ class SkyvernFrame:
         full_tree: bool = False,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]

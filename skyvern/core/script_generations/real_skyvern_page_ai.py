@@ -46,7 +46,6 @@ from skyvern.webeye.actions.handler import (
     handle_upload_file_action,
 )
 from skyvern.webeye.actions.parse_actions import parse_actions
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 jinja_sandbox_env = SandboxedEnvironment()
@@ -230,10 +229,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 elements=element_tree,
                 local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
                 user_context=context.prompt,
-                non_vision_page_context=await build_non_vision_page_context_if_needed(
-                    scraped_page=self.scraped_page,
-                    page=getattr(self, "page", None),
-                ),
             )
             json_response = await app.SINGLE_CLICK_AGENT_LLM_API_HANDLER(
                 prompt=single_click_prompt,
@@ -1344,10 +1339,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
             extracted_text=extracted_text_for_prompt,
             error_code_mapping_str=error_code_mapping_str,
             local_datetime=local_datetime_str,
-            non_vision_page_context=await build_non_vision_page_context_if_needed(
-                scraped_page=self.scraped_page,
-                page=getattr(self, "page", None),
-            ),
         )
 
         # Cache extract-information within this script-generation path. The
@@ -1390,7 +1381,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 error_code_mapping=error_code_mapping_str,
                 llm_key=None,
                 workflow_system_prompt=workflow_system_prompt,
-                non_vision_page_context=post_ceiling_kwargs.get("non_vision_page_context"),
             )
             lookup_result = extraction_cache.lookup(workflow_run_id, cache_key)
         except Exception:
@@ -1514,10 +1504,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
             data_extraction_goal=prompt_rendered,
             current_url=scraped_page_refreshed.url,
             local_datetime=datetime.now(context.tz_info or datetime.now().astimezone().tzinfo).isoformat(),
-            non_vision_page_context=await build_non_vision_page_context_if_needed(
-                scraped_page=scraped_page_refreshed,
-                page=getattr(self, "page", None),
-            ),
         )
 
         step = None
@@ -1675,10 +1661,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
             current_url=self.page.url,
             elements=element_tree,
             local_datetime=local_datetime,
-            non_vision_page_context=await build_non_vision_page_context_if_needed(
-                scraped_page=self.scraped_page,
-                page=getattr(self, "page", None),
-            ),
         )
 
         try:
@@ -1705,10 +1687,6 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     current_url=self.page.url,
                     elements=element_tree,
                     local_datetime=local_datetime,
-                    non_vision_page_context=await build_non_vision_page_context_if_needed(
-                        scraped_page=self.scraped_page,
-                        page=getattr(self, "page", None),
-                    ),
                 )
                 action_response = await llm_handler(
                     prompt=single_action_prompt,
