@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.config import (
     SCREENSHOT_DROPPED_NUDGE,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from agents.agent import Agent
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
@@ -205,6 +207,41 @@ def build_probable_site_block_user_question(ctx: Any) -> str | None:
 
 class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
+
+
+class CopilotGoalSatisfied(Exception):
+    """Raised when a tool proves the workflow already satisfies the turn."""
+
+
+def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    if contract is None:
+        return False
+    verification = contract.verification_result
+    repair_decision = contract.repair_decision
+    return (
+        verification.user_goal_satisfied is True
+        and verification.completion_contract_satisfied is True
+        and repair_decision.next_action is RepairNextAction.NO_CHANGE
+    )
+
+
+def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
+    return (
+        ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and latest_diagnosis_contract_satisfies_goal(ctx)
+        and not _verified_goal_likely_needs_more_work(ctx)
+    )
+
+
+def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
+    block_count = ctx.last_update_block_count
+    if not isinstance(block_count, int):
+        return False
+    user_message = ctx.user_message
+    completion_contract = _request_completion_contract(ctx)
+    return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
 
 
 def _mark_copilot_total_timeout(ctx: Any) -> None:
@@ -402,10 +439,10 @@ def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
 _ACTION_CATEGORIES: list[list[str]] = [
     ["navigate", "go to", "open", "visit"],
     ["download", "save", "export"],
-    ["extract", "scrape", "collect", "gather", "get all"],
+    ["extract", "scrape", "collect", "gather", "get all", "grab", "capture", "retrieve", "pull"],
     ["login", "log in", "sign in", "authenticate"],
-    ["search", "find", "look for", "look up"],
-    ["fill", "enter", "type", "submit", "complete the form"],
+    ["search", "find", "look for", "look up", "check", "verify"],
+    ["fill", "enter", "type", "submit", "complete the form", "input"],
     ["click", "select", "choose", "pick"],
     ["upload", "attach"],
 ]

@@ -365,7 +365,8 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     if not result.get("ok", False):
         return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
-    data = result.get("data") or {}
+    raw_data = result.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
@@ -382,7 +383,7 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
             return f"Block '{data.get('label', '?')}' is valid"
         return "Block validation failed"
     if tool_name == "run_blocks_and_collect_debug":
-        if not isinstance(data, dict):
+        if not isinstance(raw_data, dict):
             return "Run debug completed"
         executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]
         status = data.get("overall_status", "?")
