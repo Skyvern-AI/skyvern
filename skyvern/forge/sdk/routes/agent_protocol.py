@@ -2183,7 +2183,10 @@ async def get_artifact_content(
 ) -> Response:
     artifact = None
 
-    if sig is not None and expiry is not None and kid is not None:
+    if settings.ARTIFACT_AUTH_DISABLED:
+        # Unauthenticated path — skip auth entirely (self-hosted convenience).
+        artifact = await app.DATABASE.artifacts.get_artifact_by_id_no_org(artifact_id=artifact_id)
+    elif sig is not None and expiry is not None and kid is not None:
         # HMAC-signed URL path — no org-level API key required.
         if not settings.ARTIFACT_CONTENT_HMAC_KEYRING:
             raise HTTPException(

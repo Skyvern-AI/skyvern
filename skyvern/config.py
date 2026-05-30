@@ -536,6 +536,19 @@ class Settings(BaseSettings):
     old key in keys until all URLs it signed have expired (12 h), then remove it.
     """
 
+    ARTIFACT_AUTH_DISABLED: bool = False
+    """
+    When True, the ``/artifacts/{id}/content`` endpoint skips authentication
+    checks entirely.  Intended for self-hosted deployments where artifact URLs
+    are accessed directly from the browser (e.g. in ``<img>`` tags) and cannot
+    carry an ``X-API-Key`` header.
+
+    Requires ``SKYVERN_BASE_URL`` to be set to the server\'s external address so
+    that generated artifact URLs point to the same origin.
+
+    Defaults to False.  Has no effect when ``ARTIFACT_CONTENT_HMAC_KEYRING`` is set.
+    """
+
     # Debug Session Settings
     DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """
