@@ -2,9 +2,11 @@ import asyncio
 import copy
 import hashlib
 import os
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import aiohttp
 import httpx
 import structlog
 from playwright.async_api import Frame, Page
@@ -51,6 +53,20 @@ USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
 INVALID_SHAPE = "N/A"
+
+
+@dataclass
+class TOTPVerificationResponse:
+    """Normalized response shape for the TOTP verification seam.
+
+    Decouples the seam contract from any specific HTTP client so the OSS
+    direct path (aiohttp) and the cloud proxy path (NATEgressProxyClient)
+    can both produce a response the helper consumes the same way.
+    """
+
+    status_code: int
+    body: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 def _remove_rect(element: dict) -> None:
@@ -1107,6 +1123,23 @@ class AgentFunction:
                 headers=headers,
                 timeout=httpx.Timeout(timeout_seconds),
             )
+
+    async def post_totp_verification_request(
+        self,
+        url: str,
+        payload: str,
+        headers: dict[str, str],
+        timeout_seconds: float = 30.0,
+        organization_id: str | None = None,
+    ) -> TOTPVerificationResponse:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
+            async with session.post(url, data=payload, headers=headers) as response:
+                body = await response.text()
+                return TOTPVerificationResponse(
+                    status_code=response.status,
+                    body=body,
+                    headers=dict(response.headers),
+                )
 
     async def upload_file_to_customer_storage(
         self,

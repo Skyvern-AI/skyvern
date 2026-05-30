@@ -1,9 +1,9 @@
 import asyncio
+import json
 import re
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
 import pyotp
 import structlog
 from pydantic import BaseModel, Field
@@ -175,32 +175,44 @@ async def _post_totp_verification_url(
     url: str,
     signed_payload: str,
     headers: dict[str, str],
+    organization_id: str,
     max_attempts: int = _TOTP_WEBHOOK_REQUEST_MAX_ATTEMPTS,
     retry_timeout: float = _TOTP_WEBHOOK_REQUEST_RETRY_TIMEOUT_SECONDS,
     timeout: int = DEFAULT_REQUEST_TIMEOUT,
 ) -> _TOTPWebhookPostResponse:
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-        for attempt in range(max_attempts):
+    # Routed through app.AGENT_FUNCTION so cloud egresses via the NAT proxy
+    # (static IP), matching webhook and file-upload delivery.
+    for attempt in range(max_attempts):
+        try:
+            response = await app.AGENT_FUNCTION.post_totp_verification_request(
+                url=url,
+                payload=signed_payload,
+                headers=headers,
+                timeout_seconds=timeout,
+                organization_id=organization_id,
+            )
+            # Content-Type gate: only trust an explicit non-JSON header to mean
+            # "this is not JSON". Missing header (e.g. proxy responses, which
+            # don't preserve upstream headers) falls through to optimistic JSON
+            # parsing — customer TOTP endpoints contractually return JSON.
+            content_type = response.headers.get("content-type", "").lower()
+            if content_type and "json" not in content_type:
+                return response.status_code, response.headers, response.body, False
             try:
-                async with session.post(url, data=signed_payload, headers=headers) as response:
-                    response_headers = dict(response.headers)
-                    try:
-                        response_body = await response.json()
-                        return response.status, response_headers, response_body, True
-                    except (aiohttp.ContentTypeError, ValueError):
-                        response_body = await response.text()
-                        return response.status, response_headers, response_body, False
-            except Exception:
-                LOG.debug(
-                    "TOTP webhook request attempt failed",
-                    endpoint_url=url,
-                    attempt=attempt + 1,
-                    max_attempts=max_attempts,
-                    exc_info=True,
-                )
-                if attempt < max_attempts - 1 and retry_timeout > 0:
-                    await asyncio.sleep(retry_timeout)
-        raise _TOTPWebhookRequestError(f"Failed post request url={url}")
+                return response.status_code, response.headers, json.loads(response.body), True
+            except (json.JSONDecodeError, ValueError):
+                return response.status_code, response.headers, response.body, False
+        except Exception:
+            LOG.debug(
+                "TOTP webhook request attempt failed",
+                endpoint_url=url,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                exc_info=True,
+            )
+            if attempt < max_attempts - 1 and retry_timeout > 0:
+                await asyncio.sleep(retry_timeout)
+    raise _TOTPWebhookRequestError(f"Failed post request url={url}")
 
 
 def _try_generate_totp_for_credential(
@@ -386,6 +398,7 @@ async def _get_otp_value_from_url(
             url=url,
             signed_payload=signed_data.signed_payload,
             headers=signed_data.headers,
+            organization_id=organization_id,
         )
     except Exception as e:
         LOG.error("Failed to get otp value from url", totp_verification_url=url, exc_info=True)
