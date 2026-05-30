@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -11,11 +12,12 @@ from agents.lifecycle import RunHooksBase
 from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
+from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied, verified_goal_satisfied_context
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 
 if TYPE_CHECKING:
-    from skyvern.forge.sdk.copilot.runtime import AgentContext
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 LOG = structlog.get_logger()
 
@@ -25,12 +27,31 @@ LOG = structlog.get_logger()
 _BLOCK_OUTPUT_TOOLS: frozenset[str] = frozenset(
     {"run_blocks_and_collect_debug", "get_run_results", "update_and_run_blocks"}
 )
+_VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
+    {
+        "last_test_ok",
+        "last_full_workflow_test_ok",
+        "last_update_block_count",
+        "latest_diagnosis_repair_contract",
+        "user_message",
+    }
+)
+
+
+def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
+    if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
+        return False
+    if parsed.get("ok") is not True:
+        return False
+    if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
+        return False
+    return verified_goal_satisfied_context(ctx)
 
 
 class CopilotRunHooks(RunHooksBase):
     """Record tool activity for StructuredContext.merge_turn_summary()."""
 
-    def __init__(self, ctx: AgentContext) -> None:
+    def __init__(self, ctx: CopilotContext) -> None:
         self._ctx = ctx
 
     async def on_tool_end(
@@ -80,3 +101,14 @@ class CopilotRunHooks(RunHooksBase):
                 tool=getattr(tool, "name", None),
                 exc_info=True,
             )
+            return
+
+        if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
+            LOG.info(
+                "copilot tool satisfied goal; stopping agent loop",
+                tool_name=tool_name,
+                workflow_run_id=(parsed.get("data") or {}).get("workflow_run_id")
+                if isinstance(parsed.get("data"), dict)
+                else None,
+            )
+            raise CopilotGoalSatisfied()

@@ -27,6 +27,7 @@ from skyvern.cli.core.session_manager import (
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
@@ -124,6 +125,7 @@ class AgentContext:
     verified_prefix_labels: list[str] = field(default_factory=list)
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
     # failure_tracking; declared here so _check_enforcement can read them on a
