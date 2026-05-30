@@ -106,6 +106,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
     OutputParameter,
@@ -2864,6 +2865,149 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
     return url
 
 
+def _same_runtime_page(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except ValueError:
+        return False
+    return (
+        left_parsed.scheme.lower(),
+        left_parsed.netloc.lower(),
+        left_parsed.path,
+        left_parsed.query,
+    ) == (
+        right_parsed.scheme.lower(),
+        right_parsed.netloc.lower(),
+        right_parsed.path,
+        right_parsed.query,
+    )
+
+
+def _frontier_anchor_url_from_value(value: object, *, depth: int = 0) -> str | None:
+    if depth > 3:
+        return None
+    direct = _valid_runtime_anchor_url(value)
+    if direct is not None:
+        return direct
+    if isinstance(value, dict):
+        for key in ("current_url", "url", "page_url"):
+            candidate = _valid_runtime_anchor_url(value.get(key))
+            if candidate is not None:
+                return candidate
+        for nested in value.values():
+            candidate = _frontier_anchor_url_from_value(nested, depth=depth + 1)
+            if candidate is not None:
+                return candidate
+    if isinstance(value, list):
+        for nested in value:
+            candidate = _frontier_anchor_url_from_value(nested, depth=depth + 1)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def _frontier_runtime_anchor_url(ctx: CopilotContext, block_outputs_to_seed: dict[str, Any]) -> str | None:
+    for value in (
+        ctx.verified_prefix_current_url,
+        getattr(ctx, "composition_page_evidence", None),
+    ):
+        candidate = _frontier_anchor_url_from_value(value)
+        if candidate is not None:
+            return candidate
+    for value in reversed(list((block_outputs_to_seed or {}).values())):
+        candidate = _frontier_anchor_url_from_value(value)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _iter_workflow_model_blocks(blocks: list[BlockTypeVar] | None) -> list[BlockTypeVar]:
+    if not isinstance(blocks, list):
+        return []
+    return get_all_blocks(blocks)
+
+
+def _workflow_model_block_by_label(workflow_definition: object | None, label: str | None) -> BlockTypeVar | None:
+    if workflow_definition is None or not label:
+        return None
+    blocks = workflow_definition.blocks if hasattr(workflow_definition, "blocks") else None
+    for block in _iter_workflow_model_blocks(blocks):
+        if block.label == label:
+            return block
+    return None
+
+
+def _has_verified_prefix_before_frontier(
+    ctx: CopilotContext, workflow_definition: object | None, frontier_label: str | None
+) -> bool:
+    if not frontier_label:
+        return False
+    workflow_labels = _workflow_definition_block_labels(workflow_definition)
+    if frontier_label not in workflow_labels:
+        return False
+    prefix_labels = workflow_labels[: workflow_labels.index(frontier_label)]
+    if not prefix_labels:
+        return False
+    verified = set(ctx.verified_prefix_labels or [])
+    return all(label in verified for label in prefix_labels)
+
+
+def _workflow_with_runtime_frontier_anchor(
+    workflow: Workflow,
+    ctx: CopilotContext,
+    *,
+    labels_to_execute: list[str],
+    frontier_start_label: str | None,
+    block_outputs_to_seed: dict[str, Any],
+) -> tuple[Workflow, str | None]:
+    if not labels_to_execute:
+        return workflow, None
+    workflow_definition = workflow.workflow_definition
+    if not _has_verified_prefix_before_frontier(ctx, workflow_definition, frontier_start_label):
+        return workflow, None
+
+    first_label = labels_to_execute[0]
+    first_block = _workflow_model_block_by_label(workflow_definition, first_label)
+    if first_block is None or not hasattr(first_block, "url"):
+        return workflow, None
+
+    anchor_url = _frontier_runtime_anchor_url(ctx, block_outputs_to_seed)
+    if anchor_url is None:
+        return workflow, None
+
+    existing_url = _valid_runtime_anchor_url(first_block.url if hasattr(first_block, "url") else None)
+    if existing_url is not None and not _same_runtime_page(existing_url, anchor_url):
+        return workflow, None
+
+    if existing_url is not None:
+        if _block_type_name(first_block) != BlockType.NAVIGATION.value:
+            return workflow, None
+        anchored = workflow.model_copy(deep=True)
+        anchored_block = _workflow_model_block_by_label(anchored.workflow_definition, first_label)
+        if anchored_block is None or not hasattr(anchored_block, "url"):
+            return workflow, None
+        anchored_block.url = None
+        LOG.info(
+            "Cleared runtime frontier URL to preserve browser state",
+            frontier_start_label=frontier_start_label,
+            first_block_label=first_label,
+            existing_url=existing_url,
+            continuation_url=anchor_url,
+        )
+        return anchored, anchor_url
+
+    LOG.info(
+        "Preserved runtime frontier browser state without URL reload",
+        frontier_start_label=frontier_start_label,
+        first_block_label=first_label,
+        continuation_url=anchor_url,
+    )
+    return workflow, anchor_url
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -2926,6 +3070,13 @@ async def _run_blocks_and_collect_debug(
 
     organization = Organization.model_validate(org)
     runtime_workflow = _workflow_with_runtime_block_goal_context(workflow, ctx)
+    runtime_workflow, runtime_frontier_anchor_url = _workflow_with_runtime_frontier_anchor(
+        runtime_workflow,
+        ctx,
+        labels_to_execute=labels_to_execute,
+        frontier_start_label=frontier_start_label,
+        block_outputs_to_seed=block_outputs_to_seed,
+    )
 
     user_params: dict[str, Any] = params.get("parameters") or {}
     all_workflow_params, all_output_params = await asyncio.gather(
@@ -3294,6 +3445,8 @@ async def _run_blocks_and_collect_debug(
         "page_title": page_title,
         "action_trace_summary": action_trace_summary,
     }
+    if runtime_frontier_anchor_url is not None:
+        result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
     if screenshot_b64 is not None:
         result_data["screenshot_base64"] = screenshot_b64
     if not run_ok and run and getattr(run, "failure_reason", None):
