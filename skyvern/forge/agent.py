@@ -4123,6 +4123,8 @@ class ForgeAgent:
                     "Didn't add verification code to navigation payload",
                     final_navigation_payload=final_navigation_payload,
                 )
+            # Mark verification code as sensitive so it is masked in persisted artifacts
+            current_context.sensitive_values.add(verification_code)
             if expire_verification_code:
                 current_context.totp_codes.pop(task.task_id)
 
@@ -4147,6 +4149,7 @@ class ForgeAgent:
                             # Store TOTP secret for handler to use during execution
                             current_context = skyvern_context.ensure_context()
                             current_context.totp_codes[f"{task.task_id}_secret"] = totp_secret
+                            current_context.sensitive_values.add(totp_secret)
 
                             # Send a placeholder TOTP for the LLM to see the format
                             final_navigation_payload[key]["totp"] = "123456"
