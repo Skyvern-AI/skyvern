@@ -1394,7 +1394,7 @@ class LLMAPIHandlerFactory:
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
                 if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
+                    content = response.choices[0].message.content if response.choices and response.choices[0].message is not None else None
                     parsed_response = content or ""
                 else:
                     parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
@@ -1936,7 +1936,7 @@ class LLMAPIHandlerFactory:
                         workflow_run_block_id, organization_id, context, llm_cost, prompt_name
                     )
                 if raw_response:
-                    content = response.choices[0].message.content if response.choices else None
+                    content = response.choices[0].message.content if response.choices and response.choices[0].message is not None else None
                     parsed_response = content or ""
                 else:
                     parsed_response = parse_api_response(response, llm_config.add_assistant_prefix, force_dict)
