@@ -36,10 +36,12 @@ import {
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
+import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
-  shouldQueuePromptForLiveBrowser,
-  shouldWaitForLiveBrowser,
-} from "./browserReadiness";
+  QueuedPromptReason,
+  resolveDrainAction,
+  resolveSendAction,
+} from "./sendQueue";
 import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
 import {
@@ -129,6 +131,7 @@ interface ChatMessage {
 type QueuedPrompt = {
   id: string;
   content: string;
+  reason: QueuedPromptReason;
 };
 
 type SendOptions = {
@@ -303,6 +306,13 @@ export function WorkflowCopilotChat({
   }, [narrative]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
+  // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
+  // rapid double-submit would run a stale closure and start a second stream;
+  // this ref is set before the first await and read at the top of handleSend.
+  const inFlightRef = useRef(false);
+  // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
+  // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
+  const queuedPromptRef = useRef<QueuedPrompt | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -401,9 +411,14 @@ export function WorkflowCopilotChat({
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
 
+  const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
+    queuedPromptRef.current = next;
+    setQueuedPrompt(next);
+  }, []);
+
   const handleNewChat = () => {
     setMessages([]);
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
@@ -627,7 +642,7 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     if (!workflowPermanentId) {
       setMessages([]);
-      setQueuedPrompt(null);
+      updateQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
@@ -700,7 +715,7 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, workflowPermanentId]);
+  }, [credentialGetter, updateQueuedPrompt, workflowPermanentId]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -758,7 +773,7 @@ export function WorkflowCopilotChat({
       return;
     }
 
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -767,7 +782,7 @@ export function WorkflowCopilotChat({
       textareaRef.current?.focus();
       adjustTextareaHeight();
     });
-  }, [adjustTextareaHeight, queuedPrompt]);
+  }, [adjustTextareaHeight, queuedPrompt, updateQueuedPrompt]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -792,12 +807,19 @@ export function WorkflowCopilotChat({
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
       const candidate = messageOverride ?? inputValue;
-      if (
-        !candidate.trim() ||
-        isLoading ||
-        (queuedPrompt && !options.queuedMessageId)
-      )
+      const isDrain = Boolean(options.queuedMessageId);
+      const action = resolveSendAction({
+        inFlight: inFlightRef.current,
+        hasQueuedPrompt: Boolean(queuedPromptRef.current),
+        requiresLiveBrowser,
+        isLiveBrowserReady,
+        candidate,
+        isDrain,
+        skipQueue: Boolean(options.skipQueue),
+      });
+      if (action === "noop") {
         return;
+      }
       if (!workflowPermanentId) {
         toast({
           title: "Missing agent",
@@ -806,36 +828,38 @@ export function WorkflowCopilotChat({
         });
         return;
       }
-      if (
-        !options.skipQueue &&
-        shouldQueuePromptForLiveBrowser({
-          requiresLiveBrowser,
-          isLiveBrowserReady,
-          message: candidate,
-        })
-      ) {
-        const queued: QueuedPrompt = {
-          id: `${Date.now()}-queued`,
-          content: candidate,
-        };
-
-        setQueuedPrompt(queued);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: queued.id,
-            sender: "user",
-            content: queued.content,
-          },
-        ]);
+      if (action === "queue_working" || action === "queue_live_browser") {
+        const reason: QueuedPromptReason =
+          action === "queue_working" ? "working" : "live_browser";
+        const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        updateQueuedPrompt({ id: queuedId, content: candidate, reason });
+        // First queue adds the user bubble; a re-queue (a working drain that
+        // then had to wait for the browser) reuses the existing bubble.
+        if (!options.queuedMessageId) {
+          setMessages((prev) => [
+            ...prev,
+            { id: queuedId, sender: "user", content: candidate },
+          ]);
+        }
         setProposedWorkflow(null);
         if (messageOverride === undefined) {
           setInputValue("");
         }
-        toast({
-          title: "Prompt queued",
-          description: "Copilot will start once the live browser connects.",
-        });
+        if (!options.queuedMessageId) {
+          toast(
+            reason === "working"
+              ? {
+                  title: "Message queued",
+                  description:
+                    "Copilot is finishing the current turn — it will send next.",
+                }
+              : {
+                  title: "Prompt queued",
+                  description:
+                    "Copilot will start once the live browser connects.",
+                },
+          );
+        }
         return;
       }
 
@@ -859,6 +883,7 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       setIsLoading(true);
+      inFlightRef.current = true;
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -1152,9 +1177,13 @@ export function WorkflowCopilotChat({
           content: "Sorry, I encountered an error. Please try again.",
         };
         setMessages((prev) => [...prev, errorMessage]);
+        // A thrown stream never emits a terminal narrative event, so clear the
+        // bubble or its Working/elapsed indicator would tick forever.
+        setNarrative(EMPTY_NARRATIVE);
       } finally {
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
+          inFlightRef.current = false;
         }
         if (cancelInFlightController.current === abortController) {
           cancelInFlightController.current = null;
@@ -1175,10 +1204,9 @@ export function WorkflowCopilotChat({
       getSaveData,
       inputValue,
       isLiveBrowserReady,
-      isLoading,
       liveBrowserSessionId,
-      queuedPrompt,
       requiresLiveBrowser,
+      updateQueuedPrompt,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
@@ -1193,24 +1221,27 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    // Drain only when the browser is actually ready (non-null session id from
-    // the parent). If requiresLiveBrowser flips to false without a session
-    // (rate-limit, pane hidden), the queue stays so user intent isn't sent
-    // with browser_session_id=null.
-    if (
-      !queuedPrompt ||
-      !liveBrowserSessionId ||
-      isLoading ||
-      !workflowPermanentId
-    ) {
+    // isLoading (reactive state) is the in-flight signal here so the effect
+    // re-runs when a turn ends; handleSend uses the synchronous ref instead.
+    const drainAction = resolveDrainAction({
+      queuedReason: queuedPrompt?.reason ?? null,
+      inFlight: isLoading,
+      hasLiveBrowserSession: Boolean(liveBrowserSessionId),
+      hasWorkflowPermanentId: Boolean(workflowPermanentId),
+    });
+    if (!queuedPrompt || drainAction === "wait") {
       return;
     }
 
     const promptToSend = queuedPrompt;
-    setQueuedPrompt(null);
+    // Clear before re-entering handleSend so a 'send' resolution leaves no
+    // stale queued prompt for the effect to re-drain in a loop. A working
+    // prompt that still needs the browser re-queues under the same id and
+    // drains via the live_browser path once the session arrives.
+    updateQueuedPrompt(null);
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
-      skipQueue: true,
+      skipQueue: drainAction === "drain_skip_queue",
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
@@ -1219,6 +1250,7 @@ export function WorkflowCopilotChat({
     isLoading,
     liveBrowserSessionId,
     queuedPrompt,
+    updateQueuedPrompt,
     workflowPermanentId,
   ]);
 
@@ -1442,14 +1474,20 @@ export function WorkflowCopilotChat({
     return null;
   }
 
-  const inputDisabled = isLoading || Boolean(queuedPrompt);
+  // Input stays usable while Copilot works; only a parked queued prompt
+  // disables it (the message is already captured).
+  const inputDisabled = Boolean(queuedPrompt);
   const queuedPromptWaitingStatus =
-    "Prompt queued. Waiting for live browser...";
+    queuedPrompt?.reason === "working"
+      ? "Queued — sends when this turn finishes."
+      : "Prompt queued. Waiting for live browser...";
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
-    : isWaitingForLiveBrowser
-      ? "Live browser is starting. Send now to queue your prompt."
-      : null;
+    : isLoading
+      ? "Copilot is working — message will queue…"
+      : isWaitingForLiveBrowser
+        ? "Live browser is starting. Send now to queue your prompt."
+        : null;
 
   return (
     <div
@@ -1660,9 +1698,11 @@ export function WorkflowCopilotChat({
             placeholder={
               queuedPrompt
                 ? "Prompt queued..."
-                : isWaitingForLiveBrowser
-                  ? "Type a prompt to queue..."
-                  : "Type your message... (Shift+Enter for new line)"
+                : isLoading
+                  ? "Type a message to queue for the next turn…"
+                  : isWaitingForLiveBrowser
+                    ? "Type a prompt to queue..."
+                    : "Type your message... (Shift+Enter for new line)"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
@@ -1676,10 +1716,44 @@ export function WorkflowCopilotChat({
               overflow: "auto",
             }}
           />
-          {isLoading || Boolean(queuedPrompt) ? (
+          {isLoading && queuedPrompt ? (
+            <>
+              <button
+                onClick={cancelQueuedPrompt}
+                title="Edit queued message"
+                className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              >
+                Edit queued
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : isLoading ? (
+            <>
+              <button
+                onClick={() => handleSend()}
+                title="Queue for the next turn"
+                className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+              >
+                Queue
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : queuedPrompt ? (
             <button
-              onClick={isLoading ? cancelSend : cancelQueuedPrompt}
-              title={isLoading ? "Stop Copilot" : "Edit queued prompt"}
+              onClick={cancelQueuedPrompt}
+              title="Edit queued prompt"
               className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
             >
               Cancel

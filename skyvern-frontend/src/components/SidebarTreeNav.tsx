@@ -133,6 +133,150 @@ function useIsActive() {
   );
 }
 
+// Open on hover only after a brief rest, so a cursor crossing the icon rail doesn't flash menus open.
+const FLYOUT_OPEN_DELAY_MS = 100;
+// Keep the flyout open briefly after the cursor leaves, so it can bridge the gap to the content.
+const FLYOUT_CLOSE_DELAY_MS = 120;
+
+function CollapsedNavItem({
+  item,
+  groupStorageKey,
+  triggerClassName,
+  iconClassName,
+  menuChildItemClassName,
+}: {
+  item: SidebarNavItem;
+  groupStorageKey: string;
+  triggerClassName: string;
+  iconClassName: string;
+  menuChildItemClassName: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearHoverTimer = useCallback(() => {
+    if (hoverTimerRef.current !== null) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleHover = useCallback(
+    (nextOpen: boolean, delay: number) => {
+      clearHoverTimer();
+      hoverTimerRef.current = setTimeout(() => {
+        hoverTimerRef.current = null;
+        setOpen(nextOpen);
+      }, delay);
+    },
+    [clearHoverTimer],
+  );
+
+  useEffect(() => {
+    return () => {
+      clearHoverTimer();
+    };
+  }, [clearHoverTimer]);
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          title={item.label}
+          className={triggerClassName}
+          onMouseEnter={() => scheduleHover(true, FLYOUT_OPEN_DELAY_MS)}
+          onMouseLeave={() => scheduleHover(false, FLYOUT_CLOSE_DELAY_MS)}
+        >
+          <span className={iconClassName}>{item.icon}</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        side="right"
+        align="start"
+        onMouseEnter={clearHoverTimer}
+        onMouseLeave={() => scheduleHover(false, FLYOUT_CLOSE_DELAY_MS)}
+        className="min-w-48 border-neutral-200 bg-white p-1 text-neutral-900 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
+      >
+        <DropdownMenuItem asChild>
+          <Link
+            to={item.to}
+            className={cn(menuChildItemClassName, "font-semibold")}
+          >
+            <span className="flex size-3.5 shrink-0 items-center justify-center text-neutral-500 dark:text-neutral-400">
+              {item.icon}
+            </span>
+            <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            {item.badge ? (
+              <span className="rounded bg-neutral-200 px-1.5 py-0.5 text-[9px] font-medium uppercase leading-none text-neutral-500 dark:bg-white/[0.06] dark:text-neutral-400">
+                {item.badge}
+              </span>
+            ) : null}
+          </Link>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {(item.children ?? []).map((child) => {
+          const childKey = `${groupStorageKey}-${child.to ?? child.label}`;
+          const content = (
+            <>
+              {child.icon ? (
+                <span className="flex size-3.5 shrink-0 items-center justify-center text-neutral-500 dark:text-neutral-400">
+                  {child.icon}
+                </span>
+              ) : null}
+              <span className="truncate">{child.label}</span>
+            </>
+          );
+
+          if (child.to && child.external) {
+            return (
+              <DropdownMenuItem key={childKey} asChild>
+                <a
+                  href={child.to}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => child.onClick?.()}
+                  className={menuChildItemClassName}
+                >
+                  {content}
+                </a>
+              </DropdownMenuItem>
+            );
+          }
+
+          if (child.to) {
+            return (
+              <DropdownMenuItem key={childKey} asChild>
+                <Link
+                  to={child.to}
+                  onClick={() => child.onClick?.()}
+                  className={menuChildItemClassName}
+                >
+                  {content}
+                </Link>
+              </DropdownMenuItem>
+            );
+          }
+
+          return (
+            <DropdownMenuItem
+              key={childKey}
+              disabled={child.disabled}
+              onSelect={(event) => {
+                event.preventDefault();
+                child.onClick?.();
+              }}
+              className={menuChildItemClassName}
+            >
+              {content}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 function SidebarTreeNav({ items }: Props) {
   const collapsed = useSidebarStore((state) => state.collapsed);
   const isActive = useIsActive();
@@ -284,101 +428,13 @@ function SidebarTreeNav({ items }: Props) {
                 />
               </button>
             ) : hasChildren && collapsed ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    title={item.label}
-                    className={topLevelClassName}
-                  >
-                    <span className={topLevelIconClassName}>{item.icon}</span>
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent
-                  side="right"
-                  align="start"
-                  className="min-w-48 border-neutral-200 bg-white p-1 text-neutral-900 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
-                >
-                  <DropdownMenuItem asChild>
-                    <Link
-                      to={item.to}
-                      className={cn(menuChildItemClassName, "font-semibold")}
-                    >
-                      <span className="flex size-3.5 shrink-0 items-center justify-center text-neutral-500 dark:text-neutral-400">
-                        {item.icon}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate">
-                        {item.label}
-                      </span>
-                      {item.badge ? (
-                        <span className="rounded bg-neutral-200 px-1.5 py-0.5 text-[9px] font-medium uppercase leading-none text-neutral-500 dark:bg-white/[0.06] dark:text-neutral-400">
-                          {item.badge}
-                        </span>
-                      ) : null}
-                    </Link>
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  {(item.children ?? []).map((child) => {
-                    const childKey = `${groupStorageKey}-${
-                      child.to ?? child.label
-                    }`;
-                    const content = (
-                      <>
-                        {child.icon ? (
-                          <span className="flex size-3.5 shrink-0 items-center justify-center text-neutral-500 dark:text-neutral-400">
-                            {child.icon}
-                          </span>
-                        ) : null}
-                        <span className="truncate">{child.label}</span>
-                      </>
-                    );
-
-                    if (child.to && child.external) {
-                      return (
-                        <DropdownMenuItem key={childKey} asChild>
-                          <a
-                            href={child.to}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            onClick={() => child.onClick?.()}
-                            className={menuChildItemClassName}
-                          >
-                            {content}
-                          </a>
-                        </DropdownMenuItem>
-                      );
-                    }
-
-                    if (child.to) {
-                      return (
-                        <DropdownMenuItem key={childKey} asChild>
-                          <Link
-                            to={child.to}
-                            onClick={() => child.onClick?.()}
-                            className={menuChildItemClassName}
-                          >
-                            {content}
-                          </Link>
-                        </DropdownMenuItem>
-                      );
-                    }
-
-                    return (
-                      <DropdownMenuItem
-                        key={childKey}
-                        disabled={child.disabled}
-                        onSelect={(event) => {
-                          event.preventDefault();
-                          child.onClick?.();
-                        }}
-                        className={menuChildItemClassName}
-                      >
-                        {content}
-                      </DropdownMenuItem>
-                    );
-                  })}
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <CollapsedNavItem
+                item={item}
+                groupStorageKey={groupStorageKey}
+                triggerClassName={topLevelClassName}
+                iconClassName={topLevelIconClassName}
+                menuChildItemClassName={menuChildItemClassName}
+              />
             ) : (
               <Link
                 to={item.to}
