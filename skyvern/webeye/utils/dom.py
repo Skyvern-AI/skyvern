@@ -809,7 +809,7 @@ class SkyvernElement:
             )
         except Exception:
             LOG.warning(
-                "Failed to move mouse to the element - unexpectd exception",
+                "Failed to move mouse to the element - unexpected exception",
                 task_id=task_id,
                 step_id=step_id,
                 element_id=element_id,

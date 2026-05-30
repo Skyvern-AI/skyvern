@@ -1885,7 +1885,7 @@ class ForgeAgent:
                 else:
                     if action_node.next is not None:
                         LOG.warning(
-                            "Action failed, but have duplicated element id in the action list. Continue excuting.",
+                            "Action failed, but have duplicated element id in the action list. Continue executing.",
                             step_order=step.order,
                             step_retry=step.retry_index,
                             action_idx=action_idx,

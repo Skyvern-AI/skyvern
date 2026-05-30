@@ -403,7 +403,7 @@ async def _convert_css_shape_to_string(
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
                 except asyncio.TimeoutError:
                     LOG.warning(
-                        "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
+                        "Timeout to call LLM to parse css shape. Going to abort the conversion directly.",
                         element_id=element_id,
                         key=shape_key,
                     )
@@ -422,7 +422,7 @@ async def _convert_css_shape_to_string(
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
             else:
                 LOG.info(
-                    "Max css shape convertion retry, going to abort the convertion.",
+                    "Max css shape conversion retry, going to abort the conversion.",
                     element_id=element_id,
                     key=shape_key,
                 )
