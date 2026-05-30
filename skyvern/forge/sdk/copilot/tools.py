@@ -800,6 +800,108 @@ def _post_budget_upstream_replay_signal(
     )
 
 
+def _composition_control_label(control: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("text", "name", "id", "selector"):
+        value = control.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    unique = list(dict.fromkeys(parts))
+    return " / ".join(unique[:2])[:160] if unique else "submit/search control"
+
+
+def _disabled_submit_controls_from_evidence(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    forms = evidence.get("forms")
+    if not isinstance(forms, list):
+        return controls
+    for form in forms:
+        if not isinstance(form, dict):
+            continue
+        for control in form.get("submit_controls") or []:
+            if isinstance(control, dict) and control.get("disabled") is True:
+                controls.append(control)
+    return controls[:5]
+
+
+def _post_run_terminal_challenge_reason(evidence: dict[str, Any]) -> str | None:
+    if evidence.get("observed_after_workflow_run") is not True:
+        return None
+
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict):
+        gated_controls = [
+            control for control in challenge_state.get("gated_submit_controls") or [] if isinstance(control, dict)
+        ]
+        if challenge_state.get("gates_submit_controls") is True:
+            kind = str(challenge_state.get("kind") or "anti-bot challenge").replace("_", " ")
+            labels = ", ".join(_composition_control_label(control) for control in gated_controls[:3])
+            controls_text = f" ({labels})" if labels else ""
+            return f"{kind} is still gating disabled submit/search control(s){controls_text}"
+        if challenge_state.get("detected") is True and challenge_state.get("requires_human_verification") is True:
+            disabled_controls = _disabled_submit_controls_from_evidence(evidence)
+            if disabled_controls:
+                labels = ", ".join(_composition_control_label(control) for control in disabled_controls[:3])
+                return f"human-verification challenge remains while submit/search control(s) are disabled ({labels})"
+
+    indicators = evidence.get("anti_bot_indicators")
+    has_indicators = isinstance(indicators, list) and any(isinstance(item, str) and item.strip() for item in indicators)
+    if has_indicators:
+        disabled_controls = _disabled_submit_controls_from_evidence(evidence)
+        if disabled_controls:
+            labels = ", ".join(_composition_control_label(control) for control in disabled_controls[:3])
+            return f"anti-bot evidence remains while submit/search control(s) are disabled ({labels})"
+    return None
+
+
+def _post_budget_terminal_challenge_signal(
+    ctx: AgentContext, arguments: dict[str, Any] | None, tool_name: str
+) -> CopilotToolBlockerSignal | None:
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return None
+
+    # A failed run with post-run page evidence can prove the same terminal
+    # challenge state even when the top-level failure category was not budget.
+    prior_budget_or_failed_run = (
+        getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+        or getattr(ctx, "last_test_ok", None) is False
+        or getattr(ctx, "post_run_page_observation_after_failed_test", False) is True
+        or bool(_per_tool_budget_problem_label_set(ctx))
+    )
+    if not prior_budget_or_failed_run:
+        return None
+
+    reason = _post_run_terminal_challenge_reason(evidence)
+    if not reason:
+        return None
+
+    requested_labels = _requested_block_label_set(arguments)
+    labels_text = f" Requested labels: {', '.join(sorted(requested_labels))}." if requested_labels else ""
+    agent_steering = (
+        "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
+        f"now shows: {reason}.{labels_text} Do NOT call "
+        f"{tool_name} again in this turn, do NOT try another proxy/location from this evidence state, and "
+        "do NOT claim registry results or no-results were verified. REPLY now with a blocker explanation "
+        "that names the observed challenge/disabled control and summarizes the tested workflow state."
+    )
+    user_facing = (
+        "The site's verification challenge is still blocking the submit/search control after live-page inspection, "
+        "so I stopped without claiming results."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="tool_error_post_budget_challenge_blocker",
+        blocked_tool=tool_name,
+    )
+
+
 _RECONCILIATION_REQUIRES_INPUT_USER_FACING = (
     "The previous run was canceled. Tell me whether to retry, keep the draft as-is, or adjust the workflow first."
 )
@@ -1286,7 +1388,7 @@ def _challenge_gated_anti_bot_rerun_signal(
         "Ask whether to try a materially different proxy/location, entrypoint, or alternate source."
     )
     user_facing = (
-        "The site's verification challenge is still keeping the search control disabled, so I need to stop "
+        "The site's verification challenge is still keeping the submit/search control disabled, so I stopped "
         "instead of retrying the same workflow path."
     )
     return CopilotToolBlockerSignal(
@@ -1296,7 +1398,7 @@ def _challenge_gated_anti_bot_rerun_signal(
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,
-        renders_final_reply=False,
+        renders_final_reply=True,
         internal_reason_code="tool_error_challenge_gated_submit_disabled",
         blocked_tool=tool_name,
     )
@@ -1348,6 +1450,12 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         inspection_signal = _post_budget_page_inspection_signal(ctx, tool_name)
         if inspection_signal is not None:
             return _emit_tool_blocker_signal(ctx, inspection_signal)
+
+        # Terminal anti-bot evidence should produce the final user-facing reply
+        # before the generic budget rerun path can ask for another attempt.
+        post_budget_challenge_signal = _post_budget_terminal_challenge_signal(ctx, arguments, tool_name)
+        if post_budget_challenge_signal is not None:
+            return _emit_tool_blocker_signal(ctx, post_budget_challenge_signal)
 
         budget_signal = _per_tool_budget_problem_rerun_signal(ctx, arguments, tool_name)
         if budget_signal is not None:
@@ -1893,6 +2001,10 @@ async def _update_workflow(
     wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
     if wait_block_error:
         return {"ok": False, "error": wait_block_error}
+
+    challenge_http_error = _challenge_http_request_reject_message(ctx, workflow_yaml, ctx.workflow_yaml)
+    if challenge_http_error:
+        return {"ok": False, "error": challenge_http_error}
 
     # Post-emission reject of copilot-v2 writes that introduce a banned
     # block type. The schema pre_hook only fires when the LLM consults the
@@ -4183,6 +4295,56 @@ def _detect_timing_only_challenge_wait_blocks(submitted_yaml: str | None) -> lis
     return labels
 
 
+def _composition_evidence_has_challenge(ctx: AgentContext) -> bool:
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"):
+        return True
+    challenge_state = evidence.get("challenge_state")
+    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+
+
+def _detect_new_http_request_blocks(submitted_yaml: str | None, prior_workflow_yaml: str | None) -> list[str]:
+    submitted_blocks = _parse_workflow_blocks(submitted_yaml)
+    if submitted_blocks is None:
+        return []
+    prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
+    prior_labels: set[str] = set()
+    for block in _iter_yaml_blocks(prior_blocks or []):
+        if str(block.get("block_type") or "").strip().lower() != "http_request":
+            continue
+        label = block.get("label")
+        if isinstance(label, str):
+            prior_labels.add(label)
+    labels: list[str] = []
+    for block in _iter_yaml_blocks(submitted_blocks):
+        if str(block.get("block_type") or "").strip().lower() != "http_request":
+            continue
+        label = block.get("label")
+        if isinstance(label, str) and label not in prior_labels:
+            labels.append(label)
+    return labels
+
+
+def _challenge_http_request_reject_message(
+    ctx: AgentContext, submitted_yaml: str | None, prior_workflow_yaml: str | None
+) -> str | None:
+    if not _composition_evidence_has_challenge(ctx):
+        return None
+    labels = _detect_new_http_request_blocks(submitted_yaml, prior_workflow_yaml)
+    if not labels:
+        return None
+    labels_text = ", ".join(sorted(set(labels)))
+    return (
+        "Workflow validation failed: raw http_request blocks are not allowed for a page with observed "
+        "anti-bot or human-verification challenge evidence. "
+        f"Offending labels: [{labels_text}]. "
+        "Use browser workflow blocks grounded in the observed page, include challenge handling only when visible, "
+        "or stop and report the observed challenge blocker if it cannot be completed."
+    )
+
+
 def _timing_only_challenge_wait_reject_message(ctx: Any, submitted_yaml: str | None) -> str | None:
     if not _has_confirmed_waf_or_site_block(ctx):
         return None
@@ -5437,6 +5599,7 @@ _DISCOVERY_DOMAIN_WITH_PATH_RE = re.compile(
 )
 _DISCOVERY_BARE_WORD_RE = re.compile(r"^[a-z0-9-]{2,32}$", re.IGNORECASE)
 _DISCOVERY_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS = frozenset({"a", "an", "and", "for", "in", "of", "on", "or", "the", "to"})
 _DISCOVERY_LOGIN_TITLE_RE = re.compile(r"\b(sign\s*in|log\s*in|login)\b", re.IGNORECASE)
 _DISCOVERY_PASSWORD_INPUT_RE = re.compile(
     r"<input[^>]*type\s*=\s*[\"']password[\"']",
@@ -5494,6 +5657,14 @@ def _discovery_title_score(page_title: str, intent_tokens: set[str]) -> int:
         return 0
     lowered = page_title.lower()
     return sum(1 for token in intent_tokens if token in lowered)
+
+
+def _discovery_candidate_evidence_tokens(intent_tokens: set[str]) -> set[str]:
+    return {
+        token
+        for token in intent_tokens
+        if len(token) > 2 and token.lower() not in _DISCOVERY_CANDIDATE_EVIDENCE_STOPWORDS
+    }
 
 
 def _discovery_detect_login_wall(html: str, page_title: str) -> bool:
@@ -6114,7 +6285,45 @@ async def _discovery_walk(
             }
         )
 
-        if _discovery_detect_anti_bot(html, page_title):
+        title_score = _discovery_title_score(page_title, intent_tokens)
+
+        best_score = 0
+        best_href: str | None = None
+        best_anchor: dict[str, str] | None = None
+        for anchor in anchors:
+            score = _discovery_anchor_score(
+                anchor.get("text", ""),
+                anchor.get("title", ""),
+                anchor.get("href", ""),
+                intent_tokens,
+            )
+            if score > best_score:
+                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
+                if resolved is None:
+                    continue
+                best_score = score
+                best_href = resolved
+                best_anchor = anchor
+
+        evidence_tokens = _discovery_candidate_evidence_tokens(intent_tokens)
+        candidate_title_score = _discovery_title_score(page_title, evidence_tokens)
+        candidate_anchor_score = 0
+        for anchor in anchors:
+            candidate_anchor_score = max(
+                candidate_anchor_score,
+                _discovery_anchor_score(
+                    anchor.get("text", ""),
+                    anchor.get("title", ""),
+                    anchor.get("href", ""),
+                    evidence_tokens,
+                ),
+            )
+
+        anti_bot_detected = _discovery_detect_anti_bot(html, page_title)
+        anti_bot_has_no_candidate_evidence = (
+            not form_fields and candidate_title_score == 0 and candidate_anchor_score == 0
+        )
+        if anti_bot_detected and anti_bot_has_no_candidate_evidence:
             origin_url = _discovery_origin_url(current_url)
             if (
                 not retried_deep_link_from_origin
@@ -6141,26 +6350,6 @@ async def _discovery_walk(
                 confidence=0.0,
                 failure_reason="login_wall",
             )
-
-        title_score = _discovery_title_score(page_title, intent_tokens)
-
-        best_score = 0
-        best_href: str | None = None
-        best_anchor: dict[str, str] | None = None
-        for anchor in anchors:
-            score = _discovery_anchor_score(
-                anchor.get("text", ""),
-                anchor.get("title", ""),
-                anchor.get("href", ""),
-                intent_tokens,
-            )
-            if score > best_score:
-                resolved = _discovery_resolve_href(current_url, anchor.get("href", ""))
-                if resolved is None:
-                    continue
-                best_score = score
-                best_href = resolved
-                best_anchor = anchor
 
         if intent_tokens and title_score >= 2 and (form_fields or best_score <= title_score):
             confidence = min(1.0, title_score / max(1, len(intent_tokens)))
