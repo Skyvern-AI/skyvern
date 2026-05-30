@@ -1861,6 +1861,30 @@ if settings.ENABLE_OPENROUTER:
                 ),
             ),
         )
+if settings.ENABLE_ORCAROUTER:
+    # OrcaRouter is wired through LLMAPIHandlerFactory.LLMCaller (see ORCAROUTER branch in
+    # api_handler_factory.LLMCaller.__init__), which calls the OrcaRouter REST API directly
+    # via AsyncOpenAI — LiteLLM is not on the path. We register the bare model id so the
+    # caller sends exactly what OrcaRouter expects (e.g. "anthropic/claude-sonnet-4.6").
+    if settings.ORCAROUTER_MODEL:
+        orcarouter_model_name = settings.ORCAROUTER_MODEL
+        LLMConfigRegistry.register_config(
+            "ORCAROUTER",
+            LLMConfig(
+                orcarouter_model_name,
+                ["ORCAROUTER_API_KEY", "ORCAROUTER_MODEL"],
+                supports_vision=settings.LLM_CONFIG_SUPPORT_VISION,
+                add_assistant_prefix=False,
+                max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+                litellm_params=LiteLLMParams(
+                    api_key=settings.ORCAROUTER_API_KEY,
+                    api_base=settings.ORCAROUTER_API_BASE,
+                    api_version=None,
+                    model_info={"model_name": orcarouter_model_name},
+                ),
+            ),
+        )
+
 if settings.ENABLE_GROQ:
     # Register Groq model configured in settings
     if settings.GROQ_MODEL:
