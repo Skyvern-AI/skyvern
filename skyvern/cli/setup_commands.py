@@ -414,8 +414,8 @@ def _load_openclaw_config(config_path: Path) -> tuple[dict | None, str | None]:
 
     try:
     existing = json5.loads(config_path.read_text(encoding="utf-8"))
-except ValueError:
-    return None, f"Cannot parse {config_path}. Fix the JSON/JSONC and re-run."
+    except ValueError:
+        return None, f"Cannot parse {config_path}. Fix the JSON5/JSON and re-run."
 
     if not isinstance(existing, dict):
         return None, f"{config_path} must contain a top-level JSON object."
@@ -1640,7 +1640,7 @@ def setup_mcporter() -> None:
         try:
             if not path.exists():
                 continue
-           if name == "OpenCode":
+            if name == "OpenCode":
                 cfg, err = _load_opencode_config(path)
                 servers_key = "mcp"
             else:
