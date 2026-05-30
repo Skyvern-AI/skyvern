@@ -176,7 +176,7 @@ def test_merge_visual_composition_evidence_keeps_screenshot_bounded_and_typed() 
     assert merged["visual_evidence_omissions"] == ["Result rows are not visible before verification."]
 
 
-def test_composition_parse_html_surfaces_turnstile_challenge_controls_after_long_page_preamble() -> None:
+def test_composition_parse_html_surfaces_human_verification_controls_after_long_page_preamble() -> None:
     parsed = parse_composition_html(
         f"""
         <html><head><title>Credential Registry</title></head><body>

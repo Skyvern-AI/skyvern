@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from agents.agent import Agent
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -272,6 +273,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "press_key",
     }
 )
+_POST_RUN_PAGE_OBSERVATION_TOOLS = frozenset({"evaluate", "get_browser_screenshot", "inspect_page_for_composition"})
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
 _BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
@@ -552,6 +554,44 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_FAILED_TEST_NUDGES
 
 
+def _has_post_failed_run_page_observation(ctx: AgentContext) -> bool:
+    if getattr(ctx, "post_run_page_observation_after_failed_test", False) is not True:
+        return False
+    tool = getattr(ctx, "post_run_page_observation_tool", None)
+    if tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS:
+        return False
+    observed_run_id = getattr(ctx, "post_run_page_observation_workflow_run_id", None)
+    current_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    return bool(isinstance(observed_run_id, str) and observed_run_id and observed_run_id == current_run_id)
+
+
+def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    parsed = parse_final_response(extract_final_text(result))
+    normalized_scaffolding = normalize_response_scaffolding(
+        str(parsed.get("type") or "REPLY"),
+        str(parsed.get("user_response") or ""),
+    )
+    if normalized_scaffolding.changed:
+        parsed = {
+            **parsed,
+            "type": normalized_scaffolding.response_type,
+            "user_response": normalized_scaffolding.user_response or "Done.",
+        }
+    return parsed
+
+
+def _post_run_observed_reply_can_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
+    if not _has_post_failed_run_page_observation(ctx):
+        return False
+    parsed = _parse_normalized_final_response(result)
+    if parsed is None or parsed.get("type") != "REPLY":
+        return False
+    user_response = parsed.get("user_response")
+    return isinstance(user_response, str) and bool(user_response.strip()) and not _is_progress_narration(user_response)
+
+
 def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     """Return True when the last test 'completed' but data blocks had no output."""
     # A non-retriable nav failure cannot be "suspiciously successful" — defer
@@ -681,6 +721,9 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
+    if _post_run_observed_reply_can_finalize(ctx, result):
+        return None
+
     # If the last run had confirmed challenge evidence, do not misdiagnose a
     # challenge-solving loop as a long-chain budgeting problem.
     if _needs_failed_test_nudge(ctx) and getattr(ctx, "last_test_anti_bot", None):
@@ -730,17 +773,9 @@ def _check_enforcement(
     # (always allowed) from a REPLY with a coverage gap or progress-narration.
     # Only runs when no state-based nudge fired.
     if result is not None:
-        parsed = parse_final_response(extract_final_text(result))
-        normalized_scaffolding = normalize_response_scaffolding(
-            str(parsed.get("type") or "REPLY"),
-            str(parsed.get("user_response") or ""),
-        )
-        if normalized_scaffolding.changed:
-            parsed = {
-                **parsed,
-                "type": normalized_scaffolding.response_type,
-                "user_response": normalized_scaffolding.user_response or "Done.",
-            }
+        parsed = _parse_normalized_final_response(result)
+        if parsed is None:
+            return None
         return _response_coverage_nudge(ctx, parsed, config)
 
     return None

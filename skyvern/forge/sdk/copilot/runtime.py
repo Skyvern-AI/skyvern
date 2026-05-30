@@ -171,6 +171,12 @@ class AgentContext:
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
+    post_run_page_observation_tool: str | None = None
+    post_run_page_observation_url: str | None = None
+    post_run_page_observation_workflow_run_id: str | None = None
+    post_run_page_observation_after_failed_test: bool = False
+    post_run_current_page_inspection_workflow_run_id: str | None = None
+    challenge_gated_proxy_retry_count: int = 0
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at

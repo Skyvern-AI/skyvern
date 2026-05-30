@@ -116,6 +116,40 @@ def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
     assert "hunter2" not in contract.model_dump_json()
 
 
+def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:
+    ctx = _ctx()
+    ctx.last_test_suspicious_success = True
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_blocked",
+                "overall_status": "completed",
+                "failure_reason": ctx.last_test_failure_reason,
+                "failure_categories": [{"category": "ANTI_BOT_DETECTION"}],
+                "blocks": [
+                    {
+                        "label": "extract",
+                        "block_type": "EXTRACTION",
+                        "status": "completed",
+                    }
+                ],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.SUSPICIOUS_SUCCESS
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is False
+    assert "Verify you are human" in contract.verification_result.remaining_blocker
+
+
 def test_user_goal_urls_are_reduced_to_origins() -> None:
     ctx = _ctx()
     ctx.turn_intent.user_goal = "Fix https://example.test/account?id=secret now"
