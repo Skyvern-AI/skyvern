@@ -82,6 +82,8 @@ def _assert_signal(
         (TurnIntentMode.DOCS_ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
         (TurnIntentMode.DIAGNOSE, "run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.DOCS_ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
+        (TurnIntentMode.DOCS_ANSWER, "list_credentials", "turn_intent_credential_metadata_blocked"),
+        (TurnIntentMode.DIAGNOSE, "list_credentials", "turn_intent_credential_metadata_blocked"),
         (TurnIntentMode.CLARIFY, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.CLARIFY, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.REFUSE, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
@@ -121,6 +123,15 @@ def test_turn_intent_gate_allows_build_page_inspection_with_update_authority() -
     )
 
     assert _turn_intent_tool_error(_ctx(intent), "inspect_page_for_composition") is None
+
+
+def test_turn_intent_gate_allows_credential_metadata_with_update_authority() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+    )
+
+    assert _turn_intent_tool_error(_ctx(intent), "list_credentials") is None
 
 
 def test_turn_intent_gate_blocks_draft_only_run_tools() -> None:
@@ -408,7 +419,8 @@ def test_docs_answer_blocks_get_run_results_even_with_read_flag() -> None:
         classifier_mode="docs_answer",
         blocked_tool="get_run_results",
     )
-    assert _native_tools_for_turn(list(NATIVE_TOOLS), intent) == []
+    filtered = _native_tools_for_turn(list(NATIVE_TOOLS), intent)
+    assert {getattr(tool, "name", None) for tool in filtered} == {tool.name for tool in NATIVE_TOOLS}
 
 
 def test_within_turn_override_pending_reconciliation_allows_read() -> None:
@@ -518,7 +530,7 @@ async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success(
     mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id.assert_not_called()
 
 
-def test_recovery_diagnose_keeps_get_run_results_in_native_tools() -> None:
+def test_recovery_diagnose_keeps_all_native_tools_registered() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.DIAGNOSE,
         authority=TurnIntentAuthority(
@@ -531,7 +543,7 @@ def test_recovery_diagnose_keeps_get_run_results_in_native_tools() -> None:
     filtered = _native_tools_for_turn(list(NATIVE_TOOLS), intent)
     names = {getattr(tool, "name", None) for tool in filtered}
 
-    assert names == {"get_run_results"}
+    assert names == {tool.name for tool in NATIVE_TOOLS}
 
 
 @pytest.mark.asyncio
