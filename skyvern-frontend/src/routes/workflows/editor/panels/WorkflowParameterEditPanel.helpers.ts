@@ -67,7 +67,7 @@ export function detectInitialCredentialSource(
 export function header(type: WorkflowEditorParameterType, isEdit: boolean) {
   const prefix = isEdit ? "Edit" : "Add";
   if (type === "workflow") {
-    return isEdit ? `${prefix} Input Parameter` : `${prefix} Parameter`;
+    return `${prefix} Input`;
   }
-  return `${prefix} Context Parameter`;
+  return `${prefix} Context Input`;
 }

@@ -102,7 +102,7 @@ export function ParametersDialogBase({
           <DialogTitle>{title}</DialogTitle>
         </DialogHeader>
         {items.length === 0 ? (
-          <div className="text-sm text-slate-400">No parameters.</div>
+          <div className="text-sm text-slate-400">No inputs.</div>
         ) : (
           <div className="space-y-3">
             <Label className="text-xs">{sectionLabel}</Label>

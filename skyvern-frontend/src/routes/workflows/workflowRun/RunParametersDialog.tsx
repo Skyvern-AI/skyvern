@@ -78,8 +78,8 @@ export function RunParametersDialog({
     <ParametersDialogBase
       open={open}
       onOpenChange={onOpenChange}
-      title="Run Parameters"
-      sectionLabel="Input parameters for this run"
+      title="Run Inputs"
+      sectionLabel="Inputs for this run"
       items={items}
     />
   );

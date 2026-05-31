@@ -166,9 +166,9 @@ function BlockParametersDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle>Enter Parameter Values</DialogTitle>
+          <DialogTitle>Enter Input Values</DialogTitle>
           <DialogDescription>
-            The block "{blockLabel}" requires the following parameters to run.
+            The block "{blockLabel}" requires the following inputs to run.
           </DialogDescription>
         </DialogHeader>
 

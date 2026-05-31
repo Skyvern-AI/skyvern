@@ -55,7 +55,7 @@ const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
   "Queues new runs of this agent until any in-progress run finishes. Does not affect block ordering inside a single run; blocks always execute in declared order. Use this when concurrent runs would collide on shared state, such as the same credentials, browser session, or downstream account.";
 
 const SEQUENTIAL_KEY_TOOLTIP =
-  "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent parameters, for example {{ account_id }} to serialize per account.";
+  "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";
 
 function WorkflowSettingsEditor({ blockId }: { blockId: string }) {
   // Subscribe to the start node's data slice. The sidebar mount lives

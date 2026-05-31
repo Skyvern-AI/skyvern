@@ -95,7 +95,7 @@ function LoginBlockCredentialSelector({
   // Determine which credential is currently selected (by credential_id)
   // This handles multiple cases:
   // 1. Skyvern credential parameters (have credentialId)
-  // 2. Workflow input parameters with credential_id type and default value
+  // 2. Workflow inputs with credential_id type and default value
   const selectedCredentialId = useMemo(() => {
     if (!value) return undefined;
 
@@ -105,7 +105,7 @@ function LoginBlockCredentialSelector({
       return credentialParam.credentialId;
     }
 
-    // Check if it's a workflow input parameter with credential_id type and default value
+    // Check if it's a workflow input with credential_id type and default value
     const workflowParam = workflowParameters.find(
       (p) =>
         p.parameterType === "workflow" &&
@@ -294,7 +294,7 @@ function LoginBlockCredentialSelector({
               ];
             }
           }
-          // If user selected a parameter (non-Skyvern credential or input parameter)
+          // If user selected a parameter (non-Skyvern credential or input)
           // just use it directly (parameterKeyToUse is already set to newValue)
 
           // Update Zustand store first, then call onChange
