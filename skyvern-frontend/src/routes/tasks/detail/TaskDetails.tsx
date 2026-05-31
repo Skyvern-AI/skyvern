@@ -348,7 +348,7 @@ function TaskDetails() {
             to: "recording",
           },
           {
-            label: "Parameters",
+            label: "Inputs",
             to: "parameters",
           },
           {

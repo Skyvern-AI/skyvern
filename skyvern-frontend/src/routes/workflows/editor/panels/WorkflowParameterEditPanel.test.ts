@@ -78,7 +78,7 @@ describe("detectInitialParameterTypeSelection", () => {
     expect(detectInitialParameterTypeSelection(undefined)).toBeNull();
   });
 
-  it("returns the dataType for workflow input parameters", () => {
+  it("returns the dataType for workflow inputs", () => {
     expect(detectInitialParameterTypeSelection(workflowString)).toBe("string");
     expect(detectInitialParameterTypeSelection(workflowInteger)).toBe(
       "integer",
@@ -112,17 +112,17 @@ describe("detectInitialParameterTypeSelection", () => {
 });
 
 describe("header", () => {
-  it("uses 'Add Parameter' as the unified add-mode title", () => {
-    expect(header("workflow", false)).toBe("Add Parameter");
+  it("uses 'Add Input' as the unified add-mode title", () => {
+    expect(header("workflow", false)).toBe("Add Input");
   });
 
-  it("uses 'Edit Input Parameter' when editing any non-context parameter", () => {
-    expect(header("workflow", true)).toBe("Edit Input Parameter");
+  it("uses 'Edit Input' when editing any non-context parameter", () => {
+    expect(header("workflow", true)).toBe("Edit Input");
   });
 
   it("preserves dedicated context titles for the context entry-point type", () => {
-    expect(header("context", false)).toBe("Add Context Parameter");
-    expect(header("context", true)).toBe("Edit Context Parameter");
+    expect(header("context", false)).toBe("Add Context Input");
+    expect(header("context", true)).toBe("Edit Context Input");
   });
 });
 

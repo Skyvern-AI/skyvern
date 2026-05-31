@@ -338,7 +338,7 @@ function RunHistory() {
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {isExpanded ? "Hide Parameters" : "Show Parameters"}
+                        {isExpanded ? "Hide Inputs" : "Show Inputs"}
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
@@ -410,7 +410,7 @@ function RunHistory() {
           placeholder={
             workflowPermanentIdFilter
               ? "Clear the agent filter above to search"
-              : "Search by run ID or parameter..."
+              : "Search by run ID or input..."
           }
           disabled={!!workflowPermanentIdFilter}
           className="w-48 lg:w-72"
@@ -568,7 +568,7 @@ function WorkflowRunParametersInline({
   if (!hasParameters && !hasExtraHeaders) {
     return (
       <div className="ml-8 py-4 text-sm text-neutral-600 dark:text-slate-400">
-        No parameters for this run
+        No inputs for this run
       </div>
     );
   }
@@ -594,7 +594,7 @@ function WorkflowRunParametersInline({
     <div className="space-y-4">
       {hasParameters && (
         <ParameterDisplayInline
-          title="Run Parameters"
+          title="Run Inputs"
           parameters={parameterItems}
           searchQuery={searchQuery}
           keywordMatchesParameter={keywordMatchesParameter}

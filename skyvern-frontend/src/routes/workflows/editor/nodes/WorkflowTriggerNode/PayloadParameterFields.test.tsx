@@ -40,7 +40,7 @@ describe("PayloadParameterFields", () => {
         isLoading={false}
       />,
     );
-    expect(screen.getByText(/no input parameters/i)).toBeTruthy();
+    expect(screen.getByText(/no inputs/i)).toBeTruthy();
     expect(screen.queryByText(/dormant payload entries/i)).not.toBeTruthy();
   });
 

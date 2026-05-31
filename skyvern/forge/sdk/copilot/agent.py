@@ -78,7 +78,6 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
-    CREDENTIAL_DEFERRED_DRAFT_REASONS,
     RAW_SECRET_REFUSAL_SENTINEL,
     RequestPolicy,
     build_request_policy,
@@ -93,7 +92,6 @@ from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
-    READ_CONTEXT_DENIED_MODES,
     RequiredContextKey,
     TurnIntent,
     TurnIntentMode,
@@ -589,34 +587,15 @@ def _turn_intent_disables_tools(turn_intent: TurnIntent | None) -> bool:
     return not authority.may_update_workflow and not authority.may_run_blocks
 
 
-def _request_policy_requires_update_and_run_skip_path(request_policy: RequestPolicy | None) -> bool:
-    return (
-        isinstance(request_policy, RequestPolicy)
-        and request_policy.allow_update_workflow
-        and not request_policy.allow_run_blocks
-        and request_policy.allow_missing_credentials_in_draft
-        and request_policy.clarification_reason in CREDENTIAL_DEFERRED_DRAFT_REASONS
-    )
-
-
 def _native_tools_for_turn(
     native_tools: list[Any],
     turn_intent: TurnIntent | None,
     request_policy: RequestPolicy | None = None,
 ) -> list[Any]:
-    # Deferred: matches the existing tools.py <-> routes.workflow_copilot <-> agent.py cycle workaround.
-    from skyvern.forge.sdk.copilot.tools import ANSWER_ONLY_CONTEXT_TOOLS
-
-    if _turn_intent_disables_tools(turn_intent):
-        if (
-            turn_intent is not None
-            and turn_intent.authority.may_read_run_context
-            and turn_intent.mode not in READ_CONTEXT_DENIED_MODES
-        ):
-            return [tool for tool in native_tools if getattr(tool, "name", None) in ANSWER_ONLY_CONTEXT_TOOLS]
-        return []
-    if _request_policy_requires_update_and_run_skip_path(request_policy):
-        return [tool for tool in native_tools if getattr(tool, "name", None) != "update_workflow"]
+    # Keep native tools registered even when the current turn is not allowed to
+    # use them. The tool implementations enforce TurnIntent/RequestPolicy
+    # authority and return structured blockers; removing a tool lets the model
+    # hit an SDK-level ModelBehaviorError if static prompt text still names it.
     return list(native_tools)
 
 
@@ -783,6 +762,10 @@ def _make_agent_result(
         if ctx is not None
         else global_llm_context
     )
+    narrative_payload = kwargs.get("narrative_payload")
+    response_type = kwargs.get("response_type", "REPLY")
+    if isinstance(narrative_payload, dict) and "responseType" not in narrative_payload:
+        kwargs["narrative_payload"] = {**narrative_payload, "responseType": response_type}
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
 
 
@@ -944,7 +927,7 @@ def _build_exit_result(
             narrative_summary=ctx.narrative_summary,
             narrative_payload=_build_narrative_payload(
                 ctx,
-                terminal="error" if cancelled else "response",
+                terminal="error" if cancelled or terminal_reason else "response",
                 terminal_message=final_text,
                 narrative_summary=ctx.narrative_summary,
             ),

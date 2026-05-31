@@ -289,9 +289,7 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
 
     render(<SendEmailBlockForm blockId="b1" />);
 
-    expect(
-      screen.getByText(/Use the \+ button to add parameters/i),
-    ).toBeDefined();
+    expect(screen.getByText(/Use the \+ button to add inputs/i)).toBeDefined();
   });
 
   test("does NOT render the tip when block is not first", () => {
@@ -304,8 +302,6 @@ describe("SendEmailBlockForm (SKY-9379)", () => {
 
     render(<SendEmailBlockForm blockId="b1" />);
 
-    expect(
-      screen.queryByText(/Use the \+ button to add parameters/i),
-    ).toBeNull();
+    expect(screen.queryByText(/Use the \+ button to add inputs/i)).toBeNull();
   });
 });

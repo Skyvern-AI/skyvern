@@ -617,7 +617,7 @@ def test_store_request_policy_attaches_turn_intent_to_context() -> None:
     assert ctx.turn_intent.authority.may_run_blocks is False
 
 
-def test_answer_only_turn_intent_hides_get_run_results_tool() -> None:
+def test_answer_only_turn_intent_keeps_native_tools_registered() -> None:
     tools = [
         SimpleNamespace(name="update_workflow"),
         SimpleNamespace(name="get_run_results"),
@@ -630,7 +630,7 @@ def test_answer_only_turn_intent_hides_get_run_results_tool() -> None:
 
     filtered = _native_tools_for_turn(tools, intent)
 
-    assert filtered == []
+    assert filtered == tools
 
 
 def test_build_turn_intent_marks_declarative_step_request_as_edit() -> None:

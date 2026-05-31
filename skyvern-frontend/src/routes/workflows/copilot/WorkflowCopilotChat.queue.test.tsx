@@ -247,6 +247,120 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(screen.getByText(/I encountered an error/)).toBeTruthy();
   });
 
+  it("renders a response-only error narrative payload as halted", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse(
+          "Copilot hit an internal error before it could finish this turn.",
+        ),
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "build",
+          designStarted: false,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "error",
+          terminalMessage:
+            "Copilot hit an internal error before it could finish this turn.",
+          narrativeSummary: "Copilot hit an internal error.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      });
+      call.resolve();
+    });
+
+    expect(screen.getByText("Run halted")).toBeTruthy();
+    expect(screen.queryByText("Completed the run")).toBeNull();
+  });
+
+  it("renders an ASK_QUESTION response payload as a question", async () => {
+    await renderChat();
+    await submit("build a lookup workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse("Please provide the exact registry URL."),
+        response_type: "ASK_QUESTION",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "diagnose",
+          responseType: "ASK_QUESTION",
+          designStarted: false,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "response",
+          terminalMessage: "Please provide the exact registry URL.",
+          narrativeSummary: "Please provide the exact registry URL.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      });
+      call.resolve();
+    });
+
+    expect(screen.getByText("Question")).toBeTruthy();
+    expect(screen.queryByText("Completed the run")).toBeNull();
+  });
+
+  it("renders a legacy diagnose payload asking for input as a question", async () => {
+    await renderChat();
+    await submit("build a lookup workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+    const longInputRequest =
+      "Please provide the exact BACB lookup/registry URL you want the workflow to use. I will build a general workflow with a person_name input after you provide it.";
+
+    await act(async () => {
+      call.onMessage({
+        ...terminalResponse(longInputRequest),
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "diagnose",
+          designStarted: false,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "response",
+          terminalMessage: longInputRequest,
+          narrativeSummary: longInputRequest,
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: null,
+          endedAt: null,
+        },
+      });
+      call.resolve();
+    });
+
+    expect(screen.getByText("Question")).toBeTruthy();
+    expect(screen.getByText(longInputRequest)).toBeTruthy();
+    expect(screen.queryByText("Answered")).toBeNull();
+    expect(screen.queryByText("Completed the run")).toBeNull();
+  });
+
   it("does not orphan a message on a same-tick double submit while working", async () => {
     await renderChat();
     await submit("first message");

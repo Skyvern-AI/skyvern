@@ -84,6 +84,32 @@ class _FakeStream:
         return None
 
 
+class _FakePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _FakeBrowserState:
+    def __init__(self, page: _FakePage | None) -> None:
+        self._page = page
+
+    async def get_working_page(self) -> _FakePage | None:
+        return self._page
+
+
+class _FakePersistentSessionsManager:
+    def __init__(self, browser_state: _FakeBrowserState | None) -> None:
+        self._browser_state = browser_state
+
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        return self._browser_state
+
+
+class _FakeFailingPersistentSessionsManager:
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        raise RuntimeError("browser state unavailable")
+
+
 def _make_ctx(**kwargs: object) -> CopilotContext:
     defaults: dict[str, Any] = dict(
         organization_id="org",
@@ -266,6 +292,129 @@ def test_runtime_frontier_anchor_keeps_url_empty_to_preserve_live_state() -> Non
     assert anchor_url == "https://example.com/search"
     assert anchored is workflow
     assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_blank_browser_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_when_browser_state_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeFailingPersistentSessionsManager(),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_preserves_attached_live_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("https://example.com/search/results"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_url", ["start_url", "{{ start_url }}", "example.com"])
+async def test_runtime_frontier_starter_url_seed_preserves_runtime_resolved_url(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_url: str,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": explicit_url}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url == explicit_url
 
 
 def test_runtime_frontier_anchor_requires_verified_prefix() -> None:

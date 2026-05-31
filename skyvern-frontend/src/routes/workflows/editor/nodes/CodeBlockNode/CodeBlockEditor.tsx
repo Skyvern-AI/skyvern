@@ -32,7 +32,7 @@ function CodeBlockEditorBody({
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
       <div className="space-y-2">
-        <Label className="text-xs text-slate-300">Input Parameters</Label>
+        <Label className="text-xs text-slate-300">Inputs</Label>
         <WorkflowBlockInputSet
           nodeId={blockId}
           onChange={(parameterKeys) => {

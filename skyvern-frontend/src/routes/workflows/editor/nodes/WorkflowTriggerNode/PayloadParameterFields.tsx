@@ -131,19 +131,13 @@ function PayloadParameterFields({
   );
 
   if (parameters.length === 0 && staleKeys.length === 0) {
-    return (
-      <p className="text-xs text-slate-500">
-        This agent has no input parameters.
-      </p>
-    );
+    return <p className="text-xs text-slate-500">This agent has no inputs.</p>;
   }
 
   return (
     <div className="space-y-3">
       {parameters.length === 0 && (
-        <p className="text-xs text-slate-500">
-          This agent has no input parameters.
-        </p>
+        <p className="text-xs text-slate-500">This agent has no inputs.</p>
       )}
       {parameters.map((param) => {
         const isCredential = isCredentialParam(param);

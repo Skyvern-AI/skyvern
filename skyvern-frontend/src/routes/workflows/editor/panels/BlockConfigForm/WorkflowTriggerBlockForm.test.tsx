@@ -327,9 +327,7 @@ describe("WorkflowTriggerBlockForm (SKY-9361)", () => {
     expect(screen.getByText("Target Agent")).toBeDefined();
     expect(screen.getByTestId("workflow-selector")).toBeDefined();
     expect(
-      screen.getByText(
-        "Select a target agent to configure its input parameters here.",
-      ),
+      screen.getByText("Select a target agent to configure its inputs here."),
     ).toBeDefined();
     expect(screen.queryByTestId("payload-parameter-fields")).toBeNull();
   });
@@ -343,9 +341,7 @@ describe("WorkflowTriggerBlockForm (SKY-9361)", () => {
 
     expect(screen.getByTestId("payload-parameter-fields")).toBeDefined();
     expect(
-      screen.queryByText(
-        "Select a target agent to configure its input parameters here.",
-      ),
+      screen.queryByText("Select a target agent to configure its inputs here."),
     ).toBeNull();
     const payloadValue = screen.getByTestId("payload-value");
     expect(payloadValue.textContent).toBe('{"foo":"bar"}');

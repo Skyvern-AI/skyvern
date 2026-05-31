@@ -1243,6 +1243,8 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.proposal_disposition == "auto_applicable"
         assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["responseType"] == "ASK_QUESTION"
 
     def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
         ctx = _ctx(
@@ -1834,6 +1836,8 @@ workflow_definition:
 
         assert agent_result.updated_workflow is None
         assert agent_result.clear_proposed_workflow is True
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["responseType"] == "ASK_QUESTION"
 
     def test_reply_does_not_set_clear_proposed_flag(self) -> None:
         # Differential: a REPLY turn surfaces the verified workflow and leaves
@@ -1906,7 +1910,7 @@ class TestNativeToolSurface:
         assert "inspect_page_for_composition" in names
 
     @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
-    def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
+    def test_credential_deferred_draft_keeps_all_native_tools_registered(self, reason: str) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
         policy = RequestPolicy(
@@ -1924,7 +1928,7 @@ class TestNativeToolSurface:
 
         filtered = agent_module._native_tools_for_turn(tools, turn_intent=None, request_policy=policy)
 
-        assert [tool.name for tool in filtered] == ["list_credentials", "update_and_run_blocks"]
+        assert [tool.name for tool in filtered] == ["update_workflow", "list_credentials", "update_and_run_blocks"]
 
     def test_non_deferred_policy_keeps_update_workflow_tool(self) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy

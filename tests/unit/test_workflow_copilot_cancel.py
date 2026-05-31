@@ -189,6 +189,19 @@ def _setup_route_mocks(
     original_workflow: SimpleNamespace,
     agent_result: SimpleNamespace,
 ) -> tuple[AsyncMock, SimpleNamespace]:
+    if not hasattr(agent_result, "total_tokens"):
+        agent_result.total_tokens = None
+    if not hasattr(agent_result, "response_type"):
+        agent_result.response_type = "REPLY"
+    if not hasattr(agent_result, "output_policy_diagnostics"):
+        agent_result.output_policy_diagnostics = None
+    if not hasattr(agent_result, "turn_id"):
+        agent_result.turn_id = None
+    if not hasattr(agent_result, "narrative_summary"):
+        agent_result.narrative_summary = None
+    if not hasattr(agent_result, "narrative_payload"):
+        agent_result.narrative_payload = None
+
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
         return None

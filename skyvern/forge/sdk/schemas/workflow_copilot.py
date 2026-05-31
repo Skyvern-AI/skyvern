@@ -168,6 +168,10 @@ class WorkflowCopilotStreamResponseUpdate(BaseModel):
         None,
         description="One-line accomplishment summary for the turn. Optional; the frontend falls back to the response message when absent.",
     )
+    narrative_payload: TurnNarrativePayload | None = Field(
+        None,
+        description="Terminal narrative bubble snapshot for live clients; mirrors the persisted assistant chat row.",
+    )
 
 
 class WorkflowCopilotStreamErrorUpdate(BaseModel):

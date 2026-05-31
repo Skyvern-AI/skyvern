@@ -441,6 +441,9 @@ async def _persist_cancel_turn(
         response_type = "REPLY"
         output_policy_diagnostics = None
         turn_outcome = None
+        response_turn_id = turn_id
+        narrative_summary = None
+        narrative_payload = None
         if chat.proposed_workflow is not None:
             await asyncio.shield(_clear_proposed_workflow(chat))
     else:
@@ -461,10 +464,13 @@ async def _persist_cancel_turn(
         user_response = agent_result.user_response
         updated_workflow = agent_result.updated_workflow
         updated_global_llm_context = agent_result.global_llm_context
-        total_tokens = getattr(agent_result, "total_tokens", None)
-        response_type = getattr(agent_result, "response_type", "REPLY")
-        output_policy_diagnostics = getattr(agent_result, "output_policy_diagnostics", None)
+        total_tokens = agent_result.total_tokens
+        response_type = agent_result.response_type
+        output_policy_diagnostics = agent_result.output_policy_diagnostics
         turn_outcome = agent_result.turn_outcome
+        response_turn_id = turn_id or agent_result.turn_id
+        narrative_summary = agent_result.narrative_summary
+        narrative_payload = agent_result.narrative_payload
 
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -482,7 +488,7 @@ async def _persist_cancel_turn(
             content=user_response,
             global_llm_context=updated_global_llm_context,
             turn_outcome=turn_outcome,
-            narrative_payload=getattr(agent_result, "narrative_payload", None),
+            narrative_payload=narrative_payload,
         )
     )
     proposal_disposition = _proposal_disposition(agent_result)
@@ -500,8 +506,9 @@ async def _persist_cancel_turn(
                     proposal_disposition=proposal_disposition,
                     cancelled=True,
                     output_policy_diagnostics=output_policy_diagnostics,
-                    turn_id=turn_id or getattr(agent_result, "turn_id", None),
-                    narrative_summary=getattr(agent_result, "narrative_summary", None),
+                    turn_id=response_turn_id,
+                    narrative_summary=narrative_summary,
+                    narrative_payload=narrative_payload,
                 )
             )
         )
@@ -581,7 +588,7 @@ async def _finalise_normal_turn(
         content=user_response,
         global_llm_context=updated_global_llm_context,
         turn_outcome=agent_result.turn_outcome,
-        narrative_payload=getattr(agent_result, "narrative_payload", None),
+        narrative_payload=agent_result.narrative_payload,
     )
 
     proposal_disposition = _proposal_disposition(agent_result)
@@ -592,12 +599,13 @@ async def _finalise_normal_turn(
             message=user_response,
             updated_workflow=updated_workflow.model_dump(mode="json") if updated_workflow else None,
             response_time=assistant_message.created_at,
-            total_tokens=getattr(agent_result, "total_tokens", None),
-            response_type=getattr(agent_result, "response_type", "REPLY"),
+            total_tokens=agent_result.total_tokens,
+            response_type=agent_result.response_type,
             proposal_disposition=proposal_disposition,
-            output_policy_diagnostics=getattr(agent_result, "output_policy_diagnostics", None),
-            turn_id=getattr(agent_result, "turn_id", None),
-            narrative_summary=getattr(agent_result, "narrative_summary", None),
+            output_policy_diagnostics=agent_result.output_policy_diagnostics,
+            turn_id=agent_result.turn_id,
+            narrative_summary=agent_result.narrative_summary,
+            narrative_payload=agent_result.narrative_payload,
         )
     )
 

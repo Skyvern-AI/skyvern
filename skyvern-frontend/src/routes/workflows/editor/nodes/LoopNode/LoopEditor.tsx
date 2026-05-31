@@ -108,7 +108,7 @@ function LoopEditorBody({
               loop_variable_reference: loopVariableReference,
             }}
             exampleValue={dataSchemaExampleValue}
-            helpTooltip="Specify a format for extracted data in JSON. Only applies when the loop value is natural language - ignored for parameter references."
+            helpTooltip="Specify a format for extracted data in JSON. Only applies when the loop value is natural language - ignored for input references."
           />
 
           <div className="flex items-center gap-2">

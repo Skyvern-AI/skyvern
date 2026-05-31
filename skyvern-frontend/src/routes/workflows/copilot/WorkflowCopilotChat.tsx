@@ -1012,9 +1012,17 @@ export function WorkflowCopilotChat({
           // handleSend time (pre-turn_start), so the React state binding is
           // stale here.
           const liveNarrative = narrativeRef.current;
+          const hasNarrativePayload =
+            response.narrative_payload !== null &&
+            typeof response.narrative_payload === "object";
           const frozenNarrative: TurnNarrativeState | undefined =
-            liveNarrative.turnId !== null
-              ? applyNarrativeEvent(liveNarrative, response)
+            liveNarrative.turnId !== null || hasNarrativePayload
+              ? applyNarrativeEvent(
+                  liveNarrative.turnId !== null
+                    ? liveNarrative
+                    : EMPTY_NARRATIVE,
+                  response,
+                )
               : undefined;
 
           const aiMessage: ChatMessage = {
@@ -1043,9 +1051,9 @@ export function WorkflowCopilotChat({
           ) {
             applyWorkflowUpdate(response.updated_workflow);
           } else if (
-            // Cancel terminal on a turn that produced staged content →
+            // Cancel/error terminal on a turn that produced staged content →
             // snap canvas back to the pre-submit client snapshot.
-            response.cancelled &&
+            (response.cancelled || frozenNarrative?.terminal === "error") &&
             responseEntry?.hadStagedDraft &&
             responseEntry?.snapshot
           ) {
