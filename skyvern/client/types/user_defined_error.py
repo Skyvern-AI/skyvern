@@ -10,6 +10,7 @@ class UserDefinedError(UniversalBaseModel):
     error_code: str
     reasoning: str
     confidence_float: float
+    error_type: typing.Optional[typing.Literal["USER_DEFINED_ERROR"]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
