@@ -83,6 +83,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
     build_request_policy,
     redact_raw_secrets_for_prompt,
 )
+from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
@@ -198,6 +199,21 @@ class CopilotRequestPolicyMissingError(Exception):
     """Raised when the request-policy guardrail fails before producing a policy."""
 
 
+def _manager_can_probe_registered_browser_state() -> bool:
+    return app.PERSISTENT_SESSIONS_MANAGER.can_probe_registered_browser_state()
+
+
+async def _registered_browser_state_is_usable(session_id: str, organization_id: str) -> bool:
+    if not _manager_can_probe_registered_browser_state():
+        return False
+
+    state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+        session_id=session_id,
+        organization_id=organization_id,
+    )
+    return bool(state and _browser_context_is_attachable(state.browser_context))
+
+
 async def _resolve_live_browser_session_id(
     chat_request: WorkflowCopilotChatRequest,
     organization_id: str,
@@ -230,17 +246,24 @@ async def _resolve_live_browser_session_id(
             )
             return None
 
-        # Trust the DB row over a CDP probe here — get_browser_state opens a
-        # fresh Playwright connection. ensure_browser_session does the
-        # attachability probe right before use so stale rows still recover.
         persistent = await app.PERSISTENT_SESSIONS_MANAGER.get_session(requested, organization_id)
-        if persistent is None or is_final_status(persistent.status) or not persistent.browser_address:
+        has_browser_address = bool(persistent.browser_address) if persistent else False
+        has_registered_browser_state = False
+        if persistent is not None and not is_final_status(persistent.status) and not has_browser_address:
+            has_registered_browser_state = await _registered_browser_state_is_usable(requested, organization_id)
+
+        if (
+            persistent is None
+            or is_final_status(persistent.status)
+            or (not has_browser_address and not has_registered_browser_state)
+        ):
             LOG.warning(
                 "Copilot live browser session is not yet usable; falling back to auto-create",
                 organization_id=organization_id,
                 requested_session_id=requested,
                 status=persistent.status if persistent else None,
-                has_browser_address=bool(persistent.browser_address) if persistent else False,
+                has_browser_address=has_browser_address,
+                has_registered_browser_state=has_registered_browser_state,
             )
             return None
 

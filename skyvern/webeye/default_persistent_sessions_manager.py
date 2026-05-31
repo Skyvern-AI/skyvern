@@ -198,6 +198,9 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
     def watch_session_pool(self) -> None:
         """No-op in OSS: browsers run in-process, no external pool to monitor."""
 
+    def can_probe_registered_browser_state(self) -> bool:
+        return True
+
     async def begin_session(
         self,
         *,
