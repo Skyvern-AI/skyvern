@@ -3254,6 +3254,21 @@ def _valid_runtime_anchor_url(value: object) -> str | None:
     return url
 
 
+def _blank_runtime_page_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    # Chrome/CDP can expose ":" while the page is still in early blank-page initialization.
+    return value.strip() in {"about:blank", "", ":"}
+
+
+def _missing_runtime_frontier_block_url(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
 def _same_runtime_page(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
@@ -3397,6 +3412,70 @@ def _workflow_with_runtime_frontier_anchor(
     return workflow, anchor_url
 
 
+async def _workflow_with_runtime_frontier_starter_url_seed(
+    workflow: Workflow,
+    ctx: CopilotContext,
+    *,
+    labels_to_execute: list[str],
+    runtime_frontier_anchor_url: str | None,
+) -> Workflow:
+    if not labels_to_execute or runtime_frontier_anchor_url is None or not ctx.browser_session_id:
+        return workflow
+
+    first_label = labels_to_execute[0]
+    first_block = _workflow_model_block_by_label(workflow.workflow_definition, first_label)
+    if (
+        first_block is None
+        or not hasattr(first_block, "url")
+        or _block_type_name(first_block) != BlockType.NAVIGATION.value
+        or not _missing_runtime_frontier_block_url(first_block.url)
+    ):
+        return workflow
+
+    current_page_url: str | None = None
+    try:
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        if browser_state is not None:
+            page = await browser_state.get_working_page()
+            # Playwright Page.url is exposed as a dynamic property at this boundary.
+            current_page_url = page.url if page is not None else None
+    except Exception:
+        LOG.debug(
+            "Failed to inspect runtime frontier browser page before starter URL seed",
+            browser_session_id=ctx.browser_session_id,
+            frontier_start_label=first_label,
+            exc_info=True,
+        )
+
+    if not _blank_runtime_page_url(current_page_url):
+        LOG.info(
+            "Preserved attached runtime frontier browser page",
+            browser_session_id=ctx.browser_session_id,
+            frontier_start_label=first_label,
+            current_url=current_page_url,
+            continuation_url=runtime_frontier_anchor_url,
+        )
+        return workflow
+
+    seeded = workflow.model_copy(deep=True)
+    seeded_block = _workflow_model_block_by_label(seeded.workflow_definition, first_label)
+    # Defensive: the copied workflow definition should preserve labels and URL fields.
+    if seeded_block is None or not hasattr(seeded_block, "url"):
+        return workflow
+    seeded_block.url = runtime_frontier_anchor_url
+    LOG.info(
+        "Seeded runtime frontier starter URL because attached browser page was blank",
+        browser_session_id=ctx.browser_session_id,
+        frontier_start_label=first_label,
+        current_url=current_page_url,
+        continuation_url=runtime_frontier_anchor_url,
+    )
+    return seeded
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -3466,6 +3545,7 @@ async def _run_blocks_and_collect_debug(
         frontier_start_label=frontier_start_label,
         block_outputs_to_seed=block_outputs_to_seed,
     )
+    runtime_frontier_starter_url_seeded = False
 
     user_params: dict[str, Any] = params.get("parameters") or {}
     all_workflow_params, all_output_params = await asyncio.gather(
@@ -3522,6 +3602,15 @@ async def _run_blocks_and_collect_debug(
     session_err = await ensure_browser_session(ctx)
     if session_err is not None:
         return session_err
+
+    seeded_runtime_workflow = await _workflow_with_runtime_frontier_starter_url_seed(
+        runtime_workflow,
+        ctx,
+        labels_to_execute=labels_to_execute,
+        runtime_frontier_anchor_url=runtime_frontier_anchor_url,
+    )
+    runtime_frontier_starter_url_seeded = seeded_runtime_workflow is not runtime_workflow
+    runtime_workflow = seeded_runtime_workflow
 
     workflow_request = WorkflowRequestBody(
         data=data if data else None,
@@ -3836,6 +3925,8 @@ async def _run_blocks_and_collect_debug(
     }
     if runtime_frontier_anchor_url is not None:
         result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
+    if runtime_frontier_starter_url_seeded:
+        result_data["runtime_frontier_starter_url_seeded"] = True
     if screenshot_b64 is not None:
         result_data["screenshot_base64"] = screenshot_b64
     if not run_ok and run and getattr(run, "failure_reason", None):
