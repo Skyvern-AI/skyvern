@@ -1243,6 +1243,8 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.proposal_disposition == "auto_applicable"
         assert agent_result.response_type == "ASK_QUESTION"
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["responseType"] == "ASK_QUESTION"
 
     def test_probable_site_block_ask_question_is_concise_and_proxy_aware(self) -> None:
         ctx = _ctx(
@@ -1834,6 +1836,8 @@ workflow_definition:
 
         assert agent_result.updated_workflow is None
         assert agent_result.clear_proposed_workflow is True
+        assert agent_result.narrative_payload is not None
+        assert agent_result.narrative_payload["responseType"] == "ASK_QUESTION"
 
     def test_reply_does_not_set_clear_proposed_flag(self) -> None:
         # Differential: a REPLY turn surfaces the verified workflow and leaves

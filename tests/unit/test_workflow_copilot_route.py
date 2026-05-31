@@ -140,6 +140,18 @@ def _setup_new_copilot_mocks(
 
     Returns the restore-on-error mock so callers can assert on it.
     """
+    if not hasattr(agent_result, "response_type"):
+        agent_result.response_type = "REPLY"
+    if not hasattr(agent_result, "total_tokens"):
+        agent_result.total_tokens = None
+    if not hasattr(agent_result, "output_policy_diagnostics"):
+        agent_result.output_policy_diagnostics = None
+    if not hasattr(agent_result, "turn_id"):
+        agent_result.turn_id = None
+    if not hasattr(agent_result, "narrative_summary"):
+        agent_result.narrative_summary = None
+    if not hasattr(agent_result, "narrative_payload"):
+        agent_result.narrative_payload = None
 
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -349,7 +361,10 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
     assert "reference cpe_" in assistant_contents[0]
 
     frames = [call.args[0] for call in stream.send.await_args_list if call.args]
-    assert any(isinstance(frame, WorkflowCopilotStreamResponseUpdate) for frame in frames)
+    response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
+    assert response_frames
+    assert response_frames[-1].narrative_payload is not None
+    assert response_frames[-1].narrative_payload["terminal"] == "error"
     assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
 
 
@@ -425,7 +440,10 @@ async def test_flag_on_route_error_after_chat_persists_recoverable_reply(
     assert "reference cpe_" in assistant_contents[0]
 
     frames = [call.args[0] for call in stream.send.await_args_list if call.args]
-    assert any(isinstance(frame, WorkflowCopilotStreamResponseUpdate) for frame in frames)
+    response_frames = [frame for frame in frames if isinstance(frame, WorkflowCopilotStreamResponseUpdate)]
+    assert response_frames
+    assert response_frames[-1].narrative_payload is not None
+    assert response_frames[-1].narrative_payload["terminal"] == "error"
     assert not any(isinstance(frame, WorkflowCopilotStreamErrorUpdate) for frame in frames)
 
 

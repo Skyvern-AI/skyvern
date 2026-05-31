@@ -783,6 +783,10 @@ def _make_agent_result(
         if ctx is not None
         else global_llm_context
     )
+    narrative_payload = kwargs.get("narrative_payload")
+    response_type = kwargs.get("response_type", "REPLY")
+    if isinstance(narrative_payload, dict) and "responseType" not in narrative_payload:
+        kwargs["narrative_payload"] = {**narrative_payload, "responseType": response_type}
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
 
 
@@ -944,7 +948,7 @@ def _build_exit_result(
             narrative_summary=ctx.narrative_summary,
             narrative_payload=_build_narrative_payload(
                 ctx,
-                terminal="error" if cancelled else "response",
+                terminal="error" if cancelled or terminal_reason else "response",
                 terminal_message=final_text,
                 narrative_summary=ctx.narrative_summary,
             ),

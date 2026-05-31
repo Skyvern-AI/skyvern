@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import select
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -521,7 +522,7 @@ class WorkflowParametersRepository(BaseRepository):
         content: str,
         global_llm_context: str | None = None,
         turn_outcome: TurnOutcome | None = None,
-        narrative_payload: dict | None = None,
+        narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
     ) -> WorkflowCopilotChatMessage:
         async with self.Session() as session:
             new_message = WorkflowCopilotChatMessageModel(
