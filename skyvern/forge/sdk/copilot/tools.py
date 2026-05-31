@@ -1219,6 +1219,7 @@ async def _attach_failed_block_screenshots(
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 ANSWER_ONLY_CONTEXT_TOOLS = frozenset({"get_run_results"})
+CREDENTIAL_METADATA_TOOLS = frozenset({"list_credentials"})
 PAGE_INSPECTION_TOOLS = frozenset({"inspect_page_for_composition", "evaluate", "get_browser_screenshot"})
 PAGE_SCHEMA_CONTEXT_TOOLS = frozenset({"inspect_page_for_composition"})
 _CURRENT_PAGE_INSPECTION_TARGETS = frozenset({"", "current", "current_page", "__current_page__"})
@@ -1757,6 +1758,9 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
     blocks_page_inspection = tool_name in PAGE_SCHEMA_CONTEXT_TOOLS and (
         intent.mode in NO_MUTATION_TURN_INTENT_MODES or not authority.may_update_workflow
     )
+    blocks_credential_metadata = tool_name in CREDENTIAL_METADATA_TOOLS and not (
+        authority.may_update_workflow or authority.may_run_blocks
+    )
     # Two paths grant read access to ANSWER_ONLY_CONTEXT_TOOLS, both excluded for DOCS_ANSWER/REFUSE/CLARIFY:
     #  (1) authority.may_read_run_context — classifier-derived (DIAGNOSE turns)
     #  (2) pending_reconciliation_run_id — within-turn override anchored to the run-blocks watchdog
@@ -1781,7 +1785,13 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
 
     if blocks_run and not blocks_update and _request_policy_allows_update_and_skip_run(ctx, tool_name):
         return None
-    if not blocks_update and not blocks_run and not blocks_context_read and not blocks_page_inspection:
+    if (
+        not blocks_update
+        and not blocks_run
+        and not blocks_context_read
+        and not blocks_page_inspection
+        and not blocks_credential_metadata
+    ):
         if within_turn_read_override:
             LOG.info(
                 "copilot authority gate allowed tool via within-turn read override",
@@ -1804,6 +1814,8 @@ def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlo
         reason_code = "turn_intent_page_inspection_blocked"
     elif blocks_context_read:
         reason_code = "turn_intent_context_read_blocked"
+    elif blocks_credential_metadata:
+        reason_code = "turn_intent_credential_metadata_blocked"
     else:
         reason_code = "turn_intent_run_blocked"
     LOG.info(
@@ -5292,6 +5304,12 @@ async def list_credentials_tool(
     loop_error = _tool_loop_error(copilot_ctx, "list_credentials", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
+
+    authority_error = _authority_tool_error(copilot_ctx, "list_credentials")
+    if authority_error:
+        result = {"ok": False, "error": authority_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
+        return json.dumps(result)
 
     result = await _list_credentials(arguments, copilot_ctx)
     record_tool_step_result_for_ctx(copilot_ctx, "list_credentials", arguments, result)
