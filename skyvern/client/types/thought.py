@@ -29,7 +29,6 @@ class Thought(UniversalBaseModel):
     reasoning_token_count: typing.Optional[int] = None
     cached_token_count: typing.Optional[int] = None
     thought_cost: typing.Optional[float] = None
-    last_llm_model: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
 

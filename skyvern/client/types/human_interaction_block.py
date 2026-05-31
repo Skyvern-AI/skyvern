@@ -39,7 +39,6 @@ class HumanInteractionBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     task_type: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -61,7 +60,6 @@ class HumanInteractionBlock(UniversalBaseModel):
     complete_verification: typing.Optional[bool] = None
     include_action_history_in_verification: typing.Optional[bool] = None
     download_timeout: typing.Optional[float] = None
-    include_extracted_text: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
     negative_descriptor: typing.Optional[str] = None

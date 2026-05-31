@@ -5,7 +5,6 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .action_output import ActionOutput
 from .action_status import ActionStatus
 from .action_type import ActionType
 from .click_context import ClickContext
@@ -37,9 +36,7 @@ class Action(UniversalBaseModel):
     tool_call_id: typing.Optional[str] = None
     xpath: typing.Optional[str] = None
     errors: typing.Optional[typing.List[UserDefinedError]] = None
-    terminal_user_errors: typing.Optional[bool] = None
     data_extraction_goal: typing.Optional[str] = None
-    output: typing.Optional[ActionOutput] = None
     file_name: typing.Optional[str] = None
     file_url: typing.Optional[str] = None
     download: typing.Optional[bool] = None

@@ -33,7 +33,6 @@ ArtifactType = typing.Union[
         "pdf",
         "step_archive",
         "task_archive",
-        "download",
     ],
     typing.Any,
 ]
