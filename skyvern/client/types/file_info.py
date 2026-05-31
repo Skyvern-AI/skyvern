@@ -27,9 +27,19 @@ class FileInfo(UniversalBaseModel):
     Original filename
     """
 
+    file_size: typing.Optional[int] = pydantic.Field(default=None)
+    """
+    Size of the file in bytes
+    """
+
     modified_at: typing.Optional[dt.datetime] = pydantic.Field(default=None)
     """
     Modified time of the file
+    """
+
+    artifact_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    Artifact row id for refresh-on-read
     """
 
     if IS_PYDANTIC_V2:
