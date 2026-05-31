@@ -12,7 +12,6 @@ class BrowserProfile(UniversalBaseModel):
     organization_id: str
     name: str
     description: typing.Optional[str] = None
-    source_browser_type: typing.Optional[str] = None
     created_at: dt.datetime
     modified_at: dt.datetime
     deleted_at: typing.Optional[dt.datetime] = None

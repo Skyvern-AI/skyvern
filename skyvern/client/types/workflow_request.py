@@ -31,6 +31,5 @@ class WorkflowRequest(UniversalBaseModel):
 
 
 from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
 
 update_forward_refs(WorkflowRequest)
