@@ -701,26 +701,14 @@ function DetailView({
 interface NarrativeViewProps {
   turn: TurnNarrativeState;
   onBlockSelect?: (blockLabel: string) => void;
-  // Past turns render rolled-up by default; the latest / in-flight turn
-  // renders in detail. Parent decides via this flag.
-  defaultExpanded?: boolean;
 }
 
-export function NarrativeView({
-  turn,
-  onBlockSelect,
-  defaultExpanded = true,
-}: NarrativeViewProps) {
+export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
   const summary = useMemo(() => computeTurnSummary(turn), [turn]);
   const isInFlight = turn.terminal === null;
   const isComplete = !isInFlight;
-  const defaultRolled = isComplete && !defaultExpanded;
   const [userRolled, setUserRolled] = useState<boolean | null>(null);
-  const rolled = userRolled === null ? defaultRolled : userRolled;
-
-  useEffect(() => {
-    setUserRolled(null);
-  }, [defaultExpanded]);
+  const rolled = userRolled === null ? isComplete : userRolled;
 
   if (rolled && isComplete) {
     return (
