@@ -1910,7 +1910,7 @@ class TestNativeToolSurface:
         assert "inspect_page_for_composition" in names
 
     @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
-    def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
+    def test_credential_deferred_draft_keeps_all_native_tools_registered(self, reason: str) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 
         policy = RequestPolicy(
@@ -1928,7 +1928,7 @@ class TestNativeToolSurface:
 
         filtered = agent_module._native_tools_for_turn(tools, turn_intent=None, request_policy=policy)
 
-        assert [tool.name for tool in filtered] == ["list_credentials", "update_and_run_blocks"]
+        assert [tool.name for tool in filtered] == ["update_workflow", "list_credentials", "update_and_run_blocks"]
 
     def test_non_deferred_policy_keeps_update_workflow_tool(self) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
