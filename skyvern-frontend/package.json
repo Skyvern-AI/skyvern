@@ -52,7 +52,7 @@
     "@uiw/codemirror-theme-tokyo-night-storm": "^4.23.0",
     "@uiw/react-codemirror": "^4.23.0",
     "@xyflow/react": "^12.1.1",
-    "axios": "^1.13.5",
+    "axios": "^1.16.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.0",
     "cmdk": "^1.0.0",
@@ -100,12 +100,12 @@
     "fast-check": "^4.8.0",
     "jsdom": "^29.1.1",
     "lint-staged": "^15.5.2",
-    "postcss": "^8.4.37",
+    "postcss": "^8.5.15",
     "prettier": "^3.8.1",
     "prettier-plugin-tailwindcss": "^0.8.0",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.5.3",
-    "vite": "^6.4.2",
+    "vite": "^8.0.14",
     "vitest": "^3.2.4"
   },
   "lint-staged": {
