@@ -69,6 +69,15 @@
         "node": ">=18.0.0"
     },
     "sideEffects": false,
+    "pnpm": {
+        "overrides": {
+            "serialize-javascript": ">=7.0.5",
+            "fast-uri": ">=3.1.2",
+            "vite": ">=7.3.2",
+            "rollup": ">=4.59.0",
+            "postcss": ">=8.5.10"
+        }
+    },
     "description": "The Skyvern TypeScript library provides convenient access to the Skyvern APIs from TypeScript.",
     "publishConfig": {
         "access": "public",
