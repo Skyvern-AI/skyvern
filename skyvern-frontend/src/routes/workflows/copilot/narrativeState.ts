@@ -4,6 +4,7 @@
 // exercised under vitest without a JSX runtime.
 
 import {
+  CopilotResponseType,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -76,6 +77,7 @@ export interface TurnNarrativeState {
   turnId: string | null;
   turnIndex: number | null;
   mode: string;
+  responseType: CopilotResponseType | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -104,6 +106,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnId: null,
   turnIndex: null,
   mode: "unknown",
+  responseType: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -375,6 +378,20 @@ export function applyNarrativeEvent(
     }
 
     case "response": {
+      const hydrated = hydrateNarrativeFromPayload(event.narrative_payload);
+      if (hydrated) {
+        return {
+          ...hydrated,
+          responseType: event.response_type ?? hydrated.responseType,
+          terminalMessage: hydrated.terminalMessage ?? event.message,
+          narrativeSummary:
+            hydrated.narrativeSummary ??
+            event.narrative_summary ??
+            event.message,
+          endedAt: hydrated.endedAt ?? event.response_time ?? prev.endedAt,
+        };
+      }
+
       // Close the design phase on terminal even when DESIGN_END never
       // arrived (a refusal turn can emit DESIGN_START via first
       // tool_called and then exit without persisting a workflow).
@@ -389,6 +406,7 @@ export function applyNarrativeEvent(
       );
       return {
         ...prev,
+        responseType: event.response_type ?? prev.responseType,
         designEnded: true,
         terminal: "response",
         terminalMessage: event.message,
@@ -466,6 +484,13 @@ export function hydrateNarrativeFromPayload(
   if (turnId === null) return undefined;
 
   const mode = typeof payload.mode === "string" ? payload.mode : "unknown";
+  const rawResponseType = payload.responseType;
+  const responseType: CopilotResponseType | null =
+    rawResponseType === "REPLY" ||
+    rawResponseType === "ASK_QUESTION" ||
+    rawResponseType === "REPLACE_WORKFLOW"
+      ? rawResponseType
+      : null;
   const draftRaw = payload.draft;
   const draft =
     draftRaw && typeof draftRaw === "object"
@@ -551,6 +576,7 @@ export function hydrateNarrativeFromPayload(
     turnId,
     turnIndex,
     mode: mode as TurnNarrativeState["mode"],
+    responseType,
     designStarted: true,
     designEnded: true,
     draft,
@@ -581,6 +607,9 @@ export function hydrateNarrativeFromPayload(
 // classifier-said-"draft_only" turn that only asked a clarification
 // shows "clarify".
 export function effectiveMode(turn: TurnNarrativeState): string {
+  if (turn.responseType === "ASK_QUESTION") {
+    return "clarify";
+  }
   const blockCount = turn.draft?.blockCount ?? turn.blocks.length;
   if (blockCount > 0) {
     const priorBlocks = turn.priorBlockCount ?? 0;

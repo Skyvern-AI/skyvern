@@ -94,12 +94,6 @@ function liveElapsed(startedAt: string | null): string | null {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function truncate(s: string, n: number): string {
-  if (!s) return "";
-  if (s.length <= n) return s;
-  return s.slice(0, n).replace(/[\s,;:.!?]+$/, "") + "…";
-}
-
 function Spinner({ small = false }: { small?: boolean }) {
   const sizeClass = small ? "h-2 w-2" : "h-2.5 w-2.5";
   return (
@@ -427,28 +421,50 @@ interface TurnSummary {
   isQA: boolean;
 }
 
+function asksUserForInput(turn: TurnNarrativeState): boolean {
+  if (turn.responseType === "ASK_QUESTION") {
+    return true;
+  }
+  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
+    .toLowerCase()
+    .trim();
+  return (
+    text.includes("please provide") ||
+    text.includes("please share") ||
+    text.includes("could you provide") ||
+    text.includes("can you provide") ||
+    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
+  );
+}
+
 function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const isFail =
     turn.terminal === "error" || turn.blocks.some((b) => b.state === "failed");
   const mode = effectiveMode(turn);
+  const needsInput = asksUserForInput(turn);
   const isQA =
-    mode === "docs_answer" || mode === "clarify" || mode === "refuse";
+    mode === "docs_answer" ||
+    mode === "diagnose" ||
+    mode === "clarify" ||
+    mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
   const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
 
   const headline = isFail
     ? "Run halted"
-    : isQA
-      ? mode === "docs_answer"
-        ? "Answered"
-        : mode === "refuse"
+    : needsInput
+      ? "Question"
+      : isQA
+        ? mode === "refuse"
           ? "Declined"
-          : "Followed up"
-      : hasEdited
-        ? "Applied edits and re-tested"
-        : hasDrafts
-          ? "Built and tested the workflow"
-          : "Completed the run";
+          : mode === "clarify"
+            ? "Question"
+            : "Answered"
+        : hasEdited
+          ? "Applied edits and re-tested"
+          : hasDrafts
+            ? "Built and tested the workflow"
+            : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
@@ -556,7 +572,7 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
                 summary.isFail ? "text-rose-200/90" : "text-slate-400"
               }`}
             >
-              {summary.isQA ? truncate(closing, 90) : closing}
+              {closing}
             </div>
           ) : null
         }
