@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
@@ -293,15 +294,13 @@ def test_analyze_text_prompt_all_null_is_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_ctx_for_record() -> Any:
+def _fresh_ctx_for_record() -> SimpleNamespace:
     """SimpleNamespace shaped for _record_run_blocks_result + update_repeated_failure_state.
 
     Uses getattr-with-default-compatible defaults so the function under test
     populates the interesting fields without tripping AttributeError on the
     downstream update_repeated_failure_state call.
     """
-    from types import SimpleNamespace
-
     return SimpleNamespace(
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -312,11 +311,16 @@ def _fresh_ctx_for_record() -> Any:
         null_data_streak_count=0,
         failed_test_nudge_count=0,
         last_failed_workflow_yaml=None,
+        last_good_workflow=None,
+        last_good_workflow_yaml=None,
         non_retriable_nav_error_last_emitted_signature=None,
         workflow_yaml=None,
         last_workflow=None,
+        last_workflow_yaml=None,
         last_frontier_start_label=None,
         last_executed_block_labels=[],
+        last_full_workflow_test_ok=False,
+        last_unverified_block_labels=[],
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
@@ -325,6 +329,7 @@ def _fresh_ctx_for_record() -> Any:
         last_action_sequence_fingerprint=None,
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
+        workflow_verification_evidence=WorkflowVerificationEvidence(),
     )
 
 
@@ -339,6 +344,64 @@ def test_record_run_blocks_result_flips_last_test_ok_on_empty_extraction_envelop
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_test_failure_reason is not None
+
+
+def test_record_run_blocks_result_does_not_promote_partial_frontier_to_full_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_partial",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_unverified_block_labels == ["extract"]
+    assert ctx.last_good_workflow is None
+    assert "unverified workflow blocks remain" in (ctx.last_test_failure_reason or "")
+
+
+def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "extract"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_full",
+            "requested_block_labels": ["extract"],
+            "executed_block_labels": ["extract"],
+            "blocks": [{"label": "extract", "status": "completed", "extracted_data": {"value": "ok"}}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_unverified_block_labels == []
+    assert ctx.last_good_workflow is ctx.last_workflow
+    assert ctx.last_good_workflow_yaml == ctx.last_workflow_yaml
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:

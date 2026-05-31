@@ -9,12 +9,27 @@ alongside the tools and enforcement helpers they exercise end-to-end.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session, mcp_browser_context, mcp_to_copilot
+
+
+class _FakeBrowser:
+    def __init__(self, *, connected: bool = True) -> None:
+        self._connected = connected
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+
+class _FakeBrowserContext:
+    def __init__(self, *, connected: bool = True, closed: bool = False) -> None:
+        self.browser = _FakeBrowser(connected=connected)
+        self._impl_obj = SimpleNamespace(_close_was_called=closed, _closed=closed)
 
 
 def test_mcp_to_copilot_ok_passthrough() -> None:
@@ -135,7 +150,7 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     pending_state = MagicMock()
     pending_state.browser_context = None
     ready_state = MagicMock()
-    ready_state.browser_context = MagicMock()
+    ready_state.browser_context = _FakeBrowserContext()
 
     mock_manager = MagicMock()
     mock_manager.create_session = AsyncMock(return_value=session)
@@ -150,6 +165,105 @@ async def test_ensure_browser_session_waits_for_browser_context(monkeypatch: pyt
     assert result is None
     assert ctx.browser_session_id == "bs_1"
     assert mock_manager.get_browser_state.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_ensure_browser_session_recreates_disconnected_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A persistent-session DB row can still point at a Playwright context whose
+    # backing browser has been closed. Treat it as stale so Copilot does not
+    # keep reusing a dead session after a target page/browser shutdown.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    stale_state = MagicMock()
+    stale_state.browser_context = _FakeBrowserContext(connected=False)
+    fresh_state = MagicMock()
+    fresh_state.browser_context = _FakeBrowserContext()
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_fresh"
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(side_effect=[stale_state, fresh_state])
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_app = MagicMock()
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_stale"
+
+    result = await ensure_browser_session(ctx)
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_fresh"
+    mock_manager.create_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_browser_session_recreates_closed_persistent_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A completed persistent-session row is not begin-able even when an old
+    # Playwright context is still around in memory. Recreate before handing
+    # the id to workflow execution.
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    fresh_state = MagicMock()
+    fresh_state.browser_context = _FakeBrowserContext()
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_fresh"
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(return_value=fresh_state)
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_browser_sessions = MagicMock()
+    mock_browser_sessions.get_persistent_browser_session = AsyncMock(return_value=SimpleNamespace(status="completed"))
+    mock_app = MagicMock()
+    mock_app.DATABASE.browser_sessions = mock_browser_sessions
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_closed"
+
+    result = await ensure_browser_session(ctx)
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_fresh"
+    mock_browser_sessions.get_persistent_browser_session.assert_awaited_once_with("bs_closed", "org_1")
+    mock_manager.create_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_browser_session_recreates_sync_closed_persistent_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import skyvern.forge.sdk.copilot.runtime as runtime
+
+    fresh_state = MagicMock()
+    fresh_state.browser_context = _FakeBrowserContext()
+    session = MagicMock()
+    session.persistent_browser_session_id = "bs_fresh"
+
+    mock_manager = MagicMock()
+    mock_manager.get_browser_state = AsyncMock(return_value=fresh_state)
+    mock_manager.create_session = AsyncMock(return_value=session)
+    mock_browser_sessions = MagicMock()
+    mock_browser_sessions.get_persistent_browser_session = MagicMock(return_value=SimpleNamespace(status="failed"))
+    mock_app = MagicMock()
+    mock_app.DATABASE.browser_sessions = mock_browser_sessions
+    mock_app.PERSISTENT_SESSIONS_MANAGER = mock_manager
+    monkeypatch.setattr(runtime, "app", mock_app)
+    monkeypatch.setattr(runtime, "_BROWSER_BOOT_POLL_INTERVAL_SECONDS", 0.0)
+
+    ctx = _make_ctx()
+    ctx.browser_session_id = "bs_closed"
+
+    result = await ensure_browser_session(ctx)
+
+    assert result is None
+    assert ctx.browser_session_id == "bs_fresh"
+    mock_browser_sessions.get_persistent_browser_session.assert_called_once_with("bs_closed", "org_1")
+    mock_manager.create_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,7 @@ class TaskRunListItem(UniversalBaseModel):
     finished_at: typing.Optional[dt.datetime] = None
     created_at: dt.datetime
     workflow_permanent_id: typing.Optional[str] = None
-    workflow_deleted: bool = False
+    workflow_deleted: typing.Optional[bool] = None
     script_run: typing.Optional[bool] = None
 
     if IS_PYDANTIC_V2:

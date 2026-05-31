@@ -235,23 +235,26 @@ function layoutUtil(
   edges: Array<Edge>,
   options: Dagre.configUnion = {},
   allNodes?: Array<AppNode>,
+  heightOverrides?: Map<string, number>,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const g = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "TB", ...options });
 
   edges.forEach((edge) => g.setEdge(edge.source, edge.target));
   nodes.forEach((node) => {
-    // For loop/conditional nodes without measurements, use computed width
-    let width = node.measured?.width ?? 0;
-    let height = node.measured?.height ?? 0;
+    let width = measuredOr(node.measured?.width, DEFAULT_BLOCK_WIDTH);
+    let height =
+      heightOverrides?.get(node.id) ??
+      measuredOr(node.measured?.height, DEFAULT_BLOCK_HEIGHT);
 
     if (
       (node.type === "loop" || node.type === "conditional") &&
       !node.measured?.width
     ) {
-      // Use full nodes array for nesting calculation
       width = getLoopNodeWidth(node, allNodes ?? nodes);
-      height = 300; // Reasonable default height
+      if (!heightOverrides?.has(node.id)) {
+        height = 300;
+      }
     }
 
     g.setNode(node.id, {
@@ -266,10 +269,12 @@ function layoutUtil(
   return {
     nodes: nodes.map((node) => {
       const dagreNode = g.node(node.id);
-      // We are shifting the dagre node position (anchor=center center) to the top left
-      // so it matches the React Flow node anchor point (top left).
-      const x = dagreNode.x - (node.measured?.width ?? 0) / 2;
-      const y = dagreNode.y - (node.measured?.height ?? 0) / 2;
+      // Use the same dimensions that were fed to Dagre so center-to-topleft
+      // conversion is consistent with the layout.
+      const nodeWidth = dagreNode.width as number;
+      const nodeHeight = dagreNode.height as number;
+      const x = dagreNode.x - nodeWidth / 2;
+      const y = dagreNode.y - nodeHeight / 2;
 
       return { ...node, position: { x, y } };
     }),
@@ -372,6 +377,15 @@ export function updateNodeAndDescendantsVisibility(
   return result;
 }
 
+// w-[30rem] = 480px - the standard width for leaf block cards.
+const DEFAULT_BLOCK_WIDTH = 480;
+// Approximate rendered height of a typical leaf block card (header + one field + padding).
+const DEFAULT_BLOCK_HEIGHT = 200;
+
+function measuredOr(value: number | undefined, fallback: number): number {
+  return value && value > 0 ? value : fallback;
+}
+
 export function getLoopNodeWidth(node: AppNode, nodes: Array<AppNode>): number {
   const maxNesting = maxNestingLevel(nodes);
   const nestingLevel = getNestingLevel(node, nodes);
@@ -400,122 +414,113 @@ function layout(
   edges: Array<Edge>,
   targettedBlockLabel?: string,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
-  const loopNodes = nodes.filter(
-    (node) => node.type === "loop" && !node.hidden,
-  );
-  const loopNodeChildren: Array<Array<AppNode>> = loopNodes.map(() => []);
+  // Computed heights for containers after laying out their children.
+  // Propagated to parent layouts so Dagre uses accurate heights instead
+  // of stale measured values from the previous render cycle.
+  const computedHeights = new Map<string, number>();
 
-  loopNodes.forEach((node, index) => {
+  // Collect all container nodes (loops + conditionals), sorted deepest
+  // first so child containers are laid out before their parents.
+  const containerNodes = nodes.filter(
+    (node) =>
+      (node.type === "loop" || node.type === "conditional") && !node.hidden,
+  );
+  containerNodes.sort((a, b) => {
+    return getNestingLevel(b, nodes) - getNestingLevel(a, nodes);
+  });
+
+  const containerChildrenMap = new Map<string, Array<AppNode>>();
+
+  containerNodes.forEach((node) => {
     const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
     const childNodeIds = new Set(childNodes.map((child) => child.id));
-    // Include edges even if marked hidden, as long as both nodes are visible
-    // (edges might be hidden from branch switches but need to be used for layout)
+
     const childEdges = edges.filter(
       (edge) => childNodeIds.has(edge.source) && childNodeIds.has(edge.target),
     );
-    const maxChildWidth = Math.max(
-      ...childNodes.map((node) => node.measured?.width ?? 0),
-    );
-    const loopNodeWidth = getLoopNodeWidth(node, nodes);
-    // Reset child positions to (0,0) before layout to avoid stale positions
-    const childNodesWithResetPositions = childNodes.map((n) => ({
-      ...n,
-      position: { x: 0, y: 0 },
-    }));
-    // Check if this loop node is the targetted block (being debugged)
-    // If so, add extra margin to account for the status row that appears
-    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
-    const isTargetted =
-      targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    // Use measured header height when available, fall back to 225 for initial render.
-    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
-    const headerHeight = isLoopNode(node) ? node.data._headerHeight : undefined;
-    const baseMargin = headerHeight ? headerHeight + 28 : 225;
-    // Only add extra margin for the status row when using the fallback height,
-    // since the measured height already includes the status row content.
-    const marginy =
-      isTargetted && !headerHeight
-        ? baseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
-        : baseMargin;
-    const layouted = layoutUtil(
-      childNodesWithResetPositions,
-      childEdges,
-      {
-        marginx: (loopNodeWidth - maxChildWidth) / 2,
-        marginy,
-      },
-      nodes,
-    );
-    loopNodeChildren[index] = layouted.nodes;
-  });
 
-  const conditionalNodes = nodes.filter(
-    (node) => node.type === "conditional" && !node.hidden,
-  );
-  const conditionalNodeChildren: Array<Array<AppNode>> = conditionalNodes.map(
-    () => [],
-  );
+    const containerWidth =
+      node.type === "loop" || node.type === "conditional"
+        ? getLoopNodeWidth(node, nodes)
+        : DEFAULT_BLOCK_WIDTH;
 
-  conditionalNodes.forEach((node, index) => {
-    const childNodes = nodes.filter((n) => n.parentId === node.id && !n.hidden);
-    const childNodeIds = new Set(childNodes.map((child) => child.id));
-    // Include edges, but skip hidden edges completely (they're hidden for a reason - inactive branches)
-    const childEdges = edges.filter((edge) => {
-      if (!childNodeIds.has(edge.source) || !childNodeIds.has(edge.target)) {
-        return false;
-      }
-      // Exclude hidden edges from layout
-      if (edge.hidden) {
-        return false;
-      }
-      return true;
-    });
-    // Use computed width for loop nodes, measured width for others
     const maxChildWidth = Math.max(
       ...childNodes.map((child) =>
-        child.type === "loop"
+        child.type === "loop" || child.type === "conditional"
           ? getLoopNodeWidth(child, nodes)
-          : (child.measured?.width ?? 0),
+          : measuredOr(child.measured?.width, DEFAULT_BLOCK_WIDTH),
       ),
     );
-    const conditionalNodeWidth = getLoopNodeWidth(node, nodes);
 
-    // Reset child positions to (0,0) before layout to avoid stale positions
     const childNodesWithResetPositions = childNodes.map((n) => ({
       ...n,
       position: { x: 0, y: 0 },
     }));
 
-    // Check if this conditional node is the targetted block (being debugged)
-    // If so, add extra margin to account for the status row that appears
     const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
     const isTargetted =
       targettedBlockLabel && nodeLabel === targettedBlockLabel;
-    // Use measured header height when available, fall back to 225 for initial render.
-    // Add 28px to account for outer container (border-2 + p-2 = 10px) + gap (16px) + buffer.
-    const conditionalHeaderHeight = isConditionalNode(node)
-      ? node.data._headerHeight
-      : undefined;
-    const conditionalBaseMargin = conditionalHeaderHeight
-      ? conditionalHeaderHeight + 28
-      : 225;
-    // Only add extra margin for the status row when using the fallback height,
-    // since the measured height already includes the status row content.
-    const marginy =
-      isTargetted && !conditionalHeaderHeight
-        ? conditionalBaseMargin + TARGETTED_BLOCK_EXTRA_MARGIN
-        : conditionalBaseMargin;
+
+    let baseMargin: number;
+    if (node.type === "loop" && isLoopNode(node)) {
+      const headerHeight = node.data._headerHeight;
+      baseMargin = headerHeight ? headerHeight + 28 : 225;
+      if (isTargetted && !headerHeight) {
+        baseMargin += TARGETTED_BLOCK_EXTRA_MARGIN;
+      }
+    } else if (node.type === "conditional" && isConditionalNode(node)) {
+      const headerHeight = node.data._headerHeight;
+      baseMargin = headerHeight ? headerHeight + 28 : 225;
+      if (isTargetted && !headerHeight) {
+        baseMargin += TARGETTED_BLOCK_EXTRA_MARGIN;
+      }
+    } else {
+      baseMargin = 225;
+    }
+
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
-        marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-        marginy,
+        marginx: (containerWidth - maxChildWidth) / 2,
+        marginy: baseMargin,
       },
       nodes,
+      computedHeights,
     );
 
-    conditionalNodeChildren[index] = layouted.nodes;
+    const centeredChildren = layouted.nodes.map((n) => {
+      const nodeWidth =
+        (n.type === "loop" || n.type === "conditional") && !n.measured?.width
+          ? getLoopNodeWidth(n, nodes)
+          : measuredOr(n.measured?.width, DEFAULT_BLOCK_WIDTH);
+      return {
+        ...n,
+        position: {
+          x: (containerWidth - nodeWidth) / 2,
+          y: n.position.y,
+        },
+      };
+    });
+
+    containerChildrenMap.set(node.id, centeredChildren);
+
+    // Only override the container's height when it has visible children.
+    // Collapsed containers have all children hidden; their measured.height
+    // (the collapsed card) is already correct and must not be replaced.
+    if (centeredChildren.length > 0) {
+      let maxChildBottom = 0;
+      for (const child of centeredChildren) {
+        const childHeight =
+          computedHeights.get(child.id) ??
+          measuredOr(child.measured?.height, DEFAULT_BLOCK_HEIGHT);
+        const bottom = child.position.y + childHeight;
+        if (bottom > maxChildBottom) {
+          maxChildBottom = bottom;
+        }
+      }
+      computedHeights.set(node.id, maxChildBottom + 24);
+    }
   });
 
   const topLevelNodes = nodes.filter((node) => !node.parentId && !node.hidden);
@@ -554,15 +559,19 @@ function layout(
     layoutEdges.concat(syntheticEdges),
     {},
     nodes,
+    computedHeights,
   );
 
   // Collect all hidden nodes to preserve them
   const hiddenNodes = nodes.filter((node) => node.hidden);
 
   // Combine all layouted nodes and sort by nesting depth to ensure parents come before children
-  const allLayoutedNodes = topLevelNodesLayout.nodes
-    .concat(conditionalNodeChildren.flat())
-    .concat(loopNodeChildren.flat());
+  const allContainerChildren: Array<AppNode> = [];
+  for (const children of containerChildrenMap.values()) {
+    allContainerChildren.push(...children);
+  }
+  const allLayoutedNodes =
+    topLevelNodesLayout.nodes.concat(allContainerChildren);
 
   // Sort by depth: top-level first, then depth-1, depth-2, etc.
   const nodeDepths = new Map<string, number>();
@@ -1488,6 +1497,49 @@ function collectLabelsForBranch(
   return labels;
 }
 
+// Labels at or before `targetLabel` in execution order: the conditional itself
+// plus every block that can reach it via next_block_label / branch references.
+// Branch collection excludes these so a back-reference chain cannot pull the
+// conditional (or an earlier block) into its own branch (SKY-8216). Computed
+// from the graph rather than array position so it is independent of the order
+// branch children happen to be serialized in (SKY-10460).
+function labelsAtOrBeforeConditional(
+  targetLabel: string,
+  blocks: Array<WorkflowBlock>,
+): Set<string> {
+  const present = new Set(blocks.map((block) => block.label));
+  const predecessors = new Map<string, Array<string>>();
+  const addEdge = (from: string, to: string | null | undefined): void => {
+    if (!to || !present.has(to)) {
+      return;
+    }
+    const list = predecessors.get(to) ?? [];
+    list.push(from);
+    predecessors.set(to, list);
+  };
+  for (const block of blocks) {
+    addEdge(block.label, block.next_block_label);
+    if (block.block_type === "conditional") {
+      for (const branch of (block as ConditionalBlock).branch_conditions) {
+        addEdge(block.label, branch.next_block_label);
+      }
+    }
+  }
+
+  const result = new Set<string>([targetLabel]);
+  const queue = [targetLabel];
+  while (queue.length > 0) {
+    const label = queue.shift()!;
+    for (const pred of predecessors.get(label) ?? []) {
+      if (!result.has(pred)) {
+        result.add(pred);
+        queue.push(pred);
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * Reconstructs the proper hierarchical structure for conditional blocks from a flat blocks array.
  * This is the deserialization counterpart to the edge-based serialization logic.
@@ -1521,7 +1573,7 @@ function reconstructConditionalStructure(
   });
 
   // Process each conditional block
-  blocks.forEach((block, blockIndex) => {
+  blocks.forEach((block) => {
     if (block.block_type !== "conditional") {
       if (isNestedLoopWorkflowBlock(block)) {
         // Recursively handle conditionals inside loops
@@ -1550,15 +1602,7 @@ function reconstructConditionalStructure(
       return;
     }
 
-    // Blocks at or before this conditional must not be collected as branch
-    // children. Without this guard, next_block_label chains that loop back
-    // to earlier blocks (e.g. reporting → fetch_token) would pull the
-    // conditional itself into its own branch, setting parentId to its own id
-    // and crashing React Flow with a stack overflow.
-    const excludeLabels = new Set<string>();
-    for (let i = 0; i <= blockIndex; i++) {
-      excludeLabels.add(blocks[i]!.label);
-    }
+    const excludeLabels = labelsAtOrBeforeConditional(block.label, blocks);
 
     // Create START and NodeAdder nodes for this conditional
     const startNodeId = nanoid();
@@ -1915,6 +1959,7 @@ function getElements(
       webhookCallbackUrl: settings.webhookCallbackUrl ?? "",
       model: settings.model,
       maxScreenshotScrolls: settings.maxScreenshotScrolls,
+      maxElapsedTimeMinutes: settings.maxElapsedTimeMinutes ?? null,
       extraHttpHeaders: settings.extraHttpHeaders,
       cdpConnectHeaders: settings.cdpConnectHeaders,
       editable,
@@ -1974,14 +2019,12 @@ function getElements(
     // conditional's own edges).
     const branchLabels = new Set<string>();
     const collectBranchLabels = (loopChildren: Array<WorkflowBlock>) => {
-      loopChildren.forEach((child, childIndex) => {
+      loopChildren.forEach((child) => {
         if (child.block_type === "conditional") {
-          // Exclude labels at or before this conditional to prevent
-          // back-reference chains from pulling in earlier blocks
-          const loopExclude = new Set<string>();
-          for (let i = 0; i <= childIndex; i++) {
-            loopExclude.add(loopChildren[i]!.label);
-          }
+          const loopExclude = labelsAtOrBeforeConditional(
+            child.label,
+            loopChildren,
+          );
           child.branch_conditions.forEach((branch) => {
             collectLabelsForBranch(
               branch.next_block_label,
@@ -2128,25 +2171,17 @@ function getElements(
     }
   }
 
-  // Determine the initial active branch for each conditional node (default branch if available)
-  const conditionalBlocks = blocks.filter(
-    (b) => b.block_type === "conditional",
-  );
+  // Determine the initial active branch for each conditional node.
+  // Walk the nodes array (not blocks) so nested conditionals inside
+  // loops or other conditionals are included.
   const conditionalNodeToActiveBranch = new Map<string, string>();
-  conditionalBlocks.forEach((block) => {
-    const conditionalBlock = block as ConditionalBlock;
-    const conditionalNode = labelToNode.get(block.label);
-    if (!conditionalNode) {
+  nodes.forEach((node) => {
+    if (!isConditionalNode(node)) {
       return;
     }
-    const defaultBranch =
-      conditionalBlock.branch_conditions.find((branch) => branch.is_default) ??
-      null;
-    // Prefer the first branch for initial selection to align with UI expectations
-    const activeBranch =
-      conditionalBlock.branch_conditions[0]?.id ?? defaultBranch?.id ?? null;
+    const activeBranch = node.data.activeBranchId;
     if (activeBranch) {
-      conditionalNodeToActiveBranch.set(conditionalNode.id, activeBranch);
+      conditionalNodeToActiveBranch.set(node.id, activeBranch);
     }
   });
 
@@ -3301,6 +3336,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     webhookCallbackUrl: null,
     model: null,
     maxScreenshotScrolls: null,
+    maxElapsedTimeMinutes: null,
     extraHttpHeaders: null,
     cdpConnectHeaders: null,
     runWith: "code",
@@ -3328,6 +3364,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       webhookCallbackUrl: data.webhookCallbackUrl,
       model: data.model,
       maxScreenshotScrolls: data.maxScreenshotScrolls,
+      maxElapsedTimeMinutes: data.maxElapsedTimeMinutes,
       extraHttpHeaders:
         data.extraHttpHeaders && typeof data.extraHttpHeaders === "object"
           ? JSON.stringify(data.extraHttpHeaders)
@@ -4423,6 +4460,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
     model: workflow.model,
     totp_verification_url: workflow.totp_verification_url,
     max_screenshot_scrolls: workflow.max_screenshot_scrolls,
+    max_elapsed_time_minutes: workflow.max_elapsed_time_minutes,
     extra_http_headers: workflow.extra_http_headers,
     workflow_definition: {
       version: workflowDefinitionVersion,

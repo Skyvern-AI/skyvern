@@ -16,6 +16,7 @@ Covers four surfaces:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_PER_TOOL_BUDGET_NUDGES,
+    POST_ANTI_BOT_FAILED_TEST_NUDGE,
     POST_FAILED_TEST_NUDGE,
     POST_PER_TOOL_BUDGET_NUDGE,
     REPEATED_FRONTIER_STREAK_ESCALATE_AT,
@@ -35,8 +37,12 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 )
 from skyvern.forge.sdk.copilot.tools import (
     WatchdogExitReason,
+    _composition_anti_bot_reason,
+    _last_run_has_terminal_anti_bot_blocker,
+    _mark_page_inspected,
     _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
+    _record_composition_page_observation,
     _record_per_tool_budget_problem_blocks_from_results,
     _record_run_blocks_result,
     _record_workflow_update_result,
@@ -78,10 +84,101 @@ def _budget_trip_result(workflow_run_id: str = "wr_1") -> dict:
     }
 
 
+def _reply_result(user_response: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        final_output=json.dumps({"type": "REPLY", "user_response": user_response}),
+        new_items=[],
+    )
+
+
 def test_record_sets_top_category_on_per_tool_budget_result() -> None:
     ctx = _fresh_context()
-    _record_run_blocks_result(ctx, _budget_trip_result())
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
     assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    assert ctx.last_run_blocks_workflow_run_id == "wr_budget"
+    assert ctx.last_successful_run_blocks_workflow_run_id is None
+
+
+def test_record_per_tool_budget_with_current_url_requires_page_inspection() -> None:
+    ctx = _fresh_context()
+    result = _budget_trip_result("wr_budget")
+    result["data"]["current_url"] = "https://example.com/results"
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.post_budget_page_inspection_required is True
+    assert ctx.post_budget_page_inspection_url == "https://example.com/results"
+    assert ctx.post_budget_page_inspection_run_id == "wr_budget"
+
+
+def test_record_preserves_pre_run_anti_bot_evidence_on_budget_trip() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["human-verification", "human-verification"],
+        "challenge_controls": [{"selector": "#human-verification-widget"}],
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "indicators": ["verify you are human"],
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
+
+    assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+    assert ctx.last_test_anti_bot is not None
+    assert "human-verification" in ctx.last_test_anti_bot
+    assert "challenge-gated disabled submit/search control: Search" in ctx.last_test_anti_bot
+
+
+def test_composition_anti_bot_reason_reads_typed_challenge_state_without_legacy_indicators() -> None:
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "indicators": ["human-verification-response"],
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    reason = _composition_anti_bot_reason(ctx)
+
+    assert reason is not None
+    assert "human_verification" in reason
+    assert "challenge-gated disabled submit/search control: Search" in reason
+
+
+def test_block_running_after_budget_current_url_requires_inspection_first() -> None:
+    ctx = _fresh_context()
+    ctx.post_budget_page_inspection_required = True
+    ctx.post_budget_page_inspection_url = "https://example.com/results"
+    ctx.post_budget_page_inspection_run_id = "wr_budget"
+
+    msg = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["extract_results"]})
+
+    assert msg is not None
+    assert "inspect_page_for_composition" in msg
+    assert "current_page" in msg
+    assert "screenshot/evaluate reads" in msg
+    assert "do not satisfy the bounded page-evidence contract" in msg
+    assert "answer from that evidence" in msg
+
+
+def test_page_inspection_clears_post_budget_run_guard() -> None:
+    ctx = _fresh_context()
+    ctx.post_budget_page_inspection_required = True
+    ctx.post_budget_page_inspection_url = "https://example.com/results"
+    ctx.post_budget_page_inspection_run_id = "wr_budget"
+
+    _mark_page_inspected(ctx)
+
+    assert ctx.post_budget_page_inspection_required is False
+    assert ctx.post_budget_page_inspection_url is None
+    assert ctx.post_budget_page_inspection_run_id is None
 
 
 def test_record_uses_policy_failure_reason_not_llm_tool_instruction() -> None:
@@ -172,6 +269,63 @@ def test_check_enforcement_emits_budget_nudge_before_failed_test() -> None:
     assert ctx.per_tool_budget_nudge_count == 1
 
 
+def test_check_enforcement_emits_anti_bot_nudge_before_budget_when_challenge_observed() -> None:
+    ctx = _fresh_context()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_anti_bot = "Observed anti-bot challenge evidence before the run: human-verification"
+
+    nudge = _check_enforcement(ctx)
+
+    assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert ctx.failed_test_nudge_count == 1
+    assert ctx.per_tool_budget_nudge_count == 0
+
+
+def test_final_reply_after_post_run_observation_bypasses_stale_budget_and_anti_bot_nudges() -> None:
+    ctx = _fresh_context()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["human-verification"],
+        "challenge_controls": [{"selector": "#human-verification-widget"}],
+    }
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
+    assert ctx.last_test_anti_bot is not None
+
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/registry/search?sendid=494764",
+        observed_data={"text": "Credential Number: CRED-000123"},
+    )
+
+    evidence = ctx.workflow_verification_evidence
+    assert evidence.current_url_observed_after_workflow_run is True
+    assert evidence.current_url_may_encode_runtime_state is True
+
+    assert _check_enforcement(ctx, _reply_result("Observed result: CRED-000123 expires 01/31/2030.")) is None
+
+
+def test_progress_reply_after_post_run_observation_still_gets_anti_bot_nudge() -> None:
+    ctx = _fresh_context()
+    ctx.update_workflow_called = True
+    ctx.test_after_update_done = True
+    ctx.composition_page_evidence = {"anti_bot_indicators": ["human-verification"]}
+    _record_run_blocks_result(ctx, _budget_trip_result("wr_budget"))
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/registry/search",
+    )
+
+    nudge = _check_enforcement(ctx, _reply_result("I will now proceed to inspect the result page."))
+
+    assert nudge == POST_ANTI_BOT_FAILED_TEST_NUDGE
+
+
 def test_check_enforcement_emits_budget_nudge_before_repeated_frontier_warn() -> None:
     """The budget trip is structural (chain too long) and must not be silently
     consumed by the repeated-frontier escalation, even when both signals fire
@@ -246,6 +400,15 @@ def test_nudge_text_advises_splitting_chain() -> None:
         or "verified prefix" in POST_PER_TOOL_BUDGET_NUDGE.lower()
     )
     assert "Do NOT retry the same chain" in POST_PER_TOOL_BUDGET_NUDGE
+    assert "durable workflow blocks solely to rediscover page shape" in POST_PER_TOOL_BUDGET_NUDGE
+    assert "challenge_state.gates_submit_controls=true" in POST_PER_TOOL_BUDGET_NUDGE
+    assert "still-disabled submit/search control" in POST_PER_TOOL_BUDGET_NUDGE
+
+
+def test_anti_bot_nudge_stops_repeating_disabled_submit_challenge_flow() -> None:
+    assert "challenge_state.gates_submit_controls=true" in POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert "still disabled after challenge resolution was attempted" in POST_ANTI_BOT_FAILED_TEST_NUDGE
+    assert "Do NOT retry the same challenge solve" in POST_ANTI_BOT_FAILED_TEST_NUDGE
 
 
 @pytest.mark.parametrize(
@@ -419,7 +582,23 @@ def test_tool_loop_error_blocks_rerun_of_problem_navigation_label() -> None:
     assert msg is not None
     assert "apply_filters" in msg
     assert "Do NOT rerun" in msg
-    assert "code or validation" in msg
+    assert "live-page inspection evidence" in msg
+
+
+def test_tool_loop_error_blocks_update_and_run_rerun_of_problem_navigation_label() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {"workflow_yaml": "title: wf", "block_labels": ["apply_filters"], "parameters": {}},
+    )
+
+    assert msg is not None
+    assert "apply_filters" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_per_tool_budget_rerun"
 
 
 def test_tool_loop_error_treats_missing_labels_as_rerun_all() -> None:
@@ -441,6 +620,340 @@ def test_tool_loop_error_allows_new_smaller_label_after_budget_problem() -> None
             ctx,
             "run_blocks_and_collect_debug",
             {"block_labels": ["click_parking"], "parameters": {}},
+        )
+        is None
+    )
+
+
+def test_tool_loop_error_blocks_challenge_gated_disabled_submit_rerun() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = """
+title: Registry standard credential lookup
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+    ctx.last_failed_workflow_yaml = ctx.workflow_yaml
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = (
+        "The required Search button remains disabled after verification, and there is no enabled alternative."
+    )
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": ctx.workflow_yaml,
+            "block_labels": ["fill_sample_record_search"],
+        },
+    )
+
+    assert msg is not None
+    assert "anti-bot challenge" in msg
+    assert "disabled submit/search control" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_challenge_gated_submit_disabled"
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_tool_loop_error_allows_challenge_gated_retry_with_changed_proxy_location() -> None:
+    ctx = _fresh_context()
+    ctx.last_failed_workflow_yaml = """
+title: Registry standard credential lookup
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+    ctx.last_test_anti_bot = (
+        "Observed anti-bot challenge evidence before the run: challenge-gated disabled submit/search control: Search"
+    )
+    ctx.last_test_failure_reason = "The required Search button remains disabled after verification."
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    changed_proxy_yaml = """
+title: Registry standard credential lookup
+proxy_location: RESIDENTIAL
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+
+    assert (
+        _tool_loop_error(
+            ctx,
+            "update_and_run_blocks",
+            {
+                "workflow_yaml": changed_proxy_yaml,
+                "block_labels": ["fill_sample_record_search"],
+            },
+        )
+        is None
+    )
+    assert ctx.challenge_gated_proxy_retry_count == 1
+
+
+def test_tool_loop_error_blocks_post_budget_challenge_even_with_changed_proxy_location() -> None:
+    ctx = _fresh_context()
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_ok = False
+    ctx.per_tool_budget_problem_block_labels = ["submit_registry_search"]
+    ctx.last_failed_workflow_yaml = """
+title: Registry standard credential lookup
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+    - label: submit_registry_search
+      block_type: navigation
+      goal: Submit the credential search
+"""
+    ctx.composition_page_evidence = {
+        "current_url": "https://example.com/registry/search",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+        "anti_bot_indicators": ["human-verification"],
+        "forms": [
+            {
+                "submit_controls": [
+                    {
+                        "text": "Search",
+                        "selector": "#search",
+                        "disabled": True,
+                    }
+                ]
+            }
+        ],
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    changed_proxy_yaml = """
+title: Registry standard credential lookup
+proxy_location: US-CA
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+    - label: submit_registry_search
+      block_type: navigation
+      goal: Submit the credential search
+"""
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": changed_proxy_yaml,
+            "block_labels": ["open_registry_search", "submit_registry_search"],
+        },
+    )
+
+    assert msg is not None
+    assert "bounded current-page inspection" in msg
+    assert "disabled submit/search control" in msg
+    assert "another proxy" in msg
+    assert ctx.challenge_gated_proxy_retry_count == 0
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_tool_loop_error_blocks_second_challenge_gated_proxy_retry() -> None:
+    ctx = _fresh_context()
+    ctx.challenge_gated_proxy_retry_count = 1
+    ctx.last_failed_workflow_yaml = """
+title: Registry standard credential lookup
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+    ctx.last_test_anti_bot = "Extracted data reported anti-bot blocker: Verify you are human"
+    ctx.last_test_failure_reason = "Run completed, but extracted data reported a blocker: Verify you are human"
+    changed_proxy_yaml = """
+title: Registry standard credential lookup
+proxy_location: US-NY
+workflow_definition:
+  blocks:
+    - label: open_registry_search
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": changed_proxy_yaml,
+            "block_labels": ["search_sample_record"],
+        },
+    )
+
+    assert msg is not None
+    assert "anti-bot challenge" in msg
+    assert "blocker" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_challenge_gated_submit_disabled"
+    assert ctx.blocker_signal.renders_final_reply is True
+
+
+def test_terminal_anti_bot_blocker_requires_gated_submit_evidence_for_disabled_failure() -> None:
+    ctx = _fresh_context()
+    ctx.last_test_anti_bot = "Observed anti-bot challenge evidence before the run: human-verification"
+    ctx.last_test_failure_reason = "The page has a disabled button unrelated to the challenged search path."
+    ctx.composition_page_evidence = {
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "gates_submit_controls": False,
+        }
+    }
+
+    assert _last_run_has_terminal_anti_bot_blocker(ctx) is False
+
+
+def test_record_run_blocks_treats_structured_anti_bot_blocker_as_failed_test() -> None:
+    ctx = _fresh_context()
+    ctx.workflow_yaml = "workflow_definition: {blocks: []}"
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "completed",
+            "blocks": [
+                {
+                    "label": "extract_sample_credentials",
+                    "block_type": "EXTRACTION",
+                    "status": "completed",
+                    "extracted_data": {
+                        "extracted_information": {
+                            "results_exist": None,
+                            "credentials": [],
+                            "no_results_message": None,
+                            "blocker_message": "Verify you are human",
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_test_suspicious_success is True
+    assert ctx.last_test_anti_bot is not None
+    assert "Verify you are human" in ctx.last_test_failure_reason
+    assert ctx.last_failed_workflow_yaml == "workflow_definition: {blocks: []}"
+    assert result["data"]["failure_reason"] == (
+        "Run completed, but extracted data reported a blocker: Verify you are human"
+    )
+    assert result["data"]["failure_categories"][0]["category"] == "ANTI_BOT_DETECTION"
+
+
+def test_tool_loop_error_blocks_upstream_replay_after_post_budget_page_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    ctx.composition_page_evidence = {
+        "current_url": "https://example.com/results",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+    }
+    workflow_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_site
+      block_type: goto_url
+      url: https://example.com
+    - label: open_search
+      block_type: navigation
+      goal: Open search
+    - label: apply_filters
+      block_type: navigation
+      goal: Apply filters
+"""
+
+    msg = _tool_loop_error(
+        ctx,
+        "update_and_run_blocks",
+        {
+            "workflow_yaml": workflow_yaml,
+            "block_labels": ["open_search"],
+            "parameters": {},
+        },
+    )
+
+    assert msg is not None
+    assert "Do NOT restart upstream" in msg
+    assert "open_search" in msg
+    assert "apply_filters" in msg
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_post_budget_upstream_replay"
+
+
+def test_tool_loop_error_allows_downstream_recovery_after_post_budget_page_evidence() -> None:
+    ctx = _fresh_context()
+    ctx.per_tool_budget_problem_block_labels = ["apply_filters"]
+    ctx.composition_page_evidence = {
+        "current_url": "https://example.com/results",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+    }
+    workflow_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_site
+      block_type: goto_url
+      url: https://example.com
+    - label: open_search
+      block_type: navigation
+      goal: Open search
+    - label: apply_filters
+      block_type: navigation
+      goal: Apply filters
+    - label: expand_results
+      block_type: navigation
+      goal: Expand results
+"""
+
+    assert (
+        _tool_loop_error(
+            ctx,
+            "update_and_run_blocks",
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_labels": ["expand_results"],
+                "parameters": {},
+            },
         )
         is None
     )

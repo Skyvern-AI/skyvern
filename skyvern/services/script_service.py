@@ -92,7 +92,6 @@ from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileS
 from skyvern.utils.css_selector import build_action_summaries_with_timing
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, DecisiveAction
-from skyvern.webeye.scraper.non_vision_context import build_non_vision_page_context_if_needed
 from skyvern.webeye.scraper.scraped_page import ElementTreeFormat
 
 LOG = structlog.get_logger()
@@ -1098,7 +1097,6 @@ async def _detect_user_defined_errors(
             action_history=[],
             local_datetime=datetime.now(tz_info).isoformat(),
             reasoning=None,
-            non_vision_page_context=await build_non_vision_page_context_if_needed(scraped_page=scraped_page),
         )
 
         # Call LLM to detect errors

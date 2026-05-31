@@ -9,7 +9,7 @@ import type * as Skyvern from "../index.js";
  * first). If the condition is false on the first check, the body never runs and the block
  * returns success with an empty output list.
  *
- * Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (100). Reaching the cap is
+ * Safety: the loop is capped at ``DEFAULT_MAX_LOOP_ITERATIONS`` (500). Reaching the cap is
  * treated as a failure so that a misbehaving condition can never spin forever.
  */
 export interface WhileLoopBlock {

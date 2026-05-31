@@ -50,7 +50,7 @@ function Taskv2Node({ id, data }: NodeProps<Taskv2Node>) {
         />
         <div
           className={cn(
-            "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+            "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow",
             {
               "pointer-events-none": thisBlockIsPlaying,
               "bg-slate-950 outline outline-2 outline-slate-300":

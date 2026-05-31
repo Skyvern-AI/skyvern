@@ -22,6 +22,7 @@ export interface HumanInteractionBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
     task_type?: string;
     url?: string;
@@ -43,6 +44,7 @@ export interface HumanInteractionBlock {
     complete_verification?: boolean;
     include_action_history_in_verification?: boolean;
     download_timeout?: number;
+    include_extracted_text?: boolean;
     instructions?: string;
     positive_descriptor?: string;
     negative_descriptor?: string;

@@ -61,7 +61,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
-from skyvern.forge.sdk.experimentation.llm_vision_mode import resolve_llm_vision_mode_for_context
+from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -1085,7 +1085,7 @@ class WorkflowService:
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
 
-                await resolve_llm_vision_mode_for_context(
+                await resolve_enrich_tree_for_context(
                     new_context,
                     workflow_run.workflow_run_id,
                     organization.organization_id,
@@ -4117,6 +4117,8 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
@@ -4127,6 +4129,8 @@ class WorkflowService:
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
+        adaptive_caching: bool | object = _UNSET,
+        code_version: int | None | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -4141,6 +4145,8 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
                 model=model,
@@ -4151,6 +4157,8 @@ class WorkflowService:
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
+                adaptive_caching=adaptive_caching,
+                code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 created_by=created_by,
@@ -4166,6 +4174,8 @@ class WorkflowService:
             workflow_definition=None,
             proxy_location=proxy_location,
             webhook_callback_url=webhook_callback_url,
+            totp_verification_url=totp_verification_url,
+            totp_identifier=totp_identifier,
             persist_browser_session=persist_browser_session,
             browser_profile_id=browser_profile_id,
             model=model,
@@ -4176,6 +4186,8 @@ class WorkflowService:
             run_with=run_with,
             ai_fallback=ai_fallback,
             cache_key=cache_key,
+            adaptive_caching=adaptive_caching,
+            code_version=code_version,
             run_sequentially=run_sequentially,
             sequential_key=sequential_key,
             created_by=created_by,

@@ -13,5 +13,6 @@ export interface TaskRunListItem {
     finished_at?: string;
     created_at: string;
     workflow_permanent_id?: string;
+    workflow_deleted?: boolean;
     script_run?: boolean;
 }

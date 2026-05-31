@@ -33,6 +33,8 @@ def _ctx(
     request_policy: RequestPolicy | None = None,
     *,
     pending_reconciliation_run_id: str | None = None,
+    last_run_blocks_workflow_run_id: str | None = None,
+    last_successful_run_blocks_workflow_run_id: str | None = None,
     tool_activity: list[dict] | None = None,
 ) -> CopilotContext:
     ctx = CopilotContext(
@@ -47,6 +49,10 @@ def _ctx(
     )
     if pending_reconciliation_run_id is not None:
         ctx.pending_reconciliation_run_id = pending_reconciliation_run_id
+    if last_run_blocks_workflow_run_id is not None:
+        ctx.last_run_blocks_workflow_run_id = last_run_blocks_workflow_run_id
+    if last_successful_run_blocks_workflow_run_id is not None:
+        ctx.last_successful_run_blocks_workflow_run_id = last_successful_run_blocks_workflow_run_id
     if tool_activity is not None:
         ctx.tool_activity = tool_activity
     return ctx
@@ -75,6 +81,8 @@ def _assert_signal(
     [
         (TurnIntentMode.DOCS_ANSWER, "update_workflow", "turn_intent_no_mutation_update_blocked"),
         (TurnIntentMode.DIAGNOSE, "run_blocks_and_collect_debug", "turn_intent_no_mutation_run_blocked"),
+        (TurnIntentMode.DOCS_ANSWER, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
+        (TurnIntentMode.CLARIFY, "inspect_page_for_composition", "turn_intent_page_inspection_blocked"),
         (TurnIntentMode.CLARIFY, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
         (TurnIntentMode.REFUSE, "update_and_run_blocks", "turn_intent_no_mutation_run_blocked"),
     ],
@@ -104,6 +112,15 @@ def test_turn_intent_gate_allows_draft_update_without_run_authority() -> None:
     )
 
     assert _turn_intent_tool_error(_ctx(intent), "update_workflow") is None
+
+
+def test_turn_intent_gate_allows_build_page_inspection_with_update_authority() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=False),
+    )
+
+    assert _turn_intent_tool_error(_ctx(intent), "inspect_page_for_composition") is None
 
 
 def test_turn_intent_gate_blocks_draft_only_run_tools() -> None:
@@ -405,6 +422,28 @@ def test_within_turn_override_pending_reconciliation_allows_read() -> None:
     assert _turn_intent_tool_error(ctx, "get_run_results") is None
 
 
+def test_within_turn_override_successful_run_blocks_allows_read() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+
+    ctx = _ctx(intent, last_successful_run_blocks_workflow_run_id="wr_completed_this_turn")
+
+    assert _turn_intent_tool_error(ctx, "get_run_results") is None
+
+
+def test_within_turn_override_failed_run_blocks_allows_read() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.BUILD,
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+
+    ctx = _ctx(intent, last_run_blocks_workflow_run_id="wr_failed_this_turn")
+
+    assert _turn_intent_tool_error(ctx, "get_run_results") is None
+
+
 def test_within_turn_override_excluded_for_docs_answer() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.DOCS_ANSWER,
@@ -437,6 +476,46 @@ def test_tool_activity_is_not_a_substitute_for_pending_reconciliation_run_id() -
     )
 
     assert _turn_intent_tool_error(ctx, "get_run_results") is not None
+
+
+@pytest.mark.asyncio
+async def test_get_run_results_defaults_to_successful_same_turn_run() -> None:
+    ctx = _ctx(
+        TurnIntent(mode=TurnIntentMode.BUILD, authority=TurnIntentAuthority()),
+        last_successful_run_blocks_workflow_run_id="wr_completed_this_turn",
+    )
+    run = SimpleNamespace(workflow_run_id="wr_completed_this_turn", workflow_permanent_id="wfp-1", status="completed")
+
+    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+        mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+
+        result = await _get_run_results({}, ctx)
+
+    assert result["ok"] is True
+    assert result["data"]["workflow_run_id"] == "wr_completed_this_turn"
+    mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success() -> None:
+    ctx = _ctx(
+        TurnIntent(mode=TurnIntentMode.BUILD, authority=TurnIntentAuthority()),
+        last_run_blocks_workflow_run_id="wr_failed_this_turn",
+    )
+    run = SimpleNamespace(workflow_run_id="wr_failed_this_turn", workflow_permanent_id="wfp-1", status="canceled")
+
+    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+        mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
+        mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
+        mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
+
+        result = await _get_run_results({}, ctx)
+
+    assert result["ok"] is True
+    assert result["data"]["workflow_run_id"] == "wr_failed_this_turn"
+    mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id.assert_not_called()
 
 
 def test_recovery_diagnose_keeps_get_run_results_in_native_tools() -> None:

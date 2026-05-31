@@ -583,3 +583,159 @@ class TestTryGenerateTotpFromCredential:
 
         with skyvern_context.scoped(_scoped_context(active="credentials")):
             assert try_generate_totp_from_credential("wr_test") is None
+
+
+class TestPostTotpVerificationUrlSeam:
+    """`_post_totp_verification_url` must route through app.AGENT_FUNCTION so the
+    cloud override can egress via the NAT proxy (static IP), like webhook/file-upload."""
+
+    @pytest.mark.asyncio
+    async def test_routes_through_agent_function_and_adapts_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={"X-Sig": "abc"},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert body == {"verification_code": "123456"}
+        seam.assert_awaited_once()
+        kwargs = seam.await_args.kwargs
+        assert kwargs["url"] == "https://example.com/totp"
+        assert kwargs["payload"] == "{}"
+        assert kwargs["headers"] == {"X-Sig": "abc"}
+        assert kwargs["organization_id"] == "o_test"
+
+    @pytest.mark.asyncio
+    async def test_non_json_response_marks_is_json_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body="not a json body",
+                headers={"content-type": "text/plain"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is False
+        assert body == "not a json body"
+
+    @pytest.mark.asyncio
+    async def test_json_body_with_non_json_content_type_marks_is_json_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit non-JSON Content-Type must trump the JSON-shaped body so a
+        misconfigured customer endpoint still trips the non-JSON contract error
+        downstream instead of being silently accepted."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={"content-type": "text/plain"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is False
+        assert body == '{"verification_code": "123456"}'
+
+    @pytest.mark.asyncio
+    async def test_missing_content_type_falls_through_to_optimistic_json_parse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NATEgressProxyClient.deliver_webhook doesn't preserve upstream response
+        headers, so the proxy path produces TOTPVerificationResponse(headers={}).
+        The helper must still parse a JSON-shaped body as JSON in that case."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert body == {"verification_code": "123456"}
+
+    @pytest.mark.asyncio
+    async def test_retries_then_raises_on_persistent_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        with pytest.raises(otp_service._TOTPWebhookRequestError):
+            await otp_service._post_totp_verification_url(
+                url="https://example.com/totp",
+                signed_payload="{}",
+                headers={},
+                organization_id="o_test",
+                max_attempts=2,
+                retry_timeout=0,
+            )
+
+        assert seam.await_count == 2

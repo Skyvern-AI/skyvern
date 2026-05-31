@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from skyvern.forge.sdk.db.datetime_utils import to_naive_utc
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
 from tests.unit.conftest import MockAsyncSessionCtx, make_mock_session
 
@@ -33,7 +34,7 @@ async def test_update_persistent_browser_session_accepts_started_at() -> None:
             started_at=now,
         )
 
-    assert mock_pbs.started_at == now
+    assert mock_pbs.started_at == to_naive_utc(now)
 
 
 @pytest.mark.asyncio

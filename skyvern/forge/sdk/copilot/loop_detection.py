@@ -20,13 +20,32 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
 from skyvern.forge.failure_classifier import classify_from_failure_reason
-from skyvern.forge.sdk.copilot.blocker_signal import maybe_clear_blocker_signal_on_tool_success
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    clear_blocker_signal_for_reason_codes,
+    maybe_clear_blocker_signal_on_tool_success,
+)
 
 MAX_CONSECUTIVE_SAME_TOOL = 3
 MAX_REPEATED_FAILED_STEP = 3
 LOOP_DETECTED_MARKER = "LOOP DETECTED:"
 ARGUMENT_INSENSITIVE_FAILURE_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 ARGUMENT_INSENSITIVE_FAILURE_CATEGORIES = frozenset({"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"})
+RECONCILIATION_PROGRESS_TOOL_NAMES = frozenset(
+    {
+        "click",
+        "evaluate",
+        "get_browser_screenshot",
+        "inspect_page_for_composition",
+        "press_key",
+        "run_blocks_and_collect_debug",
+        "scroll",
+        "select_option",
+        "type_text",
+        "update_and_run_blocks",
+        "update_workflow",
+    }
+)
+RECONCILIATION_REQUIRES_INPUT_REASON_CODES = frozenset({"tool_error_pending_reconciliation_requires_input"})
 
 
 def detect_tool_loop(
@@ -231,6 +250,13 @@ def record_tool_step_result_for_ctx(
     # Strict ``is True`` check: a malformed result dict missing ``ok`` entirely
     # must not be treated as success and accidentally clear a blocker signal.
     if result.get("ok") is True:
+        if (
+            getattr(ctx, "pending_reconciliation_requires_user_input", False)
+            and tool_name in RECONCILIATION_PROGRESS_TOOL_NAMES
+        ):
+            ctx.pending_reconciliation_requires_user_input = False
+            ctx.pending_reconciliation_run_id = None
+            clear_blocker_signal_for_reason_codes(ctx, RECONCILIATION_REQUIRES_INPUT_REASON_CODES)
         maybe_clear_blocker_signal_on_tool_success(ctx, tool_name)
 
 

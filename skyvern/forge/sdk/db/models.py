@@ -350,6 +350,7 @@ class WorkflowTagEventModel(Base):
             "key",
             unique=True,
             postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set'"),
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
@@ -398,6 +399,7 @@ class TagKeyModel(Base):
             "key",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
         ),
     )
 
@@ -1435,6 +1437,7 @@ class WorkflowCopilotChatMessageModel(Base):
     content = Column(UnicodeText, nullable=False)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
+    narrative_payload = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

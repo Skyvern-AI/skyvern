@@ -12,6 +12,8 @@ export type WorkflowDefinitionYamlBlocksItem =
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileUpload
     | Skyvern.WorkflowDefinitionYamlBlocksItem.FileUrlParser
     | Skyvern.WorkflowDefinitionYamlBlocksItem.ForLoop
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.GoogleSheetsRead
+    | Skyvern.WorkflowDefinitionYamlBlocksItem.GoogleSheetsWrite
     | Skyvern.WorkflowDefinitionYamlBlocksItem.GotoUrl
     | Skyvern.WorkflowDefinitionYamlBlocksItem.HttpRequest
     | Skyvern.WorkflowDefinitionYamlBlocksItem.HumanInteraction
@@ -64,6 +66,14 @@ export namespace WorkflowDefinitionYamlBlocksItem {
 
     export interface ForLoop extends Skyvern.ForLoopBlockYaml {
         block_type: "for_loop";
+    }
+
+    export interface GoogleSheetsRead extends Skyvern.GoogleSheetsReadBlockYaml {
+        block_type: "google_sheets_read";
+    }
+
+    export interface GoogleSheetsWrite extends Skyvern.GoogleSheetsWriteBlockYaml {
+        block_type: "google_sheets_write";
     }
 
     export interface GotoUrl extends Skyvern.UrlBlockYaml {

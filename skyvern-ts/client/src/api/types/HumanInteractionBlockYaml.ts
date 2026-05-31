@@ -7,6 +7,7 @@ export interface HumanInteractionBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
     instructions?: string;
     positive_descriptor?: string;

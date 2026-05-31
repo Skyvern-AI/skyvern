@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 import yaml
@@ -13,13 +13,16 @@ except ImportError:  # pragma: no cover - bs4 is a transitive dep but inspection
     BeautifulSoup = None  # type: ignore[assignment, misc]
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 _BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
 _PAGE_SHAPING_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "login"})
 _PAGE_READING_BLOCK_TYPES: frozenset[str] = frozenset({"extraction"})
+_GOTO_URL_BLOCK_TYPE = "goto_url"
 _SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
-_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition"})
+_STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
+_POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition", "evaluate"})
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
@@ -43,6 +46,14 @@ _ANTI_BOT_PATTERNS = (
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
 _ANTI_BOT_SCAN_BYTES = 250_000
+
+
+class _PostRunCompositionContext(Protocol):
+    composition_page_evidence: dict[str, Any] | None
+    per_tool_budget_problem_block_labels: list[str]
+    workflow_verification_evidence: WorkflowVerificationEvidence
+    post_run_page_observation_after_failed_test: bool
+    last_failure_category_top: str | None
 
 
 def _bounded_string(value: Any, max_chars: int) -> str:
@@ -308,6 +319,27 @@ def _new_page_reading_blocks(workflow_yaml: str | None, previous_workflow_yaml: 
     return blocks
 
 
+def _changed_goto_url_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
+    previous_urls = {
+        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower()): str(block.get("url") or "")
+        for block in _parse_workflow_blocks(previous_workflow_yaml)
+    }
+    blocks: list[dict[str, str]] = []
+    for block in _parse_workflow_blocks(workflow_yaml):
+        block_type = str(block.get("block_type") or "").strip().lower()
+        if block_type != _GOTO_URL_BLOCK_TYPE:
+            continue
+        label = str(block.get("label") or "<missing label>")
+        url = str(block.get("url") or "").strip()
+        if not url:
+            continue
+        prior_url = previous_urls.get((label, block_type))
+        if prior_url == url:
+            continue
+        blocks.append({"label": label, "url": url})
+    return blocks
+
+
 def _format_page_block_findings(blocks: list[dict[str, str]]) -> str:
     return ", ".join(f"{block['label']} ({block['block_type']})" for block in blocks[:5])
 
@@ -342,6 +374,70 @@ def _same_origin(left: str | None, right: str | None) -> bool:
     return left_parsed.netloc.lower() == right_parsed.netloc.lower()
 
 
+def _same_url_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    return left_parsed._replace(fragment="").geturl() == right_parsed._replace(fragment="").geturl()
+
+
+def _post_run_recovery_state(ctx: _PostRunCompositionContext) -> bool:
+    if any(ctx.per_tool_budget_problem_block_labels):
+        return True
+    if any(ctx.workflow_verification_evidence.per_tool_budget_on_block):
+        return True
+    if ctx.post_run_page_observation_after_failed_test is True:
+        return True
+    return ctx.last_failure_category_top == "PER_TOOL_BUDGET"
+
+
+def _post_run_observed_url_goto_error(
+    ctx: _PostRunCompositionContext,
+    workflow_yaml: str | None,
+    previous_workflow_yaml: str | None,
+) -> str | None:
+    if not previous_workflow_yaml or not _post_run_recovery_state(ctx):
+        return None
+
+    evidence = ctx.composition_page_evidence
+    if not isinstance(evidence, dict) or evidence.get("observed_after_workflow_run") is not True:
+        return None
+    observed_url = evidence.get("current_url")
+    if not isinstance(observed_url, str) or not observed_url.strip():
+        return None
+
+    offending = [
+        block
+        for block in _changed_goto_url_blocks(workflow_yaml, previous_workflow_yaml)
+        if _same_url_ignoring_fragment(block.get("url"), observed_url)
+    ]
+    if not offending:
+        return None
+
+    labels = ", ".join(block["label"] for block in offending[:5])
+    return (
+        "Workflow validation failed: the draft is trying to persist a post-run browser URL as a new goto_url "
+        "block after an incomplete or budgeted run. That URL may encode record-specific, result-page, or "
+        "session state. Keep the reusable entrypoint and verified upstream blocks, then either extract from "
+        "the observed current page, split or replace the budgeted frontier into smaller reusable UI actions, "
+        "or report partial verification. "
+        f"Offending goto_url block(s): {labels}."
+    )
+
+
+def _has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
+    for key in ("forms", "navigation_targets", "result_containers", "challenge_controls"):
+        value = evidence.get(key)
+        if isinstance(value, list) and value:
+            return True
+    challenge_state = evidence.get("challenge_state")
+    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+
+
 def _evidence_matches_target(
     evidence: dict[str, Any] | None,
     target_url: str | None,
@@ -358,9 +454,17 @@ def _evidence_matches_target(
     if source_tool == _SCHEMA_EVIDENCE_TOOL:
         if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
             return True
+    if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and _has_bounded_page_schema(evidence):
+        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+            return True
+        if allow_post_run_browser_observation and (
+            _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
+        ):
+            return True
     if (
         allow_post_run_browser_observation
         and source_tool in _POST_RUN_CONTINUATION_EVIDENCE_TOOLS
+        and (source_tool == _SCHEMA_EVIDENCE_TOOL or _has_bounded_page_schema(evidence))
         and evidence.get("observed_after_workflow_run") is True
     ):
         return _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
@@ -379,6 +483,10 @@ def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str 
     if not _mode_requires_evidence(ctx):
         return None
     previous_workflow_yaml = getattr(ctx, "workflow_yaml", None)
+    post_run_url_error = _post_run_observed_url_goto_error(ctx, workflow_yaml, previous_workflow_yaml)
+    if post_run_url_error:
+        return post_run_url_error
+
     page_shaping_blocks = _new_page_shaping_blocks(workflow_yaml, previous_workflow_yaml)
     page_reading_blocks = _new_page_reading_blocks(workflow_yaml, previous_workflow_yaml)
     if not page_shaping_blocks and not page_reading_blocks:

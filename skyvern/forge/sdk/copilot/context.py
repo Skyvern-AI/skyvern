@@ -8,14 +8,62 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
+from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
 COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
 ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+
+class NarrativeDraft(TypedDict):
+    blockCount: int
+    blockLabels: list[str]
+    summary: str | None
+
+
+# Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
+# present only for tool_call/tool_result and success only for tool_result.
+class NarrativeActivityEntry(TypedDict):
+    kind: str
+    text: str
+    iteration: int
+    toolName: NotRequired[str]
+    success: NotRequired[bool]
+    id: str
+
+
+class NarrativeBlock(TypedDict):
+    label: str
+    blockType: str
+    state: str
+    lastSeenIteration: int
+    activity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
+
+# Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class TurnNarrativePayload(TypedDict):
+    turnId: str | None
+    turnIndex: int
+    mode: str
+    designStarted: bool
+    designEnded: bool
+    draft: NarrativeDraft | None
+    blocks: list[NarrativeBlock]
+    terminal: str
+    terminalMessage: str | None
+    narrativeSummary: str | None
+    priorBlockCount: int | None
+    designActivity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
@@ -54,6 +102,7 @@ class StructuredContext(BaseModel):
     # AgentResult.global_llm_context — finalized deterministically at every
     # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
     discovery_calls_made: int = 0
+    page_inspection_calls_made: int = 0
 
     def to_json_str(self) -> str:
         return self.model_dump_json(indent=2)
@@ -138,10 +187,13 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     """
     prior = int(getattr(ctx, "prior_discovery_calls_made", 0) or 0)
     this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
-    if not raw_context and this_turn == 0:
+    prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
+    inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    if not raw_context and this_turn == 0 and inspections_this_turn == 0:
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
+    sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
     return sc.to_json_str()
 
 
@@ -172,6 +224,14 @@ class AgentResult:
     turn_outcome: TurnOutcome | None = None
     turn_id: str | None = None
     narrative_summary: str | None = None
+    # Persisted on the assistant chat message so the bubble survives a reload.
+    narrative_payload: TurnNarrativePayload | None = None
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
 
 
 @dataclass
@@ -227,6 +287,7 @@ class CopilotContext(AgentContext):
     # Workflow state
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
+    # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None
     last_test_ok: bool | None = None
@@ -244,6 +305,13 @@ class CopilotContext(AgentContext):
     # retry" requests.
     pending_reconciliation_run_id: str | None = None
     pending_reconciliation_requires_user_input: bool = False
+    # Block-running tools make their own run context available for same-turn
+    # reporting. This is deliberately not persisted across turns. The
+    # successful variant is kept for "default to the last clean result"; the
+    # generic variant allows the agent to re-read the same failed/canceled run
+    # after a watchdog reconciliation read has cleared the retry guard.
+    last_run_blocks_workflow_run_id: str | None = None
+    last_successful_run_blocks_workflow_run_id: str | None = None
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck
@@ -265,6 +333,12 @@ class CopilotContext(AgentContext):
     # label away from navigation. Prevents rerunning the same oversized
     # navigation block unchanged.
     per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
+    # Armed when a PER_TOOL_BUDGET run leaves the browser on a meaningful page.
+    # The next block-running call must be preceded by page inspection so the
+    # agent recovers from observed state instead of replaying the same search.
+    post_budget_page_inspection_required: bool = False
+    post_budget_page_inspection_url: str | None = None
+    post_budget_page_inspection_run_id: str | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -273,8 +347,12 @@ class CopilotContext(AgentContext):
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
+    last_full_workflow_test_ok: bool = False
+    last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     last_frontier_start_label: str | None = None
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
@@ -326,6 +404,8 @@ class CopilotContext(AgentContext):
     # Hydrated from inbound StructuredContext.discovery_calls_made at turn start.
     prior_discovery_calls_made: int = 0
     discovery_calls_this_turn: int = 0
+    prior_page_inspection_calls_made: int = 0
+    page_inspection_calls_this_turn: int = 0
     discovery_step_count: int = 0
     discovery_started_monotonic: float | None = None
     discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
@@ -343,3 +423,16 @@ class CopilotContext(AgentContext):
     design_start_emitted: bool = False
     design_end_emitted: bool = False
     narrative_summary: str | None = None
+
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
+    prior_block_count: int | None = None
+    block_state_map: dict[str, str] = field(default_factory=dict)
+    block_started_at_map: dict[str, str] = field(default_factory=dict)
+    block_ended_at_map: dict[str, str] = field(default_factory=dict)
+    turn_started_at: str | None = None
+    turn_ended_at: str | None = None

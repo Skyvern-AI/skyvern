@@ -36,6 +36,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import NarrativeActivityEntry
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -54,6 +55,52 @@ MAX_TOOL_ACTIVITY_BUFFER = 8
 # Tight deadline on the narrator LLM call. On timeout we drop the emission
 # rather than delaying narration further.
 NARRATOR_TIMEOUT_SECONDS = 8.0
+
+# Caps on the persisted per-block and design activity logs. Mirror the FE
+# MAX_ACTIVITY_ENTRIES / MAX_DESIGN_ACTIVITY_ENTRIES in narrativeState.ts so
+# the rehydrated bubble matches what the live stream rendered.
+MAX_BLOCK_ACTIVITY_ENTRIES = 30
+MAX_DESIGN_ACTIVITY_ENTRIES = 50
+
+# Tools whose calls/results are never surfaced in the user-facing activity log.
+# Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
+ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
+
+
+def build_tool_call_activity(tool_name: str, iteration: int, tool_call_id: str) -> NarrativeActivityEntry | None:
+    if tool_name in ACTIVITY_TOOL_DENYLIST:
+        return None
+    return {
+        "kind": "tool_call",
+        "text": f"Calling {tool_name}…",
+        "iteration": iteration,
+        "toolName": tool_name,
+        "id": f"tc-{tool_call_id}",
+    }
+
+
+def build_tool_result_activity(
+    tool_name: str, summary: str, success: bool, iteration: int, tool_call_id: str
+) -> NarrativeActivityEntry | None:
+    if tool_name in ACTIVITY_TOOL_DENYLIST:
+        return None
+    return {
+        "kind": "tool_result",
+        "text": summary or tool_name,
+        "iteration": iteration,
+        "toolName": tool_name,
+        "success": success,
+        "id": f"tr-{tool_call_id}",
+    }
+
+
+def build_narration_activity(narration: str, iteration: int, timestamp: datetime) -> NarrativeActivityEntry:
+    return {
+        "kind": "narration",
+        "text": narration,
+        "iteration": iteration,
+        "id": f"n-{iteration}-{timestamp.isoformat()}",
+    }
 
 
 class TransitionKind(StrEnum):
@@ -105,6 +152,26 @@ class NarratorState:
     # Narrator handler resolved once per stream so per-emission calls
     # don't re-hit PostHog.
     resolved_handler: Any = None
+    # Persisted activity log routed to the running block (else design). The FE
+    # routes each entry to the block whose state is "running"; we cache the
+    # single running label here since copilot block runs are sequential.
+    block_activity: dict[str, list[NarrativeActivityEntry]] = field(default_factory=dict)
+    design_activity: list[NarrativeActivityEntry] = field(default_factory=list)
+    running_block_label: str | None = None
+
+    def record_activity(self, entry: NarrativeActivityEntry | None) -> None:
+        if entry is None:
+            return
+        label = self.running_block_label
+        if label is None:
+            self.design_activity.append(entry)
+            if len(self.design_activity) > MAX_DESIGN_ACTIVITY_ENTRIES:
+                del self.design_activity[:-MAX_DESIGN_ACTIVITY_ENTRIES]
+            return
+        bucket = self.block_activity.setdefault(label, [])
+        bucket.append(entry)
+        if len(bucket) > MAX_BLOCK_ACTIVITY_ENTRIES:
+            del bucket[:-MAX_BLOCK_ACTIVITY_ENTRIES]
 
     def record_tool(
         self,
@@ -261,18 +328,20 @@ async def _narration_task_body(
         if not narration:
             return
 
+        narration_ts = datetime.now(timezone.utc)
         try:
             await stream.send(
                 WorkflowCopilotNarrationUpdate(
                     type=WorkflowCopilotStreamMessageType.NARRATION,
                     narration=narration,
                     iteration=iteration,
-                    timestamp=datetime.now(timezone.utc),
+                    timestamp=narration_ts,
                 )
             )
         except Exception as exc:
             LOG.warning("copilot narrator send failed", error=str(exc), transition=transition_value)
             return
+        state.record_activity(build_narration_activity(narration, iteration, narration_ts))
         # Only advance last_emitted_at after a real delivery. A failed /
         # empty / leak-dropped emission leaves the clock where it was so the
         # next valid transition can emit immediately instead of waiting 10s
@@ -639,6 +708,17 @@ _BLOCK_STATUS_TO_TRANSITION: dict[str, TransitionKind] = {
     "canceled": TransitionKind.BLOCK_FAILED,
 }
 
+_TERMINAL_BLOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        "completed",
+        "failed",
+        "terminated",
+        "timed_out",
+        "canceled",
+        "skipped",
+    }
+)
+
 _BLOCK_TRANSITION_TO_SYNTHETIC_TOOL: dict[TransitionKind, str] = {
     TransitionKind.BLOCK_STARTED: "block_started",
     TransitionKind.BLOCK_COMPLETED: "block_completed",
@@ -707,7 +787,6 @@ class NarratorPollTickResult(NamedTuple):
     """Updated bookkeeping the polling loop must thread into its next call."""
 
     prior_block_ts: datetime | None
-    prior_step_ts: datetime | None
     last_block_fetch_monotonic: float
 
 
@@ -715,26 +794,25 @@ async def narrator_poll_tick(
     state: NarratorState,
     *,
     current_block_ts: datetime | None,
-    current_step_ts: datetime | None,
     prior_block_ts: datetime | None,
-    prior_step_ts: datetime | None,
     last_block_fetch_monotonic: float,
     seen_block_states: dict[str, str],
     fetch_block_statuses: FetchBlockStatusesCallable,
     stream: EventSourceStream,
+    block_state_map: dict[str, str] | None = None,
+    block_started_at_map: dict[str, str] | None = None,
+    block_ended_at_map: dict[str, str] | None = None,
 ) -> NarratorPollTickResult:
-    """Per-tick narrator bookkeeping; returns updated (prior_block_ts, prior_step_ts, last_block_fetch_monotonic).
+    """Per-tick narrator bookkeeping; returns updated (prior_block_ts, last_block_fetch_monotonic).
 
     `prior_block_ts` advances only on a successful fetch so rate-limited and failed ticks retry on the next call.
     """
     now = time.monotonic()
     block_changed = current_block_ts != prior_block_ts
-    step_changed = current_step_ts != prior_step_ts
     gate_open = (now - last_block_fetch_monotonic) >= MIN_NARRATION_GAP_SECONDS
 
     next_prior_block_ts = prior_block_ts
     next_last_fetch = last_block_fetch_monotonic
-    block_transition_recorded = False
 
     if block_changed and gate_open:
         next_last_fetch = now
@@ -770,13 +848,32 @@ async def narrator_poll_tick(
             # Repository returns DESC by created_at; reverse for chronological order.
             snapshot.reverse()
             new_events = record_block_transitions(state, snapshot, seen_block_states, state.current_iteration)
-            block_transition_recorded = bool(new_events)
             next_prior_block_ts = current_block_ts
             for event in new_events:
                 if not event.block_label:
                     # Without a label the FE has nothing readable to render; skip
                     # rather than ship empty bullets.
                     continue
+                event_ts = datetime.now(timezone.utc)
+                event_ts_iso = event_ts.isoformat()
+                if block_state_map is not None:
+                    block_state_map[event.block_label] = event.status
+                if event.status == "running":
+                    state.running_block_label = event.block_label
+                elif event.status in _TERMINAL_BLOCK_STATUSES and state.running_block_label == event.block_label:
+                    state.running_block_label = None
+                if (
+                    block_started_at_map is not None
+                    and event.status == "running"
+                    and event.block_label not in block_started_at_map
+                ):
+                    block_started_at_map[event.block_label] = event_ts_iso
+                # Clear endedAt on retry-back-to-running; overwrite on terminal
+                # events to keep latest-terminal semantics.
+                if block_ended_at_map is not None and event.status == "running":
+                    block_ended_at_map.pop(event.block_label, None)
+                if block_ended_at_map is not None and event.status in _TERMINAL_BLOCK_STATUSES:
+                    block_ended_at_map[event.block_label] = event_ts_iso
                 try:
                     await stream.send(
                         WorkflowCopilotBlockProgressUpdate(
@@ -786,19 +883,15 @@ async def narrator_poll_tick(
                             block_type=event.block_type,
                             status=event.status,
                             iteration=state.current_iteration,
-                            timestamp=datetime.now(timezone.utc),
+                            timestamp=event_ts,
                         )
                     )
                 except Exception:
                     LOG.debug("copilot block_progress send failed", exc_info=True)
 
-    if not block_transition_recorded and step_changed:
-        state.record_transition(TransitionKind.TOOL_IN_PROGRESS)
-
     schedule_narration(state, stream, state.current_iteration)
 
     return NarratorPollTickResult(
         prior_block_ts=next_prior_block_ts,
-        prior_step_ts=current_step_ts,
         last_block_fetch_monotonic=next_last_fetch,
     )

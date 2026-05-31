@@ -31,6 +31,7 @@ class TestAntiBotDetection:
             "Access denied by WAF",
             "Anti-bot system triggered",
             "Human verification required",
+            "Cloudflare Turnstile still says verify you are human",
             "The current page shows an 'Access Denied' error",
             "Access Denied - website blocked the request",
         ],

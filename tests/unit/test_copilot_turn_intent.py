@@ -633,6 +633,214 @@ def test_answer_only_turn_intent_hides_get_run_results_tool() -> None:
     assert filtered == []
 
 
+def test_build_turn_intent_marks_declarative_step_request_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="I need a step where the page scrolls to the right.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_marks_create_step_request_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="create a step in my workflow where the page scrolls to the right",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_marks_declarative_plural_step_request_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="I need steps that log in and download the report.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_marks_another_step_request_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="I need another step after the login block.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_marks_declarative_step_request_as_build_without_workflow() -> None:
+    intent = build_turn_intent(
+        user_message="I want a step that clicks the login button.",
+        workflow_yaml="",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.BUILD
+
+
+def test_build_turn_intent_marks_leading_add_step_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="add a step that downloads the invoice PDF",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_does_not_classify_leading_remove_named_block_as_edit() -> None:
+    intent = build_turn_intent(
+        user_message="remove the login block",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.UNKNOWN
+
+
+def test_build_turn_intent_leading_add_with_failure_clause_is_edit() -> None:
+    intent = build_turn_intent(
+        user_message="Add a step that fails if the invoice total is missing.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.EDIT
+
+
+def test_build_turn_intent_leading_nouny_docs_question_stays_docs_answer() -> None:
+    intent = build_turn_intent(
+        user_message="delete is a step type, what does it do?",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+
+
+def test_build_turn_intent_leading_delete_step_docs_question_stays_docs_answer() -> None:
+    intent = build_turn_intent(
+        user_message="delete step - what does it do?",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+
+
+def test_build_turn_intent_docs_question_with_nouny_edit_word_stays_docs_answer() -> None:
+    intent = build_turn_intent(
+        user_message="What does the delete step do?",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+
+
+def test_build_turn_intent_failure_report_with_nouny_step_name_is_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="The delete step failed.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_leading_nouny_failure_report_is_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="delete step failed.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_leading_nouny_block_failure_report_is_diagnose() -> None:
+    intent = build_turn_intent(
+        user_message="Remove block failed after login.",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+
+
+def test_build_turn_intent_does_not_mutate_on_existing_block_reference() -> None:
+    intent = build_turn_intent(
+        user_message="thanks, that step looks great",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode not in (TurnIntentMode.EDIT, TurnIntentMode.BUILD)
+
+
+def test_build_turn_intent_docs_question_with_structure_noun_stays_docs_answer() -> None:
+    intent = build_turn_intent(
+        user_message="Can you tell me what a block is supposed to do?",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode == TurnIntentMode.DOCS_ANSWER
+    assert intent.authority.may_update_workflow is False
+
+
+def test_build_turn_intent_structure_reference_question_does_not_mutate() -> None:
+    intent = build_turn_intent(
+        user_message="Where should a step go in the workflow?",
+        workflow_yaml="blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+    )
+
+    assert intent.mode not in (TurnIntentMode.EDIT, TurnIntentMode.BUILD)
+
+
 def _structured_context_with_run_decision() -> str:
     return StructuredContext(
         decisions_made=[

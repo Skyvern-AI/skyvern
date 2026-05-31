@@ -36,22 +36,22 @@ class DialogEntry(TypedDict):
     count: int
 
 
-class LLMVisionMode(StrEnum):
+class EnrichTreeMode(StrEnum):
     CONTROL = "control"
-    NO_IMAGES_WITH_A11Y = "no_images_with_a11y"
-    FALLBACK_WITH_A11Y = "fallback_with_a11y"
-    FALLBACK_WITHOUT_A11Y = "fallback_without_a11y"
+    ENRICHED_TREE = "enriched_tree"
+    ENRICHED_TREE_NO_IMAGES = "enriched_tree_no_images"
+    ENRICHED_TREE_NO_IMAGES_FALLBACK = "enriched_tree_no_images_fallback"
 
 
-def parse_llm_vision_mode(value: Any) -> LLMVisionMode:
-    if isinstance(value, LLMVisionMode):
+def parse_enrich_tree_mode(value: Any) -> EnrichTreeMode:
+    if isinstance(value, EnrichTreeMode):
         return value
     if isinstance(value, str):
         try:
-            return LLMVisionMode(value)
+            return EnrichTreeMode(value)
         except ValueError:
-            LOG.warning("Unknown LLM vision mode value, defaulting to control", llm_vision_mode=value)
-    return LLMVisionMode.CONTROL
+            LOG.warning("Unknown enrich_tree mode value, defaulting to control", enrich_tree_mode=value)
+    return EnrichTreeMode.CONTROL
 
 
 @dataclass
@@ -115,8 +115,7 @@ class SkyvernContext:
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
-    disable_llm_screenshots: bool = False
-    llm_vision_mode: LLMVisionMode = LLMVisionMode.CONTROL
+    enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
@@ -198,25 +197,15 @@ class SkyvernContext:
     # can be completed when a subsequent click triggers the actual file chooser.
     pending_file_chooser: PendingFileChooserListener | None = None
 
-    def set_llm_vision_mode(self, mode: Any) -> None:
-        self.llm_vision_mode = parse_llm_vision_mode(mode)
-        self.disable_llm_screenshots = self.llm_vision_mode == LLMVisionMode.NO_IMAGES_WITH_A11Y
+    def set_enrich_tree_mode(self, mode: Any) -> None:
+        self.enrich_tree_mode = parse_enrich_tree_mode(mode)
 
-    def effective_llm_vision_mode(self) -> LLMVisionMode:
-        if self.disable_llm_screenshots:
-            return LLMVisionMode.NO_IMAGES_WITH_A11Y
-        return parse_llm_vision_mode(self.llm_vision_mode)
+    def enriched_tree_enabled(self) -> bool:
+        return self.enrich_tree_mode != EnrichTreeMode.CONTROL
 
-    def llm_vision_fallback_active(self, *, retry_index: int | None = None) -> bool:
+    def enrich_tree_fallback_active(self, *, retry_index: int | None = None) -> bool:
         effective_retry_index = self.step_retry_index if retry_index is None else retry_index
-        return (
-            self.effective_llm_vision_mode()
-            in {
-                LLMVisionMode.FALLBACK_WITH_A11Y,
-                LLMVisionMode.FALLBACK_WITHOUT_A11Y,
-            }
-            and effective_retry_index > 0
-        )
+        return self.enrich_tree_mode == EnrichTreeMode.ENRICHED_TREE_NO_IMAGES_FALLBACK and effective_retry_index > 0
 
     def llm_screenshots_enabled_for_prompt(
         self,
@@ -227,21 +216,14 @@ class SkyvernContext:
         if is_vision_fallback_prompt:
             return True
 
-        mode = self.effective_llm_vision_mode()
-        if mode == LLMVisionMode.CONTROL:
+        mode = self.enrich_tree_mode
+        if mode in {EnrichTreeMode.CONTROL, EnrichTreeMode.ENRICHED_TREE}:
             return True
-        if mode == LLMVisionMode.NO_IMAGES_WITH_A11Y:
+        if mode == EnrichTreeMode.ENRICHED_TREE_NO_IMAGES:
             return False
 
         effective_retry_index = self.step_retry_index if retry_index is None else retry_index
-        # Fallback variants attach screenshots only on retries of the step being sent to the LLM.
         return effective_retry_index > 0
-
-    def llm_accessibility_context_enabled(self) -> bool:
-        return self.effective_llm_vision_mode() in {
-            LLMVisionMode.NO_IMAGES_WITH_A11Y,
-            LLMVisionMode.FALLBACK_WITH_A11Y,
-        }
 
     def cleanup_pending_file_chooser(self) -> None:
         if self.pending_file_chooser is not None:

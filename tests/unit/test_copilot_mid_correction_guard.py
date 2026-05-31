@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -190,8 +191,10 @@ def test_translate_to_agent_result_salvages_last_good_on_failed_reply() -> None:
     ctx.last_good_workflow_yaml = "yaml-good"
     agent_text = "Built 4 verified blocks; block 5 failed."
     result = _fake_run_result({"type": "REPLY", "user_response": agent_text, "goal_reached": False})
-    agent_result = _translate_to_agent_result(
-        result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+    agent_result = asyncio.run(
+        _translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+        )
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
     assert agent_result.workflow_yaml == "yaml-good"
@@ -218,8 +221,10 @@ def test_translate_to_agent_result_salvages_after_failure_then_update_workflow()
     ctx.last_good_workflow_yaml = "yaml-good"
     agent_text = "Built 4 blocks; block 5 failed; ran out of time."
     result = _fake_run_result({"type": "REPLY", "user_response": agent_text, "goal_reached": False})
-    agent_result = _translate_to_agent_result(
-        result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+    agent_result = asyncio.run(
+        _translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+        )
     )
     assert agent_result.updated_workflow is ctx.last_good_workflow
     assert agent_result.proposal_disposition == "review_untested"
@@ -241,8 +246,10 @@ def test_translate_to_agent_result_does_not_salvage_on_standalone_edit() -> None
     ctx.last_good_workflow = SimpleNamespace(workflow_id="wf-good")
     ctx.last_good_workflow_yaml = "yaml-good"
     result = _fake_run_result({"type": "REPLY", "user_response": "Drafted.", "goal_reached": False})
-    agent_result = _translate_to_agent_result(
-        result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+    agent_result = asyncio.run(
+        _translate_to_agent_result(
+            result, ctx, global_llm_context=None, chat_request=_fake_chat_request(), organization_id="o"
+        )
     )
     assert agent_result.updated_workflow is ctx.last_workflow
     assert agent_result.workflow_yaml == "yaml-edited"

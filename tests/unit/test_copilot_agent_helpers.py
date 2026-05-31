@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -12,8 +13,18 @@ import yaml
 
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisInput,
+    DiagnosisRepairContract,
+    DiagnosisResult,
+    RepairDecision,
+    RepairNextAction,
+    VerificationResult,
+)
 from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotGoalSatisfied,
     CopilotNonRetriableNavError,
     CopilotTotalTimeoutError,
     CopilotUnrecoverableToolError,
@@ -28,6 +39,7 @@ from skyvern.forge.sdk.copilot.request_policy import (
 )
 from skyvern.forge.sdk.copilot.turn_context import TranscriptContext, TurnContextOmission, TurnContextPacket
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentAuthority, TurnIntentMode
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
@@ -60,6 +72,18 @@ def _ctx(**overrides):
     )
     defaults.update(overrides)
     return CopilotContext(**defaults)
+
+
+def _verified_goal_contract(*, next_action: RepairNextAction = RepairNextAction.NO_CHANGE) -> DiagnosisRepairContract:
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=next_action),
+        verification_result=VerificationResult(
+            user_goal_satisfied=True,
+            completion_contract_satisfied=True,
+        ),
+    )
 
 
 class TestFailedTestResponseNormalization:
@@ -110,6 +134,30 @@ class TestFailedTestResponseNormalization:
         assert _pre_run_workflow_coverage_error(ctx) is None
         assert ctx.coverage_nudge_count == 0
 
+    def test_pre_run_coverage_guard_allows_single_goto_bootstrap(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Go to example.com, fill the search form, and extract the results.",
+            request_policy=SimpleNamespace(completion_contract="complete when result rows are extracted"),
+            last_update_block_count=1,
+            last_workflow=SimpleNamespace(
+                workflow_definition={
+                    "blocks": [
+                        {
+                            "label": "open_search_page",
+                            "block_type": "goto_url",
+                            "url": "https://example.com/search",
+                        }
+                    ]
+                }
+            ),
+            coverage_nudge_count=0,
+        )
+
+        assert _pre_run_workflow_coverage_error(ctx) is None
+        assert ctx.coverage_nudge_count == 0
+
     def test_failed_run_does_not_clear_last_workflow_state(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
 
@@ -137,6 +185,90 @@ class TestFailedTestResponseNormalization:
         assert ctx.last_workflow is sentinel_workflow
         assert ctx.last_test_ok is False
         assert ctx.last_test_failure_reason == "net::ERR_NAME_NOT_RESOLVED"
+
+    def test_per_tool_budget_run_records_structured_verification_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
+
+        ctx = _ctx(
+            last_workflow_yaml="""
+workflow_definition:
+  blocks:
+    - label: search_registry
+      block_type: navigation
+    - label: extract_results
+      block_type: extraction
+""",
+        )
+
+        _record_run_blocks_result(
+            ctx,
+            {
+                "ok": False,
+                "data": {
+                    "workflow_run_id": "wr_budget",
+                    "overall_status": "canceled",
+                    "current_url": "https://example.com/lookup",
+                    "page_title": "Example Lookup Registry",
+                    "executed_block_labels": ["search_registry"],
+                    "frontier_start_label": "search_registry",
+                    "failure_categories": [{"category": PER_TOOL_BUDGET_FAILURE_CATEGORY}],
+                    "blocks": [
+                        {
+                            "label": "search_registry",
+                            "status": "canceled",
+                            "failure_reason": "Per-tool-call budget exceeded while making progress.",
+                        }
+                    ],
+                },
+            },
+        )
+
+        evidence = ctx.workflow_verification_evidence
+        assert evidence.full_workflow_verified is False
+        assert evidence.test_attempted_but_incomplete is True
+        assert evidence.per_tool_budget_on_block == ["search_registry"]
+        assert evidence.live_page_state_verified is True
+        assert evidence.current_url == "https://example.com/lookup"
+        assert evidence.workflow_run_id == "wr_budget"
+
+    def test_current_state_block_run_records_partial_verification_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_run_blocks_result
+
+        ctx = _ctx(
+            last_workflow_yaml="""
+workflow_definition:
+  blocks:
+    - label: search_registry
+      block_type: navigation
+    - label: extract_results
+      block_type: extraction
+    - label: expand_results
+      block_type: navigation
+""",
+            verified_prefix_labels=["search_registry", "extract_results"],
+        )
+
+        _record_run_blocks_result(
+            ctx,
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_extract",
+                    "overall_status": "completed",
+                    "current_url": "https://example.com/lookup",
+                    "executed_block_labels": ["extract_results"],
+                    "frontier_start_label": "extract_results",
+                    "blocks": [{"label": "extract_results", "status": "completed"}],
+                },
+            },
+        )
+
+        evidence = ctx.workflow_verification_evidence
+        assert evidence.full_workflow_verified is False
+        assert evidence.block_verified == ["extract_results"]
+        assert evidence.verified_from_current_browser_state is True
+        assert evidence.unverified_block_labels == ["expand_results"]
 
     def test_rewrite_includes_navigation_follow_up_when_category_matches(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
@@ -281,6 +413,56 @@ class TestFailedTestResponseNormalization:
         assert "test failed" in rewritten.lower()
         assert "keep the draft" in rewritten.lower()
 
+    def test_partial_verification_rewrite_uses_structured_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_results"],
+                live_page_state_verified=True,
+                verified_from_current_browser_state=True,
+                per_tool_budget_on_block=["search_registry"],
+                unverified_block_labels=["search_registry"],
+                page_title="Example Lookup Registry",
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I created and tested the workflow end-to-end.", ctx)
+
+        assert "created and tested" not in rewritten.lower()
+        assert "full workflow chain has not been verified end-to-end" in rewritten
+        assert "verified block(s): extract_results" in rewritten
+        assert "per-tool budget hit on: search_registry" in rewritten
+
+    def test_runtime_verification_evidence_prompt_surfaces_state_for_agent(self) -> None:
+        ctx = _ctx(
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_results"],
+                live_page_state_verified=True,
+                test_attempted_but_incomplete=True,
+                per_tool_budget_on_block=["search_registry"],
+                verified_from_current_browser_state=True,
+                current_url_observed_after_workflow_run=True,
+                current_url_may_encode_runtime_state=True,
+                unverified_block_labels=["search_registry"],
+                current_url="https://example.com/lookup",
+            )
+        )
+
+        prompt = agent_module._runtime_verification_evidence_prompt(ctx)
+
+        assert "RUNTIME VERIFICATION EVIDENCE" in prompt
+        assert "full_workflow_verified: false" in prompt
+        assert "test_attempted_but_incomplete: true" in prompt
+        assert "current_url_observed_after_workflow_run: true" in prompt
+        assert "current_url_may_encode_runtime_state: true" in prompt
+        assert "per_tool_budget_on_block:" in prompt
+        assert "run only missing block labels" in prompt
+
 
 class TestVerifiedWorkflowOrNone:
     """SKY-9143 strict invariant: a proposal surfaces only after a passing test this turn."""
@@ -292,8 +474,24 @@ class TestVerifiedWorkflowOrNone:
         from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
 
         wf = self._wf()
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="foo: bar", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="foo: bar",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         assert _verified_workflow_or_none(ctx) == (wf, "foo: bar")
+
+    def test_zeros_when_only_frontier_tested_successfully(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
+
+        ctx = _ctx(
+            last_workflow=self._wf(),
+            last_workflow_yaml="foo: bar",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+        )
+        assert _verified_workflow_or_none(ctx) == (None, None)
 
     def test_zeros_when_test_failed(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _verified_workflow_or_none
@@ -329,6 +527,95 @@ class TestVerifiedWorkflowOrNone:
             last_test_suspicious_success=True,
         )
         assert _verified_workflow_or_none(ctx) == (None, None)
+
+
+class TestVerifiedGoalSatisfiedStop:
+    @pytest.mark.asyncio
+    async def test_block_run_hook_stops_after_verified_goal_satisfied(self) -> None:
+        from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+        hook = CopilotRunHooks(ctx)
+        result = json.dumps(
+            {
+                "ok": True,
+                "data": {
+                    "workflow_run_id": "wr_1",
+                    "blocks": [{"label": "search", "output": {"status": "found"}}],
+                },
+            }
+        )
+
+        with pytest.raises(CopilotGoalSatisfied):
+            await hook.on_tool_end(
+                context=MagicMock(),
+                agent=MagicMock(),
+                tool=SimpleNamespace(name="update_and_run_blocks"),
+                result=result,
+            )
+
+        assert ctx.tool_activity[-1]["tool"] == "update_and_run_blocks"
+
+    def test_wrapped_goal_satisfied_error_context_is_recognized(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+
+        assert verified_goal_satisfied_context(ctx)
+
+    def test_wrapped_goal_satisfied_error_context_requires_no_change(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(next_action=RepairNextAction.REPAIR),
+        )
+
+        assert not verified_goal_satisfied_context(ctx)
+
+    def test_verified_goal_satisfied_context_rejects_undercovered_workflow(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import verified_goal_satisfied_context
+
+        ctx = _ctx(
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            last_update_block_count=1,
+            user_message=(
+                "go to https://example.com/lookup and check the requested credential "
+                "type for any sample record. I want to grab the credential name, id, expiration"
+            ),
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+        )
+
+        assert not verified_goal_satisfied_context(ctx)
+
+    def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+
+        result = _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert result.updated_workflow is workflow
+        assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
+        assert result.proposal_disposition == "auto_applicable"
+        assert "tested" in result.user_response.lower()
 
 
 class TestSupersededAgentIntentGates:
@@ -562,6 +849,7 @@ class TestShouldRestorePersistedWorkflow:
     def _result(self, *, persisted: bool, updated_workflow: object | None):
         r = MagicMock()
         r.workflow_was_persisted = persisted
+        r.canonical_was_persisted_due_to_param_change = False
         r.updated_workflow = updated_workflow
         r.proposal_disposition = "auto_applicable"
         r.cancelled = False
@@ -763,8 +1051,10 @@ class TestTranslateToAgentResultGating:
         ctx = _ctx()
         result = SimpleNamespace(final_output="ASK_QUESTION\nWhich account should I use?", new_items=[])
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.response_type == "ASK_QUESTION"
@@ -782,7 +1072,12 @@ class TestTranslateToAgentResultGating:
             lambda **kwargs: new_wf,
         )
 
-        ctx = _ctx(last_workflow=old_wf, last_workflow_yaml="old: yaml", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=old_wf,
+            last_workflow_yaml="old: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result(
             {
                 "type": "REPLACE_WORKFLOW",
@@ -790,8 +1085,10 @@ class TestTranslateToAgentResultGating:
                 "workflow_yaml": "new: yaml",
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert ctx.last_test_ok is None
@@ -831,16 +1128,61 @@ workflow_definition:
       next_block_label: null
       navigation_goal: Search example.com for sample beta.
 """
-        ctx = _ctx(workflow_yaml=prior_yaml, last_workflow_yaml=prior_yaml, last_workflow=object(), last_test_ok=True)
+        ctx = _ctx(
+            workflow_yaml=prior_yaml,
+            last_workflow_yaml=prior_yaml,
+            last_workflow=object(),
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         process_mock.assert_not_called()
         assert "corrected block metadata still appears stale" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_inline_replace_workflow_rejects_page_dependent_blocks_without_inspection(self, monkeypatch) -> None:
+        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+
+        submitted_yaml = """
+title: Lookup example
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_lookup
+      url: https://example.com/lookup
+    - block_type: navigation
+      label: search_lookup
+      navigation_goal: Enter the person name into the search field and click Search.
+"""
+        ctx = _ctx(
+            workflow_yaml="",
+            build_phase=BuildPhase.COMPOSING,
+            turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
+            composition_page_evidence=None,
+        )
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        process_mock.assert_not_called()
+        assert "inspect_page_for_composition" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
@@ -857,12 +1199,19 @@ workflow_definition:
 
         monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", boom)
 
-        ctx = _ctx(last_workflow=tested_wf, last_workflow_yaml="tested: yaml", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=tested_wf,
+            last_workflow_yaml="tested: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "here", "workflow_yaml": "::: not yaml"}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert ctx.last_workflow is tested_wf
@@ -884,8 +1233,10 @@ workflow_definition:
         )
         specific_question = "I need credentials for site.example — can you link one in Settings?"
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": specific_question})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.user_response == specific_question
@@ -911,8 +1262,10 @@ workflow_definition:
         )
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": verbose_response})
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.response_type == "ASK_QUESTION"
@@ -1036,8 +1389,10 @@ workflow_definition:
             last_failure_category_top="NAVIGATION_FAILURE",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All done — your workflow is ready."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "test failed" in agent_result.user_response.lower()
@@ -1055,8 +1410,10 @@ workflow_definition:
             last_test_failure_reason="A verification challenge is preventing submission.",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1075,8 +1432,10 @@ workflow_definition:
             last_test_suspicious_success=True,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1095,8 +1454,10 @@ workflow_definition:
             last_test_ok=None,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Please provide credentials before I continue."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1118,8 +1479,10 @@ workflow_definition:
         )
         response = "I have a draft proposal. Use Review to inspect it, Accept to save it, or Reject it."
         result = _fake_run_result({"type": "REPLY", "user_response": response})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert response in agent_result.user_response
@@ -1134,6 +1497,7 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=8,
         )
         result = _fake_run_result(
@@ -1143,8 +1507,10 @@ workflow_definition:
                 "goal_reached": False,
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1159,11 +1525,14 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1175,11 +1544,14 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=3,
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "All set.", "goal_reached": True})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1193,13 +1565,16 @@ workflow_definition:
             last_workflow=wf,
             last_workflow_yaml="title: drafted",
             last_test_ok=True,
+            last_full_workflow_test_ok=True,
             last_update_block_count=2,
         )
         result = _fake_run_result(
             {"type": "REPLY", "user_response": "Cookie modal blocked the form.", "goal_reached": "false"}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1213,8 +1588,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLY", "user_response": "I couldn't find the form.", "goal_reached": False}
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1224,8 +1601,10 @@ workflow_definition:
     def test_unbacked_workflow_claim_is_rewritten_without_proposal(self) -> None:
         ctx = _ctx(last_test_ok=None)
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "here's the workflow" not in agent_result.user_response.lower()
@@ -1250,8 +1629,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "here's the workflow" not in agent_result.user_response.lower()
@@ -1269,8 +1650,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "Required context was unavailable: the workflow run ID and the block run results." in (
@@ -1300,8 +1683,10 @@ workflow_definition:
             ),
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "I've drafted a workflow for you."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "Required context was unavailable: the current browser tab or page state." in agent_result.user_response
@@ -1314,8 +1699,10 @@ workflow_definition:
                 "user_response": "In the meantime, I've drafted the initial part of your workflow with placeholders.",
             }
         )
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert "initial part of your workflow" not in agent_result.user_response.lower()
@@ -1326,10 +1713,17 @@ workflow_definition:
 
     def test_unbacked_workflow_claim_not_rewritten_when_proposal_exists(self) -> None:
         wf = SimpleNamespace(name="drafted")
-        ctx = _ctx(last_workflow=wf, last_workflow_yaml="title: drafted", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=wf,
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result({"type": "REPLY", "user_response": "Here's the workflow."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.user_response == "Here's the workflow."
@@ -1348,8 +1742,10 @@ workflow_definition:
             last_test_failure_reason="A verification challenge is preventing submission.",
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Tried but blocked.", "goal_reached": False})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf
@@ -1370,8 +1766,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
         )
-        agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert captured["yaml"] == "raw: yaml"
@@ -1393,8 +1791,10 @@ workflow_definition:
         result = _fake_run_result(
             {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": "raw: yaml"}
         )
-        agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert captured["yaml"] == "raw: yaml"
@@ -1403,10 +1803,17 @@ workflow_definition:
         # A verified-but-non-terminal workflow built this turn must not surface
         # alongside the question; the clear flag also nulls any stale prior ghost.
         verified_wf = SimpleNamespace(name="verified-partial")
-        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="verified: yaml", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=verified_wf,
+            last_workflow_yaml="verified: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Need credentials before I can continue."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1419,8 +1826,10 @@ workflow_definition:
         # prior persisted proposal so reload stays coherent.
         ctx = _ctx()
         result = _fake_run_result({"type": "ASK_QUESTION", "user_response": "Which site?"})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is None
@@ -1430,10 +1839,17 @@ workflow_definition:
         # Differential: a REPLY turn surfaces the verified workflow and leaves
         # any prior persisted proposal untouched.
         verified_wf = SimpleNamespace(name="final")
-        ctx = _ctx(last_workflow=verified_wf, last_workflow_yaml="final: yaml", last_test_ok=True)
+        ctx = _ctx(
+            last_workflow=verified_wf,
+            last_workflow_yaml="final: yaml",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+        )
         result = _fake_run_result({"type": "REPLY", "user_response": "Here you go."})
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is verified_wf
@@ -1482,6 +1898,13 @@ class TestCredentialRefusalReachesAgent:
 
 
 class TestNativeToolSurface:
+    def test_page_composition_evidence_repair_tool_is_native(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import NATIVE_TOOLS
+
+        names = {tool.name for tool in NATIVE_TOOLS}
+
+        assert "inspect_page_for_composition" in names
+
     @pytest.mark.parametrize("reason", ["workflow_credential_inputs_unbound", "credential_name_unresolved"])
     def test_credential_deferred_draft_removes_update_workflow_tool(self, reason: str) -> None:
         from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -2508,8 +2931,10 @@ workflow_definition:
         )
         result = _fake_run_result({"type": "REPLY", "user_response": "Done."})
 
-        agent_result = agent_module._translate_to_agent_result(
-            result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
         )
 
         assert agent_result.updated_workflow is wf

@@ -34,6 +34,7 @@ from skyvern.forge.sdk.copilot.config import (
     SCREENSHOT_DROPPED_NUDGE,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
@@ -50,6 +51,8 @@ if TYPE_CHECKING:
     from agents.agent import Agent
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -89,10 +92,10 @@ MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
-TOTAL_TIMEOUT_SECONDS = 600
+TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
 # already prevent individual branches from looping; this stops a brand-new
-# enforcement rule that forgets its own counter from spinning within 600s.
+# enforcement rule that forgets its own counter from spinning within 900s.
 MAX_ITERATIONS = 50
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
@@ -206,6 +209,41 @@ class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
 
 
+class CopilotGoalSatisfied(Exception):
+    """Raised when a tool proves the workflow already satisfies the turn."""
+
+
+def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    if contract is None:
+        return False
+    verification = contract.verification_result
+    repair_decision = contract.repair_decision
+    return (
+        verification.user_goal_satisfied is True
+        and verification.completion_contract_satisfied is True
+        and repair_decision.next_action is RepairNextAction.NO_CHANGE
+    )
+
+
+def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
+    return (
+        ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and latest_diagnosis_contract_satisfies_goal(ctx)
+        and not _verified_goal_likely_needs_more_work(ctx)
+    )
+
+
+def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
+    block_count = ctx.last_update_block_count
+    if not isinstance(block_count, int):
+        return False
+    user_message = ctx.user_message
+    completion_contract = _request_completion_contract(ctx)
+    return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
+
+
 def _mark_copilot_total_timeout(ctx: Any) -> None:
     ctx.copilot_total_timeout_exceeded = True
 
@@ -272,6 +310,7 @@ _BROWSER_SESSION_TOOL_NAMES = frozenset(
         "press_key",
     }
 )
+_POST_RUN_PAGE_OBSERVATION_TOOLS = frozenset({"evaluate", "get_browser_screenshot", "inspect_page_for_composition"})
 _UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
 _BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
 _BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
@@ -400,10 +439,10 @@ def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
 _ACTION_CATEGORIES: list[list[str]] = [
     ["navigate", "go to", "open", "visit"],
     ["download", "save", "export"],
-    ["extract", "scrape", "collect", "gather", "get all"],
+    ["extract", "scrape", "collect", "gather", "get all", "grab", "capture", "retrieve", "pull"],
     ["login", "log in", "sign in", "authenticate"],
-    ["search", "find", "look for", "look up"],
-    ["fill", "enter", "type", "submit", "complete the form"],
+    ["search", "find", "look for", "look up", "check", "verify"],
+    ["fill", "enter", "type", "submit", "complete the form", "input"],
     ["click", "select", "choose", "pick"],
     ["upload", "attach"],
 ]
@@ -552,6 +591,44 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_FAILED_TEST_NUDGES
 
 
+def _has_post_failed_run_page_observation(ctx: AgentContext) -> bool:
+    if getattr(ctx, "post_run_page_observation_after_failed_test", False) is not True:
+        return False
+    tool = getattr(ctx, "post_run_page_observation_tool", None)
+    if tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS:
+        return False
+    observed_run_id = getattr(ctx, "post_run_page_observation_workflow_run_id", None)
+    current_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    return bool(isinstance(observed_run_id, str) and observed_run_id and observed_run_id == current_run_id)
+
+
+def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    parsed = parse_final_response(extract_final_text(result))
+    normalized_scaffolding = normalize_response_scaffolding(
+        str(parsed.get("type") or "REPLY"),
+        str(parsed.get("user_response") or ""),
+    )
+    if normalized_scaffolding.changed:
+        parsed = {
+            **parsed,
+            "type": normalized_scaffolding.response_type,
+            "user_response": normalized_scaffolding.user_response or "Done.",
+        }
+    return parsed
+
+
+def _post_run_observed_reply_can_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
+    if not _has_post_failed_run_page_observation(ctx):
+        return False
+    parsed = _parse_normalized_final_response(result)
+    if parsed is None or parsed.get("type") != "REPLY":
+        return False
+    user_response = parsed.get("user_response")
+    return isinstance(user_response, str) and bool(user_response.strip()) and not _is_progress_narration(user_response)
+
+
 def _needs_suspicious_success_nudge(ctx: Any) -> bool:
     """Return True when the last test 'completed' but data blocks had no output."""
     # A non-retriable nav failure cannot be "suspiciously successful" — defer
@@ -681,9 +758,19 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
-    # A budget-trip is a structural problem (chain too long), not a
-    # workflow-shape problem — emit the targeted "split the chain" advice
-    # before the generic repeated-frontier and failed-test paths can fire.
+    if _post_run_observed_reply_can_finalize(ctx, result):
+        return None
+
+    # If the last run had confirmed challenge evidence, do not misdiagnose a
+    # challenge-solving loop as a long-chain budgeting problem.
+    if _needs_failed_test_nudge(ctx) and getattr(ctx, "last_test_anti_bot", None):
+        ctx.failed_test_nudge_count += 1
+        return _nudge(config, "post_anti_bot_failed_test")
+
+    # A budget-trip without challenge evidence is a structural problem (chain
+    # too long), not a workflow-shape problem — emit the targeted "split the
+    # chain" advice before the generic repeated-frontier and failed-test paths
+    # can fire.
     if _needs_per_tool_budget_nudge(ctx):
         ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
         return _nudge(config, "post_per_tool_budget")
@@ -717,25 +804,15 @@ def _check_enforcement(
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
-        if getattr(ctx, "last_test_anti_bot", None):
-            return _nudge(config, "post_anti_bot_failed_test")
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
     # (always allowed) from a REPLY with a coverage gap or progress-narration.
     # Only runs when no state-based nudge fired.
     if result is not None:
-        parsed = parse_final_response(extract_final_text(result))
-        normalized_scaffolding = normalize_response_scaffolding(
-            str(parsed.get("type") or "REPLY"),
-            str(parsed.get("user_response") or ""),
-        )
-        if normalized_scaffolding.changed:
-            parsed = {
-                **parsed,
-                "type": normalized_scaffolding.response_type,
-                "user_response": normalized_scaffolding.user_response or "Done.",
-            }
+        parsed = _parse_normalized_final_response(result)
+        if parsed is None:
+            return None
         return _response_coverage_nudge(ctx, parsed, config)
 
     return None

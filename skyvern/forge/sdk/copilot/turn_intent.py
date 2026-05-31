@@ -169,6 +169,8 @@ _GOAL_MAX_CHARS = 240
 _BUILD_TERMS = ("build", "create", "make", "generate")
 _NEW_BROWSER_TASK_TERMS = ("go to", "navigate to", "open", "visit", "search for")
 _EDIT_TERMS = ("edit", "update", "change", "modify", "replace", "fix")
+# Verbs that also commonly appear as step/block names ("the delete step").
+_EDIT_NOUNY_TERMS = ("add", "insert", "remove", "delete")
 _DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error", "result")
 _RUN_CONTEXT_REQUEST_TERMS = ("get_run_results", "workflow_run_id", "run result", "run results")
 # Subset of _DIAGNOSE_TERMS that name unambiguous diagnose intent. "result" is in
@@ -177,16 +179,35 @@ _RUN_CONTEXT_REQUEST_TERMS = ("get_run_results", "workflow_run_id", "run result"
 _CLEAR_DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error")
 _DOCS_TERMS = (
     "explain",
+    "tell me what",
     "how do",
     "how does",
     "what is",
     "what are",
+    "what does",
     "why",
     "docs",
     "documentation",
+    "where should",
     " vs ",
     " versus ",
     "difference between",
+)
+_LEADING_NOUNY_FAILURE_RE = re.compile(
+    rf"^\s*(?:the\s+)?(?:{'|'.join(_EDIT_NOUNY_TERMS)})\s+(?:steps?|blocks?)\s+"
+    r"(?:failed|failure|errored?|errors?)\b",
+    re.I,
+)
+# Anchored structure requests catch "I need a step..." without treating
+# reference/help questions like "where should a step go?" as mutation.
+_STRUCTURE_REQUEST_RE = re.compile(
+    r"^\s*(?:(?:please|pls)\s+)?(?:"
+    r"(?:i|we)\s+(?:need|want|would\s+like)\s+"
+    r"(?:(?:(?:you\s+to|to)\s+(?:create|make|build|generate|add|insert)\s+)?)"
+    r"|(?:can|could|would)\s+you\s+(?:(?:please)\s+)?(?:create|make|build|generate|add|insert)\s+"
+    r"|(?:create|make|build|generate|add|insert)\s+"
+    r")(?:(?:a|an|another|extra|new|some)\s+)?(?:steps?|blocks?)\b",
+    re.I,
 )
 _IDENTIFIER_REF_RE = r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"
 _CODE_IDENTIFIER_REF_RE = re.compile(rf"`(?P<ref>{_IDENTIFIER_REF_RE})`")
@@ -319,6 +340,12 @@ def _unresolved_explicit_block_refs(user_message: str, workflow_yaml: str | None
     return unresolved
 
 
+def _mutation_mode(has_workflow: bool) -> tuple[TurnIntentMode, TurnIntentExpectedOutput]:
+    if has_workflow:
+        return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
+    return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
+
+
 def _mode_from_keywords(
     user_message: str,
     *,
@@ -326,6 +353,8 @@ def _mode_from_keywords(
     has_workflow_blocks: bool,
     has_prior_run_signal: bool,
 ) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
+    if _LEADING_NOUNY_FAILURE_RE.search(user_message or ""):
+        return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
     if has_workflow and _contains_any(user_message, _EDIT_TERMS):
         return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
     # A browser-task verb on a saved workflow with no buildable blocks is a new
@@ -345,6 +374,8 @@ def _mode_from_keywords(
         return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
     if _contains_any(user_message, _DOCS_TERMS):
         return TurnIntentMode.DOCS_ANSWER, TurnIntentExpectedOutput.EXPLANATION
+    if _STRUCTURE_REQUEST_RE.search(user_message or ""):
+        return _mutation_mode(has_workflow)
     if _contains_any(user_message, _BUILD_TERMS):
         return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
     if not has_workflow and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS):

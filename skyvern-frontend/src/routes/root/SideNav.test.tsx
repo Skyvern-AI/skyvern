@@ -151,6 +151,20 @@ describe("SideNav", () => {
     ).toEqual(storedState);
   });
 
+  it("renders expanded navigation when collapsed override is false despite store", () => {
+    useSidebarStore.setState({ collapsed: true });
+    setViewportHeight(1024);
+
+    render(
+      <MemoryRouter>
+        <SideNav collapsed={false} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("button", { name: /Agents/i })).toBeTruthy();
+    expect(screen.queryByTitle("Agents")).toBeNull();
+  });
+
   it("shows clickable parent headers in collapsed popout menus", async () => {
     useSidebarStore.setState({ collapsed: true });
 
@@ -169,5 +183,25 @@ describe("SideNav", () => {
       await screen.findByRole("menuitem", { name: "All Agents" }),
     ).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Agents" })).toBeTruthy();
+  });
+
+  it("uses the n8n logo in the collapsed integrations popout", async () => {
+    useSidebarStore.setState({ collapsed: true });
+
+    render(
+      <MemoryRouter>
+        <SideNav />
+      </MemoryRouter>,
+    );
+
+    fireEvent.pointerDown(screen.getByTitle("Integrations"), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    const n8nMenuItem = await screen.findByRole("menuitem", { name: "n8n" });
+    expect(
+      n8nMenuItem.querySelector('svg[viewBox="0 0 304 160"]'),
+    ).toBeTruthy();
   });
 });

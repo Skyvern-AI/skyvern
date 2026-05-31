@@ -8,13 +8,17 @@ import pytest
 
 from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.tools import _discovery_walk, _inspect_page_for_composition_impl
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
-    def __init__(self, server: Any) -> None:
+    def __init__(self, server: object) -> None:
         self.discovery_mcp_server = server
         self.discovery_started_monotonic = None
         self.discovery_step_count = 0
+        self.prior_page_inspection_calls_made = 0
+        self.page_inspection_calls_this_turn = 0
+        self.workflow_verification_evidence = WorkflowVerificationEvidence()
 
 
 class _FailingNavigateServer:
@@ -108,6 +112,50 @@ class _DeepLinkAntiBotRecoveryServer:
                     "html": """
                     <html><head><title>Example Certification Registry</title></head>
                     <body><form><input name="first_name"><input name="last_name"><button>Search</button></form></body></html>
+                    """
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _EmbeddedChallengeUsefulPageServer:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            if self.urls[-1] == "https://certboard.test":
+                return {
+                    "ok": True,
+                    "data": {
+                        "html": """
+                        <html><head><title>Certification Board</title></head>
+                        <body><a href="/registry/search">Find a Certificant</a></body></html>
+                        """
+                    },
+                }
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html>
+                      <head>
+                        <title>Certificant Registry</title>
+                        <script src="https://challenges.example.test/turnstile/api.js"></script>
+                      </head>
+                      <body>
+                        <form>
+                          <label for="first-name">First Name</label>
+                          <input id="first-name" name="first_name">
+                          <label for="last-name">Last Name</label>
+                          <input id="last-name" name="last_name">
+                        </form>
+                      </body>
+                    </html>
                     """
                 },
             }
@@ -208,13 +256,32 @@ async def test_discovery_recovers_from_deep_link_anti_bot_by_clicking_from_origi
 
 
 @pytest.mark.asyncio
+async def test_discovery_keeps_candidate_when_challenge_markup_is_embedded_in_useful_page() -> None:
+    server = _EmbeddedChallengeUsefulPageServer()
+
+    result = await _discovery_walk(
+        _Ctx(server),
+        entry_url="https://certboard.test",
+        intent_hint="find certificant lookup page",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://certboard.test/registry/search"
+    assert result["data"]["failure_reason"] is None
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "First Name", "name": "first_name", "type": "input", "value_hint": ""},
+        {"label": "Last Name", "name": "last_name", "type": "input", "value_hint": ""},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pytest.MonkeyPatch) -> None:
     server = _CurrentPageServer()
     ctx = _Ctx(server)
     ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
     ctx.composition_page_evidence = None  # type: ignore[attr-defined]
 
-    async def fake_fallback_page_info(_ctx: Any) -> tuple[str, str]:
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
     monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)

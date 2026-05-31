@@ -296,7 +296,7 @@ async def test_local_allows_env_only_persistent_mode(monkeypatch: pytest.MonkeyP
 
     try:
         assert factory.call_args.kwargs["use_in_memory_db"] is False
-        assert getattr(skyvern, "_embedded_client") is embedded_client
+        assert skyvern._embedded_client is embedded_client
     finally:
         await skyvern.aclose()
 
@@ -323,7 +323,7 @@ async def test_local_persistent_mode_accepts_settings_without_dotenv(
     try:
         assert factory.call_args.kwargs["use_in_memory_db"] is False
         assert factory.call_args.kwargs["settings_overrides"] == overrides
-        assert getattr(skyvern, "_embedded_client") is embedded_client
+        assert skyvern._embedded_client is embedded_client
     finally:
         await skyvern.aclose()
 

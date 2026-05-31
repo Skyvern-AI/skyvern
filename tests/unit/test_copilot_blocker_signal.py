@@ -56,6 +56,7 @@ def test_to_trace_data_surfaces_internal_fields() -> None:
     assert trace["blocker_kind"] == "authority_denied"
     assert trace["classifier_mode"] == "docs_answer"
     assert trace["cleared_by_tools"] == ["a", "b"]
+    assert trace["renders_final_reply"] is True
     assert trace["extra"] == {}
 
 
@@ -114,6 +115,28 @@ def test_maybe_clear_on_tool_success_empty_set_keeps_signal() -> None:
     signal = _make()
     ctx.blocker_signal = signal
     maybe_clear_blocker_signal_on_tool_success(ctx, "update_workflow")
+    assert ctx.blocker_signal is signal
+
+
+def test_maybe_clear_on_tool_success_clears_consecutive_tool_loop_after_progress() -> None:
+    ctx = _Ctx()
+    ctx.blocker_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_consecutive_same_tool")
+    maybe_clear_blocker_signal_on_tool_success(ctx, "get_browser_screenshot")
+    assert ctx.blocker_signal is None
+
+
+def test_maybe_clear_on_tool_success_clears_loop_after_workflow_progress() -> None:
+    ctx = _Ctx()
+    ctx.blocker_signal = _make(kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    maybe_clear_blocker_signal_on_tool_success(ctx, "update_and_run_blocks")
+    assert ctx.blocker_signal is None
+
+
+def test_maybe_clear_on_tool_success_keeps_loop_for_metadata_only_success() -> None:
+    ctx = _Ctx()
+    signal = _make(kind="loop_detected", internal_reason_code="loop_detected_repeated_failed_step")
+    ctx.blocker_signal = signal
+    maybe_clear_blocker_signal_on_tool_success(ctx, "list_credentials")
     assert ctx.blocker_signal is signal
 
 

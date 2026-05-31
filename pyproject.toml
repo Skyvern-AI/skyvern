@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.36"
+version = "1.0.37"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -313,6 +313,7 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
+extend-select = ["B009", "B010"]  # flake8-bugbear: no getattr/setattr with a constant attribute name
 
 [tool.isort]
 profile = "black"

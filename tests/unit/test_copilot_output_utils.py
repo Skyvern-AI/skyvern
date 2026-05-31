@@ -307,6 +307,16 @@ class TestSummarizeToolResult:
         )
         assert "3" in summary
 
+    def test_update_and_run_blocks_with_scalar_data_does_not_crash(self) -> None:
+        summary = self._summarize(
+            "update_and_run_blocks",
+            {
+                "ok": True,
+                "data": "workflow_run_skipped: verified_goal_already_satisfied",
+            },
+        )
+        assert summary == "OK"
+
     def test_navigate_browser(self) -> None:
         summary = self._summarize(
             "navigate_browser",
