@@ -40,6 +40,7 @@ type SidebarNavItem = {
 
 type Props = {
   items: Array<SidebarNavItem>;
+  collapsed?: boolean;
 };
 
 const OPEN_GROUPS_STORAGE_KEY = "skyvern-sidebar-open-groups";
@@ -277,8 +278,9 @@ function CollapsedNavItem({
   );
 }
 
-function SidebarTreeNav({ items }: Props) {
-  const collapsed = useSidebarStore((state) => state.collapsed);
+function SidebarTreeNav({ items, collapsed: collapsedOverride }: Props) {
+  const collapsedFromStore = useSidebarStore((state) => state.collapsed);
+  const collapsed = collapsedOverride ?? collapsedFromStore;
   const isActive = useIsActive();
   const openGroupsDidMountRef = useRef(false);
   const expandedChildrenDidMountRef = useRef(false);
