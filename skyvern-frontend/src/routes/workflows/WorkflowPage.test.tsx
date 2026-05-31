@@ -35,7 +35,7 @@ vi.mock("@/components/StatusFilterDropdown", () => ({
 }));
 
 vi.mock("@/components/TableSearchInput", () => ({
-  TableSearchInput: () => <input aria-label="Search runs by parameter" />,
+  TableSearchInput: () => <input aria-label="Search runs by input" />,
 }));
 
 vi.mock("./WorkflowActions", () => ({

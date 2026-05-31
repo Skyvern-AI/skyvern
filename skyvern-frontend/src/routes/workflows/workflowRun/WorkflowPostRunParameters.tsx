@@ -77,7 +77,7 @@ function WorkflowPostRunParameters() {
     : (workflowRun?.extra_http_headers ?? null);
 
   if (workflowRunIsLoading || workflowRunTimelineIsLoading) {
-    return <div>Loading workflow parameters...</div>;
+    return <div>Loading workflow inputs...</div>;
   }
 
   if (!workflowRun || !workflowRunTimeline) {
@@ -89,7 +89,7 @@ function WorkflowPostRunParameters() {
       {activeBlock && isTaskVariantBlock(activeBlock) ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Block Parameters</h1>
+            <h1 className="text-lg font-bold">Block Inputs</h1>
             <TaskBlockParameters
               block={activeBlock}
               definitionBlock={definitionBlock}
@@ -122,7 +122,7 @@ function WorkflowPostRunParameters() {
       activeBlock.block_type === WorkflowBlockTypes.SendEmail ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Block Parameters</h1>
+            <h1 className="text-lg font-bold">Block Inputs</h1>
             <SendEmailBlockParameters
               body={activeBlock.body ?? ""}
               recipients={activeBlock.recipients ?? []}
@@ -134,7 +134,7 @@ function WorkflowPostRunParameters() {
       {activeBlock && activeBlock.block_type === WorkflowBlockTypes.ForLoop ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Block Parameters</h1>
+            <h1 className="text-sm font-bold">Block Inputs</h1>
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-sm">Loop Values</h1>
@@ -158,7 +158,7 @@ function WorkflowPostRunParameters() {
       activeBlock.block_type === WorkflowBlockTypes.WhileLoop ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Block Parameters</h1>
+            <h1 className="text-sm font-bold">Block Inputs</h1>
             <WhileLoopPostRunFields
               layout="sidebar"
               definitionBlock={definitionBlock}
@@ -349,7 +349,7 @@ function WorkflowPostRunParameters() {
       ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
-          <h1 className="text-lg font-bold">Agent Input Parameters</h1>
+          <h1 className="text-lg font-bold">Agent Inputs</h1>
           {getOrderedRunParameters(
             workflow?.workflow_definition.parameters,
             parameters,
@@ -377,9 +377,9 @@ function WorkflowPostRunParameters() {
             );
           })}
           {Object.keys(parameters).length === 0 ? (
-            <div>No input parameters found for this agent</div>
+            <div>No inputs found for this agent</div>
           ) : null}
-          <h1 className="text-lg font-bold">Other Agent Parameters</h1>
+          <h1 className="text-lg font-bold">Other Agent Inputs</h1>
           <div className="flex gap-16">
             <div className="w-80">
               <h1 className="text-lg">Webhook Callback URL</h1>
@@ -449,7 +449,7 @@ function WorkflowPostRunParameters() {
       {workflowRun.task_v2 ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-lg font-bold">Task 2.0 Parameters</h1>
+            <h1 className="text-lg font-bold">Task 2.0 Inputs</h1>
             <div className="flex gap-16">
               <div className="w-80">
                 <h1 className="text-lg">Task 2.0 Prompt</h1>

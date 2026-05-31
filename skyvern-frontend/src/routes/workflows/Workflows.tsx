@@ -491,7 +491,7 @@ function Workflows() {
               setSearch(value);
               setParamPatch({ page: "1" });
             }}
-            placeholder="Search by title or parameter..."
+            placeholder="Search by title or input..."
             className="w-48 lg:w-72"
           />
           <div className="flex items-center gap-4">
@@ -773,9 +773,9 @@ function Workflows() {
                                   <TooltipContent>
                                     {hasParameters
                                       ? isExpanded
-                                        ? "Hide Parameters"
-                                        : "Show Parameters"
-                                      : "No Parameters"}
+                                        ? "Hide Inputs"
+                                        : "Show Inputs"
+                                      : "No Inputs"}
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>

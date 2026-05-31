@@ -40,7 +40,7 @@ function ParameterDisplayInline({
   searchQuery,
   keywordMatchesParameter,
   showDescription = true,
-  emptyMessage = "No parameters for this run",
+  emptyMessage = "No inputs for this run",
   className,
 }: ParameterDisplayInlineProps) {
   if (!parameters || parameters.length === 0) {

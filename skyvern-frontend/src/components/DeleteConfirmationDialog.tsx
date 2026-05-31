@@ -55,8 +55,7 @@ function DeleteConfirmationDialog({
                           {" "}
                           (
                           {[
-                            block.hasParameterKeyReference &&
-                              "parameter selector",
+                            block.hasParameterKeyReference && "input selector",
                             block.hasJinjaReference && "text field",
                           ]
                             .filter(Boolean)

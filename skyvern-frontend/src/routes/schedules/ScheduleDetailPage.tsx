@@ -496,7 +496,7 @@ function ScheduleDetailPage() {
 
           {hasUserFacingParameters(workflowParameters) && (
             <div className="rounded-lg border border-slate-700 p-4">
-              <h3 className="mb-4 text-sm text-slate-400">Agent Parameters</h3>
+              <h3 className="mb-4 text-sm text-slate-400">Agent Inputs</h3>
               <div className="space-y-2">
                 {workflowParameters
                   .filter(isScheduleParameter)

@@ -80,7 +80,7 @@ function LoginEditorBody({
           </div>
           {isFirstWorkflowBlock ? (
             <div className="flex justify-end text-xs text-slate-400">
-              Tip: Use the {"+"} button to add parameters!
+              Tip: Use the {"+"} button to add inputs!
             </div>
           ) : null}
         </div>

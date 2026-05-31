@@ -570,7 +570,7 @@ function RunWorkflowForm({
         <header className="flex items-end justify-between gap-4">
           <div className="space-y-5">
             <h1 className="text-3xl">
-              Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
+              Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
             <h2 className="text-lg text-slate-400">
               Fill the placeholder values that you have linked throughout your
@@ -652,7 +652,7 @@ function RunWorkflowForm({
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Input Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
           </header>
           {workflowParameters?.map((parameter) => {
             return (
@@ -790,7 +790,7 @@ function RunWorkflowForm({
             );
           })}
           {workflowParameters.length === 0 && (
-            <div>This agent doesn't have any input parameters</div>
+            <div>This agent doesn't have any inputs</div>
           )}
         </div>
 

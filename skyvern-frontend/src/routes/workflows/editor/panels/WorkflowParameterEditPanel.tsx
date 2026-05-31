@@ -120,7 +120,7 @@ function validateParameterKey(key: string): string | null {
   const validIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
   if (!validIdentifierRegex.test(key)) {
     if (/^[0-9]/.test(key)) {
-      return "Key cannot start with a digit. Parameter keys must start with a letter or underscore.";
+      return "Key cannot start with a digit. Input keys must start with a letter or underscore.";
     }
     if (key.includes("/")) {
       return "Key cannot contain '/' characters. Use underscores instead (e.g., 'State_or_Province' instead of 'State/Province').";
@@ -540,7 +540,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     URL Parameter Key
                   </Label>
-                  <HelpTooltip content="Optional. The agent parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
+                  <HelpTooltip content="Optional. The agent input key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
                 </div>
                 <Input
                   value={urlParameterKey}
@@ -552,7 +552,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports agent parameters." />
+                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -564,7 +564,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports agent parameters." />
+                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
@@ -625,7 +625,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Collection containing the credit card. Supports agent parameters." />
+                  <HelpTooltip content="Collection containing the credit card. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -637,7 +637,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Credit card item ID. Supports agent parameters." />
+                  <HelpTooltip content="Credit card item ID. Supports agent inputs." />
                 </div>
                 <Input
                   value={sensitiveInformationItemId}
@@ -657,7 +657,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Vault ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent parameters." />
+                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={opVaultId}
@@ -669,7 +669,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Item ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent parameters." />
+                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={opItemId}
@@ -778,7 +778,7 @@ function WorkflowParameterEditPanel({
 
           {type === "context" && (
             <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Source Parameter</Label>
+              <Label className="text-xs text-slate-300">Source Input</Label>
               <SourceParameterKeySelector
                 value={sourceParameterKey}
                 onChange={setSourceParameterKey}
@@ -792,7 +792,7 @@ function WorkflowParameterEditPanel({
                 if (!key) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameter",
+                    title: "Failed to save input",
                     description: "Key is required",
                   });
                   return;
@@ -800,7 +800,7 @@ function WorkflowParameterEditPanel({
                 if (keyValidationError) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameter",
+                    title: "Failed to save input",
                     description: keyValidationError,
                   });
                   return;
@@ -808,7 +808,7 @@ function WorkflowParameterEditPanel({
                 if (!isEditMode && reservedKeys.includes(key)) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to add parameter",
+                    title: "Failed to add input",
                     description: `${key} is reserved, please use another key`,
                   });
                   return;
@@ -824,7 +824,7 @@ function WorkflowParameterEditPanel({
                 ) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameter",
+                    title: "Failed to save input",
                     description: `"${key}" is reserved for auto-generated credential variables. Please choose a different key.`,
                   });
                   return;
@@ -841,7 +841,7 @@ function WorkflowParameterEditPanel({
                     } catch (e) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description: "Invalid JSON for default value",
                       });
                       return;
@@ -890,8 +890,8 @@ function WorkflowParameterEditPanel({
                   if (!sourceParameterKey) {
                     toast({
                       variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Source parameter key is required",
+                      title: "Failed to save input",
+                      description: "Source input key is required",
                     });
                     return;
                   }
@@ -914,7 +914,7 @@ function WorkflowParameterEditPanel({
                     if (!credentialId) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description: "Credential is required",
                       });
                       return;
@@ -940,7 +940,7 @@ function WorkflowParameterEditPanel({
                       if (errorMessage) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: errorMessage,
                         });
                         return;
@@ -968,7 +968,7 @@ function WorkflowParameterEditPanel({
                       if (!bitwardenCollectionId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Collection ID is required",
                         });
                         return;
@@ -992,7 +992,7 @@ function WorkflowParameterEditPanel({
                       if (!bitwardenCollectionId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Collection ID is required",
                         });
                         return;
@@ -1000,7 +1000,7 @@ function WorkflowParameterEditPanel({
                       if (!sensitiveInformationItemId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Item ID is required",
                         });
                         return;
@@ -1021,7 +1021,7 @@ function WorkflowParameterEditPanel({
                     if (opVaultId.trim() === "" || opItemId.trim() === "") {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description:
                           "1Password Vault ID and Item ID are required",
                       });
@@ -1046,7 +1046,7 @@ function WorkflowParameterEditPanel({
                     ) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to add parameter",
+                        title: "Failed to add input",
                         description:
                           "Azure Vault Name, Username Key and Password Key are required",
                       });

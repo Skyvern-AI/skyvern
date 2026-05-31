@@ -442,7 +442,7 @@ function EditorActionToolbar() {
         leadingIcon={<CalendarIcon className="h-5 w-5" />}
         iconOnly
       />
-      <PanelToggleButton content="parameters" label="Parameters" />
+      <PanelToggleButton content="parameters" label="Inputs" />
       <RunButton />
     </>
   );

@@ -60,7 +60,7 @@ function TextPromptBlockParameters({
       {parameters && parameters.length > 0 ? (
         <div className="flex gap-16">
           <div className="w-80">
-            <h1 className="text-lg">Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
           </div>
           <div className="flex w-full flex-col gap-3">
             {parameters.map((parameter) => (

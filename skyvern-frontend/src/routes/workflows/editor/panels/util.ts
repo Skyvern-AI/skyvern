@@ -7,7 +7,7 @@ export function validateBitwardenLoginCredential(
     return "Collection ID or Item ID is required";
   }
   if (collectionId && !urlParameterKey) {
-    return "URL Parameter Key is required when collection ID is used";
+    return "URL Input Key is required when collection ID is used";
   }
   return null;
 }
