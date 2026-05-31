@@ -29,8 +29,6 @@ BlockType = typing.Union[
         "human_interaction",
         "print_page",
         "workflow_trigger",
-        "google_sheets_read",
-        "google_sheets_write",
     ],
     typing.Any,
 ]

@@ -22,19 +22,15 @@ class Artifact(UniversalBaseModel):
     artifact_type: ArtifactType
     uri: str
     bundle_key: typing.Optional[str] = None
-    checksum: typing.Optional[str] = None
-    file_size: typing.Optional[int] = None
     task_id: typing.Optional[str] = None
     step_id: typing.Optional[str] = None
     workflow_run_id: typing.Optional[str] = None
     workflow_run_block_id: typing.Optional[str] = None
     run_id: typing.Optional[str] = None
-    browser_session_id: typing.Optional[str] = None
     observer_cruise_id: typing.Optional[str] = None
     observer_thought_id: typing.Optional[str] = None
     ai_suggestion_id: typing.Optional[str] = None
     signed_url: typing.Optional[str] = None
-    archived: typing.Optional[bool] = None
     organization_id: str
 
     if IS_PYDANTIC_V2:

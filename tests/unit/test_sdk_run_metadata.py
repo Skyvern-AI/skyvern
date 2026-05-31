@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from skyvern.client import AsyncSkyvern, Skyvern
-from skyvern.client.types.workflow_run_request_output import WorkflowRunRequestOutput as WorkflowRunRequest
+from skyvern.client.types.workflow_run_request import WorkflowRunRequest
 
 
 def test_workflow_run_request_accepts_run_metadata() -> None:

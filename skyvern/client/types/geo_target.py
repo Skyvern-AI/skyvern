@@ -8,7 +8,17 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 
 class GeoTarget(UniversalBaseModel):
     """
-    Granular proxy geo-targeting request with country, optional subdivision, and optional city.
+    Granular geographic targeting for proxy selection.
+
+    Supports country, subdivision (state/region), and city level targeting.
+    Uses ISO 3166-1 alpha-2 for countries, ISO 3166-2 for subdivisions,
+    and GeoNames English names for cities.
+
+    Examples:
+        - {"country": "US"} - United States (same as RESIDENTIAL)
+        - {"country": "US", "subdivision": "CA"} - California, US
+        - {"country": "US", "subdivision": "NY", "city": "New York"} - New York City
+        - {"country": "GB", "city": "London"} - London, UK
     """
 
     country: str = pydantic.Field()

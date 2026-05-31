@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import {
   ActivityEntry,
@@ -482,6 +482,54 @@ function accentBg(accent: TurnSummary["accent"]): string {
   return "border-emerald-400/60 bg-emerald-500/15 text-emerald-300";
 }
 
+interface TurnHeadProps {
+  summary: TurnSummary;
+  expanded: boolean;
+  onClick: () => void;
+  subtitle?: ReactNode;
+}
+
+function TurnHead({ summary, expanded, onClick, subtitle }: TurnHeadProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={expanded}
+      className="flex w-full items-start gap-3 px-3.5 py-3 text-left"
+    >
+      <span
+        className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
+          summary.accent,
+        )}`}
+        aria-hidden="true"
+      >
+        {summary.glyph}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="mb-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span className="text-[14px] font-semibold tracking-tight text-slate-100">
+            {summary.headline}
+          </span>
+          {summary.stats.length ? (
+            <span className="text-[11.5px] text-slate-400">
+              {summary.stats.join(" · ")}
+            </span>
+          ) : null}
+        </div>
+        {subtitle}
+      </div>
+      <span
+        className={`mt-1 shrink-0 text-[14px] text-slate-500 transition-transform ${
+          expanded ? "rotate-90" : ""
+        }`}
+        aria-hidden="true"
+      >
+        ›
+      </span>
+    </button>
+  );
+}
+
 interface RollupCardProps {
   turn: TurnNarrativeState;
   summary: TurnSummary;
@@ -497,31 +545,12 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
 
   return (
     <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-elevation2">
-      <button
-        type="button"
+      <TurnHead
+        summary={summary}
+        expanded={false}
         onClick={onExpand}
-        className="flex w-full items-start gap-3 px-3.5 py-3 text-left"
-      >
-        <span
-          className={`flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full border text-[12px] font-bold ${accentBg(
-            summary.accent,
-          )}`}
-          aria-hidden="true"
-        >
-          {summary.glyph}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="mb-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-            <span className="text-[14px] font-semibold tracking-tight text-slate-100">
-              {summary.headline}
-            </span>
-            {summary.stats.length ? (
-              <span className="text-[11.5px] text-slate-400">
-                {summary.stats.join(" · ")}
-              </span>
-            ) : null}
-          </div>
-          {closing ? (
+        subtitle={
+          closing ? (
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
                 summary.isFail ? "text-rose-200/90" : "text-slate-400"
@@ -529,15 +558,9 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
             >
               {summary.isQA ? truncate(closing, 90) : closing}
             </div>
-          ) : null}
-        </div>
-        <span
-          className="mt-1 shrink-0 text-[14px] text-slate-500"
-          aria-hidden="true"
-        >
-          ›
-        </span>
-      </button>
+          ) : null
+        }
+      />
 
       {showCommit ? (
         <div className="border-t border-white/5 pb-3 pl-[52px] pr-3.5 pt-2.5">
@@ -603,11 +626,17 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
 
 interface DetailViewProps {
   turn: TurnNarrativeState;
+  summary: TurnSummary;
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
 }
 
-function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
+function DetailView({
+  turn,
+  summary,
+  onCollapse,
+  onBlockSelect,
+}: DetailViewProps) {
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -622,17 +651,9 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
   );
 
   return (
-    <div className="relative flex flex-col gap-2.5">
+    <div className="flex flex-col gap-2.5">
       {onCollapse ? (
-        <button
-          type="button"
-          className="absolute -top-1 right-0 flex h-6 w-6 -rotate-90 items-center justify-center rounded-md text-[16px] text-slate-400 hover:bg-slate-700/60 hover:text-slate-100"
-          onClick={onCollapse}
-          aria-label="Collapse turn"
-          title="Collapse turn"
-        >
-          ›
-        </button>
+        <TurnHead summary={summary} expanded onClick={onCollapse} />
       ) : null}
 
       {showDesign ? (
@@ -714,6 +735,7 @@ export function NarrativeView({
   return (
     <DetailView
       turn={turn}
+      summary={summary}
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
     />

@@ -4,10 +4,10 @@ import typing
 
 import pydantic
 from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
-from .workflow_run_request_output_proxy_location import WorkflowRunRequestOutputProxyLocation
+from .workflow_run_request_proxy_location import WorkflowRunRequestProxyLocation
 
 
-class WorkflowRunRequestOutput(UniversalBaseModel):
+class WorkflowRunRequest(UniversalBaseModel):
     workflow_id: str = pydantic.Field()
     """
     ID of the workflow to run. Workflow ID starts with `wpid_`.
@@ -23,7 +23,7 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     The title for this workflow run
     """
 
-    proxy_location: typing.Optional[WorkflowRunRequestOutputProxyLocation] = pydantic.Field(default=None)
+    proxy_location: typing.Optional[WorkflowRunRequestProxyLocation] = pydantic.Field(default=None)
     """
     
     Geographic Proxy location to route the browser traffic through. This is only available in Skyvern Cloud.
@@ -40,7 +40,6 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     - RESIDENTIAL_NZ: New Zealand
     - RESIDENTIAL_PH: Philippines
     - RESIDENTIAL_KR: South Korea
-    - RESIDENTIAL_SA: Saudi Arabia
     - RESIDENTIAL_ZA: South Africa
     - RESIDENTIAL_AR: Argentina
     - RESIDENTIAL_AU: Australia
@@ -57,8 +56,6 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
     - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
     - NONE: No proxy
-    
-    For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
      Can also be a GeoTarget object for granular city/state targeting: {"country": "US", "subdivision": "CA", "city": "San Francisco"}
     """
 
@@ -104,11 +101,6 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     The extra HTTP headers for the requests in browser.
     """
 
-    cdp_connect_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
-    """
-    HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Use this for browser-provider auth (e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers are NEVER forwarded to target websites.
-    """
-
     browser_address: typing.Optional[str] = pydantic.Field(default=None)
     """
     The CDP address for the workflow run.
@@ -124,7 +116,7 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
     Whether to run the workflow with agent or code. Null inherits from the workflow setting.
     """
 
-    run_metadata: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)
+    run_metadata: typing.Optional[typing.Dict[str, str]] = pydantic.Field(default=None)
     """
     String key/value metadata to attach to this workflow run for analytics tag filtering.
     """

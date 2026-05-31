@@ -41,7 +41,6 @@ class WorkflowRunBlock(UniversalBaseModel):
     created_at: dt.datetime
     modified_at: dt.datetime
     include_action_history_in_verification: typing.Optional[bool] = None
-    include_extracted_text: typing.Optional[bool] = None
     duration: typing.Optional[float] = None
     loop_values: typing.Optional[typing.List[typing.Optional[typing.Any]]] = None
     current_value: typing.Optional[str] = None

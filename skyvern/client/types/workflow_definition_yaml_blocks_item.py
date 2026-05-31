@@ -14,7 +14,6 @@ from .extraction_block_yaml_data_schema import ExtractionBlockYamlDataSchema
 from .file_storage_type import FileStorageType
 from .file_type import FileType
 from .for_loop_block_yaml_data_schema import ForLoopBlockYamlDataSchema
-from .google_sheets_write_block_yaml_write_mode import GoogleSheetsWriteBlockYamlWriteMode
 from .pdf_format import PdfFormat
 from .run_engine import RunEngine
 from .task_block_yaml_data_schema import TaskBlockYamlDataSchema
@@ -26,7 +25,6 @@ class WorkflowDefinitionYamlBlocksItem_Action(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -57,7 +55,6 @@ class WorkflowDefinitionYamlBlocksItem_Code(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     code: str
     parameter_keys: typing.Optional[typing.List[str]] = None
@@ -78,7 +75,6 @@ class WorkflowDefinitionYamlBlocksItem_Conditional(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     branch_conditions: typing.Optional[typing.List[BranchConditionYaml]] = None
 
@@ -98,7 +94,6 @@ class WorkflowDefinitionYamlBlocksItem_DownloadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
@@ -118,7 +113,6 @@ class WorkflowDefinitionYamlBlocksItem_Extraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     data_extraction_goal: str
     url: typing.Optional[str] = None
@@ -146,7 +140,6 @@ class WorkflowDefinitionYamlBlocksItem_FileDownload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
@@ -178,7 +171,6 @@ class WorkflowDefinitionYamlBlocksItem_FileUpload(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     storage_type: typing.Optional[FileStorageType] = None
     s3bucket: typing_extensions.Annotated[typing.Optional[str], FieldMetadata(alias="s3_bucket")] = None
@@ -207,7 +199,6 @@ class WorkflowDefinitionYamlBlocksItem_FileUrlParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     file_type: typing.Optional[FileType] = None
@@ -229,7 +220,6 @@ class WorkflowDefinitionYamlBlocksItem_ForLoop(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockYamlLoopBlocksItem"]
     loop_over_parameter_key: typing.Optional[str] = None
@@ -247,60 +237,8 @@ class WorkflowDefinitionYamlBlocksItem_ForLoop(UniversalBaseModel):
             extra = pydantic.Extra.allow
 
 
+from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
 from .for_loop_block_yaml_loop_blocks_item import ForLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
-
-
-class WorkflowDefinitionYamlBlocksItem_GoogleSheetsRead(UniversalBaseModel):
-    block_type: typing.Literal["google_sheets_read"] = "google_sheets_read"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    spreadsheet_url: str
-    sheet_name: typing.Optional[str] = None
-    range: typing.Optional[str] = None
-    credential_id: typing.Optional[str] = None
-    has_header_row: typing.Optional[bool] = None
-    parameter_keys: typing.Optional[typing.List[str]] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-class WorkflowDefinitionYamlBlocksItem_GoogleSheetsWrite(UniversalBaseModel):
-    block_type: typing.Literal["google_sheets_write"] = "google_sheets_write"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    spreadsheet_url: str
-    sheet_name: typing.Optional[str] = None
-    range: typing.Optional[str] = None
-    credential_id: typing.Optional[str] = None
-    write_mode: typing.Optional[GoogleSheetsWriteBlockYamlWriteMode] = None
-    values: typing.Optional[str] = None
-    column_mapping: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
-    create_sheet_if_missing: typing.Optional[bool] = None
-    parameter_keys: typing.Optional[typing.List[str]] = None
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
 
 
 class WorkflowDefinitionYamlBlocksItem_GotoUrl(UniversalBaseModel):
@@ -309,7 +247,6 @@ class WorkflowDefinitionYamlBlocksItem_GotoUrl(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: str
 
@@ -329,7 +266,6 @@ class WorkflowDefinitionYamlBlocksItem_HttpRequest(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     method: typing.Optional[str] = None
     url: typing.Optional[str] = None
@@ -358,7 +294,6 @@ class WorkflowDefinitionYamlBlocksItem_HumanInteraction(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     instructions: typing.Optional[str] = None
     positive_descriptor: typing.Optional[str] = None
@@ -385,7 +320,6 @@ class WorkflowDefinitionYamlBlocksItem_Login(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -418,7 +352,6 @@ class WorkflowDefinitionYamlBlocksItem_Navigation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     navigation_goal: str
     url: typing.Optional[str] = None
@@ -454,7 +387,6 @@ class WorkflowDefinitionYamlBlocksItem_PdfParser(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     file_url: str
     json_schema: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
@@ -475,7 +407,6 @@ class WorkflowDefinitionYamlBlocksItem_PrintPage(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     include_timestamp: typing.Optional[bool] = None
     custom_filename: typing.Optional[str] = None
@@ -500,7 +431,6 @@ class WorkflowDefinitionYamlBlocksItem_SendEmail(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     smtp_host_secret_parameter_key: str
     smtp_port_secret_parameter_key: str
@@ -528,7 +458,6 @@ class WorkflowDefinitionYamlBlocksItem_Task(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     url: typing.Optional[str] = None
     title: typing.Optional[str] = None
@@ -566,7 +495,6 @@ class WorkflowDefinitionYamlBlocksItem_TaskV2(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     prompt: str
     url: typing.Optional[str] = None
@@ -592,7 +520,6 @@ class WorkflowDefinitionYamlBlocksItem_TextPrompt(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     llm_key: typing.Optional[str] = None
     prompt: str
@@ -615,7 +542,6 @@ class WorkflowDefinitionYamlBlocksItem_UploadToS3(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     path: typing.Optional[str] = None
 
@@ -635,7 +561,6 @@ class WorkflowDefinitionYamlBlocksItem_Validation(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     complete_criterion: typing.Optional[str] = None
     terminate_criterion: typing.Optional[str] = None
@@ -659,9 +584,32 @@ class WorkflowDefinitionYamlBlocksItem_Wait(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     wait_sec: typing.Optional[int] = None
+
+    if IS_PYDANTIC_V2:
+        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
+    else:
+
+        class Config:
+            frozen = True
+            smart_union = True
+            extra = pydantic.Extra.allow
+
+
+class WorkflowDefinitionYamlBlocksItem_WorkflowTrigger(UniversalBaseModel):
+    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
+    label: str
+    next_block_label: typing.Optional[str] = None
+    continue_on_failure: typing.Optional[bool] = None
+    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    next_loop_on_failure: typing.Optional[bool] = None
+    workflow_permanent_id: str
+    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
+    wait_for_completion: typing.Optional[bool] = None
+    browser_session_id: typing.Optional[str] = None
+    use_parent_browser_session: typing.Optional[bool] = None
+    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -679,40 +627,9 @@ class WorkflowDefinitionYamlBlocksItem_WhileLoop(UniversalBaseModel):
     next_block_label: typing.Optional[str] = None
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
-    loop_blocks: typing.List["WhileLoopBlockYamlLoopBlocksItem"]
+    loop_blocks: typing.List["WorkflowDefinitionYamlBlocksItem"]
     condition: BranchCriteriaYaml
-
-    if IS_PYDANTIC_V2:
-        model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
-    else:
-
-        class Config:
-            frozen = True
-            smart_union = True
-            extra = pydantic.Extra.allow
-
-
-from .for_loop_block_yaml import ForLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml import WhileLoopBlockYaml  # noqa: E402, F401, I001
-from .while_loop_block_yaml_loop_blocks_item import WhileLoopBlockYamlLoopBlocksItem  # noqa: E402, F401, I001
-
-
-class WorkflowDefinitionYamlBlocksItem_WorkflowTrigger(UniversalBaseModel):
-    block_type: typing.Literal["workflow_trigger"] = "workflow_trigger"
-    label: str
-    next_block_label: typing.Optional[str] = None
-    continue_on_failure: typing.Optional[bool] = None
-    model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    ignore_workflow_system_prompt: typing.Optional[bool] = None
-    next_loop_on_failure: typing.Optional[bool] = None
-    workflow_permanent_id: str
-    payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
-    wait_for_completion: typing.Optional[bool] = None
-    browser_session_id: typing.Optional[str] = None
-    use_parent_browser_session: typing.Optional[bool] = None
-    parameter_keys: typing.Optional[typing.List[str]] = None
 
     if IS_PYDANTIC_V2:
         model_config: typing.ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(extra="allow", frozen=True)  # type: ignore # Pydantic v2
@@ -734,8 +651,6 @@ WorkflowDefinitionYamlBlocksItem = typing.Union[
     WorkflowDefinitionYamlBlocksItem_FileUpload,
     WorkflowDefinitionYamlBlocksItem_FileUrlParser,
     WorkflowDefinitionYamlBlocksItem_ForLoop,
-    WorkflowDefinitionYamlBlocksItem_GoogleSheetsRead,
-    WorkflowDefinitionYamlBlocksItem_GoogleSheetsWrite,
     WorkflowDefinitionYamlBlocksItem_GotoUrl,
     WorkflowDefinitionYamlBlocksItem_HttpRequest,
     WorkflowDefinitionYamlBlocksItem_HumanInteraction,
