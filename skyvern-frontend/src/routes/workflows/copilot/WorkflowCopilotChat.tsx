@@ -1579,7 +1579,6 @@ export function WorkflowCopilotChat({
                   <NarrativeView
                     turn={message.narrative}
                     onBlockSelect={onBlockSelect}
-                    defaultExpanded={isLastMessage}
                   />
                   {showProposalActions && proposedWorkflow ? (
                     <div className="flex flex-wrap gap-2 pl-1">
