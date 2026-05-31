@@ -36,7 +36,11 @@ import { defaultWorkflowRequest } from "@/routes/workflows/defaultWorkflowReques
 import { useCreateWorkflowMutation } from "@/routes/workflows/hooks/useCreateWorkflowMutation";
 import { shouldDefaultRecipesOpen } from "./sidebarDefaults";
 
-function SideNav() {
+type Props = {
+  collapsed?: boolean;
+};
+
+function SideNav({ collapsed }: Props = {}) {
   const createWorkflowMutation = useCreateWorkflowMutation();
   const navItems: Array<SidebarNavItem> = [
     {
@@ -228,7 +232,7 @@ function SideNav() {
     },
   ];
 
-  return <SidebarTreeNav items={navItems} />;
+  return <SidebarTreeNav items={navItems} collapsed={collapsed} />;
 }
 
 export { SideNav };

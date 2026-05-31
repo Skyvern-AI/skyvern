@@ -2,6 +2,6 @@
 
 import typing
 
-SkyvernSchemasRunBlocksCredentialType = typing.Union[
+SkyvernSchemasCredentialTypeCredentialType = typing.Union[
     typing.Literal["skyvern", "bitwarden", "1password", "azure_vault"], typing.Any
 ]

@@ -151,6 +151,20 @@ describe("SideNav", () => {
     ).toEqual(storedState);
   });
 
+  it("renders expanded navigation when collapsed override is false despite store", () => {
+    useSidebarStore.setState({ collapsed: true });
+    setViewportHeight(1024);
+
+    render(
+      <MemoryRouter>
+        <SideNav collapsed={false} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("button", { name: /Agents/i })).toBeTruthy();
+    expect(screen.queryByTitle("Agents")).toBeNull();
+  });
+
   it("shows clickable parent headers in collapsed popout menus", async () => {
     useSidebarStore.setState({ collapsed: true });
 

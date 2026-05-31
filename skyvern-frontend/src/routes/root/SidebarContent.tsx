@@ -41,7 +41,7 @@ function SidebarContent({ useCollapsedState }: Props) {
           "px-3": !collapsed,
         })}
       >
-        <SideNav />
+        <SideNav collapsed={collapsed} />
       </div>
       {!sidebarHidden ? <SidebarResourceLinks collapsed={collapsed} /> : null}
       <div
@@ -54,20 +54,22 @@ function SidebarContent({ useCollapsedState }: Props) {
         )}
       >
         {!collapsed ? <ThemeToggle /> : null}
-        <Button
-          size="icon"
-          variant="ghost"
-          className="size-8 text-neutral-500 hover:bg-neutral-200/70 hover:text-neutral-950 dark:hover:bg-white/[0.04] dark:hover:text-neutral-200"
-          onClick={() => {
-            setCollapsed(!collapsed);
-          }}
-        >
-          {collapsed ? (
-            <ChevronRightIcon className="h-6 w-6" />
-          ) : (
-            <ChevronLeftIcon className="hidden h-6 w-6 lg:block" />
-          )}
-        </Button>
+        {useCollapsedState ? (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8 text-neutral-500 hover:bg-neutral-200/70 hover:text-neutral-950 dark:hover:bg-white/[0.04] dark:hover:text-neutral-200"
+            onClick={() => {
+              setCollapsed(!collapsed);
+            }}
+          >
+            {collapsed ? (
+              <ChevronRightIcon className="h-6 w-6" />
+            ) : (
+              <ChevronLeftIcon className="h-6 w-6" />
+            )}
+          </Button>
+        ) : null}
       </div>
     </div>
   );

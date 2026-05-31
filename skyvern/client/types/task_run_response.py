@@ -8,7 +8,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .file_info import FileInfo
 from .run_status import RunStatus
 from .script_run_response import ScriptRunResponse
-from .task_run_request import TaskRunRequest
+from .task_run_request_output import TaskRunRequestOutput
 from .task_run_response_output import TaskRunResponseOutput
 
 
@@ -36,6 +36,11 @@ class TaskRunResponse(UniversalBaseModel):
     recording_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     URL to the recording of the run
+    """
+
+    recording_archived: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    True when the recording exists but has been archived to cold storage and is not currently accessible.
     """
 
     screenshot_urls: typing.Optional[typing.List[str]] = pydantic.Field(default=None)
@@ -108,7 +113,7 @@ class TaskRunResponse(UniversalBaseModel):
     Total number of steps executed in this run
     """
 
-    run_request: typing.Optional[TaskRunRequest] = pydantic.Field(default=None)
+    run_request: typing.Optional[TaskRunRequestOutput] = pydantic.Field(default=None)
     """
     The original request parameters used to start this task run
     """

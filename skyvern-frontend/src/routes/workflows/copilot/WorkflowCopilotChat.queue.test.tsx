@@ -157,6 +157,7 @@ async function completeOldestStream(message: string) {
 beforeEach(() => {
   // jsdom has no layout engine.
   HTMLElement.prototype.scrollIntoView = vi.fn();
+  HTMLElement.prototype.scrollTo = vi.fn();
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();

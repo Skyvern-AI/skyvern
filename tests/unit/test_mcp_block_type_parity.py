@@ -94,22 +94,7 @@ class BlockDriftEntry:
 # Allowlist: block types present in the backend but not yet regenerated into
 # the vendored Fern SDK. Run `fern generate` using the Skyvern Cloud-only
 # runbook to resync, then remove the entry here.
-_KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = (
-    BlockDriftEntry(
-        block_type="google_sheets_read",
-        ticket="SKY-9227",
-        owner="@wintonzheng",
-        added_at=date(2026, 4, 23),
-        notes="Clears with `google_sheets_write` at the next Fern SDK regeneration.",
-    ),
-    BlockDriftEntry(
-        block_type="google_sheets_write",
-        ticket="SKY-9227",
-        owner="@wintonzheng",
-        added_at=date(2026, 4, 23),
-        notes="Clears with `google_sheets_read` at the next Fern SDK regeneration.",
-    ),
-)
+_KNOWN_DRIFT_ALLOWLIST: tuple[BlockDriftEntry, ...] = ()
 
 
 def _allowlisted_block_types() -> set[str]:

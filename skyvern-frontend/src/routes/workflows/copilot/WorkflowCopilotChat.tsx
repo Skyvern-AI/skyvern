@@ -2,6 +2,7 @@ import {
   useState,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useCallback,
   memo,
@@ -9,7 +10,7 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { ReloadIcon, Cross2Icon, ChevronDownIcon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -51,6 +52,7 @@ import {
   hydrateNarrativeFromPayload,
   parseUtcIsoMs,
 } from "./narrativeState";
+import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -371,11 +373,9 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
-  const hasScrolledOnLoad = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
     requiresLiveBrowser,
@@ -395,9 +395,27 @@ export function WorkflowCopilotChat({
   // messages, and so auto-send has a synchronous "history loaded" gate.
   const historyLoadedForRef = useRef<string | null>(null);
 
-  const scrollToBottom = (behavior: ScrollBehavior) => {
-    messagesEndRef.current?.scrollIntoView({ behavior });
-  };
+  const followSignature = useMemo(
+    () =>
+      computeFollowSignature(
+        messages,
+        narrative,
+        isLoading,
+        isLoadingHistory,
+        queuedPrompt,
+        Boolean(proposedWorkflow),
+      ),
+    [
+      messages,
+      narrative,
+      isLoading,
+      isLoadingHistory,
+      queuedPrompt,
+      proposedWorkflow,
+    ],
+  );
+  const { scrollRef, isPinned, jumpToLatest, repin } =
+    useStickToBottom<HTMLDivElement>(followSignature, { enabled: isOpen });
 
   const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
@@ -426,7 +444,7 @@ export function WorkflowCopilotChat({
     turnSnapshots.current.clear();
     pendingSubmitSnapshot.current = null;
     latestTurnId.current = null;
-    hasScrolledOnLoad.current = false;
+    repin();
   };
 
   const applyWorkflowUpdate = useCallback(
@@ -624,22 +642,6 @@ export function WorkflowCopilotChat({
   }, [messages.length, onMessageCountChange]);
 
   useEffect(() => {
-    if (!isOpen) {
-      hasScrolledOnLoad.current = false;
-      return;
-    }
-    if (isLoadingHistory) {
-      return;
-    }
-    if (!hasScrolledOnLoad.current) {
-      scrollToBottom("auto");
-      hasScrolledOnLoad.current = true;
-      return;
-    }
-    scrollToBottom("smooth");
-  }, [messages, isLoading, isLoadingHistory, isOpen]);
-
-  useEffect(() => {
     if (!workflowPermanentId) {
       setMessages([]);
       updateQueuedPrompt(null);
@@ -659,7 +661,7 @@ export function WorkflowCopilotChat({
 
     const fetchHistory = async () => {
       setIsLoadingHistory(true);
-      hasScrolledOnLoad.current = false;
+      repin();
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<WorkflowCopilotChatHistoryResponse>(
@@ -715,7 +717,7 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, updateQueuedPrompt, workflowPermanentId]);
+  }, [credentialGetter, repin, updateQueuedPrompt, workflowPermanentId]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -1533,156 +1535,166 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="space-y-3">
-          {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-            <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300">
-              <p className="font-semibold text-neutral-900 dark:text-neutral-100">
-                Start a new chat
-              </p>
-              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
-                Ask the copilot to draft or edit your agent. Provide a goal, the
-                target site, and any credentials it should use.
-              </p>
-              <p className="mt-2 text-neutral-500 dark:text-neutral-400">
-                Example: "Build an agent to find the top post on hackernews
-                today"
-              </p>
-            </div>
-          ) : null}
-          <ConvoAggregatePill
-            messages={messages}
-            isInFlight={
-              isLoading ||
-              (narrative.turnId !== null && narrative.terminal === null)
-            }
-          />
-          {messages.map((message, index) => {
-            const isLastMessage = index === messages.length - 1;
-            const showQueuedFooter =
-              isQueuedPromptWaiting && message.id === queuedPrompt?.id;
-            // Per-message frozen narrative. When an AI message carries a
-            // frozen narrative, render the narrative card stack in place
-            // of the legacy text bubble so the per-block cards survive
-            // subsequent turns. The Accept/Reject controls render only on
-            // the latest message AND while the proposal is pending review.
-            if (message.sender === "ai" && message.narrative) {
-              const showProposalActions =
-                isLastMessage && Boolean(proposedWorkflow);
+      <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} className="h-full overflow-y-auto p-4">
+          <div className="space-y-3">
+            {!isLoadingHistory && messages.length === 0 && !isLoading ? (
+              <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300">
+                <p className="font-semibold text-neutral-900 dark:text-neutral-100">
+                  Start a new chat
+                </p>
+                <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                  Ask the copilot to draft or edit your agent. Provide a goal,
+                  the target site, and any credentials it should use.
+                </p>
+                <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                  Example: "Build an agent to find the top post on hackernews
+                  today"
+                </p>
+              </div>
+            ) : null}
+            <ConvoAggregatePill
+              messages={messages}
+              isInFlight={
+                isLoading ||
+                (narrative.turnId !== null && narrative.terminal === null)
+              }
+            />
+            {messages.map((message, index) => {
+              const isLastMessage = index === messages.length - 1;
+              const showQueuedFooter =
+                isQueuedPromptWaiting && message.id === queuedPrompt?.id;
+              // Per-message frozen narrative. When an AI message carries a
+              // frozen narrative, render the narrative card stack in place
+              // of the legacy text bubble so the per-block cards survive
+              // subsequent turns. The Accept/Reject controls render only on
+              // the latest message AND while the proposal is pending review.
+              if (message.sender === "ai" && message.narrative) {
+                const showProposalActions =
+                  isLastMessage && Boolean(proposedWorkflow);
+                return (
+                  <div
+                    key={message.id}
+                    className="flex flex-col gap-2"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <NarrativeView
+                      turn={message.narrative}
+                      onBlockSelect={onBlockSelect}
+                    />
+                    {showProposalActions && proposedWorkflow ? (
+                      <div className="flex flex-wrap gap-2 pl-1">
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-brand/60 bg-brand/10 px-3 py-1 text-xs text-foreground hover:bg-brand/20"
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              }
+              const showProposedPanel = isLastMessage && proposedWorkflow;
               return (
-                <div
+                <MessageItem
                   key={message.id}
-                  className="flex flex-col gap-2"
-                  role="status"
-                  aria-live="polite"
-                >
-                  <NarrativeView
-                    turn={message.narrative}
-                    onBlockSelect={onBlockSelect}
-                    defaultExpanded={isLastMessage}
-                  />
-                  {showProposalActions && proposedWorkflow ? (
-                    <div className="flex flex-wrap gap-2 pl-1">
-                      <button
-                        type="button"
-                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                        className="rounded border border-brand/60 bg-brand/10 px-3 py-1 text-xs text-foreground hover:bg-brand/20"
-                      >
-                        Review
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                        className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
-                      >
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleAcceptWorkflow(proposedWorkflow, true)
-                        }
-                        className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
-                      >
-                        Always accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleRejectWorkflow}
-                        className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  ) : null}
-                </div>
+                  message={message}
+                  footer={
+                    showQueuedFooter ? (
+                      <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                        <ReloadIcon className="h-3 w-3 animate-spin" />
+                        <span>{queuedPromptWaitingStatus}</span>
+                      </div>
+                    ) : showProposedPanel ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-900 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:hover:bg-neutral-900"
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
+                        >
+                          Reject
+                        </button>
+                      </>
+                    ) : null
+                  }
+                />
               );
-            }
-            const showProposedPanel = isLastMessage && proposedWorkflow;
-            return (
-              <MessageItem
-                key={message.id}
-                message={message}
-                footer={
-                  showQueuedFooter ? (
-                    <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
-                      <ReloadIcon className="h-3 w-3 animate-spin" />
-                      <span>{queuedPromptWaitingStatus}</span>
-                    </div>
-                  ) : showProposedPanel ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                        className="rounded border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-900 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:hover:bg-neutral-900"
-                      >
-                        Review
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                        className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
-                      >
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleAcceptWorkflow(proposedWorkflow, true)
-                        }
-                        className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
-                      >
-                        Always accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleRejectWorkflow}
-                        className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
-                      >
-                        Reject
-                      </button>
-                    </>
-                  ) : null
-                }
-              />
-            );
-          })}
-          {/*
+            })}
+            {/*
             Bottom in-flight narrative bubble. Suppressed once the terminal
             RESPONSE has frozen the narrative into the latest AI message —
             otherwise the same turn would render twice.
           */}
-          {narrative.turnId !== null && narrative.terminal === null && (
-            <div
-              className="flex flex-col gap-2"
-              role="status"
-              aria-live="polite"
-            >
-              <NarrativeView turn={narrative} onBlockSelect={onBlockSelect} />
-            </div>
-          )}
-          <div ref={messagesEndRef} />
+            {narrative.turnId !== null && narrative.terminal === null && (
+              <div
+                className="flex flex-col gap-2"
+                role="status"
+                aria-live="polite"
+              >
+                <NarrativeView turn={narrative} onBlockSelect={onBlockSelect} />
+              </div>
+            )}
+          </div>
         </div>
+        {!isPinned ? (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-700 shadow-md hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+          >
+            <ChevronDownIcon className="h-3 w-3" />
+            Jump to latest
+          </button>
+        ) : null}
       </div>
 
       {/* Input */}

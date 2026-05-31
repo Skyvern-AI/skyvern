@@ -8,7 +8,7 @@ from ..core.pydantic_utilities import IS_PYDANTIC_V2, UniversalBaseModel
 from .file_info import FileInfo
 from .run_status import RunStatus
 from .script_run_response import ScriptRunResponse
-from .workflow_run_request import WorkflowRunRequest
+from .workflow_run_request_output import WorkflowRunRequestOutput
 from .workflow_run_response_output import WorkflowRunResponseOutput
 
 
@@ -36,6 +36,11 @@ class WorkflowRunResponse(UniversalBaseModel):
     recording_url: typing.Optional[str] = pydantic.Field(default=None)
     """
     URL to the recording of the run
+    """
+
+    recording_archived: typing.Optional[bool] = pydantic.Field(default=None)
+    """
+    True when the recording exists but has been archived to cold storage and is not currently accessible.
     """
 
     screenshot_urls: typing.Optional[typing.List[str]] = pydantic.Field(default=None)
@@ -118,7 +123,12 @@ class WorkflowRunResponse(UniversalBaseModel):
     Whether to fallback to AI if code run fails.
     """
 
-    run_request: typing.Optional[WorkflowRunRequest] = pydantic.Field(default=None)
+    script_id: typing.Optional[str] = pydantic.Field(default=None)
+    """
+    ID of the cached script used for this workflow run, if any.
+    """
+
+    run_request: typing.Optional[WorkflowRunRequestOutput] = pydantic.Field(default=None)
     """
     The original request parameters used to start this workflow run
     """
