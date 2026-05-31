@@ -26,5 +26,7 @@ export const BlockType = {
     HumanInteraction: "human_interaction",
     PrintPage: "print_page",
     WorkflowTrigger: "workflow_trigger",
+    GoogleSheetsRead: "google_sheets_read",
+    GoogleSheetsWrite: "google_sheets_write",
 } as const;
 export type BlockType = (typeof BlockType)[keyof typeof BlockType];

@@ -9,6 +9,7 @@ export interface PrintPageBlockYaml {
     next_block_label?: string;
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
     include_timestamp?: boolean;
     custom_filename?: string;

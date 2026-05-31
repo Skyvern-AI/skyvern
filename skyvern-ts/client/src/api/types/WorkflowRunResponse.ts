@@ -13,6 +13,8 @@ export interface WorkflowRunResponse {
     downloaded_files?: Skyvern.FileInfo[];
     /** URL to the recording of the run */
     recording_url?: string;
+    /** True when the recording exists but has been archived to cold storage and is not currently accessible. */
+    recording_archived?: boolean;
     /** List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot. */
     screenshot_urls?: string[];
     /** Reason for failure if the run failed or terminated */
@@ -45,8 +47,10 @@ export interface WorkflowRunResponse {
     run_with?: string;
     /** Whether to fallback to AI if code run fails. */
     ai_fallback?: boolean;
+    /** ID of the cached script used for this workflow run, if any. */
+    script_id?: string;
     /** The original request parameters used to start this workflow run */
-    run_request?: Skyvern.WorkflowRunRequest;
+    run_request?: Skyvern.WorkflowRunRequestOutput;
 }
 
 export namespace WorkflowRunResponse {

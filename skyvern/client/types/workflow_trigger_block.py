@@ -25,6 +25,7 @@ class WorkflowTriggerBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     workflow_permanent_id: str
     payload: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None

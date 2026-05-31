@@ -10,11 +10,14 @@ export interface WorkflowCreateYamlRequest {
     totp_verification_url?: string;
     totp_identifier?: string;
     persist_browser_session?: boolean;
+    browser_profile_id?: string;
     model?: Record<string, unknown>;
     workflow_definition: Skyvern.WorkflowDefinitionYaml;
     is_saved_task?: boolean;
     max_screenshot_scrolls?: number;
+    max_elapsed_time_minutes?: number;
     extra_http_headers?: Record<string, string | undefined>;
+    cdp_connect_headers?: Record<string, string | undefined>;
     status?: Skyvern.WorkflowStatus;
     run_with?: string;
     ai_fallback?: boolean;

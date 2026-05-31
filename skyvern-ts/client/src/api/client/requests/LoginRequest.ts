@@ -5,10 +5,12 @@ import type * as Skyvern from "../../index.js";
 /**
  * @example
  *     {
+ *         "x-user-agent": "x-user-agent",
  *         credential_type: "skyvern"
  *     }
  */
 export interface LoginRequest {
+    "x-user-agent"?: string;
     /** Website URL */
     url?: string;
     /** Webhook URL to send status updates */
@@ -27,10 +29,12 @@ export interface LoginRequest {
     browser_address?: string;
     /** Additional HTTP headers to include in requests */
     extra_http_headers?: Record<string, string | undefined>;
+    /** HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to a remote browser via browser_address. Never forwarded to target websites. */
+    cdp_connect_headers?: Record<string, string | undefined>;
     /** Maximum number of times to scroll for screenshots */
     max_screenshot_scrolling_times?: number;
     /** Where to get the credential from */
-    credential_type: Skyvern.SkyvernSchemasRunBlocksCredentialType;
+    credential_type: Skyvern.SkyvernSchemasCredentialTypeCredentialType;
     /** Login instructions. Skyvern has default prompt/instruction for login if this field is not provided. */
     prompt?: string;
     /** ID of the Skyvern credential to use for login. */

@@ -27,7 +27,9 @@ export type WhileLoopBlockYamlLoopBlocksItem =
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.HttpRequest
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.Conditional
     | Skyvern.WhileLoopBlockYamlLoopBlocksItem.PrintPage
-    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.WorkflowTrigger;
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.WorkflowTrigger
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.GoogleSheetsRead
+    | Skyvern.WhileLoopBlockYamlLoopBlocksItem.GoogleSheetsWrite;
 
 export namespace WhileLoopBlockYamlLoopBlocksItem {
     export interface Task extends Skyvern.TaskBlockYaml {
@@ -128,5 +130,13 @@ export namespace WhileLoopBlockYamlLoopBlocksItem {
 
     export interface WorkflowTrigger extends Skyvern.WorkflowTriggerBlockYaml {
         block_type: "workflow_trigger";
+    }
+
+    export interface GoogleSheetsRead extends Skyvern.GoogleSheetsReadBlockYaml {
+        block_type: "google_sheets_read";
+    }
+
+    export interface GoogleSheetsWrite extends Skyvern.GoogleSheetsWriteBlockYaml {
+        block_type: "google_sheets_write";
     }
 }

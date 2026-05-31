@@ -11,6 +11,7 @@ export interface LoginBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
     task_type?: string;
     url?: string;
@@ -32,6 +33,7 @@ export interface LoginBlock {
     complete_verification?: boolean;
     include_action_history_in_verification?: boolean;
     download_timeout?: number;
+    include_extracted_text?: boolean;
 }
 
 export namespace LoginBlock {

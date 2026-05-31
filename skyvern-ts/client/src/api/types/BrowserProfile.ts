@@ -5,6 +5,7 @@ export interface BrowserProfile {
     organization_id: string;
     name: string;
     description?: string;
+    source_browser_type?: string;
     created_at: string;
     modified_at: string;
     deleted_at?: string;

@@ -26,6 +26,7 @@ class ForLoopBlock(UniversalBaseModel):
     continue_on_failure: typing.Optional[bool] = None
     model: typing.Optional[typing.Dict[str, typing.Optional[typing.Any]]] = None
     disable_cache: typing.Optional[bool] = None
+    ignore_workflow_system_prompt: typing.Optional[bool] = None
     next_loop_on_failure: typing.Optional[bool] = None
     loop_blocks: typing.List["ForLoopBlockLoopBlocksItem"]
     loop_over: typing.Optional[ForLoopBlockLoopOver] = None
@@ -44,6 +45,15 @@ class ForLoopBlock(UniversalBaseModel):
 
 
 from .context_parameter import ContextParameter  # noqa: E402, F401, I001
-from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
+
+# Manual patch: Fern v4.31.1 emits bottom-cross-imports that deadlock at module
+# load (for_loop ↔ while_loop ↔ *_loop_blocks_item). Catch the mid-load
+# ImportError; the symmetric *_loop_blocks_item module back-resolves once both
+# unions are fully defined. Reapply on every regen — see fern_build_python_sdk.sh.
+try:
+    from .while_loop_block import WhileLoopBlock  # noqa: E402, F401, I001
+    from .for_loop_block_loop_blocks_item import ForLoopBlockLoopBlocksItem  # noqa: E402, F401, I001
+except ImportError:
+    pass
 
 update_forward_refs(ForLoopBlock)
