@@ -15,7 +15,7 @@ dependencies = [
 
 [tool.uv]
 override-dependencies = [
-    "authlib>=1.6.11",
+    "authlib>=1.7.1",
     "pyasn1>=0.6.3",
     "pyjwt>=2.12.0",
     "fastmcp>=3.2.0",
@@ -30,7 +30,7 @@ override-dependencies = [
     "pypdf>=6.10.2",
     "python-multipart>=0.0.26",
     "cryptography>=46.0.7",
-    "langsmith>=0.7.31",
+    "langsmith>=0.8.0",
     "pygments>=2.20.0",
 ]
 
