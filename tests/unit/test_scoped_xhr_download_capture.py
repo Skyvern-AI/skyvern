@@ -1,5 +1,6 @@
 """Tests for ScopedXhrDownloadCapture — action-scoped XHR download listener."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -188,3 +189,36 @@ class TestScopedXhrDownloadCapture:
         new_page.remove_listener.assert_called_once_with("response", capture._on_response)
         assert capture._extra_pages == []
         assert not capture._active
+
+    @pytest.mark.asyncio
+    async def test_drain_waits_for_inflight_write(self, tmp_path: Path) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+
+        body_gate = asyncio.Event()
+
+        response = _make_response()
+
+        async def slow_body() -> bytes:
+            await body_gate.wait()
+            return b"%PDF-1.4 fake"
+
+        response.body = slow_body
+
+        task = asyncio.ensure_future(capture._on_response(response))
+        await asyncio.sleep(0)
+
+        assert not (tmp_path / "report.pdf").exists()
+        assert not capture._drained.is_set()
+
+        body_gate.set()
+        await capture.drain()
+
+        assert (tmp_path / "report.pdf").exists()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_drain_noop_when_no_writes(self, tmp_path: Path) -> None:
+        page = _make_page()
+        capture = ScopedXhrDownloadCapture(page, tmp_path)
+        await capture.drain()
