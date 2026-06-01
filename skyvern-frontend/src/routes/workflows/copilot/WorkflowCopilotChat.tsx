@@ -1501,7 +1501,7 @@ export function WorkflowCopilotChat({
 
   return (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-neutral-200 bg-white text-neutral-900 shadow-2xl dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-100"
+      className="fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
       style={{
         left: `${position.x}px`,
         top: `${position.y}px`,
@@ -1511,10 +1511,10 @@ export function WorkflowCopilotChat({
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-neutral-200 px-4 py-2 dark:border-neutral-800"
+        className="flex cursor-move items-center justify-between border-b border-border px-4 py-2"
         onMouseDown={handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
+        <h3 className="text-sm font-semibold text-foreground">
           Agent Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
@@ -1522,19 +1522,17 @@ export function WorkflowCopilotChat({
             type="button"
             onClick={handleNewChat}
             onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-neutral-300 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+            className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             New chat
           </button>
-          <div className="h-2 w-2 rounded-full bg-green-500"></div>
-          <span className="text-xs text-neutral-500 dark:text-neutral-400">
-            Active
-          </span>
+          <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+          <span className="text-xs text-muted-foreground">Active</span>
           <button
             type="button"
             onClick={() => onClose?.()}
             onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-900 dark:hover:text-neutral-100"
+            className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             title="Close"
           >
             <Cross2Icon className="h-4 w-4" />
@@ -1547,15 +1545,15 @@ export function WorkflowCopilotChat({
         <div ref={scrollRef} className="h-full overflow-y-auto p-4">
           <div className="space-y-3">
             {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-              <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900/60 dark:text-neutral-300">
-                <p className="font-semibold text-neutral-900 dark:text-neutral-100">
+              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
+                <p className="font-semibold text-foreground">
                   Start a new chat
                 </p>
-                <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                <p className="mt-2 text-muted-foreground">
                   Ask the copilot to draft or edit your agent. Provide a goal,
                   the target site, and any credentials it should use.
                 </p>
-                <p className="mt-2 text-neutral-500 dark:text-neutral-400">
+                <p className="mt-2 text-muted-foreground">
                   Example: "Build an agent to find the top post on hackernews
                   today"
                 </p>
@@ -1596,7 +1594,7 @@ export function WorkflowCopilotChat({
                         <button
                           type="button"
                           onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                          className="rounded border border-brand/60 bg-brand/10 px-3 py-1 text-xs text-foreground hover:bg-brand/20"
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
                         >
                           Review
                         </button>
@@ -1635,7 +1633,7 @@ export function WorkflowCopilotChat({
                   message={message}
                   footer={
                     showQueuedFooter ? (
-                      <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
                         <ReloadIcon className="h-3 w-3 animate-spin" />
                         <span>{queuedPromptWaitingStatus}</span>
                       </div>
@@ -1644,14 +1642,14 @@ export function WorkflowCopilotChat({
                         <button
                           type="button"
                           onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                          className="rounded border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-900 hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:hover:bg-neutral-900"
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
                         >
                           Review
                         </button>
                         <button
                           type="button"
                           onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                          className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
                         >
                           Accept
                         </button>
@@ -1660,14 +1658,14 @@ export function WorkflowCopilotChat({
                           onClick={() =>
                             handleAcceptWorkflow(proposedWorkflow, true)
                           }
-                          className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
                         >
                           Always accept
                         </button>
                         <button
                           type="button"
                           onClick={handleRejectWorkflow}
-                          className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
                         >
                           Reject
                         </button>
@@ -1697,7 +1695,7 @@ export function WorkflowCopilotChat({
           <button
             type="button"
             onClick={jumpToLatest}
-            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-neutral-300 bg-white px-3 py-1 text-xs text-neutral-700 shadow-md hover:bg-neutral-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800"
+            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-slate-elevation3 px-3 py-1 text-xs text-foreground shadow-md hover:bg-slate-elevation4"
           >
             <ChevronDownIcon className="h-3 w-3" />
             Jump to latest
@@ -1706,9 +1704,9 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Input */}
-      <div className="border-t border-neutral-200 p-3 dark:border-neutral-800">
+      <div className="border-t border-border p-3">
         {browserStatusText ? (
-          <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
+          <div className="mb-2 text-xs text-muted-foreground">
             {browserStatusText}
           </div>
         ) : null}
@@ -1729,7 +1727,7 @@ export function WorkflowCopilotChat({
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm text-neutral-900 placeholder-neutral-400 focus:border-neutral-700 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:border-neutral-400"
+            className="flex-1 resize-none rounded-md border border-input bg-slate-elevation2 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
               minHeight: "38px",
               maxHeight: "150px",
@@ -1741,14 +1739,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={cancelQueuedPrompt}
                 title="Edit queued message"
-                className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Edit queued
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
+                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1758,14 +1756,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={() => handleSend()}
                 title="Queue for the next turn"
-                className="rounded-md border border-neutral-300 px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-900"
+                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Queue
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
+                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1774,14 +1772,14 @@ export function WorkflowCopilotChat({
             <button
               onClick={cancelQueuedPrompt}
               title="Edit queued prompt"
-              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
               Cancel
             </button>
           ) : (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-neutral-950 px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:bg-neutral-300"
+              className="rounded-md bg-cta px-4 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
             >
               Send
             </button>

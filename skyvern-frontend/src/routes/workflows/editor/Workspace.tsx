@@ -1854,13 +1854,13 @@ function Workspace({
                         ) : null}
                       </div>
                     )}
-                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-neutral-700 dark:text-neutral-300">
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
                       <WorkflowCopilotButton
                         ref={copilotButtonRef}
                         messageCount={copilotMessageCount}
                         onClick={() => setIsCopilotOpen((prev) => !prev)}
                       />
-                      <div className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
+                      <div className="flex items-center gap-2 text-muted-foreground">
                         <GlobeIcon /> Live Browser
                         <StreamModeBadge mode="vnc" />
                       </div>
@@ -1908,13 +1908,13 @@ function Workspace({
                           />
                         ) : null}
                       </div>
-                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-neutral-700 dark:text-neutral-300">
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
                         <WorkflowCopilotButton
                           ref={copilotButtonRef}
                           messageCount={copilotMessageCount}
                           onClick={() => setIsCopilotOpen((prev) => !prev)}
                         />
-                        <div className="flex items-center gap-2 text-neutral-700 dark:text-neutral-300">
+                        <div className="flex items-center gap-2 text-muted-foreground">
                           <GlobeIcon /> Live Browser
                           <StreamModeBadge mode="cdp" />
                         </div>
