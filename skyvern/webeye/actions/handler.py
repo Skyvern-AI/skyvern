@@ -2162,6 +2162,30 @@ def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
     return matched
 
 
+async def _wait_for_upload_processing(page: Page) -> None:
+    """Wait for page readiness signals after a file upload.
+
+    Covers upload-processing UI (spinners, progress bars, DOM updates) beyond
+    bare networkidle by reusing SkyvernFrame.wait_for_page_ready with
+    upload-tuned timeouts that keep worst-case well below the old 10-15 s sleep.
+    """
+    try:
+        # Settle delay: let the page react to the file-input change and mount
+        # upload UI (spinner, progress bar, XHR) before polling for readiness.
+        await asyncio.sleep(0.5)
+        skyvern_frame = await SkyvernFrame.create_instance(page)
+        await skyvern_frame.wait_for_page_ready(
+            loading_indicator_timeout_ms=3000,
+            network_idle_timeout_ms=3000,
+            dom_stable_ms=300,
+            dom_stability_timeout_ms=2000,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        LOG.info("Upload processing page-ready wait timed out, continuing")
+    except PlaywrightError:
+        LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
+
+
 @traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
@@ -2237,8 +2261,7 @@ async def handle_upload_file_action(
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            # Sleep for 10 seconds after uploading a file to let the page process it
-            await asyncio.sleep(10)
+            await _wait_for_upload_processing(page)
 
             return [ActionSuccess()]
         else:
@@ -3468,14 +3491,13 @@ async def chain_click(
             return action_results
 
     finally:
-        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
         if is_filechooser_trigger:
             # File chooser opened during this click — upload completed normally
             LOG.info("File chooser triggered during this click", action=action)
             if file:
-                await asyncio.sleep(15)
+                await _wait_for_upload_processing(page)
             if not has_pending:
                 page.remove_listener("filechooser", fc_func)
             if context is not None and context.pending_file_chooser is not None:
@@ -3511,7 +3533,7 @@ async def chain_click(
         ):
             # A previous UPLOAD_FILE's deferred listener was consumed by this click
             LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
-            await asyncio.sleep(15)
+            await _wait_for_upload_processing(page)
             context.cleanup_pending_file_chooser()
 
         else:
