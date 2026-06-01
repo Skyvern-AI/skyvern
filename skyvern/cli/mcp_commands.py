@@ -419,6 +419,7 @@ def _entry_kind(entry: dict | None) -> str:
 
     return "unsupported"
 
+
 def _extract_entry_api_key(entry: dict) -> str:
     headers = entry.get("headers", {})
     if isinstance(headers, dict):
@@ -578,7 +579,7 @@ def _entry_location(entry: dict) -> str:
         env = entry.get("environment")
         if env is None:
             env = entry.get("env", {})
-        if isinstance(env, dict):              
+        if isinstance(env, dict):
             return str(env.get("SKYVERN_BASE_URL", ""))
 
     if kind == "remote http":
