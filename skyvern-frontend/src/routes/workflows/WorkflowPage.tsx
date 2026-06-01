@@ -204,7 +204,7 @@ function WorkflowPage() {
               params.set("page", "1");
               setSearchParams(params, { replace: true });
             }}
-            placeholder="Search runs by parameter..."
+            placeholder="Search runs by input..."
             className="w-48 lg:w-72"
           />
           <StatusFilterDropdown
@@ -308,9 +308,7 @@ function WorkflowPage() {
                                   </Button>
                                 </TooltipTrigger>
                                 <TooltipContent>
-                                  {isExpanded
-                                    ? "Hide Parameters"
-                                    : "Show Parameters"}
+                                  {isExpanded ? "Hide Inputs" : "Show Inputs"}
                                 </TooltipContent>
                               </Tooltip>
                             </TooltipProvider>
@@ -478,7 +476,7 @@ function WorkflowRunParameters({
   if (!run || !run.parameters || Object.keys(run.parameters).length === 0) {
     return (
       <div className="ml-8 py-4 text-sm text-slate-400">
-        No parameters for this run
+        No inputs for this run
       </div>
     );
   }

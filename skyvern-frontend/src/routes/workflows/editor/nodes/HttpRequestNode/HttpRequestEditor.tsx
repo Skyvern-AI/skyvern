@@ -56,7 +56,7 @@ const httpMethods = [
 ];
 
 const urlTooltip =
-  "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference parameters.";
+  "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference inputs.";
 const methodTooltip = "The HTTP method to use for the request.";
 const headersTooltip =
   "HTTP headers to include with the request as JSON object.";
@@ -280,7 +280,7 @@ function HttpRequestEditorBody({
                     disabled={!editable}
                   >
                     <PlusIcon className="mr-1 h-3 w-3" />
-                    Add Parameter
+                    Add Input
                   </Button>
                 </PopoverTrigger>
                 <PopoverContent className="w-[22rem]">
@@ -470,7 +470,7 @@ function HttpRequestEditorBody({
                 The request will return response data including status, headers,
                 and body
               </li>
-              <li>Reference response data in later blocks with parameters</li>
+              <li>Reference response data in later blocks with inputs</li>
             </ul>
           </div>
         </div>

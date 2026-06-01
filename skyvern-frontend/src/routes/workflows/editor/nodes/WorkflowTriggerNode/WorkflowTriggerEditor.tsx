@@ -42,7 +42,7 @@ import {
 const workflowPermanentIdTooltip =
   "Select the agent to trigger when this block runs.";
 const payloadTooltip =
-  "Parameters to pass to the triggered agent. Values support Jinja2 templates like {{ some_parameter }}.";
+  "Inputs to pass to the triggered agent. Values support Jinja2 templates like {{ some_parameter }}.";
 const waitForCompletionTooltip =
   "If enabled, this block will wait for the triggered agent to complete before continuing to the next block. If disabled, the agent is triggered asynchronously and the parent continues immediately. When disabled, the triggered agent cannot continue in the same session because the parent may close it before the child finishes.";
 const browserSessionTooltip =
@@ -208,7 +208,7 @@ function WorkflowTriggerEditorBody({
           />
         ) : (
           <p className="text-xs text-slate-500">
-            Select a target agent to configure its input parameters here.
+            Select a target agent to configure its inputs here.
           </p>
         )}
       </div>

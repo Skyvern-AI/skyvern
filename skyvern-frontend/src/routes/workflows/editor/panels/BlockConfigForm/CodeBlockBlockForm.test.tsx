@@ -130,13 +130,13 @@ describe("CodeBlockBlockForm (SKY-9380)", () => {
   });
 
   test("renders the migrated fields the inline tile exposes", () => {
-    // Mirrors the inline CodeBlockNode JSX: Input Parameters set and a
+    // Mirrors the inline CodeBlockNode JSX: Inputs set and a
     // python CodeEditor. If a field disappears here it disappears from
     // the sidebar UI.
     mockGetNode.mockReturnValue(baseCodeBlockNode());
     render(<CodeBlockBlockForm blockId="code-1" />);
 
-    expect(screen.getByText("Input Parameters")).toBeDefined();
+    expect(screen.getByText("Inputs")).toBeDefined();
     expect(screen.getByText("Code Input")).toBeDefined();
     expect(screen.getByTestId("workflow-block-input-set")).toBeDefined();
     expect(screen.getByTestId("code-editor")).toBeDefined();

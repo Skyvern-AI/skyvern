@@ -9,6 +9,7 @@ export type ProposalDisposition =
   | "auto_applicable"
   | "review_untested"
   | "review_tested";
+export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
@@ -93,6 +94,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
+  response_type?: CopilotResponseType;
   proposal_disposition: ProposalDisposition;
   // Cancel forces explicit review.
   cancelled?: boolean;
@@ -100,6 +102,7 @@ export interface WorkflowCopilotStreamResponseUpdate {
   // turn-narrative envelope.
   turn_id?: string | null;
   narrative_summary?: string | null;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {

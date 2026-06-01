@@ -35,7 +35,7 @@ function TaskParameters() {
   }
 
   if (taskIsError || !task) {
-    return <div>Error loading parameters</div>;
+    return <div>Error loading inputs</div>;
   }
 
   return (

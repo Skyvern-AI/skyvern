@@ -344,6 +344,78 @@ describe("applyNarrativeEvent — terminal", () => {
     expect(s.narrativeSummary).toBe("full text");
   });
 
+  it("response uses backend error narrative payload when present", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      response({
+        message:
+          "Copilot hit an internal error before it could finish this turn.",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "build",
+          designStarted: true,
+          designEnded: true,
+          draft: null,
+          blocks: [
+            {
+              workflowRunBlockId: "wrb_1",
+              label: "draft_workflow",
+              blockType: "task",
+              state: "running",
+              lastSeenIteration: 0,
+              activity: [],
+              startedAt: "2026-05-25T00:00:01Z",
+              endedAt: null,
+            },
+          ],
+          terminal: "error",
+          terminalMessage:
+            "Copilot hit an internal error before it could finish this turn.",
+          narrativeSummary: "Copilot hit an internal error.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: "2026-05-25T00:00:00Z",
+          endedAt: "2026-05-25T00:00:05Z",
+        },
+      }),
+    );
+
+    expect(s.terminal).toBe("error");
+    expect(s.narrativeSummary).toBe("Copilot hit an internal error.");
+    expect(s.blocks).toHaveLength(1);
+    expect(s.blocks[0]?.state).toBe("failed");
+  });
+
+  it("response preserves ASK_QUESTION classification for summary mode", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      response({
+        message: "Please provide the exact registry URL.",
+        response_type: "ASK_QUESTION",
+        narrative_payload: {
+          turnId: "turn-1",
+          turnIndex: 0,
+          mode: "diagnose",
+          designStarted: true,
+          designEnded: true,
+          draft: null,
+          blocks: [],
+          terminal: "response",
+          terminalMessage: "Please provide the exact registry URL.",
+          narrativeSummary: "Please provide the exact registry URL.",
+          priorBlockCount: null,
+          designActivity: [],
+          startedAt: "2026-05-25T00:00:00Z",
+          endedAt: "2026-05-25T00:00:05Z",
+        },
+      }),
+    );
+
+    expect(s.responseType).toBe("ASK_QUESTION");
+    expect(effectiveMode(s)).toBe("clarify");
+  });
+
   it("response closes design even when design_end was never emitted (CORR-3)", () => {
     let s = applyNarrativeEvent(EMPTY_NARRATIVE, designStart());
     expect(s.designEnded).toBe(false);
@@ -410,6 +482,16 @@ describe("effectiveMode", () => {
       };
       expect(effectiveMode(s)).toBe(mode);
     }
+  });
+
+  it("reports clarify when backend classified the response as ASK_QUESTION", () => {
+    const s: TurnNarrativeState = {
+      ...EMPTY_NARRATIVE,
+      mode: "diagnose",
+      responseType: "ASK_QUESTION",
+      terminal: "response",
+    };
+    expect(effectiveMode(s)).toBe("clarify");
   });
 
   it("falls back to classifier mode while turn is still in-flight (no terminal)", () => {

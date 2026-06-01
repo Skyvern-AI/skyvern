@@ -13,7 +13,7 @@ const codeLead = `
 # This feature is currently in private beta. Please reach out to
 # founders@skyvern.com to get access.
 #
-# Any parameter you've added to the "Input Parameters" list is available in
+# Any input you've added to the "Inputs" list is available in
 # global scope, by the same name.
 #
 # Any top-level variable you create is assigned to the output of this block.

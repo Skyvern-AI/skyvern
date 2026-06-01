@@ -197,7 +197,7 @@ vi.mock("@/components/ui/accordion", () => {
 });
 
 // Radix Popover positions content relative to the trigger; flatten so the
-// "Add Parameter" content is always rendered and its onAdd is reachable.
+// "Add Input" content is always rendered and its onAdd is reachable.
 vi.mock("@/components/ui/popover", () => {
   const Pass = ({ children }: { children?: ReactNode }) => <>{children}</>;
   return {
