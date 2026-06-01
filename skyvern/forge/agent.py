@@ -5012,19 +5012,7 @@ class ForgeAgent:
             task_id=task.task_id,
         )
 
-        try:
-            speculative_plan = await speculative_task
-        except CancelledError:
-            LOG.debug("Speculative extract-actions cancelled after verification finished", step_id=step.step_id)
-            speculative_plan = None
-        except Exception:
-            LOG.warning(
-                "Speculative extract-actions failed, next step will run sequentially",
-                step_id=step.step_id,
-                exc_info=True,
-            )
-            speculative_plan = None
-
+        # Budget check must precede speculative_task await so exhausted steps cancel early.
         context = skyvern_context.current()
         override_max_steps_per_run = context.max_steps_override if context else None
         max_steps_per_run = (
@@ -5034,8 +5022,47 @@ class ForgeAgent:
             or settings.MAX_STEPS_PER_RUN
         )
 
-        workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
-        if workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]:
+        try:
+            workflow_run_budget = await self._check_workflow_run_step_budget(organization, task)
+        except Exception:
+            LOG.warning("Budget preflight failed, cancelling speculative task", exc_info=True)
+            speculative_task.cancel()
+            try:
+                await speculative_task
+            except (CancelledError, Exception):
+                pass
+            raise
+        budget_exhausted = workflow_run_budget is not None and workflow_run_budget[0] >= workflow_run_budget[1]
+        steps_exhausted = step.order + 1 >= max_steps_per_run
+
+        if budget_exhausted or steps_exhausted:
+            speculative_task.cancel()
+            LOG.info(
+                "Cancelled speculative task — budget or max-steps exhausted",
+                step_id=step.step_id,
+                budget_exhausted=budget_exhausted,
+                steps_exhausted=steps_exhausted,
+            )
+            try:
+                await speculative_task
+            except (CancelledError, Exception):
+                pass
+            speculative_plan = None
+        else:
+            try:
+                speculative_plan = await speculative_task
+            except CancelledError:
+                LOG.debug("Speculative extract-actions cancelled after verification finished", step_id=step.step_id)
+                speculative_plan = None
+            except Exception:
+                LOG.warning(
+                    "Speculative extract-actions failed, next step will run sequentially",
+                    step_id=step.step_id,
+                    exc_info=True,
+                )
+                speculative_plan = None
+
+        if budget_exhausted and workflow_run_budget is not None:
             last_step = await self._terminate_for_workflow_run_step_budget(
                 organization=organization,
                 task=task,
@@ -5046,7 +5073,7 @@ class ForgeAgent:
             )
             return False, last_step, None
 
-        if step.order + 1 >= max_steps_per_run:
+        if steps_exhausted:
             LOG.info(
                 "Step completed but max steps reached, marking task as failed",
                 step_order=step.order,
