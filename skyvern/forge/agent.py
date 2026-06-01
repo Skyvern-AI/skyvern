@@ -168,6 +168,19 @@ LOG = structlog.get_logger()
 EXTRACT_ACTION_TEMPLATE = "extract-action"
 
 
+def should_auto_download_pdf(pdf_src: str) -> bool:
+    context = skyvern_context.current()
+    if not context:
+        return True
+    return hashlib.sha256(pdf_src.encode()).hexdigest() not in context.downloaded_pdf_sources
+
+
+def mark_pdf_source_downloaded(pdf_src: str) -> None:
+    context = skyvern_context.current()
+    if context:
+        context.downloaded_pdf_sources.add(hashlib.sha256(pdf_src.encode()).hexdigest())
+
+
 class _PromptCeilingExceeded(Exception):
     """Internal signal: the cached split-template prompt blew past the
     PROMPT_HARD_CEILING_TOKENS budget. Raised inside the cached extract-action
@@ -1319,6 +1332,8 @@ class ForgeAgent:
         )
         prefetched_summary_task: asyncio.Task[dict[str, Any]] | None = None
         current_artifact_task: asyncio.Task | None = None
+        pdf_auto_download_src: str | None = None
+        pdf_auto_download_used_bytes: bool = False
 
         async def await_background_artifact_task() -> None:
             nonlocal current_artifact_task
@@ -1498,6 +1513,12 @@ class ForgeAgent:
                         pdf_src = scraped_page.check_pdf_viewer_embed()
                         if not pdf_src:
                             pdf_src = await scraped_page.check_pdf_iframe()
+                        if pdf_src and not should_auto_download_pdf(pdf_src):
+                            LOG.info(
+                                "PDF source already downloaded, skipping auto-download",
+                                step_id=step.step_id,
+                            )
+                            pdf_src = None
                         if pdf_src:
                             LOG.info("Generate DownloadFileAction for PDF viewer page", step_id=step.step_id)
                             pdf_bytes: bytes | None = None
@@ -1554,6 +1575,8 @@ class ForgeAgent:
                                     download=True,
                                 )
                             ]
+                            pdf_auto_download_src = pdf_src
+                            pdf_auto_download_used_bytes = pdf_bytes is not None
                         else:
                             otp_json_response, otp_actions = await self.handle_potential_OTP_actions(
                                 task, step, scraped_page, browser_state, json_response
@@ -1845,6 +1868,11 @@ class ForgeAgent:
                 action_results.extend(results)
                 # Check the last result for this action. If that succeeded, assume the entire action is successful
                 if results and results[-1].success:
+                    if pdf_auto_download_src and isinstance(action, DownloadFileAction):
+                        actually_downloaded = pdf_auto_download_used_bytes or results[-1].download_triggered
+                        if actually_downloaded:
+                            mark_pdf_source_downloaded(pdf_auto_download_src)
+                        pdf_auto_download_src = None
                     LOG.info(
                         "Action succeeded",
                         step_order=step.order,
