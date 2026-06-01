@@ -1453,6 +1453,15 @@ async def get_credentials(
         default=None,
         description="Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')",
     ),
+    credential_type: CredentialType | None = Query(
+        default=None,
+        description="Filter credentials by type (e.g. 'password', 'credit_card', 'secret')",
+    ),
+    search: str | None = Query(
+        default=None,
+        max_length=200,
+        description="Case-insensitive search across credential name, username, secret label, and card details",
+    ),
 ) -> list[CredentialResponse]:
     """Return non-sensitive metadata for all credentials (paginated).
 
@@ -1464,6 +1473,8 @@ async def get_credentials(
         page=page,
         page_size=page_size,
         vault_type=vault_type.value if isinstance(vault_type, CredentialVaultType) else None,
+        credential_type=credential_type.value if isinstance(credential_type, CredentialType) else None,
+        search=search if isinstance(search, str) else None,
     )
     return [_convert_to_response(credential) for credential in credentials]
 

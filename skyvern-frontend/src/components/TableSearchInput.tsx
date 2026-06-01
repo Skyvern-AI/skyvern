@@ -10,6 +10,7 @@ type TableSearchInputProps = {
   className?: string;
   inputClassName?: string;
   disabled?: boolean;
+  maxLength?: number;
 };
 
 function TableSearchInput({
@@ -19,6 +20,7 @@ function TableSearchInput({
   className,
   inputClassName,
   disabled,
+  maxLength,
 }: TableSearchInputProps) {
   function handleChange(event: ChangeEvent<HTMLInputElement>) {
     onChange(event.target.value);
@@ -34,6 +36,7 @@ function TableSearchInput({
         onChange={handleChange}
         placeholder={placeholder}
         disabled={disabled}
+        maxLength={maxLength}
         className={cn("pl-9", inputClassName)}
       />
     </div>
