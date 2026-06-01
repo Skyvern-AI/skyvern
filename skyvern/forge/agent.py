@@ -48,6 +48,7 @@ from skyvern.exceptions import (
     FailedToGetTOTPVerificationCode,
     FailedToNavigateToUrl,
     FailedToParseActionInstruction,
+    FailedToReloadPage,
     FailedToSendWebhook,
     FailedToTakeScreenshot,
     InvalidTaskStatusTransition,
@@ -3138,7 +3139,7 @@ class ForgeAgent:
             await browser_state.stop_page_loading()
         elif scrape_type == ScrapeType.RELOAD:
             LOG.info("Try to reload the page before scraping")
-            await browser_state.reload_page()
+            await browser_state.reload_page(degradation=True)
 
         max_screenshot_number = settings.MAX_NUM_SCREENSHOTS
         draw_boxes = True
@@ -3287,7 +3288,7 @@ class ForgeAgent:
                         engine=engine,
                     )
                     break
-                except (FailedToTakeScreenshot, ScrapingFailed) as e:
+                except (FailedToTakeScreenshot, ScrapingFailed, FailedToReloadPage) as e:
                     if idx < len(SCRAPE_TYPE_ORDER) - 1:
                         LOG.warning(
                             "Scrape attempt failed, will retry with next strategy",

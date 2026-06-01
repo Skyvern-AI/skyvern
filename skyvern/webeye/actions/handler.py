@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import time
 import urllib.parse
 import uuid
@@ -67,6 +68,7 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_download_dir,
     list_files_in_directory,
+    make_temp_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -533,6 +535,9 @@ class ScopedXhrDownloadCapture:
         self._saved: set[str] = set()
         self._extra_pages: list[Page] = []
         self._active = False
+        self._in_flight = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
 
     def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
         """Check if an XHR response carries a downloadable file body.
@@ -553,40 +558,52 @@ class ScopedXhrDownloadCapture:
         return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
 
     async def _on_response(self, response: Response) -> None:
+        self._in_flight += 1
+        self._drained.clear()
         try:
-            if response.request.resource_type not in ("xhr", "fetch"):
-                return
-            headers = response.headers
-            if not self._is_xhr_download(headers, response.status):
-                return
-            raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
-            filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
-            if not filename or filename in self._saved:
-                return
-            content_length = headers.get("content-length", "")
-            if content_length:
-                try:
-                    if int(content_length) > MAX_FILE_SIZE_BYTES:
-                        return
-                except ValueError:
-                    pass
-            save_path = self._download_dir / filename
-            body = await response.body()
-            if len(body) > MAX_FILE_SIZE_BYTES:
-                return
             try:
-                with open(save_path, "xb") as f:
-                    f.write(body)
-            except FileExistsError:
-                pass
-            self._saved.add(filename)
-            LOG.info(
-                "XHR download captured during download action",
-                filename=filename,
-                size=len(body),
-            )
-        except Exception:
-            LOG.warning("Failed to capture XHR download response", exc_info=True)
+                if response.request.resource_type not in ("xhr", "fetch"):
+                    return
+                headers = response.headers
+                if not self._is_xhr_download(headers, response.status):
+                    return
+                raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+                filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
+                if not filename or filename in self._saved:
+                    return
+                content_length = headers.get("content-length", "")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_FILE_SIZE_BYTES:
+                            return
+                    except ValueError:
+                        pass
+                save_path = self._download_dir / filename
+                body = await response.body()
+                if len(body) > MAX_FILE_SIZE_BYTES:
+                    return
+                try:
+                    with open(save_path, "xb") as f:
+                        f.write(body)
+                except FileExistsError:
+                    pass
+                self._saved.add(filename)
+                LOG.info(
+                    "XHR download captured during download action",
+                    filename=filename,
+                    size=len(body),
+                )
+            except Exception:
+                LOG.warning("Failed to capture XHR download response", exc_info=True)
+        finally:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._drained.set()
+
+    async def drain(self) -> None:
+        """Wait for in-flight XHR captures to finish. Best-effort: late events
+        after drain returns are cleaned up by the caller's finally block."""
+        await self._drained.wait()
 
     def _on_new_page(self, page: Page) -> None:
         if not self._active:
@@ -695,11 +712,8 @@ class ActionHandler:
             return results
 
         context = skyvern_context.current()
-        download_dir = Path(
-            get_download_dir(
-                run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
-            )
-        )
+        run_id = context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+        download_dir = Path(get_download_dir(run_id=run_id))
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
 
         def _capture_download_event(download: Download) -> None:
@@ -728,7 +742,8 @@ class ActionHandler:
             download_dir=download_dir,
         )
 
-        xhr_capture = ScopedXhrDownloadCapture(page, download_dir)
+        staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
+        xhr_capture = ScopedXhrDownloadCapture(page, staging_dir)
         download_triggered = False
         transient_text_observer = TransientPageTextObserver(
             page,
@@ -767,6 +782,7 @@ class ActionHandler:
                 download_event_fallback_attempted = False
                 download_event_fallback_used = False
                 download_event_fallback_failed = False
+                xhr_fallback_moved_paths: set[str] = set()
                 download_signal_observed = False
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
@@ -930,6 +946,34 @@ class ActionHandler:
                             ",".join(error.error_code for error in download_wait_matched_errors),
                         )
 
+            await xhr_capture.drain()
+
+            if not download_triggered and staging_dir.exists():
+                staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
+                if staged_files:
+                    moved_count = 0
+                    for sf in staged_files:
+                        target = download_dir / sf.name
+                        if not target.exists():
+                            try:
+                                shutil.move(sf, target)
+                                xhr_fallback_moved_paths.add(str(target))
+                                moved_count += 1
+                            except OSError:
+                                LOG.warning(
+                                    "Failed to move staged XHR file to download dir",
+                                    file=sf.name,
+                                    workflow_run_id=task.workflow_run_id,
+                                    exc_info=True,
+                                )
+                    if moved_count > 0:
+                        download_triggered = True
+                        LOG.info(
+                            "XHR staging fallback: moved staged files to download dir",
+                            staged_count=moved_count,
+                            workflow_run_id=task.workflow_run_id,
+                        )
+
             if not download_triggered:
                 if action.errors:
                     results[-1] = ActionFailure(
@@ -955,6 +999,18 @@ class ActionHandler:
             # artifacts can still appear before task cleanup persists files.
             list_files_after = await _list_observed_download_files()
             new_file_paths = set(list_files_after) - set(list_files_before)
+            if xhr_fallback_moved_paths:
+                post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
+                if post_settle_extra_paths:
+                    LOG.warning(
+                        "XHR staging fallback used but additional download files appeared after settle",
+                        workflow_run_id=task.workflow_run_id,
+                        download_dir=download_dir,
+                        xhr_fallback_file_count=len(xhr_fallback_moved_paths),
+                        xhr_fallback_files=sorted(os.path.basename(fp) for fp in xhr_fallback_moved_paths),
+                        post_settle_extra_file_count=len(post_settle_extra_paths),
+                        post_settle_extra_files=sorted(os.path.basename(fp) for fp in post_settle_extra_paths),
+                    )
             deduplicated_paths = _deduplicate_new_downloaded_file_paths(
                 new_file_paths,
                 workflow_run_id=task.workflow_run_id,
@@ -974,6 +1030,9 @@ class ActionHandler:
         finally:
             await transient_text_observer.stop()
             xhr_capture.disable()
+            await xhr_capture.drain()
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -2103,6 +2162,30 @@ def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
     return matched
 
 
+async def _wait_for_upload_processing(page: Page) -> None:
+    """Wait for page readiness signals after a file upload.
+
+    Covers upload-processing UI (spinners, progress bars, DOM updates) beyond
+    bare networkidle by reusing SkyvernFrame.wait_for_page_ready with
+    upload-tuned timeouts that keep worst-case well below the old 10-15 s sleep.
+    """
+    try:
+        # Settle delay: let the page react to the file-input change and mount
+        # upload UI (spinner, progress bar, XHR) before polling for readiness.
+        await asyncio.sleep(0.5)
+        skyvern_frame = await SkyvernFrame.create_instance(page)
+        await skyvern_frame.wait_for_page_ready(
+            loading_indicator_timeout_ms=3000,
+            network_idle_timeout_ms=3000,
+            dom_stable_ms=300,
+            dom_stability_timeout_ms=2000,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        LOG.info("Upload processing page-ready wait timed out, continuing")
+    except PlaywrightError:
+        LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
+
+
 @traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
@@ -2178,8 +2261,7 @@ async def handle_upload_file_action(
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            # Sleep for 10 seconds after uploading a file to let the page process it
-            await asyncio.sleep(10)
+            await _wait_for_upload_processing(page)
 
             return [ActionSuccess()]
         else:
@@ -3409,14 +3491,13 @@ async def chain_click(
             return action_results
 
     finally:
-        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
         if is_filechooser_trigger:
             # File chooser opened during this click — upload completed normally
             LOG.info("File chooser triggered during this click", action=action)
             if file:
-                await asyncio.sleep(15)
+                await _wait_for_upload_processing(page)
             if not has_pending:
                 page.remove_listener("filechooser", fc_func)
             if context is not None and context.pending_file_chooser is not None:
@@ -3452,7 +3533,7 @@ async def chain_click(
         ):
             # A previous UPLOAD_FILE's deferred listener was consumed by this click
             LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
-            await asyncio.sleep(15)
+            await _wait_for_upload_processing(page)
             context.cleanup_pending_file_chooser()
 
         else:
