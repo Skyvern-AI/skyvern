@@ -1,7 +1,6 @@
 import {
   CounterClockwiseClockIcon,
   DotsHorizontalIcon,
-  ResetIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type AxiosError } from "axios";
@@ -14,7 +13,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -30,9 +28,7 @@ import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
-import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
 
-import { useUndoRedoShortcutLabels } from "../controls/useUndoRedoShortcutLabels";
 import { useSaveWorkflow } from "../hooks/useSaveWorkflow";
 import { useToggleHistoryPanel } from "../hooks/useToggleHistoryPanel";
 import { CodeSubmenu } from "./CodeSubmenu";
@@ -47,12 +43,6 @@ export function EditorOverflowMenu() {
   const onSave = useSaveWorkflow();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
-
-  const canUndo = useWorkflowHistoryAccessStore((s) => s.canUndo);
-  const onUndo = useWorkflowHistoryAccessStore((s) => s.undo);
-  const canRedo = useWorkflowHistoryAccessStore((s) => s.canRedo);
-  const onRedo = useWorkflowHistoryAccessStore((s) => s.redo);
-  const { undoShortcutLabel, redoShortcutLabel } = useUndoRedoShortcutLabels();
 
   const toggleHistoryPanel = useToggleHistoryPanel();
 
@@ -119,28 +109,6 @@ export function EditorOverflowMenu() {
       </TooltipProvider>
       <DropdownMenuContent align="end" className="min-w-[12rem]">
         <CodeSubmenu />
-        <DropdownMenuItem
-          disabled={!canUndo || isRecording}
-          onSelect={(event) => {
-            event.preventDefault();
-            onUndo();
-          }}
-        >
-          <ResetIcon className="mr-2 size-4" />
-          Undo
-          <DropdownMenuShortcut>{undoShortcutLabel}</DropdownMenuShortcut>
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          disabled={!canRedo || isRecording}
-          onSelect={(event) => {
-            event.preventDefault();
-            onRedo();
-          }}
-        >
-          <ResetIcon className="mr-2 size-4 -scale-x-100" />
-          Redo
-          <DropdownMenuShortcut>{redoShortcutLabel}</DropdownMenuShortcut>
-        </DropdownMenuItem>
         {!workflowRunIsRunningOrQueued && (
           <DropdownMenuItem
             disabled={isRecording}
