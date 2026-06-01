@@ -455,7 +455,11 @@ async def cdp_input_browser_session_stream(
             await websocket.close(code=4404, reason="browser_session_finalized")
             return
 
-        browser_state = await wait_for_browser_state(browser_session_id, "browser_session")
+        browser_state = await wait_for_browser_state(
+            browser_session_id,
+            "browser_session",
+            organization_id=organization_id,
+        )
         if browser_state is None:
             LOG.warning("CDP input: timed out waiting for browser state", browser_session_id=browser_session_id)
             await websocket.close(code=4408, reason="browser_state_timeout")

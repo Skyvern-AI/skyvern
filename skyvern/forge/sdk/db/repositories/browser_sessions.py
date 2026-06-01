@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import structlog
 from sqlalchemy import asc, case, or_, select
 
+from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
@@ -226,14 +227,16 @@ class BrowserSessionsRepository(BaseRepository):
     ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         async with self.Session() as session:
-            persistent_browser_session = (
-                await session.scalars(
-                    select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=session_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
-                )
-            ).first()
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(deleted_at=None)
+            )
+            if organization_id is not None or settings.ENV != "local":
+                if organization_id is None:
+                    raise ValueError("organization_id is required outside local development")
+                query = query.filter_by(organization_id=organization_id)
+            persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
