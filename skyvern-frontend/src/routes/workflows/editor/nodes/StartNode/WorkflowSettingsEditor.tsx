@@ -7,12 +7,6 @@ import { BrowserProfileSelector } from "@/routes/workflows/components/BrowserPro
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { KeyValueInput } from "@/components/KeyValueInput";
 import { ModelSelector } from "@/components/ModelSelector";
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
 import { ProxySelector } from "@/components/ProxySelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { WorkflowBlockInputTextarea } from "@/components/WorkflowBlockInputTextarea";
@@ -140,32 +134,23 @@ function WorkflowSettingsEditorBody({
           onChange={(value) => update({ model: value })}
         />
       </div>
-      <Accordion type="single" collapsible>
-        <AccordionItem value="systemPrompt" className="border-b-0">
-          <AccordionTrigger className="py-0 text-xs text-slate-300">
-            Agent System Prompt
-          </AccordionTrigger>
-          <AccordionContent className="pt-2">
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <Label>Agent System Prompt</Label>
-                <HelpTooltip content="Applied to every LLM call in this agent, including any sub-agents." />
-              </div>
-              <WorkflowBlockInputTextarea
-                nodeId={blockId}
-                onChange={(value) =>
-                  update({
-                    workflowSystemPrompt: value.length ? value : null,
-                  })
-                }
-                value={data.workflowSystemPrompt ?? ""}
-                placeholder="e.g. Format all dates as YYYY-MM-DD and all currency values as USD with two decimals."
-                className="nopan text-xs"
-              />
-            </div>
-          </AccordionContent>
-        </AccordionItem>
-      </Accordion>
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label>Agent System Prompt</Label>
+          <HelpTooltip content="Applied to every LLM call in this agent, including any sub-agents." />
+        </div>
+        <WorkflowBlockInputTextarea
+          nodeId={blockId}
+          onChange={(value) =>
+            update({
+              workflowSystemPrompt: value.length ? value : null,
+            })
+          }
+          value={data.workflowSystemPrompt ?? ""}
+          placeholder="e.g. Format all dates as YYYY-MM-DD and all currency values as USD with two decimals."
+          className="nopan text-xs"
+        />
+      </div>
       <div className="space-y-2">
         <div className="flex gap-2">
           <Label>Webhook Callback URL</Label>

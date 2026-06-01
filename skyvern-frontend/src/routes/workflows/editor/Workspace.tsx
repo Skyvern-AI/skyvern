@@ -1525,6 +1525,8 @@ function Workspace({
                   cacheKeyValues={cacheKeyValues}
                   pending={cacheKeyValuesLoading}
                   scriptKey={workflow.cache_key ?? "default"}
+                  filter={cacheKeyValueFilter ?? undefined}
+                  onFilterChange={setCacheKeyValueFilter}
                   onDelete={(cacheKeyValue) => {
                     deleteCacheKeyValue.mutate({
                       workflowPermanentId: workflowPermanentId!,
@@ -1615,6 +1617,8 @@ function Workspace({
                         cacheKeyValues={cacheKeyValues}
                         pending={cacheKeyValuesLoading}
                         scriptKey={workflow.cache_key ?? "default"}
+                        filter={cacheKeyValueFilter ?? undefined}
+                        onFilterChange={setCacheKeyValueFilter}
                         onDelete={(cacheKeyValue) => {
                           deleteCacheKeyValue.mutate({
                             workflowPermanentId: workflowPermanentId!,
@@ -1683,6 +1687,8 @@ function Workspace({
                   cacheKeyValues={cacheKeyValues}
                   pending={cacheKeyValuesLoading}
                   scriptKey={workflow.cache_key ?? "default"}
+                  filter={cacheKeyValueFilter ?? undefined}
+                  onFilterChange={setCacheKeyValueFilter}
                   onDelete={(cacheKeyValue) => {
                     deleteCacheKeyValue.mutate({
                       workflowPermanentId: workflowPermanentId!,
