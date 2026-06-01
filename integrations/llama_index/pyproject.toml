@@ -8,7 +8,7 @@ readme = "README.md"
 dependencies = [
     "skyvern>=0.2.0",
     "llama-index>=0.12.19,<0.14",
-    "urllib3>=2.6.0",
+    "urllib3>=2.7.0",
 ]
 
 [build-system]
@@ -23,7 +23,7 @@ dev = ["twine>=6.1.0,<7"]
 # skyvern's pinned ranges (e.g. pypdf<6, python-multipart<0.0.19).
 [tool.uv]
 override-dependencies = [
-    "authlib>=1.6.11",
+    "authlib>=1.7.1",
     "pyasn1>=0.6.3",
     "PyJWT>=2.12.0",
     "fastmcp>=3.2.0",
