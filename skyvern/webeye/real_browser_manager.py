@@ -164,6 +164,7 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        navigate: bool = True,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -210,7 +211,7 @@ class RealBrowserManager(BrowserManager):
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
                 page = await browser_state.get_working_page()
                 if page:
-                    if url:
+                    if url and navigate:
                         await browser_state.navigate_to_url(page=page, url=url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
@@ -255,8 +256,11 @@ class RealBrowserManager(BrowserManager):
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
+        # When navigate is False, the URL has already been used for proxy selection in
+        # _create_browser_state above; we skip navigation so the caller (e.g. a generated
+        # script) performs the first goto itself, avoiding a redundant page load.
         await browser_state.get_or_create_page(
-            url=url,
+            url=url if navigate else None,
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,

@@ -378,28 +378,29 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
     return workflow_dict
 
 
-async def _precreate_script_browser(
-    block: BlockTypeVar,
+def _resolve_first_block_url(
+    blocks: list[BlockTypeVar],
     workflow_run: "WorkflowRun",
-    browser_session_id: str | None,
-) -> None:
-    url = getattr(block, "url", None)
-    if not url:
-        return
+) -> str | None:
+    """Resolve the URL of the first block that has one, for proxy selection.
+
+    In script mode ``skyvern.setup()`` creates the browser before any block runs;
+    threading this URL lets the ``SKYVERN_PROXY`` flag (which matches on ``task_url``)
+    resolve instead of falling back to the org default. Best-effort: any failure
+    returns None so proxy selection degrades to the previous (url=None) behavior.
+    """
     try:
         wrc = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run.workflow_run_id)
+        for block in blocks:
+            url = getattr(block, "url", None)
+            if not url:
+                continue
+            resolved_url = block.format_block_parameter_template_from_workflow_run_context(url, wrc)
+            if resolved_url and isinstance(resolved_url, str):
+                return resolved_url
     except Exception:
-        LOG.warning("Workflow run context unavailable for browser pre-creation", exc_info=True)
-        return
-    resolved_url = block.format_block_parameter_template_from_workflow_run_context(url, wrc)
-    if not resolved_url or not isinstance(resolved_url, str):
-        return
-    await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-        workflow_run=workflow_run,
-        url=resolved_url,
-        browser_session_id=browser_session_id,
-        browser_profile_id=workflow_run.browser_profile_id,
-    )
+        LOG.warning("Failed to resolve first block URL for proxy selection", exc_info=True)
+    return None
 
 
 class WorkflowService:
@@ -1950,6 +1951,10 @@ class WorkflowService:
 
         is_script_run = await self.should_run_script(workflow, workflow_run)
 
+        # skyvern.setup() below creates the browser before any block runs, so resolve the
+        # first block's URL here to drive proxy selection from task_url (see SKYVERN_PROXY).
+        first_block_url = _resolve_first_block_url(all_blocks, workflow_run) if is_script_run else None
+
         if script:
             LOG.info(
                 "Loading script blocks for workflow execution",
@@ -2009,6 +2014,7 @@ class WorkflowService:
                             await skyvern.setup(
                                 script_parameters,
                                 generated_parameter_cls=param_cls,
+                                url=first_block_url,
                             )
                             if loaded_script_module:
                                 # Mark static (pinned) scripts so complete() skips LLM verification
@@ -2066,6 +2072,7 @@ class WorkflowService:
                     await skyvern.setup(
                         script_parameters,
                         generated_parameter_cls=param_cls,
+                        url=first_block_url,
                     )
                     # Mark context so static scripts skip LLM completion verification
                     static_ctx = skyvern_context.current()
@@ -2721,18 +2728,6 @@ class WorkflowService:
                 except Exception:
                     LOG.warning(
                         "Failed to apply workflow_system_prompt for script-path block; continuing",
-                        block_label=block.label,
-                        exc_info=True,
-                    )
-                try:
-                    await _precreate_script_browser(
-                        block=block,
-                        workflow_run=workflow_run,
-                        browser_session_id=browser_session_id,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to pre-create browser with block URL; script will create lazily",
                         block_label=block.label,
                         exc_info=True,
                     )
