@@ -5,7 +5,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SideNav } from "./SideNav";
 import { useSidebarStore } from "@/store/SidebarStore";
 
+const capture = vi.fn();
 const mutate = vi.fn();
+
+vi.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => false,
+  usePostHog: () => ({
+    capture,
+  }),
+}));
 
 vi.mock("@/routes/workflows/hooks/useCreateWorkflowMutation", () => ({
   useCreateWorkflowMutation: () => ({
@@ -29,6 +37,7 @@ describe("SideNav", () => {
     useSidebarStore.setState({ collapsed: false });
     setViewportHeight(1024);
     mutate.mockClear();
+    capture.mockClear();
   });
 
   it("creates a new agent from the sidebar", () => {
@@ -50,6 +59,53 @@ describe("SideNav", () => {
         }),
       }),
     );
+  });
+
+  it("captures recipe clicks with the legacy sidebar agent event", () => {
+    window.localStorage.clear();
+    setViewportHeight(1024);
+
+    render(
+      <MemoryRouter>
+        <SideNav />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Healthcare" }));
+
+    expect(capture).toHaveBeenCalledWith("sidebar.agent.clicked", {
+      agent: "healthcare",
+      destination: "/recipes/healthcare",
+      disabled: false,
+      beta: true,
+      badge: "Beta",
+    });
+  });
+
+  it("captures recipe clicks from the collapsed sidebar menu", async () => {
+    useSidebarStore.setState({ collapsed: true });
+
+    render(
+      <MemoryRouter>
+        <SideNav />
+      </MemoryRouter>,
+    );
+
+    fireEvent.pointerDown(screen.getByTitle("Recipes"), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Healthcare" }),
+    );
+
+    expect(capture).toHaveBeenCalledWith("sidebar.agent.clicked", {
+      agent: "healthcare",
+      destination: "/recipes/healthcare",
+      disabled: false,
+      beta: true,
+      badge: "Beta",
+    });
   });
 
   it("starts recipes collapsed on short screens", () => {
