@@ -20,6 +20,8 @@ class PersistentSessionsManager(Protocol):
         """Initialize monitoring of the session pool."""
         ...
 
+    def can_probe_registered_browser_state(self) -> bool: ...
+
     async def begin_session(
         self,
         *,

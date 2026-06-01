@@ -1,5 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useDebounce } from "use-debounce";
 import { Button } from "@/components/ui/button";
+import { TableSearchInput } from "@/components/TableSearchInput";
 import { CardStackIcon, LockClosedIcon, PlusIcon } from "@radix-ui/react-icons";
 import {
   CredentialModalTypes,
@@ -34,6 +36,8 @@ const DEFAULT_TAB: TabValue = "passwords";
 function CredentialsPage() {
   const { setIsOpen, setType } = useCredentialModalState();
   const { startBackgroundTest } = useBackgroundCredentialTest();
+  const [search, setSearch] = useState("");
+  const [debouncedSearch] = useDebounce(search, 250);
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get("tab");
   const matchedTab = TAB_VALUES.find((tab) => tab === tabParam);
@@ -106,16 +110,28 @@ function CredentialsPage() {
         className="space-y-4"
         onValueChange={handleTabChange}
       >
-        <TabsList className="bg-slate-elevation1">
-          <TabsTrigger value="passwords">Passwords</TabsTrigger>
-          <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
-          <TabsTrigger value="secrets">Secrets</TabsTrigger>
-          <TabsTrigger value="twoFactor">2FA</TabsTrigger>
-        </TabsList>
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <TabsList className="bg-slate-elevation1">
+            <TabsTrigger value="passwords">Passwords</TabsTrigger>
+            <TabsTrigger value="creditCards">Credit Cards</TabsTrigger>
+            <TabsTrigger value="secrets">Secrets</TabsTrigger>
+            <TabsTrigger value="twoFactor">2FA</TabsTrigger>
+          </TabsList>
+          {activeTab !== "twoFactor" && (
+            <TableSearchInput
+              value={search}
+              onChange={setSearch}
+              placeholder="Search credentials…"
+              className="w-72"
+              maxLength={200}
+            />
+          )}
+        </div>
 
         <TabsContent value="passwords" className="space-y-4">
           <CredentialsList
             filter="password"
+            search={debouncedSearch}
             onStartBackgroundTest={startBackgroundTest}
           />
         </TabsContent>
@@ -123,6 +139,7 @@ function CredentialsPage() {
         <TabsContent value="creditCards" className="space-y-4">
           <CredentialsList
             filter="credit_card"
+            search={debouncedSearch}
             onStartBackgroundTest={startBackgroundTest}
           />
         </TabsContent>
@@ -130,6 +147,7 @@ function CredentialsPage() {
         <TabsContent value="secrets" className="space-y-4">
           <CredentialsList
             filter="secret"
+            search={debouncedSearch}
             onStartBackgroundTest={startBackgroundTest}
           />
         </TabsContent>

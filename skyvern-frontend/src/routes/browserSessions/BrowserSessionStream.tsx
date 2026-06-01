@@ -7,6 +7,12 @@ import {
   StreamStatusPanel,
   type StreamDiagnostic,
 } from "@/routes/streaming/StreamDiagnostics";
+import {
+  STREAM_MAX_RECONNECT_ATTEMPTS,
+  STREAM_RECONNECT_DELAY_MS,
+  isTerminalStreamStatus,
+  shouldReconnectStream,
+} from "./BrowserSessionStream.utils";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -23,6 +29,14 @@ const STARTING_DIAGNOSTIC: StreamDiagnostic = {
   detail:
     "Opening the stream WebSocket and waiting for the first browser frame.",
 };
+
+function diagnosticForReconnectExhausted(): StreamDiagnostic {
+  return {
+    title: "Stream connection dropped",
+    detail: "The browser stream disconnected and could not reconnect.",
+    hint: "Refresh the editor or create a new browser session.",
+  };
+}
 
 function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
@@ -100,6 +114,9 @@ function BrowserSessionStream({
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const terminalStatusSeenRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const inputWsUrl = interactive
     ? `${newWssBaseUrl}/stream/cdp_input/browser_session/${browserSessionId}`
@@ -127,8 +144,17 @@ function BrowserSessionStream({
     setCurrentUrl("");
     setDiagnostic(STARTING_DIAGNOSTIC);
     hasFrameRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    terminalStatusSeenRef.current = false;
 
-    async function run() {
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    async function connect() {
       const credentialParam = await getCredentialParam(credentialGetter);
       if (cancelled) {
         return;
@@ -153,6 +179,7 @@ function BrowserSessionStream({
           const message: StreamMessage = JSON.parse(event.data);
           if (message.screenshot) {
             hasFrameRef.current = true;
+            reconnectAttemptsRef.current = 0;
             setStreamImgSrc(message.screenshot);
           }
           if (message.format) {
@@ -170,11 +197,8 @@ function BrowserSessionStream({
           if (!message.screenshot && message.status) {
             setDiagnostic(diagnosticForStatus(message.status));
           }
-          if (
-            message.status === "completed" ||
-            message.status === "failed" ||
-            message.status === "timeout"
-          ) {
+          if (isTerminalStreamStatus(message.status)) {
+            terminalStatusSeenRef.current = true;
             socketRef.current?.close();
           }
         } catch (e) {
@@ -195,16 +219,54 @@ function BrowserSessionStream({
       });
 
       socketRef.current.addEventListener("close", (event) => {
-        if (!cancelled && !hasFrameRef.current) {
+        if (
+          !cancelled &&
+          !hasFrameRef.current &&
+          !terminalStatusSeenRef.current
+        ) {
           setDiagnostic(diagnosticForClose(event));
         }
         socketRef.current = null;
+
+        const canReconnect =
+          !cancelled &&
+          shouldReconnectStream({
+            closeCode: event.code,
+            closeReason: event.reason,
+            terminalStatusSeen: terminalStatusSeenRef.current,
+            reconnectAttempts: reconnectAttemptsRef.current,
+          });
+
+        if (canReconnect) {
+          reconnectAttemptsRef.current += 1;
+          if (!hasFrameRef.current) {
+            setDiagnostic({
+              ...diagnosticForClose(event),
+              hint: `Reconnecting in ${STREAM_RECONNECT_DELAY_MS / 1000}s (${reconnectAttemptsRef.current}/${STREAM_MAX_RECONNECT_ATTEMPTS}).`,
+            });
+          }
+          clearReconnectTimer();
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            void connect();
+          }, STREAM_RECONNECT_DELAY_MS);
+        } else if (
+          !cancelled &&
+          !terminalStatusSeenRef.current &&
+          hasFrameRef.current &&
+          reconnectAttemptsRef.current >= STREAM_MAX_RECONNECT_ATTEMPTS
+        ) {
+          hasFrameRef.current = false;
+          setStreamImgSrc("");
+          setDiagnostic(diagnosticForReconnectExhausted());
+        }
       });
     }
-    run();
+    void connect();
 
     return () => {
       cancelled = true;
+      clearReconnectTimer();
       if (socketRef.current) {
         socketRef.current.close();
         socketRef.current = null;
