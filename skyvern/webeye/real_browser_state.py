@@ -346,23 +346,50 @@ class RealBrowserState(BrowserState):
             raise EmptyBrowserContext()
         return await self.browser_context.new_page()
 
-    async def reload_page(self) -> None:
+    async def reload_page(self, degradation: bool = False) -> None:
         page = await self.__assert_page()
+        url = page.url
 
-        LOG.info("Reload page", url=page.url)
-        try:
-            start_time = time.time()
-            await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            end_time = time.time()
-            LOG.info(
-                "Page loading time",
-                loading_time=end_time - start_time,
-            )
-            await self._wait_for_settle()
-            await self._wait_for_challenge_solver(page=page)
-        except Exception as e:
-            LOG.exception(f"Error while reload url: {repr(e)}")
-            raise FailedToReloadPage(url=page.url, error_message=repr(e))
+        if not degradation:
+            LOG.info("Reload page", url=url)
+            try:
+                start_time = time.time()
+                await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                LOG.info("Page loading time", loading_time=time.time() - start_time)
+                await self._wait_for_settle()
+                await self._wait_for_challenge_solver(page=page)
+            except Exception as e:
+                LOG.exception("Error while reload url", error=repr(e))
+                raise FailedToReloadPage(url=url, error_message=repr(e))
+            return
+
+        strategies: list[str] = ["load", "domcontentloaded", "commit"]
+        for i, strategy in enumerate(strategies):
+            try:
+                LOG.info("Reload page", url=url, wait_until=strategy, degradation_attempt=i)
+                start_time = time.time()
+                await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy)
+                LOG.info(
+                    "Page loading time",
+                    loading_time=time.time() - start_time,
+                    wait_until=strategy,
+                    degraded=i > 0,
+                )
+                await self._wait_for_settle()
+                await self._wait_for_challenge_solver(page=page)
+                return
+            except Exception as e:
+                if i < len(strategies) - 1:
+                    LOG.warning(
+                        "Reload timed out, degrading wait strategy",
+                        url=url,
+                        wait_until=strategy,
+                        next_strategy=strategies[i + 1],
+                        error=repr(e),
+                    )
+                    continue
+                LOG.exception("Error while reload url after degradation", error=repr(e))
+                raise FailedToReloadPage(url=url, error_message=repr(e))
 
     async def scrape_website(
         self,
