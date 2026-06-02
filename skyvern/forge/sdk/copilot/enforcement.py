@@ -8,6 +8,7 @@ import json
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from agents.run import Runner
@@ -18,6 +19,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
     POST_ANTI_BOT_FAILED_TEST_NUDGE,
+    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     POST_FAILED_TEST_NUDGE,
@@ -68,6 +70,7 @@ MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
+MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # Stops the suspicious-success nudge from re-firing forever when the agent has
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
@@ -532,14 +535,76 @@ def _goal_likely_needs_more_blocks(user_message: Any, block_count: int, completi
     return block_count < estimated_min_blocks
 
 
+def _same_page(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    if not left_parsed.netloc or not right_parsed.netloc:
+        return False
+    if left_parsed.netloc.lower() != right_parsed.netloc.lower():
+        return False
+    left_path = (left_parsed.path or "/").rstrip("/") or "/"
+    right_path = (right_parsed.path or "/").rstrip("/") or "/"
+    return left_path == right_path
+
+
+def _has_candidate_bound_page_evidence(ctx: Any, candidate_url: str) -> bool:
+    inspection_count = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    inspection_baseline = int(getattr(ctx, "resolved_discovery_entrypoint_inspection_baseline", 0) or 0)
+    if inspection_count <= inspection_baseline:
+        return False
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("source_tool") != "inspect_page_for_composition":
+        return False
+    for key in ("inspected_url", "current_url"):
+        value = evidence.get(key)
+        if isinstance(value, str) and _same_page(candidate_url, value):
+            return True
+    return False
+
+
+def _post_discovery_entrypoint_url_question_nudge(
+    ctx: Any,
+    parsed: dict[str, Any],
+    config: CopilotConfig | None = None,
+) -> str | None:
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    candidate_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    failure_reason = getattr(ctx, "resolved_discovery_failure_reason", None)
+    if not isinstance(candidate_url, str) or not candidate_url or failure_reason:
+        return None
+    inspected_after_discovery = _has_candidate_bound_page_evidence(ctx, candidate_url)
+    mutated_after_discovery = bool(getattr(ctx, "update_workflow_called", False))
+    if inspected_after_discovery or mutated_after_discovery:
+        return None
+    nudge_count = getattr(ctx, "discovery_entrypoint_url_question_nudge_count", 0)
+    if nudge_count >= MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES:
+        return None
+    ctx.discovery_entrypoint_url_question_nudge_count = nudge_count + 1
+    return f"{_nudge(config, 'post_discovery_entrypoint_url_question')} Resolved candidate_url: {candidate_url}"
+
+
 def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotConfig | None = None) -> str | None:
     """Peek at the model's final output and return a nudge for coverage gaps
-    or progress-narration format. ASK_QUESTION is always let through so the
-    agent can request missing credentials or disambiguation.
+    or progress-narration format. ASK_QUESTION is let through so the agent
+    can request missing credentials or disambiguation, except when discovery
+    resolved a candidate and the agent has not yet inspected or composed from
+    that candidate.
 
     Returns the nudge string to inject, or None to let the response through.
     """
     response_type = parsed.get("type")
+    discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
+    if discovery_entrypoint_nudge is not None:
+        return discovery_entrypoint_nudge
+
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None
 
@@ -1180,6 +1245,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
     POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
     POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
+    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE: "discovery_entrypoint_url_question",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
@@ -1203,6 +1269,7 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_per_tool_budget": "per_tool_budget_split",
     "post_per_tool_budget_stop": "per_tool_budget_stop",
     "post_no_workflow_delivery": "no_workflow_delivery",
+    "post_discovery_entrypoint_url_question": "discovery_entrypoint_url_question",
     "post_failed_test": "post_failed_test",
     "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
