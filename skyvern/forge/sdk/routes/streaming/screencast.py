@@ -26,12 +26,18 @@ async def wait_for_browser_state(
     entity_id: str,
     entity_type: str,
     workflow_run_id: str | None = None,
+    organization_id: str | None = None,
     timeout: float = 120,
-    poll_interval: float = 1.0,
+    poll_interval: float = 0.25,
 ) -> BrowserState | None:
     elapsed = 0.0
     while elapsed < timeout:
-        browser_state = await _resolve_browser_state(entity_id, entity_type, workflow_run_id)
+        browser_state = await _resolve_browser_state(
+            entity_id,
+            entity_type,
+            workflow_run_id,
+            organization_id=organization_id,
+        )
 
         if browser_state is not None:
             page = await browser_state.get_working_page()
@@ -48,13 +54,14 @@ async def _resolve_browser_state(
     entity_id: str,
     entity_type: str,
     workflow_run_id: str | None = None,
+    organization_id: str | None = None,
 ) -> BrowserState | None:
     if entity_type == "workflow_run":
         return app.BROWSER_MANAGER.get_for_workflow_run(entity_id)
     if entity_type == "task":
         return app.BROWSER_MANAGER.get_for_task(entity_id, workflow_run_id)
     if entity_type == "browser_session":
-        return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(entity_id)
+        return await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(entity_id, organization_id)
     return None
 
 

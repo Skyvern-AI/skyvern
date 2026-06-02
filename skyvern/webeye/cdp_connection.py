@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 from collections.abc import Iterable
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import structlog
 from playwright.async_api import Browser, Playwright
 
+from skyvern.config import settings
 from skyvern.exceptions import CdpConnectionConfigurationError
 
 LOG = structlog.get_logger()
@@ -78,6 +80,87 @@ def merge_cdp_connect_headers(
     filtered_defaults = {k: v for k, v in default_headers.items() if k.lower() not in reserved_keys}
     filtered_per_row = {k: v for k, v in (per_row_headers or {}).items() if k.lower() not in reserved_keys}
     return {**filtered_defaults, **filtered_per_row, **managed_host_header}
+
+
+def strip_browser_address_discriminator(url: str) -> str:
+    """Remove local PBS URL fragments used only for browser_address DB uniqueness."""
+    parsed = urlparse(url)
+    if parsed.fragment.startswith("pbs_"):
+        return urlunparse(parsed._replace(fragment=""))
+    return url
+
+
+_LOCAL_CONTAINER_CDP_PORT = 9222
+
+
+def parse_local_cdp_host_port_env() -> int | None:
+    raw = os.environ.get("LOCAL_CDP_HOST_PORT", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def local_pbs_cdp_host_port(url: str) -> int | None:
+    """Host-published CDP port when url targets the local PBS openresty proxy."""
+    if settings.ENV != "local":
+        return None
+
+    parsed = urlparse(url)
+    if parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port is None:
+        return None
+
+    host_port = parse_local_cdp_host_port_env()
+    if host_port is not None:
+        if parsed.port in (_LOCAL_CONTAINER_CDP_PORT, host_port):
+            return host_port
+        return None
+
+    if parsed.port == _LOCAL_CONTAINER_CDP_PORT:
+        return None
+    return parsed.port
+
+
+def resolve_local_pbs_cdp_url(url: str) -> str:
+    """Strip DB-only fragments and rewrite container :9222 to host-published PBS port."""
+    url = strip_browser_address_discriminator(url)
+    host_port = local_pbs_cdp_host_port(url)
+    if host_port is None:
+        return url
+
+    parsed = urlparse(url)
+    if parsed.port == host_port:
+        return url
+    if parsed.port != _LOCAL_CONTAINER_CDP_PORT:
+        return url
+
+    netloc = f"{parsed.hostname}:{host_port}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def is_local_pbs_cdp_url(url: str) -> bool:
+    return local_pbs_cdp_host_port(url) is not None
+
+
+def prepare_persistent_browser_cdp_connect(
+    browser_address: str,
+    *,
+    browser_session_id: str | None = None,
+    x_api_key: str | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
+) -> tuple[str, dict[str, str] | None]:
+    """Normalize CDP URL and headers for host API connections to local PBS."""
+    connect_url = resolve_local_pbs_cdp_url(browser_address)
+    headers: dict[str, str] = {}
+    if cdp_connect_headers:
+        headers.update(cdp_connect_headers)
+    if x_api_key:
+        headers["x-api-key"] = x_api_key
+    if browser_session_id and is_local_pbs_cdp_url(connect_url):
+        headers["X-Session-Id"] = browser_session_id
+    return connect_url, headers or None
 
 
 def parse_cdp_discovery_error(error: Exception) -> tuple[int, str] | None:
@@ -171,6 +254,7 @@ async def connect_over_cdp_with_diagnostics(
     headers: dict[str, str] | None = None,
     timeout_ms: int = DEFAULT_CDP_CONNECT_TIMEOUT_MS,
 ) -> Browser:
+    remote_browser_url = strip_browser_address_discriminator(remote_browser_url)
     try:
         return await playwright.chromium.connect_over_cdp(
             remote_browser_url,

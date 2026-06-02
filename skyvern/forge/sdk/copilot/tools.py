@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 import time
@@ -26,6 +27,7 @@ from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -45,6 +47,13 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_composing,
     advance_to_discovering,
     advance_to_testing,
+)
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    RunEvidenceSnapshot,
+    evaluate_completion_criteria,
+    summarize_unsatisfied_outcomes,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
@@ -80,6 +89,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -134,6 +144,10 @@ _FAILED_BLOCK_STATUSES: frozenset[str] = frozenset(
     }
 )
 _DATA_PRODUCING_BLOCK_TYPES = frozenset({"EXTRACTION", "TEXT_PROMPT"})
+# Block types whose output can demonstrate an end-state outcome. Until a workflow
+# contains one of these, an unmet outcome criterion means the build is still
+# incomplete (no confirmation step yet), not a completed run that failed the goal.
+_OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType.VALIDATION.value})
 
 # Block types whose ``block.output`` is a ``TaskOutput.from_task()`` envelope
 # (schemas/tasks.py:TaskOutput) rather than the raw payload. The
@@ -2286,6 +2300,20 @@ def _current_workflow_block_labels(ctx: object) -> list[str]:
             if label:
                 yaml_labels.append(label)
     return yaml_labels
+
+
+def _current_workflow_has_evidence_block(ctx: object) -> bool:
+    workflow = getattr(ctx, "last_workflow", None)
+    blocks = getattr(getattr(workflow, "workflow_definition", None), "blocks", None)
+    if blocks:
+        return any(_block_type_name(block) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in blocks)
+    workflow_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if not isinstance(workflow_yaml, str):
+        return False
+    return any(
+        isinstance(block, dict) and _enum_or_string_name(block.get("block_type")) in _OUTCOME_EVIDENCE_BLOCK_TYPES
+        for block in (_parse_workflow_blocks(workflow_yaml) or [])
+    )
 
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
@@ -5129,7 +5157,15 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
         unverified = list(copilot_ctx.last_unverified_block_labels or [])
         evidence.unverified_block_labels = list(dict.fromkeys(str(label) for label in unverified if str(label)))
         evidence.failed_block_labels = []
-        evidence.failure_reason = None
+        # A completed-but-suspicious run (outcome unverified, null data, blocker)
+        # keeps its failure reason so the evidence stays consistent with
+        # test_attempted_but_incomplete instead of reading as a clean success.
+        suspicious_reason = copilot_ctx.last_test_failure_reason if copilot_ctx.last_test_suspicious_success else None
+        evidence.failure_reason = (
+            " ".join(suspicious_reason.split())[:240]
+            if isinstance(suspicious_reason, str) and suspicious_reason.strip()
+            else None
+        )
         if evidence.unverified_block_labels:
             evidence.verified_from_current_browser_state = True
         return
@@ -5143,10 +5179,196 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
         evidence.failure_reason = " ".join(failure_reason.split())[:240]
 
 
-def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
+_COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS = 5.0
+
+
+def _completion_verification_handler() -> Any:
+    with contextlib.suppress(RuntimeError, AttributeError):
+        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
+    return None
+
+
+def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:
+    """A clean ok=True run worth judging on its whole-workflow outcome.
+
+    Recognition is governed by the outcome evidence the user can observe, not by
+    whether every block was verified as an end-to-end prefix (SKY-10576). The judge
+    requires positive evidence for every criterion, and ``empty_data_blocks`` rejects
+    a run whose outcome block produced nothing, so an incomplete run never passes --
+    this only lets an already-reached goal be recognized without a redundant
+    full-prefix re-run.
+    """
+    if not bool(result.get("ok", False)):
+        return False
+    if _run_blocks_structured_blocker_message(result):
+        return False
+    _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result)
+    return not empty_data_blocks
+
+
+def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:
+    """A canceled/partial run (ok=False) still worth judging because it left runtime
+    evidence behind. The judge confirms a criterion only on positive evidence, so a
+    broken run never spuriously passes; this only lets a reached goal be recognized
+    even though the run did not finish cleanly — recognition must not key on run status.
+    """
+    if bool(result.get("ok", False)):
+        return False
+    if _run_blocks_structured_blocker_message(result):
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    return _valid_runtime_anchor_url(data.get("current_url")) is not None
+
+
+def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
+    data = result.get("data")
+    data = data if isinstance(data, dict) else {}
+    current_labels = set(_current_workflow_block_labels(copilot_ctx))
+    # Evidence must be what THIS run produced. ``verified_block_outputs`` accumulates
+    # across incremental runs, so sourcing from it would let an output from a prior
+    # run satisfy a criterion the current run never re-produced.
+    blocks = data.get("blocks")
+    block_outputs: dict[str, Any] = {}
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            label = block.get("label")
+            output = block.get("extracted_data")
+            if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(output):
+                block_outputs[label] = output
+    executed = data.get("executed_block_labels")
+    page_title = data.get("page_title")
+    run_id = data.get("workflow_run_id")
+    return RunEvidenceSnapshot(
+        workflow_run_id=run_id if isinstance(run_id, str) else None,
+        block_outputs=block_outputs,
+        current_url=_valid_runtime_anchor_url(data.get("current_url")),
+        page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
+        executed_block_labels=[str(label) for label in executed] if isinstance(executed, list) else [],
+    )
+
+
+async def _maybe_run_completion_verification(
+    copilot_ctx: Any, result: dict[str, Any], handler_start: float
+) -> CompletionVerificationResult | None:
+    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
+        return None
+    if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
+        return None
+    policy = getattr(copilot_ctx, "request_policy", None)
+    # A method-mandated criterion asserts HOW the goal was reached; this judge sees
+    # only end-state evidence and would always return no_evidence, false-blocking a
+    # legitimate success. Verifying method adherence needs an action trace (separate).
+    criteria = [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+    if not criteria:
+        return None
+    if not (
+        _is_outcome_evidence_candidate(copilot_ctx, result)
+        or _is_unfinished_run_verification_candidate(copilot_ctx, result)
+    ):
+        return None
+    # A missing judge handler is an infra/config state, not a transient failure:
+    # fall back to the prior gate rather than fail closed on every run.
+    handler = _completion_verification_handler()
+    if handler is None:
+        return None
+    # Too little budget to verify a candidate run: fail closed (unavailable) rather
+    # than let the run-status proxy claim an unverified outcome as success.
+    remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
+    if remaining <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS:
+        return CompletionVerificationResult(status="unavailable")
+    snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
+    if not snapshot.has_evidence():
+        return CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=[criterion.id for criterion in criteria],
+            verdicts=[
+                CriterionVerdict(criterion_id=criterion.id, satisfied=False, reason_code="no_evidence")
+                for criterion in criteria
+            ],
+        )
+    return await evaluate_completion_criteria(criteria, snapshot, handler)
+
+
+def _outcome_unverified_reason(
+    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
+) -> str | None:
+    if completion_verification is None:
+        return None
+    if completion_verification.status == "evaluated":
+        if completion_verification.is_fully_satisfied():
+            return None
+        policy = getattr(copilot_ctx, "request_policy", None)
+        criteria = list(policy.completion_criteria) if policy is not None else []
+        unmet = summarize_unsatisfied_outcomes(completion_verification, criteria)
+        detail = f": {unmet}" if unmet else ""
+        return (
+            f"The run completed but did not demonstrate the goal outcome(s){detail}. "
+            "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
+        )
+    # An 'unavailable' result reaches here only when verification was required;
+    # fail closed and ask for a re-run rather than claim an unverified success.
+    return (
+        "The run completed but the goal outcome could not be verified (verification was unavailable). "
+        "Re-run to verify the outcome before reporting success."
+    )
+
+
+def _outcome_failure_warrants_repair(
+    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
+) -> bool:
+    """Whether an unmet outcome should route to suspicious-success/repair rather
+    than continue-building.
+
+    Contradicting evidence is always a real failure. Absence of evidence is a
+    failure only once the workflow has an outcome-producing block; while the agent
+    is still adding blocks toward the goal, an unmet criterion is expected, and the
+    run should keep building. Terminal success stays withheld in both cases via the
+    verification result, so this only governs the repair directive, not the gate.
+    """
+    if completion_verification is None:
+        return False
+    if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
+        return True
+    return _current_workflow_has_evidence_block(copilot_ctx)
+
+
+def _emit_completion_verification_trace(
+    copilot_ctx: Any, completion_verification: CompletionVerificationResult
+) -> None:
+    block_count = getattr(copilot_ctx, "last_update_block_count", None)
+    policy = getattr(copilot_ctx, "request_policy", None)
+    contract = policy.completion_contract if policy is not None else None
+    heuristic_would_block = isinstance(block_count, int) and _goal_likely_needs_more_blocks(
+        getattr(copilot_ctx, "user_message", ""), block_count, contract
+    )
+    trace_data = {
+        **completion_verification.to_trace_data(),
+        "heuristic_would_block": heuristic_would_block,
+        "evidence_block_present": _current_workflow_has_evidence_block(copilot_ctx),
+        "warrants_repair": _outcome_failure_warrants_repair(copilot_ctx, completion_verification),
+    }
+    LOG.info(
+        "copilot completion verification",
+        **{f"completion_verification_{key}": value for key, value in trace_data.items()},
+    )
+    with copilot_span("completion_verification", data=trace_data):
+        pass
+
+
+def _record_run_blocks_result(
+    copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
+) -> None:
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    copilot_ctx.completion_verification_result = completion_verification
+    record_completion_verification(copilot_ctx, completion_verification)
+    if completion_verification is not None and completion_verification.status == "evaluated":
+        _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
     copilot_ctx.last_successful_run_blocks_workflow_run_id = run_id if run_ok and isinstance(run_id, str) else None
     # Watchdog cancels normally count as ok=False; only a coincident total
@@ -5248,7 +5470,21 @@ def _record_run_blocks_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
         copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         copilot_ctx.last_unverified_block_labels = unverified
-        if not unverified:
+        outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+        if outcome_unverified_reason is not None and _outcome_failure_warrants_repair(
+            copilot_ctx, completion_verification
+        ):
+            # The workflow already has a confirmation block, yet the produced
+            # evidence does not demonstrate the outcome (or contradicts it). Treat
+            # it as a suspicious success so the existing repair/partial machinery
+            # fires. A mid-build run with no confirmation block yet falls through to
+            # keep-building below; terminal success stays withheld either way via
+            # the verification result.
+            copilot_ctx.last_test_suspicious_success = True
+            copilot_ctx.last_test_failure_reason = outcome_unverified_reason
+            if isinstance(data, dict):
+                data.setdefault("failure_reason", outcome_unverified_reason)
+        elif not unverified:
             copilot_ctx.last_full_workflow_test_ok = True
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
@@ -5484,6 +5720,8 @@ async def run_blocks_tool(
     evidence instead of retrying guessed URL params or page structure.
     """
     copilot_ctx = ctx.context
+    copilot_ctx.completion_verification_result = None
+    handler_start = time.monotonic()
     arguments = {"block_labels": block_labels, "parameters": parameters or {}}
     authority_error = _authority_tool_error(copilot_ctx, "run_blocks_and_collect_debug")
     if authority_error:
@@ -5525,7 +5763,8 @@ async def run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        _record_run_blocks_result(copilot_ctx, result)
+        completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
+        _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
         record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
@@ -5623,6 +5862,8 @@ async def update_and_run_blocks_tool(
     do not compose a click against a control observed as disabled.
     """
     copilot_ctx = ctx.context
+    copilot_ctx.completion_verification_result = None
+    handler_start = time.monotonic()
     arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
     authority_error = _authority_tool_error(
@@ -5764,7 +6005,8 @@ async def update_and_run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        _record_run_blocks_result(copilot_ctx, run_result)
+        completion_verification = await _maybe_run_completion_verification(copilot_ctx, run_result, handler_start)
+        _record_run_blocks_result(copilot_ctx, run_result, completion_verification=completion_verification)
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
