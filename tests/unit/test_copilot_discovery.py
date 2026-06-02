@@ -293,3 +293,96 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
+
+
+class _SizeCappedHtmlStrippedFallbackServer:
+    """Every page's get_html is dropped by the MCP size cap (a heavy DOM exceeds it).
+    The stripped-body evaluate fallback recovers each page, so the resolver can still
+    follow the intent anchor to the form and resolve an entrypoint instead of parsing
+    empty pages and giving up."""
+
+    def __init__(self) -> None:
+        self.tools: list[str] = []
+        self.urls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.tools.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            self.urls.append(arguments["url"])
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {"ok": True, "data": {"size_capped": True}}
+        if tool_name == "skyvern_evaluate":
+            if self.urls[-1] == "https://www.example.com":
+                stripped = "<body><a href='/registry'>Find a Certificant</a></body>"
+            else:
+                stripped = "<body><form><input name='firstName'><button>Search</button></form></body>"
+            return {"ok": True, "data": {"result": stripped}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+@pytest.mark.asyncio
+async def test_discovery_recovers_entrypoint_when_get_html_is_size_capped() -> None:
+    server = _SizeCappedHtmlStrippedFallbackServer()
+
+    result = await _discovery_walk(_Ctx(server), entry_url="https://www.example.com", intent_hint="find a member")
+
+    assert result["ok"] is True
+    assert result["data"]["candidate_url"] == "https://www.example.com/registry"
+    assert result["data"]["candidate_form_fields"] == [
+        {"label": "", "name": "firstName", "type": "input", "value_hint": ""}
+    ]
+    assert "skyvern_evaluate" in server.tools
+
+
+class _StrippedHtmlServer:
+    """get_html is size-capped (dropped); the stripped-body evaluate returns a fixed body so
+    the truncation flag can be exercised."""
+
+    def __init__(self, stripped: str) -> None:
+        self._stripped = stripped
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "skyvern_navigate":
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"size_capped": True}}
+        if tool_name == "skyvern_evaluate":
+            return {"ok": True, "data": {"result": self._stripped}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+@pytest.mark.asyncio
+async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap() -> None:
+    from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _composition_get_html
+
+    at_cap = "<body>" + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
+    assert error is None
+    assert truncated is True
+
+    under_cap = "<body><form><input name='x'></form></body>"
+    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
+    assert error is None
+    assert truncated is False
+
+
+@pytest.mark.asyncio
+async def test_capture_composition_evidence_warns_when_html_sliced_at_cap() -> None:
+    from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _capture_composition_evidence
+
+    # A real form near the top yields bounded schema (no hollow-recapture loop); the trailing
+    # padding pushes the stripped body past the cap so the fallback slice is detected as partial.
+    body = (
+        "<body><form><input name='firstName'><button>Search</button></form>"
+        + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+    )
+    evidence, error = await _capture_composition_evidence(
+        _Ctx(_StrippedHtmlServer(body)),
+        inspected_url="https://www.example.com/search",
+        current_url="https://www.example.com/search",
+    )
+    assert error is None
+    assert evidence is not None
+    assert "html_sliced_at_cap" in evidence["inspection_warnings"]

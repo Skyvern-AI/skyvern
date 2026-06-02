@@ -37,8 +37,9 @@ def test_agent_prompt_frames_inspection_as_build_time_context_not_workflow_shape
     rendered = _render_agent_prompt()
 
     assert "PAGE EVIDENCE POLICY" in rendered
-    assert "fill knowledge gaps while building, editing, or debugging a workflow" in rendered
-    assert "not to add defensive verification blocks for every website shape" in rendered
+    assert "gather ground-truth evidence in ANY phase of building" in rendered
+    assert "exploring, composing, editing, and repairing after a failed block run" in rendered
+    assert "not adding defensive verification blocks for every website shape" in rendered
     assert "Do not invent website-specific paths, query parameters, form fields" in rendered
     assert (
         "Add `validation` blocks only when the reusable workflow's task actually includes a durable check" in rendered

@@ -563,6 +563,48 @@ class TestNewToolOverlayConfigs:
         assert overlay.requires_browser is True
         assert overlay.post_hook is not None
 
+    def test_click_and_type_overlays_steer_selector_first(self) -> None:
+        # The tool contract must steer toward selector-only (deterministic) acting;
+        # an `intent` routes the action through a slow full-page AI scan, so the
+        # description must not invite "both" as the default (regression guard).
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        for name in ("click", "type_text"):
+            desc = overlays[name].description or ""
+            assert "selector ALONE" in desc, f"{name} should steer toward selector-only"
+            assert "slower full-page AI scan" in desc, f"{name} should name the intent cost"
+            assert "or both for resilient targeting" not in desc, f"{name} must not invite both by default"
+            # intent must remain available for the genuine no-selector case
+            assert "intent" not in overlays[name].hide_params
+
+    def test_browser_action_overlays_force_direct_selector_mode(self) -> None:
+        # The copilot keeps deterministic selector actions by binding selector_mode="direct"
+        # via forced_args, even though the shared MCP default is resilient (SKY-10562).
+        from skyvern.forge.sdk.copilot.tools import _build_skyvern_mcp_overlays
+
+        overlays = _build_skyvern_mcp_overlays()
+        for name in ("click", "type_text", "select_option"):
+            assert overlays[name].forced_args.get("selector_mode") == "direct", (
+                f"{name} overlay must force selector_mode=direct"
+            )
+
+    @pytest.mark.asyncio
+    async def test_discovery_click_anchor_forces_direct_selector_mode(self) -> None:
+        # call_internal_tool bypasses overlays, so the discovery path must pass selector_mode
+        # explicitly; without it the anchor click would silently regress to the resilient default.
+        from skyvern.forge.sdk.copilot.tools import _discovery_click_anchor
+
+        call_internal_tool = AsyncMock(return_value={"ok": True})
+        ctx = SimpleNamespace(discovery_mcp_server=SimpleNamespace(call_internal_tool=call_internal_tool))
+
+        await _discovery_click_anchor(ctx, {"href": "https://example.com/cart"})
+
+        call_internal_tool.assert_awaited_once()
+        tool_name, tool_args = call_internal_tool.await_args.args
+        assert tool_name == "skyvern_click"
+        assert tool_args.get("selector_mode") == "direct"
+
 
 class TestNewToolSummaries:
     """Verify summarize_tool_result handles the 4 new tools."""
@@ -600,3 +642,75 @@ class TestObservationToolsSet:
 
         expected = {"scroll", "console_messages", "select_option", "press_key"}
         assert expected.issubset(_OBSERVATION_TOOLS)
+
+
+class TestVerifyScoutTypeLanded:
+    """A scout type that an overlay silently consumed must surface as a failure."""
+
+    def _ctx_with_value(self, value: Any) -> SimpleNamespace:
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(return_value={"ok": True, "data": {"value": value}})
+        return SimpleNamespace(discovery_mcp_server=server)
+
+    @pytest.mark.asyncio
+    async def test_empty_field_after_nonempty_type_returns_failure(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is not None
+        assert result["ok"] is False
+        assert "still empty" in result["error"]
+        # an empty read settles and re-reads once before declaring the type lost
+        assert ctx.discovery_mcp_server.call_internal_tool.await_count == 2
+        ctx.discovery_mcp_server.call_internal_tool.assert_awaited_with(
+            "skyvern_get_value", {"selector": "#search-input"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_then_filled_on_reread_passes(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        server = SimpleNamespace()
+        server.call_internal_tool = AsyncMock(
+            side_effect=[
+                {"ok": True, "data": {"value": ""}},
+                {"ok": True, "data": {"value": "hello world"}},
+            ]
+        )
+        ctx = SimpleNamespace(discovery_mcp_server=server)
+
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is None
+        assert server.call_internal_tool.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_nonempty_field_passes(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("hello world")
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=12)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_selector_skips_readback(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="", typed_length=12)
+
+        assert result is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_typed_length_skips_readback(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _verify_scout_type_landed
+
+        ctx = self._ctx_with_value("")
+        result = await _verify_scout_type_landed(ctx, selector="#search-input", typed_length=0)
+
+        assert result is None
+        ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()

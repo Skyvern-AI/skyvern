@@ -147,3 +147,194 @@ async def test_skyvern_run_task_timeout_returns_timeout_code(monkeypatch: pytest
     assert result["ok"] is False
     assert result["error"]["code"] == mcp_browser.ErrorCode.TIMEOUT
     assert "45" in result["error"]["message"]
+
+
+def _click_page(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    click = AsyncMock(return_value="#resolved")
+    page = SimpleNamespace(click=click)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+    return click
+
+
+# Default (resilient) keeps the shared MCP surface unchanged for external callers: a selector
+# tries first, then dismisses overlays and AI-falls-back. selector_mode="direct" (which the
+# copilot binds via forced_args) opts into deterministic, no-AI behavior.
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_mode_direct_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit", selector_mode="direct")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["mode"] == "direct"
+    assert "prompt" not in click.await_args.kwargs and "ai" not in click.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_plus_intent_falls_back_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="#submit", intent="the blue submit button")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs.get("ai") == "fallback"
+    assert click.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_selector_mode_direct_ignores_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(
+        selector="#submit", intent="the blue submit button", selector_mode="direct"
+    )
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["mode"] == "direct"
+    assert "prompt" not in click.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_click_intent_only_uses_proactive_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(intent="the blue submit button")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["ai"] == "proactive"
+    assert click.await_args.kwargs.get("mode") != "direct"
+
+
+def _action_page(monkeypatch: pytest.MonkeyPatch, **methods: AsyncMock) -> None:
+    page = SimpleNamespace(**methods)
+    context = BrowserContext(mode="cloud_session", session_id="pbs_test")
+    monkeypatch.setattr(mcp_browser, "get_page", AsyncMock(return_value=(page, context)))
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    fill = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor")
+
+    assert result["ok"] is True
+    assert fill.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_selector_mode_direct_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    fill = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", selector_mode="direct")
+
+    assert result["ok"] is True
+    assert fill.await_args.kwargs["mode"] == "direct"
+    assert "prompt" not in fill.await_args.kwargs and "ai" not in fill.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_selector_plus_intent_falls_back_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    fill = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(selector="#first_name", text="Noor", intent="the first name field")
+
+    assert result["ok"] is True
+    assert fill.await_args.kwargs.get("ai") == "fallback"
+    assert fill.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_intent_only_uses_proactive_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    fill = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(intent="the first name field", text="Noor")
+
+    assert result["ok"] is True
+    assert fill.await_args.kwargs["ai"] == "proactive"
+    assert fill.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_selector_is_resilient_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    select = AsyncMock(return_value="us")
+    _action_page(monkeypatch, select_option=select)
+
+    result = await mcp_browser.skyvern_select_option(selector="#country", value="us")
+
+    assert result["ok"] is True
+    assert "ai" not in select.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_selector_mode_direct_is_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
+    select = AsyncMock(return_value="us")
+    _action_page(monkeypatch, select_option=select)
+
+    result = await mcp_browser.skyvern_select_option(selector="#country", value="us", selector_mode="direct")
+
+    assert result["ok"] is True
+    assert select.await_args.kwargs["ai"] is None
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_intent_only_uses_proactive_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    select = AsyncMock(return_value="us")
+    _action_page(monkeypatch, select_option=select)
+
+    result = await mcp_browser.skyvern_select_option(intent="the country dropdown", value="United States")
+
+    assert result["ok"] is True
+    assert select.await_args.kwargs["ai"] == "proactive"
+
+
+# A blank/whitespace selector (how MCP clients serialize an omitted optional arg) must be
+# treated as "no selector" so it uses the intent's AI path, not a deterministic action on "".
+@pytest.mark.asyncio
+async def test_skyvern_click_blank_selector_with_intent_uses_proactive_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    click = _click_page(monkeypatch)
+
+    result = await mcp_browser.skyvern_click(selector="   ", intent="the blue submit button")
+
+    assert result["ok"] is True
+    assert click.await_args.kwargs["ai"] == "proactive"
+    assert click.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_type_blank_selector_with_intent_uses_proactive_ai(monkeypatch: pytest.MonkeyPatch) -> None:
+    fill = AsyncMock(return_value="Noor")
+    _action_page(monkeypatch, fill=fill)
+
+    result = await mcp_browser.skyvern_type(selector="", text="Noor", intent="the first name field")
+
+    assert result["ok"] is True
+    assert fill.await_args.kwargs["ai"] == "proactive"
+    assert fill.await_args.kwargs.get("mode") != "direct"
+
+
+@pytest.mark.asyncio
+async def test_skyvern_select_option_blank_selector_with_intent_uses_proactive_ai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    select = AsyncMock(return_value="us")
+    _action_page(monkeypatch, select_option=select)
+
+    result = await mcp_browser.skyvern_select_option(selector="", intent="the country dropdown", value="US")
+
+    assert result["ok"] is True
+    assert select.await_args.kwargs["ai"] == "proactive"

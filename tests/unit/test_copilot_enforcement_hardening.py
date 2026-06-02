@@ -24,11 +24,16 @@ import pytest
 
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
+    POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
+    POST_FAILED_TEST_NUDGE,
     POST_NAVIGATE_NUDGE,
+    POST_PER_TOOL_BUDGET_NUDGE,
+    POST_PER_TOOL_BUDGET_STOP_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     SCREENSHOT_PLACEHOLDER,
     _check_enforcement,
     _is_context_window_error,
+    _needs_inspect_before_repair_nudge,
     _prune_input_list,
     _recover_from_context_overflow,
     _strip_input_images,
@@ -67,6 +72,80 @@ def test_failed_test_nudge_counter_increments_on_fresh_context() -> None:
     # First call should emit and increment without AttributeError.
     assert _check_enforcement(ctx) is not None
     assert ctx.failed_test_nudge_count == 1
+
+
+def _repair_contract(next_action: Any, *, has_current_url: bool = True) -> Any:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+        DiagnosisInput,
+        DiagnosisRepairContract,
+        DiagnosisResult,
+        RepairDecision,
+        VerificationResult,
+    )
+
+    return DiagnosisRepairContract(
+        diagnosis_input=DiagnosisInput(
+            source_tool="update_and_run_blocks",
+            browser_page_state={"has_current_url": has_current_url},
+        ),
+        diagnosis_result=DiagnosisResult(),
+        repair_decision=RepairDecision(next_action=next_action),
+        verification_result=VerificationResult(),
+    )
+
+
+def test_needs_inspect_before_repair_nudge_logic() -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _fresh_context()
+    assert _needs_inspect_before_repair_nudge(ctx) is False  # no contract
+    ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.REPAIR)
+    assert _needs_inspect_before_repair_nudge(ctx) is True  # repairable, reached page, unobserved
+    ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.NO_CHANGE)
+    assert _needs_inspect_before_repair_nudge(ctx) is False  # not a repair
+    ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.REPAIR, has_current_url=False)
+    assert _needs_inspect_before_repair_nudge(ctx) is False  # no reached page to inspect
+
+
+def test_failed_test_routes_to_inspect_first_when_repairable_and_unobserved() -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.REPAIR)
+    assert _check_enforcement(ctx) == POST_FAILED_TEST_INSPECT_FIRST_NUDGE
+
+
+def test_second_consecutive_per_tool_budget_trip_routes_to_stop_nudge() -> None:
+    from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    # First budget trip earns one smaller-frontier retry nudge.
+    assert _check_enforcement(ctx) == POST_PER_TOOL_BUDGET_NUDGE
+    assert ctx.per_tool_budget_nudge_count == 1
+    # Second consecutive budget trip -> finalize/STOP nudge, not another re-run.
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    assert _check_enforcement(ctx) == POST_PER_TOOL_BUDGET_STOP_NUDGE
+    assert ctx.per_tool_budget_nudge_count == 2
+
+
+def test_failed_test_is_generic_once_reached_page_observed() -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+
+    ctx = _fresh_context()
+    ctx.test_after_update_done = True
+    ctx.last_test_ok = False
+    ctx.latest_diagnosis_repair_contract = _repair_contract(RepairNextAction.REPAIR)
+    # The agent already inspected the reached page since the failed run -> generic nudge.
+    ctx.post_run_page_observation_after_failed_test = True
+    ctx.post_run_page_observation_tool = "inspect_page_for_composition"
+    ctx.post_run_page_observation_workflow_run_id = "wr_x"
+    ctx.last_run_blocks_workflow_run_id = "wr_x"
+    assert _check_enforcement(ctx) == POST_FAILED_TEST_NUDGE
 
 
 # ---------------------------------------------------------------------------
