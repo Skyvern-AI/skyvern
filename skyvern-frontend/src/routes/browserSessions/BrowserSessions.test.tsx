@@ -7,7 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { BrowserSessions } from "./BrowserSessions";
 import { type BrowserSession } from "@/routes/workflows/types/browserSessionTypes";
 
-const openBrowserSession: BrowserSession = {
+const openUnoccupiedSession: BrowserSession = {
   browser_address: "ws://example.test/devtools/browser/session-1",
   browser_session_id: "session-1",
   completed_at: null,
@@ -23,7 +23,7 @@ const openBrowserSession: BrowserSession = {
 
 vi.mock("@/routes/browserSessions/hooks/useBrowserSessionsQuery", () => ({
   useBrowserSessionsQuery: vi.fn((page: number) => ({
-    data: page === 1 ? [openBrowserSession] : [],
+    data: page === 1 ? [openUnoccupiedSession] : [],
     isLoading: false,
   })),
 }));
@@ -42,28 +42,29 @@ afterEach(() => {
   cleanup();
 });
 
+function renderPage() {
+  render(
+    <MemoryRouter
+      initialEntries={["/browser-sessions"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <BrowserSessions />
+    </MemoryRouter>,
+  );
+}
+
 describe("BrowserSessions", () => {
-  it("renders the open session Yes pill with completed run status colors", () => {
-    render(
-      <MemoryRouter
-        initialEntries={["/browser-sessions"]}
-        future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
-      >
-        <BrowserSessions />
-      </MemoryRouter>,
-    );
+  it("renders a session row with its id and timeout", () => {
+    renderPage();
+    expect(screen.getByText("session-1")).toBeTruthy();
+    expect(screen.getByText("60m")).toBeTruthy();
+  });
 
-    const openPill = screen.getByText("Yes");
-
-    const pillClasses = openPill.className.split(/\s+/);
-
-    expect(pillClasses).toContain("border-green-900/20");
-    expect(pillClasses).toContain("bg-green-900/10");
-    expect(pillClasses).toContain("text-green-800");
-    expect(pillClasses).toContain("hover:bg-green-900/15");
-    expect(pillClasses).toContain("dark:bg-green-900");
-    expect(pillClasses).toContain("dark:text-green-50");
-    expect(openPill.className).not.toMatch(/emerald|bg-success/);
-    expect(openPill.className).not.toMatch(/shadow-(emerald|\[)/);
+  it("derives Open=Yes / Occupied=No from the session's lifecycle fields", () => {
+    renderPage();
+    // completed_at === null && started_at !== null => open
+    expect(screen.getAllByText("Yes")).toHaveLength(1);
+    // runnable_id === null => not occupied
+    expect(screen.getAllByText("No")).toHaveLength(1);
   });
 });

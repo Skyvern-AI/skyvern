@@ -24,7 +24,11 @@ const TableHeader = React.forwardRef<
   HTMLTableSectionElement,
   React.HTMLAttributes<HTMLTableSectionElement>
 >(({ className, ...props }, ref) => (
-  <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />
+  <thead
+    ref={ref}
+    className={cn("bg-muted/30 [&_tr]:border-b", className)}
+    {...props}
+  />
 ));
 TableHeader.displayName = "TableHeader";
 
@@ -34,7 +38,10 @@ const TableBody = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <tbody
     ref={ref}
-    className={cn("[&_tr:last-child]:border-0", className)}
+    className={cn(
+      "[&_tr:hover]:bg-muted/40 [&_tr:last-child]:border-0",
+      className,
+    )}
     {...props}
   />
 ));
@@ -62,7 +69,7 @@ const TableRow = React.forwardRef<
   <tr
     ref={ref}
     className={cn(
-      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
+      "border-b border-border/60 transition-colors data-[state=selected]:bg-muted",
       className,
     )}
     {...props}
@@ -77,7 +84,7 @@ const TableHead = React.forwardRef<
   <th
     ref={ref}
     className={cn(
-      "h-10 px-2 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+      "h-9 px-3 text-left align-middle text-[11px] font-semibold uppercase tracking-wider text-muted-foreground [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
       className,
     )}
     {...props}
@@ -92,7 +99,7 @@ const TableCell = React.forwardRef<
   <td
     ref={ref}
     className={cn(
-      "p-2 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
+      "px-3 py-2.5 align-middle [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
       className,
     )}
     {...props}
@@ -112,6 +119,27 @@ const TableCaption = React.forwardRef<
 ));
 TableCaption.displayName = "TableCaption";
 
+type TableMessageRowProps = React.TdHTMLAttributes<HTMLTableCellElement> & {
+  colSpan: number;
+};
+
+const TableMessageRow = React.forwardRef<
+  HTMLTableCellElement,
+  TableMessageRowProps
+>(({ className, colSpan, children, ...props }, ref) => (
+  <TableRow>
+    <TableCell
+      ref={ref}
+      colSpan={colSpan}
+      className={cn("h-24 text-center text-muted-foreground", className)}
+      {...props}
+    >
+      {children}
+    </TableCell>
+  </TableRow>
+));
+TableMessageRow.displayName = "TableMessageRow";
+
 export {
   Table,
   TableHeader,
@@ -121,4 +149,5 @@ export {
   TableRow,
   TableCell,
   TableCaption,
+  TableMessageRow,
 };

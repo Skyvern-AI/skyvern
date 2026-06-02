@@ -14,6 +14,7 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import {
@@ -23,14 +24,13 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   BookmarkFilledIcon,
   ChevronDownIcon,
   DotsHorizontalIcon,
   LightningBoltIcon,
-  MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
   PlusIcon,
@@ -540,19 +540,15 @@ function Workflows() {
             </DropdownMenu>
           </div>
         </div>
-        <div className="rounded-lg border">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
-            <TableHeader className="rounded-t-lg bg-slate-elevation2">
+            <TableHeader>
               <TableRow>
-                <TableHead className="w-[25%] rounded-tl-lg text-slate-400">
-                  ID
-                </TableHead>
-                <TableHead className="w-[30%] text-slate-400">Title</TableHead>
-                <TableHead className="w-[15%] text-slate-400">Folder</TableHead>
-                <TableHead className="w-[15%] text-slate-400">
-                  Created At
-                </TableHead>
-                <TableHead className="w-[15%] rounded-tr-lg"></TableHead>
+                <TableHead className="w-[25%]">ID</TableHead>
+                <TableHead className="w-[30%]">Title</TableHead>
+                <TableHead className="w-[15%]">Folder</TableHead>
+                <TableHead className="w-[15%]">Created At</TableHead>
+                <TableHead className="w-[15%] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -585,9 +581,7 @@ function Workflows() {
                   </TableRow>
                 ))
               ) : displayWorkflows?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={5}>No agents found</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={5}>No agents found</TableMessageRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
                   const parameterItems = workflow.workflow_definition.parameters
@@ -621,18 +615,18 @@ function Workflows() {
                             </div>
                           </TableCell>
                           <TableCell>
-                            <span className="text-slate-400">-</span>
+                            <span className="text-muted-foreground">-</span>
+                          </TableCell>
+                          <TableCell className="text-muted-foreground">
+                            {compactLocalDateTime(workflow.created_at)}
                           </TableCell>
                           <TableCell>
-                            {basicLocalTimeFormat(workflow.created_at)}
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex justify-end gap-2">
+                            <div className="flex justify-end gap-0.5">
                               <Button size="icon" variant="ghost" disabled>
                                 <FolderIcon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
-                                <MixerHorizontalIcon className="h-4 w-4" />
+                                <Pencil2Icon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
                                 <PlayIcon className="h-4 w-4" />
@@ -654,7 +648,7 @@ function Workflows() {
                             }}
                           >
                             <div
-                              className="truncate"
+                              className="truncate font-mono text-xs text-muted-foreground"
                               title={workflow.workflow_permanent_id}
                             >
                               <HighlightText
@@ -718,7 +712,7 @@ function Workflows() {
                                 </span>
                               </div>
                             ) : (
-                              <span className="text-slate-400">-</span>
+                              <span className="text-muted-foreground">-</span>
                             )}
                           </TableCell>
                           <TableCell
@@ -728,12 +722,13 @@ function Workflows() {
                                 workflow.workflow_permanent_id,
                               );
                             }}
+                            className="text-muted-foreground"
                             title={basicTimeFormat(workflow.created_at)}
                           >
-                            {basicLocalTimeFormat(workflow.created_at)}
+                            {compactLocalDateTime(workflow.created_at)}
                           </TableCell>
                           <TableCell>
-                            <div className="flex justify-end gap-2">
+                            <div className="flex justify-end gap-0.5">
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
@@ -756,35 +751,8 @@ function Workflows() {
                                   <TooltipTrigger asChild>
                                     <Button
                                       size="icon"
-                                      variant="outline"
-                                      onClick={() =>
-                                        toggleParametersExpanded(
-                                          workflow.workflow_permanent_id,
-                                        )
-                                      }
-                                      disabled={!hasParameters}
-                                      className={cn(
-                                        isExpanded && "text-blue-400",
-                                      )}
-                                    >
-                                      <MixerHorizontalIcon className="h-4 w-4" />
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    {hasParameters
-                                      ? isExpanded
-                                        ? "Hide Inputs"
-                                        : "Show Inputs"
-                                      : "No Inputs"}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      size="icon"
-                                      variant="outline"
+                                      variant="ghost"
+                                      className="text-muted-foreground hover:text-foreground"
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
@@ -805,7 +773,8 @@ function Workflows() {
                                   <TooltipTrigger asChild>
                                     <Button
                                       size="icon"
-                                      variant="outline"
+                                      variant="ghost"
+                                      className="text-cta hover:text-cta"
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
@@ -821,7 +790,16 @@ function Workflows() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
-                              <WorkflowActions workflow={workflow} />
+                              <WorkflowActions
+                                workflow={workflow}
+                                hasParameters={hasParameters}
+                                parametersExpanded={isExpanded}
+                                onToggleParameters={() =>
+                                  toggleParametersExpanded(
+                                    workflow.workflow_permanent_id,
+                                  )
+                                }
+                              />
                             </div>
                           </TableCell>
                         </TableRow>

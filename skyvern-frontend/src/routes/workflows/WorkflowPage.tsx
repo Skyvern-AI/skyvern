@@ -34,11 +34,12 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import {
-  basicLocalTimeFormat,
   basicTimeFormat,
+  compactLocalDateTime,
   formatExecutionTime,
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
@@ -212,26 +213,24 @@ function WorkflowPage() {
             onChange={setStatusFilters}
           />
         </div>
-        <div className="rounded-md border">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead className="w-1/5">ID</TableHead>
-                <TableHead className="w-1/5">Status</TableHead>
-                <TableHead className="w-1/5">Created At</TableHead>
-                <TableHead className="w-1/5">Duration</TableHead>
-                <TableHead className="w-1/5"></TableHead>
+                <TableHead className="w-[20%]">ID</TableHead>
+                <TableHead className="w-[20%]">Status</TableHead>
+                <TableHead className="w-[20%]">Created At</TableHead>
+                <TableHead className="w-[20%]">Duration</TableHead>
+                <TableHead className="w-[20%] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={5}>Loading...</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={5}>Loading runs…</TableMessageRow>
               ) : workflowRuns?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={5}>No agent runs found</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={5}>
+                  No agent runs found
+                </TableMessageRow>
               ) : (
                 workflowRuns?.map((workflowRun) => {
                   const workflowRunId =
@@ -271,16 +270,19 @@ function WorkflowPage() {
                         }}
                         className="cursor-pointer"
                       >
-                        <TableCell>{workflowRunId}</TableCell>
+                        <TableCell className="font-mono text-xs text-muted-foreground">
+                          {workflowRunId}
+                        </TableCell>
                         <TableCell>
                           <StatusBadge status={workflowRun.status} />
                         </TableCell>
                         <TableCell
+                          className="text-muted-foreground"
                           title={basicTimeFormat(workflowRun.created_at)}
                         >
-                          {basicLocalTimeFormat(workflowRun.created_at)}
+                          {compactLocalDateTime(workflowRun.created_at)}
                         </TableCell>
-                        <TableCell className="text-slate-400">
+                        <TableCell className="tabular-nums text-muted-foreground">
                           {formatExecutionTime(
                             workflowRun.started_at ?? workflowRun.created_at,
                             workflowRun.finished_at,
@@ -293,7 +295,7 @@ function WorkflowPage() {
                                 <TooltipTrigger asChild>
                                   <Button
                                     size="icon"
-                                    variant="outline"
+                                    variant="ghost"
                                     onClick={(event) => {
                                       event.stopPropagation();
                                       toggleParametersExpanded(
@@ -301,7 +303,9 @@ function WorkflowPage() {
                                       );
                                     }}
                                     className={cn(
-                                      isExpanded && "text-blue-400",
+                                      isExpanded
+                                        ? "text-blue-400"
+                                        : "text-muted-foreground hover:text-foreground",
                                     )}
                                   >
                                     <MixerHorizontalIcon className="h-4 w-4" />
