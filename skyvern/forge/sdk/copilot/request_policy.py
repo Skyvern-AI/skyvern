@@ -118,6 +118,18 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
 )
 
 
+_MAX_COMPLETION_CRITERIA = 8
+_COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
+
+
+@dataclass(frozen=True)
+class CompletionCriterion:
+    id: str
+    outcome: str
+    implicit: bool = False
+    method_mandated: bool = False
+
+
 @dataclass
 class RequestPolicy:
     testing_intent: str = "unspecified"
@@ -130,6 +142,7 @@ class RequestPolicy:
     allow_missing_credentials_in_draft: bool = False
     user_response_policy: str = "proceed"
     completion_contract: str | None = None
+    completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
@@ -151,6 +164,13 @@ class RequestPolicy:
             "allow_missing_credentials_in_draft": self.allow_missing_credentials_in_draft,
             "resolved_credential_count": len(self.resolved_credentials),
             "has_completion_contract": bool(self.completion_contract),
+            "completion_criteria_count": len(self.completion_criteria),
+            "completion_criteria_implicit_count": sum(
+                1 for criterion in self.completion_criteria if criterion.implicit
+            ),
+            "completion_criteria_method_mandated_count": sum(
+                1 for criterion in self.completion_criteria if criterion.method_mandated
+            ),
             "raw_secret_detected": self.raw_secret_detected,
             "has_raw_secret_evidence": self.raw_secret_evidence is not None,
             "raw_secret_handling": self.raw_secret_handling,
@@ -442,6 +462,7 @@ def _classification_from_raw(raw: Any) -> RequestPolicy:
         login_page_urls=_clean_list(raw.get("login_page_urls") or []),
         requires_user_clarification=bool(raw.get("requires_user_clarification")),
         completion_contract=completion_contract or None,
+        completion_criteria=_parse_completion_criteria(raw.get("completion_criteria")),
         raw_secret_evidence=raw_secret_evidence,
         raw_secret_handling=_coerce_raw_secret_handling(raw.get("raw_secret_handling")),
         clarification_reason=_coerce_clarification_reason(raw.get("clarification_reason")),
@@ -473,6 +494,43 @@ def _ground_completion_contract(user_message: str, value: str | None) -> str | N
         return contract
 
     return None
+
+
+def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
+    """Build outcome criteria from the classifier output.
+
+    IDs are assigned server-side by index after de-duplication; any id the
+    model emits is discarded because the downstream satisfaction check keys on
+    a unique id set.
+    """
+    if not isinstance(raw, list):
+        return []
+    criteria: list[CompletionCriterion] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        outcome_raw = item.get("outcome")
+        if not isinstance(outcome_raw, str):
+            continue
+        outcome = " ".join(outcome_raw.split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS].strip()
+        if not outcome:
+            continue
+        key = outcome.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        criteria.append(
+            CompletionCriterion(
+                id=f"c{len(criteria)}",
+                outcome=outcome,
+                implicit=bool(item.get("implicit")),
+                method_mandated=bool(item.get("method_mandated")),
+            )
+        )
+        if len(criteria) >= _MAX_COMPLETION_CRITERIA:
+            break
+    return criteria
 
 
 def _classifier_fallback_policy(ids: list[str], *, raw_secret_present: bool) -> RequestPolicy:
@@ -516,6 +574,7 @@ async def _classify_request(
     transcript = build_transcript_context(chat_history, safe_user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
+        outcome_verification_enabled=settings.COPILOT_OUTCOME_VERIFICATION_ENABLED,
         user_message=escape_code_fences(safe_user_message),
         raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),

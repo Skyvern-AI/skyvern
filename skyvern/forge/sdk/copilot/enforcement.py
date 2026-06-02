@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from agents.run import Runner
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
@@ -226,13 +227,61 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
     )
 
 
+def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
+    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
+        return False
+    result = ctx.completion_verification_result
+    return result is not None and result.status == "evaluated"
+
+
+def outcome_fully_verified(ctx: CopilotContext) -> bool:
+    """The judge confirmed every outcome criterion from the evidence this run produced.
+
+    This evidence is authoritative over run status: a run that reached the goal is
+    recognized even when it was canceled or only partially completed. Run status must
+    never suppress recognition of an outcome the user can observe was achieved.
+    """
+    if not _outcome_criteria_evaluated(ctx):
+        return False
+    result = ctx.completion_verification_result
+    return result is not None and result.is_fully_satisfied()
+
+
 def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
-    return (
+    if outcome_fully_verified(ctx):
+        return True
+    # The judge verdict is authoritative: once it has evaluated, an unconfirmed
+    # criterion means the outcome is unmet regardless of run status. The block-count
+    # heuristic (which counts method verbs in the request) governs only when there
+    # is no evaluated verdict.
+    if _outcome_criteria_evaluated(ctx):
+        return False
+    if not (
         ctx.last_test_ok is True
         and ctx.last_full_workflow_test_ok is True
         and latest_diagnosis_contract_satisfies_goal(ctx)
-        and not _verified_goal_likely_needs_more_work(ctx)
-    )
+    ):
+        return False
+    return not _verified_goal_likely_needs_more_work(ctx)
+
+
+def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
+    """The terminal-gate decision plus the conjuncts that explain it.
+
+    Captured wherever the gate is evaluated (including when it returns False, the
+    signal that explains why the turn continued) so a single trace shows whether
+    the gate failed on the test, the full-workflow run, the diagnosis contract,
+    the absence of outcome verification, or the block-count heuristic.
+    """
+    return {
+        "gate_satisfied": verified_goal_satisfied_context(ctx),
+        "gate_last_test_ok": ctx.last_test_ok is True,
+        "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
+        "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),
+        "gate_outcome_criteria_evaluated": _outcome_criteria_evaluated(ctx),
+        "gate_likely_needs_more_work": _verified_goal_likely_needs_more_work(ctx),
+        "gate_evaluated_this_turn": True,
+    }
 
 
 def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:

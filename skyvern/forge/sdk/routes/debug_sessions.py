@@ -167,7 +167,7 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
     )
 
-    if completed_debug_sessions:
+    if completed_debug_sessions and settings.ENV != "local":
         closeable_browser_sessions: list[PersistentBrowserSession] = []
 
         for debug_session in completed_debug_sessions:
@@ -225,6 +225,14 @@ async def new_debug_session(
                     current_org.organization_id,
                 )
             )
+    elif completed_debug_sessions:
+        LOG.info(
+            "Local mode: skipping debug-session close tasks before creating replacement browser session",
+            num_completed_debug_sessions=len(completed_debug_sessions),
+            organization_id=current_org.organization_id,
+            user_id=current_user_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
 
     # Look up the workflow's proxy_location so the debug session browser
     # uses the same proxy region the user configured on the workflow.
@@ -238,6 +246,7 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         timeout_minutes=settings.DEBUG_SESSION_TIMEOUT_MINUTES,
         proxy_location=proxy_location,
+        wait_for_startup=settings.ENV != "local",
     )
 
     debug_session = await app.DATABASE.debug.create_debug_session(
@@ -245,9 +254,9 @@ async def new_debug_session(
         organization_id=current_org.organization_id,
         user_id=current_user_id,
         workflow_permanent_id=workflow_permanent_id,
-        vnc_streaming_supported=True if new_browser_session.ip_address else False,
-        # NOTE(jdo:streaming-local-dev)
-        # vnc_streaming_supported=True,
+        vnc_streaming_supported=(
+            settings.ENV == "local" or bool(new_browser_session.ip_address or new_browser_session.browser_address)
+        ),
     )
 
     LOG.info(

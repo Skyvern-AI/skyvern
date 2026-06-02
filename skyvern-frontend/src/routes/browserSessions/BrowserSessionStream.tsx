@@ -13,6 +13,7 @@ import {
   isTerminalStreamStatus,
   shouldReconnectStream,
 } from "./BrowserSessionStream.utils";
+import { useSettingsStore } from "@/store/SettingsStore";
 
 type StreamMessage = {
   browser_session_id?: string;
@@ -111,6 +112,7 @@ function BrowserSessionStream({
   const [diagnostic, setDiagnostic] =
     useState<StreamDiagnostic>(STARTING_DIAGNOSTIC);
   const credentialGetter = useCredentialGetter();
+  const settingsStore = useSettingsStore();
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasFrameRef = useRef(false);
@@ -280,6 +282,7 @@ function BrowserSessionStream({
     // browserSessionId intentionally not a dep: re-firing on prop change
     // before isReady resets would spuriously report (true, newSessionId).
     onReadyChange?.(isReady, isReady ? browserSessionId : null);
+    // Zustand store setters are stable; omit browserSessionId from deps on purpose.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isReady, onReadyChange]);
 
@@ -288,6 +291,13 @@ function BrowserSessionStream({
       onReadyChange?.(false, null);
     };
   }, [onReadyChange]);
+
+  useEffect(() => {
+    settingsStore.setIsUsingABrowser(isReady);
+    settingsStore.setBrowserSessionId(isReady ? browserSessionId : null);
+    // Zustand store setters are stable; only sync when stream readiness changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isReady, browserSessionId]);
 
   if (isReady) {
     return (

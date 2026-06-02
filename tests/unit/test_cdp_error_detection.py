@@ -5,7 +5,7 @@ from playwright._impl._errors import Error as PWError
 from playwright._impl._errors import TargetClosedError as PWTargetClosedError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 
-from skyvern.webeye.cdp_retry import _is_cdp_connection_error
+from skyvern.webeye.cdp_retry import is_cdp_connection_error
 
 
 class TestConnectionErrorDetection:
@@ -23,7 +23,7 @@ class TestConnectionErrorDetection:
         ids=lambda e: type(e).__name__ + ": " + str(e)[:50],
     )
     def test_connection_errors_detected(self, exc: Exception):
-        assert _is_cdp_connection_error(exc), f"Expected connection error: {exc!r}"
+        assert is_cdp_connection_error(exc), f"Expected connection error: {exc!r}"
 
     @pytest.mark.parametrize(
         "exc",
@@ -37,4 +37,4 @@ class TestConnectionErrorDetection:
         ids=lambda e: type(e).__name__ + ": " + str(e)[:50],
     )
     def test_app_errors_not_detected(self, exc: Exception):
-        assert not _is_cdp_connection_error(exc), f"Expected app error NOT to match: {exc!r}"
+        assert not is_cdp_connection_error(exc), f"Expected app error NOT to match: {exc!r}"

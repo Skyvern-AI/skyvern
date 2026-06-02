@@ -51,6 +51,10 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.outcome_verification_trace import (
+    finalize_outcome_verification_trace,
+    record_gate_decision,
+)
 from skyvern.forge.sdk.copilot.output_policy import (
     UNVALIDATED_DISCLOSURE_PHRASES,
     WORKFLOW_PRESENT_SENTINEL,
@@ -754,13 +758,28 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
     return user_response
 
 
+def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
+    result = ctx.completion_verification_result
+    if result is None:
+        return True
+    if result.status != "evaluated":
+        # Verification was required for this run but could not produce a verdict
+        # (unavailable): do not surface the workflow as verified on run status alone.
+        return False
+    return result.is_fully_satisfied()
+
+
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
-    """Surface a proposal only when it passed a test this turn AND yaml is on hand."""
+    """Surface a proposal when it passed a test this turn, or when the outcome judge
+    confirmed the goal from evidence even though the run did not finish cleanly."""
+    from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
+
+    run_status_clean = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
     if (
         ctx.last_workflow is not None
         and ctx.last_workflow_yaml
-        and ctx.last_test_ok is True
-        and ctx.last_full_workflow_test_ok is True
+        and (run_status_clean or outcome_fully_verified(ctx))
+        and _completion_contract_not_violated(ctx)
     ):
         return ctx.last_workflow, ctx.last_workflow_yaml
     return None, None
@@ -2538,6 +2557,7 @@ async def run_copilot_agent(
         # is installed; otherwise the very first turn lands the parent span on
         # OTel's no-op ProxyTracer when running locally with COPILOT_TRACING_ENABLED.
         ensure_tracing_initialized()
+        ctx_sink: list[CopilotContext] = []
         with _copilot_turn_span(
             chat_request=chat_request,
             chat_history=chat_history,
@@ -2560,6 +2580,7 @@ async def run_copilot_agent(
                     turn_index=normalized_turn_index,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
+                    ctx_sink=ctx_sink,
                 )
             except Exception as exc:
                 LOG.error(
@@ -2584,6 +2605,8 @@ async def run_copilot_agent(
                     turn_index=normalized_turn_index,
                 )
                 return _build_unexpected_error_exit_result(ctx, global_llm_context, error=exc, span=turn_span)
+            finally:
+                finalize_outcome_verification_trace(ctx_sink[0] if ctx_sink else None, turn_span)
     except Exception as exc:
         LOG.error(
             "Copilot turn unhandled error",
@@ -2624,6 +2647,7 @@ async def _run_copilot_turn_impl(
     turn_index: int,
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
+    ctx_sink: list[CopilotContext] | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -2694,6 +2718,8 @@ async def _run_copilot_turn_impl(
         raise RuntimeError(
             f"CopilotContext.turn_id ({ctx.turn_id!r}) diverged from route-supplied turn_id ({turn_id!r})"
         )
+    if ctx_sink is not None:
+        ctx_sink.append(ctx)
     policy_inputs = RequestPolicyGuardrailInputs(
         user_message=chat_request.message,
         workflow_yaml=safe_workflow_yaml,
@@ -2805,8 +2831,8 @@ async def _run_copilot_turn_impl(
         CopilotNonRetriableNavError,
         CopilotTotalTimeoutError,
         CopilotUnrecoverableToolError,
+        gate_decision_trace_fields,
         run_with_enforcement,
-        verified_goal_satisfied_context,
     )
     from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
     from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer
@@ -3084,7 +3110,11 @@ async def _run_copilot_turn_impl(
                 )
     except Exception as e:
         try:
-            goal_satisfied = verified_goal_satisfied_context(ctx)
+            # Terminal-path gate-decision record; the per-tool hook records the
+            # in-loop path, and the later write wins on the shared snapshot.
+            gate_fields = gate_decision_trace_fields(ctx)
+            record_gate_decision(ctx, gate_fields)
+            goal_satisfied = gate_fields["gate_satisfied"]
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)

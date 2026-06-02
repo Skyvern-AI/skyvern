@@ -73,16 +73,16 @@ function BrowserSession() {
       return response.data;
     },
     refetchInterval: (query) =>
-      getBrowserSessionRefetchIntervalMs(query.state.data?.status),
+      getBrowserSessionRefetchIntervalMs(query.state.data),
   });
 
   const browserSession = query.data;
-  const streamMode: StreamMode = browserSession?.vnc_streaming_supported
-    ? vncFailed
-      ? "fallback"
-      : "vnc"
-    : isCdpMode
-      ? "cdp"
+  const streamMode: StreamMode = isCdpMode
+    ? "cdp"
+    : browserSession?.vnc_streaming_supported
+      ? vncFailed
+        ? "fallback"
+        : "vnc"
       : "unavailable";
 
   const closeBrowserSessionMutation = useCloseBrowserSessionMutation({
@@ -229,23 +229,22 @@ function BrowserSession() {
               pointerEvents: activeTab === "stream" ? "auto" : "none",
             }}
           >
-            {/* VNC streaming */}
-            {browserSession.vnc_streaming_supported && !vncFailed && (
-              <BrowserStream
+            {isCdpMode && browserSessionId && (
+              <BrowserSessionStream
                 browserSessionId={browserSessionId}
-                interactive={false}
+                interactive={true}
                 showControlButtons={true}
-                isVisible={activeTab === "stream"}
-                onClose={() => setVncFailed(true)}
               />
             )}
-            {isCdpMode &&
-              browserSessionId &&
-              (!browserSession.vnc_streaming_supported || vncFailed) && (
-                <BrowserSessionStream
+            {!isCdpMode &&
+              browserSession.vnc_streaming_supported &&
+              !vncFailed && (
+                <BrowserStream
                   browserSessionId={browserSessionId}
-                  interactive={true}
+                  interactive={false}
                   showControlButtons={true}
+                  isVisible={activeTab === "stream"}
+                  onClose={() => setVncFailed(true)}
                 />
               )}
           </div>

@@ -43,7 +43,10 @@ import { useDebugSessionQuery } from "../hooks/useDebugSessionQuery";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { BrowserSessionStream } from "@/routes/browserSessions/BrowserSessionStream";
 import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
-import { StreamModeBadge } from "@/routes/streaming/StreamDiagnostics";
+import {
+  StreamModeBadge,
+  StreamStatusPanel,
+} from "@/routes/streaming/StreamDiagnostics";
 import { useCacheKeyValuesQuery } from "../hooks/useCacheKeyValuesQuery";
 import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
@@ -142,6 +145,20 @@ import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
 
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
+
+function getAxiosErrorDetail(error: unknown): string | undefined {
+  if (!(error instanceof AxiosError)) {
+    return undefined;
+  }
+
+  const data = error.response?.data;
+  if (!data || typeof data !== "object" || !("detail" in data)) {
+    return undefined;
+  }
+
+  const detail = data.detail;
+  return typeof detail === "string" ? detail : undefined;
+}
 
 const Constants = {
   NewBrowserCooldown: 30000,
@@ -393,8 +410,6 @@ function Workspace({
   );
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
-  const [activeDebugSession, setActiveDebugSession] =
-    useState<DebugSessionApiResponse | null>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<
     string | null
   >(null);
@@ -417,6 +432,11 @@ function Workspace({
   const [shouldFetchDebugSession, setShouldFetchDebugSession] = useState(false);
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
+  const isCdpStreamingMode =
+    browserStreamingMode === "cdp" && !recordingStore.isRecording;
+  // Record Browser exfiltration requires VNC even when the org default is CDP streaming.
+  const preferVncStream =
+    browserStreamingMode !== "cdp" || recordingStore.isRecording;
   const cacheKey = workflow?.cache_key ?? "";
 
   // Block delete confirmation dialog state
@@ -589,11 +609,18 @@ function Workspace({
   const { isRateLimited, recordAttempt, resetOnSuccess } =
     useBrowserSessionRateLimit(workflowPermanentId);
 
-  const { data: debugSession } = useDebugSessionQuery({
+  const {
+    data: debugSession,
+    isError: isDebugSessionError,
+    error: debugSessionError,
+    refetch: refetchDebugSession,
+  } = useDebugSessionQuery({
     workflowPermanentId,
     enabled: shouldFetchDebugSession && !!workflowPermanentId,
     isRateLimited,
   });
+
+  const activeDebugSession = debugSession ?? null;
 
   const setCollapsed = useSidebarStore((state) => {
     return state.setCollapsed;
@@ -604,6 +631,13 @@ function Workspace({
   const showBreakoutButton =
     activeDebugSession && activeDebugSession.browser_session_id;
   const liveBrowserSessionId = activeDebugSession?.browser_session_id ?? null;
+  const showVncBrowserPanel =
+    preferVncStream &&
+    shouldFetchDebugSession &&
+    !isRateLimited &&
+    (!activeDebugSession || activeDebugSession.vnc_streaming_supported);
+  const showCdpBrowserPanel =
+    isCdpStreamingMode && shouldFetchDebugSession && !isRateLimited;
   const copilotRequiresLiveBrowser =
     showBrowser && shouldFetchDebugSession && !isRateLimited;
   // readyBrowserSessionId is keyed to the browser session id rather than a
@@ -686,7 +720,16 @@ function Workspace({
     useShowAllCodeStore.getState().reset();
     useSidebarSaveStateStore.getState().reset();
     cacheKeyInitWpidRef.current = null;
-  }, [workflowPermanentId]);
+    setReadyBrowserSessionId(null);
+    if (workflowPermanentId) {
+      queryClient.removeQueries({
+        queryKey: ["debugSession", workflowPermanentId],
+      });
+      setShouldFetchDebugSession(true);
+    } else {
+      setShouldFetchDebugSession(false);
+    }
+  }, [workflowPermanentId, queryClient]);
 
   useEffect(() => {
     // Gate on workflow payload matching the route wpid: `useWorkflowQuery`
@@ -754,16 +797,10 @@ function Workspace({
     setCollapsed(true);
     workflowChangesStore.setHasChanges(false);
     if (workflowPermanentId) {
-      queryClient.removeQueries({
-        queryKey: ["debugSession", workflowPermanentId],
-      });
-      setShouldFetchDebugSession(true);
-
       queryClient.invalidateQueries({
         queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
       });
     }
-
     closeWorkflowPanel();
   });
 
@@ -883,10 +920,13 @@ function Workspace({
     },
     onSuccess: (response) => {
       const newDebugSession = response.data;
-      setActiveDebugSession(newDebugSession);
       resetOnSuccess();
 
-      queryClient.invalidateQueries({
+      queryClient.setQueryData(
+        ["debugSession", workflowPermanentId],
+        newDebugSession,
+      );
+      void queryClient.invalidateQueries({
         queryKey: ["debugSession", workflowPermanentId],
       });
 
@@ -979,10 +1019,6 @@ function Workspace({
       // Reset polling timer so it doesn't carry a stale timestamp into the
       // next polling cycle (e.g. after a rate-limit window expires).
       pollingStartRef.current = null;
-
-      if (debugSession) {
-        setActiveDebugSession(debugSession);
-      }
     }
 
     return () => {
@@ -1813,53 +1849,87 @@ function Workspace({
               {/* node library sub panel */}
               {/* browser & timeline */}
               <div className="flex h-[calc(100%_-_8rem)] w-full gap-6">
-                {/* VNC browser */}
-                {(!activeDebugSession ||
-                  activeDebugSession.vnc_streaming_supported) && (
-                  <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                    {isRateLimited ? (
-                      <div
-                        data-testid="browser-rate-limit-message"
-                        className="flex w-full flex-1 items-center justify-center"
+                {isRateLimited && shouldFetchDebugSession && (
+                  <div
+                    data-testid="browser-rate-limit-message"
+                    className="flex h-full w-[calc(100%_-_6rem)] flex-1 items-center justify-center"
+                  >
+                    <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-neutral-200 bg-white p-8 text-center dark:border-neutral-800 dark:bg-neutral-950">
+                      <p className="text-sm text-neutral-600 dark:text-neutral-300">
+                        Failed to load a browser. We have a high demand for
+                        browsers right now. The browser will become available
+                        again automatically in ~30 minutes. If the issue
+                        persists, please contact support.
+                      </p>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          resetOnSuccess();
+                          queryClient.invalidateQueries({
+                            queryKey: ["debugSession", workflowPermanentId],
+                          });
+                        }}
                       >
-                        <div className="flex max-w-md flex-col items-center justify-center gap-4 rounded-md border border-neutral-200 bg-white p-8 text-center dark:border-neutral-800 dark:bg-neutral-950">
-                          <p className="text-sm text-neutral-600 dark:text-neutral-300">
-                            Failed to load a browser. We have a high demand for
-                            browsers right now. The browser will become
-                            available again automatically in ~30 minutes. If the
-                            issue persists, please contact support.
-                          </p>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => {
-                              resetOnSuccess();
-                              queryClient.invalidateQueries({
-                                queryKey: ["debugSession", workflowPermanentId],
-                              });
+                        Try again
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Live browser: mode comes from BROWSER_STREAMING_MODE / runtime config */}
+                {showVncBrowserPanel && (
+                  <div className="skyvern-vnc-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <div key={reloadKey} className="w-full flex-1">
+                      {!liveBrowserSessionId ? (
+                        isDebugSessionError ? (
+                          <StreamStatusPanel
+                            diagnostic={{
+                              title: "Could not start browser session",
+                              detail:
+                                getAxiosErrorDetail(debugSessionError) ??
+                                "The backend rejected the browser session request.",
+                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
                             }}
                           >
-                            Try again
-                          </Button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div key={reloadKey} className="w-full flex-1">
-                        {isFlowCanvasReady ? (
-                          <BrowserStream
-                            exfiltrate={recordingStore.isRecording}
-                            interactive={true}
-                            browserSessionId={
-                              activeDebugSession?.browser_session_id
-                            }
-                            showControlButtons={true}
-                            resizeTrigger={windowResizeTrigger}
-                            isExecuting={!!workflowRun && !isFinalized}
-                            onReadyChange={handleLiveBrowserReadyChange}
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void refetchDebugSession()}
+                            >
+                              Retry
+                            </Button>
+                          </StreamStatusPanel>
+                        ) : (
+                          <StreamStatusPanel
+                            diagnostic={{
+                              title: "Starting browser session",
+                              detail:
+                                "Creating a debug browser session for this agent.",
+                            }}
                           />
-                        ) : null}
-                      </div>
-                    )}
+                        )
+                      ) : isFlowCanvasReady ? (
+                        <BrowserStream
+                          key={liveBrowserSessionId}
+                          exfiltrate={recordingStore.isRecording}
+                          interactive={true}
+                          browserSessionId={liveBrowserSessionId}
+                          showControlButtons={true}
+                          resizeTrigger={windowResizeTrigger}
+                          isExecuting={!!workflowRun && !isFinalized}
+                          onReadyChange={handleLiveBrowserReadyChange}
+                        />
+                      ) : (
+                        <StreamStatusPanel
+                          diagnostic={{
+                            title: "Preparing live browser",
+                            detail:
+                              "Waiting for the workflow canvas to finish loading.",
+                          }}
+                        />
+                      )}
+                    </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
                       <WorkflowCopilotButton
                         ref={copilotButtonRef}
@@ -1894,59 +1964,90 @@ function Workspace({
                   </div>
                 )}
 
-                {/* Local browser stream: only in local mode when VNC is not supported */}
-                {activeDebugSession &&
-                  !activeDebugSession.vnc_streaming_supported &&
-                  browserStreamingMode === "cdp" && (
-                    <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div
-                        key={reloadKey}
-                        className="flex w-full flex-1 items-center justify-center"
-                      >
-                        {isFlowCanvasReady ? (
-                          <BrowserSessionStream
-                            browserSessionId={
-                              activeDebugSession.browser_session_id
-                            }
-                            interactive={true}
-                            showControlButtons={true}
-                            onReadyChange={handleLiveBrowserReadyChange}
+                {showCdpBrowserPanel && (
+                  <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
+                    <div
+                      key={reloadKey}
+                      className="flex w-full flex-1 items-center justify-center"
+                    >
+                      {!liveBrowserSessionId ? (
+                        isDebugSessionError ? (
+                          <StreamStatusPanel
+                            diagnostic={{
+                              title: "Could not start browser session",
+                              detail:
+                                getAxiosErrorDetail(debugSessionError) ??
+                                "The backend rejected the browser session request.",
+                              hint: "Local dev only supports one browser at a time. Retry after closing other agents.",
+                            }}
+                          >
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void refetchDebugSession()}
+                            >
+                              Retry
+                            </Button>
+                          </StreamStatusPanel>
+                        ) : (
+                          <StreamStatusPanel
+                            diagnostic={{
+                              title: "Starting browser session",
+                              detail:
+                                "Creating a debug browser session for this agent.",
+                            }}
                           />
-                        ) : null}
-                      </div>
-                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
-                        <WorkflowCopilotButton
-                          ref={copilotButtonRef}
-                          messageCount={copilotMessageCount}
-                          onClick={() => setIsCopilotOpen((prev) => !prev)}
+                        )
+                      ) : isFlowCanvasReady ? (
+                        <BrowserSessionStream
+                          browserSessionId={liveBrowserSessionId}
+                          interactive={true}
+                          showControlButtons={true}
+                          onReadyChange={handleLiveBrowserReadyChange}
                         />
-                        <div className="flex items-center gap-2 text-muted-foreground">
-                          <GlobeIcon /> Live Browser
-                          <StreamModeBadge mode="cdp" />
-                        </div>
-                        <div
-                          className={cn("ml-auto flex items-center gap-2", {
-                            "mr-16": !blockLabel,
-                          })}
-                        >
-                          {!recordingStore.isRecording && showPowerButton && (
-                            <PowerButton onClick={() => cycle()} />
-                          )}
-                          {!recordingStore.isRecording && (
-                            <ReloadButton
-                              isReloading={isReloading}
-                              onClick={() => reload()}
-                            />
-                          )}
-                        </div>
-                      </footer>
+                      ) : (
+                        <StreamStatusPanel
+                          diagnostic={{
+                            title: "Preparing live browser",
+                            detail:
+                              "Waiting for the workflow canvas to finish loading.",
+                          }}
+                        />
+                      )}
                     </div>
-                  )}
+                    <footer className="flex h-[2rem] w-full items-center justify-start gap-4 text-muted-foreground">
+                      <WorkflowCopilotButton
+                        ref={copilotButtonRef}
+                        messageCount={copilotMessageCount}
+                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      />
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <GlobeIcon /> Live Browser
+                        <StreamModeBadge mode="cdp" />
+                      </div>
+                      <div
+                        className={cn("ml-auto flex items-center gap-2", {
+                          "mr-16": !blockLabel,
+                        })}
+                      >
+                        {!recordingStore.isRecording && showPowerButton && (
+                          <PowerButton onClick={() => cycle()} />
+                        )}
+                        {!recordingStore.isRecording && (
+                          <ReloadButton
+                            isReloading={isReloading}
+                            onClick={() => reload()}
+                          />
+                        )}
+                      </div>
+                    </footer>
+                  </div>
+                )}
 
-                {/* Fallback: non-local without VNC (edge case) */}
                 {activeDebugSession &&
+                  preferVncStream &&
                   !activeDebugSession.vnc_streaming_supported &&
-                  browserStreamingMode !== "cdp" && (
+                  !showCdpBrowserPanel && (
                     <div className="flex h-full w-[calc(100%_-_6rem)] flex-1 items-center justify-center text-muted-foreground">
                       Browser streaming unavailable
                     </div>

@@ -105,6 +105,7 @@ function Debugger() {
     <div className="relative flex h-screen w-full">
       <ReactFlowProvider>
         <Workspace
+          key={workflowPermanentId}
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
           initialTitle={workflow.title}

@@ -10,6 +10,7 @@ from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prom
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
 
 _TEXT_MAX = 240
@@ -124,7 +125,9 @@ def build_diagnosis_repair_contract(
     next_action = _next_action(failure_type, ctx, data)
     frontier = _safe_str(data.get("frontier_start_label"))
     target_blocks = failed_blocks or ([frontier] if frontier else []) if next_action == RepairNextAction.REPAIR else []
-    user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(run_ok, suspicious, run_status)
+    user_goal_satisfied, completion_contract_satisfied = _verification_satisfaction(
+        run_ok, suspicious, run_status, getattr(ctx, "completion_verification_result", None)
+    )
     confidence = (
         0.9
         if failure_type == DiagnosisFailureType.NO_FAILURE
@@ -357,12 +360,16 @@ def _verification_satisfaction(
     run_ok: bool,
     suspicious: bool,
     run_status: str | None,
+    completion_verification: CompletionVerificationResult | None = None,
 ) -> tuple[bool | None, bool | None]:
     user_goal_satisfied = (not suspicious) if run_ok else None if run_status is None else False
-    # Current tool evidence has one completion signal: whether the tested run
-    # can be trusted. Keep these fields separate for future richer contracts,
-    # but mirror them until an explicit completion-contract signal exists.
-    completion_contract_satisfied = user_goal_satisfied
+    # When the verification judge was required (a non-null result), its verdict
+    # is authoritative: an unmet or unavailable verdict cannot claim the outcome.
+    # With no result (no criteria, judge skipped) fall back to run trust.
+    if completion_verification is not None:
+        completion_contract_satisfied: bool | None = completion_verification.is_fully_satisfied()
+    else:
+        completion_contract_satisfied = user_goal_satisfied
     return user_goal_satisfied, completion_contract_satisfied
 
 
