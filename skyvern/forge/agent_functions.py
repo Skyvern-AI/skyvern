@@ -1325,3 +1325,19 @@ class AgentFunction:
         Override in cloud to dispatch to platform-specific widget fillers.
         """
         return None
+
+    async def on_workflow_saved(
+        self,
+        organization_id: str,
+        edited_by: str | None,
+    ) -> None:
+        """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_workflow_run_completed(
+        self,
+        organization_id: str,
+        workflow_id: str,
+    ) -> None:
+        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
+        return None
