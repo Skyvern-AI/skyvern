@@ -4229,6 +4229,43 @@
             "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
           },
           {
+            "name": "credential_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/skyvern__forge__sdk__schemas__credentials__CredentialType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')",
+              "title": "Credential Type"
+            },
+            "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "title": "Search"
+            },
+            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
