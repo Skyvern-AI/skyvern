@@ -12,6 +12,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { ModelsResponse } from "@/api/types";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 
 type Props = {
   className?: string;
@@ -40,6 +41,7 @@ function ModelSelector({
   className,
 }: Props) {
   const credentialGetter = useCredentialGetter();
+  const scopeReadOnly = useWorkflowScopeReadOnly();
 
   const { data: availableModels } = useQuery<ModelsResponse>({
     queryKey: ["models"],
@@ -47,6 +49,7 @@ function ModelSelector({
       const client = await getClient(credentialGetter);
       return client.get("/models").then((res) => res.data);
     },
+    enabled: !scopeReadOnly,
   });
 
   const rawModels = availableModels?.models ?? {};
@@ -75,6 +78,27 @@ function ModelSelector({
     ? (models[value.model_name] ?? constants.SkyvernOptimized)
     : constants.SkyvernOptimized;
   const choices = [constants.SkyvernOptimized, ...labels];
+
+  // Read-only diff shows the stored model verbatim, not remapped through the gated-off /models list.
+  if (scopeReadOnly) {
+    return (
+      <div className="flex items-center justify-between">
+        <div className="flex gap-2">
+          <Label className="text-xs font-normal text-slate-300">Model</Label>
+          <HelpTooltip content="The LLM model to use for this block" />
+        </div>
+        <div
+          data-testid="model-selector-readonly"
+          className={
+            "flex h-9 items-center rounded-md border border-input px-3 text-sm text-slate-300 " +
+            (className || "")
+          }
+        >
+          {value?.model_name ?? constants.SkyvernOptimized}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center justify-between">

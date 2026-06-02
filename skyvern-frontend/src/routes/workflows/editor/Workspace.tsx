@@ -1516,12 +1516,12 @@ function Workspace({
         <div className="relative flex h-full w-full overflow-hidden overflow-x-hidden">
           {/* comparison view */}
           <div
-            className="absolute left-6 top-[6rem]"
+            className="absolute left-6 top-[8.5rem]"
             style={{
               width: workflowPanelState.active
                 ? "calc(100% - 32rem)"
                 : "calc(100% - 3rem)",
-              height: "calc(100vh - 11rem)",
+              height: "calc(100vh - 13.5rem)",
             }}
           >
             <WorkflowComparisonPanel

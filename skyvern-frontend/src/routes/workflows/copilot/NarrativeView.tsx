@@ -642,17 +642,11 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
 
 interface DetailViewProps {
   turn: TurnNarrativeState;
-  summary: TurnSummary;
   onCollapse: (() => void) | null;
   onBlockSelect?: (label: string) => void;
 }
 
-function DetailView({
-  turn,
-  summary,
-  onCollapse,
-  onBlockSelect,
-}: DetailViewProps) {
+function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
   const hasBlocks = turn.blocks.length > 0;
   const designStarted = turn.designStarted;
   const designOpen = designStarted && !turn.designEnded;
@@ -669,7 +663,17 @@ function DetailView({
   return (
     <div className="flex flex-col gap-2.5">
       {onCollapse ? (
-        <TurnHead summary={summary} expanded onClick={onCollapse} />
+        <button
+          type="button"
+          onClick={onCollapse}
+          aria-label="Collapse turn"
+          className="flex w-full items-center justify-end gap-1.5 px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-slate-500 hover:text-slate-300"
+        >
+          <span>Collapse</span>
+          <span aria-hidden="true" className="rotate-90 text-[13px]">
+            ›
+          </span>
+        </button>
       ) : null}
 
       {showDesign ? (
@@ -739,7 +743,6 @@ export function NarrativeView({ turn, onBlockSelect }: NarrativeViewProps) {
   return (
     <DetailView
       turn={turn}
-      summary={summary}
       onCollapse={isComplete ? () => setUserRolled(true) : null}
       onBlockSelect={onBlockSelect}
     />

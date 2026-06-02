@@ -65,7 +65,8 @@ function WorkflowTriggerNode({ id, data }: NodeProps<WorkflowTriggerNodeType>) {
           type={WorkflowBlockTypes.WorkflowTrigger}
         />
         <NodeBody>
-          <BuildModeOnly>
+          {/* Editor mounts live workflow-lookup queries; keep it out of read-only version diffs. */}
+          <BuildModeOnly renderInReadOnlyComparison={false}>
             <WorkflowTriggerEditor blockId={id} />
           </BuildModeOnly>
         </NodeBody>

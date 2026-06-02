@@ -6,6 +6,7 @@ import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/Wo
 import { useEffect, useRef, useState } from "react";
 import { useDebouncedCallback } from "use-debounce";
 import { useParameterAutocomplete } from "@/hooks/useParameterAutocomplete";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { ParameterAutocompleteDropdown } from "./ParameterAutocompleteDropdown";
 import { ParameterGhostText } from "./ParameterGhostText";
 
@@ -37,7 +38,9 @@ function WorkflowBlockInputTextarea(props: Props) {
     disabled,
     ...textAreaProps
   } = props;
-  const showActions = !disabled && !hideActions;
+  // Read-only comparison canvases: prompt readable but not editable, no actions.
+  const scopeReadOnly = useWorkflowScopeReadOnly();
+  const showActions = !disabled && !hideActions && !scopeReadOnly;
   const [internalValue, setInternalValue] = useState(props.value ?? "");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [cursorPosition, setCursorPosition] = useState<{
@@ -124,6 +127,7 @@ function WorkflowBlockInputTextarea(props: Props) {
       <AutoResizingTextarea
         {...textAreaProps}
         disabled={disabled}
+        readOnly={scopeReadOnly || textAreaProps.readOnly}
         value={internalValue}
         ref={textareaRef}
         onBlur={() => {
@@ -164,7 +168,10 @@ function WorkflowBlockInputTextarea(props: Props) {
       />
 
       {showActions && (
-        <div className="absolute right-1 top-0 flex size-9 items-center justify-end">
+        <div
+          data-testid="block-textarea-actions"
+          className="absolute right-1 top-0 flex size-9 items-center justify-end"
+        >
           <div className="flex items-center justify-center gap-1">
             {aiImprove && (
               <ImprovePrompt

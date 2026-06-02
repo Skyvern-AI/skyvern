@@ -1,6 +1,8 @@
 import { useReactFlow } from "@xyflow/react";
 import { useCallback } from "react";
 
+import { useWorkflowScopeReadOnly } from "./WorkflowScopeContext";
+
 type UseUpdateOptions = {
   id: string;
   editable: boolean;
@@ -24,14 +26,16 @@ export function useUpdate<T extends Record<string, unknown>>({
   editable,
 }: UseUpdateOptions) {
   const { updateNodeData } = useReactFlow();
+  // Comparison/diff canvases mount read-only; no control may persist to the reviewed snapshot.
+  const readOnlyScope = useWorkflowScopeReadOnly();
 
   const update = useCallback(
     (updates: Partial<T>) => {
-      if (!editable) return;
+      if (!editable || readOnlyScope) return;
 
       updateNodeData(id, updates);
     },
-    [id, editable, updateNodeData],
+    [id, editable, readOnlyScope, updateNodeData],
   );
 
   return update;
