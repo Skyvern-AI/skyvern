@@ -28,9 +28,9 @@ const PALETTE_CRED: BlockPalette = {
   glyph: "⌬",
 };
 const PALETTE_LOOP: BlockPalette = {
-  fg: "text-violet-300",
-  bg: "bg-violet-500/15",
-  border: "border-violet-400/60",
+  fg: "text-sky-300",
+  bg: "bg-sky-500/15",
+  border: "border-sky-400/60",
   glyph: "↻",
 };
 const PALETTE_ACTION: BlockPalette = {
@@ -40,9 +40,9 @@ const PALETTE_ACTION: BlockPalette = {
   glyph: "✦",
 };
 const PALETTE_EXTRACTION: BlockPalette = {
-  fg: "text-violet-300",
-  bg: "bg-violet-500/15",
-  border: "border-violet-400/60",
+  fg: "text-sky-300",
+  bg: "bg-sky-500/15",
+  border: "border-sky-400/60",
   glyph: "↓",
 };
 const PALETTE_TASK: BlockPalette = {
@@ -167,7 +167,7 @@ function FSubRow({
 function ActivityRow({ entry }: { entry: ActivityEntry }) {
   if (entry.kind === "narration") {
     return (
-      <FSubRow glyph="✦" glyphClass="text-violet-300" italic muted>
+      <FSubRow glyph="✦" glyphClass="text-sky-300" italic muted>
         {entry.text}
       </FSubRow>
     );
@@ -366,7 +366,7 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
         onClick={() => setUserOpen((v) => !(v === null ? !done : v))}
       >
         <span
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-violet-400/60 bg-violet-500/15 text-[11px] font-bold text-violet-300"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/15 text-[11px] font-bold text-sky-300"
           aria-hidden="true"
         >
           {done ? "✓" : <Spinner />}
@@ -493,7 +493,7 @@ function accentBg(accent: TurnSummary["accent"]): string {
     return "border-rose-400/60 bg-rose-500/15 text-rose-300";
   }
   if (accent === "qa") {
-    return "border-violet-400/60 bg-violet-500/15 text-violet-300";
+    return "border-sky-400/60 bg-sky-500/15 text-sky-300";
   }
   return "border-emerald-400/60 bg-emerald-500/15 text-emerald-300";
 }
