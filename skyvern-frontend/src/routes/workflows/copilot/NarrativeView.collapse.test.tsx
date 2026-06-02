@@ -71,7 +71,7 @@ describe("NarrativeView collapse default", () => {
     ).toBeTruthy();
   });
 
-  it("expands on click and re-collapses via the same header control", () => {
+  it("expands via the summary card and re-collapses via the labeled control", () => {
     render(<NarrativeView turn={terminalBuildTurn()} />);
     const head = () =>
       screen.getByRole("button", { name: new RegExp(HEADLINE) });
@@ -79,9 +79,10 @@ describe("NarrativeView collapse default", () => {
     expect(head().getAttribute("aria-expanded")).toBe("false");
 
     fireEvent.click(head());
-    expect(head().getAttribute("aria-expanded")).toBe("true");
+    const collapse = screen.getByRole("button", { name: "Collapse turn" });
+    expect(screen.queryByText(HEADLINE)).toBeNull();
 
-    fireEvent.click(head());
+    fireEvent.click(collapse);
     expect(head().getAttribute("aria-expanded")).toBe("false");
   });
 
@@ -96,13 +97,13 @@ describe("NarrativeView collapse default", () => {
   it("preserves a user's expand override across re-renders", () => {
     const turn = terminalBuildTurn();
     const { rerender } = render(<NarrativeView turn={turn} />);
-    const head = () =>
-      screen.getByRole("button", { name: new RegExp(HEADLINE) });
 
-    fireEvent.click(head());
-    expect(head().getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(HEADLINE) }));
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+    expect(screen.queryByText(HEADLINE)).toBeNull();
 
     rerender(<NarrativeView turn={turn} />);
-    expect(head().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
+    expect(screen.queryByText(HEADLINE)).toBeNull();
   });
 });

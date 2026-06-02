@@ -174,6 +174,15 @@ class AgentContext:
     completion_verification_result: CompletionVerificationResult | None = None
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
+    # Ordered, bounded list of typed page-evidence packets — one per page observed
+    # while scouting the goal path, each tagged with how that state was reached.
+    # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
+    flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
+    # composition gate credit a page observed on a prior turn when this turn's
+    # flow_evidence does not cover it (closes the spent-inspection-budget
+    # deadlock). Each item: {url, had_bounded_schema, reached_via}.
+    prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
@@ -188,6 +197,11 @@ class AgentContext:
     # turn end and overrides the AgentResult with a deterministic
     # product-language reply. See blocker_signal.py for the contract.
     blocker_signal: CopilotToolBlockerSignal | None = None
+    # Most recently emitted blocker signal for the current tool output. Unlike
+    # blocker_signal, this is last-wins so the activity-log projection can
+    # render the current tool result from structured product text.
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:

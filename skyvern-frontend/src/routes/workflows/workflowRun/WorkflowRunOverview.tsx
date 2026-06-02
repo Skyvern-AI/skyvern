@@ -162,6 +162,7 @@ function WorkflowRunOverview() {
             selection,
             activeIteration,
           )}
+          runStatus={workflowRun?.status}
         />
       )}
       {isObserverThought(selection) && (

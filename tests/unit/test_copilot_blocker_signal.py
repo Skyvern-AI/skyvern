@@ -93,6 +93,11 @@ def test_assert_clean_passes_normal_product_language() -> None:
 
 class _Ctx:
     blocker_signal: CopilotToolBlockerSignal | None = None
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal]
+
+    def __init__(self) -> None:
+        self.tool_blocker_signals = []
 
 
 def test_maybe_clear_on_tool_success_clears_when_in_cleared_by_tools() -> None:
@@ -237,11 +242,15 @@ def test_stash_blocker_signal_first_wins_returns_llm_payload() -> None:
     payload = stash_blocker_signal(ctx, first)
     assert payload == first.agent_steering_text
     assert ctx.blocker_signal is first
+    assert ctx.latest_tool_blocker_signal is first
+    assert ctx.tool_blocker_signals == [first]
 
     second = _make(internal_reason_code="second")
     payload2 = stash_blocker_signal(ctx, second)
     assert payload2 == second.agent_steering_text  # LLM payload is the current signal's
     assert ctx.blocker_signal is first  # stash is sticky
+    assert ctx.latest_tool_blocker_signal is second
+    assert ctx.tool_blocker_signals == [first, second]
 
 
 def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> None:
@@ -273,3 +282,8 @@ def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> No
     assert agent_ctx.blocker_signal is None
     assert copilot_ctx.blocker_signal is None
     assert agent_ctx.blocker_signal == copilot_ctx.blocker_signal
+    assert agent_ctx.latest_tool_blocker_signal is None
+    assert copilot_ctx.latest_tool_blocker_signal is None
+    assert agent_ctx.latest_tool_blocker_signal == copilot_ctx.latest_tool_blocker_signal
+    assert agent_ctx.tool_blocker_signals == []
+    assert copilot_ctx.tool_blocker_signals == []

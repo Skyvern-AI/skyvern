@@ -38,9 +38,10 @@ def test_tool_call_activity_shape_and_denylist() -> None:
     entry = build_tool_call_activity("update_workflow", 3, "abc")
     assert entry == {
         "kind": "tool_call",
-        "text": "Calling update_workflow…",
+        "text": "Updating workflow…",
         "iteration": 3,
         "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
         "id": "tc-abc",
     }
     assert "success" not in entry
@@ -54,10 +55,11 @@ def test_tool_result_activity_shape_falls_back_to_tool_name_and_denylist() -> No
         "text": "Updated 2 blocks",
         "iteration": 4,
         "toolName": "update_workflow",
+        "displayLabel": "Updating workflow",
         "success": True,
         "id": "tr-abc",
     }
-    assert build_tool_result_activity("update_workflow", "", False, 4, "abc")["text"] == "update_workflow"
+    assert build_tool_result_activity("update_workflow", "", False, 4, "abc")["text"] == "Updating workflow"
     assert build_tool_result_activity("get_browser_screenshot", "s", True, 0, "x") is None
     assert build_tool_result_activity("get_run_results", "s", True, 0, "x") is None
 
@@ -142,6 +144,7 @@ def test_build_narrative_payload_serializes_block_and_design_activity() -> None:
             "text": "ran step_1",
             "iteration": 1,
             "toolName": "run_blocks_and_collect_debug",
+            "displayLabel": "Testing workflow",
             "success": True,
             "id": "tr-c1",
         }

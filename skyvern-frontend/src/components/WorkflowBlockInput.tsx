@@ -5,6 +5,7 @@ import { Input } from "./ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { WorkflowBlockParameterSelect } from "@/routes/workflows/editor/nodes/WorkflowBlockParameterSelect";
 import { useParameterAutocomplete } from "@/hooks/useParameterAutocomplete";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { ParameterAutocompleteDropdown } from "./ParameterAutocompleteDropdown";
 import { ParameterGhostText } from "./ParameterGhostText";
 
@@ -36,6 +37,8 @@ function WorkflowBlockInput(props: Props) {
 
   const isPasswordField = type === "password";
   const actualType = isPasswordField && showPassword ? "text" : type;
+  // Read-only comparison canvases: value readable but not editable, no actions.
+  const scopeReadOnly = useWorkflowScopeReadOnly();
 
   const autocomplete = useParameterAutocomplete({
     nodeId,
@@ -63,6 +66,7 @@ function WorkflowBlockInput(props: Props) {
       <Input
         {...inputProps}
         ref={inputRef}
+        readOnly={scopeReadOnly || inputProps.readOnly}
         value={localValue}
         type={actualType}
         className={cn(
@@ -100,8 +104,11 @@ function WorkflowBlockInput(props: Props) {
         onSelect={handleAutocompleteSelect}
         onDismiss={autocomplete.dismiss}
       />
-      {(isPasswordField || !hideParameterSelect) && (
-        <div className="absolute right-0 top-0 flex cursor-pointer items-center justify-center">
+      {(isPasswordField || !hideParameterSelect) && !scopeReadOnly && (
+        <div
+          data-testid="block-input-actions"
+          className="absolute right-0 top-0 flex cursor-pointer items-center justify-center"
+        >
           {isPasswordField && (
             <div className="flex size-9 items-center justify-center">
               <div

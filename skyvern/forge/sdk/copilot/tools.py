@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 import structlog
 import yaml
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
+from opentelemetry import trace as otel_trace
 
 try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
@@ -57,6 +58,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
+    has_bounded_page_schema,
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
@@ -3061,6 +3063,9 @@ def _frontier_run_size_error(
         "Workflow validation failed: this browser test frontier is too long for a multi-stage "
         "page-changing workflow. Keep the same complete workflow YAML, but shrink only the "
         f"block_labels argument to the next 1-2 unverified labels: {suggested!r}. "
+        "If a prior run already advanced the browser, inspect that reached page "
+        '(inspect_page_for_composition(target_url="current_page")) to ground the next labels in '
+        "what is actually there rather than shrinking the frontier blind. "
         f"Do not remove later blocks from the YAML; test them after this frontier succeeds. "
         f"Deferred labels: {remaining!r}. Requested labels: {block_labels!r}."
     )
@@ -3257,6 +3262,22 @@ def _watchdog_user_failure_reason(
         status = f" Last observed status: {run.status}." if run is not None else ""
         body = "The run ended before recording a trustworthy terminal status." + status
     return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
+
+
+def _watchdog_user_facing_summary(
+    exit_reason: WatchdogExitReason,
+    budget_seconds: int,
+    run: WorkflowRun | None,
+) -> str:
+    if exit_reason == "stagnation":
+        return f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    if exit_reason == "per_tool_budget":
+        return f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+    if exit_reason == "ceiling":
+        return f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
+    if run is not None:
+        return f"The run ended before recording a trustworthy terminal status. Last observed status: {run.status}."
+    return "The run ended before recording a trustworthy terminal status."
 
 
 def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:
@@ -3810,6 +3831,7 @@ async def _run_blocks_and_collect_debug(
             user_failure_reason = _watchdog_user_failure_reason(
                 exit_reason, workflow_run.workflow_run_id, budget_seconds, run
             )
+            user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
             current_url, page_title = await _fallback_page_info(ctx)
             result: dict[str, Any] = {
                 "ok": False,
@@ -3820,6 +3842,11 @@ async def _run_blocks_and_collect_debug(
                     "failure_reason": user_failure_reason,
                     "current_url": current_url,
                     "page_title": page_title,
+                    "control_signal": {
+                        "kind": f"watchdog_{exit_reason}",
+                        "user_facing_summary": user_facing_summary,
+                    },
+                    "user_facing_summary": user_facing_summary,
                 },
             }
             if exit_reason == "per_tool_budget":
@@ -4673,6 +4700,65 @@ async def _click_post_hook(
     return result
 
 
+_TYPE_READBACK_SETTLE_SECONDS = 0.3
+
+
+async def _verify_scout_type_landed(
+    ctx: AgentContext,
+    *,
+    selector: str,
+    typed_length: Any,
+) -> dict[str, Any] | None:
+    """Confirm a non-empty type actually entered the field, else return a failure.
+
+    A marketing/cookie overlay can consume the focus or keystrokes — the field
+    stays empty while `skyvern_type` still reports success (the first interaction
+    on an overlaid page often just dismisses the overlay). Read the field back; a
+    field still empty after a non-empty type means the input did not land. Only
+    fires when there is a selector to read and a positive typed length, so it never
+    second-guesses intent-only types or masked/formatted values, which keep a
+    non-empty value.
+    """
+    if not isinstance(selector, str) or not selector.strip():
+        return None
+    if not isinstance(typed_length, int) or typed_length <= 0:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+
+    async def _read_back() -> Any:
+        try:
+            readback = await asyncio.wait_for(
+                server.call_internal_tool("skyvern_get_value", {"selector": selector}),
+                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            LOG.debug("scout type-landed read-back failed; leaving the type result unverified", exc_info=True)
+            return None
+        if not isinstance(readback, dict) or not readback.get("ok"):
+            return None
+        return (readback.get("data") or {}).get("value")
+
+    value = await _read_back()
+    if isinstance(value, str) and value.strip() == "":
+        # A controlled/React input can mirror its value asynchronously, so a first read may be
+        # transiently empty; settle briefly and re-read once before declaring the type lost.
+        await asyncio.sleep(_TYPE_READBACK_SETTLE_SECONDS)
+        value = await _read_back()
+    if isinstance(value, str) and value.strip() == "":
+        return {
+            "ok": False,
+            "error": (
+                "type_text reported success but the field is still empty — an overlay "
+                "(cookie/marketing popup) likely consumed the keystrokes or focus. "
+                "Re-inspect the current page and retry typing into the target field; "
+                "the overlay is usually dismissed by that first interaction."
+            ),
+        }
+    return None
+
+
 async def _type_text_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -4680,12 +4766,17 @@ async def _type_text_post_hook(
 ) -> dict[str, Any]:
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = data.get("selector", "")
+        typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
         result["data"] = {
-            "selector": data.get("selector", ""),
-            "typed_length": data.get("text_length", 0),
+            "selector": selector,
+            "typed_length": typed_length,
             "url": url,
         }
+        landing_failure = await _verify_scout_type_landed(ctx, selector=selector, typed_length=typed_length)
+        if landing_failure is not None:
+            return landing_failure
     return result
 
 
@@ -4819,14 +4910,21 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
         ),
         "click": SchemaOverlay(
             description=(
-                "Click an element in the browser. Use a CSS selector, an AI intent "
-                "description, or both for resilient targeting. "
+                "Click an element in the browser. Prefer a CSS selector ALONE for a target "
+                "you can identify from page evidence — a selector-only click is instant and "
+                "deterministic. Use `intent` only when you cannot derive a selector: an "
+                "`intent`-only click routes through a slower full-page AI scan, and if you "
+                "pass both, the selector wins and the `intent` is ignored. When a shared class "
+                "matches many elements (e.g. one button per result row), scope the selector to "
+                "the specific item (its container, a unique attribute, or :nth-of-type) instead "
+                "of relying on `intent` to disambiguate. "
                 "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
                 ":visible are NOT valid CSS. Use standard selectors: "
                 "'button.download', 'a[href*=\"pdf\"]', '#submit-btn', "
                 "'table tr:nth-of-type(2) td a'."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "button", "click_count"}),
+            forced_args={"selector_mode": "direct"},
             requires_browser=True,
             timeout=15,
             pre_hook=_click_pre_hook,
@@ -4834,8 +4932,11 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
         ),
         "type_text": SchemaOverlay(
             description=(
-                "Type text into an input element. Use a CSS selector, an AI intent "
-                "description, or both to target the field. "
+                "Type text into an input element. Prefer a CSS selector ALONE to target the "
+                "field — a selector-only type is instant and deterministic. Use `intent` only "
+                "when you cannot derive a selector: an `intent`-only type routes through a "
+                "slower full-page AI scan, and if you pass both, the selector wins and the "
+                "`intent` is ignored. "
                 "Optionally clear the field first. Use this for form filling. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
                 "codes, private keys, or other raw credentials/secrets received in "
@@ -4843,6 +4944,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
                 "system prompt instead."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "delay"}),
+            forced_args={"selector_mode": "direct"},
             required_overrides=["text"],
             arg_transforms={"clear_first": "clear"},
             requires_browser=True,
@@ -4870,11 +4972,13 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
         ),
         "select_option": SchemaOverlay(
             description=(
-                "Select an option from a <select> dropdown. Provide the value to select "
-                "and use selector or intent to target the element. "
-                "For free-text inputs, use type_text instead."
+                "Select an option from a <select> dropdown. Provide the value to select and a "
+                "selector to target the element precisely; use `intent` (alone) only when you "
+                "cannot derive a selector — passing both lets the selector win and ignores the "
+                "`intent`. For free-text inputs, use type_text instead."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "timeout"}),
+            forced_args={"selector_mode": "direct"},
             required_overrides=["value"],
             requires_browser=True,
             timeout=15,
@@ -5577,7 +5681,11 @@ async def update_workflow_tool(
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
-    if _request_policy_allows_credential_deferred_draft(copilot_ctx):
+    credential_deferred_draft = _request_policy_allows_credential_deferred_draft(copilot_ctx)
+    # A credential-deferred draft is redirected to update_and_run_blocks' skip-run
+    # save path, which saves the draft and skips the browser run with the required
+    # credential setup message.
+    if credential_deferred_draft:
         agent_steering = (
             "Use update_and_run_blocks for this credential-deferred draft. It will save the workflow draft "
             "and skip the browser run with the required credential setup message."
@@ -5903,6 +6011,9 @@ async def update_and_run_blocks_tool(
 
     coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
     if coverage_error:
+        user_facing_summary = (
+            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
+        )
         result = {
             "ok": False,
             "error": coverage_error,
@@ -5910,6 +6021,11 @@ async def update_and_run_blocks_tool(
                 "block_count": copilot_ctx.last_update_block_count,
                 "workflow_updated": True,
                 "workflow_run_skipped": True,
+                "control_signal": {
+                    "kind": "intermediate_success",
+                    "user_facing_summary": user_facing_summary,
+                },
+                "user_facing_summary": user_facing_summary,
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
@@ -6035,6 +6151,7 @@ _DISCOVERY_STEP_CAP = 8
 _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
 _DISCOVERY_CANDIDATE_FORM_FIELDS_MAX = 10
 _DISCOVERY_HTML_BYTES_MAX = 200_000
+_DISCOVERY_CONCRETE_HOMEPAGE_CONFIDENCE = 0.6
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -6081,6 +6198,20 @@ def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
     if _DISCOVERY_BARE_WORD_RE.match(token):
         return f"https://www.{token.lower()}.com", "word"
     return None, "unresolved"
+
+
+def _concrete_homepage_entrypoint(entry_url: str | None, kind: str) -> str | None:
+    if kind not in {"domain", "url"} or not entry_url:
+        return None
+    try:
+        parsed = urlparse(entry_url)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
 def _discovery_anchor_score(
@@ -6157,6 +6288,40 @@ def _discovery_build_result(
         },
         "error": error,
     }
+
+
+def _record_discovery_resolution_on_ctx(ctx: Any, result: Mapping[str, Any]) -> None:
+    data_payload = result.get("data")
+    data: Mapping[str, Any] = data_payload if isinstance(data_payload, Mapping) else {}
+    candidate_url = data.get("candidate_url")
+    failure_reason = data.get("failure_reason")
+    if isinstance(candidate_url, str) and candidate_url:
+        prior_candidate_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+        ctx.resolved_discovery_entrypoint_url = candidate_url
+        ctx.resolved_discovery_failure_reason = (
+            failure_reason if isinstance(failure_reason, str) and failure_reason else None
+        )
+        if prior_candidate_url != candidate_url:
+            ctx.resolved_discovery_entrypoint_inspection_baseline = int(
+                getattr(ctx, "page_inspection_calls_this_turn", 0) or 0
+            )
+            ctx.discovery_entrypoint_url_question_nudge_count = 0
+    # Prior successful candidates remain authoritative over later no-candidate failures.
+    elif not getattr(ctx, "resolved_discovery_entrypoint_url", None):
+        # No prior candidate and no new one: clear URL state while recording the failure.
+        ctx.resolved_discovery_entrypoint_url = None
+        ctx.resolved_discovery_failure_reason = (
+            failure_reason if isinstance(failure_reason, str) and failure_reason else None
+        )
+        ctx.resolved_discovery_entrypoint_inspection_baseline = 0
+    try:
+        current_span = otel_trace.get_current_span()
+        if ctx.resolved_discovery_entrypoint_url is not None:
+            current_span.set_attribute("copilot.discovery_candidate_url", ctx.resolved_discovery_entrypoint_url)
+        if ctx.resolved_discovery_failure_reason is not None:
+            current_span.set_attribute("copilot.discovery_failure_reason", ctx.resolved_discovery_failure_reason)
+    except Exception:
+        LOG.debug("Unable to set discovery resolution span attributes", exc_info=True)
 
 
 def _discovery_parse_html(html: str) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
@@ -6277,17 +6442,34 @@ _DISCOVERY_PER_CALL_TIMEOUT_SECONDS = 20.0
 _DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE = 0.2
 
 
-async def _discovery_navigate(ctx: CopilotContext, url: str) -> dict[str, Any]:
+async def _discovery_navigate(
+    ctx: CopilotContext,
+    url: str,
+    *,
+    wait_until: str | None = None,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     server = getattr(ctx, "discovery_mcp_server", None)
     if server is None:
         return {"ok": False, "error": "discovery MCP server not attached to context"}
+    nav_args: dict[str, Any] = {"url": url}
+    cap = timeout_seconds
+    if wait_until:
+        # `load` waits for every resource (analytics/marketing beacons on heavy
+        # commerce pages keep it pending past the cap, so the navigate aborts before
+        # any HTML is captured). `domcontentloaded` returns once the server-rendered
+        # DOM is parsed — the forms/links are already present — and the recapture
+        # loop settles anything still hydrating.
+        nav_args["wait_until"] = wait_until
+        nav_args["timeout"] = int(timeout_seconds * 1000)
+        cap = timeout_seconds + 5
     try:
         return await asyncio.wait_for(
-            server.call_internal_tool("skyvern_navigate", {"url": url}),
-            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            server.call_internal_tool("skyvern_navigate", nav_args),
+            timeout=cap,
         )
     except asyncio.TimeoutError:
-        return {"ok": False, "error": f"skyvern_navigate timed out after {_DISCOVERY_PER_CALL_TIMEOUT_SECONDS:g}s"}
+        return {"ok": False, "error": f"skyvern_navigate timed out after {timeout_seconds:g}s"}
 
 
 async def _discovery_click_anchor(ctx: CopilotContext, anchor: dict[str, str]) -> dict[str, Any]:
@@ -6299,7 +6481,9 @@ async def _discovery_click_anchor(ctx: CopilotContext, anchor: dict[str, str]) -
         return {"ok": False, "error": "anchor href could not be converted to a bounded CSS selector"}
     try:
         return await asyncio.wait_for(
-            server.call_internal_tool("skyvern_click", {"selector": selector}),
+            # call_internal_tool bypasses the schema overlays, so selector_mode="direct" must be
+            # passed explicitly here (it is not picked up from the overlay's forced_args).
+            server.call_internal_tool("skyvern_click", {"selector": selector, "selector_mode": "direct"}),
             timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
@@ -6497,14 +6681,17 @@ async def _composition_evidence_after_navigation_failure(
 ) -> dict[str, Any] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
-    html_result = await _discovery_get_html(ctx)
-    if html_result.get("ok"):
-        html = _discovery_extract_html_payload(html_result)
+    # Same size-cap survival as the success path: a heavy page that rendered before the nav
+    # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
+    html, html_error, html_truncated = await _composition_get_html(ctx)
+    if html_error is None:
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
             evidence,
             f"navigation_error_before_html_capture: {navigation_error}",
         )
+        if html_truncated:
+            evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
         if page_evidence_needs_visual_fallback(evidence):
             evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
         return evidence
@@ -6516,10 +6703,159 @@ async def _composition_evidence_after_navigation_failure(
     )
     evidence = _composition_add_inspection_warning(
         evidence,
-        f"html_capture_failed_after_navigation_error: {html_result.get('error', 'unknown')}",
+        f"html_capture_failed_after_navigation_error: {html_error}",
     )
     evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
     return evidence if evidence.get("screenshot_used") else None
+
+
+_MAX_FLOW_EVIDENCE = 12
+
+
+def _inspection_reached_via(*, use_current_page: bool, post_run: bool) -> str:
+    """How the just-inspected state was reached, for the flow-evidence trajectory.
+
+    A target_url inspection navigates there itself ("navigate"); a post-run
+    current-page inspection observes the page the run left behind ("post_run"); any
+    other current-page inspection follows an in-turn interaction on that page.
+    """
+    if not use_current_page:
+        return "navigate"
+    if post_run:
+        return "post_run"
+    return "interaction"
+
+
+def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached_via: str) -> None:
+    """Append a typed entry to the bounded flow-evidence trajectory (SKY-10562).
+
+    One entry per scouted page: the page-evidence packet plus how it was reached
+    and whether bounded schema was captured. Feeds the per-acted-page composition
+    gate and the cross-turn observed-page summary; never written into the YAML.
+    """
+    trajectory = getattr(copilot_ctx, "flow_evidence", None)
+    if not isinstance(trajectory, list):
+        return
+    url = evidence.get("current_url") or evidence.get("inspected_url") or ""
+    trajectory.append(
+        {
+            "evidence": evidence,
+            "reached_via": reached_via,
+            "url": url if isinstance(url, str) else "",
+            "had_bounded_schema": has_bounded_page_schema(evidence),
+            "step": len(trajectory),
+        }
+    )
+    if len(trajectory) > _MAX_FLOW_EVIDENCE:
+        del trajectory[:-_MAX_FLOW_EVIDENCE]
+
+
+_COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
+_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS = 2.5
+# The composition inspect navigates with `domcontentloaded`, so a heavier cap than
+# the discovery walker's is safe — the navigate returns at DOM parse, well before
+# this ceiling, and only a genuinely stuck load reaches it.
+_COMPOSITION_NAVIGATE_TIMEOUT_SECONDS = 30.0
+
+
+# Body HTML stripped of script/style/svg/comments and whitespace-collapsed so the
+# evaluate result clears the shared MCP response size cap (MCP_MAX_RESPONSE_CHARS,
+# 140k). The aggressive strip is what lets a heavy commerce body (e.g. ~360KB raw,
+# ~155k stripped) fit whole (~113k) so the FULL page is parsed; the slice is only a
+# last resort for pages still over budget, and is set as high as the cap allows so it
+# loses as little below-fold structure (results/cart controls) as possible.
+_COMPOSITION_STRIPPED_HTML_MAX_CHARS = 135000
+_COMPOSITION_STRIPPED_HTML_EXPRESSION = (
+    "(() => {"
+    "  const b = document.body; if (!b) return '';"
+    "  const c = b.cloneNode(true);"
+    "  c.querySelectorAll('script,style,noscript,svg,template,iframe,canvas,link').forEach(n => n.remove());"
+    "  const w = document.createTreeWalker(c, NodeFilter.SHOW_COMMENT, null);"
+    "  const comments = []; while (w.nextNode()) comments.push(w.currentNode); comments.forEach(n => n.remove());"
+    "  const h = c.innerHTML.replace(/>\\s+</g, '><').replace(/\\s{2,}/g, ' ');"
+    f"  return h.length > {_COMPOSITION_STRIPPED_HTML_MAX_CHARS} ? h.slice(0, {_COMPOSITION_STRIPPED_HTML_MAX_CHARS}) : h;"
+    "})()"
+)
+
+
+async def _composition_get_stripped_html(copilot_ctx: Any) -> tuple[str | None, bool]:
+    """Return (stripped_body_html, truncated). truncated is True when the expression sliced
+    the body at the cap, so the tail (below-fold forms/controls) is missing from the evidence."""
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None, False
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool("skyvern_evaluate", {"expression": _COMPOSITION_STRIPPED_HTML_EXPRESSION}),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None, False
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None, False
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, str):
+        return None, False
+    return value, len(value) >= _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+
+
+async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool]:
+    """Return body HTML for composition parsing, surviving the MCP response size cap.
+
+    `skyvern_get_html("body")` is the fast path, but the shared size cap DROPS the
+    payload (no `html` field, just truncation metadata) when the serialized body
+    exceeds the limit — heavy commerce pages routinely do, so the inspector would
+    parse an empty string and report hollow evidence. On an empty/capped read, fall
+    back to an `evaluate` that returns the body with script/style/svg/etc. stripped
+    and length-bounded; that fits under the cap while preserving the form/link
+    structure. Returns (html, error, truncated): error is set only on a hard read
+    failure; truncated is True when the stripped fallback was sliced at the cap (the
+    raw path is never silently truncated — it is dropped over the cap and falls back).
+    """
+    html_result = await _discovery_get_html(copilot_ctx)
+    if html_result.get("ok"):
+        html = _discovery_extract_html_payload(html_result)
+        if html.strip():
+            return html, None, False
+    stripped, truncated = await _composition_get_stripped_html(copilot_ctx)
+    if stripped and stripped.strip():
+        return stripped, None, truncated
+    error = html_result.get("error")
+    return "", str(error) if error else None, False
+
+
+async def _capture_composition_evidence(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read page HTML and parse composition evidence, recapturing on a hollow read.
+
+    The capture (`_composition_get_html`) survives the MCP size cap; this loop adds a
+    short settle and re-read for the separate case where the page had not finished
+    rendering at capture time (a cold cloud session's first navigate to a heavy page
+    can hand back a shell). Returns (evidence, html_error); html_error is set only
+    when the HTML read itself failed. Stops early once the parse yields a bounded
+    schema (forms/links/result containers/challenge), so a genuine challenge page is
+    not retried.
+    """
+    evidence: dict[str, Any] | None = None
+    html_truncated = False
+    for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
+        html, html_error, html_truncated = await _composition_get_html(copilot_ctx)
+        if html_error is not None:
+            return None, html_error
+        evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        if has_bounded_page_schema(evidence):
+            break
+        if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
+            await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
+    if evidence is not None and html_truncated:
+        evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
+    if evidence is not None and page_evidence_needs_visual_fallback(evidence):
+        evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+    return evidence, None
 
 
 async def _inspect_page_for_composition_impl(
@@ -6595,22 +6931,24 @@ async def _inspect_page_for_composition_impl(
     ):
         if use_current_page:
             current_url = entry_url
-            html_result = await _discovery_get_html(copilot_ctx)
-            if not html_result.get("ok"):
+            evidence, html_error = await _capture_composition_evidence(
+                copilot_ctx, inspected_url=entry_url, current_url=current_url
+            )
+            if html_error is not None:
                 result = {
                     "ok": False,
                     "data": None,
-                    "error": f"inspect_page_for_composition could not read page HTML: {html_result.get('error', 'unknown')}",
+                    "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
                 }
                 record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
                 return result
-
-            html = _discovery_extract_html_payload(html_result)
-            evidence = parse_composition_html(html, inspected_url=entry_url, current_url=current_url)
-            if page_evidence_needs_visual_fallback(evidence):
-                evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
         else:
-            nav_result = await _discovery_navigate(copilot_ctx, entry_url)
+            nav_result = await _discovery_navigate(
+                copilot_ctx,
+                entry_url,
+                wait_until="domcontentloaded",
+                timeout_seconds=_COMPOSITION_NAVIGATE_TIMEOUT_SECONDS,
+            )
             if not nav_result.get("ok"):
                 nav_error = str(nav_result.get("error") or "unknown")
                 failure_evidence = await _composition_evidence_after_navigation_failure(
@@ -6630,20 +6968,26 @@ async def _inspect_page_for_composition_impl(
                 current_url = str(evidence.get("current_url") or entry_url)
             else:
                 current_url = _discovery_extract_current_url(nav_result, entry_url)
-                html_result = await _discovery_get_html(copilot_ctx)
-                if not html_result.get("ok"):
+                evidence, html_error = await _capture_composition_evidence(
+                    copilot_ctx, inspected_url=entry_url, current_url=current_url
+                )
+                if html_error is not None:
                     result = {
                         "ok": False,
                         "data": None,
-                        "error": f"inspect_page_for_composition could not read page HTML: {html_result.get('error', 'unknown')}",
+                        "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
                     }
                     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
                     return result
 
-                html = _discovery_extract_html_payload(html_result)
-                evidence = parse_composition_html(html, inspected_url=entry_url, current_url=current_url)
-                if page_evidence_needs_visual_fallback(evidence):
-                    evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
+    if evidence is None:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": "inspect_page_for_composition could not read page HTML.",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
 
     run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
     if isinstance(run_id, str) and run_id:
@@ -6661,8 +7005,13 @@ async def _inspect_page_for_composition_impl(
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence
+    reached_via = _inspection_reached_via(use_current_page=use_current_page, post_run=bool(run_id))
+    _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
     _mark_page_inspected(copilot_ctx)
-    result = {"ok": True, "data": evidence}
+    # Surface the reached page at the top level so the model registers that the
+    # inspection already navigated there and does not re-issue navigate_browser.
+    current_url = evidence.get("current_url") or evidence.get("inspected_url") or ""
+    result = {"ok": True, "current_url": current_url, "reached_via": reached_via, "data": evidence}
     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
     return result
 
@@ -6724,8 +7073,11 @@ async def _discovery_walk(
                 )
 
             current_url = _discovery_extract_current_url(nav_result, current_url)
-        html_result = await _discovery_get_html(ctx)
-        html = _discovery_extract_html_payload(html_result) if html_result.get("ok") else ""
+        # Survive the MCP size cap: a heavy DOM exceeds it and the html field is dropped, so
+        # fall back to a stripped-body evaluate that keeps the links/forms the resolver needs
+        # to identify a usable entrypoint. (Discovery only resolves the entrypoint, so a sliced
+        # tail does not matter here.)
+        html, _, _ = await _composition_get_html(ctx)
         page_title, anchors, form_fields = _discovery_parse_html(html)
 
         evidence_trail.append(
@@ -6878,11 +7230,29 @@ async def _discover_workflow_entrypoint_impl(
     """
     arguments = {"site_or_url": site_or_url, "intent_hint": intent_hint}
 
+    def finish(result: dict[str, Any], *, site_or_url_kind: str | None = None) -> dict[str, Any]:
+        _record_discovery_resolution_on_ctx(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        data_payload = result.get("data")
+        data = data_payload if isinstance(data_payload, Mapping) else {}
+        candidate_url = data.get("candidate_url")
+        failure_reason = data.get("failure_reason")
+        if not isinstance(failure_reason, str) or not failure_reason:
+            error = result.get("error")
+            failure_reason = error if isinstance(error, str) and error else None
+        LOG.info(
+            "discover_workflow_entrypoint completed",
+            ok=result.get("ok"),
+            candidate_url=candidate_url if isinstance(candidate_url, str) and candidate_url else None,
+            failure_reason=failure_reason,
+            site_or_url_kind=site_or_url_kind,
+        )
+        return result
+
     authority_error = _authority_tool_error(copilot_ctx, "discover_workflow_entrypoint")
     if authority_error:
         result = {"ok": False, "error": authority_error}
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     if copilot_ctx.discovery_calls_this_turn >= _DISCOVERY_PER_TURN_BUDGET:
         result = _discovery_build_result(
@@ -6892,8 +7262,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="discovery_already_completed_this_turn",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     cumulative = copilot_ctx.prior_discovery_calls_made + copilot_ctx.discovery_calls_this_turn
     if cumulative >= _DISCOVERY_PER_CHAT_BUDGET:
@@ -6904,8 +7273,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="discovery_budget_exhausted_for_chat",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     entry_url, kind = _resolve_discovery_entry_url(site_or_url)
     if entry_url is None:
@@ -6916,8 +7284,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="could_not_resolve_site_name",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result, site_or_url_kind=kind)
 
     if copilot_ctx.build_phase == BuildPhase.INITIAL:
         try:
@@ -6931,6 +7298,34 @@ async def _discover_workflow_entrypoint_impl(
                 build_phase=copilot_ctx.build_phase.value,
             )
     copilot_ctx.discovery_calls_this_turn += 1
+
+    concrete_homepage_url = _concrete_homepage_entrypoint(entry_url, kind)
+    if concrete_homepage_url is not None:
+        evidence_trail = [
+            {
+                "url": concrete_homepage_url,
+                "page_title": "",
+                "transition_reason": "concrete_domain_homepage",
+            }
+        ]
+        result = _discovery_build_result(
+            candidate_url=concrete_homepage_url,
+            candidate_form_fields=[],
+            evidence_trail=evidence_trail,
+            # Lower than a scraped-page match because the fast path skips page inspection.
+            confidence=_DISCOVERY_CONCRETE_HOMEPAGE_CONFIDENCE,
+            failure_reason=None,
+        )
+        copilot_ctx.discovery_evidence_trail = list(evidence_trail)
+        try:
+            advance_to_composing(copilot_ctx, reason="discovery_concrete_domain_homepage")
+        except ValueError as exc:
+            LOG.warning(
+                "discover_workflow_entrypoint phase transition to composing rejected",
+                error=str(exc),
+                build_phase=copilot_ctx.build_phase.value,
+            )
+        return finish(result, site_or_url_kind=kind)
 
     with copilot_span(
         "discover_workflow_entrypoint",
@@ -6973,8 +7368,7 @@ async def _discover_workflow_entrypoint_impl(
                 build_phase=copilot_ctx.build_phase.value,
             )
 
-    record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-    return result
+    return finish(result, site_or_url_kind=kind)
 
 
 @function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)

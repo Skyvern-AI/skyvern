@@ -23,10 +23,28 @@ class _Ctx:
     turn_intent: TurnIntent = field(default_factory=lambda: TurnIntent(mode=TurnIntentMode.BUILD))
     composition_page_evidence: dict | None = None
     workflow_yaml: str | None = None
+    flow_evidence: list[dict] = field(default_factory=list)
+    prior_observed_acted_pages: list[dict] = field(default_factory=list)
     per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     post_run_page_observation_after_failed_test: bool = False
     last_failure_category_top: str | None = None
+
+
+def _flow_entry(url: str, *, reached_via: str = "navigate", with_form: bool = True) -> dict:
+    evidence: dict = {
+        "inspected_url": url,
+        "current_url": url,
+        "source_tool": "inspect_page_for_composition",
+        "forms": [{"fields": [_field("X", "x")], "submit_controls": []}] if with_form else [],
+    }
+    return {
+        "evidence": evidence,
+        "reached_via": reached_via,
+        "url": url,
+        "had_bounded_schema": with_form,
+        "step": 0,
+    }
 
 
 def _yaml(*blocks: dict) -> str:
@@ -241,6 +259,23 @@ def test_composition_gate_requires_page_evidence_before_page_dependent_blocks() 
     assert "inspect_page_for_composition" in error
     assert "save only the initial goto_url block" in error
     assert "search_lookup" in error
+
+
+def test_composition_gate_requires_page_evidence_before_no_url_action_blocks() -> None:
+    # action / file_download / file_upload act on the reached page like a no-url navigation,
+    # and the KB steers single clicks toward `action`, so they must be gated the same way.
+    goto_block = {"block_type": "goto_url", "label": "open_cart", "url": "https://example.com/cart"}
+    for acting_type in ("action", "file_download", "file_upload"):
+        acting_block = {
+            "block_type": acting_type,
+            "label": f"do_{acting_type}",
+            "navigation_goal": "Click the Add to cart button on the current page.",
+        }
+
+        error = composition_page_evidence_error(_Ctx(), _yaml(goto_block, acting_block))
+
+        assert error is not None, f"{acting_type} should require page evidence"
+        assert f"do_{acting_type}" in error
 
 
 def test_composition_gate_names_extraction_only_blocks_missing_evidence() -> None:
@@ -525,6 +560,7 @@ def test_composition_gate_allows_post_run_current_page_schema_on_same_origin_con
         "inspected_url": "current_page",
         "current_url": "https://example.com/results?id=123",
         "forms": [],
+        "result_containers": [{"selector": "#results"}],
         "source_tool": "inspect_page_for_composition",
         "observed_after_workflow_run": True,
     }
@@ -566,7 +602,7 @@ def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_obse
     evidence = {
         "inspected_url": "current_page",
         "current_url": "https://example.com/lookup",
-        "forms": [],
+        "forms": [{"fields": [{"name": "first_name", "selector": "#first_name"}], "submit_controls": []}],
         "source_tool": "inspect_page_for_composition",
         "observed_after_workflow_run": True,
     }
@@ -576,6 +612,36 @@ def test_composition_gate_allows_multiple_new_page_changing_blocks_from_one_obse
     error = composition_page_evidence_error(ctx, workflow_yaml)
 
     assert error is None
+
+
+def test_composition_gate_rejects_hollow_inspect_evidence() -> None:
+    # A pre-render shell parses to empty forms/links/result containers. An inspect
+    # that captured nothing is not observation, so a page-acting block on that URL
+    # stays gated — URL match alone must not satisfy the gate (SKY-10562).
+    existing_yaml = _yaml({"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"})
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "search_lookup",
+            "navigation_goal": "Fill the observed search fields and submit.",
+        },
+    )
+    evidence = {
+        "inspected_url": "https://example.com/lookup",
+        "current_url": "https://example.com/lookup",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "source_tool": "inspect_page_for_composition",
+    }
+    ctx = _Ctx(composition_page_evidence=evidence)
+    ctx.workflow_yaml = existing_yaml
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "observed page evidence" in error
 
 
 def test_composition_gate_allows_extraction_added_with_new_page_changing_block() -> None:
@@ -809,7 +875,7 @@ def test_composition_gate_targets_nearest_url_before_new_page_block() -> None:
     evidence = {
         "inspected_url": "https://example.com/registry/search",
         "current_url": "https://example.com/registry/search",
-        "forms": [],
+        "forms": [{"fields": [{"name": "first_name", "selector": "#first_name"}], "submit_controls": []}],
         "source_tool": "inspect_page_for_composition",
     }
     ctx = _Ctx(composition_page_evidence=evidence)
@@ -961,3 +1027,123 @@ def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_
     error = composition_page_evidence_error(_Ctx(composition_page_evidence=_first_last_evidence()), workflow_yaml)
 
     assert error is None
+
+
+# ---------------- SKY-10562: block-type-agnostic, per-acted-page, multi-page gate ----------------
+
+
+def test_composition_gate_gates_non_entrypoint_goto_url_block() -> None:
+    # A goto_url past the entrypoint acts on its own page and must be observed —
+    # closing the goto_url block-type escape.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "goto_url", "label": "open_cart", "url": "https://example.com/cart"},
+        {"block_type": "validation", "label": "confirm_item", "complete_criterion": "An item is in the cart."},
+    )
+
+    error = composition_page_evidence_error(_Ctx(), workflow_yaml)
+    assert error is not None
+    assert "open_cart (goto_url)" in error
+
+    ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/cart")])
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_entrypoint_goto_url_stays_ungated() -> None:
+    # The first goto_url is the scaffold the agent scouts from — never gated.
+    workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
+    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+
+
+def test_composition_gate_pure_code_block_is_ungated() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "code", "label": "transform", "code": "result = 1 + 1"},
+    )
+    assert composition_page_evidence_error(_Ctx(), workflow_yaml) is None
+
+
+def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> None:
+    # Two acted pages (login then a goto_url to /secure); the single-slot evidence
+    # could only hold one, but the flow trajectory covers both.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_login", "url": "https://example.com/login"},
+        {"block_type": "login", "label": "do_login", "navigation_goal": "Log in with the saved credential."},
+        {"block_type": "goto_url", "label": "open_secure", "url": "https://example.com/secure"},
+        {"block_type": "validation", "label": "confirm_secure", "complete_criterion": "Secure area is shown."},
+    )
+    only_login = _Ctx(flow_evidence=[_flow_entry("https://example.com/login")])
+    error = composition_page_evidence_error(only_login, workflow_yaml)
+    assert error is not None
+    assert "open_secure (goto_url)" in error
+
+    both = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/login"),
+            _flow_entry("https://example.com/secure", reached_via="post_run"),
+        ]
+    )
+    assert composition_page_evidence_error(both, workflow_yaml) is None
+
+
+def test_composition_gate_regates_changed_block_url() -> None:
+    previous = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "navigation", "label": "open_page", "url": "https://example.com/old", "navigation_goal": "go"},
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "navigation", "label": "open_page", "url": "https://example.com/new", "navigation_goal": "go"},
+    )
+    ctx = _Ctx(flow_evidence=[_flow_entry("https://example.com/old")])
+    ctx.workflow_yaml = previous
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+    assert error is not None
+    assert "open_page (navigation)" in error
+
+    ctx_observed = _Ctx(flow_evidence=[_flow_entry("https://example.com/new")])
+    ctx_observed.workflow_yaml = previous
+    assert composition_page_evidence_error(ctx_observed, workflow_yaml) is None
+
+
+def test_composition_gate_credits_cross_turn_observed_page_summary() -> None:
+    # A page observed on a prior turn (its inspection budget already spent) is
+    # credited from the persisted summary so the gate does not deadlock.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {"block_type": "navigation", "label": "search_lookup", "navigation_goal": "Fill and submit the form."},
+    )
+    ctx = _Ctx(
+        prior_observed_acted_pages=[
+            {"url": "https://example.com/lookup", "had_bounded_schema": True, "reached_via": "navigate"}
+        ]
+    )
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> None:
+    # A page observed on a prior turn credits only the SAME page, never a sibling
+    # on the same origin — otherwise the gate would author an unobserved page's
+    # block from a same-origin observation.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "goto_url", "label": "open_admin", "url": "https://example.com/admin"},
+        {"block_type": "validation", "label": "confirm_admin", "complete_criterion": "Admin panel is shown."},
+    )
+    sibling_only = _Ctx(
+        prior_observed_acted_pages=[
+            {"url": "https://example.com/lookup", "had_bounded_schema": True, "reached_via": "navigate"}
+        ]
+    )
+    sibling_only.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
+    error = composition_page_evidence_error(sibling_only, workflow_yaml)
+    assert error is not None
+    assert "open_admin (goto_url)" in error
+
+    exact = _Ctx(
+        prior_observed_acted_pages=[
+            {"url": "https://example.com/admin", "had_bounded_schema": True, "reached_via": "navigate"}
+        ]
+    )
+    exact.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
+    assert composition_page_evidence_error(exact, workflow_yaml) is None

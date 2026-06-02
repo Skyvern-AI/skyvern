@@ -3,6 +3,7 @@ import { useReactFlow } from "@xyflow/react";
 import { Label } from "@/components/ui/label";
 import { WorkflowBlockInputSet } from "@/components/WorkflowBlockInputSet";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { deepEqualStringArrays } from "@/util/equality";
 
 import { type AppNode, isWorkflowBlockNode } from "..";
@@ -28,6 +29,7 @@ function CodeBlockEditorBody({
   const data = node.data;
   const { editable } = data;
   const update = useUpdate<CodeBlockNodeData>({ id: blockId, editable });
+  const scopeReadOnly = useWorkflowScopeReadOnly();
 
   return (
     <div data-testid="code-block-block-form" className="space-y-4">
@@ -49,6 +51,7 @@ function CodeBlockEditorBody({
         <CodeEditor
           language="python"
           value={data.code}
+          readOnly={scopeReadOnly}
           onChange={(value) => {
             update({ code: value });
           }}

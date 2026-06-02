@@ -3791,6 +3791,19 @@ async def get_workflows(
     ),
     folder_id: str | None = Query(None, description="Filter workflows by folder ID"),
     status: Annotated[list[WorkflowStatus] | None, Query()] = None,
+    tags: Annotated[
+        list[str] | None,
+        Query(
+            max_length=20,
+            description=(
+                "Filter by tags as `key:value` pairs. Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key "
+                "(`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). "
+                "Matches current tag values only. Not supported with `template=true`."
+            ),
+            examples=["env:prod", "customer:acme,env:prod"],
+        ),
+    ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
     template: bool = Query(False),
 ) -> list[Workflow]:
@@ -3811,6 +3824,32 @@ async def get_workflows(
 
     # Default to published and draft if no status filter provided
     effective_statuses = status if status else [WorkflowStatus.published, WorkflowStatus.draft]
+
+    # A lone empty value (?tags= with nothing else) is a no-op for backward
+    # compat; any blank segment alongside real ones — comma (env:prod,) or
+    # repeated (tags=env:prod&tags=) — is malformed, so both encodings 400 alike.
+    tag_groups = tags or []
+    if tag_groups == [""]:
+        tag_groups = []
+    workflow_tags: list[tuple[str, str]] = []
+    for raw_group in tag_groups:
+        for raw_pair in raw_group.split(","):
+            pair = raw_pair.strip()
+            tag_key, sep, tag_value = pair.partition(":")
+            tag_key, tag_value = tag_key.strip(), tag_value.strip()
+            if not sep or not tag_key or not tag_value:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{pair}'; expected 'key:value'.",
+                )
+            workflow_tags.append((tag_key, tag_value))
+
+    if template and workflow_tags:
+        # Templates are global; tags are org-scoped, so the two can't combine.
+        raise HTTPException(
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail="tags filter is not supported with template=true",
+        )
 
     if template:
         global_workflows_permanent_ids = await app.STORAGE.retrieve_global_workflows()
@@ -3841,6 +3880,7 @@ async def get_workflows(
         search_key=effective_search,
         folder_id=folder_id,
         statuses=effective_statuses,
+        workflow_tags=workflow_tags or None,
     )
 
 

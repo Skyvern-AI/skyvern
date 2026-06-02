@@ -17,8 +17,14 @@ from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerification
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 _BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
-_PAGE_SHAPING_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "login"})
-_PAGE_READING_BLOCK_TYPES: frozenset[str] = frozenset({"extraction"})
+# Block types whose acted page, when no url is on the block, is the current
+# frontier (observation of the page suffices). navigation without a url is the
+# interaction-on-current-page case and is also frontier-anchored.
+_FRONTIER_NO_URL_BLOCK_TYPES: frozenset[str] = frozenset({"login", "extraction", "validation"})
+# No-url blocks that interact with the live page (not just read it): each runs the browser
+# agent against the reached page, so they need the same observed-evidence floor as a no-url
+# navigation, otherwise the agent can author an unobserved click/download/upload.
+_INTERACTION_NO_URL_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "action", "file_download", "file_upload"})
 _GOTO_URL_BLOCK_TYPE = "goto_url"
 _SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
 _STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
@@ -250,25 +256,32 @@ def workflow_target_url(workflow_yaml: str | None) -> str | None:
     return None
 
 
-def _workflow_target_url_for_new_page_block(
-    workflow_yaml: str | None, previous_workflow_yaml: str | None
-) -> str | None:
-    previous = {
-        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
-        for block in _parse_workflow_blocks(previous_workflow_yaml)
-    }
-    last_url: str | None = None
-    for block in _parse_workflow_blocks(workflow_yaml):
-        url = block.get("url")
-        if isinstance(url, str) and url.strip():
-            last_url = url.strip()
-        block_type = str(block.get("block_type") or "").strip().lower()
-        if block_type not in _PAGE_SHAPING_BLOCK_TYPES | _PAGE_READING_BLOCK_TYPES:
-            continue
-        label = str(block.get("label") or "")
-        if (label, block_type) not in previous:
-            return last_url
-    return workflow_target_url(workflow_yaml)
+def _block_url(block: dict[str, Any]) -> str | None:
+    url = block.get("url")
+    return url.strip() if isinstance(url, str) and url.strip() else None
+
+
+def _block_acts_on_page(block: dict[str, Any]) -> str | None:
+    """How a block acts on a live page, or None if it is page-independent.
+
+    "url"        - carries a target url (goto_url, navigation/login with a url, a
+                   code block referencing a url); acts on that url's page.
+    "interaction"- a no-url navigation/action/file_download/file_upload: an
+                   interaction (click/fill/submit/download/upload) on the current page.
+    "frontier"   - a no-url login/extraction/validation: reads or authenticates on
+                   whatever page the workflow has reached.
+
+    A pure code/transform block (no url, not an interaction/reading type) returns
+    None and is not gated.
+    """
+    block_type = str(block.get("block_type") or "").strip().lower()
+    if _block_url(block):
+        return "url"
+    if block_type in _INTERACTION_NO_URL_BLOCK_TYPES:
+        return "interaction"
+    if block_type in _FRONTIER_NO_URL_BLOCK_TYPES:
+        return "frontier"
+    return None
 
 
 def _mode_requires_evidence(ctx: Any) -> bool:
@@ -285,38 +298,51 @@ def _mode_requires_evidence(ctx: Any) -> bool:
     )
 
 
-def _new_page_shaping_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
-    previous = {
-        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
+def _gated_page_acting_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, Any]]:
+    """New-or-url-changed blocks that act on a page and so need observed evidence.
+
+    Block-type-agnostic: any block carrying a url (goto_url past the entrypoint,
+    navigation/login/code with a url) is gated, closing the goto_url/code escape;
+    no-url navigation/login/extraction/validation blocks act on the current
+    frontier. The first goto_url (the entrypoint scaffold) is exempt so the agent
+    can record it and scout from it (SKY-10346). A url-bearing block whose url
+    changed under the same label is re-gated so an edit cannot retarget a block to
+    an unobserved page.
+
+    target_url is the page the block acts on (own url, else nearest preceding
+    goto_url, else the workflow entrypoint) for path/origin evidence matching.
+    """
+    previous_by_key = {
+        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower()): _block_url(block) or ""
         for block in _parse_workflow_blocks(previous_workflow_yaml)
     }
-    blocks: list[dict[str, str]] = []
-    for block in _parse_workflow_blocks(workflow_yaml):
+    gated: list[dict[str, Any]] = []
+    nearest_goto: str | None = None
+    fallback_url = workflow_target_url(workflow_yaml)
+    for index, block in enumerate(_parse_workflow_blocks(workflow_yaml)):
         block_type = str(block.get("block_type") or "").strip().lower()
-        if block_type not in _PAGE_SHAPING_BLOCK_TYPES:
+        url = _block_url(block)
+        if url:
+            nearest_goto = url
+        if index == 0 and block_type == _GOTO_URL_BLOCK_TYPE:
+            # entrypoint scaffold — ungated so the agent can record it and scout from it.
+            continue
+        acts_via = _block_acts_on_page(block)
+        if acts_via is None:
             continue
         label = str(block.get("label") or "<missing label>")
-        if (label, block_type) in previous:
-            continue
-        blocks.append({"label": label, "block_type": block_type})
-    return blocks
-
-
-def _new_page_reading_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
-    previous = {
-        (str(block.get("label") or ""), str(block.get("block_type") or "").strip().lower())
-        for block in _parse_workflow_blocks(previous_workflow_yaml)
-    }
-    blocks: list[dict[str, str]] = []
-    for block in _parse_workflow_blocks(workflow_yaml):
-        block_type = str(block.get("block_type") or "").strip().lower()
-        if block_type not in _PAGE_READING_BLOCK_TYPES:
-            continue
-        label = str(block.get("label") or "<missing label>")
-        if (label, block_type) in previous:
-            continue
-        blocks.append({"label": label, "block_type": block_type})
-    return blocks
+        key = (label, block_type)
+        is_new = key not in previous_by_key
+        is_changed = (acts_via == "url") and (not is_new) and (previous_by_key.get(key) or "") != (url or "")
+        if is_new or is_changed:
+            gated.append(
+                {
+                    "label": label,
+                    "block_type": block_type,
+                    "target_url": url or nearest_goto or fallback_url,
+                }
+            )
+    return gated
 
 
 def _changed_goto_url_blocks(workflow_yaml: str | None, previous_workflow_yaml: str | None) -> list[dict[str, str]]:
@@ -429,7 +455,7 @@ def _post_run_observed_url_goto_error(
     )
 
 
-def _has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
+def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
     for key in ("forms", "navigation_targets", "result_containers", "challenge_controls"):
         value = evidence.get(key)
         if isinstance(value, list) and value:
@@ -451,10 +477,15 @@ def _evidence_matches_target(
     inspected_url = evidence.get("inspected_url")
     current_url = current_url if isinstance(current_url, str) else None
     inspected_url = inspected_url if isinstance(inspected_url, str) else None
-    if source_tool == _SCHEMA_EVIDENCE_TOOL:
+    # A hollow inspection (empty forms/links/result containers, no detected
+    # challenge) is not observation — `inspect_page_for_composition` can return an
+    # empty schema when the page had not rendered at capture time, so URL match
+    # alone must not satisfy the gate. Require a bounded page schema for every
+    # evidence source, the inspector included.
+    if source_tool == _SCHEMA_EVIDENCE_TOOL and has_bounded_page_schema(evidence):
         if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
             return True
-    if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and _has_bounded_page_schema(evidence):
+    if source_tool in _STRUCTURED_BROWSER_EVIDENCE_TOOLS and has_bounded_page_schema(evidence):
         if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
             return True
         if allow_post_run_browser_observation and (
@@ -464,20 +495,60 @@ def _evidence_matches_target(
     if (
         allow_post_run_browser_observation
         and source_tool in _POST_RUN_CONTINUATION_EVIDENCE_TOOLS
-        and (source_tool == _SCHEMA_EVIDENCE_TOOL or _has_bounded_page_schema(evidence))
+        and has_bounded_page_schema(evidence)
         and evidence.get("observed_after_workflow_run") is True
     ):
         return _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
     return False
 
 
-def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
-    """Return a mutation error when a build adds page-dependent blocks before inspection.
+def _turn_evidence_sources(ctx: Any) -> list[dict[str, Any]]:
+    """Every page-evidence packet available this turn: the flow-evidence trajectory
+    (one packet per scouted page) plus the legacy single composition_page_evidence
+    slot (back-compat for callers and tests that set only it).
+    """
+    sources: list[dict[str, Any]] = []
+    for entry in getattr(ctx, "flow_evidence", None) or []:
+        if isinstance(entry, dict):
+            packet = entry.get("evidence")
+            if isinstance(packet, dict):
+                sources.append(packet)
+    single = getattr(ctx, "composition_page_evidence", None)
+    if isinstance(single, dict):
+        sources.append(single)
+    return sources
 
-    This is deliberately structural rather than semantic: the contract says
-    page-shaping workflow blocks need inspected page evidence first. Grounding
-    quality is measured by evals and the page-evidence tool output, not by a
-    growing natural-language classifier in the mutation path.
+
+def _prior_observed_pages(ctx: Any) -> list[dict[str, Any]]:
+    return [page for page in (getattr(ctx, "prior_observed_acted_pages", None) or []) if isinstance(page, dict)]
+
+
+def _page_observed(ctx: Any, target_url: str | None, *, allow_post_run: bool) -> bool:
+    if not target_url:
+        return False
+    for evidence in _turn_evidence_sources(ctx):
+        if _evidence_matches_target(evidence, target_url, allow_post_run_browser_observation=allow_post_run):
+            return True
+    # Cross-turn credit requires the SAME page (netloc+path), not just same
+    # origin: the compact summary only proves which page was observed, so a
+    # same-origin relaxation would credit a gated block on a sibling page the
+    # agent never saw. The within-turn post-run same-origin continuation still
+    # applies above via _evidence_matches_target.
+    for page in _prior_observed_pages(ctx):
+        if page.get("had_bounded_schema") and _same_page(page.get("url"), target_url):
+            return True
+    return False
+
+
+def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
+    """Return a mutation error when a build adds page-acting blocks before observation.
+
+    Deliberately structural rather than semantic: every block that acts on a page
+    — block-type-agnostic, including goto_url/code blocks that carry a url, and
+    each page across a multi-page flow — needs observed evidence of that page
+    first. Whether the agent observed the *right* live state (e.g. a control that
+    only appears after a click) is driven by the agent's live scouting and measured
+    by evals, not enforced by a classifier in the mutation path.
     """
 
     if not _mode_requires_evidence(ctx):
@@ -487,29 +558,23 @@ def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str 
     if post_run_url_error:
         return post_run_url_error
 
-    page_shaping_blocks = _new_page_shaping_blocks(workflow_yaml, previous_workflow_yaml)
-    page_reading_blocks = _new_page_reading_blocks(workflow_yaml, previous_workflow_yaml)
-    if not page_shaping_blocks and not page_reading_blocks:
+    gated_blocks = _gated_page_acting_blocks(workflow_yaml, previous_workflow_yaml)
+    if not gated_blocks:
         return None
 
-    target_url = _workflow_target_url_for_new_page_block(workflow_yaml, previous_workflow_yaml)
-    evidence = getattr(ctx, "composition_page_evidence", None)
-    allow_post_run_browser_observation = bool(previous_workflow_yaml)
-    if not _evidence_matches_target(
-        evidence,
-        target_url,
-        allow_post_run_browser_observation=allow_post_run_browser_observation,
-    ):
-        offending = _format_page_block_findings(page_shaping_blocks + page_reading_blocks)
-        return (
-            "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
-            f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
-            "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
-            f"Offending blocks: {offending}"
-        )
+    allow_post_run = bool(previous_workflow_yaml)
+    for block in gated_blocks:
+        target_url = block["target_url"]
+        if not _page_observed(ctx, target_url, allow_post_run=allow_post_run):
+            return (
+                "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
+                f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
+                "blocks, or save only the initial goto_url block and inspect the reached page before the next mutation. "
+                f"Offending blocks: {_format_page_block_findings([block])}"
+            )
 
     # Matched page evidence may ground a multi-block mutation. This gate enforces
-    # inspection before page-dependent composition; it does not prescribe a
+    # observation before page-dependent composition; it does not prescribe a
     # one-block-per-observation workflow construction style.
 
     return None
