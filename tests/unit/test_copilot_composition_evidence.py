@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import yaml
 
@@ -10,6 +11,7 @@ from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     merge_visual_composition_evidence,
+    normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
 )
@@ -24,6 +26,9 @@ class _Ctx:
     composition_page_evidence: dict | None = None
     workflow_yaml: str | None = None
     flow_evidence: list[dict] = field(default_factory=list)
+    # Looser than AgentContext so tests can feed malformed refs into the gate.
+    block_observation_refs: dict[str, object] = field(default_factory=dict)
+    raw_block_observation_refs: object | None = None
     prior_observed_acted_pages: list[dict] = field(default_factory=list)
     per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
@@ -31,19 +36,29 @@ class _Ctx:
     last_failure_category_top: str | None = None
 
 
-def _flow_entry(url: str, *, reached_via: str = "navigate", with_form: bool = True) -> dict:
+def _flow_entry(
+    url: str,
+    *,
+    reached_via: str = "navigate",
+    with_form: bool = True,
+    observed_empty_page: bool = False,
+    step: int = 0,
+) -> dict:
     evidence: dict = {
         "inspected_url": url,
         "current_url": url,
         "source_tool": "inspect_page_for_composition",
         "forms": [{"fields": [_field("X", "x")], "submit_controls": []}] if with_form else [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "observed_empty_page": observed_empty_page,
     }
     return {
         "evidence": evidence,
         "reached_via": reached_via,
-        "url": url,
-        "had_bounded_schema": with_form,
-        "step": 0,
+        "had_bounded_schema": with_form or observed_empty_page,
+        "step": step,
     }
 
 
@@ -164,6 +179,97 @@ def test_composition_parse_html_adds_challenge_state_for_anti_bot_dom() -> None:
     assert parsed["challenge_state"]["source"] == "dom_html"
     assert parsed["challenge_state"]["gates_submit_controls"] is False
     assert parsed["challenge_state"]["gated_submit_controls"] == []
+
+
+def test_composition_parse_html_reports_schema_empty_without_semantic_terminal_inference() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Done</title></head><body>
+          <main>Confirmation complete.</main>
+        </body></html>
+        """,
+        inspected_url="https://example.com/confirmation",
+        current_url="https://example.com/confirmation",
+    )
+
+    assert parsed["forms"] == []
+    assert parsed["navigation_targets"] == []
+    assert parsed["result_containers"] == []
+    assert parsed["schema_empty_page"] is True
+    assert parsed["observed_empty_page"] is False
+    assert parsed["empty_page_visual_state"] is None
+    assert "empty_page_state" not in parsed
+
+
+def test_composition_parse_html_keeps_loading_shell_unobserved_without_visual_confirmation() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Loading</title></head><body>
+          <main>Loading...</main>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["forms"] == []
+    assert parsed["navigation_targets"] == []
+    assert parsed["result_containers"] == []
+    assert parsed["schema_empty_page"] is True
+    assert parsed["observed_empty_page"] is False
+    assert parsed["empty_page_visual_state"] is None
+    assert "empty_page_state" not in parsed
+
+
+def test_visual_summary_marks_observed_empty_page_without_text_hints() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Receipt</title></head><body></body></html>
+        """,
+        inspected_url="https://example.com/receipt",
+        current_url="https://example.com/receipt",
+    )
+
+    marked = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A settled blank page is visible after the submit action.",
+            "challenge_detected": False,
+            "submit_blocked": False,
+            "empty_page_visible": True,
+            "loading_state_visible": False,
+        },
+    )
+
+    assert marked["observed_empty_page"] is True
+    assert marked["empty_page_observation_source"] == "vision_summary"
+    assert marked["empty_page_visual_state"] == "settled_empty"
+
+
+def test_visual_summary_keeps_loading_shell_unobserved() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><head><title>Loading</title></head><body>
+          <main>Loading...</main>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    marked = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "The page is still rendering and shows a wait state.",
+            "challenge_detected": False,
+            "submit_blocked": False,
+            "empty_page_visible": False,
+            "loading_state_visible": True,
+        },
+    )
+
+    assert marked["observed_empty_page"] is False
+    assert marked["empty_page_visual_state"] == "loading_or_progress"
 
 
 def test_merge_visual_composition_evidence_keeps_screenshot_bounded_and_typed() -> None:
@@ -1029,6 +1135,39 @@ def test_composition_gate_allows_separate_form_state_and_submit_blocks_from_one_
     assert error is None
 
 
+def test_composition_gate_allows_navigation_split_blocks_sharing_entrypoint_observation_ref() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_lookup", "url": "https://example.com/lookup"},
+        {
+            "block_type": "navigation",
+            "label": "prepare_lookup",
+            "navigation_goal": "Enter the observed First Name and Last Name fields without submitting.",
+        },
+        {
+            "block_type": "navigation",
+            "label": "submit_lookup",
+            "navigation_goal": "Click the observed Search button and wait for results.",
+        },
+        {
+            "block_type": "extraction",
+            "label": "extract_results",
+            "data_extraction_goal": "Extract the credential rows from the result page.",
+        },
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/lookup", reached_via="navigate", step=0)],
+        block_observation_refs={
+            "prepare_lookup": 0,
+            "submit_lookup": 0,
+            "extract_results": 0,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
 # ---------------- SKY-10562: block-type-agnostic, per-acted-page, multi-page gate ----------------
 
 
@@ -1084,6 +1223,223 @@ def test_composition_gate_multi_page_flow_evidence_grounds_each_acted_page() -> 
         ]
     )
     assert composition_page_evidence_error(both, workflow_yaml) is None
+
+
+def test_composition_gate_requires_block_observation_refs_for_click_reached_pages() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+        {"block_type": "extraction", "label": "read_cart", "data_extraction_goal": "Read the cart contents."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", step=0)],
+        block_observation_refs={"search_product": 0},
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "requires a block_observation_refs entry" in error
+    assert "Pass an interaction- or post_run-reached observation_step" in error
+    assert "add_first_result (action)" in error
+
+
+def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observation_ref() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+        {"block_type": "extraction", "label": "read_cart", "data_extraction_goal": "Read the cart contents."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={
+            "search_product": 0,
+            "add_first_result": 0,
+            "read_cart": 0,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "references observation_step 0" in error
+    assert "reached via 'navigate'" in error
+    assert "add_first_result (action)" in error
+
+
+def test_composition_gate_reports_missing_referenced_observation_step() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={
+            "search_product": 0,
+            "add_first_result": 9,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "references observation_step 9" in error
+    assert "observation step was not found in flow evidence" in error
+    assert "add_first_result (action)" in error
+
+
+def test_composition_gate_reports_evicted_referenced_observation_step() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/cart", reached_via="interaction", step=65)],
+        block_observation_refs={
+            "search_product": 65,
+            "add_first_result": 9,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "references observation_step 9" in error
+    assert "no longer available in the flow-evidence window" in error
+
+
+def test_normalize_block_observation_refs_rejects_string_steps() -> None:
+    assert normalize_block_observation_refs(
+        [
+            {"label": "add_to_cart", "observation_step": 2},
+            {"label": "confirm_cart", "observation_step": "3"},
+        ]
+    ) == {"add_to_cart": 2}
+
+
+def test_normalize_block_observation_refs_warns_on_unexpected_container_type() -> None:
+    with patch("skyvern.forge.sdk.copilot.composition_evidence.LOG.warning") as warning:
+        assert normalize_block_observation_refs("add_to_cart:2") == {}
+
+    warning.assert_called_once_with(
+        "copilot_block_observation_refs_unexpected_type_ignored",
+        value_type="str",
+    )
+
+
+def test_composition_gate_reports_string_typed_observation_step_from_raw_refs() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _flow_entry("https://example.com/results", reached_via="interaction", step=1),
+        ],
+        block_observation_refs={
+            "search_product": 0,
+        },
+        raw_block_observation_refs=[
+            {"label": "search_product", "observation_step": 0},
+            {"label": "add_first_result", "observation_step": "1"},
+        ],
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "observation_step '1' as a string" in error
+    assert "Pass the integer observation_step" in error
+    assert "add_first_result (action)" in error
+
+
+def test_composition_gate_rejects_action_after_navigation_reusing_entrypoint_observation_ref() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "navigation", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={
+            "search_product": 0,
+            "add_first_result": 0,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "add_first_result (action)" in error
+
+
+def test_composition_gate_allows_click_reached_pages_with_block_observation_refs() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+        {"block_type": "extraction", "label": "read_cart", "data_extraction_goal": "Read the cart contents."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _flow_entry("https://example.com/results", reached_via="interaction", step=1),
+            _flow_entry("https://example.com/cart", reached_via="interaction", step=2),
+        ],
+        block_observation_refs={
+            "search_product": 0,
+            "add_first_result": 1,
+            "read_cart": 2,
+        },
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
+
+
+def test_composition_gate_allows_truthfully_empty_observed_confirmation_page() -> None:
+    confirmation_evidence = merge_visual_composition_evidence(
+        parse_composition_html(
+            "<html><head><title>Blank receipt</title></head><body></body></html>",
+            inspected_url="https://example.com/confirmation",
+            current_url="https://example.com/confirmation",
+        ),
+        visual_summary={
+            "summary": "The browser shows a settled blank receipt page.",
+            "challenge_detected": False,
+            "submit_blocked": False,
+            "empty_page_visible": True,
+            "loading_state_visible": False,
+        },
+    )
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "submit_form", "navigation_goal": "Submit the form."},
+        {"block_type": "validation", "label": "confirm_done", "complete_criterion": "The confirmation page loaded."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            {
+                "evidence": confirmation_evidence,
+                "reached_via": "interaction",
+                "had_bounded_schema": True,
+                "step": 1,
+            },
+        ],
+        block_observation_refs={"submit_form": 0, "confirm_done": 1},
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is None
 
 
 def test_composition_gate_regates_changed_block_url() -> None:
@@ -1147,3 +1503,19 @@ def test_composition_gate_cross_turn_credit_requires_same_page_not_origin() -> N
     )
     exact.workflow_yaml = _yaml({"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"})
     assert composition_page_evidence_error(exact, workflow_yaml) is None
+
+
+def test_composition_gate_matches_url_blocks_against_target_when_observation_ref_is_present() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "goto_url", "label": "open_cart", "url": "https://example.com/cart"},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/")],
+        block_observation_refs={"open_cart": 0},
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "open_cart (goto_url)" in error

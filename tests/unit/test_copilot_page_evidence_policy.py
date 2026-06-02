@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.config import DEFAULT_MAX_TURNS
 from skyvern.forge.sdk.copilot.tools import (
     _COMPOSITION_INSPECTION_PER_CHAT_BUDGET,
     _COMPOSITION_INSPECTION_PER_TURN_BUDGET,
+    BlockObservationRef,
     run_blocks_tool,
     update_and_run_blocks_tool,
     update_workflow_tool,
@@ -99,3 +103,8 @@ def test_inspection_budget_allows_multi_page_authoring_evidence_but_remains_boun
 
 def test_default_loop_budget_allows_inspect_build_run_answer_trajectory() -> None:
     assert DEFAULT_MAX_TURNS >= 35
+
+
+def test_block_observation_ref_rejects_negative_steps() -> None:
+    with pytest.raises(ValidationError):
+        BlockObservationRef(label="add_to_cart", observation_step=-1)
