@@ -1,12 +1,34 @@
 import type { ReactNode } from "react";
 import { InfoCircledIcon } from "@radix-ui/react-icons";
 import { cn } from "@/util/utils";
+import { AnimatedWave } from "@/components/AnimatedWave";
+import { RotateThrough } from "@/components/RotateThrough";
 
 type StreamDiagnostic = {
   title: string;
   detail?: string;
   hint?: string;
+  // When true, the panel shows the whimsical "still working on it" animation.
+  pending?: boolean;
 };
+
+const WHIMSICAL_LOADING_MESSAGES = [
+  "Hm, still working on it...",
+  "Hang tight, we're almost there...",
+  "Reticulating splines...",
+  "Backpropagating...",
+  "Attention is all I need...",
+  "Warming up the pixels...",
+  "Consulting the manual...",
+  "Teaching the browser some manners...",
+  "Looking for the bat phone...",
+  "Negotiating with the tubes...",
+  "Where's Shu?...",
+];
+
+const WHIMSICAL_SPARKLE = "‧₊˚ ⋅ ✦ ✨ ✦ ⋅ ˚₊‧";
+
+const SCREENSHOT_PANEL_CLASS = "bg-slate-elevation1 text-slate-300";
 
 type StreamMode = "cdp" | "vnc" | "fallback" | "unavailable";
 
@@ -93,11 +115,21 @@ function StreamStatusPanel({
             {diagnostic.hint}
           </div>
         )}
+        {diagnostic.pending && (
+          <div className="mt-1 flex flex-col gap-1 text-neutral-600 dark:text-slate-400">
+            <RotateThrough interval={7 * 1000}>
+              {WHIMSICAL_LOADING_MESSAGES.map((message) => (
+                <span key={message}>{message}</span>
+              ))}
+            </RotateThrough>
+            <AnimatedWave text={WHIMSICAL_SPARKLE} />
+          </div>
+        )}
         {children}
       </div>
     </div>
   );
 }
 
-export { StreamModeBadge, StreamStatusPanel };
+export { SCREENSHOT_PANEL_CLASS, StreamModeBadge, StreamStatusPanel };
 export type { StreamDiagnostic, StreamMode };

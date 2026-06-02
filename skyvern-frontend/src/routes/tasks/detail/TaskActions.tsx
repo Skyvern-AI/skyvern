@@ -42,37 +42,36 @@ type StreamMessage = {
 };
 
 const STARTING_DIAGNOSTIC: StreamDiagnostic = {
-  title: "Starting browser stream",
-  detail:
-    "Opening the stream WebSocket and waiting for the first browser frame.",
+  title: "Waking up the browser stream",
+  detail: "Opening the stream and waiting for the first frame...",
+  pending: true,
 };
 
 function diagnosticForStatus(status: string): StreamDiagnostic {
   switch (status) {
     case "not_found":
       return {
-        title: "Task not found",
-        detail:
-          "The backend could not find this task for the current organization.",
+        title: "We've misplaced this task",
+        detail: "The backend can't find it for your org.",
       };
     case "timeout":
       return {
-        title: "Timed out waiting for browser state",
-        detail:
-          "The task started, but the backend did not find an active page to stream.",
+        title: "The browser's gone strangely quiet",
+        detail: "The task started, but no active page showed up to stream.",
         hint: "Check backend logs for browser launch errors or a streaming-mode mismatch.",
       };
     case "completed":
     case "failed":
     case "terminated":
       return {
-        title: "Task is no longer live",
-        detail: `The task status is ${status}.`,
+        title: "This task has wrapped up",
+        detail: `It's no longer live — status: ${status}.`,
       };
     default:
       return {
         title: "Waiting for browser frames",
         detail: `The stream is connected and the task status is ${status}.`,
+        pending: true,
       };
   }
 }
@@ -80,13 +79,13 @@ function diagnosticForStatus(status: string): StreamDiagnostic {
 function diagnosticForClose(event: CloseEvent): StreamDiagnostic {
   if (event.code === 1006) {
     return {
-      title: "Stream connection dropped",
+      title: "The connection slipped away",
       detail: "The browser stream WebSocket closed before sending a frame.",
       hint: "Check that the API server is running and reachable from the UI.",
     };
   }
   return {
-    title: "Stream connection closed",
+    title: "The stream packed up and left",
     detail: `WebSocket closed with code ${event.code}${event.reason ? ` (${event.reason})` : ""}.`,
   };
 }
@@ -160,8 +159,9 @@ function TaskActions() {
 
       socketRef.current.addEventListener("open", () => {
         setStreamDiagnostic({
-          title: "Connected to stream",
-          detail: "Waiting for the backend to attach to the browser page.",
+          title: "Hooked up to the stream",
+          detail: "Just waiting for the backend to hand us a browser.",
+          pending: true,
         });
       });
 
@@ -207,17 +207,16 @@ function TaskActions() {
         } catch (e) {
           console.error("Failed to parse message", e);
           setStreamDiagnostic({
-            title: "Unexpected stream message",
-            detail: "The browser stream sent a message the UI could not parse.",
+            title: "The stream said something funny",
+            detail: "The browser sent a message the UI couldn't parse.",
           });
         }
       });
 
       socketRef.current.addEventListener("error", () => {
         setStreamDiagnostic({
-          title: "Stream WebSocket error",
-          detail:
-            "The browser stream connection hit a network or server error.",
+          title: "The stream hit a snag",
+          detail: "The connection ran into a network or server error.",
         });
       });
 
