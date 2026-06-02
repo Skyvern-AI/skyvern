@@ -37,6 +37,7 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
@@ -238,13 +239,7 @@ function RunHistory() {
 
     // No runs found
     if (runs?.length === 0) {
-      return (
-        <TableRow>
-          <TableCell colSpan={6}>
-            <div className="text-center">No runs found</div>
-          </TableCell>
-        </TableRow>
-      );
+      return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
     }
 
     return runs?.map((run) => {
@@ -429,26 +424,16 @@ function RunHistory() {
           }}
         />
       </div>
-      <div className="rounded-lg border">
+      <div className="overflow-hidden rounded-lg border border-border">
         <Table className="sm:table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
+          <TableHeader>
             <TableRow>
-              <TableHead className="w-[20%] rounded-tl-lg text-neutral-600 dark:text-slate-400">
-                Run ID
-              </TableHead>
-              <TableHead className="w-[20%] text-neutral-600 dark:text-slate-400">
-                Detail
-              </TableHead>
-              <TableHead className="w-[16%] text-neutral-600 dark:text-slate-400">
-                Status
-              </TableHead>
-              <TableHead className="w-[27%] text-neutral-600 dark:text-slate-400">
-                Created At
-              </TableHead>
-              <TableHead className="w-[8%] text-neutral-600 dark:text-slate-400">
-                Duration
-              </TableHead>
-              <TableHead className="w-[8%] rounded-tr-lg text-neutral-600 dark:text-slate-400"></TableHead>
+              <TableHead className="w-[20%]">Run ID</TableHead>
+              <TableHead className="w-[20%]">Detail</TableHead>
+              <TableHead className="w-[16%]">Status</TableHead>
+              <TableHead className="w-[27%]">Created At</TableHead>
+              <TableHead className="w-[8%]">Duration</TableHead>
+              <TableHead className="w-[8%]"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>

@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SideNav } from "./SideNav";
@@ -7,6 +7,16 @@ import { useSidebarStore } from "@/store/SidebarStore";
 
 const capture = vi.fn();
 const mutate = vi.fn();
+
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.search}
+    </div>
+  );
+}
 
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: () => false,
@@ -106,6 +116,21 @@ describe("SideNav", () => {
       beta: true,
       badge: "Beta",
     });
+  });
+
+  it("navigates to the parent route when clicking a collapsed group icon", () => {
+    useSidebarStore.setState({ collapsed: true });
+
+    render(
+      <MemoryRouter initialEntries={["/discover"]}>
+        <SideNav />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByTitle("Agents"));
+
+    expect(screen.getByTestId("location").textContent).toBe("/workflows");
   });
 
   it("starts recipes collapsed on short screens", () => {

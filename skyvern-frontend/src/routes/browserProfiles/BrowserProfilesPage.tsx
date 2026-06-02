@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 
+import { BrowserIcon } from "@/components/icons/BrowserIcon";
 import { TableSearchInput } from "@/components/TableSearchInput";
 
 import { BrowserProfilesList } from "./BrowserProfilesList";
@@ -21,10 +22,15 @@ function BrowserProfilesPage() {
   useBackgroundBrowserProfileCreate();
 
   return (
-    <div className="space-y-5">
-      <h1 className="text-2xl">Browser Profiles</h1>
-      <div className="w-96 text-sm text-neutral-600 dark:text-slate-300">
-        {subHeaderText}
+    <div className="space-y-6">
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <BrowserIcon className="size-6" />
+          <h1 className="text-2xl">Browser Profiles</h1>
+        </div>
+        <p className="text-sm leading-6 text-muted-foreground">
+          {subHeaderText}
+        </p>
       </div>
       <div className="flex items-center justify-between gap-4">
         <TableSearchInput
