@@ -178,6 +178,12 @@ class AgentContext:
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
     flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # In-turn side channel from workflow mutation calls: block label -> flow_evidence
+    # observation step used to ground the newly authored page-acting block.
+    block_observation_refs: dict[str, int] = field(default_factory=dict)
+    # Raw tool input for block_observation_refs, retained only for diagnostics
+    # when normalization drops malformed entries before composition validation.
+    raw_block_observation_refs: Any | None = None
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
