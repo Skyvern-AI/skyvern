@@ -360,7 +360,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 type="button"
                 aria-label="submit-prompt"
                 disabled={!prompt.trim() || isSubmitting}
-                className="flex items-center justify-center rounded-lg bg-indigo-600 p-2 text-white shadow-sm shadow-indigo-950/15 transition-colors hover:bg-indigo-500 disabled:pointer-events-none disabled:bg-indigo-600/45 disabled:text-white/65 disabled:shadow-none dark:bg-indigo-500 dark:hover:bg-indigo-400 dark:disabled:bg-indigo-500/35"
+                className="flex items-center justify-center rounded-lg bg-cta p-2 text-cta-foreground shadow-sm transition-colors hover:bg-cta-hover disabled:pointer-events-none disabled:bg-cta/45 disabled:text-cta-foreground/65 disabled:shadow-none"
                 onClick={() => {
                   submitPrompt({ prompt });
                 }}
