@@ -123,7 +123,7 @@ class ScriptsRepository(BaseRepository):
             # Subquery to get the latest version of each script
             latest_versions_subquery = (
                 select(ScriptModel.script_id, func.max(ScriptModel.version).label("latest_version"))
-                .filter_by(organization_id=organization_id)
+                .filter(ScriptModel.organization_id == organization_id)
                 .filter(ScriptModel.deleted_at.is_(None))
                 .group_by(ScriptModel.script_id)
                 .subquery()
@@ -139,7 +139,7 @@ class ScriptsRepository(BaseRepository):
                         ScriptModel.version == latest_versions_subquery.c.latest_version,
                     ),
                 )
-                .filter_by(organization_id=organization_id)
+                .filter(ScriptModel.organization_id == organization_id)
                 .filter(ScriptModel.deleted_at.is_(None))
                 .order_by(ScriptModel.created_at.desc())
                 .limit(page_size)
