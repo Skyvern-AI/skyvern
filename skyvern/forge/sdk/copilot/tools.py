@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import structlog
@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
     BeautifulSoup = None  # type: ignore[assignment, misc]
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -60,6 +60,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     has_bounded_page_schema,
     merge_visual_composition_evidence,
+    normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
     workflow_target_url,
@@ -438,20 +439,25 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
     )
 
 
+def _guardrail_tool_arguments(tool_context: Any) -> tuple[dict[str, Any], Any]:
+    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    try:
+        # Agents SDK guardrails may hand us either raw JSON or an already parsed mapping.
+        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    except json.JSONDecodeError:
+        parsed_arguments = {}
+    return parsed_arguments if isinstance(parsed_arguments, dict) else {}, raw_arguments
+
+
 def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
     tool_context = data.context
-    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    tool_arguments, raw_arguments = _guardrail_tool_arguments(tool_context)
     if not raw_arguments:
         LOG.warning(
             "workflow YAML output policy guardrail received no tool arguments",
             tool_name=getattr(tool_context, "tool_name", None),
             tool_call_id=getattr(tool_context, "tool_call_id", None),
         )
-    try:
-        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
-    except json.JSONDecodeError:
-        parsed_arguments = {}
-    tool_arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
     workflow_yaml_value = tool_arguments.get("workflow_yaml")
     workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
     verdict = evaluate_output_policy(
@@ -477,6 +483,45 @@ _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
     guardrail_function=_workflow_yaml_output_policy_guardrail,
     name="workflow_yaml_output_policy_guardrail",
 )
+
+_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA = {
+    "surface": "tool_pre_side_effect",
+    "tool_name": "update_and_run_blocks",
+    "reason": "composition_page_evidence",
+}
+
+
+def _update_and_run_blocks_composition_evidence_precheck(
+    copilot_ctx: Any,
+    workflow_yaml: str | None,
+    normalized_block_observation_refs: dict[str, int],
+    raw_block_observation_refs: Any,
+) -> str | None:
+    if copilot_ctx is None or workflow_yaml is None:
+        LOG.warning(
+            "update_and_run_blocks composition evidence precheck missing context or workflow yaml",
+            has_context=copilot_ctx is not None,
+            has_workflow_yaml=workflow_yaml is not None,
+        )
+        return None
+
+    evidence_error = composition_page_evidence_error(
+        copilot_ctx,
+        workflow_yaml,
+        block_observation_refs=normalized_block_observation_refs,
+        raw_block_observation_refs=raw_block_observation_refs,
+    )
+
+    if evidence_error:
+        LOG.info(
+            "copilot composition page evidence pre-side-effect rejected workflow",
+            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
+            target_url=workflow_target_url(workflow_yaml),
+            surface="tool_pre_side_effect",
+        )
+        return evidence_error
+
+    return None
 
 
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
@@ -2022,6 +2067,11 @@ def _parameter_binding_invariant_error(
     )
 
 
+class BlockObservationRef(BaseModel):
+    label: str
+    observation_step: Annotated[int, Field(ge=0)]
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -2033,6 +2083,10 @@ async def _update_workflow(
         return {"ok": False, "error": authority_error}
 
     workflow_yaml = params["workflow_yaml"]
+    # Tool wrappers run authority/loop guards before calling here. The composition
+    # gate below consumes these refs, so they must be visible before validation.
+    ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
+    ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
@@ -5661,6 +5715,7 @@ def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str)
 async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
+    block_observation_refs: list[BlockObservationRef] | None = None,
 ) -> str:
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
@@ -5675,9 +5730,14 @@ async def update_workflow_tool(
     building or editing the workflow. Do not invent URL params, form fields,
     result affordances, or page structure from memory; ground workflow blocks
     in observed MCP evidence or information the user supplied.
+    When you compose no-url blocks from a page reached by prior clicks, include
+    `block_observation_refs` entries with each block label and the
+    `observation_step` returned by inspect_page_for_composition for the page
+    that block acts on.
     """
     copilot_ctx = ctx.context
-    arguments = {"workflow_yaml": workflow_yaml}
+    normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
+    arguments = {"workflow_yaml": workflow_yaml, "block_observation_refs": normalized_block_observation_refs}
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -5710,7 +5770,7 @@ async def update_workflow_tool(
 
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
-            arguments,
+            {**arguments, "raw_block_observation_refs": block_observation_refs},
             copilot_ctx,
             allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
         )
@@ -5927,6 +5987,7 @@ async def update_and_run_blocks_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
     block_labels: list[str],
+    block_observation_refs: list[BlockObservationRef] | None = None,
     parameters: dict[str, Any] | None = None,
 ) -> Any:
     """Update the workflow YAML and immediately run the specified blocks in one step.
@@ -5965,6 +6026,10 @@ async def update_and_run_blocks_tool(
     state or observed URL deltas.
     Browser inspection is build-time context; add durable workflow blocks only
     for the reusable actions/checks the workflow actually needs.
+    When you compose no-url blocks from a page reached by prior clicks, include
+    `block_observation_refs` entries with each block label and the
+    `observation_step` returned by inspect_page_for_composition for the page
+    that block acts on.
     When inspected evidence shows an anti-bot challenge gating a disabled
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
@@ -5972,7 +6037,13 @@ async def update_and_run_blocks_tool(
     copilot_ctx = ctx.context
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
-    arguments = {"workflow_yaml": workflow_yaml, "block_labels": block_labels, "parameters": parameters or {}}
+    normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
+    arguments = {
+        "workflow_yaml": workflow_yaml,
+        "block_labels": block_labels,
+        "block_observation_refs": normalized_block_observation_refs,
+        "parameters": parameters or {},
+    }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
     authority_error = _authority_tool_error(
         copilot_ctx,
@@ -5986,6 +6057,24 @@ async def update_and_run_blocks_tool(
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
 
+    with copilot_span("composition_evidence_precheck", data=_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA):
+        composition_evidence_error = _update_and_run_blocks_composition_evidence_precheck(
+            copilot_ctx,
+            workflow_yaml,
+            normalized_block_observation_refs,
+            block_observation_refs,
+        )
+    if composition_evidence_error:
+        result = {"ok": False, "error": composition_evidence_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=result,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", result)
+        return json.dumps(sanitized)
+
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
@@ -5993,7 +6082,11 @@ async def update_and_run_blocks_tool(
     # Step 1: Update the workflow
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         update_result = await _update_workflow(
-            {"workflow_yaml": workflow_yaml},
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_observation_refs": normalized_block_observation_refs,
+                "raw_block_observation_refs": block_observation_refs,
+            },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
         )
@@ -6558,15 +6651,21 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "challenge_state": evidence.get("challenge_state") or {},
         "form_count": len(evidence.get("forms") or []),
         "result_container_count": len(evidence.get("result_containers") or []),
+        "schema_empty_page": evidence.get("schema_empty_page") is True,
     }
     return (
         "Summarize this screenshot for Workflow Copilot build-time page evidence. "
         "Return JSON only with keys: summary, challenge_detected, challenge_kind, "
-        "challenge_location, submit_blocked, blocked_submit_controls, omissions. Focus on "
+        "challenge_location, submit_blocked, blocked_submit_controls, empty_page_visible, "
+        "loading_state_visible, omissions. Focus on "
         "visible anti-bot or human-verification state, whether it appears to gate a submit/search "
         "control, and where it appears relative to the page controls. Do not include raw DOM, "
         "code, selectors, personal data, or workflow instructions. If no challenge is visible, "
-        "set challenge_detected to false and submit_blocked to false.\n\n"
+        "set challenge_detected to false and submit_blocked to false. If DOM context shows a "
+        "schema-empty page, set empty_page_visible to true only when the screenshot shows a "
+        "settled page with no visible forms, controls, result data, challenge, or loading/progress "
+        "state; set loading_state_visible to true when the page appears to be waiting, loading, "
+        "redirecting, or still rendering.\n\n"
         f"DOM evidence context:\n{json.dumps(context, sort_keys=True)}"
     )
 
@@ -6587,6 +6686,8 @@ def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
     challenge_location = value.get("challenge_location")
     submit_blocked = value.get("submit_blocked")
     blocked_submit_controls = value.get("blocked_submit_controls")
+    empty_page_visible = value.get("empty_page_visible")
+    loading_state_visible = value.get("loading_state_visible")
     omissions = value.get("omissions")
     return {
         "summary": summary if isinstance(summary, str) else "",
@@ -6594,6 +6695,8 @@ def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
         "challenge_kind": challenge_kind if isinstance(challenge_kind, str) else "",
         "challenge_location": challenge_location if isinstance(challenge_location, str) else "",
         "submit_blocked": submit_blocked if isinstance(submit_blocked, bool) else None,
+        "empty_page_visible": empty_page_visible if isinstance(empty_page_visible, bool) else None,
+        "loading_state_visible": loading_state_visible if isinstance(loading_state_visible, bool) else None,
         "blocked_submit_controls": [item for item in blocked_submit_controls if isinstance(item, str)]
         if isinstance(blocked_submit_controls, list)
         else [],
@@ -6709,7 +6812,11 @@ async def _composition_evidence_after_navigation_failure(
     return evidence if evidence.get("screenshot_used") else None
 
 
-_MAX_FLOW_EVIDENCE = 12
+# Large enough for long single-turn reconnaissance: block_observation_refs are
+# chosen after scouting, so this cap must stay above the citation window a turn
+# can realistically compose against. Entries carry bounded parse summaries, not
+# raw HTML or screenshots.
+_MAX_FLOW_EVIDENCE = 64
 
 
 def _inspection_reached_via(*, use_current_page: bool, post_run: bool) -> str:
@@ -6726,7 +6833,7 @@ def _inspection_reached_via(*, use_current_page: bool, post_run: bool) -> str:
     return "interaction"
 
 
-def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached_via: str) -> None:
+def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached_via: str) -> int | None:
     """Append a typed entry to the bounded flow-evidence trajectory (SKY-10562).
 
     One entry per scouted page: the page-evidence packet plus how it was reached
@@ -6735,19 +6842,30 @@ def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached
     """
     trajectory = getattr(copilot_ctx, "flow_evidence", None)
     if not isinstance(trajectory, list):
-        return
-    url = evidence.get("current_url") or evidence.get("inspected_url") or ""
+        return None
+    prior_steps = [entry.get("step") for entry in trajectory if isinstance(entry, dict)]
+    step = (
+        max((value for value in prior_steps if isinstance(value, int) and not isinstance(value, bool)), default=-1) + 1
+    )
     trajectory.append(
         {
             "evidence": evidence,
             "reached_via": reached_via,
-            "url": url if isinstance(url, str) else "",
             "had_bounded_schema": has_bounded_page_schema(evidence),
-            "step": len(trajectory),
+            "step": step,
         }
     )
     if len(trajectory) > _MAX_FLOW_EVIDENCE:
+        overflow_entry_count = len(trajectory) - _MAX_FLOW_EVIDENCE
+        LOG.warning(
+            "copilot_flow_evidence_evicted",
+            overflow_entry_count=overflow_entry_count,
+            max_flow_evidence=_MAX_FLOW_EVIDENCE,
+            retained_window_size=_MAX_FLOW_EVIDENCE,
+            latest_step=step,
+        )
         del trajectory[:-_MAX_FLOW_EVIDENCE]
+    return step
 
 
 _COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
@@ -6853,7 +6971,10 @@ async def _capture_composition_evidence(
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
     if evidence is not None and html_truncated:
         evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
-    if evidence is not None and page_evidence_needs_visual_fallback(evidence):
+    if evidence is not None and (
+        page_evidence_needs_visual_fallback(evidence)
+        or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
+    ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
     return evidence, None
 
@@ -7001,17 +7122,27 @@ async def _inspect_page_for_composition_impl(
         if isinstance(page_title, str) and page_title:
             _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
 
-    copilot_ctx.page_inspection_calls_this_turn += 1
+    if not bypass_budget_for_post_run_current_page:
+        copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence
     reached_via = _inspection_reached_via(use_current_page=use_current_page, post_run=bool(run_id))
-    _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
+    observation_step = _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
+    if observation_step is None:
+        LOG.warning("copilot_flow_evidence_append_failed_no_trajectory")
     _mark_page_inspected(copilot_ctx)
     # Surface the reached page at the top level so the model registers that the
     # inspection already navigated there and does not re-issue navigate_browser.
     current_url = evidence.get("current_url") or evidence.get("inspected_url") or ""
-    result = {"ok": True, "current_url": current_url, "reached_via": reached_via, "data": evidence}
+    result = {
+        "ok": True,
+        "current_url": current_url,
+        "reached_via": reached_via,
+        "data": evidence,
+    }
+    if observation_step is not None:
+        result["observation_step"] = observation_step
     record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
     return result
 
@@ -7415,7 +7546,9 @@ async def inspect_page_for_composition_tool(
     Returns observed page evidence: current URL, title, navigation targets, form
     fields with labels and selectors, submit/search controls, result containers,
     compact visible text excerpts, anti-bot indicators, and bounded visual
-    challenge evidence when DOM evidence shows challenge state. Do NOT paste the
+    challenge evidence when DOM evidence shows challenge state. The returned
+    `observation_step` is the side-channel id to pass in `block_observation_refs`
+    when a newly authored block acts on this observed page. Do NOT paste the
     evidence into workflow YAML; use it to ground concise block prompts. If a
     block run changes pages, inspect the reached page before authoring downstream
     form/search/result blocks. If the
