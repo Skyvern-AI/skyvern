@@ -92,6 +92,21 @@ class CredentialCheck(BaseModel):
     found: bool = False
 
 
+class ObservedPage(BaseModel):
+    """Compact cross-turn record of a page the agent scouted (SKY-10562).
+
+    Carries only what the composition gate needs to credit a prior observation:
+    the full scheme-bearing url (so urlparse-based _same_page/_same_origin match),
+    whether bounded page schema was captured, and how the state was reached. Full
+    page schemas stay within-turn; this keeps a resumed turn from re-scouting (or
+    deadlocking against a spent inspection budget) for pages already observed.
+    """
+
+    url: str = ""
+    had_bounded_schema: bool = False
+    reached_via: str = ""
+
+
 class StructuredContext(BaseModel):
     user_goal: str = ""
     urls_visited: list[UrlVisit] = Field(default_factory=list)
@@ -104,6 +119,7 @@ class StructuredContext(BaseModel):
     # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
     discovery_calls_made: int = 0
     page_inspection_calls_made: int = 0
+    observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
         return self.model_dump_json(indent=2)
@@ -174,6 +190,30 @@ class StructuredContext(BaseModel):
             self.credentials_checked = self.credentials_checked[-40:]
 
 
+_MAX_OBSERVED_ACTED_PAGES = 20
+
+
+def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
+    """Fold this turn's flow-evidence trajectory into the persisted summary.
+
+    Keyed by url; a later observation of the same url replaces the earlier one,
+    and a bounded-schema or interaction observation never regresses to a weaker
+    one for the same page.
+    """
+    by_url: dict[str, ObservedPage] = {page.url: page for page in prior if page.url}
+    for entry in flow_evidence:
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        existing = by_url.get(url)
+        had_schema = bool(entry.get("had_bounded_schema")) or (existing.had_bounded_schema if existing else False)
+        reached_via = str(entry.get("reached_via") or (existing.reached_via if existing else ""))
+        if existing and existing.reached_via == "interaction":
+            reached_via = "interaction"
+        by_url[url] = ObservedPage(url=url, had_bounded_schema=had_schema, reached_via=reached_via)
+    return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
+
+
 def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
     """Fold the per-chat discovery counter into the outgoing global_llm_context.
 
@@ -190,11 +230,13 @@ def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str 
     this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
     prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
     inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
-    if not raw_context and this_turn == 0 and inspections_this_turn == 0:
+    flow_evidence = getattr(ctx, "flow_evidence", None) or []
+    if not raw_context and this_turn == 0 and inspections_this_turn == 0 and not flow_evidence:
         return None
     sc = StructuredContext.from_json_str(raw_context)
     sc.discovery_calls_made = prior + this_turn
     sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
+    sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
     return sc.to_json_str()
 
 

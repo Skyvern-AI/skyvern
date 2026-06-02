@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.config import (
     DEFAULT_TOKEN_BUDGET,
     POST_ANTI_BOT_FAILED_TEST_NUDGE,
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
+    POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     POST_FAILED_TEST_NUDGE,
     POST_NAVIGATE_NUDGE,
     POST_NO_WORKFLOW_DELIVERY_NUDGE,
@@ -26,6 +27,7 @@ from skyvern.forge.sdk.copilot.config import (
     POST_PARAMETER_BINDING_STOP_NUDGE,
     POST_PARAMETER_BINDING_WARN_NUDGE,
     POST_PER_TOOL_BUDGET_NUDGE,
+    POST_PER_TOOL_BUDGET_STOP_NUDGE,
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
@@ -640,6 +642,22 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
     return nudge_count < MAX_FAILED_TEST_NUDGES
 
 
+def _needs_inspect_before_repair_nudge(ctx: Any) -> bool:
+    """True when a failed run is repairable and the reached page is not yet observed.
+
+    Routes the first post-failure move to observing the reached page before
+    re-authoring, instead of guessing a new block goal and re-running blind.
+    """
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    if contract is None:
+        return False
+    if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
+        return False
+    if not contract.diagnosis_input.browser_page_state.get("has_current_url"):
+        return False
+    return not _has_post_failed_run_page_observation(ctx)
+
+
 def _has_post_failed_run_page_observation(ctx: AgentContext) -> bool:
     if getattr(ctx, "post_run_page_observation_after_failed_test", False) is not True:
         return False
@@ -821,7 +839,13 @@ def _check_enforcement(
     # chain" advice before the generic repeated-frontier and failed-test paths
     # can fire.
     if _needs_per_tool_budget_nudge(ctx):
-        ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
+        prior = _get_int(ctx, "per_tool_budget_nudge_count")
+        ctx.per_tool_budget_nudge_count = prior + 1
+        # First budget trip earns one smaller-frontier retry. A second consecutive trip
+        # (the shrunk frontier ALSO blew the budget) is a doomed shrinking-budget spiral on a
+        # too-heavy page — finalize the verified prefix instead of re-running into less time.
+        if prior >= 1:
+            return _nudge(config, "post_per_tool_budget_stop")
         return _nudge(config, "post_per_tool_budget")
 
     repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx, config)
@@ -853,6 +877,8 @@ def _check_enforcement(
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
+        if _needs_inspect_before_repair_nudge(ctx):
+            return _nudge(config, "post_failed_test_inspect_first")
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
@@ -1152,8 +1178,10 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
     POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
+    POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
     POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
+    POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }
 
@@ -1173,8 +1201,10 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_probable_site_block_stop": "probable_site_block_stop",
     "post_probable_site_block_stop_prefix": "probable_site_block_stop",
     "post_per_tool_budget": "per_tool_budget_split",
+    "post_per_tool_budget_stop": "per_tool_budget_stop",
     "post_no_workflow_delivery": "no_workflow_delivery",
     "post_failed_test": "post_failed_test",
+    "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
     "post_intermediate_success": "intermediate_success",
     "post_format": "format",

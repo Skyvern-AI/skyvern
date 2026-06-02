@@ -2790,6 +2790,7 @@ async def _run_copilot_turn_impl(
     prior_structured_context = StructuredContext.from_json_str(global_llm_context)
     ctx.prior_discovery_calls_made = prior_structured_context.discovery_calls_made
     ctx.prior_page_inspection_calls_made = prior_structured_context.page_inspection_calls_made
+    ctx.prior_observed_acted_pages = [page.model_dump() for page in prior_structured_context.observed_acted_pages]
     ctx.build_phase = initial_build_phase(
         ctx.turn_intent,
         chat_request.message or "",
