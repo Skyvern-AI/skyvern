@@ -23,6 +23,7 @@ from skyvern.forge.sdk.copilot.narration import (
     resolve_narrator_handler,
     schedule_narration,
     snapshot_ctx,
+    tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -152,6 +153,7 @@ async def stream_to_sse(
                         WorkflowCopilotToolCallUpdate(
                             type=WorkflowCopilotStreamMessageType.TOOL_CALL,
                             tool_name=tool_name,
+                            display_label=tool_activity_display_label(tool_name),
                             tool_input=_sanitize_input(tool_input),
                             iteration=iteration,
                             tool_call_id=call_id,
@@ -176,9 +178,10 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                summary = format_tool_result_for_user(tool_name, parsed)
+                blocker_signals = _tool_blocker_signal_candidates(ctx)
+                summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
                 success = parsed.get("ok", True)
-                detail = summarize_tool_result_detail(parsed)
+                detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
                 narrator_state.record_activity(
                     build_tool_result_activity(tool_name, summary, success, iteration, call_id)
                 )
@@ -223,6 +226,9 @@ async def stream_to_sse(
                 except CopilotUnrecoverableToolError:
                     result.cancel()
                     raise
+                # Keep latest_tool_blocker_signal scoped to the tool result
+                # that immediately follows the blocker-producing tool call.
+                ctx.latest_tool_blocker_signal = None
                 iteration += 1
     except asyncio.CancelledError:
         # Real cancellation (server shutdown, upstream abort). Propagate so
@@ -240,6 +246,28 @@ def _get_raw_field(raw: Any, key: str) -> Any:
     if isinstance(raw, dict):
         return raw.get(key)
     return getattr(raw, key, None)
+
+
+def _tool_blocker_signal_candidates(ctx: Any) -> list[Any]:
+    candidates: list[Any] = []
+    latest = getattr(ctx, "latest_tool_blocker_signal", None)
+    if latest is not None:
+        candidates.append(latest)
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if isinstance(history, list):
+        candidates.extend(reversed(history))
+    sticky = getattr(ctx, "blocker_signal", None)
+    if sticky is not None:
+        candidates.append(sticky)
+    deduped: list[Any] = []
+    seen_ids: set[int] = set()
+    for candidate in candidates:
+        candidate_id = id(candidate)
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        deduped.append(candidate)
+    return deduped
 
 
 def _extract_text_content(item: Any) -> str | None:

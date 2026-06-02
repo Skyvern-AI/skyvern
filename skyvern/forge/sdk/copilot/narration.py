@@ -66,15 +66,38 @@ MAX_DESIGN_ACTIVITY_ENTRIES = 50
 # Mirror of the FE ACTIVITY_TOOL_DENYLIST in narrativeState.ts.
 ACTIVITY_TOOL_DENYLIST = frozenset({"list_credentials", "get_run_results", "get_browser_screenshot"})
 
+_TOOL_ACTIVITY_DISPLAY_LABELS = {
+    # Mirror of the FE ACTIVITY_TOOL_DISPLAY_LABELS in narrativeState.ts.
+    "update_workflow": "Updating workflow",
+    "update_and_run_blocks": "Testing workflow",
+    "run_blocks_and_collect_debug": "Testing workflow",
+    "evaluate": "Inspecting page",
+    "click": "Interacting with page",
+    "type_text": "Entering text",
+    "scroll": "Interacting with page",
+    "select_option": "Selecting option",
+    "press_key": "Interacting with page",
+    "navigate_browser": "Opening page",
+    "get_block_schema": "Checking workflow block options",
+    "inspect_current_workflow": "Inspecting workflow",
+}
+
+
+def tool_activity_display_label(tool_name: str) -> str:
+    """Return a product-safe label for user-visible activity rows."""
+    return _TOOL_ACTIVITY_DISPLAY_LABELS.get(tool_name, "Working")
+
 
 def build_tool_call_activity(tool_name: str, iteration: int, tool_call_id: str) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
+    display_label = tool_activity_display_label(tool_name)
     return {
         "kind": "tool_call",
-        "text": f"Calling {tool_name}…",
+        "text": f"{display_label}…",
         "iteration": iteration,
         "toolName": tool_name,
+        "displayLabel": display_label,
         "id": f"tc-{tool_call_id}",
     }
 
@@ -84,11 +107,13 @@ def build_tool_result_activity(
 ) -> NarrativeActivityEntry | None:
     if tool_name in ACTIVITY_TOOL_DENYLIST:
         return None
+    display_label = tool_activity_display_label(tool_name)
     return {
         "kind": "tool_result",
-        "text": summary or tool_name,
+        "text": summary or display_label,
         "iteration": iteration,
         "toolName": tool_name,
+        "displayLabel": display_label,
         "success": success,
         "id": f"tr-{tool_call_id}",
     }

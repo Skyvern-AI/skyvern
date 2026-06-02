@@ -117,6 +117,8 @@ def to_trace_data(signal: CopilotToolBlockerSignal) -> dict[str, Any]:
 
 class _BlockerSignalCtx(Protocol):
     blocker_signal: CopilotToolBlockerSignal | None
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None
+    tool_blocker_signals: list[CopilotToolBlockerSignal]
 
 
 _LOOP_PROGRESS_TOOL_SUCCESS_REASON_CODES = frozenset(
@@ -165,6 +167,16 @@ def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reaso
 
 def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSignal) -> str:
     """First-wins stash + observability log; returns the LLM-visible payload."""
+    ctx.latest_tool_blocker_signal = signal
+    # Keep the defensive guard for tests and partial context shims even though
+    # real Copilot contexts type this field as a list.
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if not isinstance(history, list):
+        history = []
+        ctx.tool_blocker_signals = history
+    history.append(signal)
+    if len(history) > 20:
+        del history[:-20]
     existing = getattr(ctx, "blocker_signal", None)
     stashed = not isinstance(existing, CopilotToolBlockerSignal)
     if stashed:

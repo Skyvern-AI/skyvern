@@ -33,6 +33,7 @@ class NarrativeActivityEntry(TypedDict):
     text: str
     iteration: int
     toolName: NotRequired[str]
+    displayLabel: NotRequired[str]
     success: NotRequired[bool]
     id: str
 
@@ -67,6 +68,7 @@ class TurnNarrativePayload(TypedDict):
 
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -320,6 +322,8 @@ class CopilotContext(AgentContext):
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.

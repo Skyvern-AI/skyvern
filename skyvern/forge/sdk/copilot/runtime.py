@@ -197,6 +197,11 @@ class AgentContext:
     # turn end and overrides the AgentResult with a deterministic
     # product-language reply. See blocker_signal.py for the contract.
     blocker_signal: CopilotToolBlockerSignal | None = None
+    # Most recently emitted blocker signal for the current tool output. Unlike
+    # blocker_signal, this is last-wins so the activity-log projection can
+    # render the current tool result from structured product text.
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
