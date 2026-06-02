@@ -36,7 +36,7 @@ import {
   type MessageInExfiltratedEvent,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
+import { wssBaseUrl, newWssBaseUrl, getCredentialParam } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 import { captureRecordBrowser } from "@/util/recordBrowserTelemetry";
@@ -193,7 +193,7 @@ function BrowserStream({
       }
     },
     enabled: entity === "browserSession" && !!browserSessionId,
-    refetchInterval: 5000,
+    refetchInterval: (query) => (query.state.data ? 5000 : 1000),
   });
 
   const [hasBrowserSession, setHasBrowserSession] = useState(true); // be optimistic
@@ -229,22 +229,22 @@ function BrowserStream({
   useEffect(() => {
     setIsBrowserSessionStarted(false);
     setIsReady(false);
+    setIsVncConnected(false);
+    setIsCanvasReady(false);
+    setIsMessageConnected(false);
+    setHasBrowserSession(true);
+    if (rfbRef.current) {
+      rfbRef.current.disconnect();
+      rfbRef.current = null;
+    }
   }, [browserSessionId]);
 
   const getWebSocketParams = useCallback(async () => {
-    const clientIdQueryParam = `client_id=${clientId}`;
-    const runtimeApiKey = getRuntimeApiKey();
-
-    let credentialQueryParam = runtimeApiKey ? `apikey=${runtimeApiKey}` : "";
-
-    if (credentialGetter) {
-      const token = await credentialGetter();
-      credentialQueryParam = token ? `token=Bearer ${token}` : "";
-    }
-
-    return credentialQueryParam
-      ? `${credentialQueryParam}&${clientIdQueryParam}`
-      : clientIdQueryParam;
+    const params = new URLSearchParams(
+      await getCredentialParam(credentialGetter),
+    );
+    params.set("client_id", clientId);
+    return params.toString();
   }, [clientId, credentialGetter]);
 
   // browser is ready
@@ -784,33 +784,38 @@ function BrowserStream({
   const theUserIsControlling =
     userIsControlling || (interactive && !showControlButtons);
   const streamDiagnostic: StreamDiagnostic =
-    entity === "browserSession" && browserSessionId && !hasBrowserSession
+    !showStream || !runId
       ? {
-          title: "Browser session is no longer live",
-          detail: "This live browser session is no longer streaming.",
-          hint: "Refresh the page or create a new browser session.",
+          title: "Starting browser session",
+          detail: "Waiting for a live browser session to attach.",
         }
-      : !isBrowserSessionBackendReady
+      : entity === "browserSession" && browserSessionId && !hasBrowserSession
         ? {
-            title: "Waiting for browser session",
-            detail:
-              "The session exists, but the backend has not marked the browser as ready yet.",
+            title: "Browser session is no longer live",
+            detail: "This live browser session is no longer streaming.",
+            hint: "Refresh the page or create a new browser session.",
           }
-        : !isVncConnected
+        : !isBrowserSessionBackendReady
           ? {
-              title: "Connecting to VNC stream",
-              detail: "Opening the browser stream and message WebSockets.",
-              hint: "If this stays here, check VNC support for the session or use local browser streaming.",
+              title: "Waiting for browser session",
+              detail:
+                "The session exists, but the backend has not marked the browser as ready yet.",
             }
-          : !isCanvasReady
+          : !isVncConnected
             ? {
-                title: "Preparing browser display",
-                detail:
-                  "The VNC connection is open and the UI is waiting for the browser canvas.",
+                title: "Connecting to VNC stream",
+                detail: "Opening the browser stream and message WebSockets.",
+                hint: "If this stays here, check VNC support for the session or use local browser streaming.",
               }
-            : {
-                title: "Connecting to browser stream",
-              };
+            : !isCanvasReady
+              ? {
+                  title: "Preparing browser display",
+                  detail:
+                    "The VNC connection is open and the UI is waiting for the browser canvas.",
+                }
+              : {
+                  title: "Connecting to browser stream",
+                };
 
   return (
     <>
