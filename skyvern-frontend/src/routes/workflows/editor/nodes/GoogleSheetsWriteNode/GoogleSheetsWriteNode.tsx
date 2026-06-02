@@ -67,7 +67,8 @@ function GoogleSheetsWriteNode({
           type="google_sheets_write"
         />
         <NodeBody>
-          <BuildModeOnly>
+          {/* Editor mounts live Google credential/Sheets queries; keep it out of read-only version diffs. */}
+          <BuildModeOnly renderInReadOnlyComparison={false}>
             <GoogleSheetsWriteEditor blockId={id} />
           </BuildModeOnly>
         </NodeBody>

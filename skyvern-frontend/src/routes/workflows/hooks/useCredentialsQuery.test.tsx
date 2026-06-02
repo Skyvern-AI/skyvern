@@ -6,6 +6,7 @@ import { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { getClient } from "@/api/AxiosClient";
+import { WorkflowScopeContext } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { useCredentialsQuery } from "./useCredentialsQuery";
 
 vi.mock("@/api/AxiosClient", () => ({
@@ -77,5 +78,36 @@ describe("useCredentialsQuery — search + type query params (SKY-5679)", () => 
     // pagination params are always present
     expect(params.get("page")).toBe("1");
     expect(params.get("page_size")).toBe("25");
+  });
+});
+
+describe("useCredentialsQuery in a read-only comparison scope", () => {
+  function makeComparisonWrapper() {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    return function Wrapper({ children }: { children: ReactNode }) {
+      return (
+        <QueryClientProvider client={queryClient}>
+          <WorkflowScopeContext.Provider
+            value={{ workflowId: "w", readOnly: true }}
+          >
+            {children}
+          </WorkflowScopeContext.Provider>
+        </QueryClientProvider>
+      );
+    };
+  }
+
+  it("does not fetch credentials when the scope is read-only", () => {
+    const getMock = stubClient();
+
+    const { result } = renderHook(
+      () => useCredentialsQuery({ enabled: true, page_size: 100 }),
+      { wrapper: makeComparisonWrapper() },
+    );
+
+    expect(result.current.fetchStatus).toBe("idle");
+    expect(getMock).not.toHaveBeenCalled();
   });
 });

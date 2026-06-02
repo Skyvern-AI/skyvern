@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { CredentialApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
 import { useQuery } from "@tanstack/react-query";
 
 type QueryReturnType = Array<CredentialApiResponse>;
@@ -27,6 +28,8 @@ function useCredentialsQuery(props: Props = {}) {
     ...queryOptions
   } = props;
   const credentialGetter = useCredentialGetter();
+  // Read-only version-comparison canvases never need live credential data; suppress the fetch there for every caller at once.
+  const scopeReadOnly = useWorkflowScopeReadOnly();
 
   return useQuery<Array<CredentialApiResponse>>({
     queryKey: [
@@ -55,6 +58,7 @@ function useCredentialsQuery(props: Props = {}) {
     },
     refetchOnMount: "always",
     ...queryOptions,
+    enabled: queryOptions.enabled !== false && !scopeReadOnly,
   });
 }
 
