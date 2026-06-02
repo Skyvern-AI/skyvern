@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 import structlog
 import yaml
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData, function_tool
+from opentelemetry import trace as otel_trace
 
 try:
     from bs4 import BeautifulSoup  # type: ignore[import-not-found]
@@ -6120,6 +6121,7 @@ _DISCOVERY_STEP_CAP = 8
 _DISCOVERY_EVIDENCE_TRAIL_MAX = 8
 _DISCOVERY_CANDIDATE_FORM_FIELDS_MAX = 10
 _DISCOVERY_HTML_BYTES_MAX = 200_000
+_DISCOVERY_CONCRETE_HOMEPAGE_CONFIDENCE = 0.6
 _COMPOSITION_VISUAL_SUMMARY_TIMEOUT_SECONDS = 10.0
 _COMPOSITION_VISUAL_SUMMARY_PROMPT_NAME = "workflow-copilot-page-evidence-vision"
 
@@ -6166,6 +6168,20 @@ def _resolve_discovery_entry_url(site_or_url: str) -> tuple[str | None, str]:
     if _DISCOVERY_BARE_WORD_RE.match(token):
         return f"https://www.{token.lower()}.com", "word"
     return None, "unresolved"
+
+
+def _concrete_homepage_entrypoint(entry_url: str | None, kind: str) -> str | None:
+    if kind not in {"domain", "url"} or not entry_url:
+        return None
+    try:
+        parsed = urlparse(entry_url)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
 
 def _discovery_anchor_score(
@@ -6242,6 +6258,40 @@ def _discovery_build_result(
         },
         "error": error,
     }
+
+
+def _record_discovery_resolution_on_ctx(ctx: Any, result: Mapping[str, Any]) -> None:
+    data_payload = result.get("data")
+    data: Mapping[str, Any] = data_payload if isinstance(data_payload, Mapping) else {}
+    candidate_url = data.get("candidate_url")
+    failure_reason = data.get("failure_reason")
+    if isinstance(candidate_url, str) and candidate_url:
+        prior_candidate_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+        ctx.resolved_discovery_entrypoint_url = candidate_url
+        ctx.resolved_discovery_failure_reason = (
+            failure_reason if isinstance(failure_reason, str) and failure_reason else None
+        )
+        if prior_candidate_url != candidate_url:
+            ctx.resolved_discovery_entrypoint_inspection_baseline = int(
+                getattr(ctx, "page_inspection_calls_this_turn", 0) or 0
+            )
+            ctx.discovery_entrypoint_url_question_nudge_count = 0
+    # Prior successful candidates remain authoritative over later no-candidate failures.
+    elif not getattr(ctx, "resolved_discovery_entrypoint_url", None):
+        # No prior candidate and no new one: clear URL state while recording the failure.
+        ctx.resolved_discovery_entrypoint_url = None
+        ctx.resolved_discovery_failure_reason = (
+            failure_reason if isinstance(failure_reason, str) and failure_reason else None
+        )
+        ctx.resolved_discovery_entrypoint_inspection_baseline = 0
+    try:
+        current_span = otel_trace.get_current_span()
+        if ctx.resolved_discovery_entrypoint_url is not None:
+            current_span.set_attribute("copilot.discovery_candidate_url", ctx.resolved_discovery_entrypoint_url)
+        if ctx.resolved_discovery_failure_reason is not None:
+            current_span.set_attribute("copilot.discovery_failure_reason", ctx.resolved_discovery_failure_reason)
+    except Exception:
+        LOG.debug("Unable to set discovery resolution span attributes", exc_info=True)
 
 
 def _discovery_parse_html(html: str) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
@@ -7150,11 +7200,29 @@ async def _discover_workflow_entrypoint_impl(
     """
     arguments = {"site_or_url": site_or_url, "intent_hint": intent_hint}
 
+    def finish(result: dict[str, Any], *, site_or_url_kind: str | None = None) -> dict[str, Any]:
+        _record_discovery_resolution_on_ctx(copilot_ctx, result)
+        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
+        data_payload = result.get("data")
+        data = data_payload if isinstance(data_payload, Mapping) else {}
+        candidate_url = data.get("candidate_url")
+        failure_reason = data.get("failure_reason")
+        if not isinstance(failure_reason, str) or not failure_reason:
+            error = result.get("error")
+            failure_reason = error if isinstance(error, str) and error else None
+        LOG.info(
+            "discover_workflow_entrypoint completed",
+            ok=result.get("ok"),
+            candidate_url=candidate_url if isinstance(candidate_url, str) and candidate_url else None,
+            failure_reason=failure_reason,
+            site_or_url_kind=site_or_url_kind,
+        )
+        return result
+
     authority_error = _authority_tool_error(copilot_ctx, "discover_workflow_entrypoint")
     if authority_error:
         result = {"ok": False, "error": authority_error}
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     if copilot_ctx.discovery_calls_this_turn >= _DISCOVERY_PER_TURN_BUDGET:
         result = _discovery_build_result(
@@ -7164,8 +7232,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="discovery_already_completed_this_turn",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     cumulative = copilot_ctx.prior_discovery_calls_made + copilot_ctx.discovery_calls_this_turn
     if cumulative >= _DISCOVERY_PER_CHAT_BUDGET:
@@ -7176,8 +7243,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="discovery_budget_exhausted_for_chat",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result)
 
     entry_url, kind = _resolve_discovery_entry_url(site_or_url)
     if entry_url is None:
@@ -7188,8 +7254,7 @@ async def _discover_workflow_entrypoint_impl(
             confidence=0.0,
             failure_reason="could_not_resolve_site_name",
         )
-        record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-        return result
+        return finish(result, site_or_url_kind=kind)
 
     if copilot_ctx.build_phase == BuildPhase.INITIAL:
         try:
@@ -7203,6 +7268,34 @@ async def _discover_workflow_entrypoint_impl(
                 build_phase=copilot_ctx.build_phase.value,
             )
     copilot_ctx.discovery_calls_this_turn += 1
+
+    concrete_homepage_url = _concrete_homepage_entrypoint(entry_url, kind)
+    if concrete_homepage_url is not None:
+        evidence_trail = [
+            {
+                "url": concrete_homepage_url,
+                "page_title": "",
+                "transition_reason": "concrete_domain_homepage",
+            }
+        ]
+        result = _discovery_build_result(
+            candidate_url=concrete_homepage_url,
+            candidate_form_fields=[],
+            evidence_trail=evidence_trail,
+            # Lower than a scraped-page match because the fast path skips page inspection.
+            confidence=_DISCOVERY_CONCRETE_HOMEPAGE_CONFIDENCE,
+            failure_reason=None,
+        )
+        copilot_ctx.discovery_evidence_trail = list(evidence_trail)
+        try:
+            advance_to_composing(copilot_ctx, reason="discovery_concrete_domain_homepage")
+        except ValueError as exc:
+            LOG.warning(
+                "discover_workflow_entrypoint phase transition to composing rejected",
+                error=str(exc),
+                build_phase=copilot_ctx.build_phase.value,
+            )
+        return finish(result, site_or_url_kind=kind)
 
     with copilot_span(
         "discover_workflow_entrypoint",
@@ -7245,8 +7338,7 @@ async def _discover_workflow_entrypoint_impl(
                 build_phase=copilot_ctx.build_phase.value,
             )
 
-    record_tool_step_result_for_ctx(copilot_ctx, "discover_workflow_entrypoint", arguments, result)
-    return result
+    return finish(result, site_or_url_kind=kind)
 
 
 @function_tool(name_override="discover_workflow_entrypoint", strict_mode=False)

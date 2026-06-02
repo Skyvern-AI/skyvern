@@ -241,6 +241,14 @@ POST_NO_WORKFLOW_DELIVERY_NUDGE = (
     "workflow proposal behind the response."
 )
 
+POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE = (
+    "STOP — discover_workflow_entrypoint already resolved a candidate_url for this build turn, "
+    "but you have not inspected the resolved page or composed from it yet. Use the resolved "
+    "candidate_url as the goto_url entrypoint, inspect the page if needed, then call "
+    "update_and_run_blocks. Only ask a clarifying question after using the resolved page evidence "
+    "and only when a separate required non-URL input is still missing."
+)
+
 PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
     "STOP — the target site has failed to scrape on every attempt across "
     "multiple workflow shapes. Every run navigated successfully but the "
@@ -315,6 +323,7 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_per_tool_budget": POST_PER_TOOL_BUDGET_NUDGE,
     "post_per_tool_budget_stop": POST_PER_TOOL_BUDGET_STOP_NUDGE,
     "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
+    "post_discovery_entrypoint_url_question": POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
     "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
     "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,

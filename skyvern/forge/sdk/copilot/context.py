@@ -452,6 +452,10 @@ class CopilotContext(AgentContext):
     discovery_step_count: int = 0
     discovery_started_monotonic: float | None = None
     discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
+    resolved_discovery_entrypoint_url: str | None = None
+    resolved_discovery_failure_reason: str | None = None
+    resolved_discovery_entrypoint_inspection_baseline: int = 0
+    discovery_entrypoint_url_question_nudge_count: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None
