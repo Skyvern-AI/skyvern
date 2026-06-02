@@ -3264,6 +3264,22 @@ def _watchdog_user_failure_reason(
     return f"{body} Run ID: {workflow_run_id}. Outcome is uncertain."
 
 
+def _watchdog_user_facing_summary(
+    exit_reason: WatchdogExitReason,
+    budget_seconds: int,
+    run: WorkflowRun | None,
+) -> str:
+    if exit_reason == "stagnation":
+        return f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
+    if exit_reason == "per_tool_budget":
+        return f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+    if exit_reason == "ceiling":
+        return f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
+    if run is not None:
+        return f"The run ended before recording a trustworthy terminal status. Last observed status: {run.status}."
+    return "The run ended before recording a trustworthy terminal status."
+
+
 def _workflow_with_runtime_block_goal_context(workflow: Workflow, ctx: CopilotContext) -> Workflow:
     block_goal_main_goal = ctx.block_goal_main_goal or ctx.user_message or ""
     if not block_goal_main_goal:
@@ -3815,6 +3831,7 @@ async def _run_blocks_and_collect_debug(
             user_failure_reason = _watchdog_user_failure_reason(
                 exit_reason, workflow_run.workflow_run_id, budget_seconds, run
             )
+            user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
             current_url, page_title = await _fallback_page_info(ctx)
             result: dict[str, Any] = {
                 "ok": False,
@@ -3825,6 +3842,11 @@ async def _run_blocks_and_collect_debug(
                     "failure_reason": user_failure_reason,
                     "current_url": current_url,
                     "page_title": page_title,
+                    "control_signal": {
+                        "kind": f"watchdog_{exit_reason}",
+                        "user_facing_summary": user_facing_summary,
+                    },
+                    "user_facing_summary": user_facing_summary,
                 },
             }
             if exit_reason == "per_tool_budget":
@@ -5989,6 +6011,9 @@ async def update_and_run_blocks_tool(
 
     coverage_error = _pre_run_workflow_coverage_error(copilot_ctx)
     if coverage_error:
+        user_facing_summary = (
+            "Workflow draft saved; I still need to add the remaining requested actions before testing it."
+        )
         result = {
             "ok": False,
             "error": coverage_error,
@@ -5996,6 +6021,11 @@ async def update_and_run_blocks_tool(
                 "block_count": copilot_ctx.last_update_block_count,
                 "workflow_updated": True,
                 "workflow_run_skipped": True,
+                "control_signal": {
+                    "kind": "intermediate_success",
+                    "user_facing_summary": user_facing_summary,
+                },
+                "user_facing_summary": user_facing_summary,
             },
         }
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)

@@ -192,6 +192,10 @@ class WorkflowCopilotToolCallUpdate(BaseModel):
         WorkflowCopilotStreamMessageType.TOOL_CALL, description="Message type"
     )
     tool_name: str = Field(..., description="Name of the tool being called")
+    display_label: str | None = Field(
+        None,
+        description="Product-safe label for rendering the tool call in user-visible activity surfaces",
+    )
     tool_input: dict = Field(default_factory=dict, description="Sanitized tool input (no secrets)")
     iteration: int = Field(..., description="Agent loop iteration number")
     tool_call_id: str = Field(..., description="Unique ID for this tool invocation")

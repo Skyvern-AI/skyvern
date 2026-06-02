@@ -149,6 +149,7 @@ export interface WorkflowCopilotWorkflowDraftUpdate {
 export interface WorkflowCopilotToolCallUpdate {
   type: "tool_call";
   tool_name: string;
+  display_label?: string | null;
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;

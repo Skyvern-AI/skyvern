@@ -6,6 +6,7 @@ import {
   TurnNarrativeState,
   effectiveMode,
   parseUtcIsoMs,
+  toolActivityDisplayLabel,
 } from "./narrativeState";
 
 interface BlockPalette {
@@ -173,9 +174,11 @@ function ActivityRow({ entry }: { entry: ActivityEntry }) {
     );
   }
   if (entry.kind === "tool_call") {
+    const label =
+      entry.displayLabel ?? toolActivityDisplayLabel(entry.toolName);
     return (
       <FSubRow glyph="▸" glyphClass="text-slate-400">
-        <span className="font-mono text-slate-200">{entry.toolName}</span>
+        <span className="text-slate-200">{label}</span>
         <span className="text-slate-500"> · calling…</span>
       </FSubRow>
     );
