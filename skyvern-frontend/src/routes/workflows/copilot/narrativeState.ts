@@ -67,6 +67,8 @@ export interface ActivityEntry {
   iteration: number;
   // Tool name when kind is tool_call/tool_result.
   toolName?: string;
+  // Product-safe label for rendering tool activity to users.
+  displayLabel?: string;
   // Result success when kind is tool_result.
   success?: boolean;
   // Stable per-event id used as React key.
@@ -145,17 +147,41 @@ const ACTIVITY_TOOL_DENYLIST = new Set([
   "get_browser_screenshot",
 ]);
 
+// Mirror of the backend _TOOL_ACTIVITY_DISPLAY_LABELS in narration.py.
+const ACTIVITY_TOOL_DISPLAY_LABELS: Record<string, string> = {
+  update_workflow: "Updating workflow",
+  update_and_run_blocks: "Testing workflow",
+  run_blocks_and_collect_debug: "Testing workflow",
+  evaluate: "Inspecting page",
+  click: "Interacting with page",
+  type_text: "Entering text",
+  scroll: "Interacting with page",
+  select_option: "Selecting option",
+  press_key: "Interacting with page",
+  navigate_browser: "Opening page",
+  get_block_schema: "Checking workflow block options",
+  inspect_current_workflow: "Inspecting workflow",
+};
+
+export function toolActivityDisplayLabel(toolName?: string | null): string {
+  if (!toolName) return "Working";
+  return ACTIVITY_TOOL_DISPLAY_LABELS[toolName] ?? "Working";
+}
+
 function buildActivityFromToolCall(
   event: WorkflowCopilotToolCallUpdate,
 ): ActivityEntry | null {
   if (ACTIVITY_TOOL_DENYLIST.has(event.tool_name)) {
     return null;
   }
+  const displayLabel =
+    event.display_label ?? toolActivityDisplayLabel(event.tool_name);
   return {
     kind: "tool_call",
-    text: `Calling ${event.tool_name}…`,
+    text: `${displayLabel}…`,
     iteration: event.iteration,
     toolName: event.tool_name,
+    displayLabel,
     id: `tc-${event.tool_call_id}`,
   };
 }
@@ -166,11 +192,13 @@ function buildActivityFromToolResult(
   if (ACTIVITY_TOOL_DENYLIST.has(event.tool_name)) {
     return null;
   }
+  const displayLabel = toolActivityDisplayLabel(event.tool_name);
   return {
     kind: "tool_result",
-    text: event.summary || event.tool_name,
+    text: event.summary || displayLabel,
     iteration: event.iteration,
     toolName: event.tool_name,
+    displayLabel,
     success: event.success,
     id: `tr-${event.tool_call_id}`,
   };
@@ -464,6 +492,8 @@ function normalizeActivityEntries(raw: unknown): ActivityEntry[] {
       text: o.text,
       iteration: typeof o.iteration === "number" ? o.iteration : 0,
       toolName: typeof o.toolName === "string" ? o.toolName : undefined,
+      displayLabel:
+        typeof o.displayLabel === "string" ? o.displayLabel : undefined,
       success: typeof o.success === "boolean" ? o.success : undefined,
       id: o.id,
     });

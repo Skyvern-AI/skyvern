@@ -12,6 +12,7 @@ import {
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotToolCallUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
 } from "./workflowCopilotTypes";
@@ -57,6 +58,18 @@ const blockProgress = (
   block_type: "task",
   iteration: 0,
   timestamp: "2026-05-25T00:00:04Z",
+  ...overrides,
+});
+
+const toolCall = (
+  overrides: Partial<WorkflowCopilotToolCallUpdate> = {},
+): WorkflowCopilotToolCallUpdate => ({
+  type: "tool_call",
+  tool_name: "update_and_run_blocks",
+  display_label: "Testing workflow",
+  tool_input: {},
+  iteration: 0,
+  tool_call_id: "call-1",
   ...overrides,
 });
 
@@ -317,6 +330,21 @@ describe("applyNarrativeEvent — block_progress", () => {
     );
     expect(s.blocks[0]?.state).toBe("completed");
     expect(s.blocks[0]?.endedAt).toBe("2026-05-25T00:02:15Z");
+  });
+});
+
+describe("applyNarrativeEvent — activity", () => {
+  it("renders product-safe labels for internal tool calls", () => {
+    const s = applyNarrativeEvent(EMPTY_NARRATIVE, toolCall());
+
+    expect(s.designActivity).toHaveLength(1);
+    expect(s.designActivity[0]).toMatchObject({
+      kind: "tool_call",
+      toolName: "update_and_run_blocks",
+      displayLabel: "Testing workflow",
+      text: "Testing workflow…",
+    });
+    expect(s.designActivity[0]?.text).not.toContain("update_and_run_blocks");
   });
 });
 
