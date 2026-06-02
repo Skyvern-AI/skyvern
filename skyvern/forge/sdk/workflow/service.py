@@ -4159,35 +4159,44 @@ class WorkflowService:
                 created_by=created_by,
                 edited_by=edited_by,
             )
-            return updated_workflow
+        else:
+            updated_workflow = await app.DATABASE.workflows.update_workflow(
+                workflow_id=workflow_id,
+                title=title,
+                organization_id=organization_id,
+                description=description,
+                workflow_definition=None,
+                proxy_location=proxy_location,
+                webhook_callback_url=webhook_callback_url,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+                persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
+                model=model,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                cache_key=cache_key,
+                adaptive_caching=adaptive_caching,
+                code_version=code_version,
+                run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
+                created_by=created_by,
+                edited_by=edited_by,
+            )
 
-        updated_workflow = await app.DATABASE.workflows.update_workflow(
-            workflow_id=workflow_id,
-            title=title,
-            organization_id=organization_id,
-            description=description,
-            workflow_definition=None,
-            proxy_location=proxy_location,
-            webhook_callback_url=webhook_callback_url,
-            totp_verification_url=totp_verification_url,
-            totp_identifier=totp_identifier,
-            persist_browser_session=persist_browser_session,
-            browser_profile_id=browser_profile_id,
-            model=model,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            max_elapsed_time_minutes=max_elapsed_time_minutes,
-            extra_http_headers=extra_http_headers,
-            cdp_connect_headers=cdp_connect_headers,
-            run_with=run_with,
-            ai_fallback=ai_fallback,
-            cache_key=cache_key,
-            adaptive_caching=adaptive_caching,
-            code_version=code_version,
-            run_sequentially=run_sequentially,
-            sequential_key=sequential_key,
-            created_by=created_by,
-            edited_by=edited_by,
+        _edited_by: str | None = cast("str | None", edited_by) if edited_by is not _UNSET else None
+        task = asyncio.create_task(
+            app.AGENT_FUNCTION.on_workflow_saved(
+                organization_id=updated_workflow.organization_id,
+                edited_by=_edited_by,
+            ),
         )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         return updated_workflow
 
@@ -4587,6 +4596,14 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            run_completed_task = asyncio.create_task(
+                app.AGENT_FUNCTION.on_workflow_run_completed(
+                    organization_id=workflow_run.organization_id,
+                    workflow_id=workflow_run.workflow_id,
+                ),
+            )
+            self._background_tasks.add(run_completed_task)
+            run_completed_task.add_done_callback(self._background_tasks.discard)
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
         bg = asyncio.create_task(
