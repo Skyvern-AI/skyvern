@@ -72,7 +72,7 @@ function SidebarResourceLinks({ collapsed }: Props) {
               {
                 "w-7 justify-center": collapsed,
                 "w-full gap-2.5 px-2": !collapsed,
-                "border border-cta/30 bg-cta/10 text-cta shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] hover:bg-cta/15 hover:text-cta-hover dark:border-cta/35 dark:bg-cta/15 dark:text-cta-foreground dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-cta/25 dark:hover:text-cta-foreground":
+                "border border-sky-500/30 bg-sky-500/10 text-sky-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] hover:bg-sky-500/15 hover:text-sky-800 dark:border-sky-400/35 dark:bg-sky-400/10 dark:text-sky-300 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] dark:hover:bg-sky-400/20 dark:hover:text-sky-200":
                   link.cta,
               },
             )}
@@ -81,7 +81,7 @@ function SidebarResourceLinks({ collapsed }: Props) {
               className={cn(
                 "flex size-4 shrink-0 items-center justify-center text-neutral-400 transition-colors duration-100 group-hover:text-neutral-900 dark:text-neutral-500 dark:group-hover:text-neutral-300",
                 {
-                  "text-cta group-hover:text-cta-hover dark:text-cta-foreground/90 dark:group-hover:text-cta-foreground":
+                  "text-sky-700 group-hover:text-sky-800 dark:text-sky-300 dark:group-hover:text-sky-200":
                     link.cta,
                 },
               )}

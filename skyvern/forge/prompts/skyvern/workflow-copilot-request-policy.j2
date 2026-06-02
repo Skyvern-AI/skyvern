@@ -1,5 +1,5 @@
 Classify the latest Workflow Copilot request. Return only JSON with keys:
-testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
+testing_intent=require_test|skip_test|unspecified; credential_input_kind=none|raw_secret|credential_id|credential_name|website_stored_credential|placeholder; credential_refs; login_page_urls; requires_user_clarification; clarification_reason; completion_contract; {% if outcome_verification_enabled %}completion_criteria; {% endif %}raw_secret_evidence; raw_secret_handling=none|block|redacted_draft.
 
 testing_intent:
 - skip_test: the user asks for an untested draft, says they will test it themselves, says draft only, just sketch it, no validation run, or skip testing.
@@ -23,6 +23,15 @@ completion_contract:
 - Set to the user's explicit done/complete/success condition when they provide one.
 - The value must be an exact span copied from the latest user message. Do not paraphrase, summarize, or infer a completion condition.
 - Set to null when the user does not provide an explicit completion condition.
+
+{% if outcome_verification_enabled %}completion_criteria:
+- An array of the END-STATE OUTCOMES that must be true for the user's goal to be done. Each item is {outcome, implicit, method_mandated}.
+- outcome: a short statement of an end state the workflow must achieve (an END, not a step). Extract the goal as outcomes the user wants to be true, not the recipe they describe.
+- Capture ALL distinct outcomes the goal requires, including implicit constraints the user did not state as a step (for example "added exactly once / not duplicated", "the item is present in the cart"). Mark such items implicit=true.
+- A prescribed HOW step is NOT a criterion. "search for X", "open the result lightbox", "click add to cart", "go to the cart page" are methods/navigation, not outcomes — do not list them. A different or shorter path that reaches the same end state must still satisfy the goal.
+- method_mandated=true ONLY when the user explicitly makes a specific method the point of the request (for example "verify it works by submitting the real form", "specifically use the search bar"). Otherwise method_mandated=false.
+- Set to [] when the user gives no goal with a checkable outcome (for example a pure draft-only or sketch request).
+{% endif %}
 
 raw_secret_evidence:
 - When credential_input_kind=raw_secret, set this to the verbatim substring of the LATEST user message that is the pasted secret value (e.g. the password string, JWT, API key, OTP digits, or PEM body). Do not paraphrase. Do not cite a token that appears only in prior turns or in the workflow_yaml — the substring must occur in the latest user message.

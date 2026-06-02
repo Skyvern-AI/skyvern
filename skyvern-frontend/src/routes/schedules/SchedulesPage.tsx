@@ -428,9 +428,9 @@ function SchedulesPage() {
 
       {/* Table */}
       <div className="space-y-4">
-        <div className="overflow-hidden rounded-lg border border-slate-700">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
-            <TableHeader className="bg-slate-elevation2 text-slate-400 [&_tr]:border-b-0">
+            <TableHeader>
               <TableRow>
                 {showCheckbox && (
                   <TableHead className="w-[3%]">

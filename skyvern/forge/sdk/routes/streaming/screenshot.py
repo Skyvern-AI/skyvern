@@ -353,6 +353,7 @@ async def _run_local_screencast(
     check_finalized: Callable[[], Awaitable[bool]],
     get_current_status: Callable[[], Awaitable[str | None]],
     get_workflow_run_id: Callable[[], str | None] | None = None,
+    organization_id: str | None = None,
 ) -> None:
     id_key = f"{entity_type}_id"
     try:
@@ -366,6 +367,7 @@ async def _run_local_screencast(
             entity_id,
             entity_type,
             workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
         )
         if browser_state is None:
             LOG.warning("Timed out waiting for browser state", **{id_key: entity_id})
@@ -535,4 +537,5 @@ async def _local_screencast_for_browser_session(
         wait_for_running=wait_for_running,
         check_finalized=check_finalized,
         get_current_status=get_current_status,
+        organization_id=organization_id,
     )

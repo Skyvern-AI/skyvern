@@ -12,7 +12,12 @@ from agents.lifecycle import RunHooksBase
 from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
-from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied, verified_goal_satisfied_context
+from skyvern.forge.sdk.copilot.enforcement import (
+    CopilotGoalSatisfied,
+    gate_decision_trace_fields,
+    outcome_fully_verified,
+)
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
 
@@ -33,6 +38,7 @@ _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
         "last_full_workflow_test_ok",
         "last_update_block_count",
         "latest_diagnosis_repair_contract",
+        "completion_verification_result",
         "user_message",
     }
 )
@@ -41,11 +47,15 @@ _VERIFIED_GOAL_CONTEXT_ATTRS: frozenset[str] = frozenset(
 def _tool_completion_satisfies_turn(ctx: CopilotContext, tool_name: str, parsed: Mapping[str, object]) -> bool:
     if tool_name not in {"run_blocks_and_collect_debug", "update_and_run_blocks"}:
         return False
-    if parsed.get("ok") is not True:
-        return False
     if not all(hasattr(ctx, attr) for attr in _VERIFIED_GOAL_CONTEXT_ATTRS):
         return False
-    return verified_goal_satisfied_context(ctx)
+    # An unfinished run (ok != True) can still satisfy the turn when the outcome
+    # judge confirmed the goal from evidence: recognition must not key on run status.
+    if parsed.get("ok") is not True and not outcome_fully_verified(ctx):
+        return False
+    gate_fields = gate_decision_trace_fields(ctx)
+    record_gate_decision(ctx, gate_fields)
+    return gate_fields["gate_satisfied"]
 
 
 class CopilotRunHooks(RunHooksBase):

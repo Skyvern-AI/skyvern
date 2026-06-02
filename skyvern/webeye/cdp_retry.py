@@ -8,6 +8,8 @@ from playwright._impl._errors import TargetClosedError as PWTargetClosedError
 from playwright._impl._errors import TimeoutError as PWTimeoutError
 from playwright.async_api import Browser, Playwright
 
+from skyvern.webeye.cdp_connection import strip_browser_address_discriminator
+
 LOG = structlog.get_logger()
 
 _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
@@ -19,7 +21,7 @@ _CDP_CONNECTION_ERROR_SUBSTR_FALLBACK = (
 )
 
 
-def _is_cdp_connection_error(exc: Exception) -> bool:
+def is_cdp_connection_error(exc: Exception) -> bool:
     if isinstance(
         exc, (PWTimeoutError, PWTargetClosedError, ConnectionRefusedError, ConnectionResetError, TimeoutError)
     ):
@@ -38,6 +40,7 @@ async def connect_over_cdp_with_retry(
     browser_address: str,
     headers: dict[str, str] | None = None,
 ) -> Browser:
+    browser_address = strip_browser_address_discriminator(browser_address)
     for attempt in range(1, _CDP_RETRY_ATTEMPTS + 1):
         try:
             browser = await playwright.chromium.connect_over_cdp(browser_address, headers=headers)
@@ -49,7 +52,7 @@ async def connect_over_cdp_with_retry(
                 )
             return browser
         except Exception as e:
-            if not _is_cdp_connection_error(e) or attempt == _CDP_RETRY_ATTEMPTS:
+            if not is_cdp_connection_error(e) or attempt == _CDP_RETRY_ATTEMPTS:
                 raise
             backoff = (
                 _CDP_RETRY_BACKOFF_SECONDS[attempt - 1]

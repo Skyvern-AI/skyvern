@@ -245,6 +245,31 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
         return address
 
+    async def get_browser_address_if_ready(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        timeout: float = 0.0,
+        poll_interval: float = 0.25,
+    ) -> str | None:
+        browser_session = await self.database.browser_sessions.get_persistent_browser_session(
+            session_id, organization_id
+        )
+        if browser_session is None or is_final_status(browser_session.status):
+            return None
+        if browser_session.browser_address:
+            return browser_session.browser_address
+        if timeout <= 0:
+            return None
+        return await wait_on_persistent_browser_address(
+            self.database,
+            session_id,
+            organization_id,
+            timeout=max(1, int(timeout)),
+            poll_interval=poll_interval,
+        )
+
     async def get_session_by_runnable_id(
         self, runnable_id: str, organization_id: str
     ) -> PersistentBrowserSession | None:
@@ -282,6 +307,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
+        wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session for an organization and return its ID with the browser state."""
         LOG.info(

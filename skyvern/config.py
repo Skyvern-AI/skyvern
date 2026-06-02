@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
+    # Gate copilot verified-success on per-criterion outcome evidence.
+    # Off restores the prior run-status/suspicious-success gate and classifier prompt.
+    COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.

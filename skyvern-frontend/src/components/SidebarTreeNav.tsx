@@ -182,15 +182,19 @@ function CollapsedNavItem({
   return (
     <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
       <DropdownMenuTrigger asChild>
-        <button
-          type="button"
+        <Link
+          to={item.to}
           title={item.label}
           className={triggerClassName}
+          onClick={() => {
+            clearHoverTimer();
+            setOpen(false);
+          }}
           onMouseEnter={() => scheduleHover(true, FLYOUT_OPEN_DELAY_MS)}
           onMouseLeave={() => scheduleHover(false, FLYOUT_CLOSE_DELAY_MS)}
         >
           <span className={iconClassName}>{item.icon}</span>
-        </button>
+        </Link>
       </DropdownMenuTrigger>
       <DropdownMenuContent
         side="right"

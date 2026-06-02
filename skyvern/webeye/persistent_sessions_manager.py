@@ -37,6 +37,17 @@ class PersistentSessionsManager(Protocol):
         """Get the browser address for a session."""
         ...
 
+    async def get_browser_address_if_ready(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        timeout: float = 0.0,
+        poll_interval: float = 0.25,
+    ) -> str | None:
+        """Get the browser address for a session if it is already available."""
+        ...
+
     async def get_session_by_runnable_id(
         self, runnable_id: str, organization_id: str
     ) -> PersistentBrowserSession | None:
@@ -71,6 +82,7 @@ class PersistentSessionsManager(Protocol):
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
+        wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

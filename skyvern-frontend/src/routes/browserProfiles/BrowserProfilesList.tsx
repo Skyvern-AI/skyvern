@@ -132,25 +132,15 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border">
+      <div className="overflow-hidden rounded-lg border border-border">
         <Table className="w-full table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
+          <TableHeader>
             <TableRow>
-              <TableHead className="w-1/4 truncate rounded-tl-lg text-neutral-600 dark:text-slate-400">
-                Name
-              </TableHead>
-              <TableHead className="w-1/3 truncate text-neutral-600 dark:text-slate-400">
-                Description
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
-                Source Browser
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-neutral-600 dark:text-slate-400">
-                Created
-              </TableHead>
-              <TableHead className="w-32 truncate rounded-tr-lg text-right text-neutral-600 dark:text-slate-400">
-                Actions
-              </TableHead>
+              <TableHead className="w-[22%] truncate">Name</TableHead>
+              <TableHead className="w-[40%] truncate">Description</TableHead>
+              <TableHead className="w-[15%] truncate">Source Browser</TableHead>
+              <TableHead className="w-[15%] truncate">Created</TableHead>
+              <TableHead className="w-32 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -192,7 +182,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
               Items per page
             </span>
             <select
-              className="h-9 rounded-md border border-slate-300 bg-background px-3"
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
               value={itemsPerPage}
               onChange={(e) => {
                 const next = Number(e.target.value);
