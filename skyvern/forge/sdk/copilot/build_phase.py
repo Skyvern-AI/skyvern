@@ -9,8 +9,12 @@ Phases:
 - INITIAL: BUILD turn with no known entrypoint URL. Discovery is available;
   mutation and direct browser primitives are gated off.
 - DISCOVERING: discover_workflow_entrypoint is running. Same gate as INITIAL.
-- COMPOSING: entrypoint resolved. Mutation tools and direct browser primitives
-  are available; discovery is no longer available.
+- COMPOSING: entrypoint resolved and composition under way. Mutation tools,
+  block-runs, and direct browser primitives are all available, so the agent
+  scouts the goal path (including click-reached and post-login pages) with the
+  fast browser tools and authors grounded in that evidence; discovery is no
+  longer available. Authoring page-acting blocks is evidence-gated (see
+  composition_evidence).
 - TESTING: post-update; same authority as COMPOSING.
 """
 
@@ -76,25 +80,25 @@ _DISCOVERY_TOOLS: frozenset[str] = frozenset({"discover_workflow_entrypoint"})
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)]+", re.IGNORECASE)
 
 
-def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
-    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
     if not workflow_yaml:
-        return False
+        return []
     try:
         parsed = safe_load_no_dates(workflow_yaml)
     except yaml.YAMLError:
-        return False
+        return []
     if not isinstance(parsed, dict):
-        return False
+        return []
     definition = parsed.get("workflow_definition")
     if not isinstance(definition, dict):
-        return False
+        return []
     blocks = definition.get("blocks")
-    if not isinstance(blocks, list):
-        return False
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
+    return [block for block in blocks if isinstance(block, dict)] if isinstance(blocks, list) else []
+
+
+def _yaml_has_target_url(workflow_yaml: str | None) -> bool:
+    """True when the YAML carries a goto_url or navigation block with a non-empty url."""
+    for block in _parse_workflow_blocks(workflow_yaml):
         block_type = block.get("block_type")
         if block_type not in {"goto_url", "navigation"}:
             continue
@@ -114,8 +118,11 @@ def initial_build_phase(
 
     Returns COMPOSING (sentinel — harmless because the existing TurnIntent gate
     already blocks mutation for non-BUILD modes) when the mode is one of the
-    explicitly-non-build values. For BUILD / DRAFT_ONLY / UNKNOWN, returns
-    COMPOSING when this turn already has a URL signal, else INITIAL.
+    explicitly-non-build values. For BUILD / DRAFT_ONLY / UNKNOWN with a URL
+    signal, returns COMPOSING: the entrypoint is known, so the agent scouts the
+    goal path with the browser tools and authors there (page-acting blocks stay
+    evidence-gated). With no URL signal, returns INITIAL so discovery resolves
+    the entrypoint first.
 
     UNKNOWN deliberately enters INITIAL when no URL is present: a fresh chat
     whose latest message dodges every keyword heuristic (e.g. "go to X" with
@@ -133,13 +140,14 @@ def initial_build_phase(
     mode_value = getattr(getattr(turn_intent, "mode", None), "value", None)
     if mode_value in _PHASE_NON_BUILD_MODE_VALUES:
         return BuildPhase.COMPOSING
-    if _URL_IN_TEXT_RE.search(user_message or ""):
-        return BuildPhase.COMPOSING
-    if _URL_IN_TEXT_RE.search(agent_user_message or ""):
-        return BuildPhase.COMPOSING
-    if _yaml_has_target_url(workflow_yaml):
-        return BuildPhase.COMPOSING
-    return BuildPhase.INITIAL
+    has_url_signal = bool(
+        _URL_IN_TEXT_RE.search(user_message or "")
+        or _URL_IN_TEXT_RE.search(agent_user_message or "")
+        or _yaml_has_target_url(workflow_yaml)
+    )
+    if not has_url_signal:
+        return BuildPhase.INITIAL
+    return BuildPhase.COMPOSING
 
 
 def _log_transition(ctx: CopilotContext, *, prev: BuildPhase, new: BuildPhase, reason: str) -> None:
@@ -196,11 +204,11 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
         return CopilotToolBlockerSignal(
             blocker_kind="phase_gated",
             agent_steering_text=(
-                "discover_workflow_entrypoint is only available before composition. "
-                "The workflow already has a target URL — proceed with update_workflow or update_and_run_blocks. "
+                "discover_workflow_entrypoint is only available before the entrypoint is resolved. "
+                "The workflow already has a target URL — scout it with the browser tools and author with update_workflow. "
                 "safe_reason_code=build_phase_discovery_disallowed_post_compose."
             ),
-            user_facing_reason="I already have a target for this workflow — I'll keep editing it instead of starting over.",
+            user_facing_reason="I already have a target for this workflow — I'll keep working on it instead of starting over.",
             recovery_hint="retry_with_different_tool",
             cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
             internal_reason_code="build_phase_discovery_disallowed_post_compose",

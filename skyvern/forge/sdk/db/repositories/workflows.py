@@ -27,12 +27,14 @@ from skyvern.forge.sdk.db.models import (
     WorkflowParameterModel,
     WorkflowRunModel,
     WorkflowScheduleModel,
+    WorkflowTagEventModel,
     WorkflowTemplateModel,
 )
 from skyvern.forge.sdk.db.repositories.workflow_parameters import WorkflowParametersRepository
 from skyvern.forge.sdk.db.utils import convert_to_workflow, nullable_column_equals, serialize_proxy_location
 from skyvern.forge.sdk.workflow.models.block import Block, ForLoopBlock, WhileLoopBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
+from skyvern.forge.sdk.workflow.models.tags import TagEventType
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowDefinition
 from skyvern.schemas.runs import ProxyLocationInput
 from skyvern.schemas.workflows import WorkflowStatus
@@ -411,6 +413,7 @@ class WorkflowsRepository(BaseRepository):
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
+        workflow_tags: list[tuple[str, str]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -421,6 +424,14 @@ class WorkflowsRepository(BaseRepository):
           workflow parameter metadata (key, description, and default_value).
         - If `search_key` is not provided, no search filtering is applied.
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
+
+        Tag filtering (`workflow_tags`):
+        - A list of (key, value) pairs. Pairs are grouped by key; the filter is AND
+          across distinct keys and OR within a key's values. One semi-join subquery is
+          emitted per distinct key — normalized event rows can't satisfy two `key=`
+          predicates at once, so a single conjunctive subquery would match nothing.
+        - Matches only the current value of each tag: superseded and soft-deleted
+          event rows are excluded, mirroring the active-tag read path.
         """
         if page < 1:
             raise ValueError(f"Page must be greater than 0, got {page}")
@@ -469,6 +480,22 @@ class WorkflowsRepository(BaseRepository):
                 main_query = main_query.where(WorkflowModel.status.in_(statuses))
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
+            if workflow_tags:
+                values_by_key: dict[str, list[str]] = {}
+                for key, value in workflow_tags:
+                    values_by_key.setdefault(key, []).append(value)
+                for key, values in values_by_key.items():
+                    main_query = main_query.where(
+                        WorkflowModel.workflow_permanent_id.in_(
+                            select(WorkflowTagEventModel.workflow_permanent_id)
+                            .where(WorkflowTagEventModel.organization_id == organization_id)
+                            .where(WorkflowTagEventModel.deleted_at.is_(None))
+                            .where(WorkflowTagEventModel.superseded_at.is_(None))
+                            .where(WorkflowTagEventModel.event_type == TagEventType.SET.value)
+                            .where(WorkflowTagEventModel.key == key)
+                            .where(WorkflowTagEventModel.value.in_(values))
+                        )
+                    )
             if search_key:
                 search_like = f"%{search_key}%"
                 title_like = WorkflowModel.title.ilike(search_like)
