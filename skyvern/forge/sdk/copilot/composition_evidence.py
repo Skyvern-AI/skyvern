@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
+import structlog
 import yaml
 
 try:
@@ -16,6 +18,8 @@ from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
+LOG = structlog.get_logger()
+
 _BUILD_MODE_VALUES: frozenset[str] = frozenset({"build", "draft_only", "edit", "unknown"})
 # Block types whose acted page, when no url is on the block, is the current
 # frontier (observation of the page suffices). navigation without a url is the
@@ -25,6 +29,9 @@ _FRONTIER_NO_URL_BLOCK_TYPES: frozenset[str] = frozenset({"login", "extraction",
 # agent against the reached page, so they need the same observed-evidence floor as a no-url
 # navigation, otherwise the agent can author an unobserved click/download/upload.
 _INTERACTION_NO_URL_BLOCK_TYPES: frozenset[str] = frozenset({"navigation", "action", "file_download", "file_upload"})
+# Navigation can legitimately split same-page form preparation and submission across
+# blocks, so only no-url action/download/upload blocks force post-interaction refs.
+_POST_INTERACTION_OBS_REQ_BLOCK_TYPES: frozenset[str] = frozenset({"action", "file_download", "file_upload"})
 _GOTO_URL_BLOCK_TYPE = "goto_url"
 _SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
 _STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
@@ -225,6 +232,20 @@ def merge_visual_composition_evidence(
             ]
             challenge_state["gated_submit_controls"] = (existing_controls + visual_blocked_controls)[:5]
         merged["challenge_state"] = challenge_state
+        # Empty-page classification is visual-only: DOM parsing can tell that a page
+        # is schema-empty, but only the screenshot summary distinguishes settled empty
+        # pages from loading shells.
+        if merged.get("schema_empty_page") is True:
+            empty_page_visible = visual_summary.get("empty_page_visible") is True
+            loading_state_visible = visual_summary.get("loading_state_visible") is True
+            if loading_state_visible:
+                merged["empty_page_visual_state"] = "loading_or_progress"
+            elif empty_page_visible:
+                merged["observed_empty_page"] = True
+                merged["empty_page_observation_source"] = VISION_EVIDENCE_SOURCE
+                merged["empty_page_visual_state"] = "settled_empty"
+            else:
+                merged["empty_page_visual_state"] = "unknown"
     elif not merged.get("visual_evidence_summary"):
         merged["visual_evidence_summary"] = "Screenshot captured because DOM evidence indicated challenge state."
 
@@ -319,11 +340,15 @@ def _gated_page_acting_blocks(workflow_yaml: str | None, previous_workflow_yaml:
     gated: list[dict[str, Any]] = []
     nearest_goto: str | None = None
     fallback_url = workflow_target_url(workflow_yaml)
+    no_url_interaction_since_url = False
+    click_reached_observation_required = False
     for index, block in enumerate(_parse_workflow_blocks(workflow_yaml)):
         block_type = str(block.get("block_type") or "").strip().lower()
         url = _block_url(block)
         if url:
             nearest_goto = url
+            no_url_interaction_since_url = False
+            click_reached_observation_required = False
         if index == 0 and block_type == _GOTO_URL_BLOCK_TYPE:
             # entrypoint scaffold — ungated so the agent can record it and scout from it.
             continue
@@ -339,9 +364,19 @@ def _gated_page_acting_blocks(workflow_yaml: str | None, previous_workflow_yaml:
                 {
                     "label": label,
                     "block_type": block_type,
+                    "acts_via": acts_via,
                     "target_url": url or nearest_goto or fallback_url,
+                    "requires_observation_ref": acts_via != "url"
+                    and (
+                        click_reached_observation_required
+                        or (block_type in _POST_INTERACTION_OBS_REQ_BLOCK_TYPES and no_url_interaction_since_url)
+                    ),
                 }
             )
+        if acts_via == "interaction":
+            no_url_interaction_since_url = True
+            if block_type in _POST_INTERACTION_OBS_REQ_BLOCK_TYPES:
+                click_reached_observation_required = True
     return gated
 
 
@@ -461,7 +496,11 @@ def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
         if isinstance(value, list) and value:
             return True
     challenge_state = evidence.get("challenge_state")
-    return isinstance(challenge_state, dict) and challenge_state.get("detected") is True
+    if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
+        return True
+    # A visually confirmed settled-empty page is sufficient composition evidence
+    # even though it has no DOM controls to act on.
+    return evidence.get("observed_empty_page") is True
 
 
 def _evidence_matches_target(
@@ -523,6 +562,95 @@ def _prior_observed_pages(ctx: Any) -> list[dict[str, Any]]:
     return [page for page in (getattr(ctx, "prior_observed_acted_pages", None) or []) if isinstance(page, dict)]
 
 
+def _flow_evidence_by_step(ctx: Any) -> dict[int, tuple[dict[str, Any], str]]:
+    by_step: dict[int, tuple[dict[str, Any], str]] = {}
+    for entry in getattr(ctx, "flow_evidence", None) or []:
+        if not isinstance(entry, dict):
+            continue
+        packet = entry.get("evidence")
+        if not isinstance(packet, dict):
+            continue
+        step = entry.get("step")
+        if isinstance(step, bool) or not isinstance(step, int):
+            continue
+        if step in by_step:
+            # Duplicates here mean malformed persisted or deserialized evidence.
+            retained_packet, retained_reached_via = by_step[step]
+            LOG.warning(
+                "copilot_flow_evidence_duplicate_step_ignored",
+                observation_step=step,
+                retained_reached_via=retained_reached_via,
+                ignored_reached_via=str(entry.get("reached_via") or ""),
+                retained_url=retained_packet.get("current_url") or retained_packet.get("inspected_url"),
+                ignored_url=packet.get("current_url") or packet.get("inspected_url"),
+                prior_retained_steps_count=len(by_step),
+            )
+            continue
+        by_step[step] = (packet, str(entry.get("reached_via") or ""))
+    return by_step
+
+
+def _iter_block_observation_ref_items(value: Any, *, warn_malformed: bool) -> Iterable[tuple[Any, Any]] | None:
+    if isinstance(value, dict):
+        return value.items()
+    if isinstance(value, list):
+        items: list[tuple[Any, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                items.append((item.get("label"), item.get("observation_step")))
+            elif hasattr(item, "label") and hasattr(item, "observation_step"):
+                # Accept the typed ref shape without coupling the composition gate
+                # to a concrete pydantic model.
+                items.append((item.label, item.observation_step))
+            elif warn_malformed:
+                LOG.warning(
+                    "copilot_block_observation_ref_malformed_item_ignored",
+                    item_type=type(item).__name__,
+                )
+        return items
+    return None
+
+
+def normalize_block_observation_refs(value: Any) -> dict[str, int]:
+    items = _iter_block_observation_ref_items(value, warn_malformed=True)
+    if items is None:
+        LOG.warning(
+            "copilot_block_observation_refs_unexpected_type_ignored",
+            value_type=type(value).__name__,
+        )
+        return {}
+    refs: dict[str, int] = {}
+    for label, step in items:
+        if not isinstance(label, str) or not label.strip():
+            continue
+        if isinstance(step, bool):
+            continue
+        if isinstance(step, int):
+            refs[label.strip()] = step
+        elif isinstance(step, str):
+            # String steps are ignored so callers can repair malformed refs.
+            LOG.warning(
+                "copilot_block_observation_ref_string_step_ignored",
+                label=label.strip(),
+                step_length=len(step),
+            )
+    return refs
+
+
+def _block_observation_refs(ctx: Any) -> dict[str, int]:
+    return normalize_block_observation_refs(getattr(ctx, "block_observation_refs", None))
+
+
+def _evidence_observed_url(evidence: dict[str, Any]) -> str | None:
+    for key in ("current_url", "inspected_url"):
+        value = evidence.get(key)
+        # "current_page" is the sentinel for inspecting the current browser page
+        # without a known target URL.
+        if isinstance(value, str) and value.strip() and value != "current_page":
+            return value.strip()
+    return None
+
+
 def _page_observed(ctx: Any, target_url: str | None, *, allow_post_run: bool) -> bool:
     if not target_url:
         return False
@@ -538,6 +666,116 @@ def _page_observed(ctx: Any, target_url: str | None, *, allow_post_run: bool) ->
         if page.get("had_bounded_schema") and _same_page(page.get("url"), target_url):
             return True
     return False
+
+
+def _associated_observation_satisfies_block(
+    evidence: dict[str, Any],
+    target_url: str | None,
+    *,
+    acts_via: str,
+    reached_via: str,
+    requires_observation_ref: bool,
+    allow_post_run: bool,
+) -> bool:
+    if acts_via == "url":
+        # URL blocks are grounded by target_url, not observation-ref gates.
+        if requires_observation_ref:
+            return False
+        return _evidence_matches_target(evidence, target_url, allow_post_run_browser_observation=allow_post_run)
+    if requires_observation_ref and reached_via not in {"interaction", "post_run"}:
+        return False
+
+    observed_url = _evidence_observed_url(evidence)
+    if not observed_url:
+        return False
+    return _evidence_matches_target(evidence, observed_url, allow_post_run_browser_observation=allow_post_run)
+
+
+def _block_has_observed_page(
+    ctx: Any,
+    block: dict[str, Any],
+    *,
+    allow_post_run: bool,
+    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
+    block_observation_refs: dict[str, int],
+) -> bool:
+    label = str(block.get("label") or "")
+    if label and label in block_observation_refs:
+        evidence_entry = flow_evidence_by_step.get(block_observation_refs[label])
+        if evidence_entry is None:
+            return False
+        evidence, reached_via = evidence_entry
+        return _associated_observation_satisfies_block(
+            evidence,
+            block.get("target_url"),
+            acts_via=str(block.get("acts_via") or ""),
+            reached_via=reached_via,
+            requires_observation_ref=block.get("requires_observation_ref") is True,
+            allow_post_run=allow_post_run,
+        )
+
+    if block.get("requires_observation_ref") is True:
+        return False
+    return _page_observed(ctx, block.get("target_url"), allow_post_run=allow_post_run)
+
+
+def _missing_observation_ref_step(
+    block: dict[str, Any],
+    *,
+    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
+    block_observation_refs: dict[str, int],
+) -> int | None:
+    label = str(block.get("label") or "")
+    if not label or label not in block_observation_refs:
+        return None
+    step = block_observation_refs[label]
+    return None if step in flow_evidence_by_step else step
+
+
+def _raw_block_observation_ref_step(value: Any, label: str) -> object | None:
+    if not label:
+        return None
+    items = _iter_block_observation_ref_items(value, warn_malformed=False)
+    if items is None:
+        return None
+    for item_label, item_step in items:
+        if isinstance(item_label, str) and item_label.strip() == label:
+            return item_step
+    return None
+
+
+def _string_observation_ref_step(block: dict[str, Any], raw_block_observation_refs: Any) -> str | None:
+    label = str(block.get("label") or "")
+    raw_step = _raw_block_observation_ref_step(raw_block_observation_refs, label)
+    return raw_step if isinstance(raw_step, str) else None
+
+
+def _required_observation_ref_missing(block: dict[str, Any], block_observation_refs: dict[str, int]) -> bool:
+    if block.get("requires_observation_ref") is not True:
+        return False
+    label = str(block.get("label") or "")
+    return bool(label and label not in block_observation_refs)
+
+
+def _wrong_reached_via_observation_ref(
+    block: dict[str, Any],
+    *,
+    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
+    block_observation_refs: dict[str, int],
+) -> tuple[int, str] | None:
+    if block.get("requires_observation_ref") is not True:
+        return None
+    label = str(block.get("label") or "")
+    if not label or label not in block_observation_refs:
+        return None
+    step = block_observation_refs[label]
+    evidence_entry = flow_evidence_by_step.get(step)
+    if evidence_entry is None:
+        return None
+    _, reached_via = evidence_entry
+    if reached_via in {"interaction", "post_run"}:
+        return None
+    return step, reached_via or "<missing>"
 
 
 def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
@@ -563,9 +801,69 @@ def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str 
         return None
 
     allow_post_run = bool(previous_workflow_yaml)
+    flow_evidence_by_step = _flow_evidence_by_step(ctx)
+    raw_block_observation_refs = getattr(
+        ctx,
+        "raw_block_observation_refs",
+        getattr(ctx, "block_observation_refs", None),
+    )
+    block_observation_refs = _block_observation_refs(ctx)
     for block in gated_blocks:
         target_url = block["target_url"]
-        if not _page_observed(ctx, target_url, allow_post_run=allow_post_run):
+        if not _block_has_observed_page(
+            ctx,
+            block,
+            allow_post_run=allow_post_run,
+            flow_evidence_by_step=flow_evidence_by_step,
+            block_observation_refs=block_observation_refs,
+        ):
+            missing_step = _missing_observation_ref_step(
+                block,
+                flow_evidence_by_step=flow_evidence_by_step,
+                block_observation_refs=block_observation_refs,
+            )
+            string_step = _string_observation_ref_step(block, raw_block_observation_refs)
+            wrong_reached_via = _wrong_reached_via_observation_ref(
+                block,
+                flow_evidence_by_step=flow_evidence_by_step,
+                block_observation_refs=block_observation_refs,
+            )
+            if string_step is not None:
+                return (
+                    "Workflow validation failed: a block_observation_refs entry uses observation_step "
+                    f"{string_step!r} as a string. Pass the integer observation_step returned by "
+                    "inspect_page_for_composition for click-reached blocks. "
+                    f"Offending blocks: {_format_page_block_findings([block])}"
+                )
+            if _required_observation_ref_missing(block, block_observation_refs):
+                return (
+                    "Workflow validation failed: a click-reached block requires a block_observation_refs entry. "
+                    "Pass an interaction- or post_run-reached observation_step for click-reached blocks before "
+                    "composing them. "
+                    f"Offending blocks: {_format_page_block_findings([block])}"
+                )
+            if wrong_reached_via is not None:
+                step, reached_via = wrong_reached_via
+                return (
+                    "Workflow validation failed: a block references observation_step "
+                    f"{step}, but that observed page was reached via {reached_via!r}. "
+                    "Pass an interaction- or post_run-reached observation_step for click-reached blocks. "
+                    f"Offending blocks: {_format_page_block_findings([block])}"
+                )
+            if missing_step is not None:
+                min_available_step = min(flow_evidence_by_step) if flow_evidence_by_step else None
+                missing_reason = (
+                    "that observed page evidence is no longer available in the flow-evidence window"
+                    if min_available_step is not None and missing_step < min_available_step
+                    else "that observation step was not found in flow evidence"
+                )
+                return (
+                    "Workflow validation failed: a block references observation_step "
+                    f"{missing_step}, but {missing_reason}. "
+                    "Call inspect_page_for_composition again for the reached page and pass the new "
+                    "observation_step in block_observation_refs before composing page-dependent blocks. "
+                    f"Offending blocks: {_format_page_block_findings([block])}"
+                )
             return (
                 "Workflow validation failed: page-dependent build blocks need observed page evidence before they are "
                 f"authored. Call inspect_page_for_composition(target_url={target_url!r}) before composing page-dependent "
@@ -590,6 +888,9 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "result_containers": [],
         "anti_bot_indicators": [],
         "challenge_controls": [],
+        "schema_empty_page": False,
+        "observed_empty_page": False,
+        "empty_page_visual_state": None,
         "evidence_confidence": 0.0,
         "source_tool": "inspect_page_for_composition",
         **_evidence_metadata([]),
@@ -923,6 +1224,11 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
 
     field_count = sum(len(form.get("fields") or []) for form in forms)
     control_count = sum(len(form.get("submit_controls") or []) for form in forms)
+    body_text = _node_text(soup.body if soup.body is not None else soup).strip()
+    # Schema-empty means the page had content, but no bounded form/link/result/challenge structure.
+    schema_empty_page = bool((html or "").strip() or page_title or body_text) and not (
+        forms or navigation_targets or result_containers or challenge_controls or anti_bot_indicators
+    )
     # Higher confidence means the parser saw a more complete form surface.
     confidence = 0.85 if field_count and control_count else 0.6 if field_count else 0.3 if forms else 0.1
     return {
@@ -934,6 +1240,9 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "result_containers": result_containers,
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,
+        "schema_empty_page": schema_empty_page,
+        "observed_empty_page": False,
+        "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
         **_evidence_metadata(anti_bot_indicators, forms=forms),
