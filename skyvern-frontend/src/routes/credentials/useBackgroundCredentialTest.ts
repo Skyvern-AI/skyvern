@@ -10,7 +10,7 @@ import type {
 import { getHostname } from "@/util/getHostname";
 import { useCredentialTestStore } from "@/store/useCredentialTestStore";
 
-const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
+const MAX_POLL_DURATION_MS = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 5000;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
@@ -85,7 +85,7 @@ function useBackgroundCredentialTest() {
       toast({
         title: "Browser profile test timed out",
         description:
-          "The test did not complete within 5 minutes. Your credential is saved but without a browser profile.",
+          "The test did not complete within 10 minutes. Your credential is saved but without a browser profile.",
         variant: "destructive",
       });
       return;
