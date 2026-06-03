@@ -36,8 +36,9 @@ function DeleteBrowserProfileButton({ profile, onDeleted }: Props) {
             <DialogTrigger asChild>
               <Button
                 size="icon"
-                variant="outline"
+                variant="ghost"
                 aria-label="Delete browser profile"
+                className="text-muted-foreground hover:text-destructive"
               >
                 <TrashIcon className="h-4 w-4" />
               </Button>

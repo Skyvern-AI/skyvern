@@ -52,6 +52,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { TableSearchInput } from "@/components/TableSearchInput";
+import { Pill } from "@/components/StatusBadge";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
@@ -101,31 +102,10 @@ const STATUS_OPTIONS: Array<{ label: string; value: ScheduleStatus }> = [
 ];
 
 function StatusDisplay({ enabled }: Readonly<{ enabled: boolean }>) {
-  if (enabled) {
-    return (
-      <div className="flex items-center gap-1.5">
-        <span className="size-4 text-green-400">
-          <svg
-            viewBox="0 0 16 16"
-            fill="none"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <circle cx="8" cy="8" r="4" fill="currentColor" />
-          </svg>
-        </span>
-        <span className="text-sm capitalize text-slate-300">active</span>
-      </div>
-    );
-  }
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="size-4 text-amber-400">
-        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="8" cy="8" r="4" fill="currentColor" />
-        </svg>
-      </span>
-      <span className="text-sm capitalize text-slate-300">paused</span>
-    </div>
+    <Pill tone={enabled ? "success" : "queued"} className="capitalize">
+      {enabled ? "active" : "paused"}
+    </Pill>
   );
 }
 
@@ -544,9 +524,9 @@ function SchedulesPage() {
                     <DropdownMenu modal={false}>
                       <DropdownMenuTrigger asChild>
                         <Button
-                          variant="outline"
+                          variant="ghost"
                           size="icon"
-                          className="size-8"
+                          className="size-8 text-muted-foreground hover:text-foreground"
                         >
                           <DotsHorizontalIcon className="size-4" />
                         </Button>
