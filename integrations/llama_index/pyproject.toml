@@ -8,7 +8,7 @@ readme = "README.md"
 dependencies = [
     "skyvern>=0.2.0",
     "llama-index>=0.12.19,<0.14",
-    "urllib3>=2.6.0",
+    "urllib3>=2.7.0",
 ]
 
 [build-system]
@@ -48,6 +48,9 @@ override-dependencies = [
     "mako>=1.3.11",
     "cryptography>=46.0.7",
     "pygments>=2.20.0",
+    # Dependabot high security upgrades (transitive)
+    "litellm>=1.83.10",
+    "banks>=2.4.2",
 ]
 
 [tool.uv.sources]
