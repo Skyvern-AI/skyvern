@@ -112,6 +112,15 @@ LOG = structlog.get_logger()
 # See: https://docs.python.org/3/library/asyncio-task.html#creating-tasks
 _background_tasks: set[asyncio.Task] = set()
 
+# clean_up_workflow uploads the session after the run reaches `completed`, so the
+# profile task waits; the status grace period derives from these to stay aligned.
+_SESSION_PERSIST_MAX_RETRIES = 20
+_SESSION_PERSIST_RETRY_INTERVAL_SECONDS = 3
+# -1 because no sleep follows the final attempt.
+_SESSION_PERSIST_MAX_WAIT_SECONDS = (_SESSION_PERSIST_MAX_RETRIES - 1) * _SESSION_PERSIST_RETRY_INTERVAL_SECONDS
+# Buffer over the max wait so the status endpoint doesn't misreport while the task still retries.
+_PROFILE_GRACE_PERIOD_HEADROOM_SECONDS = 15
+
 
 async def fetch_credential_item_background(item_id: str) -> None:
     """
@@ -943,11 +952,9 @@ async def get_test_credential_status(
     elif status == WorkflowRunStatus.canceled:
         failure_reason = "The login test was canceled."
 
-    # Detect browser profile creation failure: workflow completed successfully
-    # but no profile was linked after the background task had time to finish.
-    # The background task retries session retrieval 5 times with 2s sleeps (~12s),
-    # so 30s is a generous grace period.
-    _PROFILE_GRACE_PERIOD_SECONDS = 30
+    # Only a real failure once the background task has had time to finish; grace must
+    # exceed its session-persist wait plus headroom, else mid-polls misread.
+    _PROFILE_GRACE_PERIOD_SECONDS = _SESSION_PERSIST_MAX_WAIT_SECONDS + _PROFILE_GRACE_PERIOD_HEADROOM_SECONDS
     if (
         status == WorkflowRunStatus.completed
         and not browser_profile_id
@@ -1104,9 +1111,10 @@ async def _create_browser_profile_after_workflow(
                         )
                 return
 
-            # Workflow completed — wait for session data to be persisted
+            # Session persistence lags the run reaching completed (see clean_up_workflow),
+            # so retrieval retries on a budget sized to that lag.
             session_dir = None
-            max_retries = 5
+            max_retries = _SESSION_PERSIST_MAX_RETRIES
             for attempt in range(max_retries):
                 session_dir = await app.STORAGE.retrieve_browser_session(
                     organization_id=organization_id,
@@ -1122,7 +1130,7 @@ async def _create_browser_profile_after_workflow(
                         attempt=attempt + 1,
                         max_retries=max_retries,
                     )
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(_SESSION_PERSIST_RETRY_INTERVAL_SECONDS)
 
             if not session_dir:
                 LOG.warning(
