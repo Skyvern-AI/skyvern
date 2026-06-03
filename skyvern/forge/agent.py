@@ -130,7 +130,7 @@ from skyvern.utils.prompt_engine import (
     enforce_prompt_ceiling_tracked,
     load_prompt_with_elements,
 )
-from skyvern.utils.prompt_truncation import truncate_extraction_schema
+from skyvern.utils.prompt_truncation import truncate_extraction_schema, truncate_page_html_for_summary
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
@@ -5408,8 +5408,10 @@ class ForgeAgent:
 
             if page is not None:
                 skyvern_frame = await SkyvernFrame.create_instance(frame=page)
-                html = await skyvern_frame.get_content()
-                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url)
+                html = truncate_page_html_for_summary(await skyvern_frame.get_content())
+                # scroll=False: one current-viewport shot (the failing region) is enough for a
+                # failure summary; avoids 10 full-page strips. SKY-10626.
+                screenshots = await SkyvernFrame.take_split_screenshots(page=page, url=page.url, scroll=False)
 
             prompt = prompt_engine.load_prompt(
                 "summarize-max-retries-reason",
