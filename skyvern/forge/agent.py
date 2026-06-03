@@ -3226,27 +3226,7 @@ class ForgeAgent:
 
         # If we don't have pre-scraped data, scrape normally
         if scraped_page is None:
-            # Check PostHog for speed optimizations BEFORE scraping
-            # This decision will be used in both:
-            # 1. SVG conversion skip (in agent_functions.py cleanup)
-            # 2. Tree selection (economy vs regular tree)
-            # By checking once and storing in context, we ensure perfect coordination
             if context:
-                try:
-                    distinct_id = task.workflow_run_id if task.workflow_run_id else task.task_id
-                    context.enable_speed_optimizations = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                        "ENABLE_SPEED_OPTIMIZATIONS",
-                        distinct_id,
-                        properties={"organization_id": task.organization_id},
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to check ENABLE_SPEED_OPTIMIZATIONS feature flag",
-                        exc_info=True,
-                        task_id=task.task_id,
-                    )
-                    context.enable_speed_optimizations = False
-
                 # SKY-9718 Layer 1: local-override env var for bench / debugging.
                 # `FORCE_ENABLE_LEAN_ELEMENT_TREE=true` bypasses the PostHog gate
                 # and forces lean ON for every run in this process. Never set in
@@ -3393,13 +3373,7 @@ class ForgeAgent:
         _artifacts_span.set_attribute("html_bytes", len(scraped_page.html) if scraped_page.html else 0)
 
         element_tree_format = ElementTreeFormat.HTML
-        element_tree_in_prompt = self._build_element_tree_for_prompt(
-            scraped_page=scraped_page,
-            step=step,
-            task=task,
-            context=context,
-            element_tree_format=element_tree_format,
-        )
+        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
 
         if context and context.use_artifact_bundling:
             app.ARTIFACT_MANAGER.accumulate_scrape_to_archive(
@@ -3468,45 +3442,6 @@ class ForgeAgent:
                 )
             if failures:
                 raise failures[0][1]
-
-    def _build_element_tree_for_prompt(
-        self,
-        *,
-        scraped_page: ScrapedPage,
-        step: Step,
-        task: Task,
-        context: SkyvernContext | None,
-        element_tree_format: ElementTreeFormat,
-    ) -> str:
-        """
-        Determine which element tree representation should be captured for the prompt/artifacts.
-        Mirrors the previous inline logic so that speculative runs can reuse it.
-        """
-
-        enable_speed_optimizations = context.enable_speed_optimizations if context else False
-        if not enable_speed_optimizations:
-            return scraped_page.build_element_tree(element_tree_format)
-
-        if step.retry_index == 0:
-            element_tree_in_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
-            LOG.info(
-                "Speed optimization: Using economy element tree (skipping SVGs)",
-                step_order=step.order,
-                step_retry=step.retry_index,
-                task_id=task.task_id,
-                workflow_run_id=task.workflow_run_id,
-            )
-            return element_tree_in_prompt
-
-        element_tree_in_prompt = scraped_page.build_element_tree(element_tree_format)
-        LOG.info(
-            "Speed optimization: Using regular tree on retry (SVGs from global cache)",
-            step_order=step.order,
-            step_retry=step.retry_index,
-            task_id=task.task_id,
-            workflow_run_id=task.workflow_run_id,
-        )
-        return element_tree_in_prompt
 
     @staticmethod
     def _build_extract_action_cache_variant(
@@ -3774,20 +3709,12 @@ class ForgeAgent:
             task_llm_key=task.llm_key,
             effective_llm_key=effective_llm_key,
         )
-        enable_speed_optimizations = context.enable_speed_optimizations
         element_tree_format = ElementTreeFormat.HTML
         # SKY-9718 Layer 1: extract-action is a planner template — keep Skyvern
         # internal IDs (default `html_need_skyvern_attrs=True`) and apply the
-        # 3 lean transforms. Speed-optimization path uses economy tree which
-        # drops lean for the same firefighting reason as prompt_engine's
-        # overflow path.
+        # 3 lean transforms.
         use_lean_tree = context.enable_lean_element_tree
-        if enable_speed_optimizations:
-            if step.retry_index == 0:
-                elements_for_prompt = scraped_page.build_economy_elements_tree(element_tree_format)
-            else:
-                elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
-        elif use_lean_tree:
+        if use_lean_tree:
             elements_for_prompt = scraped_page.build_lean_elements_tree(
                 element_tree_format,
                 # compress_long_href stays OFF — the planner reads the href
