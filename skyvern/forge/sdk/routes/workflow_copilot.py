@@ -28,6 +28,7 @@ from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write,
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
 from skyvern.forge.sdk.copilot.recoverable_failure import (
     RecoverableFailure,
@@ -36,7 +37,6 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
@@ -143,22 +143,8 @@ async def _resolve_copilot_agent_handler(
     workflow_permanent_id: str,
     organization_id: str,
 ) -> LLMAPIHandler:
-    try:
-        posthog_handler = await get_llm_handler_for_prompt_type(
-            "workflow-copilot", workflow_permanent_id, organization_id
-        )
-    except Exception as exc:
-        LOG.warning("copilot agent PostHog lookup failed, falling back", error=str(exc))
-        posthog_handler = None
-    if posthog_handler is not None:
-        return posthog_handler
-    # AppHolder.__getattr__ raises bare RuntimeError (not AttributeError)
-    # pre-startup; getattr(...,default) would not catch it.
-    try:
-        dedicated = app.WORKFLOW_COPILOT_AGENT_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        dedicated = None
-    return dedicated or app.LLM_API_HANDLER
+    handler = await resolve_main_copilot_handler(workflow_permanent_id, organization_id)
+    return handler or app.LLM_API_HANDLER
 
 
 @contextmanager
@@ -844,10 +830,7 @@ async def copilot_call_llm(
         system_prompt_len=len(system_prompt),
         user_prompt_len=len(user_prompt),
     )
-    llm_api_handler = (
-        await get_llm_handler_for_prompt_type("workflow-copilot", chat_request.workflow_permanent_id, organization_id)
-        or app.LLM_API_HANDLER
-    )
+    llm_api_handler = await _resolve_copilot_agent_handler(chat_request.workflow_permanent_id, organization_id)
     llm_start_time = time.monotonic()
     llm_response = await llm_api_handler(
         prompt=user_prompt,

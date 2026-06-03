@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 
 import pytest
@@ -55,6 +56,13 @@ def _evaluated(*satisfied_by_id: tuple[str, bool]) -> CompletionVerificationResu
         for cid, ok in satisfied_by_id
     ]
     return CompletionVerificationResult(status="evaluated", criterion_ids=ids, verdicts=verdicts)
+
+
+def _completion_handler_lookup(handler: object) -> Callable[[object], Awaitable[object]]:
+    async def _lookup(_ctx: object) -> object:
+        return handler
+
+    return _lookup
 
 
 def test_is_fully_satisfied_requires_every_criterion() -> None:
@@ -407,7 +415,10 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
     ctx = _run_ctx()
     result = await _maybe_run_completion_verification(ctx, _canceled_budget_result(), time.monotonic())
     assert result is not None
@@ -513,7 +524,10 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
     ctx = _ctx_unverified_prefix()
     result = await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic())
     assert result is not None
@@ -540,7 +554,10 @@ async def test_method_mandated_criteria_excluded_from_verification(monkeypatch: 
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
@@ -596,7 +613,10 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     async def handler(**_: object) -> dict:
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
     ctx = _run_ctx()
     starved = time.monotonic() - 100_000  # no budget left to verify this candidate run
     result = await _maybe_run_completion_verification(ctx, _clean_success_result(), starved)
@@ -607,7 +627,10 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
     assert result.is_fully_satisfied() is False
 
     # A missing judge handler stays a soft fallback (None), not a hard block.
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: None)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(None),
+    )
     assert await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic()) is None
 
 

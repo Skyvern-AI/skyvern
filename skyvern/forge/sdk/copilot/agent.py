@@ -177,10 +177,8 @@ def _copilot_turn_span(
         yield span
 
 
-def _resolve_request_policy_handler(fallback_handler: Any) -> Any:
-    with contextlib.suppress(RuntimeError, AttributeError):
-        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER or fallback_handler
-    return fallback_handler
+def _resolve_request_policy_handler(llm_api_handler: Any) -> Any:
+    return llm_api_handler
 
 
 @dataclass(frozen=True)
