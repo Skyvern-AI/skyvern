@@ -68,9 +68,10 @@ function BrowserProfileItem({ profile }: Props) {
               <TooltipTrigger asChild>
                 <Button
                   size="icon"
-                  variant="outline"
+                  variant="ghost"
                   onClick={() => setRenameOpen(true)}
                   aria-label="Rename browser profile"
+                  className="text-muted-foreground hover:text-foreground"
                 >
                   <Pencil1Icon className="h-4 w-4" />
                 </Button>
