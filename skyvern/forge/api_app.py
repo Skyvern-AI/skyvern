@@ -45,6 +45,10 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
+from skyvern.services.workflow_schedule_service import (
+    start_workflow_schedule_scheduler,
+    stop_workflow_schedule_scheduler,
+)
 
 LOG = structlog.get_logger()
 
@@ -180,6 +184,10 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if cleanup_task:
         LOG.info("Cleanup scheduler started")
 
+    workflow_schedule_task = start_workflow_schedule_scheduler()
+    if workflow_schedule_task:
+        LOG.info("Workflow schedule scheduler started")
+
     # Start MCP sub-application lifespan if mounted. Starlette Mount does NOT
     # forward lifespan events to sub-apps, so we must enter the MCP app's
     # lifespan here. This initializes the streamable-http session manager's
@@ -194,6 +202,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         yield
 
     # Stop cleanup scheduler
+    await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
 
     if forge_app.api_app_shutdown_event:

@@ -592,6 +592,14 @@ class Settings(BaseSettings):
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
 
+    # Workflow Schedule Settings
+    ENABLE_WORKFLOW_SCHEDULES: bool = True
+    """Enable recurring workflow schedules in the OSS/local server."""
+    WORKFLOW_SCHEDULE_POLL_INTERVAL_SECONDS: float = 60.0
+    """How often the OSS/local scheduler scans for due workflow schedules."""
+    WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
+    """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
+
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False
     OTEL_SERVICE_NAME: str = "skyvern"
