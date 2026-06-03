@@ -348,6 +348,11 @@ def _mask_secrets(entry: dict) -> dict:
         key = masked["env"]["SKYVERN_API_KEY"]
         masked["env"]["SKYVERN_API_KEY"] = _mask_key(key)
 
+    # OpenCode local stdio format: environment.SKYVERN_API_KEY
+    if "environment" in masked and "SKYVERN_API_KEY" in masked["environment"]:
+        key = masked["environment"]["SKYVERN_API_KEY"]
+        masked["environment"]["SKYVERN_API_KEY"] = _mask_key(key)
+
     # mcp-remote bridge format: args contain "x-api-key:..."
     if "args" in masked:
         masked["args"] = [
@@ -383,14 +388,14 @@ def _load_mcp_config(config_path: Path) -> tuple[dict | None, str | None]:
 
 
 def _load_opencode_config(config_path: Path) -> tuple[dict | None, str | None]:
-    """Load an OpenCode config file."""
+    """Load an OpenCode config file, accepting OpenCode's JSONC/JSON5 syntax."""
     if not config_path.exists():
         return {}, None
 
     try:
-        existing = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None, f"Cannot parse {config_path}. Fix the JSON and re-run."
+        existing = json5.loads(config_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return None, f"Cannot parse {config_path}. Fix the JSONC/JSON and re-run."
 
     if not isinstance(existing, dict):
         return None, f"{config_path} must contain a top-level JSON object."

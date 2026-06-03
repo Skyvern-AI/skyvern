@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,19 @@ def test_entry_kind_requires_exact_npx_for_mcp_remote_bridge() -> None:
     assert _entry_kind(entry) == "unsupported"
 
 
+def test_entry_kind_accepts_opencode_local_command_array() -> None:
+    entry = {
+        "type": "local",
+        "command": [sys.executable, "-m", "skyvern", "run", "mcp"],
+        "environment": {
+            "SKYVERN_BASE_URL": "http://localhost:8000",
+            "SKYVERN_API_KEY": "old-key",
+        },
+    }
+
+    assert _entry_kind(entry) == "local stdio"
+
+
 def test_sanitize_prompt_response_strips_arrow_escape_noise() -> None:
     assert _sanitize_prompt_response("\x1b[C\x1b[C\x1b[Call") == "all"
 
@@ -242,6 +256,60 @@ def test_apply_profile_to_target_updates_codex_entry_and_creates_backup(tmp_path
 
     backup = toml.loads(backup_path.read_text(encoding="utf-8"))
     assert backup["mcp_servers"]["skyvern"]["http_headers"]["x-api-key"] == "old-key"
+
+
+def test_apply_profile_to_target_updates_opencode_local_jsonc_entry(tmp_path: Path) -> None:
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text(
+        f"""
+{{
+  // OpenCode allows JSONC.
+  "mcp": {{
+    "skyvern": {{
+      "type": "local",
+      "command": {json.dumps([sys.executable, "-m", "skyvern", "run", "mcp"])},
+      "environment": {{
+        "SKYVERN_BASE_URL": "http://localhost:8000",
+        "SKYVERN_API_KEY": "old-key",
+        "OTHER": "keep-me",
+      }},
+    }},
+  }},
+}}
+""",
+        encoding="utf-8",
+    )
+    entry = {
+        "type": "local",
+        "command": [sys.executable, "-m", "skyvern", "run", "mcp"],
+        "environment": {
+            "SKYVERN_BASE_URL": "http://localhost:8000",
+            "SKYVERN_API_KEY": "old-key",
+            "OTHER": "keep-me",
+        },
+    }
+    target = SwitchTarget(
+        name="OpenCode",
+        config_path=config_path,
+        entry_key="skyvern",
+        entry=entry,
+        config_format="opencode",
+        entry_path=["mcp"],
+    )
+    profile = _build_profile("Prod", "new-key-1234567890", "https://alt.skyvern.example")
+
+    changed, backup_path = _apply_profile_to_target(target, profile)
+
+    assert changed is True
+    assert backup_path is not None
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    written_entry = written["mcp"]["skyvern"]
+    assert written_entry["type"] == "local"
+    assert written_entry["command"] == [sys.executable, "-m", "skyvern", "run", "mcp"]
+    assert written_entry["environment"]["SKYVERN_API_KEY"] == "new-key-1234567890"
+    assert written_entry["environment"]["SKYVERN_BASE_URL"] == "https://alt.skyvern.example"
+    assert written_entry["environment"]["OTHER"] == "keep-me"
+    assert "env" not in written_entry
 
 
 def test_patch_entry_with_profile_preserves_openclaw_transport_and_extras() -> None:
@@ -672,7 +740,7 @@ def test_discover_switch_targets_finds_claude_code_and_codex(
     assert discovered_by_name["Codex"].entry_key == "skyvern"
     assert discovered_by_name["OpenClaw"].entry_key == "skyvern"
     assert discovered_by_name["OpenClaw"].entry_path == ["mcp", "servers"]
-    assert {name for name, _ in missing} == {"Claude Desktop", "Cursor", "Windsurf", "Hermes"}
+    assert {name for name, _ in missing} == {"Claude Desktop", "Cursor", "Windsurf", "OpenCode", "Hermes"}
 
 
 def test_discover_switch_targets_reports_openclaw_invalid_nested_structure(

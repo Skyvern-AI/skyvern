@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from skyvern.cli.setup_commands import setup_app
+from skyvern.cli.setup_commands import _mask_secrets, setup_app
 
 runner = CliRunner()
 
@@ -98,3 +98,47 @@ def test_setup_opencode_respects_opencode_config_env(
     assert result.exit_code == 0, result.output
     config = _load_json(custom_config)
     assert config["mcp"]["skyvern"]["oauth"] is False
+
+
+def test_setup_opencode_accepts_jsonc_config(opencode_home: Path) -> None:
+    config_path = opencode_home / "opencode.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """
+{
+  // OpenCode configs are JSONC.
+  "mcp": {
+    "skyvern": {
+      "type": "remote",
+      "url": "https://old.example.com/mcp/",
+      "oauth": true,
+    },
+  },
+}
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(setup_app, ["opencode", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    config = _load_json(config_path)
+    entry = config["mcp"]["skyvern"]
+    assert entry["url"] == "https://api.skyvern.com/mcp/"
+    assert entry["oauth"] is False
+    assert entry["headers"]["x-api-key"] == "test-key-1234567890"
+
+
+def test_mask_secrets_masks_opencode_environment_api_key() -> None:
+    masked = _mask_secrets(
+        {
+            "type": "local",
+            "command": [sys.executable, "-m", "skyvern", "run", "mcp"],
+            "environment": {
+                "SKYVERN_BASE_URL": "http://localhost:8000",
+                "SKYVERN_API_KEY": "test-key-1234567890",
+            },
+        }
+    )
+
+    assert masked["environment"]["SKYVERN_API_KEY"] == "test****7890"

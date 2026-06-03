@@ -396,17 +396,20 @@ def _entry_kind(entry: dict | None) -> str:
 
     entry_type = entry.get("type")
 
-    command = entry.get("command", "")
-    command_name = Path(command).name if command else ""
-    args = entry.get("args", [])
-    if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
-        return "mcp-remote bridge"
-
     if entry_type == "local":
         return "local stdio"
 
     if entry_type in {"http", "remote"}:
         return "remote http"
+
+    command = entry.get("command", "")
+    if isinstance(command, list):
+        command_name = Path(str(command[0])).name if command else ""
+    else:
+        command_name = Path(command).name if command else ""
+    args = entry.get("args", [])
+    if command_name == "npx" and isinstance(args, list) and args and args[0] == "mcp-remote":
+        return "mcp-remote bridge"
 
     if entry.get("type") == "http" or "url" in entry or isinstance(entry.get("http_headers"), dict):
         return "remote http"
