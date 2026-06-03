@@ -322,12 +322,15 @@ function RunHistory() {
                       <TooltipTrigger asChild>
                         <Button
                           size="icon"
-                          variant="outline"
+                          variant="ghost"
                           onClick={(event) => {
                             event.stopPropagation();
                             toggleParametersExpanded(run.run_id);
                           }}
-                          className={cn(isExpanded && "text-blue-400")}
+                          className={cn(
+                            "text-muted-foreground hover:text-foreground",
+                            isExpanded && "text-blue-400",
+                          )}
                         >
                           <MixerHorizontalIcon className="h-4 w-4" />
                         </Button>
