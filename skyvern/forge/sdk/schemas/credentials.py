@@ -294,8 +294,27 @@ class TestCredentialRequest(BaseModel):
         max_length=1000,
         description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
     )
+    navigation_goal: str | None = Field(
+        default=None,
+        max_length=20000,
+        description=(
+            "Optional custom navigation goal that REPLACES the built-in generic login prompt. "
+            "Use the same prompt as your working `login` block when the generic login cannot "
+            "complete a site-specific 2FA step (e.g. a masked phone-number dropdown). "
+            "user_context, if provided, is still appended."
+        ),
+    )
+    terminate_criterion: str | None = Field(
+        default=None,
+        max_length=20000,
+        description=(
+            "Optional custom terminate criterion that REPLACES the built-in one. The default "
+            "criterion terminates as soon as the page asks for a phone number, which blocks "
+            "some legitimate 2FA flows; override it to allow them."
+        ),
+    )
 
-    @field_validator("user_context", mode="before")
+    @field_validator("user_context", "navigation_goal", "terminate_criterion", mode="before")
     @classmethod
     def normalize_user_context(cls, v: str | None) -> str | None:
         return _normalize_optional_str(v)
@@ -346,8 +365,25 @@ class TestLoginRequest(BaseModel):
         max_length=1000,
         description="Optional user-provided context describing the login sequence (e.g., 'click SSO button first')",
     )
+    navigation_goal: str | None = Field(
+        default=None,
+        max_length=20000,
+        description=(
+            "Optional custom navigation goal that REPLACES the built-in generic login prompt. "
+            "Use the same prompt as your working `login` block when the generic login cannot "
+            "complete a site-specific 2FA step. user_context, if provided, is still appended."
+        ),
+    )
+    terminate_criterion: str | None = Field(
+        default=None,
+        max_length=20000,
+        description=(
+            "Optional custom terminate criterion that REPLACES the built-in one (which "
+            "terminates as soon as the page asks for a phone number)."
+        ),
+    )
 
-    @field_validator("user_context", mode="before")
+    @field_validator("user_context", "navigation_goal", "terminate_criterion", mode="before")
     @classmethod
     def normalize_user_context(cls, v: str | None) -> str | None:
         return _normalize_optional_str(v)

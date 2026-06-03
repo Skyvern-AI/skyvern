@@ -533,8 +533,8 @@ async def test_login(
         label=label,
         title=label,
         url=data.url,
-        navigation_goal=_build_navigation_goal(LOGIN_TEST_PROMPT, data.user_context),
-        terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
+        navigation_goal=_build_navigation_goal(data.navigation_goal or LOGIN_TEST_PROMPT, data.user_context),
+        terminate_criterion=data.terminate_criterion or LOGIN_TEST_TERMINATE_CRITERION,
         max_steps_per_run=None,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
@@ -704,8 +704,14 @@ async def test_credential(
         has_user_context=bool(data.user_context),
     )
 
-    base_prompt = LOGIN_TEST_PROMPT
+    # A custom navigation_goal/terminate_criterion lets callers reuse the exact prompt
+    # their working `login` block uses, so a site-specific 2FA step (e.g. a masked
+    # phone-number dropdown) can be cleared during profile seeding. The default
+    # LOGIN_TEST_PROMPT/CRITERION terminate as soon as a phone number is requested, which
+    # makes those flows impossible to persist.
+    base_prompt = data.navigation_goal or LOGIN_TEST_PROMPT
     navigation_goal = _build_navigation_goal(base_prompt, data.user_context)
+    terminate_criterion = data.terminate_criterion or LOGIN_TEST_TERMINATE_CRITERION
 
     parameter_key = "credential"
     label = "login"
@@ -724,7 +730,7 @@ async def test_credential(
         title=label,
         url=data.url,
         navigation_goal=navigation_goal,
-        terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
+        terminate_criterion=terminate_criterion,
         max_steps_per_run=None,
         parameter_keys=[parameter_key],
         totp_verification_url=None,
