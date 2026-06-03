@@ -183,6 +183,10 @@ class SkyvernContext:
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
     proactive_captcha_task_ids: set[str] = field(default_factory=set)
 
+    # Circuit breaker: consecutive captcha solve timeouts for this workflow run.
+    # When this reaches the threshold, further captcha solve attempts are short-circuited.
+    consecutive_captcha_timeouts: int = 0
+
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
     recent_dialog_messages: list[DialogEntry] = field(default_factory=list)
@@ -407,20 +411,31 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
 
 
 @contextmanager
-def scoped(context: SkyvernContext) -> Iterator[SkyvernContext]:
+def scoped(
+    context: SkyvernContext,
+    *,
+    propagate_captcha_timeout: bool = False,
+) -> Iterator[SkyvernContext]:
     """
     Temporarily scope the current context to a fresh child context.
 
     Args:
         context: The child context to set for the scope
+        propagate_captcha_timeout: When True, copy the child's
+            ``consecutive_captcha_timeouts`` back to the parent on exit.
+            Only enable for scopes that represent real task executions
+            (e.g. run_task_v2), not placeholder contexts.
 
     Yields:
         The child context
     """
+    parent = _context.get() if propagate_captcha_timeout else None
     token = _context.set(context)
     try:
         yield context
     finally:
+        if parent is not None:
+            parent.consecutive_captcha_timeouts = context.consecutive_captcha_timeouts
         _restore(token)
 
 
