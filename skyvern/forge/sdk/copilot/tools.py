@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import json
 import re
 import time
@@ -82,6 +81,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import (
     clear_failed_step_tracker_for_tools_in_ctx,
     detect_failed_tool_step_loop_for_ctx,
@@ -5340,10 +5340,11 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
 _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS = 5.0
 
 
-def _completion_verification_handler() -> Any:
-    with contextlib.suppress(RuntimeError, AttributeError):
-        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
-    return None
+async def _completion_verification_handler(copilot_ctx: Any) -> Any | None:
+    return await resolve_main_copilot_handler(
+        getattr(copilot_ctx, "workflow_permanent_id", None),
+        getattr(copilot_ctx, "organization_id", None),
+    )
 
 
 def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:
@@ -5430,7 +5431,7 @@ async def _maybe_run_completion_verification(
         return None
     # A missing judge handler is an infra/config state, not a transient failure:
     # fall back to the prior gate rather than fail closed on every run.
-    handler = _completion_verification_handler()
+    handler = await _completion_verification_handler(copilot_ctx)
     if handler is None:
         return None
     # Too little budget to verify a candidate run: fail closed (unavailable) rather
@@ -6670,11 +6671,11 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
     )
 
 
-def _composition_visual_handler() -> Any | None:
-    try:
-        return app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        return None
+async def _composition_visual_handler(ctx: CopilotContext) -> Any | None:
+    return await resolve_main_copilot_handler(
+        getattr(ctx, "workflow_permanent_id", None),
+        getattr(ctx, "organization_id", None),
+    )
 
 
 def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
@@ -6710,9 +6711,9 @@ async def _composition_summarize_screenshot(
     evidence: dict[str, Any],
     screenshot_b64: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    handler = _composition_visual_handler()
+    handler = await _composition_visual_handler(ctx)
     if handler is None:
-        return None, "workflow copilot fast LLM handler is not configured"
+        return None, "workflow copilot LLM handler is not configured"
     try:
         screenshot_bytes = base64.b64decode(screenshot_b64, validate=True)
     except Exception:
