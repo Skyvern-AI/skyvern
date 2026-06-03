@@ -55,6 +55,7 @@ from skyvern.webeye.cdp_connection import (
 )
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.session_cookies import restore_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -419,6 +420,7 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
