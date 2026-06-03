@@ -34,6 +34,7 @@ for (const wf of workflows) {
 | `search_key` | `str` | No | `None` | Case-insensitive substring search across workflow title, folder name, and parameter metadata. |
 | `folder_id` | `str` | No | `None` | Filter by folder. |
 | `status` | `WorkflowStatus \| list[WorkflowStatus]` | No | `None` | Filter by status. |
+| `tags` | `list[str]` | No | `None` | Filter by tags as `key:value` pairs (e.g. `["env:prod"]` or `["customer:acme,env:prod"]`). AND across distinct keys, OR within a key. Matches current tag values only. Not supported with `template=true`. |
 | `request_options` | `RequestOptions` | No | - | Per-request configuration (see below). |
 
 ### Returns `list[Workflow]`
