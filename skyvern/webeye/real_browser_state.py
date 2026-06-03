@@ -27,6 +27,7 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -432,6 +433,8 @@ class RealBrowserState(BrowserState):
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
+                    session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+                    await persist_session_cookies(self.browser_context, session_dir)
                     try:
                         await self.browser_context.close()
                     except Exception:
