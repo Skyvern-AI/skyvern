@@ -464,12 +464,16 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
-    workflow_schedules_enabled: bool = False
+    workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 
-    OSS Skyvern has no scheduling backend wired up by default, so the routes return 501.
-    Cloud overrides this to True and provides the Temporal-backed implementations below.
+    OSS Skyvern uses a local background scheduler by default. Set
+    ENABLE_WORKFLOW_SCHEDULES=false to disable the routes and scheduler.
+    Cloud overrides the local scheduler flag and provides the Temporal-backed
+    implementations below.
     """
+    workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
+    """Whether the API process should run the built-in local scheduler loop."""
 
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
@@ -776,10 +780,10 @@ class AgentFunction:
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
 
-        OSS has no execution backend, so this returns None and the schedule simply
-        lives in the database. Cloud overrides this to derive a Temporal schedule id.
+        OSS uses a deterministic local backend id. Cloud overrides this to derive
+        a Temporal schedule id.
         """
-        return None
+        return f"local-wf-sched-{workflow_schedule_id}"
 
     async def upsert_workflow_schedule(
         self,
@@ -794,7 +798,7 @@ class AgentFunction:
     ) -> None:
         """Upsert a recurring schedule with the execution backend (e.g. Temporal).
 
-        OSS base is a no-op so the route layer can stay backend-agnostic.
+        OSS base is a no-op because the local scheduler scans the database.
         Cloud overrides this to register the schedule with Temporal.
         Implementations must be idempotent.
         """
