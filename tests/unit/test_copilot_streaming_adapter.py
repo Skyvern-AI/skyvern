@@ -205,14 +205,16 @@ async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
 
-    from skyvern.forge.sdk.copilot import narration
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 
     async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
         return "Revising the workflow draft."
 
-    monkeypatch.setattr(narration, "_get_narrator_handler", lambda: _handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.streaming_adapter.resolve_narrator_handler",
+        AsyncMock(return_value=_handler),
+    )
 
     # Tool input / output raw_items matching the shapes streaming_adapter reads.
     call_raw = {"call_id": "c-upd", "name": "update_workflow", "arguments": "{}"}

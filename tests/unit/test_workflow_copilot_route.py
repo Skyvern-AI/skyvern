@@ -158,7 +158,7 @@ def _setup_new_copilot_mocks(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
 
@@ -301,7 +301,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
     monkeypatch.setattr(
