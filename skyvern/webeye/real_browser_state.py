@@ -36,6 +36,19 @@ SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
 
 
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
+
+
 class RealBrowserState(BrowserState):
     def __init__(
         self,
@@ -118,7 +131,7 @@ class RealBrowserState(BrowserState):
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
-                if len(pages) > 0:
+                if pages:
                     page = pages[-1]
                     use_existing_page = True
             if page is None:
@@ -128,7 +141,7 @@ class RealBrowserState(BrowserState):
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url and page.url.rstrip("/") != url.rstrip("/"):
+            if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
 
     async def _wait_for_settle(self) -> None:

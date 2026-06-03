@@ -106,7 +106,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
     truncate_output,
 )
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
-from skyvern.forge.sdk.copilot.runtime import AgentContext, ensure_browser_session
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    PendingBrowserInteractionObservation,
+    ensure_browser_session,
+)
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -1358,6 +1362,57 @@ def _mark_page_inspected(ctx: AgentContext) -> None:
     ctx.post_budget_page_inspection_required = False
     ctx.post_budget_page_inspection_url = None
     ctx.post_budget_page_inspection_run_id = None
+
+
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception as exc:
+        LOG.debug("copilot_same_page_url_parse_failed", left=left, right=right, error=str(exc))
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
+
+
+def _clear_pending_browser_interaction_observation(ctx: AgentContext) -> None:
+    ctx.pending_browser_interaction_observation = None
+
+
+def _mark_pending_browser_interaction_observation(ctx: AgentContext, *, tool_name: str, url: str) -> None:
+    if not url.strip():
+        _clear_pending_browser_interaction_observation(ctx)
+        return
+    ctx.pending_browser_interaction_observation = PendingBrowserInteractionObservation(
+        tool_name=tool_name,
+        url=url.strip(),
+    )
+
+
+def _consume_pending_browser_interaction_observation(
+    ctx: AgentContext,
+    *,
+    current_url: str,
+    evidence: dict[str, Any],
+) -> bool:
+    pending = ctx.pending_browser_interaction_observation
+    if pending is None:
+        return False
+    _clear_pending_browser_interaction_observation(ctx)
+    if not has_bounded_page_schema(evidence):
+        return False
+    if not _same_page_ignoring_fragment(pending.url, current_url):
+        LOG.warning(
+            "copilot_pending_browser_interaction_observation_page_mismatch",
+            tool_name=pending.tool_name,
+            pending_url=pending.url,
+            current_url=current_url,
+        )
+        return False
+    return True
 
 
 def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
@@ -4262,6 +4317,47 @@ def _normalize_observed_forms(observed_data: dict[str, Any]) -> list[dict[str, A
     return [{"id": "", "name": "", "action": "", "method": "", "fields": fields, "submit_controls": []}]
 
 
+def _evaluate_observed_payload(observed_data: object) -> dict[str, Any]:
+    if not isinstance(observed_data, dict):
+        return {}
+    raw_result = observed_data.get("result")
+    if isinstance(raw_result, dict):
+        payload: dict[str, Any] = dict(raw_result)
+    elif isinstance(raw_result, list):
+        payload = {"rows": raw_result}
+    else:
+        payload = {}
+    for key, value in observed_data.items():
+        if key == "result":
+            continue
+        if key not in payload or payload.get(key) in (None, "", [], {}):
+            payload[key] = value
+    return payload or observed_data
+
+
+def _observed_row_text(row: object) -> str:
+    if isinstance(row, str):
+        return _bounded_observation_text(row, 500)
+    if not isinstance(row, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("text", "label", "name", "title"):
+        value = row.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    cells = row.get("cells")
+    if isinstance(cells, list):
+        for cell in cells[:12]:
+            if isinstance(cell, dict):
+                for key in ("text", "value"):
+                    value = cell.get(key)
+                    if isinstance(value, str):
+                        parts.append(value)
+            elif isinstance(cell, str):
+                parts.append(cell)
+    return _bounded_observation_text(" ".join(parts), 500)
+
+
 def _normalize_observed_result_containers(observed_data: dict[str, Any]) -> list[dict[str, Any]]:
     raw_results = observed_data.get("result_containers") or observed_data.get("tables")
     containers: list[dict[str, Any]] = []
@@ -4277,14 +4373,74 @@ def _normalize_observed_result_containers(observed_data: dict[str, Any]) -> list
                 )
     if containers:
         return containers
+    raw_rows = observed_data.get("rows")
+    if isinstance(raw_rows, list) and raw_rows:
+        sample_rows = [text for row in raw_rows[:5] if (text := _observed_row_text(row))]
+        return [
+            {
+                "tag": "table",
+                "id": _bounded_observation_text(observed_data.get("id"), 120),
+                "selector": _bounded_observation_text(observed_data.get("selector"), 160),
+                "row_count": len(raw_rows),
+                "sample_rows": sample_rows,
+            }
+        ]
     table = observed_data.get("table")
     if table:
         return [{"tag": "table", "id": "", "selector": ""}]
     return []
 
 
+def _normalize_evaluate_challenge_state(
+    observed_data: dict[str, Any],
+    anti_bot_indicators: list[str],
+) -> dict[str, Any]:
+    detected = bool(anti_bot_indicators)
+    gated_controls: list[dict[str, Any]] = []
+    for key, value in observed_data.items():
+        normalized_key = str(key).strip().lower().replace("_", " ").replace("-", " ")
+        if "disabled" not in normalized_key or value is not True:
+            continue
+        if any(token in normalized_key for token in ("submit", "search", "button", "btn")):
+            gated_controls.append(
+                {
+                    "text": _bounded_observation_text(str(key), 120),
+                    "id": "",
+                    "name": _bounded_observation_text(str(key), 120),
+                    "selector": "",
+                    "disabled": True,
+                }
+            )
+    indicator_text = " ".join(anti_bot_indicators).lower()
+    if "access denied" in indicator_text:
+        kind = "access_denied"
+    elif "turnstile" in indicator_text or "captcha" in indicator_text or "are you a robot" in indicator_text:
+        kind = "captcha"
+    elif detected:
+        kind = "human_verification"
+    else:
+        kind = "none"
+    return {
+        "detected": detected,
+        "kind": kind,
+        "source": "mcp_evaluate" if detected else "",
+        "indicators": anti_bot_indicators[:8],
+        "requires_human_verification": detected,
+        "visual_location": "",
+        "gates_submit_controls": bool(detected and gated_controls),
+        "gated_submit_controls": gated_controls[:5] if detected else [],
+    }
+
+
+def _evaluate_anti_bot_indicators(observed_data: dict[str, Any], text: str) -> list[str]:
+    key_text = " ".join(str(key) for key in observed_data.keys()).lower()
+    combined = f"{text} {key_text}"
+    return [pattern for pattern in _DISCOVERY_ANTI_BOT_PATTERNS if pattern in combined]
+
+
 def _normalize_evaluate_page_schema(observed_data: object) -> dict[str, Any]:
-    if not isinstance(observed_data, dict):
+    observed_data = _evaluate_observed_payload(observed_data)
+    if not observed_data:
         return {}
     text_parts = [
         observed_data.get("body"),
@@ -4293,7 +4449,7 @@ def _normalize_evaluate_page_schema(observed_data: object) -> dict[str, Any]:
         observed_data.get("html"),
     ]
     text = " ".join(part for part in text_parts if isinstance(part, str)).lower()[:4096]
-    anti_bot = [pattern for pattern in _DISCOVERY_ANTI_BOT_PATTERNS if pattern in text]
+    anti_bot = _evaluate_anti_bot_indicators(observed_data, text)
     forms = _normalize_observed_forms(observed_data)
     result_containers = _normalize_observed_result_containers(observed_data)
     if not forms and not result_containers and not anti_bot:
@@ -4302,6 +4458,7 @@ def _normalize_evaluate_page_schema(observed_data: object) -> dict[str, Any]:
         "forms": forms,
         "result_containers": result_containers,
         "anti_bot_indicators": anti_bot,
+        "challenge_state": _normalize_evaluate_challenge_state(observed_data, anti_bot),
         "evidence_sources": ["mcp_evaluate"],
         "evidence_confidence": (
             _EVALUATE_EVIDENCE_CONFIDENCE_WITH_SCHEMA
@@ -4318,15 +4475,15 @@ def _record_composition_page_observation(
     url: str,
     title: str = "",
     observed_data: object | None = None,
-) -> None:
+    append_to_flow: bool = False,
+    reached_via: str = "current_page",
+) -> int | None:
     if not url:
-        return
+        return None
     _mark_post_run_page_observed(ctx, source_tool=source_tool, url=url)
     if title:
         _workflow_verification_evidence(ctx).page_title = title[:160]
     existing = ctx.composition_page_evidence
-    if isinstance(existing, dict) and existing.get("source_tool") == "inspect_page_for_composition":
-        return
 
     evidence: dict[str, Any] = {
         "inspected_url": url,
@@ -4357,7 +4514,157 @@ def _record_composition_page_observation(
     if isinstance(run_id, str) and run_id:
         evidence["workflow_run_id"] = run_id
         evidence["observed_after_workflow_run"] = True
-    ctx.composition_page_evidence = evidence
+
+    observation_step: int | None = None
+    if append_to_flow and has_bounded_page_schema(evidence):
+        actual_reached_via = reached_via
+        if reached_via == "auto":
+            if isinstance(run_id, str) and run_id:
+                actual_reached_via = "post_run"
+            elif _consume_pending_browser_interaction_observation(ctx, current_url=url, evidence=evidence):
+                actual_reached_via = "interaction"
+            else:
+                actual_reached_via = "current_page"
+        observation_step = _append_flow_evidence(ctx, evidence, reached_via=actual_reached_via)
+
+    if not _should_keep_existing_composition_page_evidence(existing, evidence):
+        ctx.composition_page_evidence = evidence
+    return observation_step
+
+
+def _composition_evidence_page_url(evidence: dict[str, Any] | None) -> str | None:
+    if not isinstance(evidence, dict):
+        return None
+    for key in ("current_url", "inspected_url"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip() and value != "current_page":
+            return value.strip()
+    return None
+
+
+def _should_keep_existing_composition_page_evidence(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> bool:
+    if not isinstance(existing, dict) or existing.get("source_tool") != "inspect_page_for_composition":
+        return False
+    if incoming.get("source_tool") != "evaluate":
+        return True
+    if not has_bounded_page_schema(incoming):
+        return True
+    if not has_bounded_page_schema(existing):
+        return False
+    existing_url = _composition_evidence_page_url(existing)
+    incoming_url = _composition_evidence_page_url(incoming)
+    if existing_url and incoming_url and not _same_page_ignoring_fragment(existing_url, incoming_url):
+        return False
+    return True
+
+
+def _completion_verification_criteria(copilot_ctx: Any) -> list[Any]:
+    policy = getattr(copilot_ctx, "request_policy", None)
+    # A method-mandated criterion asserts HOW the goal was reached; the outcome
+    # judge sees only end-state evidence.
+    return [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+
+
+def _verified_context_block_labels_for_snapshot(
+    copilot_ctx: Any, current_labels: list[str], executed_labels: list[str]
+) -> list[str]:
+    current_label_set = set(current_labels)
+    executed_label_set = set(executed_labels)
+    candidates: set[str] = set()
+    for raw_values in (
+        getattr(copilot_ctx, "verified_prefix_labels", None),
+        getattr(getattr(copilot_ctx, "workflow_verification_evidence", None), "block_verified", None),
+    ):
+        if not isinstance(raw_values, list):
+            continue
+        candidates.update(str(label) for label in raw_values if isinstance(label, str) and label in current_label_set)
+    return [label for label in current_labels if label in candidates and label not in executed_label_set]
+
+
+def _build_page_observation_evidence_snapshot(
+    copilot_ctx: Any,
+    *,
+    url: str,
+    title: str = "",
+    observed_data: object | None = None,
+) -> RunEvidenceSnapshot:
+    run_id = getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None)
+    block_outputs: dict[str, Any] = {}
+    if isinstance(observed_data, dict) and observed_data:
+        block_outputs["current_page_observation"] = observed_data
+    elif observed_data is not None:
+        block_outputs["current_page_observation"] = str(observed_data)
+    return RunEvidenceSnapshot(
+        workflow_run_id=run_id if isinstance(run_id, str) else None,
+        block_outputs=block_outputs,
+        current_url=_valid_runtime_anchor_url(url),
+        page_title=title if isinstance(title, str) and title.strip() else None,
+    )
+
+
+async def _maybe_run_completion_verification_from_page_observation(
+    copilot_ctx: Any,
+    *,
+    url: str,
+    title: str = "",
+    observed_data: object | None = None,
+) -> CompletionVerificationResult | None:
+    """Verify completion only for post-run page observations after failed tests."""
+
+    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
+        return None
+    existing = getattr(copilot_ctx, "completion_verification_result", None)
+    if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():
+        return existing
+    if getattr(copilot_ctx, "post_run_page_observation_after_failed_test", False) is not True:
+        return None
+    criteria = _completion_verification_criteria(copilot_ctx)
+    if not criteria:
+        return None
+    handler = await _completion_verification_handler(copilot_ctx)
+    if handler is None:
+        return None
+    remaining = _copilot_seconds_remaining(copilot_ctx)
+    if (
+        remaining is not None
+        and remaining
+        <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+    ):
+        verification = CompletionVerificationResult(status="unavailable")
+    else:
+        snapshot = _build_page_observation_evidence_snapshot(
+            copilot_ctx,
+            url=url,
+            title=title,
+            observed_data=observed_data,
+        )
+        if not snapshot.has_evidence():
+            verification = CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=[criterion.id for criterion in criteria],
+                verdicts=[
+                    CriterionVerdict(criterion_id=criterion.id, satisfied=False, reason_code="no_evidence")
+                    for criterion in criteria
+                ],
+            )
+        else:
+            verification = await evaluate_completion_criteria(criteria, snapshot, handler)
+
+    if (
+        isinstance(existing, CompletionVerificationResult)
+        and not verification.is_fully_satisfied()
+        and not (existing.status == "unavailable" and verification.status == "evaluated")
+    ):
+        return existing
+
+    copilot_ctx.completion_verification_result = verification
+    record_completion_verification(copilot_ctx, verification)
+    if verification.status == "evaluated":
+        _emit_completion_verification_trace(copilot_ctx, verification)
+    return verification
 
 
 # Block types the copilot must never emit. They delegate the entire goal to
@@ -4709,6 +5016,7 @@ async def _navigate_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok"):
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
@@ -4743,9 +5051,11 @@ async def _click_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
+        _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
             "selector": data.get("selector", ""),
             "url": url,
@@ -4818,6 +5128,7 @@ async def _type_text_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = data.get("selector", "")
@@ -4831,6 +5142,7 @@ async def _type_text_post_hook(
         landing_failure = await _verify_scout_type_landed(ctx, selector=selector, typed_length=typed_length)
         if landing_failure is not None:
             return landing_failure
+        _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
     return result
 
 
@@ -4850,9 +5162,20 @@ async def _evaluate_post_hook(
         title = str(result["data"].get("title") or "")
         if not title:
             _, title = await _resolve_url_title(raw, ctx)
-        _record_composition_page_observation(
+        observation_step = _record_composition_page_observation(
             ctx,
             source_tool="evaluate",
+            url=url,
+            title=title,
+            observed_data=result["data"],
+            append_to_flow=True,
+            reached_via="auto",
+        )
+        if observation_step is not None:
+            result["observation_step"] = observation_step
+            result["data"]["observation_step"] = observation_step
+        await _maybe_run_completion_verification_from_page_observation(
+            ctx,
             url=url,
             title=title,
             observed_data=result["data"],
@@ -4881,9 +5204,11 @@ async def _select_option_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
+        _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
         result["data"] = {
             "selector": data.get("selector", ""),
             "value": data.get("value", ""),
@@ -4897,9 +5222,11 @@ async def _press_key_post_hook(
     raw: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any]:
+    _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
+        _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
         result["data"] = {
             "key": data.get("key", ""),
             "selector": data.get("selector", ""),
@@ -5384,7 +5711,8 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
 def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
-    current_labels = set(_current_workflow_block_labels(copilot_ctx))
+    current_label_order = _current_workflow_block_labels(copilot_ctx)
+    current_labels = set(current_label_order)
     # Evidence must be what THIS run produced. ``verified_block_outputs`` accumulates
     # across incremental runs, so sourcing from it would let an output from a prior
     # run satisfy a criterion the current run never re-produced.
@@ -5399,6 +5727,7 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
             if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(output):
                 block_outputs[label] = output
     executed = data.get("executed_block_labels")
+    executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
     run_id = data.get("workflow_run_id")
     return RunEvidenceSnapshot(
@@ -5406,7 +5735,12 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
         block_outputs=block_outputs,
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
-        executed_block_labels=[str(label) for label in executed] if isinstance(executed, list) else [],
+        executed_block_labels=executed_block_labels,
+        verified_context_block_labels=_verified_context_block_labels_for_snapshot(
+            copilot_ctx,
+            current_label_order,
+            executed_block_labels,
+        ),
     )
 
 
@@ -5417,11 +5751,7 @@ async def _maybe_run_completion_verification(
         return None
     if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
         return None
-    policy = getattr(copilot_ctx, "request_policy", None)
-    # A method-mandated criterion asserts HOW the goal was reached; this judge sees
-    # only end-state evidence and would always return no_evidence, false-blocking a
-    # legitimate success. Verifying method adherence needs an action trace (separate).
-    criteria = [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+    criteria = _completion_verification_criteria(copilot_ctx)
     if not criteria:
         return None
     if not (
@@ -5493,6 +5823,42 @@ def _outcome_failure_warrants_repair(
     if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
         return True
     return _current_workflow_has_evidence_block(copilot_ctx)
+
+
+def _tool_visible_result_after_completion_verification(
+    copilot_ctx: Any,
+    result: dict[str, Any],
+    completion_verification: CompletionVerificationResult | None,
+) -> dict[str, Any]:
+    outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+    if outcome_unverified_reason is None:
+        return result
+    if not _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
+        return result
+
+    data = result.get("data")
+    copied_data = dict(data) if isinstance(data, dict) else {}
+    copied_data["failure_reason"] = outcome_unverified_reason
+    copied_data["completion_verification"] = (
+        completion_verification.to_trace_data() if completion_verification is not None else None
+    )
+    categories = copied_data.get("failure_categories")
+    copied_categories = list(categories) if isinstance(categories, list) else []
+    copied_categories.insert(
+        0,
+        {
+            "category": "OUTCOME_UNVERIFIED",
+            "confidence_float": 1.0,
+            "reasoning": outcome_unverified_reason,
+        },
+    )
+    copied_data["failure_categories"] = copied_categories
+    return {
+        **result,
+        "ok": False,
+        "error": outcome_unverified_reason,
+        "data": copied_data,
+    }
 
 
 def _emit_completion_verification_trace(
@@ -5769,6 +6135,27 @@ async def update_workflow_tool(
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
         return json.dumps(result)
 
+    with copilot_span(
+        "composition_evidence_precheck",
+        data={**_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA, "tool_name": "update_workflow"},
+    ):
+        composition_evidence_error = _update_and_run_blocks_composition_evidence_precheck(
+            copilot_ctx,
+            workflow_yaml,
+            normalized_block_observation_refs,
+            block_observation_refs,
+        )
+    if composition_evidence_error:
+        result = {"ok": False, "error": composition_evidence_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_workflow",
+            result=result,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_workflow", result)
+        return json.dumps(sanitized)
+
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
             {**arguments, "raw_block_observation_refs": block_observation_refs},
@@ -5835,6 +6222,10 @@ def _frontier_run_size_result(
     block_labels: list[str],
     labels_to_execute: list[str],
 ) -> dict[str, Any]:
+    suggested_labels = list(labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS])
+    user_facing_summary = (
+        "Workflow draft saved; I still need to test the next smaller browser frontier before continuing."
+    )
     return {
         "ok": False,
         "error": error,
@@ -5845,8 +6236,16 @@ def _frontier_run_size_result(
             "requested_block_labels": list(block_labels),
             "executed_block_labels": [],
             "planned_block_labels": list(labels_to_execute),
-            "suggested_block_labels": list(labels_to_execute[:_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS]),
+            "suggested_block_labels": suggested_labels,
             "deferred_block_labels": list(labels_to_execute[_MAX_INCREMENTAL_PAGE_FRONTIER_LABELS:]),
+            "control_signal": {
+                "kind": "intermediate_success",
+                "user_facing_summary": user_facing_summary,
+                "next_tool": "run_blocks_and_collect_debug",
+                "next_block_labels": suggested_labels,
+                "preserve_workflow_yaml": True,
+            },
+            "user_facing_summary": user_facing_summary,
         },
     }
 
@@ -5934,15 +6333,20 @@ async def run_blocks_tool(
         )
         completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
         _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
-        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, result)
+        tool_visible_result = _tool_visible_result_after_completion_verification(
+            copilot_ctx,
+            result,
+            completion_verification,
+        )
+        record_tool_step_result_for_ctx(copilot_ctx, "run_blocks_and_collect_debug", arguments, tool_visible_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
             source_tool="run_blocks_and_collect_debug",
-            result=result,
+            result=tool_visible_result,
         )
         enqueue_screenshot_from_result(copilot_ctx, result)
 
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", result)
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", tool_visible_result)
     return json.dumps(sanitized)
 
 
@@ -6029,8 +6433,8 @@ async def update_and_run_blocks_tool(
     for the reusable actions/checks the workflow actually needs.
     When you compose no-url blocks from a page reached by prior clicks, include
     `block_observation_refs` entries with each block label and the
-    `observation_step` returned by inspect_page_for_composition for the page
-    that block acts on.
+    `observation_step` returned by inspect_page_for_composition or evaluate for
+    the page that block acts on.
     When inspected evidence shows an anti-bot challenge gating a disabled
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
@@ -6075,6 +6479,8 @@ async def update_and_run_blocks_tool(
         )
         sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", result)
         return json.dumps(sanitized)
+
+    _clear_pending_browser_interaction_observation(copilot_ctx)
 
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
@@ -6217,18 +6623,23 @@ async def update_and_run_blocks_tool(
         )
         completion_verification = await _maybe_run_completion_verification(copilot_ctx, run_result, handler_start)
         _record_run_blocks_result(copilot_ctx, run_result, completion_verification=completion_verification)
-        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, run_result)
+        tool_visible_result = _tool_visible_result_after_completion_verification(
+            copilot_ctx,
+            run_result,
+            completion_verification,
+        )
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, tool_visible_result)
         _record_diagnosis_repair_contract(
             copilot_ctx,
             source_tool="update_and_run_blocks",
-            result=run_result,
+            result=tool_visible_result,
             workflow_updated=True,
         )
         enqueue_screenshot_from_result(copilot_ctx, run_result)
         if run_result.get("ok"):
             advance_to_testing(copilot_ctx)
 
-    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", run_result)
+    sanitized = sanitize_tool_result_for_llm("run_blocks_and_collect_debug", tool_visible_result)
     return json.dumps(sanitized)
 
 
@@ -6268,6 +6679,8 @@ _DISCOVERY_ANTI_BOT_PATTERNS = (
     "just a moment",
     "captcha",
     "challenge",
+    "turnstile",
+    "cf-turnstile",
     "human-verification",
     "human verification",
     "verify you are human",
@@ -6652,17 +7065,21 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "challenge_state": evidence.get("challenge_state") or {},
         "form_count": len(evidence.get("forms") or []),
         "result_container_count": len(evidence.get("result_containers") or []),
+        "page_obstruction_count": len(evidence.get("page_obstructions") or []),
         "schema_empty_page": evidence.get("schema_empty_page") is True,
     }
     return (
         "Summarize this screenshot for Workflow Copilot build-time page evidence. "
         "Return JSON only with keys: summary, challenge_detected, challenge_kind, "
         "challenge_location, submit_blocked, blocked_submit_controls, empty_page_visible, "
-        "loading_state_visible, omissions. Focus on "
+        "loading_state_visible, page_obstruction_detected, obstruction_kind, "
+        "obstruction_location, underlying_page_blocked, visible_dismiss_controls, omissions. Focus on "
         "visible anti-bot or human-verification state, whether it appears to gate a submit/search "
-        "control, and where it appears relative to the page controls. Do not include raw DOM, "
+        "control, whether any visible artificial barrier mechanically blocks the underlying page, "
+        "and where it appears relative to the page controls. Do not include raw DOM, "
         "code, selectors, personal data, or workflow instructions. If no challenge is visible, "
-        "set challenge_detected to false and submit_blocked to false. If DOM context shows a "
+        "set challenge_detected to false and submit_blocked to false. If no page obstruction is visible, "
+        "set page_obstruction_detected to false. If DOM context shows a "
         "schema-empty page, set empty_page_visible to true only when the screenshot shows a "
         "settled page with no visible forms, controls, result data, challenge, or loading/progress "
         "state; set loading_state_visible to true when the page appears to be waiting, loading, "
@@ -6689,6 +7106,11 @@ def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
     blocked_submit_controls = value.get("blocked_submit_controls")
     empty_page_visible = value.get("empty_page_visible")
     loading_state_visible = value.get("loading_state_visible")
+    page_obstruction_detected = value.get("page_obstruction_detected")
+    obstruction_kind = value.get("obstruction_kind")
+    obstruction_location = value.get("obstruction_location")
+    underlying_page_blocked = value.get("underlying_page_blocked")
+    visible_dismiss_controls = value.get("visible_dismiss_controls")
     omissions = value.get("omissions")
     return {
         "summary": summary if isinstance(summary, str) else "",
@@ -6698,8 +7120,15 @@ def _normalize_visual_summary(value: Any) -> dict[str, Any] | None:
         "submit_blocked": submit_blocked if isinstance(submit_blocked, bool) else None,
         "empty_page_visible": empty_page_visible if isinstance(empty_page_visible, bool) else None,
         "loading_state_visible": loading_state_visible if isinstance(loading_state_visible, bool) else None,
+        "page_obstruction_detected": page_obstruction_detected if isinstance(page_obstruction_detected, bool) else None,
+        "obstruction_kind": obstruction_kind if isinstance(obstruction_kind, str) else "",
+        "obstruction_location": obstruction_location if isinstance(obstruction_location, str) else "",
+        "underlying_page_blocked": underlying_page_blocked if isinstance(underlying_page_blocked, bool) else None,
         "blocked_submit_controls": [item for item in blocked_submit_controls if isinstance(item, str)]
         if isinstance(blocked_submit_controls, list)
+        else [],
+        "visible_dismiss_controls": [item for item in visible_dismiss_controls if isinstance(item, str)]
+        if isinstance(visible_dismiss_controls, list)
         else [],
         "omissions": [item for item in omissions if isinstance(item, str)] if isinstance(omissions, list) else [],
     }
@@ -6820,18 +7249,19 @@ async def _composition_evidence_after_navigation_failure(
 _MAX_FLOW_EVIDENCE = 64
 
 
-def _inspection_reached_via(*, use_current_page: bool, post_run: bool) -> str:
+def _inspection_reached_via(*, use_current_page: bool, post_run: bool, earned_interaction: bool) -> str:
     """How the just-inspected state was reached, for the flow-evidence trajectory.
 
     A target_url inspection navigates there itself ("navigate"); a post-run
-    current-page inspection observes the page the run left behind ("post_run"); any
-    other current-page inspection follows an in-turn interaction on that page.
+    current-page inspection observes the page the run left behind ("post_run"); a
+    normal current-page inspection counts as an interaction only when a successful
+    browser action immediately earned that credit.
     """
     if not use_current_page:
         return "navigate"
     if post_run:
         return "post_run"
-    return "interaction"
+    return "interaction" if earned_interaction else "current_page"
 
 
 def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached_via: str) -> int | None:
@@ -6867,6 +7297,61 @@ def _append_flow_evidence(copilot_ctx: Any, evidence: dict[str, Any], *, reached
         )
         del trajectory[:-_MAX_FLOW_EVIDENCE]
     return step
+
+
+def _latest_interaction_reached_flow_evidence(copilot_ctx: Any) -> tuple[int, str, dict[str, Any]] | None:
+    trajectory = getattr(copilot_ctx, "flow_evidence", None)
+    if not isinstance(trajectory, list):
+        return None
+    for entry in reversed(trajectory):
+        if not isinstance(entry, dict):
+            continue
+        reached_via = str(entry.get("reached_via") or "")
+        if reached_via not in {"interaction", "post_run"}:
+            continue
+        evidence = entry.get("evidence")
+        step = entry.get("step")
+        if isinstance(step, bool) or not isinstance(step, int) or not isinstance(evidence, dict):
+            continue
+        if not has_bounded_page_schema(evidence):
+            continue
+        observed_url = _composition_evidence_page_url(evidence)
+        if observed_url:
+            return step, observed_url, evidence
+    return None
+
+
+def _non_current_inspection_regression_error(copilot_ctx: Any, *, entry_url: str) -> dict[str, Any] | None:
+    latest = _latest_interaction_reached_flow_evidence(copilot_ctx)
+    if latest is None:
+        return None
+    observation_step, observed_url, _ = latest
+    if _same_page_ignoring_fragment(observed_url, entry_url):
+        return None
+    return {
+        "ok": False,
+        "data": {
+            "current_url": observed_url,
+            "observation_step": observation_step,
+        },
+        "error": (
+            "inspect_page_for_composition would navigate away from the latest interaction-reached page "
+            f'({observed_url}). Use inspect_page_for_composition(target_url="current_page") to inspect '
+            "the live page, or compose from the existing page evidence and pass observation_step "
+            f"{observation_step} in block_observation_refs for blocks that act on that reached page."
+        ),
+    }
+
+
+def _page_inspection_budget_error(copilot_ctx: Any, *, scope: Literal["turn", "chat"]) -> str:
+    scope_label = "turn" if scope == "turn" else "chat"
+    return (
+        f"inspect_page_for_composition reached the page-inspection budget for this {scope_label}. "
+        "This is not evidence that scouting is complete. Use evaluate, get_browser_screenshot, or a browser "
+        "action on the current page to determine whether the goal is already satisfied, whether progress is still "
+        "possible, or whether a real blocker exists. Do not author downstream result, extraction, or confirmation "
+        "blocks unless the existing evidence already shows the page state those blocks will act on."
+    )
 
 
 _COMPOSITION_HOLLOW_RECAPTURE_RETRIES = 2
@@ -6998,6 +7483,8 @@ async def _inspect_page_for_composition_impl(
         return result
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
+    if not use_current_page:
+        _clear_pending_browser_interaction_observation(copilot_ctx)
     bypass_budget_for_post_run_current_page = _allows_post_run_current_page_inspection_budget_bypass(
         copilot_ctx,
         use_current_page=use_current_page,
@@ -7010,11 +7497,7 @@ async def _inspect_page_for_composition_impl(
         result = {
             "ok": False,
             "data": None,
-            "error": (
-                "inspect_page_for_composition reached the page-inspection budget for this turn. "
-                "Compose from existing evidence or ask for clarification if inspection still cannot determine "
-                "required page inputs."
-            ),
+            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
@@ -7024,7 +7507,7 @@ async def _inspect_page_for_composition_impl(
         result = {
             "ok": False,
             "data": None,
-            "error": "inspect_page_for_composition has reached the page-inspection budget for this chat. Compose from existing evidence or ask for clarification.",
+            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
         }
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
@@ -7046,6 +7529,10 @@ async def _inspect_page_for_composition_impl(
             record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
             return result
         entry_url = resolved_entry_url
+        regression_error = _non_current_inspection_regression_error(copilot_ctx, entry_url=entry_url)
+        if regression_error is not None:
+            record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, regression_error)
+            return regression_error
 
     with copilot_span(
         "inspect_page_for_composition",
@@ -7128,7 +7615,30 @@ async def _inspect_page_for_composition_impl(
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence
-    reached_via = _inspection_reached_via(use_current_page=use_current_page, post_run=bool(run_id))
+    if (
+        isinstance(run_id, str)
+        and run_id
+        and getattr(copilot_ctx, "post_run_page_observation_after_failed_test", False)
+    ):
+        page_title = evidence.get("page_title")
+        await _maybe_run_completion_verification_from_page_observation(
+            copilot_ctx,
+            url=str(evidence.get("current_url") or current_url or ""),
+            title=page_title if isinstance(page_title, str) else "",
+            observed_data=evidence,
+        )
+    earned_interaction = False
+    if use_current_page and not run_id:
+        earned_interaction = _consume_pending_browser_interaction_observation(
+            copilot_ctx,
+            current_url=str(evidence.get("current_url") or current_url or ""),
+            evidence=evidence,
+        )
+    reached_via = _inspection_reached_via(
+        use_current_page=use_current_page,
+        post_run=bool(run_id),
+        earned_interaction=earned_interaction,
+    )
     observation_step = _append_flow_evidence(copilot_ctx, evidence, reached_via=reached_via)
     if observation_step is None:
         LOG.warning("copilot_flow_evidence_append_failed_no_trajectory")
