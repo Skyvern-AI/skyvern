@@ -382,17 +382,30 @@ class Block(BaseModel, abc.ABC):
         """
         Acquire or create browser state for block execution.
 
-        Checks persistent sessions first (debugger use case), then falls back to
-        workflow run browser manager. If no state exists, creates a new one.
+        Prefers the live browser already bound to this workflow run, then falls
+        back to a persistent session (debugger use case), then creates a new one.
+
+        IMPORTANT (regression fix): agent blocks (login/navigation/extraction)
+        register the BrowserState they authenticate into under the workflow_run_id
+        (see RealBrowserManager.get_or_create_for_task / get_or_create_for_workflow_run,
+        both of which set ``self.pages[workflow_run_id]``). Querying that live entry
+        FIRST guarantees a subsequent code block runs in the SAME authenticated
+        BrowserContext the agent just used. Consulting PERSISTENT_SESSIONS_MANAGER
+        first (the previous behavior) could hand back a different/unauthenticated
+        browser handle, so ``page.goto(<authed url>)`` landed on the sign-in page.
+        The persistent-sessions lookup is kept only as a fallback for runs where no
+        live workflow-run browser exists yet (e.g. a code-only run from the debugger).
 
         Returns BrowserState if successful, None if creation failed.
         """
         browser_state: BrowserState | None = None
 
-        if browser_session_id and organization_id:
+        # 1. Reuse the agent's live, authenticated browser for this workflow run.
+        browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        # 2. Fall back to a persistent session only when there is no live browser.
+        if not browser_state and browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-        else:
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
         if not browser_state:
             workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
