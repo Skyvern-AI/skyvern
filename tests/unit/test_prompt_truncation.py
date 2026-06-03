@@ -134,3 +134,52 @@ def test_truncate_extraction_schema_preserves_array_top_level() -> None:
     result = truncate_extraction_schema(schema, max_tokens=2_000)
     assert count_tokens(json.dumps(result)) <= 2_200
     assert result["type"] == "array"
+
+
+def test_truncate_page_html_short_returns_unchanged() -> None:
+    from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
+
+    html = "<html><body>small page</body></html>"
+    assert truncate_page_html_for_summary(html, max_chars=10_000) == html
+
+
+def test_truncate_page_html_empty_returns_unchanged() -> None:
+    from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
+
+    assert truncate_page_html_for_summary("", max_chars=10_000) == ""
+
+
+def test_truncate_page_html_long_is_bounded_and_marked() -> None:
+    from skyvern.utils.prompt_truncation import (
+        _SUMMARY_HTML_TRUNCATION_MARKER,
+        truncate_page_html_for_summary,
+    )
+
+    html = "<div>" + ("x" * 1_000_000) + "</div>"
+    result = truncate_page_html_for_summary(html, max_chars=120_000)
+    assert len(result) == 120_000 + len(_SUMMARY_HTML_TRUNCATION_MARKER)
+    assert result.startswith("<div>")
+    assert _SUMMARY_HTML_TRUNCATION_MARKER in result
+
+
+def test_truncate_page_html_keeps_head_and_tail() -> None:
+    from skyvern.utils.prompt_truncation import truncate_page_html_for_summary
+
+    html = "HEAD_MARKER" + ("x" * 500_000) + "TAIL_MARKER"
+    result = truncate_page_html_for_summary(html, max_chars=50_000)
+    assert "HEAD_MARKER" in result  # small head kept for page identity
+    assert "TAIL_MARKER" in result  # tail kept — head-only slicing would have dropped this
+    assert len(result) < len(html)  # middle dropped
+
+
+def test_truncate_page_html_tiny_budget_keeps_head_only() -> None:
+    from skyvern.utils.prompt_truncation import (
+        _SUMMARY_HTML_TRUNCATION_MARKER,
+        SUMMARY_HTML_HEAD_CHARS,
+        truncate_page_html_for_summary,
+    )
+
+    budget = SUMMARY_HTML_HEAD_CHARS // 2  # tail_chars == 0, so the head-only branch runs
+    html = "h" * (budget * 4)
+    result = truncate_page_html_for_summary(html, max_chars=budget)
+    assert result == html[:budget] + _SUMMARY_HTML_TRUNCATION_MARKER
