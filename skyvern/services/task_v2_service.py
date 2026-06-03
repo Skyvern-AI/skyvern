@@ -505,11 +505,12 @@ async def run_task_v2(
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
+        consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context):
+    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
