@@ -7,8 +7,9 @@ browser manager could land on a DIFFERENT, unauthenticated BrowserContext, so
 was authenticated.
 
 ``Block.resolve_live_page`` must therefore return the live script run-context page
-(the exact authenticated page the agent used) when a script run is active, and only
-fall back to the workflow-run browser when there is none (live/agent mode).
+(the exact authenticated page the agent used) when a script run is active, only fall
+back to the workflow-run browser when there is none (live/agent mode), and never hand
+back a CLOSED page — instead recovering an open page in the same authenticated context.
 """
 
 from datetime import datetime
@@ -18,6 +19,8 @@ import pytest
 
 from skyvern.forge.sdk.workflow.models.block import CodeBlock, OutputParameter
 from skyvern.forge.sdk.workflow.models.parameter import ParameterType
+
+_MGR = "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager"
 
 
 def _code_block() -> CodeBlock:
@@ -32,23 +35,36 @@ def _code_block() -> CodeBlock:
     return CodeBlock(label="audit_gallery", code="result = 1", output_parameter=output_parameter)
 
 
-@pytest.mark.asyncio
-async def test_resolve_live_page_prefers_script_runcontext_page() -> None:
-    """When a script run is active, use its live page — NOT a re-derived browser."""
-    block = _code_block()
+def _open_page(name: str) -> MagicMock:
+    page = MagicMock(name=name)
+    page.is_closed.return_value = False
+    return page
 
-    agent_page = MagicMock(name="agent_authenticated_playwright_page")
+
+def _closed_page(name: str) -> MagicMock:
+    page = MagicMock(name=name)
+    page.is_closed.return_value = True
+    return page
+
+
+def _run_ctx_with(page: MagicMock | None) -> MagicMock:
     run_ctx = MagicMock()
     run_ctx.page = MagicMock()
-    run_ctx.page.page = agent_page  # underlying Playwright page in the agent's authed context
+    run_ctx.page.page = page
+    return run_ctx
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_page_prefers_script_runcontext_page() -> None:
+    """When a script run is active with an OPEN page, use it — NOT a re-derived browser."""
+    block = _code_block()
+    agent_page = _open_page("agent_authenticated_playwright_page")
 
     with (
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager"
-        ) as mock_mgr,
+        patch(_MGR) as mock_mgr,
         patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock) as mock_get_bs,
     ):
-        mock_mgr.get_run_context.return_value = run_ctx
+        mock_mgr.get_run_context.return_value = _run_ctx_with(agent_page)
 
         page = await block.resolve_live_page(workflow_run_id="wr_1", organization_id="o_1")
 
@@ -60,15 +76,12 @@ async def test_resolve_live_page_prefers_script_runcontext_page() -> None:
 async def test_resolve_live_page_falls_back_when_no_script_run() -> None:
     """Live/agent mode (no script run context) falls back to the workflow-run browser."""
     block = _code_block()
-
-    fallback_page = MagicMock(name="workflow_run_working_page")
+    fallback_page = _open_page("workflow_run_working_page")
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=fallback_page)
 
     with (
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager"
-        ) as mock_mgr,
+        patch(_MGR) as mock_mgr,
         patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock) as mock_get_bs,
     ):
         mock_mgr.get_run_context.return_value = None
@@ -83,8 +96,7 @@ async def test_resolve_live_page_falls_back_when_no_script_run() -> None:
 @pytest.mark.asyncio
 async def test_resolve_live_page_falls_back_when_runcontext_has_no_page() -> None:
     block = _code_block()
-
-    fallback_page = MagicMock(name="workflow_run_working_page")
+    fallback_page = _open_page("workflow_run_working_page")
     browser_state = MagicMock()
     browser_state.get_working_page = AsyncMock(return_value=fallback_page)
 
@@ -92,9 +104,7 @@ async def test_resolve_live_page_falls_back_when_runcontext_has_no_page() -> Non
     run_ctx.page = None
 
     with (
-        patch(
-            "skyvern.core.script_generations.script_skyvern_page.script_run_context_manager"
-        ) as mock_mgr,
+        patch(_MGR) as mock_mgr,
         patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock) as mock_get_bs,
     ):
         mock_mgr.get_run_context.return_value = run_ctx
@@ -104,3 +114,50 @@ async def test_resolve_live_page_falls_back_when_runcontext_has_no_page() -> Non
 
         assert page is fallback_page
         mock_get_bs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_page_recovers_when_runcontext_page_closed() -> None:
+    """A CLOSED script run-context page (poisoned persisted session) must not be returned;
+    recover an open page from the same authenticated browser instead."""
+    block = _code_block()
+    recovered = _open_page("recovered_open_page")
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=recovered)
+
+    with (
+        patch(_MGR) as mock_mgr,
+        patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock) as mock_get_bs,
+    ):
+        mock_mgr.get_run_context.return_value = _run_ctx_with(_closed_page("dead_restored_page"))
+        mock_get_bs.return_value = browser_state
+
+        page = await block.resolve_live_page(workflow_run_id="wr_1", organization_id="o_1")
+
+        assert page is recovered, "must not return the closed page"
+        assert not page.is_closed()
+        mock_get_bs.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_live_page_opens_new_page_when_no_open_page_remains() -> None:
+    """Closed live page AND no open page in the context → open a fresh page in the
+    authenticated context (inherits its cookies)."""
+    block = _code_block()
+    new_page = _open_page("freshly_opened_page")
+    browser_state = MagicMock()
+    browser_state.get_working_page = AsyncMock(return_value=None)
+    browser_state.browser_context = MagicMock()
+    browser_state.browser_context.new_page = AsyncMock(return_value=new_page)
+
+    with (
+        patch(_MGR) as mock_mgr,
+        patch.object(CodeBlock, "get_or_create_browser_state", new_callable=AsyncMock) as mock_get_bs,
+    ):
+        mock_mgr.get_run_context.return_value = _run_ctx_with(_closed_page("dead_restored_page"))
+        mock_get_bs.return_value = browser_state
+
+        page = await block.resolve_live_page(workflow_run_id="wr_1", organization_id="o_1")
+
+        assert page is new_page
+        browser_state.browser_context.new_page.assert_awaited_once()

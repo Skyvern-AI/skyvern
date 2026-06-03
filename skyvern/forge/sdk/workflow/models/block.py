@@ -443,7 +443,10 @@ class Block(BaseModel, abc.ABC):
         BrowserContext.
 
         Falls back to the workflow-run browser for live/agent mode (no script run
-        context exists there).
+        context exists there). Never returns a CLOSED page: if the agent's live page
+        was closed (e.g. user code closed a tab and a persisted session restored the
+        dead context), recover an open page in the same authenticated browser instead
+        of handing back a dead handle, which would raise TargetClosedError.
         """
         # Local import avoids a module-load cycle (script_skyvern_page imports
         # heavily from forge/app, which transitively reaches this module).
@@ -451,9 +454,11 @@ class Block(BaseModel, abc.ABC):
 
         run_ctx = script_run_context_manager.get_run_context()
         live_page = getattr(getattr(run_ctx, "page", None), "page", None) if run_ctx is not None else None
-        if live_page is not None:
+        if live_page is not None and not live_page.is_closed():
             return live_page
 
+        # Script run-context page is missing or CLOSED — recover an OPEN page in the
+        # same authenticated browser rather than returning a closed handle.
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
@@ -461,7 +466,15 @@ class Block(BaseModel, abc.ABC):
         )
         if not browser_state:
             return None
-        return await browser_state.get_working_page()
+        page = await browser_state.get_working_page()
+        if page is not None and not page.is_closed():
+            return page
+        # No open page left in the authenticated context — open a fresh one; it inherits
+        # the context's cookies, so it stays authenticated.
+        browser_context = getattr(browser_state, "browser_context", None)
+        if browser_context is not None:
+            return await browser_context.new_page()
+        return None
 
     def format_block_parameter_template_from_workflow_run_context(
         self,
