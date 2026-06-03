@@ -1670,6 +1670,50 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
+def _normalize_dropdown_match_text(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "", value).lower()
+
+
+def _incremental_tree_contains_target_value(elements: list[dict], target_value: str) -> bool:
+    """Return True when newly surfaced elements contain the requested value.
+
+    Search-combobox results often render formatted labels like ``(CODE) 12345678``
+    while the action text is just ``12345678``. Normalize punctuation and
+    whitespace so post-input dropdown handling is gated on a concrete target
+    match instead of any arbitrary search suggestion.
+    """
+
+    normalized_target = _normalize_dropdown_match_text(target_value)
+    if not normalized_target:
+        return False
+
+    stack = list(elements)
+    while stack:
+        element = stack.pop()
+        for key in (
+            "text",
+            "value",
+            "label",
+            "ariaLabel",
+            "placeholder",
+            "title",
+            "beforePseudoText",
+            "afterPseudoText",
+        ):
+            value = element.get(key)
+            if isinstance(value, str) and normalized_target in _normalize_dropdown_match_text(value):
+                return True
+        attributes = element.get("attributes")
+        if isinstance(attributes, dict):
+            for attr_value in attributes.values():
+                if isinstance(attr_value, str) and normalized_target in _normalize_dropdown_match_text(attr_value):
+                    return True
+        children = element.get("children", [])
+        if isinstance(children, list):
+            stack.extend(children)
+    return False
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -2069,8 +2113,36 @@ async def handle_input_text_action(
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
+                if (
+                    input_or_select_context
+                    and input_or_select_context.is_search_bar
+                    and _incremental_tree_contains_target_value(incremental_element, text)
+                ):
+                    LOG.info(
+                        "Detected target-matching dropdown after search-bar input; attempting custom selection",
+                        element_id=skyvern_element.get_id(),
+                        target_value=text,
+                    )
+                    action.set_has_mini_agent()
+                    select_result = await sequentially_select_from_dropdown(
+                        action=select_action,
+                        input_or_select_context=input_or_select_context,
+                        page=page,
+                        dom=dom,
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        incremental_scraped=incremental_scraped,
+                        step=step,
+                        task=task,
+                        force_select=True,
+                        target_value=text,
+                    )
+                    if select_result and select_result.action_result and select_result.action_result.success:
+                        auto_complete_hacky_flag = False
+                        return [select_result.action_result]
         except PlaywrightError as inc_error:
-            # Handle Playwright-specific errors during incremental element processing (e.g., TOTP form auto-submit)
+            # Handle Playwright-specific errors during incremental element processing
+            # (e.g., TOTP form auto-submit, or search-dropdown selection triggering navigation)
             error_message = str(inc_error).lower()
             if (
                 "execution context was destroyed" in error_message
