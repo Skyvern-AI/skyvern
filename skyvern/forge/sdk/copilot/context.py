@@ -204,7 +204,10 @@ def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[d
     """
     by_url: dict[str, ObservedPage] = {page.url: page for page in prior if page.url}
     for entry in flow_evidence:
+        evidence = entry.get("evidence")
         url = entry.get("url")
+        if (not isinstance(url, str) or not url.strip()) and isinstance(evidence, dict):
+            url = evidence.get("current_url") or evidence.get("inspected_url")
         if not isinstance(url, str) or not url.strip():
             continue
         existing = by_url.get(url)

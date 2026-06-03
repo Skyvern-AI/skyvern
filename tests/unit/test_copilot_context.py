@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import ObservedPage, StructuredContext, _merge_observed_acted_pages
 
 
 def test_merge_turn_summary_caps_urls_visited() -> None:
@@ -32,6 +32,27 @@ def test_merge_turn_summary_caps_credentials_checked() -> None:
     ctx.merge_turn_summary(activity)
 
     assert len(ctx.credentials_checked) == 40
+
+
+def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
+    pages = _merge_observed_acted_pages(
+        [ObservedPage(url="https://example.com/old", had_bounded_schema=True, reached_via="navigate")],
+        [
+            {
+                "evidence": {
+                    "current_url": "https://example.com/cart",
+                    "inspected_url": "https://example.com/cart",
+                },
+                "had_bounded_schema": True,
+                "reached_via": "interaction",
+                "step": 3,
+            }
+        ],
+    )
+
+    by_url = {page.url: page for page in pages}
+    assert by_url["https://example.com/cart"].had_bounded_schema is True
+    assert by_url["https://example.com/cart"].reached_via == "interaction"
 
 
 class TestCopilotContext:
