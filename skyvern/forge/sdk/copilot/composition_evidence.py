@@ -778,7 +778,13 @@ def _wrong_reached_via_observation_ref(
     return step, reached_via or "<missing>"
 
 
-def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str | None:
+def composition_page_evidence_error(
+    ctx: Any,
+    workflow_yaml: str | None,
+    *,
+    block_observation_refs: dict[str, int] | None = None,
+    raw_block_observation_refs: Any | None = None,
+) -> str | None:
     """Return a mutation error when a build adds page-acting blocks before observation.
 
     Deliberately structural rather than semantic: every block that acts on a page
@@ -802,12 +808,14 @@ def composition_page_evidence_error(ctx: Any, workflow_yaml: str | None) -> str 
 
     allow_post_run = bool(previous_workflow_yaml)
     flow_evidence_by_step = _flow_evidence_by_step(ctx)
-    raw_block_observation_refs = getattr(
-        ctx,
-        "raw_block_observation_refs",
-        getattr(ctx, "block_observation_refs", None),
-    )
-    block_observation_refs = _block_observation_refs(ctx)
+    if raw_block_observation_refs is None:
+        raw_block_observation_refs = getattr(
+            ctx,
+            "raw_block_observation_refs",
+            getattr(ctx, "block_observation_refs", None),
+        )
+    if block_observation_refs is None:
+        block_observation_refs = _block_observation_refs(ctx)
     for block in gated_blocks:
         target_url = block["target_url"]
         if not _block_has_observed_page(

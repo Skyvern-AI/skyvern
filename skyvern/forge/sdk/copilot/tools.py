@@ -439,20 +439,25 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
     )
 
 
+def _guardrail_tool_arguments(tool_context: Any) -> tuple[dict[str, Any], Any]:
+    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    try:
+        # Agents SDK guardrails may hand us either raw JSON or an already parsed mapping.
+        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    except json.JSONDecodeError:
+        parsed_arguments = {}
+    return parsed_arguments if isinstance(parsed_arguments, dict) else {}, raw_arguments
+
+
 def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
     tool_context = data.context
-    raw_arguments = getattr(tool_context, "tool_arguments", "")
+    tool_arguments, raw_arguments = _guardrail_tool_arguments(tool_context)
     if not raw_arguments:
         LOG.warning(
             "workflow YAML output policy guardrail received no tool arguments",
             tool_name=getattr(tool_context, "tool_name", None),
             tool_call_id=getattr(tool_context, "tool_call_id", None),
         )
-    try:
-        parsed_arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else {}
-    except json.JSONDecodeError:
-        parsed_arguments = {}
-    tool_arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
     workflow_yaml_value = tool_arguments.get("workflow_yaml")
     workflow_yaml = workflow_yaml_value if isinstance(workflow_yaml_value, str) else None
     verdict = evaluate_output_policy(
@@ -478,6 +483,45 @@ _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL = ToolInputGuardrail(
     guardrail_function=_workflow_yaml_output_policy_guardrail,
     name="workflow_yaml_output_policy_guardrail",
 )
+
+_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA = {
+    "surface": "tool_pre_side_effect",
+    "tool_name": "update_and_run_blocks",
+    "reason": "composition_page_evidence",
+}
+
+
+def _update_and_run_blocks_composition_evidence_precheck(
+    copilot_ctx: Any,
+    workflow_yaml: str | None,
+    normalized_block_observation_refs: dict[str, int],
+    raw_block_observation_refs: Any,
+) -> str | None:
+    if copilot_ctx is None or workflow_yaml is None:
+        LOG.warning(
+            "update_and_run_blocks composition evidence precheck missing context or workflow yaml",
+            has_context=copilot_ctx is not None,
+            has_workflow_yaml=workflow_yaml is not None,
+        )
+        return None
+
+    evidence_error = composition_page_evidence_error(
+        copilot_ctx,
+        workflow_yaml,
+        block_observation_refs=normalized_block_observation_refs,
+        raw_block_observation_refs=raw_block_observation_refs,
+    )
+
+    if evidence_error:
+        LOG.info(
+            "copilot composition page evidence pre-side-effect rejected workflow",
+            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
+            target_url=workflow_target_url(workflow_yaml),
+            surface="tool_pre_side_effect",
+        )
+        return evidence_error
+
+    return None
 
 
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:
@@ -6013,6 +6057,24 @@ async def update_and_run_blocks_tool(
     if loop_error:
         return _diagnosis_repair_tool_error(copilot_ctx, "update_and_run_blocks", loop_error)
 
+    with copilot_span("composition_evidence_precheck", data=_COMPOSITION_EVIDENCE_PRECHECK_TRACE_DATA):
+        composition_evidence_error = _update_and_run_blocks_composition_evidence_precheck(
+            copilot_ctx,
+            workflow_yaml,
+            normalized_block_observation_refs,
+            block_observation_refs,
+        )
+    if composition_evidence_error:
+        result = {"ok": False, "error": composition_evidence_error}
+        record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, result)
+        _record_diagnosis_repair_contract(
+            copilot_ctx,
+            source_tool="update_and_run_blocks",
+            result=result,
+        )
+        sanitized = sanitize_tool_result_for_llm("update_and_run_blocks", result)
+        return json.dumps(sanitized)
+
     # Snapshot the prior workflow definition BEFORE _update_workflow saves
     # the new one — we need the pre-update state to diff against.
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
@@ -7060,7 +7122,8 @@ async def _inspect_page_for_composition_impl(
         if isinstance(page_title, str) and page_title:
             _workflow_verification_evidence(copilot_ctx).page_title = page_title[:160]
 
-    copilot_ctx.page_inspection_calls_this_turn += 1
+    if not bypass_budget_for_post_run_current_page:
+        copilot_ctx.page_inspection_calls_this_turn += 1
     if bypass_budget_for_post_run_current_page:
         copilot_ctx.post_run_current_page_inspection_workflow_run_id = run_id
     copilot_ctx.composition_page_evidence = evidence

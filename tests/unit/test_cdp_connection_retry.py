@@ -31,7 +31,7 @@ class TestRetryBehavior:
                 "browser",
             ]
         )
-        with patch("skyvern.webeye.cdp_retry.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
             result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 2
@@ -46,7 +46,7 @@ class TestRetryBehavior:
                 "browser",
             ]
         )
-        with patch("skyvern.webeye.cdp_retry.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock) as mock_sleep:
             result = await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
         assert result == "browser"
         assert pw.chromium.connect_over_cdp.call_count == 3
@@ -56,7 +56,7 @@ class TestRetryBehavior:
     async def test_all_attempts_fail_raises(self):
         error = PWError("connect ECONNREFUSED 10.0.0.1:9224")
         pw = _make_playwright([error, error, error])
-        with patch("skyvern.webeye.cdp_retry.asyncio.sleep", new_callable=AsyncMock):
+        with patch("skyvern.webeye.cdp_retry._sleep", new_callable=AsyncMock):
             with pytest.raises(PWError):
                 await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
         assert pw.chromium.connect_over_cdp.call_count == 3
@@ -77,7 +77,7 @@ class TestRetryBehavior:
         async def track_sleep(seconds):
             sleep_values.append(seconds)
 
-        with patch("skyvern.webeye.cdp_retry.asyncio.sleep", side_effect=track_sleep):
+        with patch("skyvern.webeye.cdp_retry._sleep", side_effect=track_sleep):
             with pytest.raises(PWError):
                 await connect_over_cdp_with_retry(pw, "http://10.0.0.1:9224")
         assert sleep_values == [1, 3]

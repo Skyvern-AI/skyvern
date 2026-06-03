@@ -9,6 +9,7 @@ import pytest
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 
 
 def _credential(credential_id: str = "cred_safe", tested_url: str = "https://login.example.test/login") -> object:
@@ -1106,15 +1108,17 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     from agents import ToolInputGuardrailData
     from agents.tool_context import ToolContext
 
-    from skyvern.forge.sdk.copilot.tools import _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL, NATIVE_TOOLS
+    from skyvern.forge.sdk.copilot.tools import (
+        _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
+        NATIVE_TOOLS,
+    )
 
     guarded_tools = {
         tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
     }
     assert guarded_tools.keys() == {"update_workflow", "update_and_run_blocks"}
-    assert all(
-        tool.tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL] for tool in guarded_tools.values()
-    )
+    assert guarded_tools["update_workflow"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
+    assert guarded_tools["update_and_run_blocks"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
 
     result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
         ToolInputGuardrailData(
@@ -1140,6 +1144,181 @@ workflow_definition:
 
     assert result.behavior["type"] == "reject_content"
     assert "raw_secret_leak" in result.behavior["message"]
+
+
+@pytest.mark.asyncio
+async def test_update_and_run_blocks_rejects_unobserved_page_before_workflow_update(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot import tools as tools_module
+
+    workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_lookup
+      url: https://example.com/lookup
+    - block_type: navigation
+      label: search_lookup
+      navigation_goal: Enter the observed field and submit.
+"""
+    ctx = _ctx(
+        build_phase=BuildPhase.COMPOSING,
+        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
+    )
+
+    async def unexpected_prior_definition(*args: object, **kwargs: object) -> object:
+        raise AssertionError("composition evidence precheck must run before reading prior workflow")
+
+    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
+        raise AssertionError("composition evidence precheck must run before updating workflow")
+
+    sanitized_tool_names: list[str] = []
+
+    def fake_sanitize_tool_result_for_llm(tool_name: str, result: dict[str, object]) -> dict[str, object]:
+        sanitized_tool_names.append(tool_name)
+        return result
+
+    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", unexpected_prior_definition)
+    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
+    monkeypatch.setattr(tools_module, "sanitize_tool_result_for_llm", fake_sanitize_tool_result_for_llm)
+
+    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+        json.dumps(
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_labels": ["search_lookup"],
+                "parameters": {},
+            }
+        ),
+    )
+
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert "inspect_page_for_composition" in payload["error"]
+    assert "https://example.com/lookup" in payload["error"]
+    assert ctx.block_observation_refs == {}
+    assert sanitized_tool_names == ["update_and_run_blocks"]
+
+
+@pytest.mark.asyncio
+async def test_update_and_run_blocks_precheck_uses_proposed_block_observation_refs(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot import tools as tools_module
+
+    workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_home
+      url: https://example.com/
+    - block_type: action
+      label: open_results
+      navigation_goal: Open the observed result list.
+    - block_type: extraction
+      label: read_results
+      data_extraction_goal: Read the visible result rows.
+"""
+    ctx = _ctx(
+        build_phase=BuildPhase.COMPOSING,
+        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
+        flow_evidence=[
+            {
+                "step": 0,
+                "reached_via": "navigate",
+                "url": "https://example.com/",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "inspect_page_for_composition",
+                    "inspected_url": "https://example.com/",
+                    "current_url": "https://example.com/",
+                    "forms": [{"fields": [{"name": "q", "selector": "#q"}], "submit_controls": []}],
+                    "navigation_targets": [],
+                    "result_containers": [],
+                    "challenge_controls": [],
+                },
+            },
+            {
+                "step": 1,
+                "reached_via": "interaction",
+                "url": "https://example.com/results",
+                "had_bounded_schema": True,
+                "evidence": {
+                    "source_tool": "inspect_page_for_composition",
+                    "inspected_url": "https://example.com/results",
+                    "current_url": "https://example.com/results",
+                    "forms": [],
+                    "navigation_targets": [],
+                    "result_containers": [{"selector": "#results"}],
+                    "challenge_controls": [],
+                },
+            },
+        ],
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_update_workflow(payload: dict, update_ctx: CopilotContext, **kwargs: object) -> dict:
+        captured["payload"] = payload
+        workflow = SimpleNamespace(workflow_definition={"blocks": [{"label": "open_results"}]})
+        update_ctx.last_workflow = workflow
+        update_ctx.last_update_block_count = 2
+        return {"ok": True, "_workflow": workflow, "data": {"block_count": 2}}
+
+    async def fake_run_blocks(params: dict, run_ctx: CopilotContext, **kwargs: object) -> dict:
+        return {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr-1",
+                "overall_status": "completed",
+                "blocks": [],
+            },
+        }
+
+    async def fake_prior_definition(update_ctx: CopilotContext) -> object:
+        return None
+
+    monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+    monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", fake_prior_definition)
+    monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+    monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
+    monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["open_results"], {}, "open_results"))
+    monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
+    monkeypatch.setattr(tools_module, "_run_blocks_and_collect_debug", fake_run_blocks)
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+    result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_and_run_blocks"),
+        json.dumps(
+            {
+                "workflow_yaml": workflow_yaml,
+                "block_labels": ["open_results", "read_results"],
+                "block_observation_refs": [
+                    {"label": "open_results", "observation_step": 0},
+                    {"label": "read_results", "observation_step": 1},
+                ],
+                "parameters": {},
+            }
+        ),
+    )
+
+    assert json.loads(result)["ok"] is True
+    assert captured["payload"]["workflow_yaml"] == workflow_yaml
+    assert captured["payload"]["block_observation_refs"] == {
+        "open_results": 0,
+        "read_results": 1,
+    }
+    assert [ref.model_dump() for ref in captured["payload"]["raw_block_observation_refs"]] == [
+        {"label": "open_results", "observation_step": 0},
+        {"label": "read_results", "observation_step": 1},
+    ]
+    assert ctx.block_observation_refs == {}
 
 
 @pytest.mark.asyncio

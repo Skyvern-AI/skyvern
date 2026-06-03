@@ -295,6 +295,32 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     assert result["data"]["observed_after_workflow_run"] is True
 
 
+@pytest.mark.asyncio
+async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_chat_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.prior_page_inspection_calls_made = 6
+    ctx.page_inspection_calls_this_turn = 0
+    ctx.last_run_blocks_workflow_run_id = "wr_123"  # type: ignore[attr-defined]
+    ctx.last_test_ok = True  # type: ignore[attr-defined]
+    ctx.composition_page_evidence = None  # type: ignore[attr-defined]
+
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["data"]["workflow_run_id"] == "wr_123"
+    assert result["data"]["observed_after_workflow_run"] is True
+    assert ctx.page_inspection_calls_this_turn == 0
+    assert ctx.post_run_current_page_inspection_workflow_run_id == "wr_123"  # type: ignore[attr-defined]
+
+
 class _SizeCappedHtmlStrippedFallbackServer:
     """Every page's get_html is dropped by the MCP size cap (a heavy DOM exceeds it).
     The stripped-body evaluate fallback recovers each page, so the resolver can still

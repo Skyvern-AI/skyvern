@@ -33,6 +33,8 @@ def is_cdp_connection_error(exc: Exception) -> bool:
 
 _CDP_RETRY_ATTEMPTS = 3
 _CDP_RETRY_BACKOFF_SECONDS = (1, 3)
+# Patch this module alias in tests so shard-wide asyncio.sleep mocks do not leak call counts.
+_sleep = asyncio.sleep
 
 
 async def connect_over_cdp_with_retry(
@@ -67,5 +69,5 @@ async def connect_over_cdp_with_retry(
                 backoff_seconds=backoff,
                 error_type=type(e).__name__,
             )
-            await asyncio.sleep(backoff)
+            await _sleep(backoff)
     raise RuntimeError("unreachable")
