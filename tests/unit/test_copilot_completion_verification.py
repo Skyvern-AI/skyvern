@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from skyvern.config import settings
-from skyvern.forge.sdk.copilot.agent import _completion_contract_not_violated, _verified_workflow_or_none
+from skyvern.forge.sdk.copilot.agent import (
+    _completion_contract_not_violated,
+    _rewrite_failed_test_response,
+    _verified_workflow_or_none,
+)
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
@@ -39,9 +43,12 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_outcome_evidence_candidate,
     _is_unfinished_run_verification_candidate,
     _maybe_run_completion_verification,
+    _maybe_run_completion_verification_from_page_observation,
     _outcome_failure_warrants_repair,
     _outcome_unverified_reason,
+    _record_composition_page_observation,
     _record_run_blocks_result,
+    _tool_visible_result_after_completion_verification,
 )
 
 
@@ -320,6 +327,33 @@ def test_record_run_blocks_downgrades_when_confirmation_block_present_but_unmet(
     assert "item in cart" in (ctx.last_test_failure_reason or "")
 
 
+def test_tool_visible_result_fails_when_confirmation_block_outcome_unmet() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    result = _clean_success_result()
+    verification = _evaluated(("c0", False))
+
+    visible = _tool_visible_result_after_completion_verification(ctx, result, verification)
+
+    assert visible["ok"] is False
+    assert "item in cart" in visible["error"]
+    assert result["ok"] is True
+    assert visible["data"]["overall_status"] == "completed"
+    assert visible["data"]["completion_verification"]["fully_satisfied"] is False
+    assert visible["data"]["failure_categories"][0]["category"] == "OUTCOME_UNVERIFIED"
+
+
+def test_tool_visible_result_keeps_mid_build_run_visible_success() -> None:
+    ctx = _ctx_with_blocks("goto_url", "navigation")
+
+    visible = _tool_visible_result_after_completion_verification(
+        ctx,
+        _clean_success_result(),
+        _evaluated(("c0", False)),
+    )
+
+    assert visible["ok"] is True
+
+
 def test_record_run_blocks_keeps_building_on_mid_build_no_evidence() -> None:
     ctx = _ctx_with_blocks("goto_url", "navigation")
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
@@ -472,6 +506,187 @@ def test_verified_workflow_presented_on_recognized_canceled_run() -> None:
     assert _verified_workflow_or_none(ctx) == (None, None)
 
 
+@pytest.mark.asyncio
+async def test_page_observation_verification_recognizes_budgeted_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_prompt: dict[str, str] = {}
+
+    async def handler(**kwargs: object) -> dict:
+        seen_prompt["prompt"] = str(kwargs.get("prompt") or "")
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _run_ctx()
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    ctx.copilot_run_start_monotonic = time.monotonic()
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/cart",
+        title="Shopping Cart",
+        observed_data={
+            "hasProduct": True,
+            "excerpts": ["SKU-12345 is present in the cart"],
+            "url": "https://example.com/cart",
+            "title": "Shopping Cart",
+        },
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.com/cart",
+        title="Shopping Cart",
+        observed_data={
+            "hasProduct": True,
+            "excerpts": ["SKU-12345 is present in the cart"],
+        },
+    )
+
+    assert result is not None
+    assert result.is_fully_satisfied() is True
+    assert ctx.completion_verification_result is result
+    assert outcome_fully_verified(ctx) is True
+    assert "current_page_observation" in seen_prompt["prompt"]
+    assert "SKU-12345 is present in the cart" in seen_prompt["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_page_observation_verification_does_not_overwrite_satisfied_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("handler should not be called once the outcome is verified")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _run_ctx()
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    existing = _evaluated(("c0", True))
+    ctx.completion_verification_result = existing
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/cart",
+        observed_data={"hasProduct": True},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.com/cart",
+        observed_data={"hasProduct": True},
+    )
+
+    assert result is existing
+    assert ctx.completion_verification_result is existing
+
+
+@pytest.mark.asyncio
+async def test_page_observation_verification_preserves_existing_unsatisfied_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_calls = 0
+
+    async def handler(**_: object) -> dict:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _run_ctx()
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    existing = _evaluated(("c0", False))
+    ctx.completion_verification_result = existing
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/cart",
+        observed_data={"hasProduct": False},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.com/cart",
+        observed_data={"hasProduct": False},
+    )
+
+    assert handler_calls == 1
+    assert result is existing
+    assert ctx.completion_verification_result is existing
+
+
+@pytest.mark.asyncio
+async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _run_ctx()
+    ctx.last_test_ok = False
+    ctx.last_run_blocks_workflow_run_id = "wr_cancel"
+    existing = _evaluated(("c0", False))
+    ctx.completion_verification_result = existing
+    _record_composition_page_observation(
+        ctx,
+        source_tool="evaluate",
+        url="https://example.com/cart",
+        observed_data={"hasProduct": True},
+    )
+
+    result = await _maybe_run_completion_verification_from_page_observation(
+        ctx,
+        url="https://example.com/cart",
+        observed_data={"hasProduct": True},
+    )
+
+    assert result is not None
+    assert result is not existing
+    assert result.is_fully_satisfied() is True
+    assert ctx.completion_verification_result is result
+
+
+def test_failed_test_rewrite_recognizes_post_budget_verified_outcome() -> None:
+    ctx = _canceled_gate_ctx()
+    ctx.last_workflow = SimpleNamespace()
+    ctx.last_workflow_yaml = "workflow: {}"
+    ctx.last_update_block_count = 5
+    ctx.completion_verification_result = _evaluated(("c0", True))
+
+    response = _rewrite_failed_test_response("The test failed.", ctx)
+
+    assert "verified the requested outcome" in response
+    assert "test failed" not in response.lower()
+
+
+def test_failed_test_rewrite_does_not_render_zero_block_verified_outcome() -> None:
+    ctx = _canceled_gate_ctx()
+    ctx.last_workflow = SimpleNamespace()
+    ctx.last_workflow_yaml = "workflow: {}"
+    ctx.last_update_block_count = 0
+    ctx.completion_verification_result = _evaluated(("c0", True))
+
+    response = _rewrite_failed_test_response("The test failed.", ctx)
+
+    assert "0 blocks" not in response
+    assert "workflow with 0" not in response
+
+
 # --- SKY-10576: recognition governed by whole-workflow outcome, not per-block prefix ---
 #
 # A clean ok=True run can reach the goal (its outcome block produced data and the
@@ -606,6 +821,150 @@ def test_snapshot_uses_current_run_blocks_not_stale_outputs() -> None:
     }
     snap2 = _build_run_evidence_snapshot(ctx, fresh_run)
     assert snap2.block_outputs.get("b3") == {"extracted_information": {"price": "9.99"}}
+
+
+def test_snapshot_includes_verified_context_labels_without_prior_outputs() -> None:
+    ctx = _run_ctx()
+    labels = [
+        "open_bacb_homepage",
+        "click_find_a_certificant",
+        "search_noor_assi_rbt",
+        "expand_noor_assi_result",
+        "extract_credential_details",
+    ]
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[SimpleNamespace(label=label, block_type="task") for label in labels]
+        )
+    )
+    ctx.verified_prefix_labels = list(labels)
+    ctx.verified_block_outputs["expand_noor_assi_result"] = {"stale": "prior run output"}
+
+    run = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_extract",
+            "current_url": "https://www.bacb.com/services/o.php?page=101135",
+            "executed_block_labels": ["extract_credential_details"],
+            "blocks": [
+                {
+                    "label": "extract_credential_details",
+                    "block_type": "EXTRACTION",
+                    "status": "completed",
+                    "extracted_data": {
+                        "extracted_information": {
+                            "credentials": [
+                                {
+                                    "credential_type": "Registered Behavior Technician",
+                                    "credential_number": "RBT-19-98341",
+                                    "expiration_date": "09/06/2022",
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    snapshot = _build_run_evidence_snapshot(ctx, run)
+
+    assert snapshot.verified_context_block_labels == labels[:-1]
+    assert snapshot.block_outputs == {
+        "extract_credential_details": {
+            "extracted_information": {
+                "credentials": [
+                    {
+                        "credential_type": "Registered Behavior Technician",
+                        "credential_number": "RBT-19-98341",
+                        "expiration_date": "09/06/2022",
+                    }
+                ]
+            }
+        }
+    }
+    assert "expand_noor_assi_result" not in snapshot.block_outputs
+    rendered = snapshot.render_prompt_block()
+    assert "verified_context_block_labels: open_bacb_homepage" in rendered
+    assert "expand_noor_assi_result" in rendered
+
+
+@pytest.mark.asyncio
+async def test_completion_verification_receives_verified_context_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_prompt: dict[str, str] = {}
+
+    async def handler(**kwargs: object) -> dict:
+        seen_prompt["prompt"] = str(kwargs.get("prompt") or "")
+        return {
+            "verdicts": [
+                {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
+                {"criterion_id": "c1", "satisfied": True, "reason_code": "evidence_confirms"},
+            ]
+        }
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", True)
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[
+            _criterion("c0", "credential type, number, and expiration date are reported"),
+            _criterion("c1", "the data came from the expanded certificant result"),
+        ]
+    )
+    labels = [
+        "open_bacb_homepage",
+        "click_find_a_certificant",
+        "search_noor_assi_rbt",
+        "expand_noor_assi_result",
+        "extract_credential_details",
+    ]
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(
+            blocks=[
+                SimpleNamespace(label=label, block_type="extraction" if label.startswith("extract") else "task")
+                for label in labels
+            ]
+        )
+    )
+    ctx.verified_prefix_labels = list(labels)
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_extract",
+            "current_url": "https://www.bacb.com/services/o.php?page=101135",
+            "executed_block_labels": ["extract_credential_details"],
+            "blocks": [
+                {
+                    "label": "extract_credential_details",
+                    "block_type": "EXTRACTION",
+                    "status": "completed",
+                    "extracted_data": {
+                        "extracted_information": {
+                            "person_name": "NOOR ASSI",
+                            "credentials": [
+                                {
+                                    "credential_type": "Registered Behavior Technician",
+                                    "credential_number": "RBT-19-98341",
+                                    "expiration_date": "09/06/2022",
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is not None
+    assert verification.is_fully_satisfied() is True
+    assert "verified_context_block_labels" in seen_prompt["prompt"]
+    assert "expand_noor_assi_result" in seen_prompt["prompt"]
+    assert "RBT-19-98341" in seen_prompt["prompt"]
 
 
 @pytest.mark.asyncio
