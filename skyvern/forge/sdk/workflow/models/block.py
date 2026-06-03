@@ -425,6 +425,44 @@ class Block(BaseModel, abc.ABC):
 
         return browser_state
 
+    async def resolve_live_page(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> Page | None:
+        """Return the Playwright page a browser-driving block (code / print) should use.
+
+        In script-execution mode the agent blocks act on a single live
+        ``ScriptSkyvernPage`` held in the script run context. A code/print block
+        that instead re-derives a page via ``get_or_create_browser_state`` ->
+        ``get_working_page`` can end up on a DIFFERENT (unauthenticated)
+        BrowserContext, so ``page.goto(<authed url>)`` bounces to the sign-in page
+        even though every agent block was authenticated. Reuse the agent's live
+        page directly so the block shares the exact same authenticated
+        BrowserContext.
+
+        Falls back to the workflow-run browser for live/agent mode (no script run
+        context exists there).
+        """
+        # Local import avoids a module-load cycle (script_skyvern_page imports
+        # heavily from forge/app, which transitively reaches this module).
+        from skyvern.core.script_generations.script_skyvern_page import script_run_context_manager
+
+        run_ctx = script_run_context_manager.get_run_context()
+        live_page = getattr(getattr(run_ctx, "page", None), "page", None) if run_ctx is not None else None
+        if live_page is not None:
+            return live_page
+
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+        if not browser_state:
+            return None
+        return await browser_state.get_working_page()
+
     def format_block_parameter_template_from_workflow_run_context(
         self,
         potential_template: str,
@@ -3411,22 +3449,11 @@ async def wrapper():
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
-        browser_state = await self.get_or_create_browser_state(
+        page = await self.resolve_live_page(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
         )
-        if not browser_state:
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No browser found to run the code block",
-                output_parameter_value=None,
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-
-        page = await browser_state.get_working_page()
         if not page:
             return await self.build_block_result(
                 success=False,
@@ -6473,21 +6500,11 @@ class PrintPageBlock(Block):
         if block_context:
             await capture_block_download_baseline(block_context, organization_id or "", workflow_run_id, self.label)
 
-        browser_state = await self.get_or_create_browser_state(
+        page = await self.resolve_live_page(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
             browser_session_id=browser_session_id,
         )
-        if not browser_state:
-            return await self.build_block_result(
-                success=False,
-                failure_reason="No browser state available",
-                status=BlockStatus.failed,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-            )
-
-        page = await browser_state.get_working_page()
         if not page:
             return await self.build_block_result(
                 success=False,
