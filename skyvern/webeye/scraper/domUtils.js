@@ -508,6 +508,16 @@ function isElementVisible(element) {
     if (isHoverOnlyElement(element)) {
       return true;
     }
+    // Icon buttons using ::before/::after pseudo-content may have zero rect
+    // when positioned outside their parent. Only bypass if cursor:pointer is own, not inherited.
+    if (
+      style.cursor === "pointer" &&
+      hasBeforeOrAfterPseudoContent(element) &&
+      (!element.parentElement ||
+        getElementComputedStyle(element.parentElement)?.cursor !== "pointer")
+    ) {
+      return true;
+    }
     return false;
   }
 
