@@ -116,6 +116,10 @@ class SkyvernContext:
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
+    # Per-run screenshot_downscale A/B state, set at run boot. variant is the raw flag value
+    # ("control"/"treatment"/None); max_height (None = no downscale) drives the actual resize.
+    screenshot_downscale_variant: str | None = None
+    screenshot_downscale_max_height: int | None = None
     step_retry_index: int = 0
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
