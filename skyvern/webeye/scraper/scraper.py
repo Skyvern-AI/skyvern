@@ -617,6 +617,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+        self.last_used_element_tree_html: str | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
         self.element_tree_trimmed = element_tree_trimmed

@@ -49,15 +49,19 @@ def sanitize_identifier(value: str, default: str = "identifier") -> str:
     return sanitized
 
 
-def escape_code_fences(text: str | None) -> str:
-    """Neutralize Markdown code-fence delimiters in untrusted content.
-
-    Prompts that wrap user content inside triple-backtick (```` ``` ````) or
-    triple-tilde (``~~~``) fences can be broken out of by content that
-    contains the same delimiter, allowing injection of arbitrary instructions.
-    Replace both with spaced versions so the fence stays intact.
+def escape_code_fences(text: str | None, escape_quotes: bool = False) -> str:
+    """Neutralize Markdown code-fence delimiters so fenced untrusted content
+    can't break out of the fence and inject instructions. ``escape_quotes`` also
+    rewrites ``"`` to ``'`` for values rendered inside a ``"..."`` literal
+    (lossy, but harmless for the prompt).
     """
     if text is None:
         return ""
     text = unicodedata.normalize("NFKC", text)
-    return text.replace("```", "` ` `").replace("~~~", "~ ~ ~")
+    # Space out the whole run, not just the first three chars: replacing each
+    # "```" in isolation leaves a trailing backtick that re-seams with the rest
+    # of a longer run (e.g. 5 backticks), reforming an intact fence.
+    text = re.sub(r"`{3,}|~{3,}", lambda m: " ".join(m.group()), text)
+    if escape_quotes:
+        text = text.replace('"', "'")
+    return text

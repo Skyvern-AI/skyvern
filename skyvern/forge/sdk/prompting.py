@@ -28,8 +28,17 @@ import structlog
 from jinja2 import Environment, FileSystemLoader
 
 from skyvern.constants import SKYVERN_DIR
+from skyvern.utils.strings import escape_code_fences
 
 LOG = structlog.get_logger()
+
+
+def _untrusted_filter(value: Any, escape_quotes: bool = False) -> str:
+    # Coerce to a plain str so dict/list values do not crash NFKC and so
+    # Markup subclasses do not carry safe-html semantics into prompts.
+    if value is None:
+        return ""
+    return escape_code_fences(str(value), escape_quotes=escape_quotes)
 
 
 class PromptEngine:
@@ -58,6 +67,7 @@ class PromptEngine:
             self.model = self.get_closest_match(self.model, model_names)
 
             self.env = Environment(loader=FileSystemLoader(models_dir))
+            self.env.filters["untrusted"] = _untrusted_filter
         except Exception:
             LOG.error("Error initializing PromptEngine.", model=model, exc_info=True)
             raise

@@ -11,14 +11,14 @@ If you are unable to extract the requested information for a specific field in t
 
 If you are trying to extract the href links which are using the jinja style like "{% raw %}{{}}{% endraw %}", please keep the original string.
 
-User Data Extraction Goal: {{ data_extraction_goal }}
+User Data Extraction Goal: {{ data_extraction_goal | untrusted }}
 
 {% if previous_extracted_information %}
-Previous contexts or thoughts: ```{{ previous_extracted_information }}```
+Previous contexts or thoughts: ```{{ previous_extracted_information | untrusted }}```
 {% endif %}
 
 {% if error_code_mapping_str %}
-Use the error codes and their descriptions to return errors in the output, do not return any error that's not defined by the user. Don't return any outputs if the schema doesn't specify an error related field. Here are the descriptions defined by the user: {{ error_code_mapping_str }}
+Use the error codes and their descriptions to return errors in the output, do not return any error that's not defined by the user. Don't return any outputs if the schema doesn't specify an error related field. Here are the descriptions defined by the user: {{ error_code_mapping_str | untrusted }}
 {% endif %}
 
 Clickable elements from `{{ current_url }}`:
@@ -29,10 +29,10 @@ Clickable elements from `{{ current_url }}`:
 Current URL: {{ current_url }}
 {%- if extracted_text %}
 
-Text extracted from the webpage: {{ extracted_text }}
+Text extracted from the webpage: {{ extracted_text | untrusted }}
 {%- endif %}
 
-User Navigation Payload: {{ navigation_payload }}
+User Navigation Payload: {{ navigation_payload | untrusted }}
 
 Current datetime, ISO format:
 ```
