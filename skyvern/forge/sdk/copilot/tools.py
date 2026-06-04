@@ -85,6 +85,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _goal_likely_needs_more_blocks,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     _canonical_block_config,
     compute_action_sequence_fingerprint,
@@ -193,6 +195,9 @@ RUN_BLOCKS_SAFETY_CEILING_SECONDS = 1200  # 20 min
 # copilot a chance to issue a smaller chain. Quiet-block runs keep the longer
 # ``RUN_BLOCKS_SAFETY_CEILING_SECONDS`` above.
 PER_TOOL_CALL_BUDGET_SECONDS = 240
+_ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS = 30.0
+_ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS = 30.0
+_ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES = 8
 
 # Primary exit condition: seconds of no observed progress across the combined
 # run / block / step heartbeat. Sized to accommodate the slowest single LLM
@@ -215,6 +220,15 @@ _DETACHED_CLEANUP_TASKS: set[asyncio.Task] = set()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _EVALUATE_EVIDENCE_CONFIDENCE_WITH_SCHEMA = 0.75
 _EVALUATE_EVIDENCE_CONFIDENCE_ANTIBOT_ONLY = 0.4
+
+
+@dataclass(frozen=True)
+class ActiveRunTerminalEvidenceSample:
+    current_url: str | None
+    page_title: str | None
+    page_evidence: dict[str, Any]
+    completion_verification: CompletionVerificationResult
+    sample_index: int
 
 
 async def _cancel_run_task_if_not_final(
@@ -618,6 +632,54 @@ def _trusted_post_drain_status(run: WorkflowRun | None) -> str | None:
     return None
 
 
+def _active_run_terminal_evidence_detected(result: Mapping[str, object]) -> bool:
+    data_value = result.get("data")
+    data = data_value if isinstance(data_value, Mapping) else {}
+    return data.get("active_run_terminal_evidence_detected") is True
+
+
+def _active_run_terminal_evidence_signal(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
+    evidence = getattr(ctx, "workflow_verification_evidence", None)
+    has_active_terminal_evidence = getattr(
+        ctx, "last_failure_category_top", None
+    ) == ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY or bool(
+        getattr(evidence, "active_run_terminal_evidence_detected", False)
+    )
+    if not has_active_terminal_evidence:
+        return None
+
+    run_id = getattr(evidence, "active_run_terminal_evidence_workflow_run_id", None) or getattr(
+        ctx, "last_run_blocks_workflow_run_id", None
+    )
+    location = (
+        getattr(evidence, "page_title", None) or getattr(evidence, "current_url", None) or "the current browser page"
+    )
+    run_detail = f" Workflow run: {run_id}." if isinstance(run_id, str) and run_id else ""
+    agent_steering = (
+        "The prior active workflow run emitted typed ACTIVE_RUN_TERMINAL_EVIDENCE while the browser task "
+        f"was still running.{run_detail} The current page evidence already matched the user's terminal "
+        "browser-state criteria, but the reusable workflow is not verified end-to-end. "
+        f"Do not call {tool_name} again in this turn; reply with a partial-verification/blocker state that "
+        "says the requested browser state was observed, the active run was interrupted before overshoot, "
+        "and the workflow still needs a clean corrected run before it can be offered as tested."
+    )
+    user_facing = (
+        f"I reached the requested browser state on {location} and stopped before continuing, "
+        "but the reusable workflow still needs a clean verification run before it is ready."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+        blocked_tool=tool_name,
+    )
+
+
 def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
     """Clear ``pending_reconciliation_run_id`` iff the matching resolved run
     landed in a status the caller can move past: any ``is_final_excluding_canceled``
@@ -642,8 +704,11 @@ def _maybe_clear_reconciliation_flag(copilot_ctx: Any, result: Any) -> None:
     # ``last_failure_category_top`` reflects the prior block-running tool's outcome —
     # only ``_record_run_blocks_result`` writes it, and the reconciliation guard
     # prevents another block-running call from clobbering it before this read.
-    was_per_tool_budget = getattr(copilot_ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
-    if is_trusted_final or was_per_tool_budget:
+    internal_watchdog_cancel_category = getattr(copilot_ctx, "last_failure_category_top", None) in {
+        PER_TOOL_BUDGET_FAILURE_CATEGORY,
+        ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    }
+    if is_trusted_final or internal_watchdog_cancel_category:
         copilot_ctx.pending_reconciliation_run_id = None
         copilot_ctx.pending_reconciliation_requires_user_input = False
         clear_blocker_signal_for_reason_codes(
@@ -1592,6 +1657,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return _emit_tool_blocker_signal(ctx, _build_loop_blocker_signal(detected, tool_name=tool_name))
+
+    if tool_name == "update_workflow" or tool_name in BLOCK_RUNNING_TOOLS:
+        active_terminal_signal = _active_run_terminal_evidence_signal(ctx, tool_name)
+        if active_terminal_signal is not None:
+            return _emit_tool_blocker_signal(ctx, active_terminal_signal)
 
     # Hard-abort when the agent has re-fired the same action sequence against
     # the page N times without intervening success. This is the signal that
@@ -3200,7 +3270,18 @@ def _frontier_run_size_error(
 # last-resort budget-exhausted branch, and ``task_exit_unfinalized`` is the
 # rare race where ``execute_workflow`` naturally exits before writing a
 # terminal row.
-WatchdogExitReason = Literal["success", "stagnation", "ceiling", "per_tool_budget", "task_exit_unfinalized"]
+WatchdogExitReason = Literal[
+    "success",
+    "stagnation",
+    "ceiling",
+    "per_tool_budget",
+    "task_exit_unfinalized",
+    "active_run_terminal_evidence",
+]
+
+
+def _watchdog_exit_allows_terminal_promotion(exit_reason: WatchdogExitReason | None) -> bool:
+    return exit_reason != "active_run_terminal_evidence"
 
 
 # Block types that legitimately execute long silent periods: one DB write on
@@ -3343,6 +3424,21 @@ async def _watchdog_error_message(
         if current_url:
             message += f" Browser was on: {current_url}"
         return message
+    elif exit_reason == "active_run_terminal_evidence":
+        message = (
+            "The active run was interrupted because bounded current-page evidence matched the requested "
+            "browser terminal state while the workflow run was still in progress.\n"
+            f"Run ID: {workflow_run_id}.\n"
+            "This is NOT full workflow verification: the requested browser state was observed, but the durable "
+            "workflow chain still needs diagnosis/repair and a clean verification run. Next step: call "
+            "get_run_results with this workflow_run_id to inspect the active run boundary, preserve the observed "
+            "current-page evidence, and update only the block(s) that overshot or kept running after the state "
+            "was reached. Do NOT report end-to-end success unless a corrected workflow run verifies cleanly."
+        )
+        current_url, _ = await _fallback_page_info(ctx)
+        if current_url:
+            message += f" Browser was on: {current_url}"
+        return message
     elif exit_reason == "ceiling":
         body = (
             f"The run exceeded the {budget_seconds}s absolute ceiling "
@@ -3377,6 +3473,11 @@ def _watchdog_user_failure_reason(
         body = f"The run stopped after no observable progress for {RUN_BLOCKS_STAGNATION_WINDOW_SECONDS}s."
     elif exit_reason == "per_tool_budget":
         body = f"The run exceeded the {budget_seconds}s per-tool-call budget while still making progress."
+    elif exit_reason == "active_run_terminal_evidence":
+        body = (
+            "The active run reached the requested browser state before the workflow finished, "
+            "so it was interrupted for diagnosis/repair. Full workflow verification is still required."
+        )
     elif exit_reason == "ceiling":
         body = f"The run exceeded the {budget_seconds}s absolute ceiling while still showing progress."
     else:
@@ -3837,6 +3938,7 @@ async def _run_blocks_and_collect_debug(
     run: Any = initial_run
     exit_reason: WatchdogExitReason | None = None
     run_cancelled_by_watchdog = False
+    active_run_terminal_evidence: ActiveRunTerminalEvidenceSample | None = None
     # Quiet blocks (WAIT/TEXT_PROMPT/HUMAN_INTERACTION) legitimately have
     # DB-silent periods; disable stagnation for any invocation that includes
     # one. Safety ceiling still applies.
@@ -3861,6 +3963,13 @@ async def _run_blocks_and_collect_debug(
     seen_block_states: dict[str, str] = {}
     prior_block_ts: datetime | None = initial_block_ts
     last_block_fetch_monotonic = 0.0
+    active_terminal_monitor_enabled = await _active_run_terminal_monitor_enabled(ctx)
+    next_active_terminal_monitor_monotonic = (
+        started_monotonic + _ACTIVE_RUN_TERMINAL_MONITOR_INITIAL_DELAY_SECONDS
+        if active_terminal_monitor_enabled
+        else float("inf")
+    )
+    active_terminal_monitor_samples = 0
 
     try:
         while True:
@@ -3906,6 +4015,32 @@ async def _run_blocks_and_collect_debug(
             is_paused = run is not None and run.status == WorkflowRunStatus.paused.value
             stagnation_active = stagnation_enabled and not is_paused
 
+            if (
+                active_terminal_monitor_enabled
+                and not is_paused
+                and active_terminal_monitor_samples < _ACTIVE_RUN_TERMINAL_MONITOR_MAX_SAMPLES
+                and now >= next_active_terminal_monitor_monotonic
+            ):
+                active_terminal_monitor_samples += 1
+                next_active_terminal_monitor_monotonic += _ACTIVE_RUN_TERMINAL_MONITOR_INTERVAL_SECONDS
+                sample = await _active_run_terminal_evidence_sample(
+                    ctx,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    labels_to_execute=labels_to_execute,
+                    sample_index=active_terminal_monitor_samples,
+                )
+                if sample is not None:
+                    post_sample_run = await _safe_read_workflow_run(
+                        workflow_run.workflow_run_id,
+                        ctx.organization_id,
+                        context="active-terminal-post-sample",
+                    )
+                    if post_sample_run is not None:
+                        run = post_sample_run
+                    active_run_terminal_evidence = sample
+                    exit_reason = "active_run_terminal_evidence"
+                    break
+
             if new_marker != progress_marker:
                 progress_marker = new_marker
                 last_progress_monotonic = now
@@ -3928,20 +4063,28 @@ async def _run_blocks_and_collect_debug(
             pre_cancel_run = await _safe_read_workflow_run(
                 workflow_run.workflow_run_id, ctx.organization_id, context="pre-cancel"
             )
-            if pre_cancel_run is not None and WorkflowRunStatus(pre_cancel_run.status).is_final():
+            if (
+                _watchdog_exit_allows_terminal_promotion(exit_reason)
+                and pre_cancel_run is not None
+                and WorkflowRunStatus(pre_cancel_run.status).is_final()
+            ):
                 final_status = pre_cancel_run.status
                 run = pre_cancel_run
                 exit_reason = "success"
             else:
-                await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
-                run_cancelled_by_watchdog = True
-                run = await _safe_read_workflow_run(
-                    workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
-                )
-                trusted = _trusted_post_drain_status(run)
-                if trusted is not None:
-                    final_status = trusted
-                    exit_reason = "success"
+                if pre_cancel_run is not None:
+                    run = pre_cancel_run
+                if run is None or not WorkflowRunStatus(run.status).is_final():
+                    await _cancel_run_task_if_not_final(run_task, workflow_run.workflow_run_id)
+                    run_cancelled_by_watchdog = True
+                    run = await _safe_read_workflow_run(
+                        workflow_run.workflow_run_id, ctx.organization_id, context="post-drain"
+                    )
+                if _watchdog_exit_allows_terminal_promotion(exit_reason):
+                    trusted = _trusted_post_drain_status(run)
+                    if trusted is not None:
+                        final_status = trusted
+                        exit_reason = "success"
 
         if exit_reason != "success":
             assert exit_reason is not None  # narrows for mypy; outer check excludes "success" but not None
@@ -3954,22 +4097,35 @@ async def _run_blocks_and_collect_debug(
             )
             user_facing_summary = _watchdog_user_facing_summary(exit_reason, budget_seconds, run)
             current_url, page_title = await _fallback_page_info(ctx)
-            result: dict[str, Any] = {
-                "ok": False,
-                "error": error_msg,
-                "data": {
-                    "workflow_run_id": workflow_run.workflow_run_id,
-                    "overall_status": run.status if run is not None else None,
-                    "failure_reason": user_failure_reason,
-                    "current_url": current_url,
-                    "page_title": page_title,
-                    "control_signal": {
-                        "kind": f"watchdog_{exit_reason}",
-                        "user_facing_summary": user_facing_summary,
+            if exit_reason == "active_run_terminal_evidence" and active_run_terminal_evidence is not None:
+                result: dict[str, Any] = _active_run_terminal_evidence_result(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    run_status=run.status if run is not None else None,
+                    sample=active_run_terminal_evidence,
+                    requested_block_labels=list(block_labels),
+                    executed_block_labels=list(labels_to_execute),
+                    current_url=current_url,
+                    page_title=page_title,
+                )
+                result["error"] = error_msg
+                result["data"]["failure_reason"] = user_failure_reason
+            else:
+                result = {
+                    "ok": False,
+                    "error": error_msg,
+                    "data": {
+                        "workflow_run_id": workflow_run.workflow_run_id,
+                        "overall_status": run.status if run is not None else None,
+                        "failure_reason": user_failure_reason,
+                        "current_url": current_url,
+                        "page_title": page_title,
                     },
-                    "user_facing_summary": user_facing_summary,
-                },
+                }
+            result["data"]["control_signal"] = {
+                "kind": f"watchdog_{exit_reason}",
+                "user_facing_summary": user_facing_summary,
             }
+            result["data"]["user_facing_summary"] = user_facing_summary
             if exit_reason == "per_tool_budget":
                 # Stable failure_categories entry so consecutive budget trips
                 # hash to the same streak signature; without it the run_id in
@@ -5638,6 +5794,17 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
     run_id = data.get("workflow_run_id")
     if isinstance(run_id, str) and run_id.strip():
         evidence.workflow_run_id = run_id.strip()
+    if _active_run_terminal_evidence_detected(result):
+        evidence.active_run_terminal_evidence_detected = True
+        evidence.live_page_state_verified = True
+        evidence.verified_from_current_browser_state = True
+        evidence.full_workflow_verified = False
+        evidence.test_attempted_but_incomplete = True
+        if isinstance(run_id, str) and run_id.strip():
+            evidence.active_run_terminal_evidence_workflow_run_id = run_id.strip()
+        sample_index = data.get("active_run_terminal_evidence_sample_index")
+        if isinstance(sample_index, int):
+            evidence.active_run_terminal_evidence_sample_index = sample_index
     current_url = _valid_runtime_anchor_url(data.get("current_url"))
     if current_url is not None:
         evidence.current_url = current_url
@@ -5686,6 +5853,146 @@ async def _completion_verification_handler(copilot_ctx: Any) -> Any | None:
     )
 
 
+async def _active_run_terminal_monitor_enabled(copilot_ctx: Any) -> bool:
+    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
+        return False
+    if not getattr(copilot_ctx, "browser_session_id", None):
+        return False
+    if not getattr(copilot_ctx, "discovery_mcp_server", None):
+        return False
+    if not _completion_verification_criteria(copilot_ctx):
+        return False
+    return await _completion_verification_handler(copilot_ctx) is not None
+
+
+def _active_run_terminal_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
+    if page_evidence_needs_visual_fallback(evidence):
+        return True
+    return evidence.get("screenshot_used") is not True
+
+
+async def _active_run_terminal_evidence_sample(
+    copilot_ctx: Any,
+    *,
+    workflow_run_id: str,
+    labels_to_execute: list[str],
+    sample_index: int,
+) -> ActiveRunTerminalEvidenceSample | None:
+    criteria = _completion_verification_criteria(copilot_ctx)
+    if not criteria:
+        return None
+    handler = await _completion_verification_handler(copilot_ctx)
+    if handler is None:
+        return None
+
+    current_url_raw, page_title_raw = await _fallback_page_info(copilot_ctx)
+    current_url = _valid_runtime_anchor_url(current_url_raw)
+    if current_url is None:
+        return None
+
+    evidence, html_error = await _capture_composition_evidence(
+        copilot_ctx,
+        inspected_url=current_url,
+        current_url=current_url,
+        active_run_terminal_sample=True,
+    )
+    if html_error is not None or evidence is None:
+        LOG.info(
+            "copilot active-run terminal evidence sample skipped",
+            workflow_run_id=workflow_run_id,
+            sample_index=sample_index,
+            html_error=html_error,
+        )
+        return None
+
+    page_title = evidence.get("page_title")
+    if not isinstance(page_title, str) or not page_title.strip():
+        page_title = page_title_raw if isinstance(page_title_raw, str) and page_title_raw.strip() else None
+    evidence = {
+        **evidence,
+        "workflow_run_id": workflow_run_id,
+        "observed_during_active_workflow_run": True,
+    }
+    snapshot = RunEvidenceSnapshot(
+        workflow_run_id=workflow_run_id,
+        current_url=current_url,
+        page_title=page_title,
+        executed_block_labels=list(labels_to_execute),
+        page_evidence=evidence,
+    )
+    if not snapshot.has_evidence():
+        return None
+
+    result = await evaluate_completion_criteria(criteria, snapshot, handler)
+    LOG.info(
+        "copilot active-run terminal evidence sample",
+        workflow_run_id=workflow_run_id,
+        sample_index=sample_index,
+        completion_verification_status=result.status,
+        completion_verification_fully_satisfied=result.is_fully_satisfied(),
+    )
+    if result.status != "evaluated" or not result.is_fully_satisfied():
+        return None
+    copilot_ctx.composition_page_evidence = evidence
+    return ActiveRunTerminalEvidenceSample(
+        current_url=current_url,
+        page_title=page_title,
+        page_evidence=evidence,
+        completion_verification=result,
+        sample_index=sample_index,
+    )
+
+
+def _active_run_terminal_evidence_result(
+    *,
+    workflow_run_id: str,
+    run_status: str | None,
+    sample: Any,
+    requested_block_labels: list[str],
+    executed_block_labels: list[str],
+    current_url: str | None = None,
+    page_title: str | None = None,
+) -> dict[str, Any]:
+    observed_url = current_url or getattr(sample, "current_url", None)
+    observed_title = page_title or getattr(sample, "page_title", None)
+    completion = getattr(sample, "completion_verification", None)
+    completion_trace = completion.to_trace_data() if isinstance(completion, CompletionVerificationResult) else {}
+    reason = (
+        "The active run reached the requested browser state while the workflow was still running, "
+        "so Copilot interrupted it before further browser actions could overshoot that state. "
+        "The current page evidence is not a durable full-workflow verification; inspect the run boundary, "
+        "repair the workflow if needed, and verify the corrected workflow run."
+    )
+    return {
+        "ok": False,
+        "error": reason,
+        "data": {
+            "workflow_run_id": workflow_run_id,
+            "overall_status": run_status,
+            "failure_reason": reason,
+            "requested_block_labels": list(requested_block_labels),
+            "executed_block_labels": list(executed_block_labels),
+            "current_url": observed_url,
+            "page_title": observed_title,
+            "active_run_terminal_evidence_detected": True,
+            "active_run_terminal_evidence_sample_index": getattr(sample, "sample_index", None),
+            "full_workflow_verified": False,
+            "current_page_evidence": getattr(sample, "page_evidence", None),
+            "active_run_terminal_completion_verification": completion_trace,
+            "failure_categories": [
+                {
+                    "category": ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+                    "confidence_float": 1.0,
+                    "reasoning": (
+                        "Bounded current-page evidence matched the request-policy completion criteria "
+                        "while the workflow run was still active; the run was interrupted for diagnosis/repair."
+                    ),
+                }
+            ],
+        },
+    }
+
+
 def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> bool:
     """A clean ok=True run worth judging on its whole-workflow outcome.
 
@@ -5711,6 +6018,8 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
     even though the run did not finish cleanly — recognition must not key on run status.
     """
     if bool(result.get("ok", False)):
+        return False
+    if _active_run_terminal_evidence_detected(result):
         return False
     if _run_blocks_structured_blocker_message(result):
         return False
@@ -5959,6 +6268,12 @@ def _record_run_blocks_result(
         data = result.get("data")
         if isinstance(data, dict):
             data["failure_categories"] = failure_categories
+
+    if _active_run_terminal_evidence_detected(result):
+        _update_verification_evidence_from_run_result(copilot_ctx, result)
+        signal = _active_run_terminal_evidence_signal(copilot_ctx, "update_and_run_blocks")
+        if signal is not None:
+            stash_blocker_signal(copilot_ctx, signal)
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
@@ -7086,17 +7401,20 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "Return JSON only with keys: summary, challenge_detected, challenge_kind, "
         "challenge_location, submit_blocked, blocked_submit_controls, empty_page_visible, "
         "loading_state_visible, page_obstruction_detected, obstruction_kind, "
-        "obstruction_location, underlying_page_blocked, visible_dismiss_controls, omissions. Focus on "
-        "visible anti-bot or human-verification state, whether it appears to gate a submit/search "
-        "control, whether any visible artificial barrier mechanically blocks the underlying page, "
-        "and where it appears relative to the page controls. Do not include raw DOM, "
-        "code, selectors, personal data, or workflow instructions. If no challenge is visible, "
-        "set challenge_detected to false and submit_blocked to false. If no page obstruction is visible, "
-        "set page_obstruction_detected to false. If DOM context shows a "
-        "schema-empty page, set empty_page_visible to true only when the screenshot shows a "
-        "settled page with no visible forms, controls, result data, challenge, or loading/progress "
-        "state; set loading_state_visible to true when the page appears to be waiting, loading, "
-        "redirecting, or still rendering.\n\n"
+        "obstruction_location, underlying_page_blocked, visible_dismiss_controls, omissions. "
+        "In summary, include the visible page state that would help verify an end-state outcome, "
+        "such as cart items, "
+        "record rows, visible identifiers, quantities, statuses, prices, confirmations, search results, "
+        "or selected values when legible. Also note visible anti-bot or human-verification state, "
+        "whether it appears to gate a submit/search control, whether any visible artificial barrier "
+        "mechanically blocks the underlying page, and where it appears relative to the page controls. "
+        "Do not include raw DOM, code, selectors, personal data, or workflow instructions. "
+        "If no challenge is visible, set challenge_detected to false and submit_blocked to false. "
+        "If no page obstruction is visible, set page_obstruction_detected to false. "
+        "If DOM context shows a schema-empty page, set empty_page_visible to true only when the "
+        "screenshot shows a settled page with no visible forms, controls, result data, challenge, "
+        "or loading/progress state; set loading_state_visible to true when the page appears to be "
+        "waiting, loading, redirecting, or still rendering.\n\n"
         f"DOM evidence context:\n{json.dumps(context, sort_keys=True)}"
     )
 
@@ -7498,6 +7816,7 @@ async def _capture_composition_evidence(
     *,
     inspected_url: str,
     current_url: str,
+    active_run_terminal_sample: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Read page HTML and parse composition evidence, recapturing on a hollow read.
 
@@ -7526,6 +7845,7 @@ async def _capture_composition_evidence(
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
+        or (active_run_terminal_sample and _active_run_terminal_evidence_needs_visual_fallback(evidence))
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)

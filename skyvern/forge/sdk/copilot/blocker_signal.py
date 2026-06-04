@@ -9,6 +9,8 @@ from typing import Any, Literal, Protocol
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
+from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+
 BlockerKind = Literal[
     "authority_denied",
     "loop_detected",
@@ -141,6 +143,21 @@ _LOOP_PROGRESS_TOOLS = frozenset(
         "update_workflow",
     }
 )
+_ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
+
+
+def _should_stash_over_existing(
+    existing: CopilotToolBlockerSignal | None,
+    incoming: CopilotToolBlockerSignal,
+) -> bool:
+    if not isinstance(existing, CopilotToolBlockerSignal):
+        return True
+    if (
+        incoming.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
+        and existing.internal_reason_code in _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES
+    ):
+        return True
+    return False
 
 
 def _tool_success_clears_signal(signal: CopilotToolBlockerSignal, succeeded_tool_name: str) -> bool:
@@ -166,7 +183,7 @@ def clear_blocker_signal_for_reason_codes(ctx: _BlockerSignalCtx, internal_reaso
 
 
 def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSignal) -> str:
-    """First-wins stash + observability log; returns the LLM-visible payload."""
+    """Mostly first-wins stash + observability log; returns the LLM-visible payload."""
     ctx.latest_tool_blocker_signal = signal
     # Keep the defensive guard for tests and partial context shims even though
     # real Copilot contexts type this field as a list.
@@ -178,13 +195,16 @@ def stash_blocker_signal(ctx: _BlockerSignalCtx, signal: CopilotToolBlockerSigna
     if len(history) > 20:
         del history[:-20]
     existing = getattr(ctx, "blocker_signal", None)
-    stashed = not isinstance(existing, CopilotToolBlockerSignal)
+    stashed = _should_stash_over_existing(existing, signal)
     if stashed:
         ctx.blocker_signal = signal
     extra: dict[str, Any] = {"stashed": stashed}
     if not stashed and isinstance(existing, CopilotToolBlockerSignal):
         extra["existing_reason_code"] = existing.internal_reason_code
         extra["existing_blocker_kind"] = existing.blocker_kind
+    elif stashed and isinstance(existing, CopilotToolBlockerSignal):
+        extra["replaced_reason_code"] = existing.internal_reason_code
+        extra["replaced_blocker_kind"] = existing.blocker_kind
     LOG.info("copilot tool blocker signal", **extra, **to_trace_data(signal))
     return build_llm_tool_error_payload(signal)
 

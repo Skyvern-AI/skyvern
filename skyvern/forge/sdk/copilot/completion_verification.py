@@ -29,6 +29,23 @@ PROMPT_TEMPLATE_NAME = "workflow-copilot-completion-verification"
 _EVIDENCE_VALUE_MAX_CHARS = 2000
 _MAX_BLOCK_OUTPUTS = 20
 _REASON_CODES = frozenset({"evidence_confirms", "no_evidence", "evidence_contradicts", "unknown"})
+_PAGE_EVIDENCE_KEYS = (
+    "current_url",
+    "page_title",
+    "visual_evidence_summary",
+    "screenshot_used",
+    "evidence_sources",
+    "visible_text_excerpt",
+    "forms",
+    "navigation_targets",
+    "result_containers",
+    "anti_bot_indicators",
+    "challenge_state",
+    "visual_evidence_omissions",
+    "inspection_warnings",
+    "observed_empty_page",
+    "evidence_confidence",
+)
 
 VerificationStatus = Literal["evaluated", "unavailable"]
 
@@ -71,9 +88,10 @@ class RunEvidenceSnapshot:
     page_title: str | None = None
     executed_block_labels: list[str] = field(default_factory=list)
     verified_context_block_labels: list[str] = field(default_factory=list)
+    page_evidence: dict[str, Any] = field(default_factory=dict)
 
     def has_evidence(self) -> bool:
-        return bool(self.block_outputs or self.current_url or self.page_title)
+        return bool(self.block_outputs or self.current_url or self.page_title or self.page_evidence)
 
     def render_prompt_block(self) -> str:
         lines: list[str] = []
@@ -95,6 +113,15 @@ class RunEvidenceSnapshot:
                 serialized = payload if isinstance(payload, str) else json.dumps(payload, default=str)
                 serialized = " ".join(serialized.split())[:_EVIDENCE_VALUE_MAX_CHARS]
                 lines.append(f"  - {label}: {serialized}")
+        page_evidence = {
+            key: self.page_evidence[key]
+            for key in _PAGE_EVIDENCE_KEYS
+            if key in self.page_evidence and self.page_evidence[key] not in (None, "", [], {})
+        }
+        if page_evidence:
+            serialized = json.dumps(page_evidence, default=str)
+            serialized = " ".join(serialized.split())[:_EVIDENCE_VALUE_MAX_CHARS]
+            lines.append(f"page_evidence: {serialized}")
         return redact_raw_secrets_for_prompt("\n".join(lines))
 
 

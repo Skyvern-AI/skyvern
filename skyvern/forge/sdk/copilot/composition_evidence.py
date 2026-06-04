@@ -61,6 +61,7 @@ _MODAL_DISMISS_HINTS: frozenset[str] = frozenset(
     }
 )
 _MODAL_DISMISS_SYMBOLS: frozenset[str] = frozenset({"x", "\u00d7"})
+_MAX_VISIBLE_TEXT_EXCERPT_CHARS = 3000
 DOM_EVIDENCE_SOURCE = "dom_html"
 DOM_STYLE_EVIDENCE_SOURCE = "dom_style"
 SCREENSHOT_EVIDENCE_SOURCE = "screenshot"
@@ -1005,6 +1006,7 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "forms": [],
         "navigation_targets": [],
         "result_containers": [],
+        "visible_text_excerpt": "",
         "anti_bot_indicators": [],
         "challenge_controls": [],
         "modal_overlays": [],
@@ -1489,6 +1491,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
 
+    visible_text = _node_text(soup.body if getattr(soup, "body", None) is not None else soup)
     all_nodes = soup.find_all(True)
     modal_overlays = _modal_overlays(all_nodes)
     page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
@@ -1600,6 +1603,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "visible_text_excerpt": _schema_text(visible_text, _MAX_VISIBLE_TEXT_EXCERPT_CHARS),
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,
         "modal_overlays": modal_overlays,
