@@ -10,7 +10,7 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from skyvern.exceptions import FailedToNavigateToUrl
-from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.real_browser_state import RealBrowserState, _same_page_ignoring_fragment
 
 
 @pytest.fixture
@@ -18,6 +18,12 @@ def browser_state() -> RealBrowserState:
     # Bypass __init__; navigate_to_url only uses `self` for LOG context and _wait_for_settle.
     state = RealBrowserState.__new__(RealBrowserState)
     return state
+
+
+def test_same_page_ignoring_fragment_matches_fragment_only_differences() -> None:
+    assert _same_page_ignoring_fragment("https://example.test/results#section", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results/", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results?page=2", "https://example.test/results") is False
 
 
 @pytest.mark.asyncio

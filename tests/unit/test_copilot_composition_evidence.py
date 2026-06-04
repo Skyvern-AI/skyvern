@@ -10,6 +10,7 @@ import yaml
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
+    has_bounded_page_schema,
     merge_visual_composition_evidence,
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
@@ -122,6 +123,109 @@ def test_composition_parse_html_extracts_labeled_fields_and_submit_controls() ->
     assert parsed["visual_evidence_summary"] == ""
     assert parsed["challenge_state"]["detected"] is False
     assert parsed["source_tool"] == "inspect_page_for_composition"
+
+
+def test_composition_parse_html_extracts_modal_overlay_controls() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="newsletter" role="dialog" aria-modal="true" class="promo-modal">
+            <h2>Get updates</h2>
+            <p>Join our list before browsing.</p>
+            <button aria-label="Close modal">x</button>
+            <button>No thanks</button>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"][0]["selector"] == "#newsletter"
+    assert parsed["modal_overlays"][0]["role"] == "dialog"
+    assert parsed["modal_overlays"][0]["dismiss_controls"][0]["text"] == "x"
+    assert parsed["modal_overlays"][0]["dismiss_controls"][0]["aria_label"] == "Close modal"
+    assert parsed["page_obstructions"][0]["kind"] == "modal_overlay"
+    assert parsed["page_obstructions"][0]["visible_controls"][0]["text"] == "x"
+    assert has_bounded_page_schema(parsed) is True
+
+
+def test_composition_parse_html_extracts_class_only_modal_overlay() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div class="promo modal">
+            <h2>Before you continue</h2>
+            <button>Close</button>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"][0]["class"] == "promo modal"
+    assert parsed["modal_overlays"][0]["dismiss_controls"][0]["text"] == "Close"
+    assert parsed["page_obstructions"][0]["visible_controls"][0]["text"] == "Close"
+    assert has_bounded_page_schema(parsed) is True
+
+
+def test_composition_parse_html_ignores_hidden_modal_overlay_markup() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="closedDialog" role="dialog" aria-modal="true" aria-hidden="true">
+            <button>Close</button>
+          </div>
+          <div id="closedModal" class="modal" style="display: none;">
+            <button>Dismiss</button>
+          </div>
+          <div aria-hidden="true">
+            <div id="wrappedDialog" role="dialog">
+              <button>Close</button>
+            </div>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+
+
+def test_composition_parse_html_ignores_empty_modal_root_as_bounded_schema() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="modal-root"></div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert has_bounded_page_schema(parsed) is False
+
+
+def test_composition_parse_html_does_not_treat_next_as_modal_dismiss_control() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <div id="modal-root">
+            <button>Next</button>
+            <button>Export</button>
+          </div>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert has_bounded_page_schema(parsed) is False
 
 
 def test_composition_parse_html_preserves_stable_control_selectors_and_values() -> None:
@@ -288,6 +392,11 @@ def test_merge_visual_composition_evidence_keeps_screenshot_bounded_and_typed() 
             "challenge_location": "Below the acknowledgement checkbox and above the Search button.",
             "submit_blocked": True,
             "blocked_submit_controls": ["Search"],
+            "page_obstruction_detected": True,
+            "obstruction_kind": "verification_panel",
+            "obstruction_location": "Centered above the search form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
             "omissions": ["Result rows are not visible before verification."],
         },
     )
@@ -302,7 +411,37 @@ def test_merge_visual_composition_evidence_keeps_screenshot_bounded_and_typed() 
     )
     assert merged["challenge_state"]["gates_submit_controls"] is True
     assert merged["challenge_state"]["gated_submit_controls"] == [{"text": "Search", "disabled": True}]
+    assert merged["page_obstructions"] == [
+        {
+            "kind": "verification_panel",
+            "source": "vision_summary",
+            "visual_location": "Centered above the search form.",
+            "visible_controls": [{"text": "Continue"}],
+            "underlying_page_blocked": True,
+        }
+    ]
     assert merged["visual_evidence_omissions"] == ["Result rows are not visible before verification."]
+
+
+def test_merge_visual_composition_evidence_keeps_false_underlying_page_blocked() -> None:
+    parsed = parse_composition_html(
+        "<html><head><title>Search</title></head><body><form><input name='q' /></form></body></html>",
+        inspected_url="https://example.com/search",
+        current_url="https://example.com/search",
+    )
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A banner is visible but the search form remains usable.",
+            "page_obstruction_detected": True,
+            "obstruction_kind": "banner",
+            "obstruction_location": "Bottom of viewport.",
+            "underlying_page_blocked": False,
+        },
+    )
+
+    assert merged["page_obstructions"][0]["underlying_page_blocked"] is False
 
 
 def test_composition_parse_html_surfaces_human_verification_controls_after_long_page_preamble() -> None:
@@ -1267,6 +1406,27 @@ def test_composition_gate_rejects_click_reached_blocks_reusing_entrypoint_observ
     assert "references observation_step 0" in error
     assert "reached via 'navigate'" in error
     assert "add_first_result (action)" in error
+
+
+def test_composition_gate_allows_current_page_read_after_matching_interaction_reached_page() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _flow_entry("https://example.com/results?s=1", reached_via="interaction", step=1),
+            _flow_entry("https://example.com/results?s=1", reached_via="current_page", step=2),
+        ],
+        block_observation_refs={
+            "search_product": 0,
+            "add_first_result": 2,
+        },
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
 
 
 def test_composition_gate_reports_missing_referenced_observation_step() -> None:

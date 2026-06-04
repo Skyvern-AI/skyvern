@@ -51,6 +51,7 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
+from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_gate_decision,
@@ -685,31 +686,40 @@ def _partial_verification_response(ctx: CopilotContext) -> str | None:
 def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> str:
     has_keepable_draft = ctx.last_workflow is not None and bool(ctx.last_workflow_yaml)
     keep_draft_affordance = " Keep the draft to iterate on, or discard." if has_keepable_draft else ""
+    block_count = ctx.last_update_block_count if isinstance(ctx.last_update_block_count, int) else None
+    positive_block_count = block_count if block_count is not None and block_count > 0 else None
+
+    if outcome_fully_verified(ctx) and has_keepable_draft and positive_block_count is not None:
+        block_word = "block" if positive_block_count == 1 else "blocks"
+        return (
+            f"I created a workflow with {positive_block_count} {block_word} and verified the requested "
+            "outcome from the current browser page after the run. The workflow is ready to review."
+        )
 
     policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     if (
         policy is not None
         and policy.clarification_reason == "workflow_credential_inputs_unbound"
         and ctx.last_workflow is not None
-        and ctx.last_update_block_count is not None
+        and block_count is not None
     ):
-        if ctx.last_update_block_count <= 0:
+        if positive_block_count is None:
             draft_phrase = "a draft workflow"
         else:
-            block_word = "block" if ctx.last_update_block_count == 1 else "blocks"
-            draft_phrase = f"a draft workflow with {ctx.last_update_block_count} {block_word}"
+            block_word = "block" if positive_block_count == 1 else "blocks"
+            draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
         return (
             f"I applied your requested change as {draft_phrase}. "
             f"I couldn't test the modified workflow because I couldn't find the required credentials — "
             f"please add them via the Credentials UI, then I can try again.{keep_draft_affordance}"
         )
 
-    if ctx.last_test_ok is False and ctx.last_update_block_count is not None:
-        if ctx.last_update_block_count <= 0:
+    if ctx.last_test_ok is False and block_count is not None:
+        if positive_block_count is None:
             draft_phrase = "a draft workflow"
         else:
-            block_word = "block" if ctx.last_update_block_count == 1 else "blocks"
-            draft_phrase = f"a draft workflow with {ctx.last_update_block_count} {block_word}"
+            block_word = "block" if positive_block_count == 1 else "blocks"
+            draft_phrase = f"a draft workflow with {positive_block_count} {block_word}"
 
         failure_summary = _normalize_failure_reason(ctx.last_test_failure_reason)
         follow_up = _FAILURE_FOLLOW_UP.get(ctx.last_failure_category_top or "", "")
@@ -723,7 +733,7 @@ def _rewrite_failed_test_response(user_response: str, ctx: CopilotContext) -> st
         if partial_reply is not None:
             return partial_reply
 
-    if ctx.last_test_ok is None and ctx.last_update_block_count is not None and ctx.last_workflow is not None:
+    if ctx.last_test_ok is None and block_count is not None and ctx.last_workflow is not None:
         if policy is not None and policy.raw_secret_handling == "redacted_draft":
             return (
                 "I drafted the workflow with the pasted secret redacted. "
@@ -770,8 +780,6 @@ def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
 def _verified_workflow_or_none(ctx: CopilotContext) -> tuple[Any, str | None]:
     """Surface a proposal when it passed a test this turn, or when the outcome judge
     confirmed the goal from evidence even though the run did not finish cleanly."""
-    from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
-
     run_status_clean = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
     if (
         ctx.last_workflow is not None

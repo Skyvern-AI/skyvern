@@ -570,7 +570,6 @@ def build_turn_intent(
         required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
         reason_codes.append(TurnIntentReasonCode.RUN_CONTEXT_PRESENT)
     if browser_session_id:
-        required_context.append(RequiredContextKey.BROWSER_STATE)
         reason_codes.append(TurnIntentReasonCode.BROWSER_CONTEXT_PRESENT)
     if request_policy.credential_input_kind != "none" or request_policy.resolved_credentials:
         required_context.append(RequiredContextKey.CREDENTIAL_METADATA)

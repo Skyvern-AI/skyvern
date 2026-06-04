@@ -43,6 +43,24 @@ _MAX_RESULT_CONTAINERS = 8
 _MAX_NAVIGATION_TARGETS = 20
 _MAX_SELECT_OPTIONS = 30
 _MAX_CHALLENGE_CONTROLS = 8
+_MAX_MODAL_OVERLAYS = 5
+_MAX_MODAL_DISMISS_CONTROLS = 6
+_MAX_PAGE_OBSTRUCTIONS = 5
+_MAX_VISIBLE_CONTROLS = 6
+_MODAL_IDENTITY_PATTERNS: frozenset[str] = frozenset({"modal", "popup", "overlay", "dialog", "drawer", "lightbox"})
+_MODAL_ROLE_VALUES: frozenset[str] = frozenset({"dialog", "alertdialog"})
+_MODAL_DISMISS_HINTS: frozenset[str] = frozenset(
+    {
+        "cancel",
+        "close",
+        "dismiss",
+        "got it",
+        "no thanks",
+        "not now",
+        "skip",
+    }
+)
+_MODAL_DISMISS_SYMBOLS: frozenset[str] = frozenset({"x", "\u00d7"})
 DOM_EVIDENCE_SOURCE = "dom_html"
 SCREENSHOT_EVIDENCE_SOURCE = "screenshot"
 VISION_EVIDENCE_SOURCE = "vision_summary"
@@ -50,6 +68,8 @@ _ANTI_BOT_PATTERNS = (
     "just a moment",
     "captcha",
     "challenge",
+    "turnstile",
+    "cf-turnstile",
     "human-verification",
     "human verification",
     "verify you are human",
@@ -157,6 +177,37 @@ def _evidence_metadata(
     }
 
 
+def _bounded_visual_controls(values: Iterable[Any]) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    for value in values:
+        if len(controls) >= _MAX_VISIBLE_CONTROLS:
+            break
+        text = _bounded_string(value, 120)
+        if text:
+            controls.append({"text": text})
+    return controls
+
+
+def _page_obstructions_from_visual_summary(visual_summary: dict[str, Any]) -> list[dict[str, Any]]:
+    if visual_summary.get("page_obstruction_detected") is not True:
+        return []
+    obstruction: dict[str, Any] = {
+        "kind": _bounded_string(visual_summary.get("obstruction_kind"), 80) or "visual_obstruction",
+        "source": VISION_EVIDENCE_SOURCE,
+        "visual_location": _bounded_string(visual_summary.get("obstruction_location"), 180),
+        "visible_controls": _bounded_visual_controls(visual_summary.get("visible_dismiss_controls") or []),
+    }
+    if isinstance(visual_summary.get("underlying_page_blocked"), bool):
+        obstruction["underlying_page_blocked"] = visual_summary["underlying_page_blocked"]
+    return [
+        {
+            key: value
+            for key, value in obstruction.items()
+            if value or key in {"visible_controls", "underlying_page_blocked"}
+        }
+    ]
+
+
 def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     """Return True when DOM evidence should be augmented with visual evidence."""
 
@@ -232,6 +283,10 @@ def merge_visual_composition_evidence(
             ]
             challenge_state["gated_submit_controls"] = (existing_controls + visual_blocked_controls)[:5]
         merged["challenge_state"] = challenge_state
+        visual_obstructions = _page_obstructions_from_visual_summary(visual_summary)
+        if visual_obstructions:
+            existing_obstructions = [item for item in merged.get("page_obstructions") or [] if isinstance(item, dict)]
+            merged["page_obstructions"] = (existing_obstructions + visual_obstructions)[:_MAX_PAGE_OBSTRUCTIONS]
         # Empty-page classification is visual-only: DOM parsing can tell that a page
         # is schema-empty, but only the screenshot summary distinguishes settled empty
         # pages from loading shells.
@@ -495,6 +550,22 @@ def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
         value = evidence.get(key)
         if isinstance(value, list) and value:
             return True
+    modal_overlays = evidence.get("modal_overlays")
+    if isinstance(modal_overlays, list):
+        for overlay in modal_overlays:
+            if not isinstance(overlay, dict):
+                continue
+            dismiss_controls = overlay.get("dismiss_controls")
+            if isinstance(dismiss_controls, list) and dismiss_controls:
+                return True
+    page_obstructions = evidence.get("page_obstructions")
+    if isinstance(page_obstructions, list):
+        for obstruction in page_obstructions:
+            if not isinstance(obstruction, dict):
+                continue
+            visible_controls = obstruction.get("visible_controls")
+            if isinstance(visible_controls, list) and visible_controls:
+                return True
     challenge_state = evidence.get("challenge_state")
     if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
         return True
@@ -691,6 +762,27 @@ def _associated_observation_satisfies_block(
     return _evidence_matches_target(evidence, observed_url, allow_post_run_browser_observation=allow_post_run)
 
 
+def _current_page_evidence_has_reached_page_credit(
+    evidence: dict[str, Any],
+    reached_via: str,
+    *,
+    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
+) -> bool:
+    if reached_via != "current_page" or not has_bounded_page_schema(evidence):
+        return False
+    observed_url = _evidence_observed_url(evidence)
+    if not observed_url:
+        return False
+    for prior_evidence, prior_reached_via in flow_evidence_by_step.values():
+        if prior_reached_via not in {"interaction", "post_run"}:
+            continue
+        if not has_bounded_page_schema(prior_evidence):
+            continue
+        if _same_page(observed_url, _evidence_observed_url(prior_evidence)):
+            return True
+    return False
+
+
 def _block_has_observed_page(
     ctx: Any,
     block: dict[str, Any],
@@ -705,11 +797,20 @@ def _block_has_observed_page(
         if evidence_entry is None:
             return False
         evidence, reached_via = evidence_entry
+        effective_reached_via = (
+            "interaction"
+            if _current_page_evidence_has_reached_page_credit(
+                evidence,
+                reached_via,
+                flow_evidence_by_step=flow_evidence_by_step,
+            )
+            else reached_via
+        )
         return _associated_observation_satisfies_block(
             evidence,
             block.get("target_url"),
             acts_via=str(block.get("acts_via") or ""),
-            reached_via=reached_via,
+            reached_via=effective_reached_via,
             requires_observation_ref=block.get("requires_observation_ref") is True,
             allow_post_run=allow_post_run,
         )
@@ -772,8 +873,14 @@ def _wrong_reached_via_observation_ref(
     evidence_entry = flow_evidence_by_step.get(step)
     if evidence_entry is None:
         return None
-    _, reached_via = evidence_entry
+    evidence, reached_via = evidence_entry
     if reached_via in {"interaction", "post_run"}:
+        return None
+    if _current_page_evidence_has_reached_page_credit(
+        evidence,
+        reached_via,
+        flow_evidence_by_step=flow_evidence_by_step,
+    ):
         return None
     return step, reached_via or "<missing>"
 
@@ -840,7 +947,7 @@ def composition_page_evidence_error(
                 return (
                     "Workflow validation failed: a block_observation_refs entry uses observation_step "
                     f"{string_step!r} as a string. Pass the integer observation_step returned by "
-                    "inspect_page_for_composition for click-reached blocks. "
+                    "inspect_page_for_composition or evaluate for click-reached blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             if _required_observation_ref_missing(block, block_observation_refs):
@@ -868,8 +975,8 @@ def composition_page_evidence_error(
                 return (
                     "Workflow validation failed: a block references observation_step "
                     f"{missing_step}, but {missing_reason}. "
-                    "Call inspect_page_for_composition again for the reached page and pass the new "
-                    "observation_step in block_observation_refs before composing page-dependent blocks. "
+                    "Inspect or evaluate the reached page again and pass the new observation_step in "
+                    "block_observation_refs before composing page-dependent blocks. "
                     f"Offending blocks: {_format_page_block_findings([block])}"
                 )
             return (
@@ -896,6 +1003,8 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "result_containers": [],
         "anti_bot_indicators": [],
         "challenge_controls": [],
+        "modal_overlays": [],
+        "page_obstructions": [],
         "schema_empty_page": False,
         "observed_empty_page": False,
         "empty_page_visual_state": None,
@@ -1122,6 +1231,145 @@ def _challenge_controls(soup: Any) -> list[dict[str, Any]]:
     return controls
 
 
+def _modal_identity(node: Any) -> str:
+    values = (
+        getattr(node, "name", ""),
+        _attr_value(node, "id"),
+        " ".join(_classes_for(node)),
+        _attr_value(node, "role"),
+        _attr_value(node, "aria-label"),
+        _attr_value(node, "title"),
+        _attr_value(node, "data-testid"),
+        _attr_value(node, "data-test"),
+        _attr_value(node, "data-dismiss"),
+    )
+    return " ".join(str(value or "") for value in values).lower()
+
+
+def _is_modal_overlay_candidate(node: Any) -> bool:
+    role = _attr_value(node, "role").strip().lower()
+    if role in _MODAL_ROLE_VALUES:
+        return True
+    if _attr_value(node, "aria-modal").strip().lower() == "true":
+        return True
+    return any(pattern in _modal_identity(node) for pattern in _MODAL_IDENTITY_PATTERNS)
+
+
+def _is_hidden_modal_candidate(node: Any) -> bool:
+    current = node
+    while current is not None:
+        if _attr_value(current, "aria-hidden").strip().lower() == "true":
+            return True
+        if hasattr(current, "has_attr") and current.has_attr("hidden"):
+            return True
+        style = _attr_value(current, "style").replace(" ", "").lower()
+        if "display:none" in style or "visibility:hidden" in style:
+            return True
+        current = getattr(current, "parent", None)
+    return False
+
+
+def _modal_dismiss_controls(node: Any) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    seen_selectors: set[str] = set()
+    for control in node.find_all(["button", "a", "input"]):
+        if len(controls) >= _MAX_MODAL_DISMISS_CONTROLS:
+            break
+        selector = _selector_for(control)[:160]
+        if selector in seen_selectors:
+            continue
+        text = _schema_text(_node_text(control) or _attr_value(control, "value"), 120)
+        aria_label = _schema_text(_attr_value(control, "aria-label"), 120)
+        title = _schema_text(_attr_value(control, "title"), 120)
+        explicit_values = {text.strip().lower(), aria_label.strip().lower(), title.strip().lower()}
+        identity = f"{text} {aria_label} {title} {_modal_identity(control)}".lower()
+        # Controls are typed as Any because BeautifulSoup is optional at import time.
+        has_data_dismiss = hasattr(control, "has_attr") and control.has_attr("data-dismiss")
+        has_symbol_hint = bool(explicit_values & _MODAL_DISMISS_SYMBOLS)
+        has_text_hint = any(hint in identity for hint in _MODAL_DISMISS_HINTS)
+        if not (has_data_dismiss or has_symbol_hint or has_text_hint):
+            continue
+        seen_selectors.add(selector)
+        controls.append(
+            {
+                "tag": str(getattr(control, "name", "") or "").lower()[:40],
+                "text": text,
+                "aria_label": aria_label,
+                "title": title,
+                "selector": selector,
+                "type": _attr_value(control, "type")[:40],
+            }
+        )
+    return [{key: value for key, value in entry.items() if value} for entry in controls]
+
+
+def _modal_overlay_entry(node: Any) -> dict[str, Any]:
+    return {
+        "role": _attr_value(node, "role")[:80],
+        "aria_modal": _attr_value(node, "aria-modal").strip().lower() == "true",
+        "id": _attr_value(node, "id")[:120],
+        "class": " ".join(_classes_for(node)[:5])[:160],
+        "selector": _selector_for(node)[:160],
+        "text": _schema_text(_node_text(node), 240),
+        "dismiss_controls": _modal_dismiss_controls(node),
+    }
+
+
+def _modal_overlays(nodes: Iterable[Any]) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    seen_selectors: set[str] = set()
+    for node in nodes:
+        if len(overlays) >= _MAX_MODAL_OVERLAYS:
+            break
+        if not _is_modal_overlay_candidate(node):
+            continue
+        if _is_hidden_modal_candidate(node):
+            continue
+        selector = _selector_for(node)[:160]
+        if selector in seen_selectors:
+            continue
+        entry = _modal_overlay_entry(node)
+        dismiss_controls = entry.get("dismiss_controls")
+        has_dismiss_controls = isinstance(dismiss_controls, list) and bool(dismiss_controls)
+        has_explicit_modal_semantics = bool(entry.get("role") or entry.get("aria_modal") is True)
+        if not (has_explicit_modal_semantics or has_dismiss_controls):
+            continue
+        seen_selectors.add(selector)
+        # Omit aria_modal=False from compact evidence: only affirmative modal
+        # semantics matter for obstruction handoff.
+        compact_entry = {key: value for key, value in entry.items() if value or key == "dismiss_controls"}
+        overlays.append(compact_entry)
+    return overlays
+
+
+def _page_obstructions_from_modal_overlays(modal_overlays: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    obstructions: list[dict[str, Any]] = []
+    for overlay in modal_overlays[:_MAX_PAGE_OBSTRUCTIONS]:
+        if not isinstance(overlay, dict):
+            continue
+        visible_controls: list[dict[str, Any]] = []
+        for control in overlay.get("dismiss_controls") or []:
+            if len(visible_controls) >= _MAX_VISIBLE_CONTROLS:
+                break
+            if not isinstance(control, dict):
+                continue
+            text = _bounded_string(control.get("text") or control.get("aria_label") or control.get("title"), 120)
+            selector = _bounded_string(control.get("selector"), 160)
+            if text or selector:
+                visible_controls.append(
+                    {key: value for key, value in {"text": text, "selector": selector}.items() if value}
+                )
+        entry = {
+            "kind": "modal_overlay",
+            "source": DOM_EVIDENCE_SOURCE,
+            "selector": _bounded_string(overlay.get("selector"), 160),
+            "text": _bounded_string(overlay.get("text"), 240),
+            "visible_controls": visible_controls,
+        }
+        obstructions.append({key: value for key, value in entry.items() if value or key == "visible_controls"})
+    return obstructions
+
+
 def _anti_bot_indicators(html: str, page_title: str) -> list[str]:
     haystack = f"{page_title}\n{html[:_ANTI_BOT_SCAN_BYTES]}".lower()
     return [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in haystack]
@@ -1144,6 +1392,8 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         node.decompose()
 
     all_nodes = soup.find_all(True)
+    modal_overlays = _modal_overlays(all_nodes)
+    page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
 
     forms: list[dict[str, Any]] = []
     for form in soup.find_all("form")[:_MAX_FORMS]:
@@ -1235,7 +1485,12 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
     body_text = _node_text(soup.body if soup.body is not None else soup).strip()
     # Schema-empty means the page had content, but no bounded form/link/result/challenge structure.
     schema_empty_page = bool((html or "").strip() or page_title or body_text) and not (
-        forms or navigation_targets or result_containers or challenge_controls or anti_bot_indicators
+        forms
+        or navigation_targets
+        or result_containers
+        or challenge_controls
+        or page_obstructions
+        or anti_bot_indicators
     )
     # Higher confidence means the parser saw a more complete form surface.
     confidence = 0.85 if field_count and control_count else 0.6 if field_count else 0.3 if forms else 0.1
@@ -1248,6 +1503,8 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "result_containers": result_containers,
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,
+        "modal_overlays": modal_overlays,
+        "page_obstructions": page_obstructions,
         "schema_empty_page": schema_empty_page,
         "observed_empty_page": False,
         "empty_page_visual_state": None,

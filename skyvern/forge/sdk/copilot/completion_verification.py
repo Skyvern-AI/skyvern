@@ -70,6 +70,7 @@ class RunEvidenceSnapshot:
     current_url: str | None = None
     page_title: str | None = None
     executed_block_labels: list[str] = field(default_factory=list)
+    verified_context_block_labels: list[str] = field(default_factory=list)
 
     def has_evidence(self) -> bool:
         return bool(self.block_outputs or self.current_url or self.page_title)
@@ -82,6 +83,10 @@ class RunEvidenceSnapshot:
             lines.append(f"observed_end_state_url: {self.current_url}")
         if self.page_title:
             lines.append(f"observed_end_state_page_title: {self.page_title}")
+        if self.verified_context_block_labels:
+            lines.append(
+                "verified_context_block_labels: " + ", ".join(self.verified_context_block_labels[:_MAX_BLOCK_OUTPUTS])
+            )
         if self.executed_block_labels:
             lines.append("executed_block_labels: " + ", ".join(self.executed_block_labels[:_MAX_BLOCK_OUTPUTS]))
         if self.block_outputs:
