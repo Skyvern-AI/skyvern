@@ -4,6 +4,12 @@ import {
 } from "@/routes/workflows/types/workflowTypes";
 
 export type WorkflowCopilotChatSender = "user" | "ai";
+export type ProposalDisposition =
+  | "no_proposal"
+  | "auto_applicable"
+  | "review_untested"
+  | "review_tested";
+export type CopilotResponseType = "REPLY" | "ASK_QUESTION" | "REPLACE_WORKFLOW";
 
 export interface WorkflowCopilotChat {
   workflow_copilot_chat_id: string;
@@ -42,6 +48,7 @@ export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
   created_at: string;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotChatHistoryResponse {
@@ -69,7 +76,11 @@ export type WorkflowCopilotStreamMessageType =
   | "tool_result"
   | "condensing"
   | "narration"
-  | "block_progress";
+  | "block_progress"
+  | "turn_start"
+  | "design_start"
+  | "design_end"
+  | "workflow_draft";
 
 export interface WorkflowCopilotProcessingUpdate {
   type: "processing_update";
@@ -83,20 +94,62 @@ export interface WorkflowCopilotStreamResponseUpdate {
   message: string;
   updated_workflow?: WorkflowApiResponse | null;
   response_time: string;
-  // Clients must NOT auto-apply when true; render Accept/Reject explicitly.
-  unvalidated?: boolean;
-  // Same auto-apply guard as unvalidated; cancel forces explicit review.
+  response_type?: CopilotResponseType;
+  proposal_disposition: ProposalDisposition;
+  // Cancel forces explicit review.
   cancelled?: boolean;
+  // Optional so the FE tolerates an older backend that does not emit the
+  // turn-narrative envelope.
+  turn_id?: string | null;
+  narrative_summary?: string | null;
+  narrative_payload?: Record<string, unknown> | null;
 }
 
 export interface WorkflowCopilotStreamErrorUpdate {
   type: "error";
   error: string;
+  turn_id?: string | null;
+  narrative_summary?: string | null;
+}
+
+export interface WorkflowCopilotTurnStartUpdate {
+  type: "turn_start";
+  turn_id: string;
+  turn_index: number;
+  mode: string;
+  timestamp: string;
+  // Block count of the canonical workflow at turn entry. Drives the FE's
+  // edit-vs-build chip; the snap-back source is captured client-side at
+  // submit time so unsaved local canvas edits survive.
+  prior_block_count?: number | null;
+}
+
+export interface WorkflowCopilotDesignStartUpdate {
+  type: "design_start";
+  timestamp: string;
+}
+
+export interface WorkflowCopilotDesignEndUpdate {
+  type: "design_end";
+  timestamp: string;
+}
+
+// Summary-only payload — the full workflow definition is delivered via the
+// terminal response's updated_workflow or via the chat's proposed_workflow
+// field, not here.
+export interface WorkflowCopilotWorkflowDraftUpdate {
+  type: "workflow_draft";
+  block_count: number;
+  block_labels: string[];
+  summary: string | null;
+  timestamp: string;
+  workflow?: WorkflowApiResponse | null;
 }
 
 export interface WorkflowCopilotToolCallUpdate {
   type: "tool_call";
   tool_name: string;
+  display_label?: string | null;
   tool_input: Record<string, unknown>;
   iteration: number;
   tool_call_id: string;

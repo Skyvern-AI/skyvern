@@ -19,7 +19,17 @@ from urllib.parse import parse_qsl, urlparse
 
 import psutil
 import structlog
-from playwright.async_api import Browser, BrowserContext, ConsoleMessage, Download, Page, Playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    ConsoleMessage,
+    Download,
+)
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import (
+    Page,
+    Playwright,
+)
 
 from skyvern.config import settings
 from skyvern.constants import (
@@ -33,12 +43,19 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_download_dir, make_temp_directory
 from skyvern.forge.sdk.core.skyvern_context import current, ensure_context
-from skyvern.schemas.runs import ProxyLocation, get_tzinfo_from_proxy
+from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput, get_tzinfo_from_proxy
 from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
-from skyvern.webeye.cdp_connection import build_cdp_connect_headers
+from skyvern.webeye.cdp_connection import (
+    build_cdp_connect_headers,
+)
 from skyvern.webeye.cdp_connection import connect_over_cdp_with_diagnostics as _connect_over_cdp_with_diagnostics
+from skyvern.webeye.cdp_connection import (
+    merge_cdp_connect_headers,
+    parse_default_cdp_connect_headers,
+)
 from skyvern.webeye.cdp_download_interceptor import CDPDownloadInterceptor
 from skyvern.webeye.dialog_handler import set_dialog_handler
+from skyvern.webeye.session_cookies import restore_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -116,6 +133,46 @@ def set_browser_console_log(browser_context: BrowserContext, browser_artifacts: 
 
     LOG.info("browser console log is saved", log_path=browser_artifacts.browser_console_log_path)
     browser_context.on("console", browser_console_log)
+
+
+def set_popup_video_listener(browser_context: BrowserContext, browser_artifacts: BrowserArtifacts) -> None:
+    tracked_paths: set[str] = set()
+
+    async def _on_page(page: Page) -> None:
+        try:
+            video = page.video
+            if not video:
+                return
+            async with asyncio.timeout(settings.POPUP_VIDEO_PATH_TIMEOUT_SECONDS):
+                raw_path = await video.path()
+            if raw_path is None:
+                return
+            video_path = str(raw_path)
+            # After the await, another handler may have already registered this path
+            if video_path in tracked_paths:
+                return
+            for va in browser_artifacts.video_artifacts:
+                if va.video_path == video_path:
+                    tracked_paths.add(video_path)
+                    return
+            tracked_paths.add(video_path)
+            browser_artifacts.video_artifacts.append(VideoArtifact(video_path=video_path))
+        except PlaywrightError:
+            LOG.debug("Failed to register popup page video", exc_info=True)
+        except TimeoutError:
+            try:
+                page_origin = urlparse(page.url).hostname or "unknown"
+            except Exception:
+                page_origin = "unknown"
+            LOG.warning("Popup video path resolution timed out", page_origin=page_origin)
+        except Exception:
+            LOG.warning("Failed to register popup page video", exc_info=True)
+
+    browser_context.on("page", _on_page)
+
+    # Register pages that already exist (e.g. the initial page from launch_persistent_context)
+    for page in browser_context.pages:
+        asyncio.ensure_future(_on_page(page))
 
 
 def set_download_file_listener(
@@ -221,7 +278,7 @@ async def _apply_download_behaviour(browser: Browser) -> None:
 
 class BrowserContextCreator(Protocol):
     def __call__(
-        self, playwright: Playwright, proxy_location: ProxyLocation | None = None, **kwargs: dict[str, Any]
+        self, playwright: Playwright, proxy_location: ProxyLocationInput = None, **kwargs: dict[str, Any]
     ) -> Awaitable[tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]]: ...
 
 
@@ -260,7 +317,7 @@ class BrowserContextFactory:
 
     @staticmethod
     def build_browser_args(
-        proxy_location: ProxyLocation | None = None,
+        proxy_location: ProxyLocationInput = None,
         cdp_port: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -312,12 +369,22 @@ class BrowserContextFactory:
         if settings.BROWSER_LOCALE:
             args["locale"] = settings.BROWSER_LOCALE
 
-        if settings.ENABLE_PROXY:
+        # Custom per-request proxy URL takes precedence over the global proxy pool.
+        # Users may pass proxy_location={"url": "http://user:pass@host:port"} to
+        # route this specific task/session through their own proxy server.
+        if isinstance(proxy_location, dict) and "url" in proxy_location:
+            proxy_url = proxy_location["url"]
+            if _is_valid_proxy_url(proxy_url):
+                args["proxy"] = {"server": proxy_url}
+                LOG.info("Using custom per-request proxy URL", proxy_url=_redact_proxy_url(proxy_url))
+            else:
+                LOG.warning("Invalid custom proxy URL provided, ignoring", proxy_url=_redact_proxy_url(proxy_url))
+        elif settings.ENABLE_PROXY:
             proxy_config = setup_proxy()
             if proxy_config:
                 args["proxy"] = proxy_config
 
-        if proxy_location:
+        if isinstance(proxy_location, ProxyLocation):
             if tz_info := get_tzinfo_from_proxy(proxy_location=proxy_location):
                 args["timezone_id"] = tz_info.key
         return args
@@ -353,13 +420,16 @@ class BrowserContextFactory:
             if not creator:
                 raise UnknownBrowserType(browser_type)
             browser_context, browser_artifacts, cleanup_func = await creator(playwright, **kwargs)
+            await restore_session_cookies(browser_context, browser_artifacts.browser_session_dir)
             if settings.BROWSER_LOGS_ENABLED:
                 set_browser_console_log(browser_context=browser_context, browser_artifacts=browser_artifacts)
+            set_popup_video_listener(browser_context=browser_context, browser_artifacts=browser_artifacts)
             set_download_file_listener(browser_context=browser_context, **kwargs)
             set_dialog_handler(browser_context=browser_context)
+            await app.AGENT_FUNCTION.setup_browser_context_extensions(browser_context=browser_context, **kwargs)
 
-            proxy_location: ProxyLocation | None = kwargs.get("proxy_location")
-            if proxy_location is not None:
+            proxy_location: ProxyLocationInput = kwargs.get("proxy_location")
+            if isinstance(proxy_location, ProxyLocation):
                 context = ensure_context()
                 context.tz_info = get_tzinfo_from_proxy(proxy_location)
 
@@ -412,6 +482,22 @@ def setup_proxy() -> dict | None:
     except Exception as e:
         LOG.warning(f"Error setting up proxy: {e}. Continuing without proxy...")
         return None
+
+
+def _redact_proxy_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        if not parsed.hostname:
+            return "<redacted>"
+        host = parsed.hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        userinfo = ""
+        if parsed.username:
+            userinfo = f"{parsed.username}:***@" if parsed.password else f"{parsed.username}@"
+        return f"{parsed.scheme}://{userinfo}{host}"
+    except Exception:
+        return "<redacted>"
 
 
 def _is_valid_proxy_url(url: str) -> bool:
@@ -515,8 +601,9 @@ def _is_chrome_running() -> bool:
 
 async def _create_headless_chromium(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -524,6 +611,7 @@ async def _create_headless_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -604,8 +692,9 @@ async def _create_headless_chromium(
 
 async def _create_headful_chromium(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -613,6 +702,7 @@ async def _create_headful_chromium(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -721,8 +811,9 @@ def is_valid_chromium_user_data_dir(directory: str) -> bool:
 
 async def _create_cdp_connection_browser(
     playwright: Playwright,
-    proxy_location: ProxyLocation | None = None,
+    proxy_location: ProxyLocationInput = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     **kwargs: dict,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     if browser_address := kwargs.get("browser_address"):
@@ -730,6 +821,7 @@ async def _create_cdp_connection_browser(
             playwright,
             remote_browser_url=str(browser_address),
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             apply_download_behaviour=True,
         )
 
@@ -780,13 +872,19 @@ async def _create_cdp_connection_browser(
         else:
             LOG.info("Port 9222 is in use, using existing browser")
 
-    return await _connect_to_cdp_browser(playwright, settings.BROWSER_REMOTE_DEBUGGING_URL, extra_http_headers)
+    return await _connect_to_cdp_browser(
+        playwright,
+        settings.BROWSER_REMOTE_DEBUGGING_URL,
+        extra_http_headers=extra_http_headers,
+        cdp_connect_headers=cdp_connect_headers,
+    )
 
 
 async def _connect_to_cdp_browser(
     playwright: Playwright,
     remote_browser_url: str,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     apply_download_behaviour: bool = False,
 ) -> tuple[BrowserContext, BrowserArtifacts, BrowserCleanupFunc]:
     parsed_headers = parse_extra_headers(extra_http_headers)
@@ -800,10 +898,15 @@ async def _connect_to_cdp_browser(
     )
 
     LOG.info("Connecting browser CDP connection", remote_browser_url=remote_browser_url)
+    cdp_headers = merge_cdp_connect_headers(
+        default_headers=parse_default_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS),
+        per_row_headers=cdp_connect_headers,
+        managed_host_header=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER) or {},
+    )
     browser = await _connect_over_cdp_with_diagnostics(
         playwright,
         remote_browser_url,
-        headers=build_cdp_connect_headers(settings.BROWSER_REMOTE_DEBUGGING_HOST_HEADER),
+        headers=cdp_headers or None,
         timeout_ms=settings.BROWSER_CDP_CONNECT_TIMEOUT_MS,
     )
 
@@ -850,6 +953,7 @@ async def _connect_to_cdp_browser(
                 LOG.warning("Failed to enable CDP intercept on new page", page_url=page.url, exc_info=True)
 
         browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
+        browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,

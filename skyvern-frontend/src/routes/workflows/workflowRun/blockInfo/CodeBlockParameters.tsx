@@ -28,7 +28,7 @@ function CodeBlockParameters({ code, parameters }: Props) {
       {parameters && parameters.length > 0 ? (
         <div className="flex gap-16">
           <div className="w-80">
-            <h1 className="text-lg">Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
             <h2 className="text-base text-slate-400">
               Inputs passed to this code block
             </h2>

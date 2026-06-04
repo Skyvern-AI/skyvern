@@ -22,9 +22,15 @@ from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock
+from skyvern.webeye.session_cookies import SESSION_COOKIES_FILENAME
 
 LOG = structlog.get_logger()
 WINDOWS = os.name == "nt"
+
+# Live Chromium profiles carry runtime files that exist but can't be copied as regular files
+# (Singleton sockets/locks). These are skipped during a store; a copy failure on any other file
+# means an incomplete profile and is re-raised.
+_TRANSIENT_PROFILE_FILES = {"RunningChromeVersion", "SingletonLock", "SingletonSocket", "SingletonCookie"}
 
 
 def _safe_timestamp() -> str:
@@ -182,6 +188,36 @@ class LocalStorage(BaseStorage):
         except Exception:
             return None
 
+    def _drop_stale_session_sidecar(self, source_directory: Path, stored_folder_path: Path) -> None:
+        # These stores overlay onto an existing dir. persist_session_cookies removes the sidecar at the
+        # source when a session ends with no session cookies; without this the old sidecar survives in the
+        # destination and a dead session gets re-injected on the next reuse.
+        if (source_directory / SESSION_COOKIES_FILENAME).exists():
+            return
+        stale_sidecar = stored_folder_path / SESSION_COOKIES_FILENAME
+        if stale_sidecar.exists():
+            stale_sidecar.unlink(missing_ok=True)
+
+    def _copy_directory_best_effort(self, source_directory: Path, stored_folder_path: Path) -> None:
+        # Source may be a live browser profile. Skip only transient runtime files: ones that vanish
+        # mid-walk (FileNotFoundError) or Chrome's Singleton sockets/locks that can't be copied as
+        # regular files. Re-raise anything else (e.g. ENOSPC/permission on Cookies or localStorage) so
+        # a partial profile isn't silently stored and later reused as if it were valid.
+        for root, _, files in os.walk(source_directory):
+            for file in files:
+                source_file_path = Path(root) / file
+                target_file_path = stored_folder_path / source_file_path.relative_to(source_directory)
+                try:
+                    self._create_directories_if_not_exists(target_file_path)
+                    shutil.copy2(source_file_path, target_file_path)
+                except OSError as e:
+                    if isinstance(e, FileNotFoundError) or file in _TRANSIENT_PROFILE_FILES:
+                        LOG.debug(
+                            "Skipped transient profile file while storing browser dir", path=str(source_file_path)
+                        )
+                    else:
+                        raise
+
     async def store_browser_session(self, organization_id: str, workflow_permanent_id: str, directory: str) -> None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
         if stored_folder_path is None:
@@ -204,14 +240,8 @@ class LocalStorage(BaseStorage):
             browser_session_path=str(stored_folder_path),
         )
 
-        # Copy all files from the directory to the stored folder
-        for root, _, files in os.walk(source_directory):
-            for file in files:
-                source_file_path = Path(root) / file
-                relative_path = source_file_path.relative_to(source_directory)
-                target_file_path = stored_folder_path / relative_path
-                self._create_directories_if_not_exists(target_file_path)
-                shutil.copy2(source_file_path, target_file_path)
+        self._drop_stale_session_sidecar(source_directory, stored_folder_path)
+        self._copy_directory_best_effort(source_directory, stored_folder_path)
 
     async def retrieve_browser_session(self, organization_id: str, workflow_permanent_id: str) -> str | None:
         stored_folder_path = self._resolve_browser_storage_path(organization_id, workflow_permanent_id)
@@ -273,13 +303,8 @@ class LocalStorage(BaseStorage):
             browser_profile_path=str(stored_folder_path),
         )
 
-        for root, _, files in os.walk(source_directory):
-            for file in files:
-                source_file_path = Path(root) / file
-                relative_path = source_file_path.relative_to(source_directory)
-                target_file_path = stored_folder_path / relative_path
-                self._create_directories_if_not_exists(target_file_path)
-                shutil.copy2(source_file_path, target_file_path)
+        self._drop_stale_session_sidecar(source_directory, stored_folder_path)
+        self._copy_directory_best_effort(source_directory, stored_folder_path)
 
     async def retrieve_browser_profile(self, organization_id: str, profile_id: str) -> str | None:
         """Retrieve browser profile from local storage."""

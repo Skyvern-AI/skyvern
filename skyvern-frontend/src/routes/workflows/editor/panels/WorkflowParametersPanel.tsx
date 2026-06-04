@@ -98,10 +98,10 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
     >
       <div className="space-y-4">
         <header>
-          <h1 className="text-lg">Parameters</h1>
+          <h1 className="text-lg">Inputs</h1>
           <span className="text-sm text-slate-400">
             Create placeholder values that you can link in nodes. You will be
-            prompted to fill them in before running your workflow.
+            prompted to fill them in before running your agent.
           </span>
         </header>
         <Button
@@ -115,7 +115,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
           }}
         >
           <PlusIcon className="mr-2 h-6 w-6" />
-          Add Parameter
+          Add Input
         </Button>
 
         <ScrollArea>
@@ -163,11 +163,9 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
                             operation: "edit",
                             parameter: parameter,
                             type:
-                              parameter.parameterType === "onepassword" ||
-                              parameter.parameterType === "secret" ||
-                              parameter.parameterType === "creditCardData"
-                                ? WorkflowEditorParameterTypes.Credential
-                                : parameter.parameterType,
+                              parameter.parameterType === "context"
+                                ? WorkflowEditorParameterTypes.Context
+                                : WorkflowEditorParameterTypes.Workflow,
                           });
                         }}
                       />
@@ -205,7 +203,7 @@ function WorkflowParametersPanel({ onMouseDownCapture }: Props) {
             setDeleteDialogState({ open: false, parameterKey: null });
           }
         }}
-        title="Delete Parameter"
+        title="Delete Input"
         description={`Are you sure you want to delete "${deleteDialogState.parameterKey}"?`}
         affectedBlocks={affectedBlocksForDelete}
         onConfirm={() => {

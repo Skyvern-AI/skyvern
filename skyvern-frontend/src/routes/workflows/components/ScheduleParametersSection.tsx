@@ -32,7 +32,7 @@ function ScheduleParametersSection({
   return (
     <div className="space-y-2">
       <div className="space-y-1">
-        <Label>Workflow Parameters</Label>
+        <Label>Agent Inputs</Label>
         <p className="text-xs text-slate-500">
           Values supplied here are used every time this schedule runs.
         </p>

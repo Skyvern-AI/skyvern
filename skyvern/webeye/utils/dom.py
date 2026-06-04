@@ -159,19 +159,11 @@ class SkyvernElement:
             return True
 
         autocomplete: str | None = await self.get_attr("aria-autocomplete")
-        if autocomplete and autocomplete.lower() in ("list", "both", "inline"):
+        if autocomplete and autocomplete.lower() == "list":
             return True
 
         class_name: str | None = await self.get_attr("class")
         if class_name and "autocomplete-input" in class_name.lower():
-            return True
-
-        # Combobox inputs (role="combobox") present a list of options — treat as
-        # auto-completion so the agent uses the dropdown-selection flow instead of
-        # the Tab hack.  This covers account-search fields in many apps that use
-        # role="combobox" without setting aria-autocomplete.
-        role: str | None = await self.get_attr("role")
-        if role and role.lower() == "combobox":
             return True
 
         # Tag inputs where typing surfaces a suggestion list to select from
@@ -883,9 +875,16 @@ class SkyvernElement:
         skyvern_frame = await SkyvernFrame.create_instance(self.get_frame())
         await skyvern_frame.click_element_in_javascript(await self.get_element_handler())
 
-    async def coordinate_click(self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS) -> None:
+    async def coordinate_click(
+        self, page: Page, timeout: float = settings.BROWSER_ACTION_TIMEOUT_MS, click_count: int = 1
+    ) -> None:
         click_x, click_y = await self.move_mouse_to(page=page, timeout=timeout)
-        await page.mouse.click(click_x, click_y)
+        if click_count == 2:
+            await page.mouse.dblclick(click_x, click_y)
+        elif click_count >= 3:
+            await page.mouse.click(click_x, click_y, click_count=click_count)
+        else:
+            await page.mouse.click(click_x, click_y)
 
     async def blur(self) -> None:
         if not await self.is_visible():
@@ -945,8 +944,8 @@ class SkyvernElement:
             element_handler = await self.get_element_handler(timeout=timeout)
             await element_handler.scroll_into_view_if_needed(timeout=timeout)
         except TimeoutError:
-            LOG.info(
-                "Timeout to execute scrolling into view, try to re-focus to locate the element",
+            LOG.warning(
+                "Scroll into view timed out",
                 element_id=self.get_id(),
             )
             await self.blur()

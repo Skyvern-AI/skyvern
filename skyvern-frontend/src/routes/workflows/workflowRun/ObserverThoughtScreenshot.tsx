@@ -1,9 +1,13 @@
+import { useEffect, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ArtifactApiResponse, ArtifactType, Status } from "@/api/types";
 import { ZoomableImage } from "@/components/ZoomableImage";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { ReloadIcon } from "@radix-ui/react-icons";
+import {
+  SCREENSHOT_PANEL_CLASS,
+  StreamStatusPanel,
+} from "@/routes/streaming/StreamDiagnostics";
 import { statusIsNotFinalized } from "@/routes/tasks/types";
 import { getImageURL } from "@/routes/tasks/detail/artifactUtils";
 import { apiPathPrefix } from "@/util/env";
@@ -15,6 +19,7 @@ type Props = {
 
 function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
   const credentialGetter = useCredentialGetter();
+  const [imageFailed, setImageFailed] = useState(false);
 
   const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["observerThought", observerThoughtId, "artifacts"],
@@ -43,12 +48,20 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
   // use the last screenshot as the llmScreenshots are in reverse order
   const screenshot = llmScreenshots?.[llmScreenshots.length - 1];
 
+  useEffect(() => {
+    setImageFailed(false);
+  }, [observerThoughtId, screenshot?.signed_url]);
+
   if (isLoading) {
     return (
-      <div className="flex h-full items-center justify-center gap-2 bg-slate-elevation1">
-        <ReloadIcon className="h-6 w-6 animate-spin" />
-        <div>Loading screenshot...</div>
-      </div>
+      <StreamStatusPanel
+        className={SCREENSHOT_PANEL_CLASS}
+        diagnostic={{
+          title: "Looking for the screenshot",
+          detail: "Just a sec while we fetch it.",
+          pending: true,
+        }}
+      />
     );
   }
 
@@ -57,20 +70,51 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
     taskStatus &&
     statusIsNotFinalized({ status: taskStatus })
   ) {
-    return <div>The screenshot for this action is not available yet.</div>;
+    return (
+      <StreamStatusPanel
+        className={SCREENSHOT_PANEL_CLASS}
+        diagnostic={{
+          title: "Still capturing this screenshot",
+          detail:
+            "The agent's working on it — checking back every few seconds.",
+          pending: true,
+        }}
+      />
+    );
   }
 
   if (!screenshot) {
     return (
-      <div className="flex h-full items-center justify-center bg-slate-elevation1">
-        No screenshot found for this thought.
-      </div>
+      <StreamStatusPanel
+        className={SCREENSHOT_PANEL_CLASS}
+        diagnostic={{
+          title: "No screenshot for this one",
+          detail: "The agent didn't capture one here.",
+        }}
+      />
+    );
+  }
+
+  if (imageFailed) {
+    return (
+      <StreamStatusPanel
+        className={SCREENSHOT_PANEL_CLASS}
+        diagnostic={{
+          title: "This screenshot got away from us",
+          detail: "The artifact's there, but the image wouldn't load.",
+          hint: "Refresh the page or open the artifact directly.",
+        }}
+      />
     );
   }
 
   return (
     <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden rounded">
-      <ZoomableImage src={getImageURL(screenshot)} alt="llm-screenshot" />
+      <ZoomableImage
+        src={getImageURL(screenshot)}
+        alt="llm-screenshot"
+        onError={() => setImageFailed(true)}
+      />
     </figure>
   );
 }

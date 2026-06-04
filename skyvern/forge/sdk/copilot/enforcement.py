@@ -8,16 +8,20 @@ import json
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 import structlog
 from agents.run import Runner
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
     POST_ANTI_BOT_FAILED_TEST_NUDGE,
+    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
     POST_EXPLORE_WITHOUT_WORKFLOW_NUDGE,
+    POST_FAILED_TEST_INSPECT_FIRST_NUDGE,
     POST_FAILED_TEST_NUDGE,
     POST_NAVIGATE_NUDGE,
     POST_NO_WORKFLOW_DELIVERY_NUDGE,
@@ -25,6 +29,7 @@ from skyvern.forge.sdk.copilot.config import (
     POST_PARAMETER_BINDING_STOP_NUDGE,
     POST_PARAMETER_BINDING_WARN_NUDGE,
     POST_PER_TOOL_BUDGET_NUDGE,
+    POST_PER_TOOL_BUDGET_STOP_NUDGE,
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_STOP_NUDGE,
     POST_REPEATED_FRONTIER_FAILURE_WARN_NUDGE,
@@ -34,8 +39,10 @@ from skyvern.forge.sdk.copilot.config import (
     SCREENSHOT_DROPPED_NUDGE,
     CopilotConfig,
 )
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
+from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
 from skyvern.forge.sdk.copilot.output_utils import (
     extract_final_text,
     looks_like_workflow_delivery_claim,
@@ -49,6 +56,8 @@ if TYPE_CHECKING:
     from agents.agent import Agent
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
+    from skyvern.forge.sdk.copilot.runtime import AgentContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
 
 LOG = structlog.get_logger()
@@ -61,6 +70,7 @@ MAX_INTERMEDIATE_NUDGES = 8
 MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
+MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # Stops the suspicious-success nudge from re-firing forever when the agent has
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
@@ -76,6 +86,7 @@ REPEATED_FRONTIER_STREAK_STOP_AT = 3
 # scraper could not read the page. Aligned with MAX_FAILED_TEST_NUDGES so the
 # copilot gets one generic retry nudge, then stops on the second occurrence.
 PROBABLE_SITE_BLOCK_STREAK_STOP_AT = 2
+UNRECOVERABLE_TOOL_ERROR_STOP_AT = 2
 # Caps how many times the stop nudge can re-fire — without this, the streak
 # stays latched while no new test runs reset it and every subsequent turn
 # re-injects the same nudge until MAX_ITERATIONS. Independent of
@@ -87,10 +98,10 @@ MAX_PROBABLE_SITE_BLOCK_STOP_NUDGES = 2
 # trips fall through to the repeated-frontier escalation path.
 MAX_PER_TOOL_BUDGET_NUDGES = 2
 MIN_BLOCKS_FOR_AUTO_COMPLETE = 10
-TOTAL_TIMEOUT_SECONDS = 600
+TOTAL_TIMEOUT_SECONDS = 900
 # Belt-and-braces cap alongside the elapsed-time budget. Per-nudge caps
 # already prevent individual branches from looping; this stops a brand-new
-# enforcement rule that forgets its own counter from spinning within 600s.
+# enforcement rule that forgets its own counter from spinning within 900s.
 MAX_ITERATIONS = 50
 SCREENSHOT_SENTINEL = "[copilot:screenshot] "
 NUDGE_SENTINEL = "[copilot:nudge] "
@@ -204,6 +215,89 @@ class CopilotTotalTimeoutError(Exception):
     """Raised when the copilot agent exceeds the total allowed runtime."""
 
 
+class CopilotGoalSatisfied(Exception):
+    """Raised when a tool proves the workflow already satisfies the turn."""
+
+
+def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
+    contract = ctx.latest_diagnosis_repair_contract
+    if contract is None:
+        return False
+    verification = contract.verification_result
+    repair_decision = contract.repair_decision
+    return (
+        verification.user_goal_satisfied is True
+        and verification.completion_contract_satisfied is True
+        and repair_decision.next_action is RepairNextAction.NO_CHANGE
+    )
+
+
+def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
+    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
+        return False
+    result = ctx.completion_verification_result
+    return result is not None and result.status == "evaluated"
+
+
+def outcome_fully_verified(ctx: CopilotContext) -> bool:
+    """The judge confirmed every outcome criterion from the evidence this run produced.
+
+    This evidence is authoritative over run status: a run that reached the goal is
+    recognized even when it was canceled or only partially completed. Run status must
+    never suppress recognition of an outcome the user can observe was achieved.
+    """
+    if not _outcome_criteria_evaluated(ctx):
+        return False
+    result = ctx.completion_verification_result
+    return result is not None and result.is_fully_satisfied()
+
+
+def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
+    if outcome_fully_verified(ctx):
+        return True
+    # The judge verdict is authoritative: once it has evaluated, an unconfirmed
+    # criterion means the outcome is unmet regardless of run status. The block-count
+    # heuristic (which counts method verbs in the request) governs only when there
+    # is no evaluated verdict.
+    if _outcome_criteria_evaluated(ctx):
+        return False
+    if not (
+        ctx.last_test_ok is True
+        and ctx.last_full_workflow_test_ok is True
+        and latest_diagnosis_contract_satisfies_goal(ctx)
+    ):
+        return False
+    return not _verified_goal_likely_needs_more_work(ctx)
+
+
+def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
+    """The terminal-gate decision plus the conjuncts that explain it.
+
+    Captured wherever the gate is evaluated (including when it returns False, the
+    signal that explains why the turn continued) so a single trace shows whether
+    the gate failed on the test, the full-workflow run, the diagnosis contract,
+    the absence of outcome verification, or the block-count heuristic.
+    """
+    return {
+        "gate_satisfied": verified_goal_satisfied_context(ctx),
+        "gate_last_test_ok": ctx.last_test_ok is True,
+        "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
+        "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),
+        "gate_outcome_criteria_evaluated": _outcome_criteria_evaluated(ctx),
+        "gate_likely_needs_more_work": _verified_goal_likely_needs_more_work(ctx),
+        "gate_evaluated_this_turn": True,
+    }
+
+
+def _verified_goal_likely_needs_more_work(ctx: CopilotContext) -> bool:
+    block_count = ctx.last_update_block_count
+    if not isinstance(block_count, int):
+        return False
+    user_message = ctx.user_message
+    completion_contract = _request_completion_contract(ctx)
+    return _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
+
+
 def _mark_copilot_total_timeout(ctx: Any) -> None:
     ctx.copilot_total_timeout_exceeded = True
 
@@ -248,13 +342,161 @@ def _maybe_raise_non_retriable_nav(ctx: Any) -> None:
     raise CopilotNonRetriableNavError(url=_extract_url_from_nav_error(err), error_message=err)
 
 
+class CopilotUnrecoverableToolError(Exception):
+    """Raised when browser-session tool failures prove the current loop cannot recover."""
+
+    def __init__(self, tool_name: str, error_message: str) -> None:
+        self.tool_name = tool_name
+        self.error_message = error_message
+        super().__init__(f"Unrecoverable tool error in {tool_name}: {error_message}")
+
+
+_BROWSER_SESSION_TOOL_NAMES = frozenset(
+    {
+        "navigate_browser",
+        "get_browser_screenshot",
+        "evaluate",
+        "click",
+        "type_text",
+        "scroll",
+        "console_messages",
+        "select_option",
+        "press_key",
+    }
+)
+_POST_RUN_PAGE_OBSERVATION_TOOLS = frozenset({"evaluate", "get_browser_screenshot", "inspect_page_for_composition"})
+_UNRECOVERABLE_TOOL_ERROR_CATEGORY = "UNRECOVERABLE_TOOL_ERROR"
+_BROWSER_SESSION_ID_RE = re.compile(r"\bpbs_[A-Za-z0-9_-]+\b")
+_BROWSER_SESSION_WITH_ID_RE = re.compile(r"\bbrowser session\s+pbs_[A-Za-z0-9_-]+\b", re.IGNORECASE)
+
+
+def redact_browser_session_references(value: str) -> str:
+    value = _BROWSER_SESSION_WITH_ID_RE.sub("Browser session", value)
+    return _BROWSER_SESSION_ID_RE.sub("the browser session", value)
+
+
+def _result_text_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        result: list[str] = []
+        for item in value.values():
+            result.extend(_result_text_values(item))
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_result_text_values(item))
+        return result
+    return []
+
+
+def _unrecoverable_tool_error_reason(output: dict[str, Any]) -> str:
+    raw_reason = output.get("error")
+    if not isinstance(raw_reason, str) or not raw_reason.strip():
+        data = output.get("data")
+        raw_reason = data.get("failure_reason") if isinstance(data, dict) else None
+    if not isinstance(raw_reason, str) or not raw_reason.strip():
+        raw_reason = " ".join(_result_text_values(output))
+    reason = " ".join(str(raw_reason or "Browser session was no longer reachable.").split())
+    reason = redact_browser_session_references(reason)
+    return reason[:240].rstrip()
+
+
+def _is_unrecoverable_browser_session_error(tool_name: str, output: dict[str, Any]) -> bool:
+    if tool_name not in _BROWSER_SESSION_TOOL_NAMES or output.get("ok", True):
+        return False
+    lowered = " ".join(_result_text_values(output)).lower()
+    if "no browser context" in lowered:
+        return True
+    has_session_signal = "browser session" in lowered or "browser context" in lowered
+    has_lost_signal = "not found" in lowered or "404" in lowered
+    return has_session_signal and has_lost_signal
+
+
+def _record_unrecoverable_tool_error_contract(ctx: Any, tool_name: str, reason: str) -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
+
+    result = {
+        "ok": False,
+        "error": reason,
+        "data": {
+            "overall_status": "aborted",
+            "failure_reason": reason,
+            "failure_categories": [{"category": _UNRECOVERABLE_TOOL_ERROR_CATEGORY, "reasoning": reason}],
+        },
+    }
+    contract = build_diagnosis_repair_contract(source_tool=tool_name, result=result, ctx=ctx)
+    ctx.latest_diagnosis_repair_contract = contract
+    ctx.unrecoverable_tool_error_reason = reason
+    ctx.unrecoverable_tool_error_tool_name = tool_name
+    ctx.last_test_failure_reason = reason
+    trace_data = contract.to_trace_data()
+    LOG.warning(
+        "Copilot unrecoverable tool error stop",
+        tool_name=tool_name,
+        error_reason=reason,
+        **{f"diagnosis_repair_{key}": value for key, value in trace_data.items()},
+    )
+    with copilot_span("copilot_unrecoverable_tool_error", data={"tool_name": tool_name, **trace_data}):
+        pass
+
+
+def _maybe_raise_unrecoverable_tool_error(ctx: Any, tool_name: str, output: dict[str, Any]) -> None:
+    if not _is_unrecoverable_browser_session_error(tool_name, output):
+        if tool_name in _BROWSER_SESSION_TOOL_NAMES and output.get("ok", False):
+            ctx.unrecoverable_tool_error_streak_count = 0
+            ctx.unrecoverable_tool_error_signature = None
+        return
+
+    reason = _unrecoverable_tool_error_reason(output)
+    signature = "browser_session_unreachable"
+    prior_signature = getattr(ctx, "unrecoverable_tool_error_signature", None)
+    prior_count = getattr(ctx, "unrecoverable_tool_error_streak_count", 0)
+    prior_count = prior_count if isinstance(prior_count, int) else 0
+    count = prior_count + 1 if prior_signature == signature else 1
+    ctx.unrecoverable_tool_error_signature = signature
+    ctx.unrecoverable_tool_error_streak_count = count
+    ctx.unrecoverable_tool_error_reason = reason
+    ctx.unrecoverable_tool_error_tool_name = tool_name
+
+    if count >= UNRECOVERABLE_TOOL_ERROR_STOP_AT:
+        _record_unrecoverable_tool_error_contract(ctx, tool_name, reason)
+        raise CopilotUnrecoverableToolError(tool_name, reason)
+
+
+def _raise_if_unrecoverable_contract_stop(ctx: Any) -> None:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    diagnosis = getattr(contract, "diagnosis_result", None)
+    repair_decision = getattr(contract, "repair_decision", None)
+    failure_type = getattr(getattr(diagnosis, "suspected_failure_type", None), "value", None) or getattr(
+        diagnosis,
+        "suspected_failure_type",
+        None,
+    )
+    next_action = getattr(getattr(repair_decision, "next_action", None), "value", None) or getattr(
+        repair_decision,
+        "next_action",
+        None,
+    )
+    if failure_type != "unrecoverable_tool_error" or next_action != "stop":
+        return
+    verification = getattr(contract, "verification_result", None)
+    reason = getattr(verification, "remaining_blocker", None) or getattr(diagnosis, "root_cause_summary", None)
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "Browser session was no longer reachable."
+    source_tool = getattr(getattr(contract, "diagnosis_input", None), "source_tool", None)
+    tool_name = source_tool if isinstance(source_tool, str) and source_tool else "unknown"
+    raise CopilotUnrecoverableToolError(tool_name, reason)
+
+
 _ACTION_CATEGORIES: list[list[str]] = [
     ["navigate", "go to", "open", "visit"],
     ["download", "save", "export"],
-    ["extract", "scrape", "collect", "gather", "get all"],
+    ["extract", "scrape", "collect", "gather", "get all", "grab", "capture", "retrieve", "pull"],
     ["login", "log in", "sign in", "authenticate"],
-    ["search", "find", "look for", "look up"],
-    ["fill", "enter", "type", "submit", "complete the form"],
+    ["search", "find", "look for", "look up", "check", "verify"],
+    ["fill", "enter", "type", "submit", "complete the form", "input"],
     ["click", "select", "choose", "pick"],
     ["upload", "attach"],
 ]
@@ -293,14 +535,76 @@ def _goal_likely_needs_more_blocks(user_message: Any, block_count: int, completi
     return block_count < estimated_min_blocks
 
 
+def _same_page(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    if not left_parsed.netloc or not right_parsed.netloc:
+        return False
+    if left_parsed.netloc.lower() != right_parsed.netloc.lower():
+        return False
+    left_path = (left_parsed.path or "/").rstrip("/") or "/"
+    right_path = (right_parsed.path or "/").rstrip("/") or "/"
+    return left_path == right_path
+
+
+def _has_candidate_bound_page_evidence(ctx: Any, candidate_url: str) -> bool:
+    inspection_count = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    inspection_baseline = int(getattr(ctx, "resolved_discovery_entrypoint_inspection_baseline", 0) or 0)
+    if inspection_count <= inspection_baseline:
+        return False
+    evidence = getattr(ctx, "composition_page_evidence", None)
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("source_tool") != "inspect_page_for_composition":
+        return False
+    for key in ("inspected_url", "current_url"):
+        value = evidence.get(key)
+        if isinstance(value, str) and _same_page(candidate_url, value):
+            return True
+    return False
+
+
+def _post_discovery_entrypoint_url_question_nudge(
+    ctx: Any,
+    parsed: dict[str, Any],
+    config: CopilotConfig | None = None,
+) -> str | None:
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    candidate_url = getattr(ctx, "resolved_discovery_entrypoint_url", None)
+    failure_reason = getattr(ctx, "resolved_discovery_failure_reason", None)
+    if not isinstance(candidate_url, str) or not candidate_url or failure_reason:
+        return None
+    inspected_after_discovery = _has_candidate_bound_page_evidence(ctx, candidate_url)
+    mutated_after_discovery = bool(getattr(ctx, "update_workflow_called", False))
+    if inspected_after_discovery or mutated_after_discovery:
+        return None
+    nudge_count = getattr(ctx, "discovery_entrypoint_url_question_nudge_count", 0)
+    if nudge_count >= MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES:
+        return None
+    ctx.discovery_entrypoint_url_question_nudge_count = nudge_count + 1
+    return f"{_nudge(config, 'post_discovery_entrypoint_url_question')} Resolved candidate_url: {candidate_url}"
+
+
 def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotConfig | None = None) -> str | None:
     """Peek at the model's final output and return a nudge for coverage gaps
-    or progress-narration format. ASK_QUESTION is always let through so the
-    agent can request missing credentials or disambiguation.
+    or progress-narration format. ASK_QUESTION is let through so the agent
+    can request missing credentials or disambiguation, except when discovery
+    resolved a candidate and the agent has not yet inspected or composed from
+    that candidate.
 
     Returns the nudge string to inject, or None to let the response through.
     """
     response_type = parsed.get("type")
+    discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
+    if discovery_entrypoint_nudge is not None:
+        return discovery_entrypoint_nudge
+
     if response_type not in ("REPLY", "REPLACE_WORKFLOW"):
         return None
 
@@ -401,6 +705,60 @@ def _needs_failed_test_nudge(ctx: Any) -> bool:
         return False
     nudge_count = getattr(ctx, "failed_test_nudge_count", 0)
     return nudge_count < MAX_FAILED_TEST_NUDGES
+
+
+def _needs_inspect_before_repair_nudge(ctx: Any) -> bool:
+    """True when a failed run is repairable and the reached page is not yet observed.
+
+    Routes the first post-failure move to observing the reached page before
+    re-authoring, instead of guessing a new block goal and re-running blind.
+    """
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    if contract is None:
+        return False
+    if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
+        return False
+    if not contract.diagnosis_input.browser_page_state.get("has_current_url"):
+        return False
+    return not _has_post_failed_run_page_observation(ctx)
+
+
+def _has_post_failed_run_page_observation(ctx: AgentContext) -> bool:
+    if getattr(ctx, "post_run_page_observation_after_failed_test", False) is not True:
+        return False
+    tool = getattr(ctx, "post_run_page_observation_tool", None)
+    if tool not in _POST_RUN_PAGE_OBSERVATION_TOOLS:
+        return False
+    observed_run_id = getattr(ctx, "post_run_page_observation_workflow_run_id", None)
+    current_run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
+    return bool(isinstance(observed_run_id, str) and observed_run_id and observed_run_id == current_run_id)
+
+
+def _parse_normalized_final_response(result: RunResultStreaming | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    parsed = parse_final_response(extract_final_text(result))
+    normalized_scaffolding = normalize_response_scaffolding(
+        str(parsed.get("type") or "REPLY"),
+        str(parsed.get("user_response") or ""),
+    )
+    if normalized_scaffolding.changed:
+        parsed = {
+            **parsed,
+            "type": normalized_scaffolding.response_type,
+            "user_response": normalized_scaffolding.user_response or "Done.",
+        }
+    return parsed
+
+
+def _post_run_observed_reply_can_finalize(ctx: AgentContext, result: RunResultStreaming | None) -> bool:
+    if not _has_post_failed_run_page_observation(ctx):
+        return False
+    parsed = _parse_normalized_final_response(result)
+    if parsed is None or parsed.get("type") != "REPLY":
+        return False
+    user_response = parsed.get("user_response")
+    return isinstance(user_response, str) and bool(user_response.strip()) and not _is_progress_narration(user_response)
 
 
 def _needs_suspicious_success_nudge(ctx: Any) -> bool:
@@ -506,6 +864,8 @@ def _check_enforcement(
     config: CopilotConfig | None = None,
 ) -> str | None:
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
+    _raise_if_unrecoverable_contract_stop(ctx)
+
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated
     # workflow against the same bad URL, so let it speak first.
@@ -530,11 +890,27 @@ def _check_enforcement(
     ):
         return _nudge(config, "post_update")
 
-    # A budget-trip is a structural problem (chain too long), not a
-    # workflow-shape problem — emit the targeted "split the chain" advice
-    # before the generic repeated-frontier and failed-test paths can fire.
+    if _post_run_observed_reply_can_finalize(ctx, result):
+        return None
+
+    # If the last run had confirmed challenge evidence, do not misdiagnose a
+    # challenge-solving loop as a long-chain budgeting problem.
+    if _needs_failed_test_nudge(ctx) and getattr(ctx, "last_test_anti_bot", None):
+        ctx.failed_test_nudge_count += 1
+        return _nudge(config, "post_anti_bot_failed_test")
+
+    # A budget-trip without challenge evidence is a structural problem (chain
+    # too long), not a workflow-shape problem — emit the targeted "split the
+    # chain" advice before the generic repeated-frontier and failed-test paths
+    # can fire.
     if _needs_per_tool_budget_nudge(ctx):
-        ctx.per_tool_budget_nudge_count = _get_int(ctx, "per_tool_budget_nudge_count") + 1
+        prior = _get_int(ctx, "per_tool_budget_nudge_count")
+        ctx.per_tool_budget_nudge_count = prior + 1
+        # First budget trip earns one smaller-frontier retry. A second consecutive trip
+        # (the shrunk frontier ALSO blew the budget) is a doomed shrinking-budget spiral on a
+        # too-heavy page — finalize the verified prefix instead of re-running into less time.
+        if prior >= 1:
+            return _nudge(config, "post_per_tool_budget_stop")
         return _nudge(config, "post_per_tool_budget")
 
     repeated_frontier_nudge = _repeated_frontier_failure_nudge(ctx, config)
@@ -566,15 +942,17 @@ def _check_enforcement(
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
-        if getattr(ctx, "last_test_anti_bot", None):
-            return _nudge(config, "post_anti_bot_failed_test")
+        if _needs_inspect_before_repair_nudge(ctx):
+            return _nudge(config, "post_failed_test_inspect_first")
         return _nudge(config, "post_failed_test")
 
     # Response-time gate: peek at the model's final output to tell ASK_QUESTION
     # (always allowed) from a REPLY with a coverage gap or progress-narration.
     # Only runs when no state-based nudge fired.
     if result is not None:
-        parsed = parse_final_response(extract_final_text(result))
+        parsed = _parse_normalized_final_response(result)
+        if parsed is None:
+            return None
         return _response_coverage_nudge(ctx, parsed, config)
 
     return None
@@ -865,8 +1243,11 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_ANTI_BOT_FAILED_TEST_NUDGE: "anti_bot_block",
     POST_PROBABLE_SITE_BLOCK_STOP_NUDGE: "probable_site_block_stop",
     POST_PER_TOOL_BUDGET_NUDGE: "per_tool_budget_split",
+    POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
     POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
+    POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE: "discovery_entrypoint_url_question",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
+    POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
 }
 
@@ -886,8 +1267,11 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_probable_site_block_stop": "probable_site_block_stop",
     "post_probable_site_block_stop_prefix": "probable_site_block_stop",
     "post_per_tool_budget": "per_tool_budget_split",
+    "post_per_tool_budget_stop": "per_tool_budget_stop",
     "post_no_workflow_delivery": "no_workflow_delivery",
+    "post_discovery_entrypoint_url_question": "discovery_entrypoint_url_question",
     "post_failed_test": "post_failed_test",
+    "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
     "post_intermediate_success": "intermediate_success",
     "post_format": "format",

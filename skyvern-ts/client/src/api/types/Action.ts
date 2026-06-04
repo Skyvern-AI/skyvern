@@ -25,7 +25,9 @@ export interface Action {
     tool_call_id?: string;
     xpath?: string;
     errors?: Skyvern.UserDefinedError[];
+    terminal_user_errors?: boolean;
     data_extraction_goal?: string;
+    output?: Action.Output;
     file_name?: string;
     file_url?: string;
     download?: boolean;
@@ -44,4 +46,8 @@ export interface Action {
     created_at?: string;
     modified_at?: string;
     created_by?: string;
+}
+
+export namespace Action {
+    export type Output = Record<string, unknown> | unknown[] | string;
 }

@@ -22,7 +22,16 @@ function WorkflowRunRecording() {
   const recordingUrls = rawUrls.map(resolveUrl);
 
   if (!workflowRun || recordingUrls.length === 0) {
-    return <div>No recording available for this workflow</div>;
+    if (workflowRun?.recording_archived) {
+      return (
+        <div className="text-muted-foreground">
+          This recording has been archived. To request restoration, please
+          contact support@skyvern.com
+          {/* TODO: add a "Request Restore" button */}
+        </div>
+      );
+    }
+    return <div>No recording available for this agent</div>;
   }
 
   const run = workflowRun;

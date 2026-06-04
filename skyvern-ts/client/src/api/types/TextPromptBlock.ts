@@ -11,6 +11,7 @@ export interface TextPromptBlock {
     continue_on_failure?: boolean;
     model?: Record<string, unknown>;
     disable_cache?: boolean;
+    ignore_workflow_system_prompt?: boolean;
     next_loop_on_failure?: boolean;
     llm_key?: string;
     prompt: string;

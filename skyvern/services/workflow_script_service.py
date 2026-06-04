@@ -1,3 +1,4 @@
+import ast
 import base64
 import hashlib
 import re
@@ -18,12 +19,22 @@ from skyvern.core.script_generations.generate_script import (
 )
 from skyvern.core.script_generations.transform_workflow_run import transform_workflow_run_to_code_gen_input
 from skyvern.forge import app
+from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.workflow.models.block import get_all_blocks
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, is_adaptive_caching
 from skyvern.schemas.scripts import FileEncoding, Script, ScriptFileCreate, ScriptStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.services import script_service
+from skyvern.services.script_review_cap import is_script_review_cap_exceeded_v3
+from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
+from skyvern.services.script_reviewer_v3.mint_audit import (
+    SuspiciousLiteralFinding,
+    build_allowed_strings_envelope,
+    find_suspicious_selector_literals,
+)
+from skyvern.services.script_reviewer_v3.mint_review import fire_and_forget_mint_review
+from skyvern.services.script_version_persist_bridge import register_script_version_persist_handlers
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 
 LOG = structlog.get_logger()
@@ -37,22 +48,121 @@ _CACHED_DECORATOR_RE = re.compile(
 )
 
 
+def _cached_label_from_decorator(decorator: ast.expr) -> str | None:
+    if not isinstance(decorator, ast.Call):
+        return None
+    func = decorator.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and func.attr == "cached"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "skyvern"
+    ):
+        return None
+    for keyword in decorator.keywords:
+        if keyword.arg == "cache_key" and isinstance(keyword.value, ast.Constant):
+            value = keyword.value.value
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def _cached_block_spans_regex(content: str) -> list[tuple[str, int, int]]:
+    """Best-effort fallback for malformed generated scripts.
+
+    Valid scripts use the AST path above; this fallback may stop early if
+    malformed generated code contains column-zero multiline string content.
+    """
+    spans: list[tuple[str, int, int]] = []
+    for match in _CACHED_DECORATOR_RE.finditer(content):
+        label = match.group(1)
+        end = len(content)
+        saw_function_def = False
+        for line_match in re.finditer(r"(?m)^.*(?:\n|$)", content[match.end() :]):
+            line_start = match.end() + line_match.start()
+            line = line_match.group(0)
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if line[:1].isspace():
+                continue
+            if not saw_function_def and stripped.startswith(("async def ", "def ")):
+                saw_function_def = True
+                continue
+            if saw_function_def:
+                end = line_start
+                break
+        spans.append((label, match.start(), end))
+    return spans
+
+
+def _cached_block_spans(content: str) -> list[tuple[str, int, int]]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return _cached_block_spans_regex(content)
+
+    line_offsets: list[int] = []
+    pos = 0
+    for line in content.splitlines(keepends=True):
+        line_offsets.append(pos)
+        pos += len(line)
+
+    def _offset(lineno: int, col_offset: int) -> int:
+        return line_offsets[lineno - 1] + col_offset
+
+    spans: list[tuple[str, int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        label = next(
+            (
+                label
+                for decorator in node.decorator_list
+                if (label := _cached_label_from_decorator(decorator)) is not None
+            ),
+            None,
+        )
+        if label is None or node.end_lineno is None or node.end_col_offset is None:
+            continue
+        start_lineno = (
+            min(decorator.lineno for decorator in node.decorator_list) if node.decorator_list else node.lineno
+        )
+        start = _offset(start_lineno, 0)
+        end = _offset(node.end_lineno, node.end_col_offset)
+        spans.append((label, start, end))
+    return sorted(spans, key=lambda span: span[1])
+
+
 def extract_cached_blocks_from_source(content: str) -> dict[str, str]:
     """Parse all @skyvern.cached blocks from Python source.
 
     Returns {block_label: code} for every block found. Each value includes
-    the decorator line through to the start of the next decorator (or EOF).
+    the decorator line through that function body. Valid Python source uses
+    AST spans; malformed generated scripts fall back to best-effort regex
+    spans so reviewer repair paths can still see cached blocks.
     """
-    matches = list(_CACHED_DECORATOR_RE.finditer(content))
     result: dict[str, str] = {}
-    for idx, match in enumerate(matches):
-        label = match.group(1)
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+    for label, start, end in _cached_block_spans(content):
         block_code = content[start:end].rstrip()
         if block_code:
             result[label] = block_code
     return result
+
+
+def remove_cached_blocks_from_source(content: str) -> str:
+    """Return source outside @skyvern.cached block bodies."""
+    spans = _cached_block_spans(content)
+    if not spans:
+        return content
+
+    pieces: list[str] = []
+    cursor = 0
+    for _, start, end in spans:
+        pieces.append(content[cursor:start])
+        cursor = end
+    pieces.append(content[cursor:])
+    return "".join(pieces)
 
 
 def extract_single_cached_block(content: str, block_label: str) -> str | None:
@@ -854,6 +964,19 @@ async def generate_workflow_script(
             status=status,
         )
 
+    # 5) Mint-time static audit — only on published mints, not pending
+    # intermediate revisions. The pending path fires per-block during a
+    # workflow run; mint-audit there would consume LLM/cap budget on
+    # draft revisions and rewrite intermediate scripts that aren't yet
+    # the final published version.
+    if not pending:
+        await _log_mint_audit_findings(
+            python_src=python_src,
+            workflow=workflow,
+            script_revision_id=script.script_revision_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Post-processing: fix static actions inside for-loop blocks
@@ -984,6 +1107,195 @@ def _find_click_calls(text: str) -> list[tuple[int, int, str]]:
         if depth == 0:
             results.append((start, pos, text[m.end() : pos - 1]))
     return results
+
+
+async def _log_mint_audit_findings(
+    *,
+    python_src: str,
+    workflow: Workflow,
+    script_revision_id: str,
+    workflow_run_id: str,
+) -> None:
+    """Run the v3 mint-time static audit on a freshly-generated script.
+
+    Static-pass validator runs unconditionally and emits structured log
+    lines. If findings exist, the LLM trigger is gated on the v3 cohort
+    flag, Redis cache availability, and the daily review cap. Caller is
+    ``generate_workflow_script`` AFTER ``build_file_tree`` +
+    ``create_workflow_script``, so the agent loop always operates on a
+    persisted, mapped revision.
+
+    Never raises — audit failures degrade silently to "no findings" so a
+    broken validator can't block legitimate script persistence.
+    """
+    try:
+        prompts: list[str] = []
+        param_dict: dict[str, Any] = {}
+        try:
+            wf_def = workflow.workflow_definition
+            for block in getattr(wf_def, "blocks", []) or []:
+                block_prompt = getattr(block, "prompt", None)
+                if isinstance(block_prompt, str) and block_prompt:
+                    prompts.append(block_prompt)
+                nav_goal = getattr(block, "navigation_goal", None)
+                if isinstance(nav_goal, str) and nav_goal:
+                    prompts.append(nav_goal)
+            for param in getattr(wf_def, "parameters", []) or []:
+                key = getattr(param, "key", None)
+                if key:
+                    param_dict[str(key)] = getattr(param, "default_value", None)
+        except Exception:
+            LOG.debug(
+                "Failed to build mint-audit envelope from workflow definition",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+
+        envelope = build_allowed_strings_envelope(
+            user_prompt="\n".join(prompts) if prompts else None,
+            workflow_parameters=param_dict or None,
+            upstream_block_outputs=None,
+        )
+
+        # Per-block scan — each finding gets file_path=blocks/{label}.skyvern
+        # so block_label propagates through to the agent's persist_block_edit.
+        all_findings: list[SuspiciousLiteralFinding] = []
+        block_sources = extract_cached_blocks_from_source(python_src)
+        for block_label, block_source in block_sources.items():
+            all_findings.extend(
+                find_suspicious_selector_literals(
+                    source=block_source,
+                    allowed_strings=envelope,
+                    file_path=f"blocks/{block_label}.skyvern",
+                )
+            )
+        seen = {(f.file_path, f.block_label, f.literal, f.selector) for f in all_findings}
+        for f in find_suspicious_selector_literals(
+            source=remove_cached_blocks_from_source(python_src),
+            allowed_strings=envelope,
+            file_path="main.py",
+        ):
+            key = (f.file_path, f.block_label, f.literal, f.selector)
+            if key not in seen:
+                seen.add(key)
+                all_findings.append(f)
+
+        if not all_findings:
+            LOG.info(
+                "v3_mint_audit_clean",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+                envelope_size=len(envelope),
+            )
+            return
+        for f in all_findings:
+            LOG.warning(
+                "v3_mint_audit_finding",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+                finding_type=f.type,
+                literal=f.literal,
+                selector=f.selector,
+                block_label=f.block_label,
+                reason=f.reason,
+            )
+        LOG.warning(
+            "v3_mint_audit_summary",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            script_revision_id=script_revision_id,
+            finding_count=len(all_findings),
+            envelope_size=len(envelope),
+        )
+
+        # Cohort gate — only v3-cohort wpids get the LLM follow-up.
+        try:
+            in_v3_cohort = await is_v3_cohort(
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                organization_id=workflow.organization_id,
+                workflow_run_id=workflow_run_id,
+            )
+        except Exception:
+            LOG.debug(
+                "is_v3_cohort raised during mint-audit; skipping trigger",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                exc_info=True,
+            )
+            return
+        if not in_v3_cohort:
+            LOG.info(
+                "v3_mint_audit_skipped_v2_cohort",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+            )
+            return
+
+        # Cache-availability gate — fail-closed under Redis outage.
+        if CacheFactory.get_cache() is None:
+            LOG.warning(
+                "v3_mint_audit_cache_unavailable",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+            )
+            return
+
+        # Cap gate — read-only check; persist owns the atomic increment.
+        cap_exceeded = await is_script_review_cap_exceeded_v3(
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            organization_id=workflow.organization_id,
+            fail_closed=True,
+        )
+        if cap_exceeded:
+            LOG.info(
+                "v3_mint_audit_cap_skipped",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+            )
+            return
+
+        # All gates passed — fire the v3 agent loop as a background task.
+        try:
+            finding_dicts = [
+                {
+                    "type": f.type,
+                    "literal": f.literal,
+                    "selector": f.selector,
+                    "reason": f.reason,
+                    "file_path": f.file_path,
+                    "block_label": f.block_label,
+                }
+                for f in all_findings
+            ]
+            user_prompt_for_v3 = "\n".join(prompts) if prompts else ""
+            fire_and_forget_mint_review(
+                organization_id=workflow.organization_id,
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+                user_prompt=user_prompt_for_v3,
+                findings=finding_dicts,
+            )
+        except Exception:
+            LOG.warning(
+                "v3_mint_audit_trigger_failed",
+                workflow_permanent_id=workflow.workflow_permanent_id,
+                workflow_run_id=workflow_run_id,
+                script_revision_id=script_revision_id,
+                exc_info=True,
+            )
+    except Exception:
+        LOG.warning(
+            "v3_mint_audit_failed",
+            workflow_permanent_id=workflow.workflow_permanent_id,
+            workflow_run_id=workflow_run_id,
+            script_revision_id=script_revision_id,
+            exc_info=True,
+        )
 
 
 def _fix_static_actions_in_for_loops(code: str) -> str:
@@ -1733,3 +2045,222 @@ async def create_script_version_from_review(
             workflow_permanent_id=workflow_permanent_id,
         )
         return None
+
+
+async def create_script_version_from_full_code(
+    organization_id: str,
+    workflow_permanent_id: str,
+    base_script: Script,
+    full_main_py: str,
+    workflow: Workflow,
+    workflow_run: WorkflowRun | None = None,
+) -> Script | None:
+    """Create a new script version from a complete main.py rewrite.
+
+    Sibling of :func:`create_script_version_from_review`. The block-patch helper
+    mutates individual @cached function bodies via libcst; this helper replaces
+    the entire main.py verbatim. Used by the v3 post-run (and mid-run) agent's
+    ``persist_script_rewrite`` skill when the right fix is at the orchestrator
+    level (control flow, helper functions, FIELD_MAP constants, imports, etc.)
+    rather than a single block body.
+
+    Safety parity with the block-patch helper:
+    - Pinned-script check at the head (same behavior: log + return ``None``; no
+      exception). Mirrors ``create_script_version_from_review`` explicitly.
+    - Full compile check on the provided main.py BEFORE creating any DB rows or
+      uploading any artifact. Rejection returns ``None`` so no partial state
+      leaks.
+    - Script-block metadata is copied from the base revision (same pattern as
+      the block-patch helper). The new main.py is expected to still define the
+      same @cached functions; script-level validators in the v3 skills catalog
+      are responsible for enforcing that before this helper is called.
+
+    Args:
+        organization_id: The organization ID.
+        workflow_permanent_id: The workflow permanent ID.
+        base_script: The script revision being replaced.
+        full_main_py: The complete new main.py source code.
+        workflow: The workflow model.
+        workflow_run: The workflow run that triggered the rewrite.
+
+    Returns:
+        The new Script revision, or ``None`` if creation failed (including
+        pinned-script skip and compile-check failure).
+    """
+    try:
+        # Defense-in-depth: refuse to mutate a pinned script.
+        # MUST match create_script_version_from_review's behavior (log + return None)
+        # so callers can uniformly treat None as "pinned or failed — don't retry".
+        if await app.DATABASE.scripts.is_script_pinned(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+        ):
+            LOG.info(
+                "Skipping script rewrite — script is pinned",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+            )
+            return None
+
+        # Compile the full main.py BEFORE creating the new version. A broken
+        # rewrite should not persist any artifacts or DB rows.
+        try:
+            compile(full_main_py, "<full_rewrite_main.py>", "exec")
+        except SyntaxError as exc:
+            LOG.warning(
+                "Full-script rewrite failed compile check — aborting persist",
+                organization_id=organization_id,
+                script_id=base_script.script_id,
+                workflow_permanent_id=workflow_permanent_id,
+                error=str(exc),
+                lineno=exc.lineno,
+            )
+            return None
+
+        # Create a new script version
+        new_script = await app.DATABASE.scripts.create_script(
+            organization_id=organization_id,
+            script_id=base_script.script_id,
+            version=base_script.version + 1,
+            run_id=workflow_run.workflow_run_id if workflow_run else None,
+        )
+
+        # Copy existing script blocks from the base revision. The rewrite is
+        # expected to preserve the same @cached block set (enforced upstream
+        # by script-level validators); we keep the metadata rows intact.
+        existing_blocks = await app.DATABASE.scripts.get_script_blocks_by_script_revision_id(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+        )
+
+        for sb in existing_blocks:
+            await app.DATABASE.scripts.create_script_block(
+                organization_id=organization_id,
+                script_id=new_script.script_id,
+                script_revision_id=new_script.script_revision_id,
+                script_block_label=sb.script_block_label,
+                run_signature=sb.run_signature,
+                workflow_run_id=workflow_run.workflow_run_id if workflow_run else sb.workflow_run_id,
+                workflow_run_block_id=sb.workflow_run_block_id,
+                input_fields=sb.input_fields,
+                requires_agent=sb.requires_agent,
+            )
+
+        # Write the full main.py verbatim.
+        main_bytes = full_main_py.encode("utf-8")
+        main_hash = hashlib.sha256(main_bytes).hexdigest()
+
+        main_artifact_id = await app.ARTIFACT_MANAGER.create_script_file_artifact(
+            organization_id=organization_id,
+            script_id=new_script.script_id,
+            script_version=new_script.version,
+            file_path="main.py",
+            data=main_bytes,
+        )
+        await app.DATABASE.scripts.create_script_file(
+            script_revision_id=new_script.script_revision_id,
+            script_id=new_script.script_id,
+            organization_id=organization_id,
+            file_path="main.py",
+            file_name="main.py",
+            file_type="file",
+            content_hash=f"sha256:{main_hash}",
+            file_size=len(main_bytes),
+            mime_type="text/x-python",
+            artifact_id=main_artifact_id,
+        )
+
+        # Copy non-block files from base revision (preserves .skyvern metadata etc.).
+        # Same fallback-to-v1 pattern as the block-patch helper.
+        source_files = await app.DATABASE.scripts.get_script_files(
+            script_revision_id=base_script.script_revision_id,
+            organization_id=organization_id,
+        )
+        if not any(f.file_path != "main.py" and not f.file_path.startswith("blocks/") for f in source_files):
+            v1_script = await app.DATABASE.scripts.get_script(
+                script_id=base_script.script_id,
+                organization_id=organization_id,
+                version=1,
+            )
+            if v1_script:
+                source_files = await app.DATABASE.scripts.get_script_files(
+                    script_revision_id=v1_script.script_revision_id,
+                    organization_id=organization_id,
+                )
+
+        for f in source_files:
+            if f.file_path == "main.py" or f.file_path.startswith("blocks/"):
+                continue
+            await app.DATABASE.scripts.create_script_file(
+                script_revision_id=new_script.script_revision_id,
+                script_id=new_script.script_id,
+                organization_id=organization_id,
+                file_path=f.file_path,
+                file_name=f.file_name,
+                file_type=f.file_type,
+                content_hash=f.content_hash,
+                file_size=f.file_size,
+                mime_type=f.mime_type,
+                artifact_id=f.artifact_id,
+            )
+
+        # Workflow script mapping — same logic as the block-patch helper.
+        if workflow_run:
+            _script, rendered_cache_key_value, _is_pinned = await get_workflow_script(
+                workflow=workflow,
+                workflow_run=workflow_run,
+                status=ScriptStatus.published,
+            )
+        else:
+            existing_ws = await app.DATABASE.scripts.get_workflow_scripts_by_permanent_id(
+                organization_id=organization_id,
+                workflow_permanent_id=workflow_permanent_id,
+                statuses=[ScriptStatus.published],
+            )
+            rendered_cache_key_value = ""
+            for ws in existing_ws:
+                if ws.script_id == base_script.script_id:
+                    rendered_cache_key_value = ws.cache_key_value
+                    break
+
+        await app.DATABASE.scripts.create_workflow_script(
+            organization_id=organization_id,
+            script_id=new_script.script_id,
+            workflow_permanent_id=workflow_permanent_id,
+            cache_key=workflow.cache_key or "",
+            cache_key_value=rendered_cache_key_value,
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id if workflow_run else None,
+            status=ScriptStatus.published,
+        )
+
+        clear_workflow_script_cache(
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+
+        LOG.info(
+            "Created new script version from full-code rewrite",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+            base_version=base_script.version,
+            new_version=new_script.version,
+            main_py_size=len(main_bytes),
+        )
+
+        return new_script
+
+    except Exception:
+        LOG.exception(
+            "Failed to create script version from full code rewrite",
+            organization_id=organization_id,
+            workflow_permanent_id=workflow_permanent_id,
+        )
+        return None
+
+
+register_script_version_persist_handlers(
+    create_from_review=create_script_version_from_review,
+    create_from_full_code=create_script_version_from_full_code,
+)

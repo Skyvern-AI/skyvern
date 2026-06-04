@@ -1,3 +1,6 @@
+import asyncio
+
+import structlog
 from fastapi import HTTPException, status
 
 from skyvern.config import settings
@@ -5,9 +8,18 @@ from skyvern.exceptions import OrganizationNotFound, TaskNotFound, WorkflowRunNo
 from skyvern.forge import app
 from skyvern.forge.sdk.schemas.tasks import TaskStatus
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.schemas.runs import RunEngine, RunResponse, RunType, TaskRunRequest, TaskRunResponse
+from skyvern.schemas.runs import (
+    BulkCancelRunsResponse,
+    RunEngine,
+    RunResponse,
+    RunType,
+    TaskRunRequest,
+    TaskRunResponse,
+)
 from skyvern.schemas.webhooks import RunWebhookReplayResponse
 from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
+
+LOG = structlog.get_logger()
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -26,6 +38,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         or run.task_run_type == RunType.openai_cua
         or run.task_run_type == RunType.anthropic_cua
         or run.task_run_type == RunType.ui_tars
+        or run.task_run_type == RunType.yutori_navigator
     ):
         # fetch task v1 from db and transform to task run response
         try:
@@ -41,6 +54,8 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             run_engine = RunEngine.anthropic_cua
         elif run.task_run_type == RunType.ui_tars:
             run_engine = RunEngine.ui_tars
+        elif run.task_run_type == RunType.yutori_navigator:
+            run_engine = RunEngine.yutori_navigator
 
         return TaskRunResponse(
             run_id=run.run_id,
@@ -55,6 +70,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             modified_at=task_v1_response.modified_at,
             app_url=f"{settings.SKYVERN_APP_URL.rstrip('/')}/tasks/{task_v1_response.task_id}",
             recording_url=task_v1_response.recording_url,
+            recording_archived=task_v1_response.recording_archived,
             screenshot_urls=task_v1_response.action_screenshot_urls,
             downloaded_files=task_v1_response.downloaded_files,
             run_request=TaskRunRequest(
@@ -136,7 +152,13 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             detail=f"Run not found {run_id}",
         )
 
-    if run.task_run_type in [RunType.task_v1, RunType.openai_cua, RunType.anthropic_cua, RunType.ui_tars]:
+    if run.task_run_type in [
+        RunType.task_v1,
+        RunType.openai_cua,
+        RunType.anthropic_cua,
+        RunType.ui_tars,
+        RunType.yutori_navigator,
+    ]:
         await cancel_task_v1(run_id, organization_id=organization_id, api_key=api_key)
     elif run.task_run_type == RunType.task_v2:
         await cancel_task_v2(run_id, organization_id=organization_id)
@@ -147,6 +169,24 @@ async def cancel_run(run_id: str, organization_id: str | None = None, api_key: s
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid run type to cancel: {run.task_run_type}",
         )
+
+
+async def bulk_cancel_runs(
+    run_ids: list[str], organization_id: str | None = None, api_key: str | None = None
+) -> BulkCancelRunsResponse:
+    cancelled: list[str] = []
+    failed: list[str] = []
+
+    async def _cancel_one(run_id: str) -> None:
+        try:
+            await cancel_run(run_id, organization_id=organization_id, api_key=api_key)
+            cancelled.append(run_id)
+        except Exception:
+            LOG.warning("bulk_cancel_runs: failed to cancel run", run_id=run_id, exc_info=True)
+            failed.append(run_id)
+
+    await asyncio.gather(*[_cancel_one(run_id) for run_id in dict.fromkeys(run_ids)])
+    return BulkCancelRunsResponse(cancelled=cancelled, failed=failed)
 
 
 async def retry_run_webhook(

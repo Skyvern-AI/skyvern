@@ -7,9 +7,11 @@ from unittest.mock import MagicMock
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     format_tool_result_for_user,
+    looks_like_workflow_yaml_in_chat,
     parse_final_response,
     sanitize_tool_result_for_llm,
     summarize_tool_result,
+    summarize_tool_result_detail,
     truncate_output,
 )
 
@@ -306,6 +308,16 @@ class TestSummarizeToolResult:
         )
         assert "3" in summary
 
+    def test_update_and_run_blocks_with_scalar_data_does_not_crash(self) -> None:
+        summary = self._summarize(
+            "update_and_run_blocks",
+            {
+                "ok": True,
+                "data": "workflow_run_skipped: verified_goal_already_satisfied",
+            },
+        )
+        assert summary == "OK"
+
     def test_navigate_browser(self) -> None:
         summary = self._summarize(
             "navigate_browser",
@@ -422,6 +434,80 @@ class TestFormatToolResultForUser:
     @staticmethod
     def _format(tool_name: str, result: dict) -> str:
         return format_tool_result_for_user(tool_name, result)
+
+    def test_blocker_signal_overrides_activity_summary_and_detail(self) -> None:
+        from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+
+        signal = CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text=(
+                "Less than 90 seconds remain in this Copilot turn. "
+                "Do NOT start another block-running tool call; reply from gathered progress."
+            ),
+            user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
+            recovery_hint="stop",
+            renders_final_reply=False,
+            internal_reason_code="tool_error_late_block_running",
+            blocked_tool="update_and_run_blocks",
+        )
+        result = {"ok": False, "error": signal.agent_steering_text}
+
+        summary = format_tool_result_for_user("update_and_run_blocks", result, blocker_signal=signal)
+        detail = summarize_tool_result_detail(result, blocker_signal=signal)
+
+        assert summary == signal.user_facing_reason
+        assert detail == signal.user_facing_reason
+        assert "Do NOT" not in summary
+        assert "Do NOT" not in detail
+        assert "update_and_run_blocks" not in summary
+        assert "tool_error_late_block_running" not in summary
+        agent_summary = summarize_tool_result("update_and_run_blocks", result)
+        assert "Do NOT start another block-running tool call" in agent_summary
+
+    def test_watchdog_control_signal_summary_overrides_raw_detail(self) -> None:
+        result = {
+            "ok": False,
+            "error": (
+                "The run has not made progress. Run ID: wr_stalled. Outcome is uncertain. "
+                "Do NOT re-invoke block-running tools without first calling get_run_results."
+            ),
+            "data": {
+                "failure_reason": (
+                    "The run stopped after no observable progress for 120s. Run ID: wr_stalled. Outcome is uncertain."
+                ),
+                "control_signal": {
+                    "kind": "watchdog_stagnation",
+                    "user_facing_summary": "The run stopped after no observable progress for 120s.",
+                },
+                "user_facing_summary": "The run stopped after no observable progress for 120s.",
+            },
+        }
+
+        summary = self._format("run_blocks_and_collect_debug", result)
+        detail = summarize_tool_result_detail(result, tool_name="run_blocks_and_collect_debug")
+
+        assert summary == "The run stopped after no observable progress for 120s."
+        assert detail == summary
+        assert "wr_stalled" not in summary
+        assert "get_run_results" not in detail
+        assert "Do NOT" not in detail
+
+    def test_unsafe_structured_summary_falls_back_for_summary_and_detail(self) -> None:
+        result = {
+            "ok": False,
+            "error": "STOP - do NOT respond to the user yet.",
+            "data": {
+                "user_facing_summary": "The update_and_run_blocks tool could not continue.",
+            },
+        }
+
+        summary = self._format("update_and_run_blocks", result)
+        detail = summarize_tool_result_detail(result, tool_name="update_and_run_blocks")
+
+        assert summary == "Couldn't complete that step."
+        assert detail == "Couldn't complete that step."
+        assert "update_and_run_blocks" not in summary
+        assert "STOP" not in detail
 
     def test_loop_detected_failure_drops_use_a_different_tool_tail(self) -> None:
         summary = self._format(
@@ -674,9 +760,35 @@ class TestParseFinalResponse:
         assert parsed["type"] == "ASK_QUESTION"
         assert parsed["user_response"] == "what date?"
 
+    def test_plain_leading_label_falls_through_for_output_policy(self) -> None:
+        text = "ASK_QUESTION\nWhich account should I use?"
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
+    def test_sentence_starting_with_reply_is_not_stripped(self) -> None:
+        text = "Reply with the invoice number from the page."
+        parsed = parse_final_response(text)
+        assert parsed == {"type": "REPLY", "user_response": text}
+
     def test_strips_leading_replace_workflow_label(self) -> None:
         envelope = (
             'REPLACE_WORKFLOW {"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}'
+        )
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "REPLACE_WORKFLOW"
+        assert parsed["workflow_yaml"] == "title: x"
+
+    def test_strips_mixed_case_leading_structured_label(self) -> None:
+        envelope = 'ask_question {"type": "ASK_QUESTION", "user_response": "which account?"}'
+        parsed = parse_final_response(envelope)
+        assert parsed["type"] == "ASK_QUESTION"
+        assert parsed["user_response"] == "which account?"
+
+    def test_strips_leading_label_before_json_code_fence(self) -> None:
+        envelope = (
+            "REPLACE_WORKFLOW\n```json\n"
+            '{"type": "REPLACE_WORKFLOW", "user_response": "updated", "workflow_yaml": "title: x"}\n'
+            "```"
         )
         parsed = parse_final_response(envelope)
         assert parsed["type"] == "REPLACE_WORKFLOW"
@@ -752,3 +864,82 @@ class TestParseFinalResponse:
         text = "I'm not sure how to help with that."
         parsed = parse_final_response(text)
         assert parsed == {"type": "REPLY", "user_response": text}
+
+
+class TestLooksLikeWorkflowYamlInChat:
+    def test_detects_block_yaml_with_navigation_goal(self) -> None:
+        text = (
+            "Here's how the block now looks:\n\n"
+            "    - label: fill_form\n"
+            "      block_type: navigation\n"
+            "      navigation_goal: Fill the abuse form.\n"
+            "      url: https://example.test/abuse\n"
+            "      parameter_keys:\n"
+            "        - name\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_detects_block_yaml_inside_fenced_code(self) -> None:
+        text = (
+            "I've drafted the change:\n\n"
+            "```yaml\n"
+            "block_type: extraction\n"
+            "data_extraction_goal: Pull the table.\n"
+            "label: extract_data\n"
+            "```\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_detects_full_workflow_definition_paste(self) -> None:
+        text = (
+            "workflow_definition:\n"
+            "  parameters: []\n"
+            "  blocks:\n"
+            "    - block_type: validation\n"
+            "      complete_criterion: The page shows a thank-you message.\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_does_not_flag_inline_block_type_mention(self) -> None:
+        text = (
+            "I'll use a navigation block to fill the form. The block_type field on a "
+            "navigation block accepts goals like a navigation_goal string — but the user "
+            "doesn't need to see the YAML directly."
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is False
+
+    def test_does_not_flag_short_prose(self) -> None:
+        assert looks_like_workflow_yaml_in_chat("Sure, I can do that.") is False
+
+    def test_does_not_flag_empty_or_non_string(self) -> None:
+        assert looks_like_workflow_yaml_in_chat("") is False
+        assert looks_like_workflow_yaml_in_chat(None) is False
+        assert looks_like_workflow_yaml_in_chat(12345) is False
+
+    def test_detects_bare_block_type_line(self) -> None:
+        text = "Here's a small snippet:\n\n    - block_type: navigation\n      label: open_page\n"
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_unknown_block_type_value_does_not_trip(self) -> None:
+        text = "Diagnostic note:\n\n    block_type: experimental_thing\n    detail: not a real block\n"
+        assert looks_like_workflow_yaml_in_chat(text) is False
+
+    def test_detects_json_shape_block_paste(self) -> None:
+        text = (
+            "Here is the block as JSON:\n\n"
+            "```json\n"
+            "{\n"
+            '  "block_type": "navigation",\n'
+            '  "navigation_goal": "Fill the form.",\n'
+            '  "parameter_keys": ["name"]\n'
+            "}\n"
+            "```\n"
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is True
+
+    def test_inline_field_mention_does_not_trip(self) -> None:
+        text = (
+            "When the navigation_goal field is unset and the block_type is wrong, the block "
+            "will fail validation — those fields need to come from the user."
+        )
+        assert looks_like_workflow_yaml_in_chat(text) is False

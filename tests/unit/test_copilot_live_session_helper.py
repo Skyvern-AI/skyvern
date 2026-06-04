@@ -10,6 +10,16 @@ from skyvern.forge.sdk.copilot.agent import _resolve_live_browser_session_id
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatRequest
 
 
+class _FakeBrowser:
+    def is_connected(self) -> bool:
+        return True
+
+
+class _FakeBrowserContext:
+    browser = _FakeBrowser()
+    _impl_obj = SimpleNamespace(_close_was_called=False, _closed=False)
+
+
 def _request(browser_session_id: str | None = None, wpid: str = "wpid-1") -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id=wpid,
@@ -88,7 +98,10 @@ async def test_persistent_row_missing_falls_back(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         app,
         "PERSISTENT_SESSIONS_MANAGER",
-        SimpleNamespace(get_session=AsyncMock(return_value=None)),
+        SimpleNamespace(
+            get_session=AsyncMock(return_value=None),
+            can_probe_registered_browser_state=lambda: False,
+        ),
     )
 
     result = await _resolve_live_browser_session_id(
@@ -117,6 +130,7 @@ async def test_status_in_final_state_falls_back(monkeypatch: pytest.MonkeyPatch)
             get_session=AsyncMock(
                 return_value=SimpleNamespace(status="completed", browser_address="wss://example/cdp"),
             ),
+            can_probe_registered_browser_state=lambda: False,
         ),
     )
 
@@ -146,6 +160,7 @@ async def test_browser_address_unset_falls_back(monkeypatch: pytest.MonkeyPatch)
             get_session=AsyncMock(
                 return_value=SimpleNamespace(status="running", browser_address=None),
             ),
+            can_probe_registered_browser_state=lambda: False,
         ),
     )
 
@@ -155,6 +170,66 @@ async def test_browser_address_unset_falls_back(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_default_manager_registered_browser_state_allows_missing_browser_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=_FakeBrowserContext()))
+    manager = SimpleNamespace(
+        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_browser_state=get_browser_state,
+        can_probe_registered_browser_state=lambda: True,
+    )
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", manager)
+
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_booted_local", wpid="wpid-1"),
+        organization_id="org-1",
+    )
+
+    assert result == "pbs_booted_local"
+    get_browser_state.assert_awaited_once_with(session_id="pbs_booted_local", organization_id="org-1")
+
+
+@pytest.mark.asyncio
+async def test_default_manager_unattachable_registered_browser_state_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app.DATABASE,
+        "debug",
+        SimpleNamespace(
+            get_debug_session_by_browser_session_id=AsyncMock(
+                return_value=SimpleNamespace(workflow_permanent_id="wpid-1"),
+            ),
+        ),
+    )
+    get_browser_state = AsyncMock(return_value=SimpleNamespace(browser_context=None))
+    manager = SimpleNamespace(
+        get_session=AsyncMock(return_value=SimpleNamespace(status="running", browser_address=None)),
+        get_browser_state=get_browser_state,
+        can_probe_registered_browser_state=lambda: True,
+    )
+    monkeypatch.setattr(app, "PERSISTENT_SESSIONS_MANAGER", manager)
+
+    result = await _resolve_live_browser_session_id(
+        _request(browser_session_id="pbs_not_ready", wpid="wpid-1"),
+        organization_id="org-1",
+    )
+
+    assert result is None
+    get_browser_state.assert_awaited_once_with(session_id="pbs_not_ready", organization_id="org-1")
 
 
 @pytest.mark.asyncio
@@ -171,7 +246,10 @@ async def test_owned_and_running_returns_id(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(
         app,
         "PERSISTENT_SESSIONS_MANAGER",
-        SimpleNamespace(get_session=AsyncMock(return_value=_running_session())),
+        SimpleNamespace(
+            get_session=AsyncMock(return_value=_running_session()),
+            can_probe_registered_browser_state=lambda: False,
+        ),
     )
 
     result = await _resolve_live_browser_session_id(
@@ -212,7 +290,7 @@ async def test_ensure_browser_session_recovers_from_stale_supplied_id(monkeypatc
     # First get_browser_state returns a stale row (no browser_context).
     # After auto-create, the second call returns a healthy state so the
     # post-create boot wait can complete.
-    fresh_state = SimpleNamespace(browser_context=object())
+    fresh_state = SimpleNamespace(browser_context=_FakeBrowserContext())
     get_browser_state_mock = AsyncMock(side_effect=[SimpleNamespace(browser_context=None), fresh_state])
     create_session_mock = AsyncMock(return_value=SimpleNamespace(persistent_browser_session_id="pbs_fresh"))
 

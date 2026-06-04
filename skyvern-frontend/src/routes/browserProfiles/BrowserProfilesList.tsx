@@ -1,6 +1,7 @@
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { useSearchParams } from "react-router-dom";
 
+import { BrowserIcon } from "@/components/icons/BrowserIcon";
 import { Button } from "@/components/ui/button";
 import {
   Pagination,
@@ -14,11 +15,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
   TableBody,
+  TableCell,
   TableHead,
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
 import { useBrowserProfilesQuery } from "@/routes/workflows/hooks/useBrowserProfilesQuery";
+import { useBrowserProfileCreateStore } from "@/store/useBrowserProfileCreateStore";
 import { cn } from "@/util/utils";
 
 import { BrowserProfileItem } from "./BrowserProfileItem";
@@ -72,6 +75,10 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   const isNextDisabled =
     isFetching || !nextPageProfiles || nextPageProfiles.length === 0;
 
+  const activeCreate = useBrowserProfileCreateStore((state) => state.active);
+  const hasSearch = Boolean(searchKey && searchKey.length > 0);
+  const showPlaceholderRow = Boolean(activeCreate && page === 1 && !hasSearch);
+
   if (isLoading) {
     return (
       <div className="space-y-3">
@@ -84,7 +91,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   if (isError) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-neutral-600 dark:text-slate-300">
         <div className="mb-3">Failed to load browser profiles.</div>
         <Button
           variant="secondary"
@@ -99,19 +106,25 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
   }
 
   const pageItems = profiles ?? [];
-  const hasSearch = Boolean(searchKey && searchKey.length > 0);
 
-  if (pageItems.length === 0 && page === 1) {
+  if (pageItems.length === 0 && page === 1 && !showPlaceholderRow) {
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-10 text-sm text-neutral-600 dark:text-slate-300">
         {hasSearch ? (
           <>No browser profiles match &ldquo;{searchKey}&rdquo;.</>
         ) : (
-          <>
-            No browser profiles yet. Profiles are created via the API/SDK, or
-            when a credential test or workflow run saves its persistent browser
-            session.
-          </>
+          <div className="flex flex-col items-center gap-3 text-center">
+            <BrowserIcon className="size-10 text-neutral-600 dark:text-slate-400" />
+            <div className="space-y-1">
+              <p className="text-base font-medium text-slate-100">
+                No browser profiles yet
+              </p>
+              <p className="mx-auto max-w-md text-sm text-neutral-600 dark:text-slate-400">
+                Start a session, then click Save Profile on the session page to
+                capture it here.
+              </p>
+            </div>
+          </div>
         )}
       </div>
     );
@@ -119,28 +132,42 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border">
+      <div className="overflow-hidden rounded-lg border border-border">
         <Table className="w-full table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
+          <TableHeader>
             <TableRow>
-              <TableHead className="w-1/4 truncate rounded-tl-lg text-slate-400">
-                Name
-              </TableHead>
-              <TableHead className="w-1/3 truncate text-slate-400">
-                Description
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-slate-400">
-                Source Browser
-              </TableHead>
-              <TableHead className="w-1/6 truncate text-slate-400">
-                Created
-              </TableHead>
-              <TableHead className="w-32 truncate rounded-tr-lg text-right text-slate-400">
-                Actions
-              </TableHead>
+              <TableHead className="w-[22%] truncate">Name</TableHead>
+              <TableHead className="w-[40%] truncate">Description</TableHead>
+              <TableHead className="w-[15%] truncate">Source Browser</TableHead>
+              <TableHead className="w-[15%] truncate">Created</TableHead>
+              <TableHead className="w-32 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
+            {showPlaceholderRow && activeCreate ? (
+              <TableRow className="opacity-70">
+                <TableCell className="truncate">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
+                    <span className="truncate" title={activeCreate.name}>
+                      {activeCreate.name}
+                    </span>
+                  </div>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell className="text-slate-400">
+                  <span className="opacity-50">—</span>
+                </TableCell>
+                <TableCell>
+                  <span className="opacity-50">—</span>
+                </TableCell>
+              </TableRow>
+            ) : null}
             {pageItems.map((profile) => (
               <BrowserProfileItem
                 key={profile.browser_profile_id}
@@ -151,9 +178,11 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+            <span className="text-neutral-600 dark:text-slate-400">
+              Items per page
+            </span>
             <select
-              className="h-9 rounded-md border border-slate-300 bg-background px-3"
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm"
               value={itemsPerPage}
               onChange={(e) => {
                 const next = Number(e.target.value);

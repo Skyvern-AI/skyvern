@@ -169,7 +169,7 @@ function WorkflowBlockCollapsibleContent({ task, onNavigate }: Props) {
                       setActiveTab("parameters");
                     }}
                   >
-                    Parameters
+                    Inputs
                   </div>
                 </div>
                 <div>

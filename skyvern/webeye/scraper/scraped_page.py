@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import typing
 from abc import ABC, abstractmethod
 from enum import StrEnum
@@ -24,6 +25,14 @@ ScrapeExcludeFunc = Callable[[Page, Frame], Awaitable[bool]]
 ELEMENT_NODE_ATTRIBUTES = {
     "id",
 }
+
+_PUA_PATTERN = re.compile(r"[\uE000-\uF8FF\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]+")
+
+
+def _replace_pua_with_marker(text: str | None) -> str:
+    if not text:
+        return ""
+    return _PUA_PATTERN.sub("[icon]", text)
 
 
 def build_attribute(key: str, value: Any) -> str:
@@ -89,8 +98,8 @@ def json_to_html(element: dict, need_skyvern_attrs: bool = True) -> str:
     if element.get("purgeable", False):
         return children_html + option_html
 
-    before_pseudo_text = element.get("beforePseudoText") or ""
-    after_pseudo_text = element.get("afterPseudoText") or ""
+    before_pseudo_text = _replace_pua_with_marker(element.get("beforePseudoText"))
+    after_pseudo_text = _replace_pua_with_marker(element.get("afterPseudoText"))
 
     # Check if the element is self-closing
     if (
@@ -208,31 +217,56 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         self._clean_up_func = clean_up_func
         self._scrape_exclude = scrape_exclude
 
+    @staticmethod
+    def _is_pdf_embed(element: dict) -> str | None:
+        if element.get("tagName", "") != "embed":
+            return None
+        attributes: dict = element.get("attributes", {})
+        if not attributes:
+            return None
+        type_attr: str | None = attributes.get("type")
+        if not type_attr or type_attr.lower() != "application/pdf":
+            return None
+        return attributes.get("src", "")
+
     def check_pdf_viewer_embed(self) -> str | None:
         """
         Check if the page contains a PDF viewer embed.
         If found, return the src attribute of the embed.
+
+        Detection works at two levels:
+        1. Whole-page: entire page has exactly one element and it is a PDF embed.
+        2. Per-frame: any child frame has exactly one element and it is a PDF embed.
+           This covers multi-frame pages (e.g. framesets) where the PDF is loaded
+           in one frame while other frames contain navigation elements.
         """
-        if len(self.elements) != 1:
-            return None
+        if len(self.elements) == 1:
+            pdf_src = self._is_pdf_embed(self.elements[0])
+            if pdf_src is not None:
+                LOG.info("Found a PDF viewer page", element=self.elements[0])
+                return pdf_src
 
-        element = self.elements[0]
-        if element.get("tagName", "") != "embed":
-            return None
+        if self.id_to_frame_dict:
+            frame_elements: dict[str, list[dict]] = {}
+            for element in self.elements:
+                element_id = element.get("id", "")
+                frame_id = self.id_to_frame_dict.get(element_id, "main.frame")
+                if frame_id == "main.frame":
+                    continue
+                frame_elements.setdefault(frame_id, []).append(element)
 
-        attributes: dict = element.get("attributes", {})
-        if not attributes:
-            return None
+            for frame_id, elements in frame_elements.items():
+                if len(elements) == 1:
+                    pdf_src = self._is_pdf_embed(elements[0])
+                    if pdf_src is not None:
+                        LOG.info(
+                            "Found a PDF viewer embed in frame",
+                            frame_id=frame_id,
+                            element=elements[0],
+                        )
+                        return pdf_src
 
-        type_attr: str | None = attributes.get("type")
-        if not type_attr:
-            return None
-
-        if type_attr.lower() != "application/pdf":
-            return None
-
-        LOG.info("Found a PDF viewer page", element=element)
-        return attributes.get("src", "")
+        return None
 
     async def check_pdf_iframe(self) -> str | None:
         """
@@ -308,9 +342,24 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             return element_str[: int(len(element_str) * percent_to_keep)]
 
         if fmt == ElementTreeFormat.HTML:
+            elements_to_render = self.economy_element_tree
+            if percent_to_keep < 1:
+                # Portals (popper menus, dialogs) are appended near the end of
+                # <body> and appear last in the root-level list. A naïve front
+                # slice drops them disproportionately. Move overlay root elements
+                # to the front so they survive character-level truncation.
+                overlay_roots = [e for e in self.economy_element_tree if self._element_subtree_has_overlay(e)]
+                if overlay_roots:
+                    regular_roots = [e for e in self.economy_element_tree if not self._element_subtree_has_overlay(e)]
+                    elements_to_render = overlay_roots + regular_roots
+                    LOG.info(
+                        "economy_tree_portal_priority: moved overlay roots to front before truncation",
+                        overlay_count=len(overlay_roots),
+                        regular_count=len(regular_roots),
+                        percent_to_keep=percent_to_keep,
+                    )
             element_str = "".join(
-                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs)
-                for element in self.economy_element_tree
+                json_to_html(element, need_skyvern_attrs=html_need_skyvern_attrs) for element in elements_to_render
             )
             result = element_str[: int(len(element_str) * percent_to_keep)]
             self.last_used_element_tree_html = result
@@ -336,6 +385,22 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
                     new_children.append(processed_child)
             element["children"] = new_children
         return element
+
+    @staticmethod
+    def _element_subtree_has_overlay(element: dict, _depth: int = 0) -> bool:
+        """Return True if this element or any descendant carries role=listbox/option.
+
+        These roles are preserved by `_trimmed_attributes` and are reliable
+        indicators of popper/dialog portal content.  Recursion is limited to
+        avoid spending time walking deep table trees — portals are typically
+        shallow (1-3 levels).
+        """
+        if _depth > 4:
+            return False
+        role = (element.get("attributes") or {}).get("role", "")
+        if role in ("listbox", "option"):
+            return True
+        return any(ScrapedPage._element_subtree_has_overlay(child, _depth + 1) for child in element.get("children", []))
 
     def build_lean_elements_tree(
         self,

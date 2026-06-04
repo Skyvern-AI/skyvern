@@ -87,7 +87,7 @@ function WorkflowRunTimelineItemInfoSection({ activeItem }: Props) {
                 <TabsTrigger value="failure_reason">Failure Reason</TabsTrigger>
               )}
               <TabsTrigger value="navigation_goal">Navigation Goal</TabsTrigger>
-              <TabsTrigger value="parameters">Parameters</TabsTrigger>
+              <TabsTrigger value="parameters">Inputs</TabsTrigger>
               {item.task_id && (
                 <Link
                   to={`/tasks/${item.task_id}/diagnostics`}

@@ -260,6 +260,7 @@ async def initialize_task_v2(
     max_screenshot_scrolling_times: int | None = None,
     browser_session_id: str | None = None,
     extra_http_headers: dict[str, str] | None = None,
+    cdp_connect_headers: dict[str, str] | None = None,
     browser_address: str | None = None,
     run_with: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
@@ -278,6 +279,7 @@ async def initialize_task_v2(
         model=model,
         max_screenshot_scrolling_times=max_screenshot_scrolling_times,
         extra_http_headers=extra_http_headers,
+        cdp_connect_headers=cdp_connect_headers,
         browser_address=browser_address,
         run_with=run_with,
     )
@@ -299,6 +301,7 @@ async def initialize_task_v2(
             status=workflow_status,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
         )
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
@@ -307,6 +310,7 @@ async def initialize_task_v2(
                 max_screenshot_scrolls=max_screenshot_scrolling_times,
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 run_with=run_with,
             ),
@@ -501,11 +505,12 @@ async def run_task_v2(
         loop_internal_state=copy.deepcopy(parent_context.loop_internal_state) if parent_context else None,
         trigger_type=parent_context.trigger_type if parent_context else None,
         use_flex_llm_routing=parent_context.use_flex_llm_routing if parent_context else False,
+        consecutive_captcha_timeouts=parent_context.consecutive_captcha_timeouts if parent_context else 0,
     )
     # SKY-7005: scoped() restores the parent context on exit, preserving
     # loop_internal_state so per-iteration download filtering continues to
     # work for subsequent blocks in the same loop iteration.
-    with skyvern_context.scoped(context):
+    with skyvern_context.scoped(context, propagate_captcha_timeout=True):
         try:
             workflow, workflow_run, task_v2 = await run_task_v2_helper(
                 organization=organization,
@@ -658,12 +663,6 @@ async def run_task_v2_helper(
     context.run_id = current_run_id
     context.browser_session_id = browser_session_id
     context.max_screenshot_scrolls = task_v2.max_screenshot_scrolls
-    enable_parse_select_in_extract = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-        "ENABLE_PARSE_SELECT_IN_EXTRACT",
-        current_run_id,
-        properties={"organization_id": organization_id, "task_url": task_v2.url},
-    )
-    context.enable_parse_select_in_extract = bool(enable_parse_select_in_extract)
 
     task_v2 = await app.DATABASE.observer.update_task_v2(
         task_v2_id=task_v2_id, organization_id=organization_id, status=TaskV2Status.running
@@ -1054,7 +1053,8 @@ async def run_task_v2_helper(
             )
             break
         if block_result.success is True:
-            completion_screenshots = []
+            completion_screenshots: list[bytes] = []
+            completion_scraped_page: ScrapedPage | None = None
             try:
                 browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
                     workflow_run=workflow_run,
@@ -1062,12 +1062,12 @@ async def run_task_v2_helper(
                     browser_session_id=browser_session_id,
                     browser_profile_id=workflow_run.browser_profile_id,
                 )
-                scraped_page = await browser_state.scrape_website(
+                completion_scraped_page = await browser_state.scrape_website(
                     url=url,
                     cleanup_element_tree=app.AGENT_FUNCTION.cleanup_element_tree_factory(),
                     scrape_exclude=app.scrape_exclude,
                 )
-                completion_screenshots = scraped_page.screenshots
+                completion_screenshots = completion_scraped_page.screenshots
             except Exception:
                 LOG.warning("Failed to scrape the website for task v2 completion check")
 
@@ -2042,6 +2042,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
         created_at=task_v2.created_at,
         modified_at=task_v2.modified_at,
         recording_url=workflow_run_resp.recording_url if workflow_run_resp else None,
+        recording_archived=workflow_run_resp.recording_archived if workflow_run_resp else False,
         screenshot_urls=workflow_run_resp.screenshot_urls if workflow_run_resp else None,
         downloaded_files=workflow_run_resp.downloaded_files if workflow_run_resp else None,
         app_url=app_url,

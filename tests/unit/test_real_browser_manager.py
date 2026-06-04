@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_factory import set_popup_video_listener
 from skyvern.webeye.real_browser_manager import RealBrowserManager
+from skyvern.webeye.real_browser_state import RealBrowserState
 
 
 def make_workflow_run(
@@ -133,6 +136,146 @@ async def test_non_pbs_workflow_run_inherits_parent_browser() -> None:
     assert manager.pages["wfr_parent"] is parent_state
 
 
+def make_task(
+    task_id: str,
+    organization_id: str = "org_test",
+    proxy_location: object = None,
+    workflow_run_id: str | None = None,
+) -> MagicMock:
+    task = MagicMock()
+    task.task_id = task_id
+    task.organization_id = organization_id
+    task.proxy_location = proxy_location
+    task.workflow_run_id = workflow_run_id
+    task.url = "https://example.com"
+    task.workflow_permanent_id = None
+    task.extra_http_headers = None
+    task.browser_address = None
+    return task
+
+
+def make_session(proxy_location: object = None) -> MagicMock:
+    session = MagicMock()
+    session.proxy_location = proxy_location
+    return session
+
+
+@pytest.mark.asyncio
+async def test_task_browser_inherits_session_proxy_when_no_browser_state() -> None:
+    """When a task has a browser_session_id and no in-memory browser state, the session's proxy_location is used."""
+    manager = RealBrowserManager()
+    task = make_task("tsk_1", proxy_location="RESIDENTIAL")
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session_proxy = "RESIDENTIAL_DE"
+    session = make_session(proxy_location=session_proxy)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_123")
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_task_browser_uses_task_proxy_when_session_has_no_proxy() -> None:
+    """When the session has no proxy_location, the task's proxy_location is used."""
+    manager = RealBrowserManager()
+    task_proxy = "RESIDENTIAL_US"
+    task = make_task("tsk_2", proxy_location=task_proxy)
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_task(task=task, browser_session_id="pbs_123")
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == task_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_inherits_session_proxy_when_no_browser_state() -> None:
+    """When a workflow run has a browser_session_id and no in-memory state, the session's proxy is used."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_1")
+    workflow_run.proxy_location = "RESIDENTIAL"
+
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session_proxy = "RESIDENTIAL_FR"
+    session = make_session(proxy_location=session_proxy)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+            )
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == session_proxy
+
+
+@pytest.mark.asyncio
+async def test_workflow_run_browser_uses_workflow_proxy_when_session_has_no_proxy() -> None:
+    """When the session has no proxy_location, the workflow run's proxy_location is used."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_2")
+    wf_proxy = "RESIDENTIAL_IE"
+    workflow_run.proxy_location = wf_proxy
+
+    new_browser_state = MagicMock()
+    new_browser_state.get_or_create_page = AsyncMock()
+
+    session = make_session(proxy_location=None)
+
+    with patch("skyvern.webeye.real_browser_manager.app") as mock_app:
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=None)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_session = AsyncMock(return_value=session)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        with patch.object(
+            manager, "_create_browser_state", new=AsyncMock(return_value=new_browser_state)
+        ) as mock_create:
+            await manager.get_or_create_for_workflow_run(
+                workflow_run=workflow_run,
+                url="https://example.com",
+                browser_session_id="pbs_456",
+            )
+
+        mock_create.assert_awaited_once()
+        _, kwargs = mock_create.call_args
+        assert kwargs["proxy_location"] == wf_proxy
+
+
 def _make_browser_state_with_video(video_path: str) -> MagicMock:
     video_artifact = MagicMock()
     video_artifact.video_path = video_path
@@ -172,3 +315,178 @@ async def test_get_video_artifacts_finalize_false_skips_ffmpeg(tmp_path) -> None
 
     m.assert_not_awaited()
     assert artifacts[0].video_data == b"partial-webm-bytes"
+
+
+def _make_page_mock(video_path: str | None) -> MagicMock:
+    page = MagicMock()
+    if video_path is None:
+        page.video = None
+    else:
+        page.video = MagicMock()
+        page.video.path = AsyncMock(return_value=video_path)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_picks_up_popup_page() -> None:
+    """set_popup_video_listener registers popup video paths on the page event."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    popup = _make_page_mock("/tmp/videos/popup.webm")
+    await handler(popup)
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == ["/tmp/videos/main.webm", "/tmp/videos/popup.webm"]
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_deduplicates() -> None:
+    """Already-tracked pages are not added twice."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = _make_page_mock("/tmp/videos/main.webm")
+    await handler(page)
+
+    assert len(artifacts.video_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_skips_pages_without_video() -> None:
+    """Pages with no video (e.g. about:blank) are silently skipped."""
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    await handler(_make_page_mock(None))
+
+    assert len(artifacts.video_artifacts) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_multiple_popups() -> None:
+    """Multiple popup pages from loop iterations are all captured."""
+
+    artifacts = BrowserArtifacts(video_artifacts=[VideoArtifact(video_path="/tmp/videos/main.webm")])
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    for name in ["popup1", "popup2", "popup3"]:
+        await handler(_make_page_mock(f"/tmp/videos/{name}.webm"))
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == [
+        "/tmp/videos/main.webm",
+        "/tmp/videos/popup1.webm",
+        "/tmp/videos/popup2.webm",
+        "/tmp/videos/popup3.webm",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_working_page_does_not_touch_video_artifacts() -> None:
+    """set_working_page only sets the working page; video tracking is handled by the listener."""
+
+    artifacts = BrowserArtifacts()
+    state = RealBrowserState(pw=MagicMock(), browser_context=MagicMock(), browser_artifacts=artifacts)
+
+    page = _make_page_mock("/tmp/v/page.webm")
+    await state.set_working_page(page, index=0)
+
+    assert len(artifacts.video_artifacts) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_registers_pre_existing_pages() -> None:
+    """Pages that already exist when the listener is registered are captured."""
+    import asyncio
+
+    artifacts = BrowserArtifacts()
+    initial_page = _make_page_mock("/tmp/videos/initial.webm")
+    browser_context = MagicMock()
+    browser_context.pages = [initial_page]
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    # Let the ensure_future tasks run
+    await asyncio.sleep(0)
+
+    paths = [va.video_path for va in artifacts.video_artifacts]
+    assert paths == ["/tmp/videos/initial.webm"]
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_page_closed_no_warning() -> None:
+    """PlaywrightError (e.g. Page closed) must not produce a WARNING log."""
+    import structlog.testing
+    from playwright.async_api import Error as PlaywrightError
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=PlaywrightError("Page closed"))
+
+    with structlog.testing.capture_logs() as cap:
+        await handler(page)
+
+    assert len(artifacts.video_artifacts) == 0
+    warning_events = [e for e in cap if e["log_level"] == "warning"]
+    assert len(warning_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_timeout_logs_sanitized_origin() -> None:
+    """TimeoutError logs WARNING with only the domain, no query params or PII."""
+    import structlog.testing
+
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=TimeoutError())
+    page.url = "https://user:pass@example.com/o/oauth2/auth?client_id=secret&redirect_uri=https://evil.com"
+
+    with structlog.testing.capture_logs() as cap:
+        await handler(page)
+
+    assert len(artifacts.video_artifacts) == 0
+    warning_events = [e for e in cap if e["log_level"] == "warning"]
+    assert len(warning_events) == 1
+    logged = str(warning_events[0])
+    assert "example.com" in logged  # nosemgrep: incomplete-url-substring-sanitization
+    assert "user:pass" not in logged
+    assert "client_id=secret" not in logged
+    assert "redirect_uri" not in logged
+
+
+@pytest.mark.asyncio
+async def test_popup_video_listener_timeout_url_error_safe() -> None:
+    """If page.url itself raises, the handler still completes without crashing."""
+    artifacts = BrowserArtifacts()
+    browser_context = MagicMock()
+    set_popup_video_listener(browser_context=browser_context, browser_artifacts=artifacts)
+
+    handler = browser_context.on.call_args[0][1]
+    page = MagicMock()
+    page.video = MagicMock()
+    page.video.path = AsyncMock(side_effect=TimeoutError())
+    type(page).url = property(lambda self: (_ for _ in ()).throw(RuntimeError("page destroyed")))
+
+    await handler(page)
+    assert len(artifacts.video_artifacts) == 0

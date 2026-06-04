@@ -30,11 +30,13 @@ import {
   CopyIcon,
   DotsHorizontalIcon,
   DownloadIcon,
+  MixerHorizontalIcon,
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { stringify as convertToYAML } from "yaml";
+import { useNodeCollapseStore } from "./editor/collapse/useNodeCollapseStore";
 import { convert } from "./editor/workflowEditorUtils";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -42,6 +44,9 @@ import { WorkflowApiResponse } from "./types/workflowTypes";
 type Props = {
   workflow: WorkflowApiResponse;
   onSuccessfullyDeleted?: () => void;
+  hasParameters?: boolean;
+  parametersExpanded?: boolean;
+  onToggleParameters?: () => void;
 };
 
 function downloadFile(fileName: string, contents: string) {
@@ -60,7 +65,13 @@ function downloadFile(fileName: string, contents: string) {
   document.body.removeChild(element);
 }
 
-function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
+function WorkflowActions({
+  workflow,
+  onSuccessfullyDeleted,
+  hasParameters,
+  parametersExpanded,
+  onToggleParameters,
+}: Props) {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
 
@@ -83,19 +94,20 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
       const client = await getClient(credentialGetter);
       return client.delete(`/workflows/${id}`);
     },
-    onSuccess: () => {
+    onSuccess: (_data, deletedId) => {
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
       queryClient.invalidateQueries({
         queryKey: ["folders"],
       });
+      useNodeCollapseStore.getState().pruneWorkflow(deletedId);
       onSuccessfullyDeleted?.();
     },
     onError: (error: AxiosError) => {
       toast({
         variant: "destructive",
-        title: "Failed to delete workflow",
+        title: "Failed to delete agent",
         description: error.message,
       });
     },
@@ -145,11 +157,32 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
     <Dialog>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button size="icon" variant="outline">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="text-muted-foreground hover:text-foreground"
+          >
             <DotsHorizontalIcon className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent>
+          {onToggleParameters ? (
+            <>
+              <DropdownMenuItem
+                onSelect={() => onToggleParameters()}
+                disabled={!hasParameters}
+                className="p-2"
+              >
+                <MixerHorizontalIcon className="mr-2 h-4 w-4" />
+                {hasParameters
+                  ? parametersExpanded
+                    ? "Hide parameters"
+                    : "Show parameters"
+                  : "No parameters"}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          ) : null}
           <DropdownMenuItem
             onSelect={() => {
               if (!workflow) {
@@ -164,7 +197,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
             className="p-2"
           >
             <CopyIcon className="mr-2 h-4 w-4" />
-            Clone Workflow
+            Clone Agent
           </DropdownMenuItem>
           <DropdownMenuItem
             onSelect={() => {
@@ -213,7 +246,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
           <DialogTrigger>
             <DropdownMenuItem className="p-2">
               <GarbageIcon className="mr-2 h-4 w-4 text-destructive" />
-              Delete Workflow
+              Delete Agent
             </DropdownMenuItem>
           </DialogTrigger>
         </DropdownMenuContent>
@@ -222,7 +255,7 @@ function WorkflowActions({ workflow, onSuccessfullyDeleted }: Props) {
         <DialogHeader>
           <DialogTitle>Are you sure?</DialogTitle>
           <DialogDescription>
-            The workflow{" "}
+            The agent{" "}
             <span className="font-semibold text-primary">{workflow.title}</span>{" "}
             will be deleted.
           </DialogDescription>

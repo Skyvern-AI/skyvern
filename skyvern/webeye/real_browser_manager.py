@@ -34,6 +34,7 @@ class RealBrowserManager(BrowserManager):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> BrowserState:
@@ -52,6 +53,7 @@ class RealBrowserManager(BrowserManager):
             script_id=script_id,
             organization_id=organization_id,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             browser_address=browser_address,
             browser_profile_id=browser_profile_id,
         )
@@ -116,13 +118,19 @@ class RealBrowserManager(BrowserManager):
 
         if browser_state is None:
             LOG.info("Creating browser state for task", task_id=task.task_id)
+            proxy_location = task.proxy_location
+            if browser_session_id and task.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, task.organization_id)
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=task.proxy_location,
+                proxy_location=proxy_location,
                 url=task.url,
                 task_id=task.task_id,
                 workflow_permanent_id=task.workflow_permanent_id,
                 organization_id=task.organization_id,
                 extra_http_headers=task.extra_http_headers,
+                cdp_connect_headers=task.cdp_connect_headers,
                 browser_address=task.browser_address,
             )
 
@@ -145,6 +153,7 @@ class RealBrowserManager(BrowserManager):
             workflow_permanent_id=task.workflow_permanent_id,
             organization_id=task.organization_id,
             extra_http_headers=task.extra_http_headers,
+            cdp_connect_headers=task.cdp_connect_headers,
             browser_address=task.browser_address,
         )
         return browser_state
@@ -155,6 +164,7 @@ class RealBrowserManager(BrowserManager):
         url: str | None = None,
         browser_session_id: str | None = None,
         browser_profile_id: str | None = None,
+        navigate: bool = True,
     ) -> BrowserState:
         parent_workflow_run_id = workflow_run.parent_workflow_run_id
         workflow_run_id = workflow_run.workflow_run_id
@@ -201,7 +211,7 @@ class RealBrowserManager(BrowserManager):
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
                 page = await browser_state.get_working_page()
                 if page:
-                    if url:
+                    if url and navigate:
                         await browser_state.navigate_to_url(page=page, url=url)
                 else:
                     LOG.warning("Browser state has no page", workflow_run_id=workflow_run.workflow_run_id)
@@ -211,13 +221,21 @@ class RealBrowserManager(BrowserManager):
                 "Creating browser state for workflow run",
                 workflow_run_id=workflow_run.workflow_run_id,
             )
+            proxy_location = workflow_run.proxy_location
+            if browser_session_id and workflow_run.organization_id:
+                session = await app.PERSISTENT_SESSIONS_MANAGER.get_session(
+                    browser_session_id, workflow_run.organization_id
+                )
+                if session and session.proxy_location is not None:
+                    proxy_location = session.proxy_location
             browser_state = await self._create_browser_state(
-                proxy_location=workflow_run.proxy_location,
+                proxy_location=proxy_location,
                 url=url,
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
                 organization_id=workflow_run.organization_id,
                 extra_http_headers=workflow_run.extra_http_headers,
+                cdp_connect_headers=workflow_run.cdp_connect_headers,
                 browser_address=workflow_run.browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -238,13 +256,17 @@ class RealBrowserManager(BrowserManager):
 
         # The URL here is only used when creating a new page, and not when using an existing page.
         # This will make sure browser_state.page is not None.
+        # When navigate is False, the URL has already been used for proxy selection in
+        # _create_browser_state above; we skip navigation so the caller (e.g. a generated
+        # script) performs the first goto itself, avoiding a redundant page load.
         await browser_state.get_or_create_page(
-            url=url,
+            url=url if navigate else None,
             proxy_location=workflow_run.proxy_location,
             workflow_run_id=workflow_run.workflow_run_id,
             workflow_permanent_id=workflow_run.workflow_permanent_id,
             organization_id=workflow_run.organization_id,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             browser_address=workflow_run.browser_address,
             browser_profile_id=browser_profile_id,
         )

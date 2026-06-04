@@ -4,11 +4,10 @@ import structlog
 from fastapi import BackgroundTasks, Depends, Header, HTTPException, Request
 
 from skyvern.config import settings
-from skyvern.constants import DEFAULT_LOGIN_PROMPT, SKYVERN_UI_USER_AGENT
+from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.exceptions import MissingBrowserAddressError
 from skyvern.forge import app
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.routes.code_samples import (
     DOWNLOAD_FILES_CODE_SAMPLE_PYTHON,
     DOWNLOAD_FILES_CODE_SAMPLE_TS,
@@ -20,6 +19,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     LOGIN_CODE_SAMPLE_SKYVERN_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router
+from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
@@ -79,9 +79,7 @@ async def _run_workflow_and_build_response(
         extra_http_headers=run_block_request.extra_http_headers,
     )
 
-    trigger_type = (
-        WorkflowRunTriggerType.manual if x_user_agent == SKYVERN_UI_USER_AGENT else WorkflowRunTriggerType.api
-    )
+    trigger_type = workflow_run_trigger_type_from_user_agent(x_user_agent)
     try:
         workflow_run = await workflow_service.run_workflow(
             workflow_id=workflow_id,
@@ -127,6 +125,7 @@ async def _run_workflow_and_build_response(
     tags=["Agent"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-excluded": True,
         "x-fern-sdk-method-name": "login",
         "x-fern-examples": [
             {
@@ -293,6 +292,7 @@ async def login(
     tags=["Agent"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-excluded": True,
         "x-fern-sdk-method-name": "download_files",
         "x-fern-examples": [
             {

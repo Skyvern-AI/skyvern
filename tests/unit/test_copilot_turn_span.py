@@ -57,6 +57,10 @@ async def _stub_build_request_policy_proceed(*_args: Any, **_kwargs: Any) -> Req
     return RequestPolicy(user_response_policy="ask_clarification", clarification_question="?")
 
 
+async def _raise_unhandled_turn_error(*_args: Any, **_kwargs: Any) -> None:
+    raise RuntimeError("boom")
+
+
 @pytest.fixture
 def patched_build_request_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -103,8 +107,8 @@ async def test_copilot_turn_span_parents_inner_spans(
     assert attrs.get("skyvern.span.role") == "wrapper"
     assert attrs.get("copilot.session_id") == "chat_abc"
     assert attrs.get("workflow_permanent_id") == "wpid_xyz"
-    # one prior user msg in history + this turn = 2.
-    assert attrs.get("copilot.turn_index") == 2
+    # Zero-based: one prior user msg in history → this turn is index 1.
+    assert attrs.get("copilot.turn_index") == 1
     preview = attrs.get("copilot.user_message_preview")
     assert isinstance(preview, str) and preview.startswith("Hello")
 
@@ -179,6 +183,35 @@ async def test_copilot_turn_span_preview_is_single_line_and_truncated(
     assert "\r" not in preview
     assert len(preview) <= copilot_agent._USER_MESSAGE_PREVIEW_MAX_CHARS
     assert preview.endswith("…")
+
+
+@pytest.mark.asyncio
+async def test_outer_turn_recovery_records_error_attrs_on_turn_span(
+    span_exporter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(copilot_agent, "_run_copilot_turn_impl", _raise_unhandled_turn_error)
+    chat_request = _make_chat_request()
+
+    result = await copilot_agent.run_copilot_agent(
+        stream=object(),
+        organization_id="o_test",
+        chat_request=chat_request,
+        chat_history=[],
+        global_llm_context=None,
+        debug_run_info_text="",
+        llm_api_handler=None,
+    )
+
+    assert result.updated_workflow is None
+    assert "reference cpe_" in result.user_response
+    turn_span = _find_span(span_exporter.get_finished_spans(), "copilot.turn")
+    attrs = dict(turn_span.attributes or {})
+    assert attrs.get("copilot.error_recovered") is True
+    assert attrs.get("copilot.error_failure_kind") == "unknown"
+    assert attrs.get("copilot.error_exception_type") == "RuntimeError"
+    assert attrs.get("copilot.error_reply_proposal_disposition") == result.proposal_disposition
+    assert attrs.get("copilot.error_workflow_modified") is False
 
 
 def test_build_user_message_preview_redacts_known_secret_patterns() -> None:

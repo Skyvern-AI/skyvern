@@ -47,6 +47,7 @@ import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQu
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { type ApiCommandOptions } from "@/util/apiCommands";
+import { parseHeaderJson } from "@/util/secretHeaders";
 
 import { MAX_SCREENSHOT_SCROLLS_DEFAULT } from "./editor/nodes/Taskv2Node/types";
 import { getLabelForWorkflowParameterType } from "./editor/workflowEditorUtils";
@@ -120,6 +121,7 @@ type Props = {
     maxScreenshotScrolls: number | null;
     extraHttpHeaders: Record<string, string> | null;
     browserProfileId: string | null;
+    cdpConnectHeaders: Record<string, string> | null;
     runWith: string | null;
   };
 };
@@ -191,6 +193,7 @@ type RunWorkflowRequestBody = {
   browser_profile_id?: string | null;
   max_screenshot_scrolls?: number | null;
   extra_http_headers?: Record<string, string> | null;
+  cdp_connect_headers?: Record<string, string> | null;
   browser_address?: string | null;
   run_with?: "agent" | "code";
   ai_fallback?: boolean;
@@ -208,6 +211,7 @@ function getRunWorkflowRequestBody(
     cdpAddress,
     maxScreenshotScrolls,
     extraHttpHeaders,
+    cdpConnectHeaders,
     runWith,
     aiFallback,
     ...parameters
@@ -241,10 +245,20 @@ function getRunWorkflowRequestBody(
 
   if (extraHttpHeaders) {
     try {
-      body.extra_http_headers = JSON.parse(extraHttpHeaders);
+      body.extra_http_headers = parseHeaderJson(extraHttpHeaders);
     } catch (e) {
       console.error("Invalid extra Header JSON");
       body.extra_http_headers = null;
+    }
+  }
+
+  if (cdpConnectHeaders) {
+    try {
+      body.cdp_connect_headers = parseHeaderJson(cdpConnectHeaders);
+    } catch {
+      throw new Error(
+        'Invalid CDP Connect Headers: value must be valid JSON (e.g., {"x-api-key": "..."}).',
+      );
     }
   }
 
@@ -291,6 +305,7 @@ type RunWorkflowFormType = Record<string, unknown> & {
   cdpAddress: string | null;
   maxScreenshotScrolls: number | null;
   extraHttpHeaders: string | null;
+  cdpConnectHeaders: string | null;
   runWith: "agent" | "code";
   aiFallback: boolean | null;
 };
@@ -336,6 +351,9 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
+      cdpConnectHeaders: initialSettings.cdpConnectHeaders
+        ? JSON.stringify(initialSettings.cdpConnectHeaders)
+        : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     },
@@ -360,8 +378,8 @@ function RunWorkflowForm({
     onSuccess: (response) => {
       toast({
         variant: "success",
-        title: "Workflow run started",
-        description: "The workflow run has been started successfully",
+        title: "Agent run started",
+        description: "The agent run has been started successfully",
       });
       queryClient.invalidateQueries({
         queryKey: ["workflowRuns"],
@@ -379,7 +397,7 @@ function RunWorkflowForm({
       const detail = (error.response?.data as { detail?: string })?.detail;
       toast({
         variant: "destructive",
-        title: "Failed to start workflow run",
+        title: "Failed to start agent run",
         description: detail ?? error.message,
       });
     },
@@ -445,6 +463,9 @@ function RunWorkflowForm({
       extraHttpHeaders: initialSettings.extraHttpHeaders
         ? JSON.stringify(initialSettings.extraHttpHeaders)
         : null,
+      cdpConnectHeaders: initialSettings.cdpConnectHeaders
+        ? JSON.stringify(initialSettings.cdpConnectHeaders)
+        : null,
       runWith: deriveRunWith(workflow, initialSettings.runWith),
       aiFallback: workflow?.ai_fallback ?? true,
     });
@@ -477,6 +498,7 @@ function RunWorkflowForm({
       browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
+      cdpConnectHeaders,
       cdpAddress,
       runWith,
       aiFallback,
@@ -495,6 +517,7 @@ function RunWorkflowForm({
       browserProfileId,
       maxScreenshotScrolls,
       extraHttpHeaders,
+      cdpConnectHeaders,
       cdpAddress,
       runWith,
       aiFallback,
@@ -509,6 +532,7 @@ function RunWorkflowForm({
       "browserProfileId",
       "maxScreenshotScrolls",
       "extraHttpHeaders",
+      "cdpConnectHeaders",
       "cdpAddress",
       "runWith",
     ]);
@@ -534,7 +558,7 @@ function RunWorkflowForm({
   };
 
   if (!workflowPermanentId || !workflow) {
-    return <div>Invalid workflow</div>;
+    return <div>Invalid agent</div>;
   }
 
   return (
@@ -546,11 +570,11 @@ function RunWorkflowForm({
         <header className="flex items-end justify-between gap-4">
           <div className="space-y-5">
             <h1 className="text-3xl">
-              Parameters{workflow?.title ? ` - ${workflow.title}` : ""}
+              Inputs{workflow?.title ? ` - ${workflow.title}` : ""}
             </h1>
             <h2 className="text-lg text-slate-400">
               Fill the placeholder values that you have linked throughout your
-              workflow.
+              agent.
             </h2>
           </div>
           <div className="flex shrink-0 gap-2">
@@ -594,7 +618,7 @@ function RunWorkflowForm({
               {!runWorkflowMutation.isPending && (
                 <PlayIcon className="mr-2 h-4 w-4" />
               )}
-              Run workflow
+              Run agent
             </Button>
           </div>
         </header>
@@ -602,7 +626,7 @@ function RunWorkflowForm({
         {hasLoginBlockValidationError && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
-            <AlertTitle>Cannot run workflow</AlertTitle>
+            <AlertTitle>Cannot run agent</AlertTitle>
             <AlertDescription>
               <p>
                 The following login block(s) need a credential selected before
@@ -628,7 +652,7 @@ function RunWorkflowForm({
 
         <div className="space-y-8 rounded-lg bg-slate-elevation3 px-6 py-5">
           <header>
-            <h1 className="text-lg">Input Parameters</h1>
+            <h1 className="text-lg">Inputs</h1>
           </header>
           {workflowParameters?.map((parameter) => {
             return (
@@ -766,7 +790,7 @@ function RunWorkflowForm({
             );
           })}
           {workflowParameters.length === 0 && (
-            <div>This workflow doesn't have any input parameters</div>
+            <div>This agent doesn't have any inputs</div>
           )}
         </div>
 
@@ -804,7 +828,7 @@ function RunWorkflowForm({
                         </div>
                         <h2 className="text-sm text-slate-400">
                           The URL of a webhook endpoint to send the details of
-                          the workflow result.
+                          the agent result.
                         </h2>
                       </div>
                     </FormLabel>
@@ -890,17 +914,16 @@ function RunWorkflowForm({
               const descriptions: Record<string, ReactNode> = {
                 agent: hasCode ? (
                   <span>
-                    Run this workflow with AI. (Even though it has generated
-                    code.)
+                    Run this agent with AI. (Even though it has generated code.)
                   </span>
                 ) : (
-                  <span>Run this workflow with AI.</span>
+                  <span>Run this agent with AI.</span>
                 ),
                 code: hasCode ? (
-                  <span>Run this workflow with generated code.</span>
+                  <span>Run this agent with generated code.</span>
                 ) : (
                   <span>
-                    Run this workflow with generated code (after it is first
+                    Run this agent with generated code (after it is first
                     generated).
                   </span>
                 ),
@@ -1072,7 +1095,7 @@ function RunWorkflowForm({
                                 </div>
                                 <h2 className="text-sm text-slate-400">
                                   The address of the Browser server to use for
-                                  the workflow run.
+                                  the agent run.
                                 </h2>
                               </div>
                             </FormLabel>
@@ -1111,6 +1134,42 @@ function RunWorkflowForm({
                                 <h2 className="text-sm text-slate-400">
                                   Specify some self defined HTTP requests
                                   headers in Dict format
+                                </h2>
+                              </div>
+                            </FormLabel>
+                            <div className="w-full space-y-2">
+                              <FormControl>
+                                <KeyValueInput
+                                  value={field.value ?? ""}
+                                  onChange={(val) => field.onChange(val)}
+                                  addButtonText="Add Header"
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </div>
+                          </div>
+                        </FormItem>
+                      );
+                    }}
+                  />
+                  <FormField
+                    key="cdpConnectHeaders"
+                    control={form.control}
+                    name="cdpConnectHeaders"
+                    render={({ field }) => {
+                      return (
+                        <FormItem>
+                          <div className="flex gap-16">
+                            <FormLabel>
+                              <div className="w-72">
+                                <div className="flex items-center gap-2 text-lg">
+                                  CDP Connect Headers
+                                </div>
+                                <h2 className="text-sm text-slate-400">
+                                  Headers attached only to the CDP WebSocket
+                                  handshake when connecting to a remote browser
+                                  (e.g. auth for the CDP endpoint). Not
+                                  forwarded to target sites.
                                 </h2>
                               </div>
                             </FormLabel>

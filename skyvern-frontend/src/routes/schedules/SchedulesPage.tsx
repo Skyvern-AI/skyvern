@@ -52,6 +52,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { TableSearchInput } from "@/components/TableSearchInput";
+import { Pill } from "@/components/StatusBadge";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { toast } from "@/components/ui/use-toast";
@@ -101,31 +102,10 @@ const STATUS_OPTIONS: Array<{ label: string; value: ScheduleStatus }> = [
 ];
 
 function StatusDisplay({ enabled }: Readonly<{ enabled: boolean }>) {
-  if (enabled) {
-    return (
-      <div className="flex items-center gap-1.5">
-        <span className="size-4 text-green-400">
-          <svg
-            viewBox="0 0 16 16"
-            fill="none"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <circle cx="8" cy="8" r="4" fill="currentColor" />
-          </svg>
-        </span>
-        <span className="text-sm capitalize text-slate-300">active</span>
-      </div>
-    );
-  }
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="size-4 text-amber-400">
-        <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="8" cy="8" r="4" fill="currentColor" />
-        </svg>
-      </span>
-      <span className="text-sm capitalize text-slate-300">paused</span>
-    </div>
+    <Pill tone={enabled ? "success" : "queued"} className="capitalize">
+      {enabled ? "active" : "paused"}
+    </Pill>
   );
 }
 
@@ -372,7 +352,7 @@ function SchedulesPage() {
           <TableSearchInput
             value={search}
             onChange={setSearch}
-            placeholder="Search by workflow or schedule name..."
+            placeholder="Search by agent or schedule name..."
             className="w-64"
           />
           <DropdownMenu modal={false}>
@@ -428,9 +408,9 @@ function SchedulesPage() {
 
       {/* Table */}
       <div className="space-y-4">
-        <div className="overflow-hidden rounded-lg border border-slate-700">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
-            <TableHeader className="bg-slate-elevation2 text-slate-400 [&_tr]:border-b-0">
+            <TableHeader>
               <TableRow>
                 {showCheckbox && (
                   <TableHead className="w-[3%]">
@@ -441,7 +421,7 @@ function SchedulesPage() {
                   </TableHead>
                 )}
                 <TableHead className={showCheckbox ? "w-[28%]" : "w-[31%]"}>
-                  Workflow
+                  Agent
                 </TableHead>
                 <TableHead className="w-[20%]">Name</TableHead>
                 <TableHead className="w-[20%]">Schedule</TableHead>
@@ -544,9 +524,9 @@ function SchedulesPage() {
                     <DropdownMenu modal={false}>
                       <DropdownMenuTrigger asChild>
                         <Button
-                          variant="outline"
+                          variant="ghost"
                           size="icon"
-                          className="size-8"
+                          className="size-8 text-muted-foreground hover:text-foreground"
                         >
                           <DotsHorizontalIcon className="size-4" />
                         </Button>

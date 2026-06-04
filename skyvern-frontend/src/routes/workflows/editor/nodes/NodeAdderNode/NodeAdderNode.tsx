@@ -11,16 +11,24 @@ import {
   useWorkflowPanelStore,
 } from "@/store/WorkflowPanelStore";
 import { useWorkflowSettingsStore } from "@/store/WorkflowSettingsStore";
-import type { NodeBaseData } from "../types";
 import { useRecordedBlocksStore } from "@/store/RecordedBlocksStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
 import { cn } from "@/util/utils";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 
 import type { NodeAdderNode } from "./types";
 import { WorkflowAddMenu } from "../../WorkflowAddMenu";
 import { WorkflowAdderBusy } from "../../WorkflowAdderBusy";
+import { SELECTED_RING_CLASSES } from "../../selection/selectedRingClasses";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
+import { findBranchContextForInsertion } from "../../workflowInsertion";
 
 function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   const { workflowPermanentId } = useParams();
@@ -41,51 +49,8 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   // SOP upload
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const deriveBranchContext = (previousNodeId: string | undefined) => {
-    const previousNode = nodes.find((node) => node.id === previousNodeId);
-    if (
-      previousNode &&
-      "data" in previousNode &&
-      (previousNode.data as NodeBaseData).conditionalBranchId &&
-      (previousNode.data as NodeBaseData).conditionalNodeId
-    ) {
-      const prevData = previousNode.data as NodeBaseData;
-      return {
-        conditionalNodeId: prevData.conditionalNodeId!,
-        conditionalLabel: prevData.conditionalLabel ?? prevData.label,
-        branchId: prevData.conditionalBranchId!,
-        mergeLabel: prevData.conditionalMergeLabel ?? null,
-      } satisfies BranchContext;
-    }
-
-    // If previous node doesn't have branch context, check if this NodeAdderNode is inside a conditional block
-    if (parentId) {
-      const parentNode = nodes.find((n) => n.id === parentId);
-      if (parentNode?.type === "conditional" && "data" in parentNode) {
-        const conditionalData = parentNode.data as {
-          activeBranchId: string | null;
-          branches: Array<{ id: string }>;
-          label: string;
-          mergeLabel: string | null;
-        };
-        const activeBranchId = conditionalData.activeBranchId;
-        const activeBranch = conditionalData.branches?.find(
-          (b) => b.id === activeBranchId,
-        );
-
-        if (activeBranch) {
-          return {
-            conditionalNodeId: parentNode.id,
-            conditionalLabel: conditionalData.label,
-            branchId: activeBranch.id,
-            mergeLabel: conditionalData.mergeLabel ?? null,
-          } satisfies BranchContext;
-        }
-      }
-    }
-
-    return undefined;
-  };
+  const deriveBranchContext = (previousNodeId: string | undefined) =>
+    findBranchContextForInsertion(nodes, previousNodeId, parentId);
 
   // Find the edge that targets this NodeAdder
   // If inside a conditional, find the edge for the active branch
@@ -159,8 +124,21 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   const isBlockedByFinally =
     !parentId && Boolean(workflowSettingsStore.finallyBlockLabel);
+  // Read-only canvases (WorkflowComparisonPanel) must not let the `+`
+  // affordance open the node library — selecting a block from there
+  // would route through `addNode` and mutate the underlying workflow.
+  const isReadOnlyScope = useWorkflowScopeReadOnly();
   const isDisabled =
-    isBlockedByFinally || (!isBusy && recordingStore.isRecording);
+    isReadOnlyScope ||
+    isBlockedByFinally ||
+    (!isBusy && recordingStore.isRecording);
+  const disabledReason: string | null = isReadOnlyScope
+    ? "This canvas is read-only"
+    : isBlockedByFinally
+      ? "Finally block must run last - choose a position above it"
+      : !isBusy && recordingStore.isRecording
+        ? "Stop recording to add a block"
+        : null;
 
   const updateWorkflowPanelState = (
     active: boolean,
@@ -172,7 +150,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       data: {
         previous: previous ?? null,
         next: id,
-        parent: branchContext?.conditionalNodeId ?? parentId,
+        parent: parentId,
         connectingEdgeType: "default",
         branchContext,
       },
@@ -229,18 +207,47 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     e.target.value = "";
   };
 
-  const adder = (
+  // Highlight the + CTA the same way withSelectableBlock highlights a selected block,
+  // active while the node library is open targeting this specific NodeAdder.
+  const isAdding =
+    workflowStatePanel.workflowPanelState.active &&
+    workflowStatePanel.workflowPanelState.content === "nodeLibrary" &&
+    workflowStatePanel.workflowPanelState.data?.previous === previous &&
+    workflowStatePanel.workflowPanelState.data?.next === id &&
+    workflowStatePanel.workflowPanelState.data?.parent ===
+      (parentId || undefined);
+
+  const adderInner = (
     <div
-      className={cn("rounded-full bg-slate-50 p-2", {
-        "cursor-not-allowed bg-[grey]": isDisabled,
-      })}
+      data-testid="node-adder-button"
+      className={cn(
+        "rounded-full bg-slate-50 p-1 transition-colors hover:bg-blue-50 hover:ring-2 hover:ring-blue-500/40",
+        {
+          "cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted hover:ring-0":
+            isDisabled,
+          [SELECTED_RING_CLASSES]: isAdding,
+        },
+      )}
       onClick={() => {
         onAdd();
       }}
     >
-      <PlusIcon className="h-12 w-12 text-slate-950" />
+      <PlusIcon className="h-8 w-8 text-slate-950" />
     </div>
   );
+  const adder =
+    isDisabled && disabledReason ? (
+      <TooltipProvider delayDuration={150}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>{adderInner}</div>
+          </TooltipTrigger>
+          <TooltipContent>{disabledReason}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    ) : (
+      adderInner
+    );
 
   const busy = (
     <WorkflowAdderBusy

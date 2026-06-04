@@ -29,7 +29,7 @@ const useCloseBrowserSessionMutation = ({
     },
     onSuccess: () => {
       queryClient.invalidateQueries({
-        queryKey: ["browserSessions"],
+        queryKey: ["browser_sessions"],
       });
       queryClient.invalidateQueries({
         queryKey: ["browserSession", browserSessionId],

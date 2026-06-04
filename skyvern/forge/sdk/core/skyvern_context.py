@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterator, TypedDict
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,10 @@ if TYPE_CHECKING:
     from playwright.async_api import FileChooser, Frame, Page
 
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+
+    # Deferred import: skyvern_context.py sits below the service layer and
+    # must not pull a service module at import time. String annotation below.
+    from skyvern.services.script_reviewer_v3.budget import RunBudget
 
 LOG = structlog.get_logger()
 
@@ -29,6 +34,24 @@ class DialogEntry(TypedDict):
     type: str
     message: str
     count: int
+
+
+class EnrichTreeMode(StrEnum):
+    CONTROL = "control"
+    ENRICHED_TREE = "enriched_tree"
+    ENRICHED_TREE_NO_IMAGES = "enriched_tree_no_images"
+    ENRICHED_TREE_NO_IMAGES_FALLBACK = "enriched_tree_no_images_fallback"
+
+
+def parse_enrich_tree_mode(value: Any) -> EnrichTreeMode:
+    if isinstance(value, EnrichTreeMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return EnrichTreeMode(value)
+        except ValueError:
+            LOG.warning("Unknown enrich_tree mode value, defaulting to control", enrich_tree_mode=value)
+    return EnrichTreeMode.CONTROL
 
 
 @dataclass
@@ -70,6 +93,7 @@ class SkyvernContext:
     active_credential_parameter_key: str | None = None
     log: list[dict] = field(default_factory=list)
     hashed_href_map: dict[str, str] = field(default_factory=dict)
+    downloaded_pdf_sources: set[str] = field(default_factory=set)
     refresh_working_page: bool = False
     frame_index_map: dict[Frame, int] = field(default_factory=dict)
     dropped_css_svg_element_map: dict[str, bool] = field(default_factory=dict)
@@ -80,20 +104,19 @@ class SkyvernContext:
 
     # feature flags
     enable_page_ready_wait: bool = False
-    enable_parse_select_in_extract: bool = False
     use_prompt_caching: bool = False
     cached_static_prompt: str | None = None
     vertex_cache_name: str | None = None  # Vertex AI cache resource name for explicit caching
     vertex_cache_key: str | None = None  # Logical cache key (includes variant + llm key)
     vertex_cache_variant: str | None = None  # Variant identifier used when creating the cache
     prompt_caching_settings: dict[str, bool] | None = None
-    enable_speed_optimizations: bool = False
     use_artifact_bundling: bool = False
     # SKY-9718 Layer 1 — gates apply_lean_recipe in prompt_engine + agent.
     # PostHog flag ENABLE_LEAN_ELEMENT_TREE, evaluated once per run at scrape time
     # and read sync from prompt-build sites.
     enable_lean_element_tree: bool = False
-    disable_llm_screenshots: bool = False
+    enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
+    step_retry_index: int = 0
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
@@ -126,6 +149,10 @@ class SkyvernContext:
     current_step_actions: list[dict[str, Any]] | None = None
     skip_complete_verification: bool = False
 
+    # v3 agentic reviewer — per-run cumulative budget. Initialized at workflow
+    # run start for v3-cohort workflows; None for v2-cohort runs. SKY-7676.
+    v3_run_budget: RunBudget | None = None
+
     # magic link handling
     # task_id is the key, page is the value
     # we only consider the page is a magic link page in the same task scope
@@ -155,6 +182,10 @@ class SkyvernContext:
     # preventing repeated injection loops when the captcha solver succeeds but the page doesn't change
     proactive_captcha_task_ids: set[str] = field(default_factory=set)
 
+    # Circuit breaker: consecutive captcha solve timeouts for this workflow run.
+    # When this reaches the threshold, further captcha solve attempts are short-circuited.
+    consecutive_captcha_timeouts: int = 0
+
     # Browser dialogs captured since the last agent prompt build, surfaced into the
     # next extract-action prompt so the LLM can react to validation rejections.
     recent_dialog_messages: list[DialogEntry] = field(default_factory=list)
@@ -169,6 +200,34 @@ class SkyvernContext:
     # Deferred file chooser listener — survives across steps so a popup-intercepted upload
     # can be completed when a subsequent click triggers the actual file chooser.
     pending_file_chooser: PendingFileChooserListener | None = None
+
+    def set_enrich_tree_mode(self, mode: Any) -> None:
+        self.enrich_tree_mode = parse_enrich_tree_mode(mode)
+
+    def enriched_tree_enabled(self) -> bool:
+        return self.enrich_tree_mode != EnrichTreeMode.CONTROL
+
+    def enrich_tree_fallback_active(self, *, retry_index: int | None = None) -> bool:
+        effective_retry_index = self.step_retry_index if retry_index is None else retry_index
+        return self.enrich_tree_mode == EnrichTreeMode.ENRICHED_TREE_NO_IMAGES_FALLBACK and effective_retry_index > 0
+
+    def llm_screenshots_enabled_for_prompt(
+        self,
+        *,
+        is_vision_fallback_prompt: bool = False,
+        retry_index: int | None = None,
+    ) -> bool:
+        if is_vision_fallback_prompt:
+            return True
+
+        mode = self.enrich_tree_mode
+        if mode in {EnrichTreeMode.CONTROL, EnrichTreeMode.ENRICHED_TREE}:
+            return True
+        if mode == EnrichTreeMode.ENRICHED_TREE_NO_IMAGES:
+            return False
+
+        effective_retry_index = self.step_retry_index if retry_index is None else retry_index
+        return effective_retry_index > 0
 
     def cleanup_pending_file_chooser(self) -> None:
         if self.pending_file_chooser is not None:
@@ -351,20 +410,31 @@ def _restore(token: Token[SkyvernContext | None]) -> None:
 
 
 @contextmanager
-def scoped(context: SkyvernContext) -> Iterator[SkyvernContext]:
+def scoped(
+    context: SkyvernContext,
+    *,
+    propagate_captcha_timeout: bool = False,
+) -> Iterator[SkyvernContext]:
     """
     Temporarily scope the current context to a fresh child context.
 
     Args:
         context: The child context to set for the scope
+        propagate_captcha_timeout: When True, copy the child's
+            ``consecutive_captcha_timeouts`` back to the parent on exit.
+            Only enable for scopes that represent real task executions
+            (e.g. run_task_v2), not placeholder contexts.
 
     Yields:
         The child context
     """
+    parent = _context.get() if propagate_captcha_timeout else None
     token = _context.set(context)
     try:
         yield context
     finally:
+        if parent is not None:
+            parent.consecutive_captcha_timeouts = context.consecutive_captcha_timeouts
         _restore(token)
 
 

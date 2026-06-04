@@ -11,17 +11,20 @@ function TaskRecording() {
   const credentialGetter = useCredentialGetter();
 
   const {
-    data: recordingURL,
+    data: recordingData,
     isLoading: taskIsLoading,
     isError: taskIsError,
-  } = useQuery<string | null>({
+  } = useQuery<{ url: string | null; archived: boolean }>({
     queryKey: ["task", taskId, "recordingURL"],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
       const task: TaskApiResponse = await client
         .get(`/tasks/${taskId}`)
         .then((response) => response.data);
-      return getRecordingURL(task);
+      return {
+        url: getRecordingURL(task),
+        archived: task.recording_archived ?? false,
+      };
     },
     refetchOnMount: true,
   });
@@ -38,11 +41,21 @@ function TaskRecording() {
     return <div>Error loading recording</div>;
   }
 
-  return recordingURL ? (
-    <video width={800} height={450} src={recordingURL} controls />
-  ) : (
-    <div>No recording available for this task</div>
-  );
+  if (recordingData?.url) {
+    return <video width={800} height={450} src={recordingData.url} controls />;
+  }
+
+  if (recordingData?.archived) {
+    return (
+      <div className="text-muted-foreground">
+        This recording has been archived. To request restoration, please contact
+        support@skyvern.com
+        {/* TODO: add a "Request Restore" button */}
+      </div>
+    );
+  }
+
+  return <div>No recording available for this task</div>;
 }
 
 export { TaskRecording };

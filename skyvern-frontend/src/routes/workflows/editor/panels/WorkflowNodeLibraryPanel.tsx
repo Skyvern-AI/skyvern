@@ -1,11 +1,7 @@
 import { ScrollArea, ScrollAreaViewport } from "@/components/ui/scroll-area";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { useState, useRef, useEffect } from "react";
-import {
-  Cross2Icon,
-  PlusIcon,
-  MagnifyingGlassIcon,
-} from "@radix-ui/react-icons";
+import { PlusIcon, MagnifyingGlassIcon } from "@radix-ui/react-icons";
 import { WorkflowBlockTypes } from "../../types/workflowTypes";
 import { WorkflowBlockNode } from "../nodes";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
@@ -85,7 +81,7 @@ const nodeLibraryItems: Array<{
       />
     ),
     title: "Human Interaction Block",
-    description: "Pause workflow for human review and approval",
+    description: "Pause agent for human review and approval",
   },
   // {
   //   nodeType: "task",
@@ -270,8 +266,8 @@ const nodeLibraryItems: Array<{
         className="size-6"
       />
     ),
-    title: "Workflow Trigger Block",
-    description: "Trigger another workflow",
+    title: "Agent Trigger Block",
+    description: "Trigger another agent",
   },
   {
     nodeType: "googleSheetsRead",
@@ -298,16 +294,10 @@ const nodeLibraryItems: Array<{
 ];
 
 type Props = {
-  onMouseDownCapture?: () => void;
   onNodeClick: (props: AddNodeProps) => void;
-  first?: boolean;
 };
 
-function WorkflowNodeLibraryPanel({
-  onMouseDownCapture,
-  onNodeClick,
-  first,
-}: Props) {
+function WorkflowNodeLibraryPanel({ onNodeClick }: Props) {
   const workflowPanelData = useWorkflowPanelStore(
     (state) => state.workflowPanelState.data,
   );
@@ -372,96 +362,70 @@ function WorkflowNodeLibraryPanel({
   });
 
   return (
-    <div
-      className="h-full w-[25rem] rounded-xl border border-slate-700 bg-slate-950 p-5 shadow-xl"
-      onMouseDownCapture={() => onMouseDownCapture?.()}
-    >
-      <div className="flex h-full flex-col space-y-4">
-        <header className="space-y-2">
-          <div className="flex justify-between">
-            <h1 className="text-lg">Block Library</h1>
-            {!first && (
-              <Cross2Icon
-                className="size-6 cursor-pointer"
-                onClick={() => {
-                  closeWorkflowPanel();
-                }}
-              />
+    <div className="flex h-full flex-col gap-4">
+      <div className="relative">
+        <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
+          <MagnifyingGlassIcon className="size-5" />
+        </div>
+        <Input
+          value={search}
+          onChange={(event) => {
+            setSearch(event.target.value);
+          }}
+          placeholder="Search blocks..."
+          className="pl-9"
+          ref={inputRef}
+          autoFocus
+          tabIndex={0}
+        />
+      </div>
+      <ScrollArea className="h-full flex-1">
+        <ScrollAreaViewport className="h-full">
+          <div className="space-y-2">
+            {filteredItems.length > 0 ? (
+              filteredItems.map((item) => (
+                <div
+                  key={item.nodeType}
+                  data-testid={`block-library-item-${item.nodeType}`}
+                  className="flex cursor-pointer items-center justify-between rounded-sm bg-slate-elevation4 p-4 hover:bg-slate-elevation5"
+                  onClick={() => {
+                    onNodeClick({
+                      nodeType: item.nodeType,
+                      next: workflowPanelData?.next ?? null,
+                      parent: workflowPanelData?.parent,
+                      previous: workflowPanelData?.previous ?? null,
+                      connectingEdgeType:
+                        workflowPanelData?.connectingEdgeType ??
+                        "edgeWithAddButton",
+                      branch: workflowPanelData?.branchContext,
+                    });
+                    closeWorkflowPanel();
+                  }}
+                >
+                  <div className="flex gap-2">
+                    <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
+                      {item.icon}
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <span className="max-w-64 truncate text-base">
+                        {item.title}
+                      </span>
+                      <span className="text-xs text-slate-600 dark:text-slate-400">
+                        {item.description}
+                      </span>
+                    </div>
+                  </div>
+                  <PlusIcon className="size-6 shrink-0" />
+                </div>
+              ))
+            ) : (
+              <div className="p-4 text-center text-sm text-slate-400">
+                No results found
+              </div>
             )}
           </div>
-          <span className="text-sm text-slate-400">
-            {first
-              ? "Click on the block type to add your first block"
-              : "Click on the block type you want to add"}
-          </span>
-        </header>
-        <div className="relative">
-          <div className="absolute left-0 top-0 flex size-9 items-center justify-center">
-            <MagnifyingGlassIcon className="size-5" />
-          </div>
-          <Input
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-            }}
-            placeholder="Search blocks..."
-            className="pl-9"
-            ref={inputRef}
-            autoFocus
-            tabIndex={0}
-          />
-        </div>
-        <ScrollArea className="h-full flex-1">
-          <ScrollAreaViewport className="h-full">
-            <div className="space-y-2">
-              {filteredItems.length > 0 ? (
-                filteredItems.map((item) => {
-                  const itemContent = (
-                    <div
-                      key={item.nodeType}
-                      className={`flex items-center justify-between rounded-sm bg-slate-elevation4 p-4 ${"cursor-pointer hover:bg-slate-elevation5"}`}
-                      onClick={() => {
-                        onNodeClick({
-                          nodeType: item.nodeType,
-                          next: workflowPanelData?.next ?? null,
-                          parent: workflowPanelData?.parent,
-                          previous: workflowPanelData?.previous ?? null,
-                          connectingEdgeType:
-                            workflowPanelData?.connectingEdgeType ??
-                            "edgeWithAddButton",
-                          branch: workflowPanelData?.branchContext,
-                        });
-                        closeWorkflowPanel();
-                      }}
-                    >
-                      <div className="flex gap-2">
-                        <div className="flex h-[2.75rem] w-[2.75rem] shrink-0 items-center justify-center rounded border border-slate-600">
-                          {item.icon}
-                        </div>
-                        <div className="flex flex-col gap-1">
-                          <span className="max-w-64 truncate text-base">
-                            {item.title}
-                          </span>
-                          <span className="text-xs text-slate-400">
-                            {item.description}
-                          </span>
-                        </div>
-                      </div>
-                      <PlusIcon className="size-6 shrink-0" />
-                    </div>
-                  );
-
-                  return itemContent;
-                })
-              ) : (
-                <div className="p-4 text-center text-sm text-slate-400">
-                  No results found
-                </div>
-              )}
-            </div>
-          </ScrollAreaViewport>
-        </ScrollArea>
-      </div>
+        </ScrollAreaViewport>
+      </ScrollArea>
     </div>
   );
 }

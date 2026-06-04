@@ -1,9 +1,9 @@
 export const baseHelpTooltipContent = {
   url: "The URL Skyvern is navigating to. Leave this field blank to pick up from where the last block left off.",
   navigationGoal:
-    "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference a parameter value",
+    "Give Skyvern an objective. Make sure to include when the block is complete, when it should self-terminate, and any guardrails. Use {{ parameter_name }} to reference an input value",
   parameters:
-    'Define placeholder values using the "parameters" drop down that you predefine or redefine run-to-run.',
+    'Define placeholder values using the "inputs" drop down that you predefine or redefine run-to-run.',
   dataExtractionGoal:
     "Tell Skyvern what data you would like to scrape at the end of your run.",
   dataSchema: "Specify a format for extracted data in JSON.",
@@ -30,7 +30,7 @@ export const baseHelpTooltipContent = {
   includeActionHistoryInVerification:
     "Include the action history in the completion verification.",
   engine:
-    "Skyvern 1.0: Fast, single-goal tasks. Skyvern 2.0: Complex, multi-goal tasks (slower).",
+    "Skyvern 1.0 is the default for new browser tasks. Existing V2 blocks remain supported.",
 } as const;
 
 export const basePlaceholderContent = {
@@ -55,12 +55,12 @@ export const helpTooltips = {
   extraction: {
     ...baseHelpTooltipContent,
     dataExtractionGoal:
-      "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify parameters to use.",
+      "Tell Skyvern what data you would like to scrape. Use {{ parameter_name }} to specify inputs to use.",
   },
   action: {
     ...baseHelpTooltipContent,
     navigationGoal:
-      "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify parameters to use.",
+      "Specify a single step or action you'd like Skyvern to complete. Actions are one-off tasks like filling a field or interacting with a specific element on the page.\n\nCurrently supported actions are click, input text, upload file, and select. Use {{ parameter_name }} to specify inputs to use.",
   },
   fileDownload: {
     ...baseHelpTooltipContent,
@@ -105,9 +105,9 @@ export const helpTooltips = {
   loop: {
     ...baseHelpTooltipContent,
     loopValue:
-      "Define the values to iterate over. Use a parameter reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
+      "Define the values to iterate over. Use an input reference or natural language (e.g., 'Extract links of the top 2 posts'). Natural language automatically creates an extraction block that generates a list of string values. Use {{ current_value }} in the loop to get the current iteration value.",
     loopDataSchema:
-      "JSON shape for extracted items when the loop value is natural language that triggers extraction—not when you point at an existing list parameter.",
+      "JSON shape for extracted items when the loop value is natural language that triggers extraction—not when you point at an existing list input.",
     completeIfEmpty:
       "If the list is empty, treat this loop as successful and continue the workflow instead of failing.",
     nextLoopOnFailure:
@@ -172,7 +172,7 @@ export const helpTooltips = {
   url: baseHelpTooltipContent,
   httpRequest: {
     ...baseHelpTooltipContent,
-    url: "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference parameters.",
+    url: "The URL to send the HTTP request to. You can use {{ parameter_name }} to reference inputs.",
     method: "The HTTP method to use for the request.",
     headers: "HTTP headers to include with the request as JSON object.",
     body: "Request body as JSON object. Only used for POST, PUT, PATCH methods.",

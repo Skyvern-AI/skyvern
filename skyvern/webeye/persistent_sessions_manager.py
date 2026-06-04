@@ -20,6 +20,8 @@ class PersistentSessionsManager(Protocol):
         """Initialize monitoring of the session pool."""
         ...
 
+    def can_probe_registered_browser_state(self) -> bool: ...
+
     async def begin_session(
         self,
         *,
@@ -33,6 +35,17 @@ class PersistentSessionsManager(Protocol):
 
     async def get_browser_address(self, session_id: str, organization_id: str) -> str:
         """Get the browser address for a session."""
+        ...
+
+    async def get_browser_address_if_ready(
+        self,
+        session_id: str,
+        organization_id: str,
+        *,
+        timeout: float = 0.0,
+        poll_interval: float = 0.25,
+    ) -> str | None:
+        """Get the browser address for a session if it is already available."""
         ...
 
     async def get_session_by_runnable_id(
@@ -69,6 +82,7 @@ class PersistentSessionsManager(Protocol):
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
+        wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""
         ...

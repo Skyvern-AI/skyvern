@@ -7,8 +7,10 @@ token truncation, and error handling for DOCX files.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import docx
 import pytest
@@ -251,3 +253,130 @@ class TestParseDocxFileErrorHandling:
         block = _make_file_parser_block("https://example.com/missing.docx", FileType.DOCX)
         with pytest.raises(InvalidFileType):
             await block._parse_docx_file(str(tmp_path / "nonexistent.docx"))
+
+
+class TestExtractFileUrlFromBlockOutput:
+    """Tests for _extract_file_url_from_block_output – unstructured block output parsing."""
+
+    def _extract(self, value: object) -> str | None:
+        return FileParserBlock._extract_file_url_from_block_output(value)
+
+    # --- dict inputs ---
+
+    def test_dict_with_downloaded_files_returns_first_url(self) -> None:
+        value = {"downloaded_files": [{"url": "https://example.com/file.pdf", "checksum": None}]}
+        assert self._extract(value) == "https://example.com/file.pdf"
+
+    def test_dict_multiple_downloaded_files_returns_first(self) -> None:
+        value = {
+            "downloaded_files": [
+                {"url": "https://example.com/first.pdf"},
+                {"url": "https://example.com/second.pdf"},
+            ]
+        }
+        assert self._extract(value) == "https://example.com/first.pdf"
+
+    def test_dict_with_extra_fields_still_extracts_url(self) -> None:
+        value = {
+            "extracted_information": {"key": "value"},
+            "downloaded_files": [{"url": "https://s3.amazonaws.com/bucket/report.xlsx", "filename": "report.xlsx"}],
+        }
+        assert self._extract(value) == "https://s3.amazonaws.com/bucket/report.xlsx"
+
+    def test_dict_empty_downloaded_files_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": []}) is None
+
+    def test_dict_missing_downloaded_files_returns_none(self) -> None:
+        assert self._extract({"extracted_information": {"foo": "bar"}}) is None
+
+    def test_dict_downloaded_files_item_missing_url_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": [{"filename": "file.pdf"}]}) is None
+
+    def test_dict_downloaded_files_item_empty_url_returns_none(self) -> None:
+        assert self._extract({"downloaded_files": [{"url": ""}]}) is None
+
+    # --- JSON string inputs ---
+
+    def test_json_string_with_downloaded_files_returns_url(self) -> None:
+        value = json.dumps({"downloaded_files": [{"url": "https://example.com/file.csv"}]})
+        assert self._extract(value) == "https://example.com/file.csv"
+
+    def test_json_string_without_downloaded_files_returns_none(self) -> None:
+        value = json.dumps({"extracted_information": {"k": "v"}})
+        assert self._extract(value) is None
+
+    # --- Python dict repr strings (produced by Jinja {{ block_output }} rendering) ---
+
+    def test_python_repr_string_with_downloaded_files_returns_url(self) -> None:
+        value = "{'downloaded_files': [{'url': 'https://example.com/report.pdf', 'checksum': None}]}"
+        assert self._extract(value) == "https://example.com/report.pdf"
+
+    def test_python_repr_string_without_downloaded_files_returns_none(self) -> None:
+        value = "{'extracted_information': {'a': 1}}"
+        assert self._extract(value) is None
+
+    # --- Plain URL strings (should not be extracted, returns None) ---
+
+    def test_plain_url_string_returns_none(self) -> None:
+        assert self._extract("https://example.com/file.pdf") is None
+
+    def test_plain_string_returns_none(self) -> None:
+        assert self._extract("not a url or dict") is None
+
+    # --- Other types ---
+
+    def test_none_returns_none(self) -> None:
+        assert self._extract(None) is None
+
+    def test_list_returns_none(self) -> None:
+        assert self._extract([{"url": "https://example.com/file.pdf"}]) is None
+
+    def test_integer_returns_none(self) -> None:
+        assert self._extract(42) is None
+
+
+@pytest.mark.asyncio
+class TestExtractWithAiSerialization:
+    """Tests for _extract_with_ai content serialization."""
+
+    async def test_list_content_serialized_as_compact_json(self) -> None:
+        """CSV/Excel data (list[dict]) must use compact JSON to minimize tokens."""
+        block = _make_file_parser_block("https://example.com/data.xlsx", FileType.EXCEL)
+        block.json_schema = {"type": "object"}
+        records = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_handler = AsyncMock(return_value={})
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: mock_handler,
+            )
+            mock_load = MagicMock(return_value="prompt")
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+
+            await block._extract_with_ai(records, MagicMock())
+
+            _, kwargs = mock_load.call_args
+            content_str = kwargs["extracted_text_content"]
+
+            assert content_str == json.dumps(records, separators=(",", ":"))
+            assert json.loads(content_str) == records
+
+    async def test_string_content_passed_unchanged(self) -> None:
+        """Non-list content (PDF/DOCX text) must pass through unchanged."""
+        block = _make_file_parser_block("https://example.com/doc.pdf", FileType.PDF)
+        block.json_schema = {"type": "object"}
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_handler = AsyncMock(return_value={})
+            mp.setattr(
+                "skyvern.forge.sdk.workflow.models.block.LLMAPIHandlerFactory.get_override_llm_api_handler",
+                lambda *a, **kw: mock_handler,
+            )
+            mock_load = MagicMock(return_value="prompt")
+            mp.setattr("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", mock_load)
+
+            await block._extract_with_ai("Hello\nWorld", MagicMock())
+
+            _, kwargs = mock_load.call_args
+            assert kwargs["extracted_text_content"] == "Hello\nWorld"

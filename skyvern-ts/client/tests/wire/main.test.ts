@@ -14,9 +14,17 @@ describe("SkyvernClient", () => {
             status: "created",
             output: { key: "value" },
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -50,7 +58,7 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 model: { key: "value" },
                 extra_http_headers: { key: "value" },
-                publish_workflow: true,
+                cdp_connect_headers: { key: "value" },
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
@@ -69,9 +77,7 @@ describe("SkyvernClient", () => {
 
         const response = await client.runTask({
             "x-user-agent": "x-user-agent",
-            body: {
-                prompt: "Find the top 3 posts on Hacker News.",
-            },
+            prompt: "Find the top 3 posts on Hacker News.",
         });
         expect(response).toEqual({
             run_id: "tsk_123",
@@ -84,10 +90,13 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -133,7 +142,9 @@ describe("SkyvernClient", () => {
                 extra_http_headers: {
                     key: "value",
                 },
-                publish_workflow: true,
+                cdp_connect_headers: {
+                    key: "value",
+                },
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
@@ -158,9 +169,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.runTask({
-                body: {
-                    prompt: "prompt",
-                },
+                prompt: "prompt",
             });
         }).rejects.toThrow(Skyvern.BadRequestError);
     });
@@ -181,9 +190,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.runTask({
-                body: {
-                    prompt: "prompt",
-                },
+                prompt: "prompt",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
@@ -197,9 +204,17 @@ describe("SkyvernClient", () => {
             status: "created",
             output: { key: "value" },
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -220,6 +235,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: { key: "value" },
@@ -231,10 +247,13 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: { key: "value" },
             },
         };
         server
@@ -252,9 +271,7 @@ describe("SkyvernClient", () => {
             "x-max-steps-override": 1,
             "x-user-agent": "x-user-agent",
             template: true,
-            body: {
-                workflow_id: "wpid_123",
-            },
+            workflow_id: "wpid_123",
         });
         expect(response).toEqual({
             run_id: "tsk_123",
@@ -267,10 +284,13 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -295,6 +315,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: {
@@ -308,12 +329,19 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
                     key: "value",
                 },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: {
+                    key: "value",
+                },
             },
         });
     });
@@ -334,9 +362,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.runWorkflow({
-                body: {
-                    workflow_id: "workflow_id",
-                },
+                workflow_id: "workflow_id",
             });
         }).rejects.toThrow(Skyvern.BadRequestError);
     });
@@ -357,9 +383,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.runWorkflow({
-                body: {
-                    workflow_id: "workflow_id",
-                },
+                workflow_id: "workflow_id",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
@@ -374,9 +398,17 @@ describe("SkyvernClient", () => {
             status: "created",
             output: { key: "value" },
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -410,7 +442,7 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 model: { key: "value" },
                 extra_http_headers: { key: "value" },
-                publish_workflow: true,
+                cdp_connect_headers: { key: "value" },
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
@@ -432,10 +464,13 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -481,7 +516,9 @@ describe("SkyvernClient", () => {
                 extra_http_headers: {
                     key: "value",
                 },
-                publish_workflow: true,
+                cdp_connect_headers: {
+                    key: "value",
+                },
                 include_action_history_in_verification: true,
                 max_screenshot_scrolls: 1,
                 browser_address: "browser_address",
@@ -551,6 +588,50 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("bulk_cancel_runs (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { run_ids: ["run_ids"] };
+        const rawResponseBody = { cancelled: ["cancelled"], failed: ["failed"] };
+        server
+            .mockEndpoint()
+            .post("/v1/runs/cancel")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.bulkCancelRuns({
+            run_ids: ["run_ids"],
+        });
+        expect(response).toEqual({
+            cancelled: ["cancelled"],
+            failed: ["failed"],
+        });
+    });
+
+    test("bulk_cancel_runs (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = { run_ids: ["run_ids", "run_ids"] };
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/runs/cancel")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.bulkCancelRuns({
+                run_ids: ["run_ids", "run_ids"],
+            });
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("get_workflows (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -592,16 +673,21 @@ describe("SkyvernClient", () => {
                         },
                     ],
                     finally_block_label: "finally_block_label",
+                    error_code_mapping: {},
+                    workflow_system_prompt: "workflow_system_prompt",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 totp_verification_url: "totp_verification_url",
                 totp_identifier: "totp_identifier",
                 persist_browser_session: true,
+                browser_profile_id: "browser_profile_id",
                 model: { key: "value" },
                 status: "published",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
@@ -612,6 +698,8 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
                 import_error: "import_error",
+                created_by: "created_by",
+                edited_by: "edited_by",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -667,18 +755,25 @@ describe("SkyvernClient", () => {
                         },
                     ],
                     finally_block_label: "finally_block_label",
+                    error_code_mapping: {},
+                    workflow_system_prompt: "workflow_system_prompt",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 totp_verification_url: "totp_verification_url",
                 totp_identifier: "totp_identifier",
                 persist_browser_session: true,
+                browser_profile_id: "browser_profile_id",
                 model: {
                     key: "value",
                 },
                 status: "published",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
                     key: "value",
                 },
                 run_with: "run_with",
@@ -691,6 +786,8 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
                 import_error: "import_error",
+                created_by: "created_by",
+                edited_by: "edited_by",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -750,16 +847,21 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: { key: "value" },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: { key: "value" },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: { key: "value" },
+            cdp_connect_headers: { key: "value" },
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
@@ -770,6 +872,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -823,18 +927,27 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: {
+                    key: "value",
+                },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: {
                 key: "value",
             },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: {
+                key: "value",
+            },
+            cdp_connect_headers: {
                 key: "value",
             },
             run_with: "run_with",
@@ -847,6 +960,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -914,16 +1029,21 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: { key: "value" },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: { key: "value" },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: { key: "value" },
+            cdp_connect_headers: { key: "value" },
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
@@ -934,6 +1054,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -984,18 +1106,27 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: {
+                    key: "value",
+                },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: {
                 key: "value",
             },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: {
+                key: "value",
+            },
+            cdp_connect_headers: {
                 key: "value",
             },
             run_with: "run_with",
@@ -1008,6 +1139,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -1433,16 +1566,21 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: { key: "value" },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: { key: "value" },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: { key: "value" },
+            cdp_connect_headers: { key: "value" },
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
@@ -1453,6 +1591,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -1503,18 +1643,27 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: {
+                    key: "value",
+                },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: {
                 key: "value",
             },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: {
+                key: "value",
+            },
+            cdp_connect_headers: {
                 key: "value",
             },
             run_with: "run_with",
@@ -1527,6 +1676,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -1602,15 +1753,19 @@ describe("SkyvernClient", () => {
                 artifact_type: "recording",
                 uri: "uri",
                 bundle_key: "bundle_key",
+                checksum: "checksum",
+                file_size: 1,
                 task_id: "task_id",
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
                 workflow_run_block_id: "workflow_run_block_id",
                 run_id: "run_id",
+                browser_session_id: "browser_session_id",
                 observer_cruise_id: "observer_cruise_id",
                 observer_thought_id: "observer_thought_id",
                 ai_suggestion_id: "ai_suggestion_id",
                 signed_url: "signed_url",
+                archived: true,
                 organization_id: "organization_id",
             },
         ];
@@ -1631,15 +1786,19 @@ describe("SkyvernClient", () => {
                 artifact_type: "recording",
                 uri: "uri",
                 bundle_key: "bundle_key",
+                checksum: "checksum",
+                file_size: 1,
                 task_id: "task_id",
                 step_id: "step_id",
                 workflow_run_id: "workflow_run_id",
                 workflow_run_block_id: "workflow_run_block_id",
                 run_id: "run_id",
+                browser_session_id: "browser_session_id",
                 observer_cruise_id: "observer_cruise_id",
                 observer_thought_id: "observer_thought_id",
                 ai_suggestion_id: "ai_suggestion_id",
                 signed_url: "signed_url",
+                archived: true,
                 organization_id: "organization_id",
             },
         ]);
@@ -1667,7 +1826,18 @@ describe("SkyvernClient", () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
 
-        const rawResponseBody = { key: "value" };
+        const rawResponseBody = {
+            run_id: "run_id",
+            run_type: "run_type",
+            default_webhook_url: "default_webhook_url",
+            target_webhook_url: "target_webhook_url",
+            payload: "payload",
+            headers: { key: "value" },
+            status_code: 1,
+            latency_ms: 1,
+            response_body: "response_body",
+            error: "error",
+        };
         server
             .mockEndpoint()
             .post("/v1/runs/tsk_123/retry_webhook")
@@ -1678,7 +1848,18 @@ describe("SkyvernClient", () => {
 
         const response = await client.retryRunWebhook("tsk_123");
         expect(response).toEqual({
-            key: "value",
+            run_id: "run_id",
+            run_type: "run_type",
+            default_webhook_url: "default_webhook_url",
+            target_webhook_url: "target_webhook_url",
+            payload: "payload",
+            headers: {
+                key: "value",
+            },
+            status_code: 1,
+            latency_ms: 1,
+            response_body: "response_body",
+            error: "error",
         });
     });
 
@@ -1734,6 +1915,7 @@ describe("SkyvernClient", () => {
                     created_at: "2024-01-15T09:30:00Z",
                     modified_at: "2024-01-15T09:30:00Z",
                     include_action_history_in_verification: true,
+                    include_extracted_text: true,
                     duration: 1.1,
                     loop_values: [],
                     current_value: "current_value",
@@ -1771,6 +1953,7 @@ describe("SkyvernClient", () => {
                     reasoning_token_count: 1,
                     cached_token_count: 1,
                     thought_cost: 1.1,
+                    last_llm_model: "last_llm_model",
                     created_at: "2024-01-15T09:30:00Z",
                     modified_at: "2024-01-15T09:30:00Z",
                 },
@@ -1827,6 +2010,7 @@ describe("SkyvernClient", () => {
                     created_at: "2024-01-15T09:30:00Z",
                     modified_at: "2024-01-15T09:30:00Z",
                     include_action_history_in_verification: true,
+                    include_extracted_text: true,
                     duration: 1.1,
                     loop_values: [],
                     current_value: "current_value",
@@ -1866,6 +2050,7 @@ describe("SkyvernClient", () => {
                     reasoning_token_count: 1,
                     cached_token_count: 1,
                     thought_cost: 1.1,
+                    last_llm_model: "last_llm_model",
                     created_at: "2024-01-15T09:30:00Z",
                     modified_at: "2024-01-15T09:30:00Z",
                 },
@@ -1929,6 +2114,208 @@ describe("SkyvernClient", () => {
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
+    test("retry_workflow_run (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = {
+            run_id: "tsk_123",
+            status: "created",
+            output: { key: "value" },
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            recording_url: "recording_url",
+            recording_archived: true,
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
+            errors: [{ key: "value" }],
+            step_count: 1,
+            run_with: "agent",
+            ai_fallback: true,
+            script_id: "script_id",
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: { key: "value" },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
+                extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+                run_metadata: { key: "value" },
+            },
+        };
+        server
+            .mockEndpoint()
+            .post("/v1/workflows/runs/wr_123/retry")
+            .header("x-max-steps-override", "1")
+            .header("x-user-agent", "x-user-agent")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.retryWorkflowRun("wr_123", {
+            "x-max-steps-override": 1,
+            "x-user-agent": "x-user-agent",
+        });
+        expect(response).toEqual({
+            run_id: "tsk_123",
+            status: "created",
+            output: {
+                key: "value",
+            },
+            downloaded_files: [
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
+            ],
+            recording_url: "recording_url",
+            recording_archived: true,
+            screenshot_urls: ["screenshot_urls"],
+            failure_reason: "failure_reason",
+            created_at: "2025-01-01T00:00:00Z",
+            modified_at: "2025-01-01T00:05:00Z",
+            queued_at: "2024-01-15T09:30:00Z",
+            started_at: "2024-01-15T09:30:00Z",
+            finished_at: "2024-01-15T09:30:00Z",
+            app_url: "app_url",
+            browser_session_id: "browser_session_id",
+            browser_profile_id: "browser_profile_id",
+            max_screenshot_scrolls: 1,
+            script_run: {
+                ai_fallback_triggered: true,
+                script_id: "script_id",
+                script_revision_id: "script_revision_id",
+            },
+            errors: [
+                {
+                    key: "value",
+                },
+            ],
+            step_count: 1,
+            run_with: "agent",
+            ai_fallback: true,
+            script_id: "script_id",
+            run_request: {
+                workflow_id: "wpid_123",
+                parameters: {
+                    key: "value",
+                },
+                title: "title",
+                proxy_location: "RESIDENTIAL",
+                webhook_url: "webhook_url",
+                totp_url: "totp_url",
+                totp_identifier: "totp_identifier",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
+                extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
+                    key: "value",
+                },
+                browser_address: "browser_address",
+                ai_fallback: true,
+                run_with: "run_with",
+                run_metadata: {
+                    key: "value",
+                },
+            },
+        });
+    });
+
+    test("retry_workflow_run (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/workflows/runs/workflow_run_id/retry")
+            .respondWith()
+            .statusCode(400)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.retryWorkflowRun("workflow_run_id");
+        }).rejects.toThrow(Skyvern.BadRequestError);
+    });
+
+    test("retry_workflow_run (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/workflows/runs/workflow_run_id/retry")
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.retryWorkflowRun("workflow_run_id");
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("retry_workflow_run (4)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .post("/v1/workflows/runs/workflow_run_id/retry")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.retryWorkflowRun("workflow_run_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
     test("get_runs_v2 (1)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
@@ -1944,6 +2331,7 @@ describe("SkyvernClient", () => {
                 finished_at: "2024-01-15T09:30:00Z",
                 created_at: "2024-01-15T09:30:00Z",
                 workflow_permanent_id: "workflow_permanent_id",
+                workflow_deleted: true,
                 script_run: true,
             },
         ];
@@ -1965,6 +2353,7 @@ describe("SkyvernClient", () => {
                 finished_at: "2024-01-15T09:30:00Z",
                 created_at: "2024-01-15T09:30:00Z",
                 workflow_permanent_id: "workflow_permanent_id",
+                workflow_deleted: true,
                 script_run: true,
             },
         ]);
@@ -1997,6 +2386,7 @@ describe("SkyvernClient", () => {
                 debug_session_id: "debug_session_id",
                 status: "created",
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 webhook_failure_reason: "webhook_failure_reason",
@@ -2007,6 +2397,7 @@ describe("SkyvernClient", () => {
                 parent_workflow_run_id: "parent_workflow_run_id",
                 workflow_title: "workflow_title",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 browser_address: "browser_address",
                 run_with: "run_with",
                 script_run: {
@@ -2021,6 +2412,10 @@ describe("SkyvernClient", () => {
                 code_gen: true,
                 trigger_type: "manual",
                 workflow_schedule_id: "workflow_schedule_id",
+                ignore_inherited_workflow_system_prompt: true,
+                copilot_session_id: "copilot_session_id",
+                credits_used: 1,
+                cached_credits_used: 1,
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -2049,6 +2444,9 @@ describe("SkyvernClient", () => {
                 extra_http_headers: {
                     key: "value",
                 },
+                cdp_connect_headers: {
+                    key: "value",
+                },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 webhook_failure_reason: "webhook_failure_reason",
@@ -2063,6 +2461,7 @@ describe("SkyvernClient", () => {
                 parent_workflow_run_id: "parent_workflow_run_id",
                 workflow_title: "workflow_title",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 browser_address: "browser_address",
                 run_with: "run_with",
                 script_run: {
@@ -2077,6 +2476,10 @@ describe("SkyvernClient", () => {
                 code_gen: true,
                 trigger_type: "manual",
                 workflow_schedule_id: "workflow_schedule_id",
+                ignore_inherited_workflow_system_prompt: true,
+                copilot_session_id: "copilot_session_id",
+                credits_used: 1,
+                cached_credits_used: 1,
                 queued_at: "2024-01-15T09:30:00Z",
                 started_at: "2024-01-15T09:30:00Z",
                 finished_at: "2024-01-15T09:30:00Z",
@@ -2095,6 +2498,148 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.getWorkflowRuns();
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("get_workflow_runs_by_id (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = [
+            {
+                workflow_run_id: "workflow_run_id",
+                workflow_id: "workflow_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                organization_id: "organization_id",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                debug_session_id: "debug_session_id",
+                status: "created",
+                extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                webhook_failure_reason: "webhook_failure_reason",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                failure_reason: "failure_reason",
+                failure_category: [{ key: "value" }],
+                parent_workflow_run_id: "parent_workflow_run_id",
+                workflow_title: "workflow_title",
+                max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
+                browser_address: "browser_address",
+                run_with: "run_with",
+                script_run: {
+                    ai_fallback_triggered: true,
+                    script_id: "script_id",
+                    script_revision_id: "script_revision_id",
+                },
+                job_id: "job_id",
+                depends_on_workflow_run_id: "depends_on_workflow_run_id",
+                sequential_key: "sequential_key",
+                ai_fallback: true,
+                code_gen: true,
+                trigger_type: "manual",
+                workflow_schedule_id: "workflow_schedule_id",
+                ignore_inherited_workflow_system_prompt: true,
+                copilot_session_id: "copilot_session_id",
+                credits_used: 1,
+                cached_credits_used: 1,
+                queued_at: "2024-01-15T09:30:00Z",
+                started_at: "2024-01-15T09:30:00Z",
+                finished_at: "2024-01-15T09:30:00Z",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+            },
+        ];
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_id/runs")
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.getWorkflowRunsById("workflow_id", {
+            page: 1,
+            page_size: 1,
+            search_key: "search_key",
+            error_code: "error_code",
+        });
+        expect(response).toEqual([
+            {
+                workflow_run_id: "workflow_run_id",
+                workflow_id: "workflow_id",
+                workflow_permanent_id: "workflow_permanent_id",
+                organization_id: "organization_id",
+                browser_session_id: "browser_session_id",
+                browser_profile_id: "browser_profile_id",
+                debug_session_id: "debug_session_id",
+                status: "created",
+                extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
+                    key: "value",
+                },
+                proxy_location: "RESIDENTIAL",
+                webhook_callback_url: "webhook_callback_url",
+                webhook_failure_reason: "webhook_failure_reason",
+                totp_verification_url: "totp_verification_url",
+                totp_identifier: "totp_identifier",
+                failure_reason: "failure_reason",
+                failure_category: [
+                    {
+                        key: "value",
+                    },
+                ],
+                parent_workflow_run_id: "parent_workflow_run_id",
+                workflow_title: "workflow_title",
+                max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
+                browser_address: "browser_address",
+                run_with: "run_with",
+                script_run: {
+                    ai_fallback_triggered: true,
+                    script_id: "script_id",
+                    script_revision_id: "script_revision_id",
+                },
+                job_id: "job_id",
+                depends_on_workflow_run_id: "depends_on_workflow_run_id",
+                sequential_key: "sequential_key",
+                ai_fallback: true,
+                code_gen: true,
+                trigger_type: "manual",
+                workflow_schedule_id: "workflow_schedule_id",
+                ignore_inherited_workflow_system_prompt: true,
+                copilot_session_id: "copilot_session_id",
+                credits_used: 1,
+                cached_credits_used: 1,
+                queued_at: "2024-01-15T09:30:00Z",
+                started_at: "2024-01-15T09:30:00Z",
+                finished_at: "2024-01-15T09:30:00Z",
+                created_at: "2024-01-15T09:30:00Z",
+                modified_at: "2024-01-15T09:30:00Z",
+            },
+        ]);
+    });
+
+    test("get_workflow_runs_by_id (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .get("/v1/workflows/workflow_id/runs")
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.getWorkflowRunsById("workflow_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -2138,16 +2683,21 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: { key: "value" },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: { key: "value" },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: { key: "value" },
+            cdp_connect_headers: { key: "value" },
             run_with: "run_with",
             ai_fallback: true,
             cache_key: "cache_key",
@@ -2158,6 +2708,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2210,18 +2762,27 @@ describe("SkyvernClient", () => {
                     },
                 ],
                 finally_block_label: "finally_block_label",
+                error_code_mapping: {
+                    key: "value",
+                },
+                workflow_system_prompt: "workflow_system_prompt",
             },
             proxy_location: "RESIDENTIAL",
             webhook_callback_url: "webhook_callback_url",
             totp_verification_url: "totp_verification_url",
             totp_identifier: "totp_identifier",
             persist_browser_session: true,
+            browser_profile_id: "browser_profile_id",
             model: {
                 key: "value",
             },
             status: "published",
             max_screenshot_scrolls: 1,
+            max_elapsed_time_minutes: 1,
             extra_http_headers: {
+                key: "value",
+            },
+            cdp_connect_headers: {
                 key: "value",
             },
             run_with: "run_with",
@@ -2234,6 +2795,8 @@ describe("SkyvernClient", () => {
             sequential_key: "sequential_key",
             folder_id: "folder_id",
             import_error: "import_error",
+            created_by: "created_by",
+            edited_by: "edited_by",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2299,16 +2862,21 @@ describe("SkyvernClient", () => {
                         },
                     ],
                     finally_block_label: "finally_block_label",
+                    error_code_mapping: {},
+                    workflow_system_prompt: "workflow_system_prompt",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 totp_verification_url: "totp_verification_url",
                 totp_identifier: "totp_identifier",
                 persist_browser_session: true,
+                browser_profile_id: "browser_profile_id",
                 model: { key: "value" },
                 status: "published",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 run_with: "run_with",
                 ai_fallback: true,
                 cache_key: "cache_key",
@@ -2319,6 +2887,8 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
                 import_error: "import_error",
+                created_by: "created_by",
+                edited_by: "edited_by",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -2372,18 +2942,25 @@ describe("SkyvernClient", () => {
                         },
                     ],
                     finally_block_label: "finally_block_label",
+                    error_code_mapping: {},
+                    workflow_system_prompt: "workflow_system_prompt",
                 },
                 proxy_location: "RESIDENTIAL",
                 webhook_callback_url: "webhook_callback_url",
                 totp_verification_url: "totp_verification_url",
                 totp_identifier: "totp_identifier",
                 persist_browser_session: true,
+                browser_profile_id: "browser_profile_id",
                 model: {
                     key: "value",
                 },
                 status: "published",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
                     key: "value",
                 },
                 run_with: "run_with",
@@ -2396,6 +2973,8 @@ describe("SkyvernClient", () => {
                 sequential_key: "sequential_key",
                 folder_id: "folder_id",
                 import_error: "import_error",
+                created_by: "created_by",
+                edited_by: "edited_by",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -2431,6 +3010,7 @@ describe("SkyvernClient", () => {
                 organization_id: "organization_id",
                 name: "name",
                 description: "description",
+                source_browser_type: "source_browser_type",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -2445,7 +3025,10 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.listBrowserProfiles({
+            page: 1,
+            page_size: 1,
             include_deleted: true,
+            search_key: "search_key",
         });
         expect(response).toEqual([
             {
@@ -2453,6 +3036,7 @@ describe("SkyvernClient", () => {
                 organization_id: "organization_id",
                 name: "name",
                 description: "description",
+                source_browser_type: "source_browser_type",
                 created_at: "2024-01-15T09:30:00Z",
                 modified_at: "2024-01-15T09:30:00Z",
                 deleted_at: "2024-01-15T09:30:00Z",
@@ -2487,6 +3071,7 @@ describe("SkyvernClient", () => {
             organization_id: "organization_id",
             name: "name",
             description: "description",
+            source_browser_type: "source_browser_type",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2508,6 +3093,7 @@ describe("SkyvernClient", () => {
             organization_id: "organization_id",
             name: "name",
             description: "description",
+            source_browser_type: "source_browser_type",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2517,7 +3103,7 @@ describe("SkyvernClient", () => {
     test("create_browser_profile (2)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { name: "name" };
+        const rawRequestBody = { name: "x" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -2530,7 +3116,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.createBrowserProfile({
-                name: "name",
+                name: "x",
             });
         }).rejects.toThrow(Skyvern.BadRequestError);
     });
@@ -2538,7 +3124,7 @@ describe("SkyvernClient", () => {
     test("create_browser_profile (3)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { name: "name" };
+        const rawRequestBody = { name: "x" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -2551,7 +3137,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.createBrowserProfile({
-                name: "name",
+                name: "x",
             });
         }).rejects.toThrow(Skyvern.ConflictError);
     });
@@ -2559,7 +3145,7 @@ describe("SkyvernClient", () => {
     test("create_browser_profile (4)", async () => {
         const server = mockServerPool.createServer();
         const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
-        const rawRequestBody = { name: "name" };
+        const rawRequestBody = { name: "x" };
         const rawResponseBody = { key: "value" };
         server
             .mockEndpoint()
@@ -2572,7 +3158,7 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.createBrowserProfile({
-                name: "name",
+                name: "x",
             });
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
@@ -2586,6 +3172,7 @@ describe("SkyvernClient", () => {
             organization_id: "organization_id",
             name: "name",
             description: "description",
+            source_browser_type: "source_browser_type",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2604,6 +3191,7 @@ describe("SkyvernClient", () => {
             organization_id: "organization_id",
             name: "name",
             description: "description",
+            source_browser_type: "source_browser_type",
             created_at: "2024-01-15T09:30:00Z",
             modified_at: "2024-01-15T09:30:00Z",
             deleted_at: "2024-01-15T09:30:00Z",
@@ -2689,6 +3277,99 @@ describe("SkyvernClient", () => {
 
         await expect(async () => {
             return await client.deleteBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.UnprocessableEntityError);
+    });
+
+    test("update_browser_profile (1)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {};
+        const rawResponseBody = {
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            source_browser_type: "source_browser_type",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        };
+        server
+            .mockEndpoint()
+            .patch("/v1/browser_profiles/bp_123456")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(200)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        const response = await client.updateBrowserProfile("bp_123456");
+        expect(response).toEqual({
+            browser_profile_id: "browser_profile_id",
+            organization_id: "organization_id",
+            name: "name",
+            description: "description",
+            source_browser_type: "source_browser_type",
+            created_at: "2024-01-15T09:30:00Z",
+            modified_at: "2024-01-15T09:30:00Z",
+            deleted_at: "2024-01-15T09:30:00Z",
+        });
+    });
+
+    test("update_browser_profile (2)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {};
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .patch("/v1/browser_profiles/profile_id")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(404)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.updateBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.NotFoundError);
+    });
+
+    test("update_browser_profile (3)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {};
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .patch("/v1/browser_profiles/profile_id")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(409)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.updateBrowserProfile("profile_id");
+        }).rejects.toThrow(Skyvern.ConflictError);
+    });
+
+    test("update_browser_profile (4)", async () => {
+        const server = mockServerPool.createServer();
+        const client = new SkyvernClient({ apiKey: "test", environment: server.baseUrl });
+        const rawRequestBody = {};
+        const rawResponseBody = { key: "value" };
+        server
+            .mockEndpoint()
+            .patch("/v1/browser_profiles/profile_id")
+            .jsonBody(rawRequestBody)
+            .respondWith()
+            .statusCode(422)
+            .jsonBody(rawResponseBody)
+            .build();
+
+        await expect(async () => {
+            return await client.updateBrowserProfile("profile_id");
         }).rejects.toThrow(Skyvern.UnprocessableEntityError);
     });
 
@@ -2818,10 +3499,24 @@ describe("SkyvernClient", () => {
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recordings: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             started_at: "2024-01-15T09:30:00Z",
             completed_at: "2024-01-15T09:30:00Z",
@@ -2858,7 +3553,9 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recordings: [
@@ -2866,7 +3563,9 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             started_at: "2024-01-15T09:30:00Z",
@@ -3008,10 +3707,24 @@ describe("SkyvernClient", () => {
             vnc_streaming_supported: true,
             download_path: "download_path",
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recordings: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             started_at: "2024-01-15T09:30:00Z",
             completed_at: "2024-01-15T09:30:00Z",
@@ -3047,7 +3760,9 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recordings: [
@@ -3055,7 +3770,9 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             started_at: "2024-01-15T09:30:00Z",
@@ -3529,9 +4246,17 @@ describe("SkyvernClient", () => {
             status: "created",
             output: { key: "value" },
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -3552,6 +4277,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: { key: "value" },
@@ -3563,15 +4289,19 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: { key: "value" },
             },
         };
         server
             .mockEndpoint()
             .post("/v1/run/tasks/login")
+            .header("x-user-agent", "x-user-agent")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(200)
@@ -3579,6 +4309,7 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.login({
+            "x-user-agent": "x-user-agent",
             credential_type: "skyvern",
         });
         expect(response).toEqual({
@@ -3592,10 +4323,13 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -3620,6 +4354,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: {
@@ -3633,12 +4368,19 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
                     key: "value",
                 },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: {
+                    key: "value",
+                },
             },
         });
     });
@@ -3673,9 +4415,17 @@ describe("SkyvernClient", () => {
             status: "created",
             output: { key: "value" },
             downloaded_files: [
-                { url: "url", checksum: "checksum", filename: "filename", modified_at: "2024-01-15T09:30:00Z" },
+                {
+                    url: "url",
+                    checksum: "checksum",
+                    filename: "filename",
+                    file_size: 1,
+                    modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
+                },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -3696,6 +4446,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: { key: "value" },
@@ -3707,15 +4458,19 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: { key: "value" },
+                cdp_connect_headers: { key: "value" },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: { key: "value" },
             },
         };
         server
             .mockEndpoint()
             .post("/v1/run/tasks/download_files")
+            .header("x-user-agent", "x-user-agent")
             .jsonBody(rawRequestBody)
             .respondWith()
             .statusCode(200)
@@ -3723,6 +4478,7 @@ describe("SkyvernClient", () => {
             .build();
 
         const response = await client.downloadFiles({
+            "x-user-agent": "x-user-agent",
             navigation_goal: "navigation_goal",
         });
         expect(response).toEqual({
@@ -3736,10 +4492,13 @@ describe("SkyvernClient", () => {
                     url: "url",
                     checksum: "checksum",
                     filename: "filename",
+                    file_size: 1,
                     modified_at: "2024-01-15T09:30:00Z",
+                    artifact_id: "artifact_id",
                 },
             ],
             recording_url: "recording_url",
+            recording_archived: true,
             screenshot_urls: ["screenshot_urls"],
             failure_reason: "failure_reason",
             created_at: "2025-01-01T00:00:00Z",
@@ -3764,6 +4523,7 @@ describe("SkyvernClient", () => {
             step_count: 1,
             run_with: "agent",
             ai_fallback: true,
+            script_id: "script_id",
             run_request: {
                 workflow_id: "wpid_123",
                 parameters: {
@@ -3777,12 +4537,19 @@ describe("SkyvernClient", () => {
                 browser_session_id: "browser_session_id",
                 browser_profile_id: "browser_profile_id",
                 max_screenshot_scrolls: 1,
+                max_elapsed_time_minutes: 1,
                 extra_http_headers: {
+                    key: "value",
+                },
+                cdp_connect_headers: {
                     key: "value",
                 },
                 browser_address: "browser_address",
                 ai_fallback: true,
                 run_with: "run_with",
+                run_metadata: {
+                    key: "value",
+                },
             },
         });
     });

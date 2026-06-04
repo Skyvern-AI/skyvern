@@ -6,12 +6,14 @@ import base64
 import binascii
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
 from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
+from skyvern.schemas.workflows import BlockType
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
@@ -46,7 +48,6 @@ def extract_final_text(result: RunResultStreaming) -> str:
 
 
 _TYPE_ALTERNATION = "|".join(COPILOT_RESPONSE_TYPES)
-_LEADING_LABEL_RE = re.compile(rf"^\s*({_TYPE_ALTERNATION})\s*[:,]?\s+", re.IGNORECASE)
 _USER_RESPONSE_VALUE_RE = re.compile(r'"user_response"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _TYPE_VALUE_RE = re.compile(rf'"type"\s*:\s*"({_TYPE_ALTERNATION})"')
 _WORKFLOW_DELIVERY_CLAIM_PATTERNS = [
@@ -65,6 +66,38 @@ def _try_loads_dict(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    cleaned = text.strip()
+    for prefix in ("```json", "```"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+            break
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _strip_structured_response_label(text: str) -> str | None:
+    text_upper = text.upper()
+    for response_type in sorted(COPILOT_RESPONSE_TYPES, key=len, reverse=True):
+        if not text_upper.startswith(response_type):
+            continue
+        remainder = text[len(response_type) :]
+        if not remainder:
+            continue
+        stripped = remainder.lstrip()
+        if not stripped:
+            continue
+        if stripped[0] in {":", ","}:
+            stripped = stripped[1:].lstrip()
+        elif not remainder[0].isspace():
+            continue
+        candidate = _strip_markdown_code_fence(stripped)
+        if candidate.startswith("{"):
+            return candidate
+    return None
 
 
 def _looks_like_envelope(parsed: dict[str, Any]) -> bool:
@@ -97,24 +130,18 @@ def parse_final_response(text: str) -> dict[str, Any]:
     control characters in string values. Falls back to regex-extracting
     ``user_response`` from envelope-shaped text so a malformed envelope never
     reaches the chat bubble."""
-    cleaned = text.strip()
-    for prefix in ("```json", "```"):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix) :]
-            break
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
+    cleaned = _strip_markdown_code_fence(text)
 
     parsed = _try_loads_dict(cleaned)
     if parsed is not None:
         return parsed
 
-    label_stripped = _LEADING_LABEL_RE.sub("", cleaned, count=1)
-    if label_stripped != cleaned:
+    label_stripped = _strip_structured_response_label(cleaned)
+    if label_stripped is not None:
         parsed = _try_loads_dict(label_stripped)
         if parsed is not None:
             return parsed
+        cleaned = label_stripped
 
     first = cleaned.find("{")
     last = cleaned.rfind("}")
@@ -143,6 +170,26 @@ def looks_like_workflow_delivery_claim(text: Any) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     return any(pattern.search(text) for pattern in _WORKFLOW_DELIVERY_CLAIM_PATTERNS)
+
+
+# A `block_type:` line whose value is a real BlockType, or a `workflow_definition:`
+# line — both keyed to canonical identifiers and anchored at line start, so inline
+# prose ("the block_type field") cannot trip them. The optional quote group also
+# matches the JSON serialization (`"block_type": "navigation"`).
+_BLOCK_TYPE_LINE_RE = re.compile(
+    r'^\s*-?\s*["\']?block_type["\']?\s*:\s*["\']?(?:' + "|".join(re.escape(bt.value) for bt in BlockType) + r")\b",
+    re.MULTILINE,
+)
+_WORKFLOW_DEFINITION_LINE_RE = re.compile(r'^\s*["\']?workflow_definition["\']?\s*:', re.MULTILINE)
+
+
+def looks_like_workflow_yaml_in_chat(text: Any) -> bool:
+    """Return True when ``text`` contains serialized Skyvern workflow YAML/JSON."""
+    if not isinstance(text, str):
+        return False
+    if "block_type" not in text and "workflow_definition" not in text:
+        return False
+    return bool(_WORKFLOW_DEFINITION_LINE_RE.search(text) or _BLOCK_TYPE_LINE_RE.search(text))
 
 
 def extract_screenshot_b64(result: dict[str, Any]) -> str | None:
@@ -260,6 +307,9 @@ def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
 
 
 _UNKNOWN_ERROR_SENTINEL = "Unknown error"
+_PER_TOOL_BUDGET_FAILURE_CATEGORY = "PER_TOOL_BUDGET"
+_USER_FACING_SUMMARY_KEYS: tuple[str, ...] = ("user_facing_summary", "user_facing_reason")
+_STRUCTURED_UNSAFE_FALLBACK = "Couldn't complete that step."
 
 
 def _extract_failure_message(result: dict[str, Any]) -> str:
@@ -270,6 +320,101 @@ def _extract_failure_message(result: dict[str, Any]) -> str:
     if isinstance(top, str) and top:
         return top
     return next(iter_failure_reasons(result), _UNKNOWN_ERROR_SENTINEL)
+
+
+def _result_data(result: dict[str, Any]) -> dict[str, Any]:
+    data = result.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _clean_structured_user_facing_text(value: Any, *, blocked_tool: str | None = None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return None
+    try:
+        assert_clean_user_facing_text(cleaned, blocked_tool=blocked_tool)
+    except ValueError:
+        return None
+    return cleaned
+
+
+def _blocker_signal_matches_result(signal: CopilotToolBlockerSignal, result: dict[str, Any]) -> bool:
+    error = result.get("error")
+    if not isinstance(error, str) or not error:
+        return False
+    steering = signal.agent_steering_text
+    return error == steering or steering in error
+
+
+def _failure_categories(result: dict[str, Any]) -> list[Any]:
+    data = _result_data(result)
+    categories = data.get("failure_categories")
+    return categories if isinstance(categories, list) else []
+
+
+def _has_failure_category(result: dict[str, Any], category: str) -> bool:
+    for item in _failure_categories(result):
+        if isinstance(item, dict) and item.get("category") == category:
+            return True
+    return False
+
+
+def _iter_blocker_signals(
+    blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None,
+) -> Iterator[CopilotToolBlockerSignal]:
+    if isinstance(blocker_signal, CopilotToolBlockerSignal):
+        yield blocker_signal
+        return
+    if blocker_signal is None:
+        return
+    for signal in blocker_signal:
+        if isinstance(signal, CopilotToolBlockerSignal):
+            yield signal
+
+
+def _structured_failure_summary_for_user(
+    result: dict[str, Any],
+    *,
+    blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None = None,
+    blocked_tool: str | None = None,
+) -> str | None:
+    if result.get("ok", False):
+        return None
+
+    for signal in _iter_blocker_signals(blocker_signal):
+        if _blocker_signal_matches_result(signal, result):
+            return (
+                _clean_structured_user_facing_text(
+                    signal.user_facing_reason,
+                    blocked_tool=signal.blocked_tool or blocked_tool,
+                )
+                or _STRUCTURED_UNSAFE_FALLBACK
+            )
+
+    data = _result_data(result)
+    saw_structured_summary = False
+    for container in (result, data):
+        for key in _USER_FACING_SUMMARY_KEYS:
+            raw_value = container.get(key)
+            if isinstance(raw_value, str) and raw_value.strip():
+                saw_structured_summary = True
+            summary = _clean_structured_user_facing_text(raw_value, blocked_tool=blocked_tool)
+            if summary is not None:
+                return summary
+    if saw_structured_summary:
+        return _STRUCTURED_UNSAFE_FALLBACK
+
+    if _has_failure_category(result, _PER_TOOL_BUDGET_FAILURE_CATEGORY):
+        # An explicit but empty failure_reason still means the structured
+        # watchdog path fired; use the generic safe copy rather than raw error
+        # fallback.
+        return _clean_structured_user_facing_text(data.get("failure_reason"), blocked_tool=blocked_tool) or (
+            _STRUCTURED_UNSAFE_FALLBACK if isinstance(data.get("failure_reason"), str) else None
+        )
+
+    return None
 
 
 _HEADERS_BLOB_RE = re.compile(r"\s*headers:\s*\{[^{}]*\}\s*", re.IGNORECASE)
@@ -319,10 +464,13 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
     if not result.get("ok", False):
         return f"Failed: {_sanitize_failure_text(_extract_failure_message(result))}"
 
-    data = result.get("data") or {}
+    raw_data = result.get("data")
+    data = raw_data if isinstance(raw_data, dict) else {}
 
     if tool_name == "update_workflow":
         return f"Workflow updated ({data.get('block_count', '?')} blocks)"
+    if tool_name == "update_and_run_blocks" and data.get("skipped_run"):
+        return f"Workflow updated ({data.get('block_count', '?')} blocks); browser run skipped"
     if tool_name == "list_credentials":
         return f"Found {data.get('count', 0)} credential(s)"
     if tool_name == "get_block_schema":
@@ -334,7 +482,7 @@ def summarize_tool_result(tool_name: str, result: dict[str, Any]) -> str:
             return f"Block '{data.get('label', '?')}' is valid"
         return "Block validation failed"
     if tool_name == "run_blocks_and_collect_debug":
-        if not isinstance(data, dict):
+        if not isinstance(raw_data, dict):
             return "Run debug completed"
         executed = data.get("executed_block_labels") or [b.get("label", "?") for b in data.get("blocks", [])]
         status = data.get("overall_status", "?")
@@ -380,10 +528,19 @@ def build_run_blocks_response(run_ok: bool, result_data: dict[str, Any]) -> dict
     return response
 
 
-def summarize_tool_result_detail(result: dict[str, Any], max_chars: int = 800) -> str | None:
+def summarize_tool_result_detail(
+    result: dict[str, Any],
+    max_chars: int = 800,
+    *,
+    tool_name: str | None = None,
+    blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None = None,
+) -> str | None:
     """Tooltip-grade failure detail (longer cap than ``summarize_tool_result``); None on success."""
     if result.get("ok", False):
         return None
+    structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
+    if structured is not None:
+        return structured
     return _sanitize_failure_text(_extract_failure_message(result), max_chars=max_chars)
 
 
@@ -402,7 +559,7 @@ _USE_TOOL_NAME_RE = re.compile(r"use the ['\"]?[a-z_][a-z0-9_]*['\"]? tool", re.
 
 _USER_FACING_LOOP_MESSAGE = "The agent got stuck retrying the same step — moving on."
 _USER_FACING_JINJA_MESSAGE = "A workflow parameter could not be filled in."
-_USER_FACING_GENERIC_FAILURE = "Couldn't complete that step."
+_USER_FACING_GENERIC_FAILURE = _STRUCTURED_UNSAFE_FALLBACK
 
 _USER_FACING_EMPTY_SUCCESS_TOOLS: frozenset[str] = frozenset({"click", "type_text", "evaluate", "select_option"})
 
@@ -422,13 +579,21 @@ def _translate_failure_for_user(error_text: str) -> str:
     return f"Failed: {_sanitize_failure_text(error_text)}"
 
 
-def format_tool_result_for_user(tool_name: str, result: dict[str, Any]) -> str:
+def format_tool_result_for_user(
+    tool_name: str,
+    result: dict[str, Any],
+    *,
+    blocker_signal: CopilotToolBlockerSignal | Iterable[CopilotToolBlockerSignal] | None = None,
+) -> str:
     """SSE-bound counterpart to summarize_tool_result; do not mix the two.
 
     summarize_tool_result is parsed by context.merge_turn_summary for state
     extraction — rewriting it would corrupt agent state.
     """
     if not result.get("ok", False):
+        structured = _structured_failure_summary_for_user(result, blocker_signal=blocker_signal, blocked_tool=tool_name)
+        if structured is not None:
+            return structured
         return _translate_failure_for_user(_extract_failure_message(result))
     if tool_name in _USER_FACING_EMPTY_SUCCESS_TOOLS:
         return ""

@@ -115,7 +115,10 @@ async def test_cleanup_element_tree_enables_conversion_when_setting_on() -> None
 
         mock_svg_check.return_value = False
 
-        cleanup_fn = agent_fn.cleanup_element_tree_factory(task=None, step=None)
+        mock_task = MagicMock()
+        mock_step = MagicMock()
+
+        cleanup_fn = agent_fn.cleanup_element_tree_factory(task=mock_task, step=mock_step)
         await cleanup_fn(mock_frame, "https://example.com", element_tree)
 
         # CSS conversion should be called since the element is eligible and conversion is enabled

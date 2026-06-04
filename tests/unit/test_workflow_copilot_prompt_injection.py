@@ -223,7 +223,7 @@ class TestCopilotCallLLMWiring:
 
         with (
             patch(
-                "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+                "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
                 return_value=mock_handler,
             ),
             patch("skyvern.forge.sdk.routes.workflow_copilot.app") as mock_app,
@@ -376,6 +376,65 @@ class TestBuildUserContext:
         )
         # Exactly zero literal fence-breakouts survive; every occurrence
         # must be escaped by escape_code_fences().
+        assert "``` injected ```" not in rendered
+
+    def test_workflow_change_summary_slot_renders_when_present(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            user_workflow_change_summary=(
+                "user_modified_since_last_turn: the user changed the workflow YAML between turns.\n"
+                "added blocks: summarize_result"
+            ),
+        )
+        assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" in rendered
+        assert "user_modified_since_last_turn" in rendered
+        assert "added blocks: summarize_result" in rendered
+
+    def test_workflow_change_summary_slot_omitted_when_empty(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+        )
+        assert "USER WORKFLOW CHANGES SINCE LAST COPILOT TURN" not in rendered
+
+    def test_repeated_reply_warning_slot_renders_when_present(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            repeated_reply_warning="repeated_reply_detected: your last 2 replies were near-identical.",
+        )
+        assert "REPEATED REPLY WARNING" in rendered
+        assert "repeated_reply_detected" in rendered
+
+    def test_repeated_reply_warning_slot_omitted_when_empty(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="title: t",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+        )
+        assert "REPEATED REPLY WARNING" not in rendered
+
+    def test_repeated_reply_warning_is_fence_escaped(self) -> None:
+        rendered = _build_user_context(
+            workflow_yaml="",
+            chat_history_text="",
+            global_llm_context="",
+            debug_run_info_text="",
+            user_message="hello",
+            repeated_reply_warning="``` injected ```",
+        )
         assert "``` injected ```" not in rendered
 
     def test_workflow_summary_indexes_block_labels_and_error_mappings(self) -> None:

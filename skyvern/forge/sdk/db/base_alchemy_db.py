@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, AsyncContextManager, AsyncIterator, Callable
 
@@ -68,11 +69,17 @@ class BaseAlchemyDB:
         return False
 
 
+@dataclass(frozen=True)
+class _SessionEntry:
+    session: AsyncSession
+    task: asyncio.Task[Any] | None
+
+
 class _SessionFactory:
     def __init__(self, db: BaseAlchemyDB, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         self._db = db
         self._sessionmaker = sessionmaker
-        self._session_ctx: contextvars.ContextVar[AsyncSession | None] = contextvars.ContextVar(
+        self._session_ctx: contextvars.ContextVar[_SessionEntry | None] = contextvars.ContextVar(
             "skyvern_db_session",
             default=None,
         )
@@ -85,13 +92,14 @@ class _SessionFactory:
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[AsyncSession]:
-        existing_session = self._session_ctx.get()
-        if existing_session is not None:
-            yield existing_session
+        existing = self._session_ctx.get()
+        current_task = asyncio.current_task()
+        if existing is not None and current_task is not None and existing.task is current_task:
+            yield existing.session
             return
 
         session = self._sessionmaker()
-        token = self._session_ctx.set(session)
+        token = self._session_ctx.set(_SessionEntry(session=session, task=current_task))
         try:
             yield session
         finally:

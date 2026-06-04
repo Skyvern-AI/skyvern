@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     BROWSER_TYPE: str = "chromium-headful"
     BROWSER_REMOTE_DEBUGGING_URL: str = "http://127.0.0.1:9222"
     BROWSER_REMOTE_DEBUGGING_HOST_HEADER: str | None = None
+    BROWSER_REMOTE_DEBUGGING_CONNECT_HEADERS: str | None = None
     BROWSER_CDP_CONNECT_TIMEOUT_MS: int = 120000
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
@@ -95,6 +96,7 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    POPUP_VIDEO_PATH_TIMEOUT_SECONDS: float = 3.0
     CACHED_ACTION_DELAY_SECONDS: float = 1.0
     # Page readiness settings for cached action execution
     # These help prevent cached actions from executing before the page is fully loaded
@@ -119,10 +121,8 @@ class Settings(BaseSettings):
     DATABASE_REPLICA_STRING: str | None = None
     DATABASE_STATEMENT_TIMEOUT_MS: int = 60000
     DISABLE_CONNECTION_POOL: bool = False
-    DATABASE_POOL_SIZE: int = 20
-    DATABASE_POOL_MAX_OVERFLOW: int = 20
-    DATABASE_POOL_TIMEOUT: int = 10
-    DATABASE_POOL_RECYCLE: int = 1800
+    DATABASE_POOL_SIZE: int = 5
+    DATABASE_POOL_MAX_OVERFLOW: int = 10
     PROMPT_ACTION_HISTORY_WINDOW: int = 1
     TASK_RESPONSE_ACTION_SCREENSHOT_COUNT: int = 3
 
@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     LOG_RAW_API_REQUESTS: bool = True
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
+    # Gate copilot verified-success on per-criterion outcome evidence.
+    # Off restores the prior run-status/suspicious-success gate and classifier prompt.
+    COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
@@ -285,6 +288,14 @@ class Settings(BaseSettings):
     VOLCENGINE_API_KEY: str | None = None
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
+
+    # Yutori Navigator
+    ENABLE_YUTORI: bool = False
+    YUTORI_API_KEY: str | None = None
+    YUTORI_API_BASE: str = "https://api.yutori.com/v1"
+    YUTORI_MODEL: str = "n1.5-latest"
+    YUTORI_LLM_KEY: str = "YUTORI_NAVIGATOR"
+    YUTORI_TOOL_SET: str = ""
 
     # OPENAI COMPATIBLE
     OPENAI_COMPATIBLE_MODEL_NAME: str | None = None
@@ -580,6 +591,14 @@ class Settings(BaseSettings):
     """Interval in minutes for the cleanup cron job."""
     CLEANUP_STALE_TASK_THRESHOLD_HOURS: int = 24
     """Tasks/workflows not updated for this many hours are considered stale (stuck)."""
+
+    # Workflow Schedule Settings
+    ENABLE_WORKFLOW_SCHEDULES: bool = True
+    """Enable recurring workflow schedules in the OSS/local server."""
+    WORKFLOW_SCHEDULE_POLL_INTERVAL_SECONDS: float = 60.0
+    """How often the OSS/local scheduler scans for due workflow schedules."""
+    WORKFLOW_SCHEDULE_MAX_CONCURRENT_RUNS: int = 1
+    """Maximum number of scheduled workflow runs dispatched concurrently by one OSS server process."""
 
     # OpenTelemetry Settings
     OTEL_ENABLED: bool = False

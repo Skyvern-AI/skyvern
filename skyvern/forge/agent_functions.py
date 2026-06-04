@@ -1,19 +1,29 @@
 import asyncio
 import copy
 import hashlib
+import os
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import aiohttp
 import httpx
 import structlog
 from playwright.async_api import Frame, Page
 
 from skyvern.config import settings
-from skyvern.constants import SKYVERN_ID_ATTR
-from skyvern.exceptions import DisabledBlockExecutionError, StepUnableToExecuteError, TaskAlreadyTimeout
+from skyvern.constants import CUSTOMER_STORAGE_UPLOAD_MAX_BYTES, SKYVERN_ID_ATTR
+from skyvern.exceptions import (
+    AzureConfigurationError,
+    DisabledBlockExecutionError,
+    StepUnableToExecuteError,
+    TaskAlreadyTimeout,
+    UploadFileMaxSizeExceeded,
+)
 from skyvern.forge import app
 from skyvern.forge.async_operations import AsyncOperation
 from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot.config import CopilotConfig
@@ -25,6 +35,7 @@ from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.services import google_oauth_service
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar
+from skyvern.schemas.workflows import FileStorageType, FileUploadDestination
 from skyvern.webeye.actions.actions import Action
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.scraper.scraped_page import ELEMENT_NODE_ATTRIBUTES, CleanupElementTreeFunc, json_to_html
@@ -33,6 +44,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
 
 LOG = structlog.get_logger()
 
@@ -41,6 +53,20 @@ USELESS_SHAPE_ATTRIBUTE = [SKYVERN_ID_ATTR, "id", "aria-describedby"]
 SVG_SHAPE_CONVERTION_ATTEMPTS = 3
 CSS_SHAPE_CONVERTION_ATTEMPTS = 1
 INVALID_SHAPE = "N/A"
+
+
+@dataclass
+class TOTPVerificationResponse:
+    """Normalized response shape for the TOTP verification seam.
+
+    Decouples the seam contract from any specific HTTP client so the OSS
+    direct path (aiohttp) and the cloud proxy path (NATEgressProxyClient)
+    can both produce a response the helper consumes the same way.
+    """
+
+    status_code: int
+    body: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 def _remove_rect(element: dict) -> None:
@@ -245,7 +271,7 @@ async def _convert_svg_to_string(
                 break
             except LLMProviderError:
                 LOG.info(
-                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                    "Failed to convert SVG to string due to llm error. Will retry if haven't met the max try attempt.",
                     exc_info=True,
                     element_id=element_id,
                     key=svg_key,
@@ -254,7 +280,8 @@ async def _convert_svg_to_string(
                 if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                await asyncio.sleep(3)
+                else:
+                    await asyncio.sleep(0.5 * (2**retry))
             except asyncio.TimeoutError:
                 LOG.warning(
                     "Timeout to call LLM to parse SVG. Going to drop the svg element directly.",
@@ -265,7 +292,7 @@ async def _convert_svg_to_string(
                 return
             except Exception:
                 LOG.info(
-                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                    "Failed to convert SVG to string shape by secondary llm. Will retry if haven't met the max try attempt.",
                     exc_info=True,
                     element_id=element_id,
                     retry=retry,
@@ -273,7 +300,8 @@ async def _convert_svg_to_string(
                 if retry == SVG_SHAPE_CONVERTION_ATTEMPTS - 1:
                     # set the invalid css shape to cache to avoid retry in the near future
                     await app.CACHE.set(svg_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                await asyncio.sleep(3)
+                else:
+                    await asyncio.sleep(0.5 * (2**retry))
         else:
             LOG.warning(
                 "Reaching the max try to convert svg element, going to drop the svg element.",
@@ -380,7 +408,7 @@ async def _convert_css_shape_to_string(
                     break
                 except LLMProviderError:
                     LOG.info(
-                        "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt after 3s.",
+                        "Failed to convert css shape due to llm error. Will retry if haven't met the max try attempt.",
                         exc_info=True,
                         element_id=element_id,
                         retry=retry,
@@ -389,7 +417,6 @@ async def _convert_css_shape_to_string(
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(hours=1))
-                    await asyncio.sleep(3)
                 except asyncio.TimeoutError:
                     LOG.warning(
                         "Timeout to call LLM to parse css shape. Going to abort the convertion directly.",
@@ -400,7 +427,7 @@ async def _convert_css_shape_to_string(
                     return None
                 except Exception:
                     LOG.info(
-                        "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt after 3s.",
+                        "Failed to convert css shape to string shape by secondary llm. Will retry if haven't met the max try attempt.",
                         exc_info=True,
                         element_id=element_id,
                         retry=retry,
@@ -409,7 +436,6 @@ async def _convert_css_shape_to_string(
                     if retry == CSS_SHAPE_CONVERTION_ATTEMPTS - 1:
                         # set the invalid css shape to cache to avoid retry in the near future
                         await app.CACHE.set(shape_key, INVALID_SHAPE, ex=timedelta(weeks=1))
-                    await asyncio.sleep(3)
             else:
                 LOG.info(
                     "Max css shape convertion retry, going to abort the convertion.",
@@ -438,17 +464,29 @@ async def _convert_css_shape_to_string(
 
 
 class AgentFunction:
-    workflow_schedules_enabled: bool = False
+    workflow_schedules_enabled: bool = settings.ENABLE_WORKFLOW_SCHEDULES
     """Whether the workflow scheduler routes should serve traffic on this build.
 
-    OSS Skyvern has no scheduling backend wired up by default, so the routes return 501.
-    Cloud overrides this to True and provides the Temporal-backed implementations below.
+    OSS Skyvern uses a local background scheduler by default. Set
+    ENABLE_WORKFLOW_SCHEDULES=false to disable the routes and scheduler.
+    Cloud overrides the local scheduler flag and provides the Temporal-backed
+    implementations below.
     """
+    workflow_schedules_use_local_scheduler: bool = settings.ENABLE_WORKFLOW_SCHEDULES
+    """Whether the API process should run the built-in local scheduler loop."""
 
     def get_flex_llm_key(self, llm_key: str | None) -> str | None:
         """Return a flex-tier router key for the given LLM key, or None if no flex twin exists.
 
         Cloud overrides this with the Gemini family → flex+GPT-5-fallback mapping.
+        OSS no-op so self-hosted users without flex routers see no behavior change.
+        """
+        return None
+
+    def get_non_flex_llm_key(self, llm_key: str | None) -> str | None:
+        """Return a non-flex router twin for the given LLM key, or None if no twin exists.
+
+        Cloud overrides this with the flex-router → standard-router mapping.
         OSS no-op so self-hosted users without flex routers see no behavior change.
         """
         return None
@@ -468,6 +506,22 @@ class AgentFunction:
         """
         return False
 
+    async def should_keep_code_mode_for_workflow_run(
+        self,
+        *,
+        workflow: "Workflow",
+        workflow_run: "WorkflowRun",
+    ) -> bool:
+        return True
+
+    async def get_analytics_warmable_organization_ids(self, statement_timeout_seconds: int = 10) -> list[str]:
+        """Return org IDs whose analytics summary cache should be kept warm.
+
+        OSS returns all org IDs. Cloud overrides with enterprise pricing filter.
+        """
+        orgs = await app.DATABASE.organizations.get_all_organizations()
+        return [org.organization_id for org in orgs]
+
     async def record_workflow_run_metadata(
         self,
         *,
@@ -477,6 +531,19 @@ class AgentFunction:
     ) -> None:
         """Persist per-run analytics metadata. OSS builds have no sidecar table."""
         return None
+
+    async def get_workflow_run_metadata(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str,
+    ) -> dict[str, str] | None:
+        """Fetch per-run analytics metadata. OSS builds have no sidecar table."""
+        return None
+
+    async def is_block_scoped_workflow_run(self, workflow_run: "WorkflowRun") -> bool:
+        """Return whether this workflow run was created for scoped block execution."""
+        return workflow_run.debug_session_id is not None
 
     # Phrases that indicate a magic-link confirmation page meant to be closed.
     # Keep lowercase; matching is case-insensitive.
@@ -534,6 +601,9 @@ class AgentFunction:
     async def resolve_org_api_key(self, organization_id: str) -> str | None:
         """Return an org-scoped API key; returns None in the base implementation."""
         return None
+
+    async def setup_browser_context_extensions(self, browser_context: Any, **kwargs: Any) -> None:
+        """Attach cloud-only listeners/route handlers to a fresh BrowserContext. OSS no-op."""
 
     async def validate_step_execution(
         self,
@@ -664,15 +734,6 @@ class AgentFunction:
     async def post_cache_step_execution(self, task: Task, step: Step) -> None:
         return
 
-    async def release_proxy_session_for_owner(self, owner_id: str) -> None:
-        """Release any proxy lease held by ``owner_id``.
-
-        OSS no-op. Cloud overrides this to release the lease back to the
-        proxy-session pool so workflow/task cleanup doesn't have to
-        import cloud-only modules from the OSS-synced ``skyvern/`` tree.
-        """
-        return None
-
     async def wait_for_challenge_solver(self, page: Page) -> None:
         """Wait for a cloud-managed challenge solver if one is attached to the page.
 
@@ -719,10 +780,10 @@ class AgentFunction:
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
         """Return the backend-specific schedule id used by the execution engine.
 
-        OSS has no execution backend, so this returns None and the schedule simply
-        lives in the database. Cloud overrides this to derive a Temporal schedule id.
+        OSS uses a deterministic local backend id. Cloud overrides this to derive
+        a Temporal schedule id.
         """
-        return None
+        return f"local-wf-sched-{workflow_schedule_id}"
 
     async def upsert_workflow_schedule(
         self,
@@ -737,7 +798,7 @@ class AgentFunction:
     ) -> None:
         """Upsert a recurring schedule with the execution backend (e.g. Temporal).
 
-        OSS base is a no-op so the route layer can stay backend-agnostic.
+        OSS base is a no-op because the local scheduler scans the database.
         Cloud overrides this to register the schedule with Temporal.
         Implementations must be idempotent.
         """
@@ -956,6 +1017,7 @@ class AgentFunction:
             queue = []
             element_cnt = 0
             eligible_svgs = []  # List to store eligible SVGs and their frames
+            eligible_css_shapes = []  # List to store eligible CSS shapes for parallel conversion
 
             for element in element_tree:
                 queue.append(element)
@@ -984,12 +1046,7 @@ class AgentFunction:
                     eligible_svgs.append((queue_ele, skyvern_frame))
 
                 if not disable_conversion and _should_css_shape_convert(element=queue_ele):
-                    await _convert_css_shape_to_string(
-                        skyvern_frame=skyvern_frame,
-                        element=queue_ele,
-                        task=task,
-                        step=step,
-                    )
+                    eligible_css_shapes.append((queue_ele, skyvern_frame))
 
                 # TODO: we can come back to test removing the unique_id
                 # from element attributes to make sure this won't increase hallucination
@@ -997,30 +1054,15 @@ class AgentFunction:
                 if "children" in queue_ele:
                     queue.extend(queue_ele["children"])
 
-            # SPEED OPTIMIZATION: Skip SVG conversion when using economy tree
-            # Economy tree removes SVGs, so no point converting them
-            #
-            # COORDINATION: Use the same enable_speed_optimizations decision from context
-            # that was set in agent.py BEFORE scraping. This ensures SVG conversion skip
-            # is perfectly coordinated with economy tree selection.
-            skip_svg_conversion = False
-            if eligible_svgs and task and step:
-                # Get the optimization decision from context (set before scraping in agent.py)
-                current_context = skyvern_context.current()
-                enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
+            if eligible_css_shapes and task and step:
+                await asyncio.gather(
+                    *[
+                        _convert_css_shape_to_string(skyvern_frame=sf, element=elem, task=task, step=step)
+                        for elem, sf in eligible_css_shapes
+                    ]
+                )
 
-                if enable_speed_optimizations and step.retry_index == 0:
-                    skip_svg_conversion = True
-                    LOG.info(
-                        "Speed optimization: Skipping SVG conversion (will use economy tree)",
-                        step_order=step.order,
-                        step_retry=step.retry_index,
-                        workflow_run_id=task.workflow_run_id,
-                        svg_count=len(eligible_svgs),
-                    )
-
-            # Convert all eligible SVGs in parallel (unless skipped by optimization)
-            if eligible_svgs and not skip_svg_conversion:
+            if eligible_svgs:
                 await asyncio.gather(*[_convert_svg_to_string(element, task, step) for element, frame in eligible_svgs])
 
             return element_tree
@@ -1062,6 +1104,83 @@ class AgentFunction:
                 headers=headers,
                 timeout=httpx.Timeout(timeout_seconds),
             )
+
+    async def post_totp_verification_request(
+        self,
+        url: str,
+        payload: str,
+        headers: dict[str, str],
+        timeout_seconds: float = 30.0,
+        organization_id: str | None = None,
+    ) -> TOTPVerificationResponse:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
+            async with session.post(url, data=payload, headers=headers) as response:
+                body = await response.text()
+                return TOTPVerificationResponse(
+                    status_code=response.status,
+                    body=body,
+                    headers=dict(response.headers),
+                )
+
+    async def upload_file_to_customer_storage(
+        self,
+        file_path: str,
+        destination: FileUploadDestination,
+        organization_id: str | None = None,
+        run_id: str | None = None,
+    ) -> str:
+        """Upload a single file to customer-specified S3 or Azure storage.
+
+        Returns the customer-facing URI (``destination.customer_uri``).  The
+        cloud override routes NAT-org traffic through the egress proxy so it
+        egresses from a static IP; the OSS base path uploads directly via the
+        AWS / Azure SDK.
+
+        Enforces ``CUSTOMER_STORAGE_UPLOAD_MAX_BYTES`` (1 GB) regardless of
+        route so the proxy pod and the customer's quota are both protected
+        from runaway uploads.
+        """
+        await self._enforce_upload_size_cap(file_path)
+
+        if destination.storage_type == FileStorageType.S3:
+            aws_client = AsyncAWSClient(
+                aws_access_key_id=destination.aws_access_key_id,
+                aws_secret_access_key=destination.aws_secret_access_key,
+                region_name=destination.aws_region_name,
+            )
+            await aws_client.upload_file_from_path(
+                uri=destination.sdk_uri,
+                file_path=file_path,
+                raise_exception=True,
+            )
+            return destination.customer_uri
+
+        if destination.storage_type == FileStorageType.AZURE:
+            if not destination.azure_storage_account_name or not destination.azure_storage_account_key:
+                raise AzureConfigurationError("Azure Storage is not configured")
+            azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
+                storage_account_name=destination.azure_storage_account_name,
+                storage_account_key=destination.azure_storage_account_key,
+            )
+            await azure_client.upload_file_from_path(destination.sdk_uri, file_path)
+            return destination.customer_uri
+
+        raise ValueError(f"Unsupported storage type: {destination.storage_type}")
+
+    @staticmethod
+    async def _enforce_upload_size_cap(file_path: str) -> None:
+        """Reject files larger than CUSTOMER_STORAGE_UPLOAD_MAX_BYTES.
+
+        Centralized so direct and proxied paths share the same cap. Stat the
+        file (fast, no IO of contents) and raise a typed exception so callers
+        translate it into a clean block failure.
+        """
+        try:
+            size = await asyncio.to_thread(os.path.getsize, file_path)
+        except FileNotFoundError:
+            raise
+        if size > CUSTOMER_STORAGE_UPLOAD_MAX_BYTES:
+            raise UploadFileMaxSizeExceeded(file_size_bytes=size, max_size_bytes=CUSTOMER_STORAGE_UPLOAD_MAX_BYTES)
 
     def get_copilot_security_rules(self) -> str:
         """Return security guardrails for the workflow copilot system prompt.
@@ -1186,4 +1305,20 @@ class AgentFunction:
 
         Override in cloud to dispatch to platform-specific widget fillers.
         """
+        return None
+
+    async def on_workflow_saved(
+        self,
+        organization_id: str,
+        edited_by: str | None,
+    ) -> None:
+        """Fired after a workflow is saved. Overrides must be best-effort and never raise."""
+        return None
+
+    async def on_workflow_run_completed(
+        self,
+        organization_id: str,
+        workflow_id: str,
+    ) -> None:
+        """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None

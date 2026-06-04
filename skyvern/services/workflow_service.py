@@ -27,6 +27,8 @@ async def prepare_workflow(
     code_gen: bool | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    workflow_schedule_id: str | None = None,
+    workflow_run_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
     copilot_session_id: str | None = None,
 ) -> WorkflowRun:
@@ -47,8 +49,10 @@ async def prepare_workflow(
         is_template_workflow=template,
         debug_session_id=debug_session_id,
         code_gen=code_gen,
+        workflow_run_id=workflow_run_id,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
         copilot_session_id=copilot_session_id,
     )
@@ -91,6 +95,7 @@ async def run_workflow(
     block_outputs: dict[str, t.Any] | None = None,
     parent_workflow_run_id: str | None = None,
     trigger_type: WorkflowRunTriggerType | None = None,
+    workflow_schedule_id: str | None = None,
     ignore_inherited_workflow_system_prompt: bool = False,
 ) -> WorkflowRun:
     workflow_run = await prepare_workflow(
@@ -103,6 +108,7 @@ async def run_workflow(
         request_id=request_id,
         parent_workflow_run_id=parent_workflow_run_id,
         trigger_type=trigger_type,
+        workflow_schedule_id=workflow_schedule_id,
         ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
     )
 
@@ -142,6 +148,7 @@ async def get_workflow_run_response(
         output=workflow_run_resp.outputs,
         downloaded_files=workflow_run_resp.downloaded_files,
         recording_url=workflow_run_resp.recording_url,
+        recording_archived=workflow_run_resp.recording_archived,
         screenshot_urls=workflow_run_resp.screenshot_urls,
         failure_reason=workflow_run_resp.failure_reason,
         queued_at=workflow_run.queued_at,
@@ -156,6 +163,7 @@ async def get_workflow_run_response(
         browser_profile_id=workflow_run.browser_profile_id,
         max_screenshot_scrolls=workflow_run.max_screenshot_scrolls,
         script_run=workflow_run.script_run,
+        script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
         run_request=WorkflowRunRequest(
             workflow_id=workflow_run.workflow_permanent_id,
             title=workflow_run_resp.workflow_title,

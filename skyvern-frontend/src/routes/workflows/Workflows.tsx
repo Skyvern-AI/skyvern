@@ -14,6 +14,7 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import {
@@ -23,14 +24,13 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
+import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import {
   BookmarkFilledIcon,
   ChevronDownIcon,
   DotsHorizontalIcon,
   LightningBoltIcon,
-  MixerHorizontalIcon,
   Pencil2Icon,
   PlayIcon,
   PlusIcon,
@@ -39,7 +39,7 @@ import {
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { useQuery } from "@tanstack/react-query";
 import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
   DropdownMenu,
@@ -60,7 +60,6 @@ import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { convert } from "./editor/workflowEditorUtils";
 import { WorkflowApiResponse } from "./types/workflowTypes";
-import { WorkflowCreateYAMLRequest } from "./types/workflowYamlTypes";
 import { WorkflowActions } from "./WorkflowActions";
 import { WorkflowTemplates } from "../discover/WorkflowTemplates";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -69,6 +68,7 @@ import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
+import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
 
 // Utility function to create URL-safe folder slugs from folder names
 function slugifyFolderName(name: string): string {
@@ -108,19 +108,6 @@ function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
   // First folder (oldest) gets the base slug, others get numbered suffixes
   return index === 0 ? baseSlug : `${baseSlug}-${index + 1}`;
 }
-const emptyWorkflowRequest: WorkflowCreateYAMLRequest = {
-  title: "New Workflow",
-  description: "",
-  ai_fallback: true,
-  code_version: 2,
-  run_with: "code",
-  workflow_definition: {
-    version: 2,
-    blocks: [],
-    parameters: [],
-  },
-};
-
 function Workflows() {
   const credentialGetter = useCredentialGetter();
   const navigate = useNavigate();
@@ -373,7 +360,7 @@ function Workflows() {
     setParamPatch({ page: String(page + 1) });
   }
 
-  // Show importing workflows from polling hook (only on page 1)
+  // Show importing agents from polling hook (only on page 1)
   const displayWorkflows = useMemo(() => {
     const importingOnly = activeImports.filter(
       (imp) => imp.status === "importing",
@@ -391,10 +378,10 @@ function Workflows() {
         <div className="space-y-5">
           <div className="flex items-center gap-2">
             <LightningBoltIcon className="size-6" />
-            <h1 className="text-2xl">Workflows</h1>
+            <h1 className="text-2xl">Agents</h1>
           </div>
-          <p className="text-slate-300">
-            Create your own complex workflows by connecting web agents together.
+          <p className="text-sm leading-6 text-muted-foreground">
+            Create your own complex agents by connecting web agents together.
             Define a series of actions, set it, and forget it.
           </p>
         </div>
@@ -462,12 +449,12 @@ function Workflows() {
               <div className="mx-auto max-w-md">
                 <FolderIcon className="mx-auto mb-3 h-10 w-10 text-blue-400 opacity-50" />
                 <h3 className="mb-2 text-slate-900 dark:text-slate-100">
-                  Organize Your Workflows with Folders
+                  Organize Your Agents with Folders
                 </h3>
                 <p className="mb-4 text-sm text-slate-500 dark:text-slate-400">
-                  Keep your workflows organized by creating folders. Group
-                  related workflows together by project, team, or workflow type
-                  for easier management.
+                  Keep your agents organized by creating folders. Group related
+                  agents together by project, team, or agent type for easier
+                  management.
                 </p>
                 <Button
                   variant="link"
@@ -483,9 +470,9 @@ function Workflows() {
           )}
         </div>
 
-        {/* Workflows Section */}
+        {/* Agents Section */}
         <header className="flex items-center justify-between">
-          <h1 className="text-xl">My Flows</h1>
+          <h1 className="text-xl">My Agents</h1>
           {selectedFolderId && (
             <Button
               variant="link"
@@ -493,7 +480,7 @@ function Workflows() {
               className="h-auto p-0 text-blue-600 dark:text-blue-400"
               onClick={() => setSelectedFolderId(null)}
             >
-              View all workflows
+              View all agents
             </Button>
           )}
         </header>
@@ -504,10 +491,16 @@ function Workflows() {
               setSearch(value);
               setParamPatch({ page: "1" });
             }}
-            placeholder="Search by title or parameter..."
+            placeholder="Search by title or input..."
             className="w-48 lg:w-72"
           />
-          <div className="flex gap-4">
+          <div className="flex items-center gap-4">
+            <Link
+              to="/discover"
+              className="text-sm text-muted-foreground hover:text-foreground"
+            >
+              Or start from a description →
+            </Link>
             <ImportWorkflowButton
               onImportStart={startPolling}
               selectedFolderId={selectedFolderId}
@@ -528,13 +521,14 @@ function Workflows() {
                 <DropdownMenuItem
                   onSelect={() => {
                     createWorkflowMutation.mutate({
-                      ...emptyWorkflowRequest,
+                      ...defaultWorkflowRequest,
                       folder_id: selectedFolderId,
+                      _via: "blank",
                     });
                   }}
                 >
                   <PlusIcon className="mr-2 h-4 w-4" />
-                  Blank Workflow
+                  Blank Agent
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => setIsTemplateDialogOpen(true)}
@@ -546,19 +540,15 @@ function Workflows() {
             </DropdownMenu>
           </div>
         </div>
-        <div className="rounded-lg border">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
-            <TableHeader className="rounded-t-lg bg-slate-elevation2">
+            <TableHeader>
               <TableRow>
-                <TableHead className="w-[25%] rounded-tl-lg text-slate-400">
-                  ID
-                </TableHead>
-                <TableHead className="w-[30%] text-slate-400">Title</TableHead>
-                <TableHead className="w-[15%] text-slate-400">Folder</TableHead>
-                <TableHead className="w-[15%] text-slate-400">
-                  Created At
-                </TableHead>
-                <TableHead className="w-[15%] rounded-tr-lg"></TableHead>
+                <TableHead className="w-[25%]">ID</TableHead>
+                <TableHead className="w-[30%]">Title</TableHead>
+                <TableHead className="w-[15%]">Folder</TableHead>
+                <TableHead className="w-[15%]">Created At</TableHead>
+                <TableHead className="w-[15%] text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -591,9 +581,7 @@ function Workflows() {
                   </TableRow>
                 ))
               ) : displayWorkflows?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={5}>No workflows found</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={5}>No agents found</TableMessageRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
                   const parameterItems = workflow.workflow_definition.parameters
@@ -610,7 +598,7 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id,
                   );
-                  // Check if this is an importing workflow
+                  // Check if this is an importing agent
                   const isUploading = workflow.status === "importing";
 
                   return (
@@ -627,18 +615,18 @@ function Workflows() {
                             </div>
                           </TableCell>
                           <TableCell>
-                            <span className="text-slate-400">-</span>
+                            <span className="text-muted-foreground">-</span>
+                          </TableCell>
+                          <TableCell className="text-muted-foreground">
+                            {compactLocalDateTime(workflow.created_at)}
                           </TableCell>
                           <TableCell>
-                            {basicLocalTimeFormat(workflow.created_at)}
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex justify-end gap-2">
+                            <div className="flex justify-end gap-0.5">
                               <Button size="icon" variant="ghost" disabled>
                                 <FolderIcon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
-                                <MixerHorizontalIcon className="h-4 w-4" />
+                                <Pencil2Icon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
                                 <PlayIcon className="h-4 w-4" />
@@ -660,7 +648,7 @@ function Workflows() {
                             }}
                           >
                             <div
-                              className="truncate"
+                              className="truncate font-mono text-xs text-muted-foreground"
                               title={workflow.workflow_permanent_id}
                             >
                               <HighlightText
@@ -724,7 +712,7 @@ function Workflows() {
                                 </span>
                               </div>
                             ) : (
-                              <span className="text-slate-400">-</span>
+                              <span className="text-muted-foreground">-</span>
                             )}
                           </TableCell>
                           <TableCell
@@ -734,12 +722,13 @@ function Workflows() {
                                 workflow.workflow_permanent_id,
                               );
                             }}
+                            className="text-muted-foreground"
                             title={basicTimeFormat(workflow.created_at)}
                           >
-                            {basicLocalTimeFormat(workflow.created_at)}
+                            {compactLocalDateTime(workflow.created_at)}
                           </TableCell>
                           <TableCell>
-                            <div className="flex justify-end gap-2">
+                            <div className="flex justify-end gap-0.5">
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
@@ -762,35 +751,8 @@ function Workflows() {
                                   <TooltipTrigger asChild>
                                     <Button
                                       size="icon"
-                                      variant="outline"
-                                      onClick={() =>
-                                        toggleParametersExpanded(
-                                          workflow.workflow_permanent_id,
-                                        )
-                                      }
-                                      disabled={!hasParameters}
-                                      className={cn(
-                                        isExpanded && "text-blue-400",
-                                      )}
-                                    >
-                                      <MixerHorizontalIcon className="h-4 w-4" />
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    {hasParameters
-                                      ? isExpanded
-                                        ? "Hide Parameters"
-                                        : "Show Parameters"
-                                      : "No Parameters"}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      size="icon"
-                                      variant="outline"
+                                      variant="ghost"
+                                      className="text-muted-foreground hover:text-foreground"
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
@@ -811,7 +773,8 @@ function Workflows() {
                                   <TooltipTrigger asChild>
                                     <Button
                                       size="icon"
-                                      variant="outline"
+                                      variant="ghost"
+                                      className="text-cta hover:text-cta"
                                       onClick={(event) => {
                                         handleIconClick(
                                           event,
@@ -827,7 +790,16 @@ function Workflows() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
-                              <WorkflowActions workflow={workflow} />
+                              <WorkflowActions
+                                workflow={workflow}
+                                hasParameters={hasParameters}
+                                parametersExpanded={isExpanded}
+                                onToggleParameters={() =>
+                                  toggleParametersExpanded(
+                                    workflow.workflow_permanent_id,
+                                  )
+                                }
+                              />
                             </div>
                           </TableCell>
                         </TableRow>

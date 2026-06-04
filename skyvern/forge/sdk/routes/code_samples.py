@@ -50,6 +50,16 @@ CANCEL_RUN_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
 const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
 await skyvern.cancelRun("tsk_v2_123");
 """
+BULK_CANCEL_RUNS_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
+
+skyvern = Skyvern(api_key="YOUR_API_KEY")
+await skyvern.bulk_cancel_runs(run_ids=["tsk_v2_123", "wr_456"])
+"""
+BULK_CANCEL_RUNS_CODE_SAMPLE_TS = """import { SkyvernClient } from "@skyvern/client";
+
+const skyvern = new SkyvernClient({ apiKey: "YOUR_API_KEY" });
+await skyvern.bulkCancelRuns({ run_ids: ["tsk_v2_123", "wr_456"] });
+"""
 RETRY_RUN_WEBHOOK_CODE_SAMPLE_PYTHON = """from skyvern import Skyvern
 
 skyvern = Skyvern(api_key="YOUR_API_KEY")

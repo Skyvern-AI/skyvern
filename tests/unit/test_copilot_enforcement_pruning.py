@@ -9,6 +9,7 @@ These cover three regressions observed in trace 019d7b5c884dff0ff648680b9f31f715
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _is_meaningful_extracted_data,
     _record_run_blocks_result,
 )
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
 
 class _Ctx:
@@ -110,6 +112,70 @@ def test_meaningful_data_empty_string() -> None:
 
 def test_meaningful_data_string() -> None:
     assert _is_meaningful_extracted_data("$260.48") is True
+
+
+def test_unrecoverable_browser_session_error_stops_after_second_failure() -> None:
+    from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotUnrecoverableToolError,
+        _maybe_raise_unrecoverable_tool_error,
+    )
+
+    ctx = SimpleNamespace()
+    output = {"ok": False, "error": "Browser session not found while taking screenshot (404)."}
+
+    _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
+    assert ctx.unrecoverable_tool_error_streak_count == 1
+
+    with pytest.raises(CopilotUnrecoverableToolError) as exc_info:
+        _maybe_raise_unrecoverable_tool_error(ctx, "get_browser_screenshot", output)
+
+    assert "Browser session not found" in str(exc_info.value)
+    assert ctx.unrecoverable_tool_error_streak_count == 2
+    contract = ctx.latest_diagnosis_repair_contract
+    assert contract.repair_decision.next_action == "stop"
+    assert contract.verification_result.remaining_blocker == "Browser session not found while taking screenshot (404)."
+
+
+def test_unrecoverable_tool_error_ignores_regular_website_404() -> None:
+    from skyvern.forge.sdk.copilot.enforcement import _maybe_raise_unrecoverable_tool_error
+
+    ctx = SimpleNamespace()
+
+    _maybe_raise_unrecoverable_tool_error(
+        ctx,
+        "navigate_browser",
+        {"ok": False, "error": "The page returned HTTP 404 page not found."},
+    )
+
+    assert getattr(ctx, "unrecoverable_tool_error_streak_count", 0) == 0
+    assert getattr(ctx, "latest_diagnosis_repair_contract", None) is None
+
+
+def test_unrecoverable_contract_stop_preempts_failed_test_nudge() -> None:
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import build_diagnosis_repair_contract
+    from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError, _check_enforcement
+
+    ctx = _Ctx()
+    ctx.last_test_ok = False
+    reason = "Browser session not found while running blocks (404)."
+    ctx.latest_diagnosis_repair_contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": reason,
+            "data": {
+                "overall_status": "aborted",
+                "failure_reason": reason,
+                "failure_categories": [{"category": "UNRECOVERABLE_TOOL_ERROR"}],
+            },
+        },
+        ctx=ctx,
+    )
+
+    with pytest.raises(CopilotUnrecoverableToolError):
+        _check_enforcement(ctx)
+
+    assert ctx.failed_test_nudge_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -228,15 +294,13 @@ def test_analyze_text_prompt_all_null_is_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_ctx_for_record() -> Any:
+def _fresh_ctx_for_record() -> SimpleNamespace:
     """SimpleNamespace shaped for _record_run_blocks_result + update_repeated_failure_state.
 
     Uses getattr-with-default-compatible defaults so the function under test
     populates the interesting fields without tripping AttributeError on the
     downstream update_repeated_failure_state call.
     """
-    from types import SimpleNamespace
-
     return SimpleNamespace(
         last_test_ok=True,
         last_test_failure_reason=None,
@@ -247,11 +311,16 @@ def _fresh_ctx_for_record() -> Any:
         null_data_streak_count=0,
         failed_test_nudge_count=0,
         last_failed_workflow_yaml=None,
+        last_good_workflow=None,
+        last_good_workflow_yaml=None,
         non_retriable_nav_error_last_emitted_signature=None,
         workflow_yaml=None,
         last_workflow=None,
+        last_workflow_yaml=None,
         last_frontier_start_label=None,
         last_executed_block_labels=[],
+        last_full_workflow_test_ok=False,
+        last_unverified_block_labels=[],
         last_failure_signature=None,
         last_frontier_fingerprint=None,
         repeated_failure_streak_count=0,
@@ -260,6 +329,7 @@ def _fresh_ctx_for_record() -> Any:
         last_action_sequence_fingerprint=None,
         repeated_action_fingerprint_streak_count=0,
         copilot_total_timeout_exceeded=False,
+        workflow_verification_evidence=WorkflowVerificationEvidence(),
     )
 
 
@@ -274,6 +344,64 @@ def test_record_run_blocks_result_flips_last_test_ok_on_empty_extraction_envelop
     assert ctx.last_test_ok is None
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_test_failure_reason is not None
+
+
+def test_record_run_blocks_result_does_not_promote_partial_frontier_to_full_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_partial",
+            "requested_block_labels": ["open"],
+            "executed_block_labels": ["open"],
+            "blocks": [{"label": "open", "status": "completed"}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_unverified_block_labels == ["extract"]
+    assert ctx.last_good_workflow is None
+    assert "unverified workflow blocks remain" in (ctx.last_test_failure_reason or "")
+
+
+def test_record_run_blocks_result_promotes_when_verified_prefix_covers_workflow() -> None:
+    from types import SimpleNamespace
+
+    ctx = _fresh_ctx_for_record()
+    ctx.last_workflow = SimpleNamespace(
+        workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="open"), SimpleNamespace(label="extract")])
+    )
+    ctx.last_workflow_yaml = "workflow: yaml"
+    ctx.verified_prefix_labels = ["open", "extract"]
+
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_full",
+            "requested_block_labels": ["extract"],
+            "executed_block_labels": ["extract"],
+            "blocks": [{"label": "extract", "status": "completed", "extracted_data": {"value": "ok"}}],
+        },
+    }
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_unverified_block_labels == []
+    assert ctx.last_good_workflow is ctx.last_workflow
+    assert ctx.last_good_workflow_yaml == ctx.last_workflow_yaml
 
 
 def test_record_run_blocks_result_keeps_failure_when_watchdog_cancel_without_timeout() -> None:
@@ -621,6 +749,22 @@ class TestEnforcement:
         )
         ask = MagicMock()
         ask.final_output = json.dumps({"type": "ASK_QUESTION", "user_response": "Which source?"})
+        ask.new_items = []
+        assert _check_enforcement(ctx, ask) is None
+
+    def test_plain_labeled_ask_question_passes_even_with_coverage_gap(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import _check_enforcement
+
+        ctx = self._make_ctx(
+            update_workflow_called=True,
+            test_after_update_done=True,
+            last_test_ok=True,
+            last_update_block_count=1,
+            user_message="Go to france.fr and then download all french regulations",
+            coverage_nudge_count=0,
+        )
+        ask = MagicMock()
+        ask.final_output = "ASK_QUESTION\nWhich source?"
         ask.new_items = []
         assert _check_enforcement(ctx, ask) is None
 

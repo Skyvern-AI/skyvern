@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from skyvern.forge.sdk.copilot.context import StructuredContext
+from skyvern.forge.sdk.copilot.context import ObservedPage, StructuredContext, _merge_observed_acted_pages
 
 
 def test_merge_turn_summary_caps_urls_visited() -> None:
@@ -32,6 +32,27 @@ def test_merge_turn_summary_caps_credentials_checked() -> None:
     ctx.merge_turn_summary(activity)
 
     assert len(ctx.credentials_checked) == 40
+
+
+def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
+    pages = _merge_observed_acted_pages(
+        [ObservedPage(url="https://example.com/old", had_bounded_schema=True, reached_via="navigate")],
+        [
+            {
+                "evidence": {
+                    "current_url": "https://example.com/cart",
+                    "inspected_url": "https://example.com/cart",
+                },
+                "had_bounded_schema": True,
+                "reached_via": "interaction",
+                "step": 3,
+            }
+        ],
+    )
+
+    by_url = {page.url: page for page in pages}
+    assert by_url["https://example.com/cart"].had_bounded_schema is True
+    assert by_url["https://example.com/cart"].reached_via == "interaction"
 
 
 class TestCopilotContext:
@@ -101,8 +122,12 @@ class TestCopilotContext:
         frontier_fields = {
             "verified_block_outputs",
             "verified_prefix_labels",
+            "verified_prefix_current_url",
+            "last_run_blocks_workflow_run_id",
             "last_requested_block_labels",
             "last_executed_block_labels",
+            "last_full_workflow_test_ok",
+            "last_unverified_block_labels",
             "last_frontier_start_label",
             "last_frontier_fingerprint",
             "last_failure_signature",
@@ -126,8 +151,12 @@ class TestCopilotContext:
         )
         assert ctx.verified_block_outputs == {}
         assert ctx.verified_prefix_labels == []
+        assert ctx.verified_prefix_current_url is None
+        assert ctx.last_run_blocks_workflow_run_id is None
         assert ctx.last_requested_block_labels == []
         assert ctx.last_executed_block_labels == []
+        assert ctx.last_full_workflow_test_ok is False
+        assert ctx.last_unverified_block_labels == []
         assert ctx.last_frontier_start_label is None
         assert ctx.last_frontier_fingerprint is None
         assert ctx.last_failure_signature is None

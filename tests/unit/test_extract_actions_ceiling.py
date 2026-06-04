@@ -34,12 +34,42 @@ def test_extract_action_ceiling_drops_action_history_on_overshoot() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        parse_select_feature_enabled=False,
-        has_magic_link_page=False,
+        show_close_page_action=False,
+        open_tabs_context=None,
     )
 
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
     assert "UNIQUE_ACTION_BLOCK_0_" not in rendered
+
+
+def test_enforce_ceiling_raises_when_unfixable() -> None:
+    import pytest
+
+    from skyvern.exceptions import SkyvernContextWindowExceededError
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, enforce_prompt_ceiling_tracked
+    from skyvern.utils.token_counter import count_tokens
+
+    oversized_goal = "extract " + ("important data " * 200_000)
+    prompt = engine_module.load_prompt(
+        "data-extraction-summary",
+        data_extraction_goal=oversized_goal,
+        data_extraction_schema=None,
+        local_datetime="2026-05-19T12:00:00",
+    )
+    assert count_tokens(prompt) > PROMPT_HARD_CEILING_TOKENS
+
+    with pytest.raises(SkyvernContextWindowExceededError):
+        enforce_prompt_ceiling_tracked(
+            prompt,
+            prompt_engine=engine_module,
+            template_name="data-extraction-summary",
+            kwargs={
+                "data_extraction_goal": oversized_goal,
+                "data_extraction_schema": None,
+                "local_datetime": "2026-05-19T12:00:00",
+            },
+        )
 
 
 def test_extract_action_small_prompt_passes_through() -> None:
@@ -62,8 +92,8 @@ def test_extract_action_small_prompt_passes_through() -> None:
         verification_code_check=False,
         complete_criterion=None,
         terminate_criterion=None,
-        parse_select_feature_enabled=False,
-        has_magic_link_page=False,
+        show_close_page_action=False,
+        open_tabs_context=None,
     )
 
     assert "small history" in rendered

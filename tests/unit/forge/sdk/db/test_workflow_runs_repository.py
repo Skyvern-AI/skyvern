@@ -306,6 +306,7 @@ async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> No
     await repo.get_workflow_runs_for_workflow_permanent_id(
         workflow_permanent_id="wpid_test",
         organization_id="o_test",
+        exclude_child_runs=True,
     )
 
     assert len(captured_queries) == 2
@@ -313,6 +314,31 @@ async def test_workflow_run_history_queries_exclude_copilot_session_runs() -> No
         where_clause = _where_clause_sql(query)
         assert "workflow_runs.copilot_session_id IS NULL" in where_clause
         _assert_not_filtering_copilot_authored_workflows(where_clause)
+    workflow_runs_for_workflow_clause = _where_clause_sql(captured_queries[1])
+    assert "workflow_runs.parent_workflow_run_id IS NULL" in workflow_runs_for_workflow_clause
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_for_workflow_permanent_id_keeps_child_runs_by_default() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_for_workflow_permanent_id(
+        workflow_permanent_id="wpid_test",
+        organization_id="o_test",
+    )
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.parent_workflow_run_id IS NULL" not in where_clause
+    assert "workflow_runs.copilot_session_id IS NULL" in where_clause
 
 
 @pytest.mark.asyncio

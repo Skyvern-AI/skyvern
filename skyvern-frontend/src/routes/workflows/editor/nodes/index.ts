@@ -1,4 +1,5 @@
-import { memo } from "react";
+import type { NodeProps } from "@xyflow/react";
+import { memo, type ComponentType } from "react";
 import { CodeBlockNode as CodeBlockNodeComponent } from "./CodeBlockNode/CodeBlockNode";
 import { CodeBlockNode } from "./CodeBlockNode/types";
 import { ConditionalNode as ConditionalNodeComponent } from "./ConditionalNode/ConditionalNode";
@@ -55,6 +56,9 @@ import { GoogleSheetsReadNode } from "./GoogleSheetsReadNode/types";
 import { GoogleSheetsReadNode as GoogleSheetsReadNodeComponent } from "./GoogleSheetsReadNode/GoogleSheetsReadNode";
 import { GoogleSheetsWriteNode } from "./GoogleSheetsWriteNode/types";
 import { GoogleSheetsWriteNode as GoogleSheetsWriteNodeComponent } from "./GoogleSheetsWriteNode/GoogleSheetsWriteNode";
+import { withSortableBlock } from "../sortable/withSortableBlock";
+import { withCollapsible } from "../collapse/withCollapsible";
+import { withSelectableBlock } from "../selection/withSelectableBlock";
 
 export type UtilityNode = StartNode | NodeAdderNode;
 
@@ -96,33 +100,54 @@ export function isWorkflowBlockNode(node: AppNode): node is WorkflowBlockNode {
 
 export type AppNode = UtilityNode | WorkflowBlockNode;
 
+// Composition order is load-bearing:
+//   memo (outermost)    - stable identity per node type for RF reconciliation
+//   withSortableBlock   - registers `useSortable({ id })`; the inner tree
+//                         must mount in both open and collapsed states so
+//                         drag pickup works on either
+//   withSelectableBlock - reads `useSortable.isDragging` to suppress
+//                         selection on drag pickup
+//   withCollapsible     - leaf wrapper for body chrome
+function wrapBlock<P extends NodeProps>(Component: ComponentType<P>) {
+  return memo(
+    withSortableBlock(withSelectableBlock(withCollapsible(Component))),
+  );
+}
+
+// `loop` and `conditional` are containers — RF renders their bodies as
+// child nodes, so collapsing the parent to a header-only card would leave
+// children visually overflowing the card and break edge layout.
+function wrapContainerBlock<P extends NodeProps>(Component: ComponentType<P>) {
+  return memo(withSortableBlock(withSelectableBlock(Component)));
+}
+
 export const nodeTypes = {
-  loop: memo(LoopNodeComponent),
-  conditional: memo(ConditionalNodeComponent),
-  task: memo(TaskNodeComponent),
-  textPrompt: memo(TextPromptNodeComponent),
-  sendEmail: memo(SendEmailNodeComponent),
-  codeBlock: memo(CodeBlockNodeComponent),
-  fileParser: memo(FileParserNodeComponent),
-  upload: memo(UploadNodeComponent),
-  fileUpload: memo(FileUploadNodeComponent),
-  download: memo(DownloadNodeComponent),
+  loop: wrapContainerBlock(LoopNodeComponent),
+  conditional: wrapContainerBlock(ConditionalNodeComponent),
+  task: wrapBlock(TaskNodeComponent),
+  textPrompt: wrapBlock(TextPromptNodeComponent),
+  sendEmail: wrapBlock(SendEmailNodeComponent),
+  codeBlock: wrapBlock(CodeBlockNodeComponent),
+  fileParser: wrapBlock(FileParserNodeComponent),
+  upload: wrapBlock(UploadNodeComponent),
+  fileUpload: wrapBlock(FileUploadNodeComponent),
+  download: wrapBlock(DownloadNodeComponent),
   nodeAdder: memo(NodeAdderNodeComponent),
   start: memo(StartNodeComponent),
-  validation: memo(ValidationNodeComponent),
-  action: memo(ActionNodeComponent),
-  navigation: memo(NavigationNodeComponent),
-  human_interaction: memo(HumanInteractionNodeComponent),
-  extraction: memo(ExtractionNodeComponent),
-  login: memo(LoginNodeComponent),
-  wait: memo(WaitNodeComponent),
-  fileDownload: memo(FileDownloadNodeComponent),
-  pdfParser: memo(PDFParserNodeComponent),
-  taskv2: memo(Taskv2NodeComponent),
-  url: memo(URLNodeComponent),
-  http_request: memo(HttpRequestNodeComponent),
-  printPage: memo(PrintPageNodeComponent),
-  workflowTrigger: memo(WorkflowTriggerNodeComponent),
-  googleSheetsRead: memo(GoogleSheetsReadNodeComponent),
-  googleSheetsWrite: memo(GoogleSheetsWriteNodeComponent),
+  validation: wrapBlock(ValidationNodeComponent),
+  action: wrapBlock(ActionNodeComponent),
+  navigation: wrapBlock(NavigationNodeComponent),
+  human_interaction: wrapBlock(HumanInteractionNodeComponent),
+  extraction: wrapBlock(ExtractionNodeComponent),
+  login: wrapBlock(LoginNodeComponent),
+  wait: wrapBlock(WaitNodeComponent),
+  fileDownload: wrapBlock(FileDownloadNodeComponent),
+  pdfParser: wrapBlock(PDFParserNodeComponent),
+  taskv2: wrapBlock(Taskv2NodeComponent),
+  url: wrapBlock(URLNodeComponent),
+  http_request: wrapBlock(HttpRequestNodeComponent),
+  printPage: wrapBlock(PrintPageNodeComponent),
+  workflowTrigger: wrapBlock(WorkflowTriggerNodeComponent),
+  googleSheetsRead: wrapBlock(GoogleSheetsReadNodeComponent),
+  googleSheetsWrite: wrapBlock(GoogleSheetsWriteNodeComponent),
 } as const;

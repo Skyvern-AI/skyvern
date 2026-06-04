@@ -80,8 +80,12 @@ function Debugger() {
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
     maxScreenshotScrolls: workflow.max_screenshot_scrolls,
+    maxElapsedTimeMinutes: workflow.max_elapsed_time_minutes ?? null,
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
+      : null,
+    cdpConnectHeaders: workflow.cdp_connect_headers
+      ? JSON.stringify(workflow.cdp_connect_headers)
       : null,
     runWith: workflow.run_with ?? "agent",
     codeVersion: workflow.code_version ?? null,
@@ -101,6 +105,7 @@ function Debugger() {
     <div className="relative flex h-screen w-full">
       <ReactFlowProvider>
         <Workspace
+          key={workflowPermanentId}
           initialEdges={elements.edges}
           initialNodes={elements.nodes}
           initialTitle={workflow.title}

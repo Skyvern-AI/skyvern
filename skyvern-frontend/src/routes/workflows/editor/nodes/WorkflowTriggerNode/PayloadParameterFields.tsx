@@ -131,19 +131,13 @@ function PayloadParameterFields({
   );
 
   if (parameters.length === 0 && staleKeys.length === 0) {
-    return (
-      <p className="text-xs text-slate-500">
-        This workflow has no input parameters.
-      </p>
-    );
+    return <p className="text-xs text-slate-500">This agent has no inputs.</p>;
   }
 
   return (
     <div className="space-y-3">
       {parameters.length === 0 && (
-        <p className="text-xs text-slate-500">
-          This workflow has no input parameters.
-        </p>
+        <p className="text-xs text-slate-500">This agent has no inputs.</p>
       )}
       {parameters.map((param) => {
         const isCredential = isCredentialParam(param);
@@ -212,10 +206,9 @@ function PayloadParameterFields({
             Dormant payload entries
           </p>
           <p className="text-[10px] text-slate-400">
-            The target workflow no longer declares these parameters. They are
-            saved but never consumed at runtime, and any malformed Jinja2 here
-            will still fail the trigger at execute time. Delete or align the
-            target.
+            The target agent no longer declares these parameters. They are saved
+            but never consumed at runtime, and any malformed Jinja2 here will
+            still fail the trigger at execute time. Delete or align the target.
           </p>
           {staleKeys.map((key) => (
             <div key={key} className="flex items-center gap-2">

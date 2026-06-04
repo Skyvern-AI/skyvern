@@ -5,6 +5,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -50,6 +51,8 @@ from skyvern.forge.sdk.db.id import (
     generate_script_id,
     generate_script_revision_id,
     generate_step_id,
+    generate_tag_event_id,
+    generate_tag_key_id,
     generate_task_generation_id,
     generate_task_id,
     generate_task_run_id,
@@ -109,6 +112,7 @@ class TaskModel(Base):
     proxy_location = Column(String)
     extracted_information_schema = Column(JSON)
     extra_http_headers = Column(JSON, nullable=True)
+    cdp_connect_headers = Column(JSON, nullable=True)
     workflow_run_id = Column(String, ForeignKey("workflow_runs.workflow_run_id"), index=True)
     order = Column(Integer, nullable=True)
     retry = Column(Integer, nullable=True)
@@ -300,6 +304,120 @@ class FolderModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class WorkflowTagEventModel(Base):
+    """Append-only event log for workflow tags.
+
+    Every state change writes a new row. SET events carry value; DELETE
+    events have value=NULL and carry their own attribution. Supersession
+    sets superseded_at on the previously-current row so the partial unique
+    index keeps exactly one active SET per (org, wpid, key). superseded_at
+    means "no longer current but still historical fact"; deleted_at follows
+    the same soft-delete convention as SoftDeleteMixin (via a manual column)
+    and is separate.
+
+    workflow_permanent_id is intentionally NOT a foreign key: WorkflowModel
+    only has a unique constraint on (organization_id, workflow_permanent_id,
+    version), so the column itself isn't a valid FK target. Mirrors
+    WorkflowScheduleModel; integrity enforced at app level.
+    """
+
+    __tablename__ = "workflow_tag_events"
+    # workflow_permanent_id has no single-column index: it's only ever queried alongside
+    # organization_id, so the (organization_id, workflow_permanent_id, ...) composites below
+    # cover it. Skipping the redundant index saves write throughput on this append-only table.
+    __table_args__ = (
+        Index("workflow_tag_events_org_wpid_set_at_idx", "organization_id", "workflow_permanent_id", "set_at"),
+        Index(
+            "workflow_tag_events_org_wpid_key_set_at_idx",
+            "organization_id",
+            "workflow_permanent_id",
+            "key",
+            "set_at",
+        ),
+        Index(
+            "workflow_tag_events_org_key_value_active_idx",
+            "organization_id",
+            "key",
+            "value",
+            postgresql_include=["workflow_permanent_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        Index(
+            "workflow_tag_events_active_set_unique",
+            "organization_id",
+            "workflow_permanent_id",
+            "key",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
+        CheckConstraint(
+            "source IN ('manual', 'bulk_apply', 'backfill', 'inherited', 'import')",
+            name="ck_workflow_tag_events_source",
+        ),
+        CheckConstraint(
+            "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
+            name="ck_workflow_tag_events_caller_type",
+        ),
+        CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
+    )
+
+    tag_event_id = Column(String, primary_key=True, default=generate_tag_event_id)
+    workflow_permanent_id = Column(String, nullable=False)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    value = Column(String, nullable=True)
+    event_type = Column(String, nullable=False)
+    set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    set_by = Column(String, nullable=False)
+    source = Column(String, nullable=False)
+    caller_type = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
+class TagKeyModel(Base):
+    """Org-scoped registry of tag keys and their descriptions. Auto-registered
+    on first use; partial UNIQUE on (org, key) WHERE deleted_at IS NULL races
+    concurrent first-use writers — the losing writer surfaces IntegrityError to the caller."""
+
+    __tablename__ = "tag_keys"
+    __table_args__ = (
+        Index(
+            "ix_tag_keys_org_key_active",
+            "organization_id",
+            "key",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    tag_key_id = Column(String, primary_key=True, default=generate_tag_key_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
+    key = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 # TODO: ~22 other models with manual deleted_at columns could inherit SoftDeleteMixin.
 # WorkflowModel is the proof of concept; remaining models will be migrated in a follow-up PR.
 class WorkflowModel(SoftDeleteMixin, Base):
@@ -325,7 +443,9 @@ class WorkflowModel(SoftDeleteMixin, Base):
     proxy_location = Column(String)
     webhook_callback_url = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    max_elapsed_time_minutes = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    cdp_connect_headers = Column(JSON, nullable=True)
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     persist_browser_session = Column(Boolean, default=False, nullable=False)
@@ -443,7 +563,9 @@ class WorkflowRunModel(Base):
     totp_verification_url = Column(String)
     totp_identifier = Column(String)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
+    max_elapsed_time_minutes = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    cdp_connect_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True, index=True)
     script_run = Column(JSON, nullable=True)
     job_id = Column(String, nullable=True, index=True)
@@ -913,6 +1035,7 @@ class TaskV2Model(Base):
     max_steps = Column(Integer, nullable=True)
     max_screenshot_scrolling_times = Column(Integer, nullable=True)
     extra_http_headers = Column(JSON, nullable=True)
+    cdp_connect_headers = Column(JSON, nullable=True)
     browser_address = Column(String, nullable=True)
     generate_script = Column(Boolean, default=False, nullable=False)
     run_with = Column(String, nullable=True)  # 'agent' or 'code'
@@ -1084,6 +1207,9 @@ class TaskRunModel(Base):
     memory_mb = Column(Integer, nullable=True)
     duration_ms = Column(BigInteger, nullable=True)
     compute_cost = Column(Numeric, nullable=True)
+    llm_cost = Column(Numeric, nullable=True)
+    proxy_cost = Column(Numeric, nullable=True)
+    captcha_cost = Column(Numeric, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
 
@@ -1310,6 +1436,8 @@ class WorkflowCopilotChatMessageModel(Base):
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
     global_llm_context = Column(UnicodeText, nullable=True)
+    turn_outcome = Column(JSON, nullable=True)
+    narrative_payload = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
@@ -1325,6 +1453,7 @@ class ScriptFallbackEpisodeModel(Base):
     __table_args__ = (
         Index("sfe_org_wpid_index", "organization_id", "workflow_permanent_id"),
         Index("sfe_org_created_at_index", "organization_id", "created_at"),
+        Index("sfe_org_wrid_idx", "organization_id", "workflow_run_id"),
     )
 
     episode_id = Column(String, primary_key=True, default=generate_script_fallback_episode_id)
@@ -1343,6 +1472,7 @@ class ScriptFallbackEpisodeModel(Base):
     reviewed = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     reviewer_output = Column(UnicodeText, nullable=True)
     new_script_revision_id = Column(String, nullable=True)
+    reviewer_version = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(

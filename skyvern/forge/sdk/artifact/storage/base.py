@@ -30,15 +30,13 @@ async def _file_infos_from_artifacts(artifacts: list[Artifact], *, artifact_type
         return []
     organization_id = artifacts[0].organization_id
     expiry_seconds = await app.ARTIFACT_MANAGER.resolve_artifact_url_expiry_seconds(organization_id)
+    _ = artifact_type  # kept for call-site compatibility; URL hint now sourced from the artifact row.
     infos: list[FileInfo] = []
     for artifact in artifacts:
         filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
-        url = app.ARTIFACT_MANAGER.build_signed_content_url(
-            artifact_id=artifact.artifact_id,
-            artifact_name=filename,
-            artifact_type=artifact_type.value,
-            expiry_seconds=expiry_seconds,
-        )
+        url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
+        if url is None:
+            continue
         infos.append(
             FileInfo(
                 url=url,
@@ -151,6 +149,14 @@ class BaseStorage(ABC):
     @abstractmethod
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         pass
+
+    async def check_archived_uris(self, uris: list[str]) -> dict[str, bool]:
+        """Check whether each URI points to an archived (non-retrievable) S3 object.
+
+        Returns a mapping of URI -> True if the object is in GLACIER or DEEP_ARCHIVE.
+        Default implementation returns False for all URIs (local/Azure storage is never archived).
+        """
+        return {uri: False for uri in uris}
 
     @abstractmethod
     async def get_share_link(self, artifact: Artifact) -> str | None:

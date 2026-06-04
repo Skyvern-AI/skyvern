@@ -4,7 +4,6 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { ProxyLocation } from "@/api/types";
 
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -15,6 +14,7 @@ import {
   DrawerTitle,
 } from "@/components/ui/drawer";
 import { HelpTooltip } from "@/components/HelpTooltip";
+import { Pill } from "@/components/StatusBadge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -39,6 +39,7 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import { useBrowserSessionsQuery } from "@/routes/browserSessions/hooks/useBrowserSessionsQuery";
@@ -58,17 +59,9 @@ function sessionIsOpen(browserSession: BrowserSession): boolean {
   );
 }
 
-const No = () => (
-  <Badge className="flex h-7 w-12 justify-center bg-gray-800 text-orange-50 hover:bg-gray-900">
-    No
-  </Badge>
-);
+const No = () => <Pill tone="neutral">No</Pill>;
 
-const Yes = () => (
-  <Badge className="flex h-7 w-12 justify-center bg-green-900 text-green-50 hover:bg-green-900/80">
-    Yes
-  </Badge>
-);
+const Yes = () => <Pill tone="success">Yes</Pill>;
 
 const BROWSER_TYPE_OPTIONS: Array<{
   value: BrowserSessionType;
@@ -178,21 +171,19 @@ function BrowserSessions() {
   }
 
   return (
-    <div className="px-8">
-      {/* header */}
-      <div className="space-y-5">
+    <div className="container mx-auto space-y-6">
+      <div className="space-y-2">
         <div className="flex items-center gap-2">
           <GlobeIcon className="size-6" />
           <h1 className="text-2xl">Browsers</h1>
         </div>
-        <p className="text-slate-300">
-          Create your own live browsers to interact with websites, or run
-          workflows in.
+        <p className="text-sm leading-6 text-muted-foreground">
+          Create your own live browsers to interact with websites, or run agents
+          in.
         </p>
       </div>
 
-      {/* browsers */}
-      <div className="mt-6 space-y-4">
+      <div className="space-y-4">
         <div className="flex justify-end">
           <div className="flex gap-4">
             <Button
@@ -210,43 +201,33 @@ function BrowserSessions() {
             </Button>
           </div>
         </div>
-        <div className="rounded-lg border">
+        <div className="overflow-hidden rounded-lg border border-border">
           <Table className="w-full table-fixed">
-            <TableHeader className="rounded-t-lg bg-slate-elevation2">
+            <TableHeader>
               <TableRow>
-                <TableHead className="w-1/4 truncate rounded-tl-lg text-slate-400">
-                  ID
+                <TableHead className="w-[22%] truncate">ID</TableHead>
+                <TableHead className="w-[10%] truncate">Open</TableHead>
+                <TableHead className="w-[14%]">
+                  <span className="inline-flex items-center gap-1.5">
+                    Occupied
+                    <HelpTooltip
+                      className="inline"
+                      content="Browser is busy running a task or agent"
+                    />
+                  </span>
                 </TableHead>
-                <TableHead className="w-1/12 truncate text-slate-400">
-                  Open
-                </TableHead>
-                <TableHead className="w-1/6 truncate text-slate-400">
-                  <span className="mr-2">Occupied</span>
-                  <HelpTooltip
-                    className="inline"
-                    content="Browser is busy running a task or workflow"
-                  />
-                </TableHead>
-                <TableHead className="w-1/6 truncate text-slate-400">
-                  Started
-                </TableHead>
-                <TableHead className="w-1/6 truncate text-slate-400">
-                  Timeout
-                </TableHead>
-                <TableHead className="w-1/2 truncate text-slate-400">
-                  CDP Url
-                </TableHead>
+                <TableHead className="w-[14%] truncate">Started</TableHead>
+                <TableHead className="w-[12%] truncate">Timeout</TableHead>
+                <TableHead className="w-[28%] truncate">CDP Url</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
-                <TableRow>
-                  <TableCell colSpan={6}>Loading...</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={6}>Loading browsers…</TableMessageRow>
               ) : browserSessions?.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={6}>No browser sessions found</TableCell>
-                </TableRow>
+                <TableMessageRow colSpan={6}>
+                  No browser sessions found
+                </TableMessageRow>
               ) : (
                 browserSessions?.map((browserSession) => {
                   const isOpen = sessionIsOpen(browserSession);
@@ -264,18 +245,18 @@ function BrowserSessions() {
                   return (
                     <TableRow
                       key={browserSession.browser_session_id}
-                      className="cursor-pointer hover:bg-slate-elevation2"
+                      className="cursor-pointer"
                       onClick={(e) => {
                         handleRowClick(e, browserSession.browser_session_id);
                       }}
                     >
                       <TableCell>
-                        <div className="flex items-center font-mono text-sm">
-                          <div className="truncate opacity-75">
+                        <div className="flex items-center font-mono text-xs">
+                          <div className="truncate text-muted-foreground">
                             {browserSession.browser_session_id}
                           </div>
                           <CopyText
-                            className="opacity-75 hover:opacity-100"
+                            className="opacity-60 hover:opacity-100"
                             text={browserSession.browser_session_id}
                           />
                         </div>
@@ -285,6 +266,7 @@ function BrowserSessions() {
                         {browserSession.runnable_id ? <Yes /> : <No />}
                       </TableCell>
                       <TableCell
+                        className="text-muted-foreground"
                         title={
                           browserSession.started_at
                             ? basicTimeFormat(browserSession.started_at)
@@ -293,14 +275,16 @@ function BrowserSessions() {
                       >
                         {ago}
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="tabular-nums text-muted-foreground">
                         {browserSession.timeout
                           ? `${browserSession.timeout}m`
                           : "-"}
                       </TableCell>
                       <TableCell>
-                        <div className="flex items-center font-mono text-sm">
-                          <div className="truncate opacity-75">{cdpUrl}</div>
+                        <div className="flex items-center font-mono text-xs">
+                          <div className="truncate text-muted-foreground">
+                            {cdpUrl}
+                          </div>
                           {cdpUrl !== "-" ? (
                             <CopyText
                               className="opacity-75 hover:opacity-100"
@@ -319,7 +303,7 @@ function BrowserSessions() {
             <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
               <span className="text-slate-400">Items per page</span>
               <select
-                className="h-9 rounded-md border border-slate-300 bg-background"
+                className="h-8 rounded-md border border-input bg-background px-2 text-sm"
                 value={itemsPerPage}
                 onChange={(e) => {
                   const next = Number(e.target.value);
@@ -381,7 +365,7 @@ function BrowserSessions() {
             <DrawerTitle>Create Browser Session</DrawerTitle>
             <DrawerDescription>
               Create a new browser session to interact with websites, or run
-              workflows in.
+              agents in.
               <div className="mt-8 flex flex-col gap-4">
                 <div className="space-y-2">
                   <div className="flex gap-2">

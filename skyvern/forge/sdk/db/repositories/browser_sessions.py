@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import structlog
 from sqlalchemy import asc, case, or_, select
 
+from skyvern.config import settings
 from skyvern.exceptions import BrowserProfileNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
     BrowserProfileModel,
@@ -115,7 +117,7 @@ class BrowserSessionsRepository(BaseRepository):
             browser_profile = (await session.scalars(query)).first()
             if not browser_profile:
                 raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
-            browser_profile.deleted_at = datetime.now(timezone.utc)
+            browser_profile.deleted_at = naive_utc_now()
             await session.commit()
 
     @db_operation("update_browser_profile")
@@ -159,10 +161,7 @@ class BrowserSessionsRepository(BaseRepository):
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
                 .filter_by(completed_at=None)
-                .filter(
-                    PersistentBrowserSessionModel.created_at
-                    > datetime.now(timezone.utc) - timedelta(hours=active_hours)
-                )
+                .filter(PersistentBrowserSessionModel.created_at > naive_utc_now() - timedelta(hours=active_hours))
             )
             sessions = result.scalars().all()
             return [PersistentBrowserSession.model_validate(session) for session in sessions]
@@ -189,10 +188,7 @@ class BrowserSessionsRepository(BaseRepository):
                 select(PersistentBrowserSessionModel)
                 .filter_by(organization_id=organization_id)
                 .filter_by(deleted_at=None)
-                .filter(
-                    PersistentBrowserSessionModel.created_at
-                    > (datetime.now(timezone.utc) - timedelta(hours=lookback_hours))
-                )
+                .filter(PersistentBrowserSessionModel.created_at > (naive_utc_now() - timedelta(hours=lookback_hours)))
                 .order_by(
                     open_first.asc(),  # open sessions first
                     PersistentBrowserSessionModel.created_at.desc(),  # then newest within each group
@@ -231,14 +227,16 @@ class BrowserSessionsRepository(BaseRepository):
     ) -> PersistentBrowserSession | None:
         """Get a specific persistent browser session."""
         async with self.Session() as session:
-            persistent_browser_session = (
-                await session.scalars(
-                    select(PersistentBrowserSessionModel)
-                    .filter_by(persistent_browser_session_id=session_id)
-                    .filter_by(organization_id=organization_id)
-                    .filter_by(deleted_at=None)
-                )
-            ).first()
+            query = (
+                select(PersistentBrowserSessionModel)
+                .filter_by(persistent_browser_session_id=session_id)
+                .filter_by(deleted_at=None)
+            )
+            if organization_id is not None or settings.ENV != "local":
+                if organization_id is None:
+                    raise ValueError("organization_id is required outside local development")
+                query = query.filter_by(organization_id=organization_id)
+            persistent_browser_session = (await session.scalars(query)).first()
             if persistent_browser_session:
                 return PersistentBrowserSession.model_validate(persistent_browser_session)
             return None
@@ -303,9 +301,9 @@ class BrowserSessionsRepository(BaseRepository):
             if timeout_minutes:
                 persistent_browser_session.timeout_minutes = timeout_minutes
             if completed_at:
-                persistent_browser_session.completed_at = completed_at
+                persistent_browser_session.completed_at = to_naive_utc(completed_at)
             if started_at:
-                persistent_browser_session.started_at = started_at
+                persistent_browser_session.started_at = to_naive_utc(started_at)
 
             await session.commit()
             await session.refresh(persistent_browser_session)
@@ -334,7 +332,7 @@ class BrowserSessionsRepository(BaseRepository):
                 if browser_address:
                     persistent_browser_session.browser_address = browser_address
                     # once the address is set, the session is started
-                    persistent_browser_session.started_at = datetime.now(timezone.utc)
+                    persistent_browser_session.started_at = naive_utc_now()
                 if ip_address:
                     persistent_browser_session.ip_address = ip_address
                 if ecs_task_arn:
@@ -388,7 +386,7 @@ class BrowserSessionsRepository(BaseRepository):
                 )
             ).first()
             if persistent_browser_session:
-                persistent_browser_session.deleted_at = datetime.now(timezone.utc)
+                persistent_browser_session.deleted_at = naive_utc_now()
                 await session.commit()
                 await session.refresh(persistent_browser_session)
             else:
@@ -456,7 +454,7 @@ class BrowserSessionsRepository(BaseRepository):
             if persistent_browser_session:
                 if persistent_browser_session.completed_at:
                     return PersistentBrowserSession.model_validate(persistent_browser_session)
-                persistent_browser_session.completed_at = datetime.now(timezone.utc)
+                persistent_browser_session.completed_at = naive_utc_now()
                 persistent_browser_session.status = "completed"
                 await session.commit()
                 await session.refresh(persistent_browser_session)

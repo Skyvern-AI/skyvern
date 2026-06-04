@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import time
 import urllib.parse
 import uuid
@@ -15,7 +16,7 @@ import structlog
 from fuzzysearch import find_near_matches
 from opentelemetry import trace as otel_trace
 from playwright._impl._errors import Error as PlaywrightError
-from playwright.async_api import Download, FileChooser, Frame, Locator, Page, TimeoutError
+from playwright.async_api import Download, FileChooser, Frame, Locator, Page, Response, TimeoutError
 from pydantic import BaseModel
 
 from skyvern.config import settings
@@ -67,16 +68,16 @@ from skyvern.forge.sdk.api.files import (
     check_downloading_files_and_wait_for_download_to_complete,
     get_download_dir,
     list_files_in_directory,
+    make_temp_directory,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
-from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
-from skyvern.forge.sdk.core.skyvern_context import ensure_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
+from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
@@ -85,6 +86,7 @@ from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
+from skyvern.utils.lean_html import apply_lean_to_tree
 from skyvern.utils.prompt_engine import (
     CheckDateFormatResponse,
     CheckPhoneNumberFormatResponse,
@@ -111,6 +113,13 @@ from skyvern.webeye.actions.actions import (
 )
 from skyvern.webeye.actions.responses import ActionAbort, ActionFailure, ActionResult, ActionSuccess
 from skyvern.webeye.browser_factory import initialize_download_dir
+from skyvern.webeye.cdp_download_interceptor import (
+    DOWNLOAD_MIME_TYPES,
+    MAX_FILE_SIZE_BYTES,
+    extract_filename,
+    is_download_response,
+    normalize_download_filename,
+)
 from skyvern.webeye.scraper.scraped_page import (
     CleanupElementTreeFunc,
     ElementTreeBuilder,
@@ -119,10 +128,16 @@ from skyvern.webeye.scraper.scraped_page import (
     json_to_html,
 )
 from skyvern.webeye.scraper.scraper import IncrementalScrapePage, hash_element, trim_element_tree
+from skyvern.webeye.transient_page_observer import (
+    TransientPageTextObserver,
+    match_user_defined_errors_from_transient_text,
+)
 from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+UPLOAD_PENDING_FOLLOWUP_MESSAGE = "Upload is not complete yet. Continue the upload flow."
 
 DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS = 60
 DOWNLOAD_DUPLICATE_STEM_SUFFIX_RE = re.compile(r"(?:\s+\(\d{1,3}\)|_\d{1,3})$")
@@ -501,6 +516,120 @@ class AutoCompletionResult(BaseModel):
     action_result: ActionResult = ActionSuccess()
 
 
+class ScopedXhrDownloadCapture:
+    """Install on a page before a download action; remove after the polling window.
+
+    Skipped when CDPDownloadInterceptor is active on the browser context
+    (detected via ``_skyvern_cdp_download_active`` flag) because the CDP path
+    already handles downloads at the Fetch domain level.
+
+    Automatically attaches to new pages opened during the action window
+    (e.g. target="_blank" links) so XHR responses on child tabs are captured.
+    """
+
+    def __init__(self, page: Page, download_dir: Path) -> None:
+        self._page = page
+        self._download_dir = download_dir
+        self._saved: set[str] = set()
+        self._extra_pages: list[Page] = []
+        self._active = False
+        self._in_flight = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
+
+    def _is_xhr_download(self, headers: dict[str, str], status: int) -> bool:
+        """Check if an XHR response carries a downloadable file body.
+
+        Reuses ``is_download_response`` for attachment cases. For inline
+        responses, additionally accepts download MIME + explicit filename
+        (the case ``is_download_response`` intentionally rejects for the
+        global CDP path to avoid false positives on PDF previews).
+        """
+        if is_download_response(headers, status, resource_type="XHR"):
+            return True
+        if status >= 400:
+            return False
+        content_type = headers.get("content-type", "").split(";")[0].strip().lower()
+        content_disposition = headers.get("content-disposition", "")
+        if content_type not in DOWNLOAD_MIME_TYPES:
+            return False
+        return bool(re.search(r"filename\s*[*]?\s*=", content_disposition, re.IGNORECASE))
+
+    async def _on_response(self, response: Response) -> None:
+        self._in_flight += 1
+        self._drained.clear()
+        try:
+            try:
+                if response.request.resource_type not in ("xhr", "fetch"):
+                    return
+                headers = response.headers
+                if not self._is_xhr_download(headers, response.status):
+                    return
+                raw_filename = extract_filename({"content-disposition": headers.get("content-disposition", "")}, "")
+                filename = normalize_download_filename(raw_filename, headers.get("content-type", ""))
+                if not filename or filename in self._saved:
+                    return
+                content_length = headers.get("content-length", "")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_FILE_SIZE_BYTES:
+                            return
+                    except ValueError:
+                        pass
+                save_path = self._download_dir / filename
+                body = await response.body()
+                if len(body) > MAX_FILE_SIZE_BYTES:
+                    return
+                try:
+                    with open(save_path, "xb") as f:
+                        f.write(body)
+                except FileExistsError:
+                    pass
+                self._saved.add(filename)
+                LOG.info(
+                    "XHR download captured during download action",
+                    filename=filename,
+                    size=len(body),
+                )
+            except Exception:
+                LOG.warning("Failed to capture XHR download response", exc_info=True)
+        finally:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._drained.set()
+
+    async def drain(self) -> None:
+        """Wait for in-flight XHR captures to finish. Best-effort: late events
+        after drain returns are cleaned up by the caller's finally block."""
+        await self._drained.wait()
+
+    def _on_new_page(self, page: Page) -> None:
+        if not self._active:
+            return
+        page.on("response", self._on_response)
+        self._extra_pages.append(page)
+
+    def enable(self) -> None:
+        if getattr(self._page.context, "_skyvern_cdp_download_active", False):
+            return
+        self._page.on("response", self._on_response)
+        self._page.context.on("page", self._on_new_page)
+        self._active = True
+
+    def disable(self) -> None:
+        if not self._active:
+            return
+        self._page.remove_listener("response", self._on_response)
+        self._page.context.remove_listener("page", self._on_new_page)
+        for page in self._extra_pages:
+            try:
+                page.remove_listener("response", self._on_response)
+            except Exception:
+                pass
+        self._extra_pages.clear()
+        self._active = False
+
+
 class ActionHandler:
     _handled_action_types: dict[
         ActionType,
@@ -581,11 +710,8 @@ class ActionHandler:
             return results
 
         context = skyvern_context.current()
-        download_dir = Path(
-            get_download_dir(
-                run_id=context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
-            )
-        )
+        run_id = context.run_id if context and context.run_id else task.workflow_run_id or task.task_id
+        download_dir = Path(get_download_dir(run_id=run_id))
         download_event: asyncio.Future[Download] = asyncio.get_running_loop().create_future()
 
         def _capture_download_event(download: Download) -> None:
@@ -614,9 +740,19 @@ class ActionHandler:
             download_dir=download_dir,
         )
 
+        staging_dir = Path(make_temp_directory(prefix=f"{run_id}_xhr_staging_"))
+        xhr_capture = ScopedXhrDownloadCapture(page, staging_dir)
         download_triggered = False
+        transient_text_observer = TransientPageTextObserver(
+            page,
+            task_id=task.task_id,
+            step_id=step.step_id,
+            workflow_run_id=task.workflow_run_id,
+        )
         page.on("download", _capture_download_event)
         try:
+            await transient_text_observer.start()
+            xhr_capture.enable()
             with _tracer.start_as_current_span("skyvern.agent.action.handle_inner") as _hi_span:
                 apply_context_attrs(_hi_span)
                 results = await ActionHandler._handle_action(
@@ -628,6 +764,7 @@ class ActionHandler:
                 )
             if not results:
                 return results
+            await transient_text_observer.start()
             _download_timeout = task.download_timeout or BROWSER_DOWNLOAD_MAX_WAIT_TIME
             _download_event_grace_seconds = min(DOWNLOAD_EVENT_ACTIVE_DIR_GRACE_SECONDS, _download_timeout)
             with _tracer.start_as_current_span("skyvern.agent.action.download_wait") as _dl_wait_span:
@@ -643,10 +780,12 @@ class ActionHandler:
                 download_event_fallback_attempted = False
                 download_event_fallback_used = False
                 download_event_fallback_failed = False
+                xhr_fallback_moved_paths: set[str] = set()
                 download_signal_observed = False
                 download_signal_source: str | None = None
                 download_signal_elapsed_seconds: float | None = None
                 download_signal_poll_iterations: int | None = None
+                download_wait_matched_errors: list[UserDefinedError] = []
                 download_wait_started_at = time.monotonic()
 
                 def _record_download_signal(source: str) -> None:
@@ -742,6 +881,24 @@ class ActionHandler:
                                     download_event_fallback_failed = True
                                     break
                             elapsed_since_action = time.monotonic() - download_wait_started_at
+                            if not download_signal_observed:
+                                download_wait_matched_errors = match_user_defined_errors_from_transient_text(
+                                    task,
+                                    step,
+                                    transient_text_observer.events,
+                                )
+                                if download_wait_matched_errors:
+                                    action.errors = (action.errors or []) + download_wait_matched_errors
+                                    action.terminal_user_errors = True
+                                    LOG.warning(
+                                        "Stopping download wait after transient user-defined error text",
+                                        task_id=task.task_id,
+                                        step_id=step.step_id,
+                                        workflow_run_id=task.workflow_run_id,
+                                        error_codes=[error.error_code for error in download_wait_matched_errors],
+                                    )
+                                    break
+
                             if not download_signal_observed and elapsed_since_action >= no_signal_grace_seconds:
                                 LOG.warning(
                                     "No download signal observed after action",
@@ -773,9 +930,56 @@ class ActionHandler:
                     _dl_wait_span.set_attribute("download_event_fallback_attempted", download_event_fallback_attempted)
                     _dl_wait_span.set_attribute("download_event_fallback_used", download_event_fallback_used)
                     _dl_wait_span.set_attribute("download_event_fallback_failed", download_event_fallback_failed)
+                    _dl_wait_span.set_attribute(
+                        "download_wait_observed_text_count",
+                        len(transient_text_observer.events),
+                    )
+                    _dl_wait_span.set_attribute(
+                        "download_wait_user_error_detected",
+                        bool(download_wait_matched_errors),
+                    )
+                    if download_wait_matched_errors:
+                        _dl_wait_span.set_attribute(
+                            "download_wait_user_error_codes",
+                            ",".join(error.error_code for error in download_wait_matched_errors),
+                        )
+
+            await xhr_capture.drain()
+
+            if not download_triggered and staging_dir.exists():
+                staged_files = [f for f in staging_dir.iterdir() if f.is_file()]
+                if staged_files:
+                    moved_count = 0
+                    for sf in staged_files:
+                        target = download_dir / sf.name
+                        if not target.exists():
+                            try:
+                                shutil.move(sf, target)
+                                xhr_fallback_moved_paths.add(str(target))
+                                moved_count += 1
+                            except OSError:
+                                LOG.warning(
+                                    "Failed to move staged XHR file to download dir",
+                                    file=sf.name,
+                                    workflow_run_id=task.workflow_run_id,
+                                    exc_info=True,
+                                )
+                    if moved_count > 0:
+                        download_triggered = True
+                        LOG.info(
+                            "XHR staging fallback: moved staged files to download dir",
+                            staged_count=moved_count,
+                            workflow_run_id=task.workflow_run_id,
+                        )
 
             if not download_triggered:
-                results[-1].download_triggered = False
+                if action.errors:
+                    results[-1] = ActionFailure(
+                        Exception("; ".join(error.reasoning for error in action.errors)),
+                        download_triggered=False,
+                    )
+                else:
+                    results[-1].download_triggered = False
                 action.download_triggered = False
                 return results
             results[-1].download_triggered = True
@@ -793,6 +997,18 @@ class ActionHandler:
             # artifacts can still appear before task cleanup persists files.
             list_files_after = await _list_observed_download_files()
             new_file_paths = set(list_files_after) - set(list_files_before)
+            if xhr_fallback_moved_paths:
+                post_settle_extra_paths = new_file_paths - xhr_fallback_moved_paths
+                if post_settle_extra_paths:
+                    LOG.warning(
+                        "XHR staging fallback used but additional download files appeared after settle",
+                        workflow_run_id=task.workflow_run_id,
+                        download_dir=download_dir,
+                        xhr_fallback_file_count=len(xhr_fallback_moved_paths),
+                        xhr_fallback_files=sorted(os.path.basename(fp) for fp in xhr_fallback_moved_paths),
+                        post_settle_extra_file_count=len(post_settle_extra_paths),
+                        post_settle_extra_files=sorted(os.path.basename(fp) for fp in post_settle_extra_paths),
+                    )
             deduplicated_paths = _deduplicate_new_downloaded_file_paths(
                 new_file_paths,
                 workflow_run_id=task.workflow_run_id,
@@ -810,6 +1026,11 @@ class ActionHandler:
 
             return results
         finally:
+            await transient_text_observer.stop()
+            xhr_capture.disable()
+            await xhr_capture.drain()
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
             if browser_state is not None and download_triggered:
                 # get the page count after download
                 pages_after_download = await browser_state.list_valid_pages()
@@ -1130,7 +1351,7 @@ async def handle_click_action(
                     LOG.info(
                         "The element has onclick attribute, waiting for 1 second to load new elements", action=action
                     )
-                    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+                    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
 
                 if sequential_click_result := await handle_sequential_click_for_dropdown(
                     action=action,
@@ -1157,7 +1378,14 @@ async def handle_click_action(
 
         finally:
             if incremental_scraped:
-                await incremental_scraped.stop_listen_dom_increment()
+                try:
+                    await incremental_scraped.stop_listen_dom_increment()
+                except Exception:
+                    LOG.warning(
+                        "stop_listen_dom_increment failed after click, ignoring",
+                        exc_info=True,
+                        element_id=skyvern_element.get_id(),
+                    )
 
     return results
 
@@ -1178,7 +1406,7 @@ async def handle_sequential_click_for_dropdown(
     if await incremental_scraped.get_incremental_elements_num() == 0:
         return None
 
-    await skyvern_frame.safe_wait_for_animation_end()
+    await skyvern_frame.safe_wait_for_animation_end(caller="click.dropdown")
     if page.url != scraped_page.url:
         LOG.info("Page URL changed after clicking, exiting the sequential click logic")
         return None
@@ -1237,7 +1465,11 @@ async def handle_sequential_click_for_dropdown(
         lean_compress_image_src=lean_enabled,
         lean_strip_url_query_strings=lean_enabled,
     )
-    response = await app.CHECK_USER_GOAL_LLM_API_HANDLER(
+    distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
+    check_user_goal_handler = await resolve_check_user_goal_handler(
+        distinct_id_for_override, task.organization_id, app.CHECK_USER_GOAL_LLM_API_HANDLER
+    )
+    response = await check_user_goal_handler(
         prompt=prompt,
         step=step,
         prompt_name="check-user-goal-after-click",
@@ -1436,6 +1668,50 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
+def _normalize_dropdown_match_text(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]+", "", value).lower()
+
+
+def _incremental_tree_contains_target_value(elements: list[dict], target_value: str) -> bool:
+    """Return True when newly surfaced elements contain the requested value.
+
+    Search-combobox results often render formatted labels like ``(CODE) 12345678``
+    while the action text is just ``12345678``. Normalize punctuation and
+    whitespace so post-input dropdown handling is gated on a concrete target
+    match instead of any arbitrary search suggestion.
+    """
+
+    normalized_target = _normalize_dropdown_match_text(target_value)
+    if not normalized_target:
+        return False
+
+    stack = list(elements)
+    while stack:
+        element = stack.pop()
+        for key in (
+            "text",
+            "value",
+            "label",
+            "ariaLabel",
+            "placeholder",
+            "title",
+            "beforePseudoText",
+            "afterPseudoText",
+        ):
+            value = element.get(key)
+            if isinstance(value, str) and normalized_target in _normalize_dropdown_match_text(value):
+                return True
+        attributes = element.get("attributes")
+        if isinstance(attributes, dict):
+            for attr_value in attributes.values():
+                if isinstance(attr_value, str) and normalized_target in _normalize_dropdown_match_text(attr_value):
+                    return True
+        children = element.get("children", [])
+        if isinstance(children, list):
+            stack.extend(children)
+    return False
+
+
 @traced(name="skyvern.agent.action.input_text")
 async def handle_input_text_action(
     action: actions.InputTextAction,
@@ -1506,41 +1782,12 @@ async def handle_input_text_action(
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
 
-    # OPTIMIZATION: Skip expensive LLM context parsing for TOTP and secret values
-    # TOTP inputs don't need autocomplete detection - we already have the generated code
-    # This saves ~4-5s per TOTP digit (6 digits = ~27s saved for 2FA!)
-    # Gated by ENABLE_SPEED_OPTIMIZATIONS feature flag
-    skip_context_parsing = False
-    if (
-        is_totp_value
-        or is_secret_value
-        or (action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
-    ):
-        try:
-            current_context = skyvern_current()
-            enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
-
-            if enable_speed_optimizations:
-                skip_context_parsing = True
-                LOG.info(
-                    "Speed optimization: Skipping input context parsing for TOTP/secret input",
-                    element_id=skyvern_element.get_id(),
-                    is_totp=is_totp_value,
-                    is_secret=is_secret_value,
-                    is_multi_field_totp=bool(action.totp_timing_info),
-                )
-        except Exception:
-            LOG.warning("Failed to read ENABLE_SPEED_OPTIMIZATIONS from context for TOTP optimization", exc_info=True)
-
-    if skip_context_parsing:
-        input_or_select_context = None
-    else:
-        input_or_select_context = await _get_input_or_select_context(
-            action=action,
-            element_tree_builder=scraped_page,
-            skyvern_element=skyvern_element,
-            step=step,
-        )
+    input_or_select_context = await _get_input_or_select_context(
+        action=action,
+        element_tree_builder=scraped_page,
+        skyvern_element=skyvern_element,
+        step=step,
+    )
 
     # check if it's selectable
     if (
@@ -1578,7 +1825,7 @@ async def handle_input_text_action(
             LOG.info("The element has onclick attribute, waiting for 1 second to load new elements", action=action)
             wait_sec = 1
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec, caller="input_text.autocomplete")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -1724,7 +1971,7 @@ async def handle_input_text_action(
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
     # wait for blocking element to show up
-    await skyvern_frame.safe_wait_for_animation_end()
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
@@ -1835,8 +2082,36 @@ async def handle_input_text_action(
             )
             if len(incremental_element) > 0:
                 auto_complete_hacky_flag = True
+                if (
+                    input_or_select_context
+                    and input_or_select_context.is_search_bar
+                    and _incremental_tree_contains_target_value(incremental_element, text)
+                ):
+                    LOG.info(
+                        "Detected target-matching dropdown after search-bar input; attempting custom selection",
+                        element_id=skyvern_element.get_id(),
+                        target_value=text,
+                    )
+                    action.set_has_mini_agent()
+                    select_result = await sequentially_select_from_dropdown(
+                        action=select_action,
+                        input_or_select_context=input_or_select_context,
+                        page=page,
+                        dom=dom,
+                        skyvern_element=skyvern_element,
+                        skyvern_frame=skyvern_frame,
+                        incremental_scraped=incremental_scraped,
+                        step=step,
+                        task=task,
+                        force_select=True,
+                        target_value=text,
+                    )
+                    if select_result and select_result.action_result and select_result.action_result.success:
+                        auto_complete_hacky_flag = False
+                        return [select_result.action_result]
         except PlaywrightError as inc_error:
-            # Handle Playwright-specific errors during incremental element processing (e.g., TOTP form auto-submit)
+            # Handle Playwright-specific errors during incremental element processing
+            # (e.g., TOTP form auto-submit, or search-dropdown selection triggering navigation)
             error_message = str(inc_error).lower()
             if (
                 "execution context was destroyed" in error_message
@@ -1928,6 +2203,30 @@ def _find_similar_url_in_text(candidate_url: str, text: str) -> str | None:
     return matched
 
 
+async def _wait_for_upload_processing(page: Page) -> None:
+    """Wait for page readiness signals after a file upload.
+
+    Covers upload-processing UI (spinners, progress bars, DOM updates) beyond
+    bare networkidle by reusing SkyvernFrame.wait_for_page_ready with
+    upload-tuned timeouts that keep worst-case well below the old 10-15 s sleep.
+    """
+    try:
+        # Settle delay: let the page react to the file-input change and mount
+        # upload UI (spinner, progress bar, XHR) before polling for readiness.
+        await asyncio.sleep(0.5)
+        skyvern_frame = await SkyvernFrame.create_instance(page)
+        await skyvern_frame.wait_for_page_ready(
+            loading_indicator_timeout_ms=3000,
+            network_idle_timeout_ms=3000,
+            dom_stable_ms=300,
+            dom_stability_timeout_ms=2000,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        LOG.info("Upload processing page-ready wait timed out, continuing")
+    except PlaywrightError:
+        LOG.warning("Upload processing page-ready wait interrupted by Playwright error, continuing", exc_info=True)
+
+
 @traced(name="skyvern.agent.action.upload_file")
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
@@ -2003,8 +2302,7 @@ async def handle_upload_file_action(
                 timeout=settings.BROWSER_ACTION_TIMEOUT_MS,
             )
 
-            # Sleep for 10 seconds after uploading a file to let the page process it
-            await asyncio.sleep(10)
+            await _wait_for_upload_processing(page)
 
             return [ActionSuccess()]
         else:
@@ -2094,7 +2392,7 @@ async def handle_null_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    return [ActionSuccess()]
+    return [ActionSuccess(data=action.output)]
 
 
 @traced(name="skyvern.agent.action.select_option")
@@ -2274,7 +2572,7 @@ async def handle_select_option_action(
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
         # wait for options to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.open")
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -2290,7 +2588,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
             # wait for options to load
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
                     task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -2384,7 +2682,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.fallback")
         is_open = True
 
         result = await select_from_dropdown_by_value(
@@ -2739,7 +3037,7 @@ async def handle_keypress_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration)
+    await handler_utils.keypress(page, action.keys, hold=action.hold, duration=action.duration, repeat=action.repeat)
     return [ActionSuccess()]
 
 
@@ -2810,6 +3108,39 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
+async def handle_go_back_action(
+    action: actions.GoBackAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.go_back(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
+async def handle_go_forward_action(
+    action: actions.GoForwardAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.go_forward(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
+async def handle_reload_page_action(
+    action: actions.ReloadPageAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+    return [ActionSuccess()]
+
+
 @traced(name="skyvern.agent.action.close_page")
 async def handle_close_page_action(
     action: actions.ClosePageAction,
@@ -2820,6 +3151,23 @@ async def handle_close_page_action(
 ) -> list[ActionResult]:
     await page.close(reason=action.reasoning)
     return [ActionSuccess()]
+
+
+async def handle_execute_js_action(
+    action: actions.ExecuteJsAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    import json as _json
+
+    result = await page.evaluate(action.js_code)
+    if result is None:
+        return [ActionSuccess(data="undefined")]
+    if isinstance(result, str):
+        return [ActionSuccess(data=result)]
+    return [ActionSuccess(data=_json.dumps(result))]
 
 
 ActionHandler.register_action_type(ActionType.SOLVE_CAPTCHA, handle_solve_captcha_action)
@@ -2842,6 +3190,10 @@ ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verifica
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
+ActionHandler.register_action_type(ActionType.GO_BACK, handle_go_back_action)
+ActionHandler.register_action_type(ActionType.GO_FORWARD, handle_go_forward_action)
+ActionHandler.register_action_type(ActionType.RELOAD_PAGE, handle_reload_page_action)
+ActionHandler.register_action_type(ActionType.EXECUTE_JS, handle_execute_js_action)
 
 
 def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str) -> Any:
@@ -2849,11 +3201,25 @@ def get_actual_value_of_parameter_if_secret(workflow_run_id: str, parameter: str
     secret_value = workflow_run_context.get_original_secret_value_or_none(parameter)
     if secret_value is not None:
         credential_parameter_key = workflow_run_context.find_credential_parameter_key_for_secret(parameter)
+        if credential_parameter_key is None and secret_value != parameter:
+            credential_parameter_key = _find_credential_key_for_embedded_placeholders(workflow_run_context, parameter)
         if credential_parameter_key is not None:
             current_context = skyvern_context.current()
             if current_context is not None:
                 current_context.active_credential_parameter_key = credential_parameter_key
     return secret_value if secret_value is not None else parameter
+
+
+def _find_credential_key_for_embedded_placeholders(workflow_run_context: Any, parameter: str) -> str | None:
+    tokens = workflow_run_context.find_embedded_placeholder_tokens(parameter)
+    if not tokens:
+        return None
+    keys: set[str | None] = set()
+    for token in tokens:
+        key = workflow_run_context.find_credential_parameter_key_for_secret(token)
+        keys.add(key)
+    keys.discard(None)
+    return keys.pop() if len(keys) == 1 else None
 
 
 def get_actual_value_of_parameter_if_secret_with_task(task: Task, parameter: str) -> Any:
@@ -2892,11 +3258,31 @@ async def _did_page_respond(
 ) -> bool:
     try:
         if skyvern_frame:
-            await skyvern_frame.safe_wait_for_animation_end()
+            await skyvern_frame.safe_wait_for_animation_end(caller="page_respond")
         return (await incremental_scraped.get_incremental_elements_num()) > 0
     except Exception:
         LOG.debug("Failed to check incremental elements after click", exc_info=True)
         return True
+
+
+def _get_click_count(action: ClickAction | UploadFileAction) -> int:
+    if isinstance(action, ClickAction):
+        return action.repeat
+    return 1
+
+
+async def _locator_click(
+    locator: Locator,
+    click_count: int,
+    timeout: int = settings.BROWSER_ACTION_TIMEOUT_MS,
+    **kwargs: Any,
+) -> None:
+    if click_count == 2:
+        await locator.dblclick(timeout=timeout, **kwargs)
+    elif click_count >= 3:
+        await locator.click(timeout=timeout, click_count=click_count, **kwargs)
+    else:
+        await locator.click(timeout=timeout, **kwargs)
 
 
 async def chain_click(
@@ -2916,6 +3302,7 @@ async def chain_click(
 
     dom = DomUtil(scraped_page=scraped_page, page=page)
     locator = skyvern_element.locator
+    click_count = _get_click_count(action)
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
     LOG.info("Chain click starts", action=action, locator=locator)
     file = pending_upload_files or []
@@ -2958,7 +3345,7 @@ async def chain_click(
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
             await EventStrategyFactory.move_to_element(page, locator)
-            await locator.click(timeout=timeout)
+            await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         action_results = [ActionSuccess()]
         return action_results
@@ -2975,7 +3362,7 @@ async def chain_click(
                     locator=locator,
                 )
                 if bound_element := await skyvern_element.find_label_for(dom=dom):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await _locator_click(bound_element.get_locator(), click_count, timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -2993,7 +3380,7 @@ async def chain_click(
                 if bound_element := await skyvern_element.find_element_in_label_children(
                     dom=dom, element_type=InteractiveElement.INPUT
                 ):
-                    await bound_element.get_locator().click(timeout=timeout)
+                    await _locator_click(bound_element.get_locator(), click_count, timeout=timeout)
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3011,7 +3398,7 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_attr_id():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
+                    await _locator_click(bound_locator, click_count, timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3028,7 +3415,7 @@ async def chain_click(
                 )
                 if bound_locator := await skyvern_element.find_bound_label_by_direct_parent():
                     # click on (0, 0) to avoid playwright clicking on the wrong element by accident
-                    await bound_locator.click(timeout=timeout, position={"x": 0, "y": 0})
+                    await _locator_click(bound_locator, click_count, timeout=timeout, position={"x": 0, "y": 0})
                     action_results.append(ActionSuccess())
                     return action_results
             except Exception as e:
@@ -3068,7 +3455,7 @@ async def chain_click(
                 )
 
             try:
-                await skyvern_element.coordinate_click(page=page)
+                await skyvern_element.coordinate_click(page=page, click_count=click_count)
                 action_results.append(ActionSuccess())
                 return action_results
             except Exception as e:
@@ -3145,14 +3532,13 @@ async def chain_click(
             return action_results
 
     finally:
-        # FIXME: use 'page.wait_for_event("filechooser", timeout)' to wait for the file to be uploaded instead of hardcoding sleeping time
         click_succeeded = any(isinstance(r, ActionSuccess) for r in action_results)
 
         if is_filechooser_trigger:
             # File chooser opened during this click — upload completed normally
             LOG.info("File chooser triggered during this click", action=action)
             if file:
-                await asyncio.sleep(15)
+                await _wait_for_upload_processing(page)
             if not has_pending:
                 page.remove_listener("filechooser", fc_func)
             if context is not None and context.pending_file_chooser is not None:
@@ -3188,7 +3574,7 @@ async def chain_click(
         ):
             # A previous UPLOAD_FILE's deferred listener was consumed by this click
             LOG.info("Pending file chooser from previous UPLOAD_FILE was consumed by this click", action=action)
-            await asyncio.sleep(15)
+            await _wait_for_upload_processing(page)
             context.cleanup_pending_file_chooser()
 
         else:
@@ -3200,6 +3586,9 @@ async def chain_click(
             for r in action_results:
                 if isinstance(r, ActionSuccess):
                     r.upload_file_triggered = is_filechooser_trigger
+                    if not is_filechooser_trigger:
+                        r.needs_followup = True
+                        r.followup_message = UPLOAD_PENDING_FOLLOWUP_MESSAGE
 
 
 @traced(name="skyvern.agent.dropdown.auto_completion")
@@ -3228,7 +3617,7 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fill")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -3627,7 +4016,7 @@ async def discover_and_select_from_full_dropdown(
                 element_id=skyvern_element.get_id(),
             )
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.click")
 
         cleanup_func = clean_and_remove_element_tree_factory(
             task=task,
@@ -3650,7 +4039,7 @@ async def discover_and_select_from_full_dropdown(
                     element_id=skyvern_element.get_id(),
                 )
 
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
 
         # If incremental detection failed (e.g. options in a different shadow root),
@@ -3746,7 +4135,7 @@ async def discover_and_select_from_full_dropdown(
         # filter will show it as the only option. Then find and click it directly via Playwright.
         await skyvern_element.input_clear()
         await skyvern_element.press_fill(discovered_value)
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.exact_match")
 
         # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
         # This avoids needing to locate the option element in shadow DOM.
@@ -3832,7 +4221,7 @@ async def sequentially_select_from_dropdown(
         select_history.append(single_select_result)
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="sequential_select.pick")
 
         if await single_select_result.is_done():
             return single_select_result
@@ -3849,7 +4238,7 @@ async def sequentially_select_from_dropdown(
             selected_time=i + 1,
         )
         # wait to load new options
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="sequential_select.next_level")
 
         check_filter_funcs.append(
             check_disappeared_element_id_in_incremental_factory(incremental_scraped=incremental_scraped)
@@ -3957,6 +4346,31 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
+def _extract_new_subtrees(elements: list[dict], new_ids: set[str]) -> list[dict]:
+    """Walk *elements* and return the minimal set of subtrees rooted at new IDs.
+
+    A "new root" is a node whose ``id`` is in *new_ids* but whose parent is
+    not.  This avoids including the entire page tree when a new dropdown is
+    injected inside an existing container — only the dropdown subtree (and its
+    children, which may also be new) is returned.
+
+    For portal-style dropdowns (appended as a direct ``<body>`` child), this
+    behaves identically to a top-level filter.
+    """
+    result: list[dict] = []
+    for element in elements:
+        _collect_new_roots(element, new_ids, result)
+    return result
+
+
+def _collect_new_roots(element: dict, new_ids: set[str], out: list[dict]) -> None:
+    if element.get("id") in new_ids:
+        out.append(element)
+        return
+    for child in element.get("children", []):
+        _collect_new_roots(child, new_ids, out)
+
+
 @traced(name="skyvern.agent.dropdown.select_emerging")
 async def select_from_emerging_elements(
     current_element_id: str,
@@ -3987,16 +4401,35 @@ async def select_from_emerging_elements(
     if len(new_interactable_element_ids) == 0:
         raise NoIncrementalElementFoundForCustomSelection(element_id=current_element_id)
 
-    # SKY-9718 Layer 1: custom-select threads `new_elements_ids` so Skyvern IDs
-    # stay (default html_need_skyvern_attrs=True). Gate lean on the PostHog flag.
-    # `lean_compress_long_href` stays OFF — the LLM reads option hrefs to pick
-    # the right select target.
-    _ctx = skyvern_context.current()
-    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
-    prompt = load_prompt_with_elements(
-        element_tree_builder=scraped_page_after_open,
-        prompt_engine=prompt_engine,
-        template_name="custom-select",
+    # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
+    # which gets truncated on large pages, losing portal-rendered dropdown items.
+    new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    if new_element_subtrees:
+        _ctx = skyvern_context.current()
+        if _ctx and _ctx.enable_lean_element_tree:
+            new_element_subtrees = apply_lean_to_tree(
+                new_element_subtrees,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+            )
+        incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
+    else:
+        LOG.warning(
+            "No subtrees matched new element IDs; falling back to full element tree",
+            current_element_id=current_element_id,
+            new_element_id_count=len(new_element_ids),
+        )
+        incremental_html = scraped_page_after_open.build_element_tree(html_need_skyvern_attrs=True)
+    LOG.debug(
+        "Built HTML for emerging-element custom-select",
+        current_element_id=current_element_id,
+        new_interactable_count=len(new_interactable_element_ids),
+        subtree_count=len(new_element_subtrees),
+        html_length=len(incremental_html),
+    )
+
+    prompt = prompt_engine.load_prompt(
+        "custom-select",
         is_date_related=options.is_date_related,
         field_information=options.field_information,
         required_field=options.required_field,
@@ -4004,10 +4437,8 @@ async def select_from_emerging_elements(
         navigation_goal=task.navigation_goal,
         new_elements_ids=new_interactable_element_ids,
         navigation_payload_str=json.dumps(task.navigation_payload),
+        elements=incremental_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
-        lean_compress_long_href=False,
-        lean_compress_image_src=lean_enabled,
-        lean_strip_url_query_strings=lean_enabled,
     )
     LOG.info("Calling LLM to find the match element")
 
@@ -4025,6 +4456,14 @@ async def select_from_emerging_elements(
     element_id: str | None = json_response.get("id", None)
     if not element_id or action_type not in [ActionType.CLICK, ActionType.INPUT_TEXT]:
         raise NoAvailableOptionFoundForCustomSelection(reason=json_response.get("reasoning"))
+
+    new_ids_set = set(new_interactable_element_ids)
+    if element_id not in new_ids_set:
+        LOG.warning(
+            "custom-select returned element outside new_interactable_element_ids",
+            selected_element_id=element_id,
+            new_interactable_count=len(new_ids_set),
+        )
 
     if value is not None and action_type == ActionType.INPUT_TEXT:
         actual_value = get_actual_value_of_parameter_if_secret_with_task(task, value)
@@ -4432,7 +4871,9 @@ async def locate_dropdown_menu(
         await skyvern_frame.scroll_to_x_y(x, y)
 
         # TODO: better to send untrimmed HTML without skyvern attributes in the future
-        dropdown_confirm_prompt = prompt_engine.load_prompt("opened-dropdown-confirm")
+        dropdown_confirm_prompt = prompt_engine.load_prompt(
+            "opened-dropdown-confirm",
+        )
         LOG.debug(
             "Confirm if it's an opened dropdown menu",
             element=element_dict,
@@ -4518,13 +4959,13 @@ async def scroll_down_to_load_all_options(
         else:
             await skyvern_frame.scroll_to_element_bottom(dropdown_menu_element_handle, page_by_page)
             # wait until animation ends, otherwise the scroll operation could be overwritten
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.scroll")
 
         # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.trigger")
 
         current_num = await incremental_scraped.get_incremental_elements_num()
         LOG.info(
@@ -4547,7 +4988,7 @@ async def scroll_down_to_load_all_options(
         await page.mouse.wheel(0, -scroll_pace)
     else:
         await skyvern_frame.scroll_to_element_top(dropdown_menu_element_handle)
-    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.top")
 
 
 async def normal_select(

@@ -37,6 +37,33 @@ from skyvern.webeye.scraper.scraped_page import (
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
+
+
+async def build_scraping_failed_reason(browser_state: BrowserState, requested_url: str) -> str:
+    """Build the user-facing ScrapingFailed reason with the requested URL plus the landed URL when they differ.
+
+    Query strings are stripped because OAuth/SSO URLs commonly carry secrets in query params.
+    """
+    safe_requested = strip_query_params(requested_url)
+    safe_landed: str | None = None
+    try:
+        page = await browser_state.get_working_page()
+        if page is not None and page.url:
+            safe_landed = strip_query_params(page.url)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("Could not resolve landed URL for ScrapingFailed reason", exc_info=True)
+
+    base = (
+        "Skyvern failed to load the website. "
+        "The page may have navigated unexpectedly or become unresponsive during analysis."
+    )
+    if safe_landed and safe_landed != safe_requested and safe_landed not in {"about:blank", ""}:
+        return f"{base} Requested URL: {safe_requested}. Current URL: {safe_landed}."
+    return f"{base} URL: {safe_requested}."
+
+
 RESERVED_ATTRIBUTES = {
     "accept",  # for input file
     "alt",
@@ -68,6 +95,28 @@ RESERVED_ATTRIBUTES = {
     "type",
     "value",
 }
+
+ENRICHED_ONLY_ATTRIBUTES = {
+    "aria-describedby",
+    "aria-errormessage",
+    "aria-expanded",
+    "aria-haspopup",
+    "aria-invalid",
+    "aria-labelledby",
+    "errorText",
+    "invalid",
+    "validationMessage",
+}
+
+ENRICHED_RESERVED_ATTRIBUTES = RESERVED_ATTRIBUTES | ENRICHED_ONLY_ATTRIBUTES
+
+
+def _reserved_attributes_for_context() -> set[str]:
+    context = skyvern_context.current()
+    if context and context.enriched_tree_enabled():
+        return ENRICHED_RESERVED_ATTRIBUTES
+    return RESERVED_ATTRIBUTES
+
 
 BASE64_INCLUDE_ATTRIBUTES = {
     "href",
@@ -204,7 +253,7 @@ async def scrape_website(
             if isinstance(e, FailedToTakeScreenshot):
                 raise e
             else:
-                raise ScrapingFailed() from e
+                raise ScrapingFailed(reason=await build_scraping_failed_reason(browser_state, url)) from e
         LOG.info("Scraping failed, will retry", max_retries=max_retries, num_retry=num_retry, url=url, wait_seconds=0.5)
         await asyncio.sleep(0.5)
         return await scrape_website(
@@ -269,6 +318,18 @@ def _should_use_page_ready_wait() -> bool:
     return bool(context and context.enable_page_ready_wait)
 
 
+async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
+    if _should_use_page_ready_wait():
+        await skyvern_frame.wait_for_page_ready(
+            network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
+            loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
+            dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
+            dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
+        )
+    else:
+        await skyvern_frame.safe_wait_for_animation_end(caller="scraper.scrape_ready")
+
+
 @traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -317,15 +378,7 @@ async def scrape_web_unsafe(
         )
 
     skyvern_frame = await SkyvernFrame.create_instance(page)
-    if _should_use_page_ready_wait():
-        await skyvern_frame.wait_for_page_ready(
-            network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
-            loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
-            dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
-            dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
-        )
-    else:
-        await skyvern_frame.safe_wait_for_animation_end()
+    await _wait_for_scrape_ready(skyvern_frame)
 
     if wait_seconds > 0:
         LOG.info(f"Waiting for {wait_seconds} seconds before scraping the website.", wait_seconds=wait_seconds)
@@ -496,15 +549,7 @@ async def add_frame_interactable_elements(
 
     try:
         skyvern_frame = await SkyvernFrame.create_instance(frame)
-        if _should_use_page_ready_wait():
-            await skyvern_frame.wait_for_page_ready(
-                network_idle_timeout_ms=settings.PAGE_READY_NETWORK_IDLE_TIMEOUT_MS,
-                loading_indicator_timeout_ms=settings.PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS,
-                dom_stable_ms=settings.PAGE_READY_DOM_STABLE_MS,
-                dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
-            )
-        else:
-            await skyvern_frame.safe_wait_for_animation_end()
+        await _wait_for_scrape_ready(skyvern_frame)
 
         frame_elements, frame_element_tree = await skyvern_frame.build_tree_from_body(
             frame_name=skyvern_id, frame_index=frame_index, must_included_tags=must_included_tags
@@ -783,7 +828,11 @@ def trim_element(element: dict) -> dict:
                 del queue_ele["attributes"]
 
         if "attributes" in queue_ele and not queue_ele.get("keepAllAttr", False):
-            new_attributes = _trimmed_attributes(queue_ele["attributes"])
+            has_pseudo = bool(queue_ele.get("beforePseudoText") or queue_ele.get("afterPseudoText"))
+            is_icon_only = (
+                queue_ele.get("interactable", False) and not str(queue_ele.get("text", "")).strip() and has_pseudo
+            )
+            new_attributes = _trimmed_attributes(queue_ele["attributes"], keep_class=is_icon_only)
             if new_attributes:
                 queue_ele["attributes"] = new_attributes
             else:
@@ -834,14 +883,22 @@ def _trimmed_base64_data(attributes: dict) -> dict:
     return new_attributes
 
 
-def _trimmed_attributes(attributes: dict) -> dict:
+def _trimmed_attributes(attributes: dict, *, keep_class: bool = False) -> dict:
     new_attributes: dict = {}
+    reserved_attributes = _reserved_attributes_for_context()
 
     for key in attributes:
         if key == "role" and attributes[key] in ["listbox", "option"]:
             new_attributes[key] = attributes[key]
-        if key in RESERVED_ATTRIBUTES:
+        if key in reserved_attributes:
             new_attributes[key] = attributes[key]
+
+    if keep_class and "class" in attributes:
+        cls = str(attributes["class"])
+        if len(cls) > 100:
+            last_space = cls.rfind(" ", 0, 100)
+            cls = cls[: last_space if last_space > 0 else 100]
+        new_attributes["class"] = cls
 
     return new_attributes
 

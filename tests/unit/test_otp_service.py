@@ -14,6 +14,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services.otp_service import (
     OTPValue,
+    _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
     extract_totp_from_navigation_inputs,
     poll_otp_value,
@@ -117,8 +118,279 @@ def _mock_org_token() -> MagicMock:
     return token
 
 
+def _patch_totp_url_response(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status_code: int,
+    headers: dict[str, str],
+    response_body: object,
+    is_json_response: bool,
+) -> None:
+    from skyvern.services import otp_service
+
+    async def post_totp_verification_url(*_args: object, **_kwargs: object) -> tuple[int, dict[str, str], object, bool]:
+        return status_code, headers, response_body, is_json_response
+
+    monkeypatch.setattr(otp_service, "_post_totp_verification_url", post_totp_verification_url)
+
+
+class TestGetOtpValueFromUrl:
+    @pytest.mark.asyncio
+    async def test_returns_totp_from_valid_json_verification_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": "123456"},
+            is_json_response=True,
+        )
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+        )
+
+        assert result == OTPValue(value="123456", type="totp")
+
+    @pytest.mark.asyncio
+    async def test_text_plain_200_raises_actionable_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+            response_body="147258",
+            is_json_response=False,
+        )
+
+        with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+            await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                workflow_run_id="wr_test",
+            )
+
+        reason = exc_info.value.reason or ""
+        assert "https://example.com/totp" in reason
+        assert "HTTP status=200" in reason
+        assert "content_type=text/plain; charset=utf-8" in reason
+        assert "body_preview='147258'" in reason
+        assert '{"verification_code":"123456"}' in reason
+        assert "api-key" not in reason
+
+    @pytest.mark.asyncio
+    async def test_text_plain_200_truncates_long_body_preview(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        long_body = "x" * 250
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "text/plain"},
+            response_body=long_body,
+            is_json_response=False,
+        )
+
+        with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+            await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                workflow_run_id="wr_test",
+            )
+
+        reason = exc_info.value.reason or ""
+        assert f"body_preview='{long_body[:200]}... (truncated)'" in reason
+        assert long_body not in reason
+
+    @pytest.mark.asyncio
+    async def test_text_plain_200_reports_absent_content_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={},
+            response_body="147258",
+            is_json_response=False,
+        )
+
+        with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+            await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                workflow_run_id="wr_test",
+            )
+
+        reason = exc_info.value.reason or ""
+        assert "content_type=<absent>" in reason
+
+    @pytest.mark.asyncio
+    async def test_text_plain_200_body_preview_uses_single_repr_escaping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "text/plain"},
+            response_body="line1\nline2",
+            is_json_response=False,
+        )
+
+        with pytest.raises(FailedToGetTOTPVerificationCode) as exc_info:
+            await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                workflow_run_id="wr_test",
+            )
+
+        reason = exc_info.value.reason or ""
+        assert "body_preview='line1\\nline2'" in reason
+        assert "body_preview='line1\\\\nline2'" not in reason
+
+    @pytest.mark.asyncio
+    async def test_json_missing_verification_code_returns_none_and_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import structlog.testing
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"message": "pending"},
+            is_json_response=True,
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+        assert any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_json_non_object_response_returns_none_and_logs_distinct_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog.testing
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body=["147258"],
+            is_json_response=True,
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+        assert any("TOTP webhook response body is not a JSON object" in log.get("event", "") for log in logs)
+        assert not any("No verification_code found in TOTP webhook response" in log.get("event", "") for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_non_200_response_returns_none_and_logs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import structlog.testing
+
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=500,
+            headers={"Content-Type": "text/plain"},
+            response_body="temporary outage",
+            is_json_response=False,
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+        assert any("TOTP webhook returned non-200 response" in log.get("event", "") for log in logs)
+
+    @pytest.mark.asyncio
+    async def test_relayed_email_in_malformed_json_extracts_code_instead_of_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: a customer relays a raw OTP email into verification_code,
+        producing a body that isn't strict JSON. The login must recover the code
+        via the LLM extractor rather than terminating with a contract error."""
+        from types import SimpleNamespace
+
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        raw_email = (
+            "Verification Code - Your One-Time Passcode for Secure Account Login\r\n"
+            "WARNING! EXTERNAL EMAIL.\r\nYour passcode is 654321."
+        )
+        body = '{\r\n  "task_id": "tsk_test",\r\n  "verification_code": "' + raw_email + '"\r\n}'
+        seam = AsyncMock(return_value=TOTPVerificationResponse(status_code=200, body=body, headers={}))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        async def fake_parse_otp_login(
+            content: str, organization_id: str, *_args: object, **_kwargs: object
+        ) -> OTPValue:
+            assert "654321" in content
+            return OTPValue(value="654321", type="totp")
+
+        monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+
+        result = await _get_otp_value_from_url(
+            organization_id="o_test",
+            url="https://example.com/totp",
+            api_key="api-key",
+            task_id="tsk_test",
+        )
+
+        assert result == OTPValue(value="654321", type="totp")
+
+
 class TestPollOtpValueRetry:
     """poll_otp_value retries fetch failures across the full wall-clock timeout window."""
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_passes_workflow_permanent_id_to_totp_url_fetch(
+        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
+    ) -> None:
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        otp = OTPValue(value="123456")
+        mock_fetch.return_value = otp
+
+        result = await poll_otp_value(
+            organization_id="o_test",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+            totp_verification_url="https://example.com/mfa",
+        )
+
+        assert result == otp
+        mock_fetch.assert_awaited_once_with(
+            "o_test",
+            "https://example.com/mfa",
+            "fake-token",
+            task_id="tsk_test",
+            workflow_run_id="wr_test",
+            workflow_permanent_id="wpid_test",
+        )
 
     @pytest.mark.asyncio
     @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
@@ -350,3 +622,309 @@ class TestTryGenerateTotpFromCredential:
 
         with skyvern_context.scoped(_scoped_context(active="credentials")):
             assert try_generate_totp_from_credential("wr_test") is None
+
+
+class TestPostTotpVerificationUrlSeam:
+    """`_post_totp_verification_url` must route through app.AGENT_FUNCTION so the
+    cloud override can egress via the NAT proxy (static IP), like webhook/file-upload."""
+
+    @pytest.mark.asyncio
+    async def test_routes_through_agent_function_and_adapts_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={"X-Sig": "abc"},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert body == {"verification_code": "123456"}
+        seam.assert_awaited_once()
+        kwargs = seam.await_args.kwargs
+        assert kwargs["url"] == "https://example.com/totp"
+        assert kwargs["payload"] == "{}"
+        assert kwargs["headers"] == {"X-Sig": "abc"}
+        assert kwargs["organization_id"] == "o_test"
+
+    @pytest.mark.asyncio
+    async def test_non_json_response_marks_is_json_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body="not a json body",
+                headers={"content-type": "text/plain"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is False
+        assert body == "not a json body"
+
+    @pytest.mark.asyncio
+    async def test_json_body_with_non_json_content_type_marks_is_json_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit non-JSON Content-Type must trump the JSON-shaped body so a
+        misconfigured customer endpoint still trips the non-JSON contract error
+        downstream instead of being silently accepted."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={"content-type": "text/plain"},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is False
+        assert body == '{"verification_code": "123456"}'
+
+    @pytest.mark.asyncio
+    async def test_missing_content_type_falls_through_to_optimistic_json_parse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NATEgressProxyClient.deliver_webhook doesn't preserve upstream response
+        headers, so the proxy path produces TOTPVerificationResponse(headers={}).
+        The helper must still parse a JSON-shaped body as JSON in that case."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body='{"verification_code": "123456"}',
+                headers={},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert body == {"verification_code": "123456"}
+
+    @pytest.mark.asyncio
+    async def test_retries_then_raises_on_persistent_exception(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        with pytest.raises(otp_service._TOTPWebhookRequestError):
+            await otp_service._post_totp_verification_url(
+                url="https://example.com/totp",
+                signed_payload="{}",
+                headers={},
+                organization_id="o_test",
+                max_attempts=2,
+                retry_timeout=0,
+            )
+
+        assert seam.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_body_with_literal_control_chars_recovers_as_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A customer that relays a raw multi-line OTP email into
+        ``verification_code`` produces a body with literal newlines, which strict
+        JSON rejects. The helper must still recover it as a JSON object so the
+        downstream extractor can read the field instead of failing the login."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        raw_email = "Verification Code\r\nYour one-time passcode is 123456\r\nThanks"
+        body = '{\r\n  "task_id": "tsk_1",\r\n  "verification_code": "' + raw_email + '"\r\n}'
+        seam = AsyncMock(return_value=TOTPVerificationResponse(status_code=200, body=body, headers={}))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, parsed, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert isinstance(parsed, dict)
+        assert parsed["verification_code"] == raw_email
+
+    @pytest.mark.asyncio
+    async def test_body_with_unescaped_quotes_recovers_verification_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the relayed email contains unescaped quotes, even lenient JSON
+        parsing fails. The helper must best-effort recover the verification_code
+        field so the downstream LLM extractor can still pull the code."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        raw_email = 'Your "one-time" passcode is 123456'
+        body = '{"task_id": "tsk_1", "verification_code": "' + raw_email + '"}'
+        seam = AsyncMock(return_value=TOTPVerificationResponse(status_code=200, body=body, headers={}))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, parsed, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert isinstance(parsed, dict)
+        assert parsed["verification_code"] == raw_email
+
+    @pytest.mark.asyncio
+    async def test_truly_non_json_body_still_marks_is_json_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A body with no recoverable verification_code (e.g. an HTML error page)
+        must still trip the non-JSON contract path so genuinely broken
+        integrations stay visible to operators."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        seam = AsyncMock(
+            return_value=TOTPVerificationResponse(
+                status_code=200,
+                body="<html><body>Service Unavailable</body></html>",
+                headers={},
+            )
+        )
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, body, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is False
+        assert body == "<html><body>Service Unavailable</body></html>"
+
+    @pytest.mark.asyncio
+    async def test_forwarded_email_payload_recovers_verification_code(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mirrors a real-world payload shape: a customer relays an entire
+        forwarded OTP email (multi-line, with literal CRLF line breaks) into
+        verification_code. The literal control characters make it invalid strict
+        JSON, but the helper must still recover the field so the downstream LLM
+        extractor can read the code instead of terminating the login."""
+        from skyvern.forge.agent_functions import TOTPVerificationResponse
+        from skyvern.services import otp_service
+
+        email_lines = [
+            "Fw: Verification Code - Your Example Business One-Time Passcode for Secure Account Login",
+            "",
+            "Example Company",
+            "www.example.comhttps://www.example.com",
+            "",
+            "CONFIDENTIALITY NOTICE: This e-mail and any attachments are intended only for the named "
+            "recipient. If you received this in error, please notify the sender and delete it.",
+            "",
+            "________________________________",
+            "From: Example Business noreply@mail.example.com",
+            "Sent: Wednesday, June 3, 2026 11:01 AM",
+            "Subject: Verification Code - Your Example Business One-Time Passcode for Secure Account Login",
+            "",
+            "WARNING! EXTERNAL EMAIL: Please confirm its authenticity before acting on any requests.",
+            "________________________________",
+            "[Verification Code]",
+            "",
+            "Hello Jane Doe,",
+            "",
+            "You requested to verify your Example Business account.",
+            "",
+            "[Verified]      Your verification code is: 123456",
+            "",
+            "[Important]     For your security, this code expires 10 minutes after it is requested.",
+            "",
+            "Terms of Use https://example.com/legal/terms | Your Privacy Center https://example.com/privacy",
+            "(c) 2026 Example Corp. All rights reserved.",
+            "",
+        ]
+        email = "\r\n".join(email_lines)
+        body = '{\r\n  "task_id": "t_123123123",\r\n  "verification_code": "' + email + '"\r\n}'
+        seam = AsyncMock(return_value=TOTPVerificationResponse(status_code=200, body=body, headers={}))
+        monkeypatch.setattr(
+            otp_service.app, "AGENT_FUNCTION", SimpleNamespace(post_totp_verification_request=seam), raising=False
+        )
+
+        status, _headers, parsed, is_json = await otp_service._post_totp_verification_url(
+            url="https://example.com/totp",
+            signed_payload="{}",
+            headers={},
+            organization_id="o_test",
+            retry_timeout=0,
+        )
+
+        assert status == 200
+        assert is_json is True
+        assert isinstance(parsed, dict)
+        assert parsed["task_id"] == "t_123123123"
+        assert parsed["verification_code"] == email
+        assert "123456" in parsed["verification_code"]

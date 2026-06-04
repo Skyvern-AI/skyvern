@@ -62,8 +62,8 @@ function WorkflowFolderSelector({
           variant="ghost"
           size="icon"
           className={cn(
-            "h-8 w-8",
-            currentFolderId ? "text-blue-400" : "text-slate-400",
+            "text-muted-foreground hover:text-foreground",
+            currentFolderId && "text-blue-400 hover:text-blue-400",
           )}
         >
           <FolderIcon className="h-4 w-4" />

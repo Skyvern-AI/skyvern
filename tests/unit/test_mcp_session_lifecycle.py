@@ -12,6 +12,7 @@ from skyvern.cli.core.result import BrowserContext
 from skyvern.cli.core.session_ops import SessionCloseResult, coerce_proxy_location
 from skyvern.cli.mcp_tools import session as mcp_session
 from skyvern.client.types.extensions import Extensions
+from skyvern.constants import SKYVERN_MCP_USER_AGENT
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 
 CAPTCHA_SOLVER_EXTENSION: Extensions = "captcha-solver"
@@ -30,6 +31,7 @@ def _reset_singletons() -> None:
 
     session_manager._current_session.set(None)
     session_manager._global_session = None
+    session_manager._copilot_sessions.clear()
     session_manager.set_stateless_http_mode(False)
 
 
@@ -185,6 +187,23 @@ def test_build_cloud_client_uses_self_url_in_stateless_mode(monkeypatch: pytest.
     base_url = captured_kwargs[0]["base_url"]
     assert isinstance(base_url, str)
     assert "127.0.0.1" in base_url
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
+
+
+def test_build_cloud_client_passes_mcp_user_agent_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_kwargs: list[dict[str, object]] = []
+
+    class FakeSkyvern:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured_kwargs.append(dict(kwargs))
+
+    monkeypatch.setattr(client_mod, "Skyvern", FakeSkyvern)
+    session_manager.set_stateless_http_mode(False)
+
+    client_mod._build_cloud_client("sk_test")
+
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
 
 
 def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,6 +222,7 @@ def test_build_cloud_client_uses_settings_url_in_normal_mode(monkeypatch: pytest
 
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0]["base_url"] == "https://api-staging.skyvern.com"
+    assert captured_kwargs[0]["headers"] == {"x-user-agent": SKYVERN_MCP_USER_AGENT}
 
 
 @pytest.mark.asyncio
@@ -321,6 +341,33 @@ async def test_resolve_browser_does_not_reuse_session_for_different_api_key(
     assert browser is replacement_browser
     assert ctx.session_id == "pbs_123"
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
+
+
+@pytest.mark.asyncio
+async def test_resolve_browser_does_not_reuse_registered_copilot_session_for_different_api_key_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered_state = session_manager.SessionState(
+        browser=MagicMock(),
+        context=BrowserContext(mode="cloud_session", session_id="pbs_copilot"),
+        api_key_hash=session_manager._api_key_hash("sk_copilot_org"),
+    )
+    session_manager.register_copilot_session("pbs_copilot", registered_state)
+
+    fallback_browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=fallback_browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    token = client_mod.set_api_key_override("sk_other_org")
+    try:
+        browser, ctx = await session_manager.resolve_browser(session_id="pbs_copilot")
+    finally:
+        client_mod.reset_api_key_override(token)
+
+    assert browser is fallback_browser
+    assert ctx.session_id == "pbs_copilot"
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_copilot")
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,7 @@ async def test_get_workflow_run_response_passes_through_all_fields() -> None:
 
     assert resp is not None
     assert resp.script_run == script_run
+    assert resp.script_id == "s_abc"
     assert resp.ai_fallback is True
     assert resp.browser_session_id == "pbs_123"
     assert resp.max_screenshot_scrolls == 5

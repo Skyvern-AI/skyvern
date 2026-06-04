@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import structlog
 from jinja2.sandbox import SandboxedEnvironment
@@ -12,7 +13,7 @@ from playwright.async_api import Page
 from skyvern.config import settings
 from skyvern.constants import SKYVERN_PAGE_MAX_SCRAPING_RETRIES, SPECIAL_FIELD_VERIFICATION_CODE
 from skyvern.core.script_generations.skyvern_page_ai import SYSTEM_PROMPT_UNSET, SkyvernPageAi
-from skyvern.exceptions import WorkflowRunContextNotInitialized
+from skyvern.exceptions import SkyvernActionFailed, WorkflowRunContextNotInitialized
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.files import validate_download_url
@@ -23,6 +24,9 @@ from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.services import script_service
 from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
+from skyvern.services.script_reviewer_v3.midrun import v3_review_in_flight
+from skyvern.services.script_reviewer_v3.types import FailureContext, InterceptedActionType
 from skyvern.utils.css_selector import compute_selector_options
 from skyvern.utils.prompt_engine import load_prompt_with_elements, load_prompt_with_elements_tracked
 from skyvern.utils.prompt_truncation import truncate_extraction_schema
@@ -47,6 +51,8 @@ from skyvern.webeye.scraper.scraped_page import ScrapedPage
 jinja_sandbox_env = SandboxedEnvironment()
 
 LOG = structlog.get_logger()
+
+_INTERCEPTED_ACTION_TYPES = frozenset(get_args(InterceptedActionType))
 
 INPUT_GOAL = """- The intention to fill out an input: {intention}.
 - The overall goal that the user wants to achieve: {prompt}."""
@@ -170,6 +176,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        v3_parent_episode_id: str | None = None,
     ) -> str | None:
         """Click an element using AI to locate it based on intention.
 
@@ -179,7 +186,31 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 the script reviewer can fix the selector. Only set when called from
                 the ai='fallback' path in skyvern_page.py.
             block_label: The cached block label (from SkyvernPage.current_label).
+            v3_parent_episode_id: pre-existing episode id from v3 mid-run Class B
+                fall-through. When set, this call updates that episode instead of
+                creating a duplicate.
         """
+        # v3 mid-run hook: only on the original call (not on internal recursion).
+        # If v3 commits an in-flight fix (Class A), we short-circuit; if it
+        # gives up (Class B), the episode already exists and we propagate
+        # v3_parent_episode_id so the agent-fallback path updates it instead
+        # of creating a duplicate row.
+        if v3_parent_episode_id is None:
+            ep_id, class_a = await self._maybe_run_v3_midrun(
+                action_type="click",
+                failed_selector=failed_selector,
+                intention=intention,
+                value=None,
+                totp_identifier=None,
+                totp_url=None,
+                block_label=block_label,
+            )
+            if class_a:
+                # v3's live_try_click already advanced the page state.
+                return None
+            if ep_id is not None:
+                v3_parent_episode_id = ep_id
+
         try:
             # Build the element tree of the current page for the prompt
             context = skyvern_context.ensure_context()
@@ -207,9 +238,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             )
             actions_json = json_response.get("actions", [])
             if not actions_json:
-                # LLM returned no actions - the element likely doesn't exist on the page.
-                # Raise an exception so the caller knows the action failed.
-                raise Exception(
+                raise SkyvernActionFailed(
                     f"AI could not find an element to click for intention: {intention}. "
                     "The element may not exist on the current page."
                 )
@@ -222,7 +251,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 action = cast(ClickAction, actions[0])
                 result = await handle_click_action(action, self.page, self.scraped_page, task, step)
                 if result and result[-1].success is False:
-                    raise Exception(result[-1].exception_message)
+                    raise SkyvernActionFailed(result[-1].exception_message or "Click action returned success=False")
                 xpath = action.get_xpath()
                 selector = f"xpath={xpath}" if xpath else selector
 
@@ -238,10 +267,21 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     action=action,
                     block_label=block_label,
                     recoverable_marker_id=recoverable_marker_id,
+                    v3_parent_episode_id=v3_parent_episode_id,
                 )
 
                 return selector
+        except SkyvernActionFailed:
+            if selector is None:
+                raise
+            LOG.warning(
+                "AI click failed, falling back to original selector",
+                selector=selector,
+                intention=intention,
+            )
         except Exception:
+            if selector is None:
+                raise
             LOG.exception(
                 f"Failed to do ai click. Falling back to original selector={selector}, intention={intention}, data={data}"
             )
@@ -251,8 +291,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
             await locator.click(timeout=timeout)
             return selector
 
-        # If we reach here with no selector, the AI failed and there's no fallback - raise an error
-        raise Exception(f"AI click failed and no fallback selector available for intention: {intention}")
+        raise SkyvernActionFailed(f"AI click failed and no fallback selector available for intention: {intention}")
 
     async def ai_input_text(
         self,
@@ -266,8 +305,28 @@ class RealSkyvernPageAi(SkyvernPageAi):
         failed_selector: str | None = None,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        v3_parent_episode_id: str | None = None,
     ) -> str:
         """Input text into an element using AI to determine the value."""
+
+        # v3 mid-run hook — see ai_click for the contract.
+        if v3_parent_episode_id is None:
+            ep_id, class_a = await self._maybe_run_v3_midrun(
+                action_type="fill",
+                failed_selector=failed_selector,
+                intention=intention,
+                value=value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+                block_label=block_label,
+            )
+            if class_a:
+                # v3 mid-run committed the fill on the live page. The
+                # caller relies on page state, not this return value; "" means
+                # no selector was resolved.
+                return ""
+            if ep_id is not None:
+                v3_parent_episode_id = ep_id
 
         context = skyvern_context.ensure_context()
         value = value or ""
@@ -390,6 +449,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
                 action=action,
                 block_label=block_label,
                 recoverable_marker_id=recoverable_marker_id,
+                v3_parent_episode_id=v3_parent_episode_id,
             )
         else:
             locator = self.page.locator(selector)
@@ -711,6 +771,116 @@ class RealSkyvernPageAi(SkyvernPageAi):
         )
         return result
 
+    async def _maybe_run_v3_midrun(
+        self,
+        *,
+        action_type: str,
+        failed_selector: str | None,
+        intention: str,
+        value: str | None,
+        totp_identifier: str | None,
+        totp_url: str | None,
+        block_label: str | None,
+    ) -> tuple[str | None, bool]:
+        """v3 mid-run gate. Called at the top of ai_click / ai_input_text.
+
+        Returns ``(parent_episode_id, did_class_a)``.
+
+        - ``parent_episode_id`` is set when a v3 episode was created and v3
+          ran. None means v3 didn't fire (not v3 cohort, missing context,
+          or pre-conditions not met).
+        - ``did_class_a`` is True when v3's agent committed an in-flight fix
+          via a successful live_try_*. The caller short-circuits the AI
+          fallback in that case — the workflow already advanced.
+
+        Never raises — any internal failure logs and returns ``(None, False)``
+        so the caller falls through to the existing AI fallback path.
+        """
+        if failed_selector is None or not failed_selector.strip():
+            return None, False
+
+        episode_id_for_cleanup: str | None = None
+        organization_id_for_cleanup: str | None = None
+        try:
+            context = skyvern_context.current()
+            if context is None or not context.workflow_permanent_id or not context.workflow_run_id:
+                return None, False
+            # organization_id is required for episode FK + cohort lookup.
+            # Guard explicitly rather than silently coercing to "".
+            if not context.organization_id:
+                return None, False
+            if (context.code_version or 0) < 2:
+                return None, False
+            # FailureContext narrows the action_type set; bail if the
+            # caller passed something outside the typed set.
+            if action_type not in _INTERCEPTED_ACTION_TYPES:
+                return None, False
+            narrowed_action_type = cast(InterceptedActionType, action_type)
+
+            use_v3 = await is_v3_cohort(
+                workflow_permanent_id=context.workflow_permanent_id,
+                organization_id=context.organization_id,
+                workflow_run_id=context.workflow_run_id,
+            )
+            if not use_v3:
+                return None, False
+
+            # Create the episode now so v3's agent can attach decisions to it.
+            episode = await app.DATABASE.scripts.create_fallback_episode(
+                organization_id=context.organization_id,
+                workflow_permanent_id=context.workflow_permanent_id,
+                workflow_run_id=context.workflow_run_id,
+                block_label=block_label or self.current_label or "unknown",
+                fallback_type="element",
+                script_revision_id=context.script_revision_id,
+                page_url=self.page.url,
+                reviewer_version="v3",
+            )
+            episode_id_for_cleanup = episode.episode_id
+            organization_id_for_cleanup = context.organization_id
+
+            fc = FailureContext(
+                failed_selector=failed_selector,
+                intention=intention,
+                action_type=narrowed_action_type,
+                value=value,
+                totp_identifier=totp_identifier,
+                totp_url=totp_url,
+                page=self.page,
+                context=context,
+                episode_id=episode.episode_id,
+            )
+            result = await v3_review_in_flight(fc)
+            return episode.episode_id, result.decision.is_midrun_class_a()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning(
+                "v3 mid-run hook raised — falling through to agent fallback",
+                action_type=action_type,
+                block_label=block_label,
+                exc_info=True,
+            )
+            if episode_id_for_cleanup is not None and organization_id_for_cleanup is not None:
+                try:
+                    await app.DATABASE.scripts.delete_fallback_episode(
+                        episode_id=episode_id_for_cleanup,
+                        organization_id=organization_id_for_cleanup,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Double-fault: v3_review_in_flight raised AND cleanup also
+                    # failed. Log at error so the orphan is observable in DD —
+                    # post-run v3 will see reviewed=False, reviewer_version="v3"
+                    # with no useful agent data.
+                    LOG.error(
+                        "v3_midrun_orphan_episode_cleanup_failed",
+                        episode_id=episode_id_for_cleanup,
+                        exc_info=True,
+                    )
+            return None, False
+
     async def _record_element_fallback_episode(
         self,
         context: skyvern_context.SkyvernContext,
@@ -720,6 +890,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         action: Any,
         block_label: str | None = None,
         recoverable_marker_id: int | None = None,
+        v3_parent_episode_id: str | None = None,
     ) -> None:
         """Record an element-level fallback episode when ai_click/ai_input_text fires
         because a CSS selector failed or was missing. Gated on code_version >= 2.
@@ -730,6 +901,10 @@ class RealSkyvernPageAi(SkyvernPageAi):
           `ai='proactive'` because no semantic selector existed at codegen.
           AI succeeded; capture the element pick so the reviewer can later
           upgrade the call to `selector=, ai='fallback'`.
+
+        ``v3_parent_episode_id`` is set on Class B fall-through from mid-run v3.
+        The episode row was already created when v3 fired; we update_ it with
+        the agent fallback's action data instead of creating a duplicate.
         """
         if failed_selector is None and recoverable_marker_id is None:
             return
@@ -797,23 +972,40 @@ class RealSkyvernPageAi(SkyvernPageAi):
                     f"Original selector: {failed_selector or '(none)'}. "
                     f"Intention: {intention}"
                 )
-            await app.DATABASE.scripts.create_fallback_episode(
-                organization_id=context.organization_id or "",
-                workflow_permanent_id=context.workflow_permanent_id,
-                workflow_run_id=context.workflow_run_id,
-                block_label=block_label or self.current_label or "unknown",
-                fallback_type="element",
-                script_revision_id=context.script_revision_id,
-                error_message=error_msg,
-                page_url=self.page.url,
-                agent_actions=action_data,
-            )
-            LOG.info(
-                "Recorded element fallback episode for selector failure",
-                block_label=block_label or self.current_label,
-                action_type=action_type,
-                failed_selector=failed_selector,
-            )
+            if v3_parent_episode_id:
+                # v3 mid-run Class B fall-through: episode already exists; update
+                # it with the agent's action_data + error_message instead of
+                # creating a duplicate row.
+                await app.DATABASE.scripts.update_fallback_episode(
+                    episode_id=v3_parent_episode_id,
+                    organization_id=context.organization_id or "",
+                    agent_actions=action_data,
+                    error_message=error_msg,
+                )
+                LOG.info(
+                    "Updated v3 mid-run episode with agent fallback action data",
+                    episode_id=v3_parent_episode_id,
+                    block_label=block_label or self.current_label,
+                    action_type=action_type,
+                )
+            else:
+                await app.DATABASE.scripts.create_fallback_episode(
+                    organization_id=context.organization_id or "",
+                    workflow_permanent_id=context.workflow_permanent_id,
+                    workflow_run_id=context.workflow_run_id,
+                    block_label=block_label or self.current_label or "unknown",
+                    fallback_type="element",
+                    script_revision_id=context.script_revision_id,
+                    error_message=error_msg,
+                    page_url=self.page.url,
+                    agent_actions=action_data,
+                )
+                LOG.info(
+                    "Recorded element fallback episode for selector failure",
+                    block_label=block_label or self.current_label,
+                    action_type=action_type,
+                    failed_selector=failed_selector,
+                )
         except Exception:
             LOG.warning("Failed to record element fallback episode for selector failure", exc_info=True)
 

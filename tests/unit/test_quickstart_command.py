@@ -479,7 +479,7 @@ def test_quickstart_server_flags_select_server_path_without_server_extra(monkeyp
     monkeypatch.setattr(
         quickstart_module,
         "_install_server_extra_for_quickstart",
-        lambda: install_calls.append("install") or True,
+        lambda **kwargs: install_calls.append(kwargs) or True,
     )
     monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
@@ -518,6 +518,15 @@ def test_quickstart_server_extra_probe_rejects_local_with_incidental_uvicorn(mon
     assert quickstart_module._has_server_quickstart_extra() is False
 
 
+def test_quickstart_local_extra_probe_allows_missing_psycopg(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "skyvern.exceptions.find_spec",
+        lambda module_name: None if module_name == "psycopg" else object(),
+    )
+
+    assert quickstart_module._has_local_quickstart_extra() is True
+
+
 def test_quickstart_interactive_server_choice_without_server_extra_prints_install_steps(monkeypatch) -> None:
     monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
     monkeypatch.setattr(quickstart_module, "_has_local_quickstart_extra", lambda: False)
@@ -547,14 +556,14 @@ def test_quickstart_interactive_server_choice_can_install_server_extra(monkeypat
     monkeypatch.setattr(
         quickstart_module,
         "_install_server_extra_for_quickstart",
-        lambda: install_calls.append("install") or True,
+        lambda **kwargs: install_calls.append(kwargs) or True,
     )
     monkeypatch.setattr(quickstart_module, "_run_server_quickstart", lambda **kwargs: server_calls.append(kwargs))
 
     result = CliRunner().invoke(quickstart_module.quickstart_app, [], input="3\n")
 
     assert result.exit_code == 0
-    assert install_calls == ["install"]
+    assert install_calls == [{"assume_yes": False}]
     assert server_calls == [
         {
             "no_postgres": False,

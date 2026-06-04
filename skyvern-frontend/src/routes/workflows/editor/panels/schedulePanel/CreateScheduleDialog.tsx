@@ -116,7 +116,7 @@ function CreateScheduleDialog({
       }}
     >
       <DialogTrigger asChild>
-        <Button variant="outline" size="sm" className="h-8 gap-1.5">
+        <Button size="sm" className="h-8 gap-1.5">
           <PlusIcon className="size-3" />
           Add
         </Button>
@@ -125,7 +125,7 @@ function CreateScheduleDialog({
         <DialogHeader>
           <DialogTitle>Create Schedule</DialogTitle>
           <DialogDescription>
-            Configure when this workflow should run automatically.
+            Configure when this agent should run automatically.
           </DialogDescription>
         </DialogHeader>
 

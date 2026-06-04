@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.36"
+version = "1.0.37"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -13,7 +13,8 @@ dependencies = [
     "cachetools>=5.3.2,<6",
     "orjson>=3.9.10,<4",
     "structlog>=23.2.0,<24",
-    "typer>=0.16.0",
+    "typer>=0.16.0,<0.26",
+    "click>=8,<9",
     "httpx[socks]>=0.27.0",
     "rich>=13.7.0,<14",
 ]
@@ -26,6 +27,7 @@ dependencies = [
 local = [
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    "yutori>=0.5.0",
     "sqlalchemy>=2.0.29,<3",
     "aiohttp>=3.13.4,<4",
     "python-multipart>=0.0.27,<1",
@@ -71,7 +73,7 @@ local = [
     "jsonschema>=4.23.0",
     "python-calamine>=0.6.1",
     "python-docx>=1.1.0",
-    "urllib3>=2.6.3",
+    "urllib3>=2.7.0",
     "zstandard>=0.25.0",
     "sse-starlette>=3.4.1,<4",
     "opentelemetry-api>=1.41.1,<2",
@@ -86,6 +88,7 @@ local = [
 server = [
     "azure-storage-blob>=12.26.0",
     "openai>=1.68.2",
+    "yutori>=0.5.0",
     # Plain pip sees LiteLLM's exact openai pin and therefore resolves this
     # range to openai-agents 0.10.x. Cloud/source installs include the cloud
     # group below, where uv overrides let the newer 0.14.x SDK resolve.
@@ -145,7 +148,7 @@ server = [
     "jsonschema>=4.23.0",
     "python-calamine>=0.6.1",
     "python-docx>=1.1.0",
-    "urllib3>=2.6.3",
+    "urllib3>=2.7.0",
     "zstandard>=0.25.0",
     "sse-starlette>=3.4.1,<4",
     "opentelemetry-api>=1.41.1,<2",
@@ -214,6 +217,8 @@ dev = [
     "openpyxl>=3.1.0",
     "gspread>=6",
     "python-pptx>=1.0.2",
+    "pyinstrument>=5.1.2",
+    "pip-audit>=2.10.0",
 ]
 
 [tool.hatch.build]
@@ -249,11 +254,17 @@ override-dependencies = [
     "jsonschema>=4.23.0",
     "python-dotenv>=1.0.0",
     "openai>=2.24.0",
+    # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
+    "httpx[socks]>=0.26.0",
 ]
 constraint-dependencies = [
     "authlib>=1.7.1",
     "flask>=3.1.3",
+    "idna>=3.15",
     "joserfc>=1.6.3",
+    "jupyter-server>=2.18.0",
+    "mako>=1.3.12",
+    "mistune>=3.2.1",
     "pyasn1>=0.6.3",
     "tornado>=6.5.5",
     "werkzeug>=3.1.6",
@@ -302,6 +313,7 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
+extend-select = ["B009", "B010"]  # flake8-bugbear: no getattr/setattr with a constant attribute name
 
 [tool.isort]
 profile = "black"

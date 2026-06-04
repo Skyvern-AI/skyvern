@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, cast
 
 import structlog
 
@@ -26,18 +27,78 @@ from skyvern.cli.core.session_manager import (
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.library.skyvern_browser import SkyvernBrowser
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
 LOG = structlog.get_logger()
 
 _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
-_BROWSER_BOOT_WAIT_SECONDS = 15.0
+# Browser contexts can lag the persistent-session row under load; this keeps
+# Copilot from handing a not-yet-attachable session to the next MCP tool.
+_BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
+_FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+
+
+def _playwright_private_impl(browser_context: object) -> object | None:
+    if not hasattr(browser_context, "_impl_obj"):
+        return None
+    return browser_context._impl_obj  # type: ignore[attr-defined]
+
+
+def _object_bool_attr(value: object | None, attr_name: str) -> bool:
+    return getattr(value, attr_name, False) is True
+
+
+def _browser_context_is_attachable(browser_context: object | None) -> bool:
+    if browser_context is None:
+        return False
+
+    # Playwright Python has no public BrowserContext.closed flag. These private
+    # attrs are a best-effort early guard; fallback defaults keep future
+    # Playwright changes from breaking the public browser.is_connected probe.
+    impl = _playwright_private_impl(browser_context)
+    if _object_bool_attr(impl, "_close_was_called") or _object_bool_attr(impl, "_closed"):
+        return False
+
+    # Test doubles and older Playwright-like wrappers may omit the public
+    # browser property. Treat that as attachable after the private close check.
+    browser = getattr(browser_context, "browser", None)
+    if browser is not None:
+        try:
+            if not browser.is_connected():
+                return False
+        except Exception:
+            return False
+
+    return True
+
+
+def _browser_session_status_is_final(status: str | None) -> bool:
+    return status in _FINAL_BROWSER_SESSION_STATUSES
+
+
+async def _get_persistent_browser_session(session_id: str, organization_id: str) -> PersistentBrowserSession | None:
+    browser_sessions_repo = app.DATABASE.browser_sessions
+    persistent_result = browser_sessions_repo.get_persistent_browser_session(session_id, organization_id)
+    # Production returns an awaitable; sync test doubles keep this edge branch easy to exercise.
+    if inspect.isawaitable(persistent_result):
+        return await cast("Awaitable[PersistentBrowserSession | None]", persistent_result)
+    return cast("PersistentBrowserSession | None", persistent_result)
+
+
+@dataclass
+class PendingBrowserInteractionObservation:
+    tool_name: str
+    url: str = ""
 
 
 @dataclass
@@ -53,6 +114,10 @@ class AgentContext:
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     failed_tool_step_tracker: dict[str, int] = field(default_factory=dict)
+    unrecoverable_tool_error_streak_count: int = 0
+    unrecoverable_tool_error_signature: str | None = None
+    unrecoverable_tool_error_reason: str | None = None
+    unrecoverable_tool_error_tool_name: str | None = None
 
     # Cross-turn agent state accumulated by tools.py as the agent runs.
     # Read back by failure_tracking / loop_detection to detect stuck loops,
@@ -65,6 +130,9 @@ class AgentContext:
     pending_action_sequence_fingerprint: str | None = None
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    last_full_workflow_test_ok: bool = False
+    last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
 
     # Enforcement state. Set lazily by streaming_adapter, tools, and
     # failure_tracking; declared here so _check_enforcement can read them on a
@@ -90,11 +158,16 @@ class AgentContext:
     last_failed_workflow_yaml: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
+    challenge_gated_proxy_retry_count: int = 0
     last_test_non_retriable_nav_error: str | None = None
     non_retriable_nav_error_last_emitted_signature: str | None = None
     workflow_persisted: bool = False
     last_workflow: Any | None = None
     last_workflow_yaml: str | None = None
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Any | None = None
+    has_staged_proposal: bool = False
+    canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     effective_workflow_proxy_location: Any | None = None
@@ -103,6 +176,45 @@ class AgentContext:
 
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
+    last_run_blocks_workflow_run_id: str | None = None
+    completion_verification_result: CompletionVerificationResult | None = None
+    outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
+    composition_page_evidence: dict[str, Any] | None = None
+    # Ordered, bounded list of typed page-evidence packets — one per page observed
+    # while scouting the goal path, each tagged with how that state was reached.
+    # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
+    flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
+    # In-turn side channel from workflow mutation calls: block label -> flow_evidence
+    # observation step used to ground the newly authored page-acting block.
+    block_observation_refs: dict[str, int] = field(default_factory=dict)
+    # Raw tool input for block_observation_refs, retained only for diagnostics
+    # when normalization drops malformed entries before composition validation.
+    raw_block_observation_refs: Any | None = None
+    # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
+    # composition gate credit a page observed on a prior turn when this turn's
+    # flow_evidence does not cover it (closes the spent-inspection-budget
+    # deadlock). Each item: {url, had_bounded_schema, reached_via}.
+    prior_observed_acted_pages: list[dict[str, Any]] = field(default_factory=list)
+    post_budget_page_inspection_required: bool = False
+    post_budget_page_inspection_url: str | None = None
+    post_budget_page_inspection_run_id: str | None = None
+    post_run_page_observation_tool: str | None = None
+    post_run_page_observation_url: str | None = None
+    post_run_page_observation_workflow_run_id: str | None = None
+    post_run_page_observation_after_failed_test: bool = False
+    post_run_current_page_inspection_workflow_run_id: str | None = None
+
+    # Set by tool gates / loop guards / tool-side error branches when a tool
+    # dispatch is blocked. The finalization shim in agent.py reads this at
+    # turn end and overrides the AgentResult with a deterministic
+    # product-language reply. See blocker_signal.py for the contract.
+    blocker_signal: CopilotToolBlockerSignal | None = None
+    # Most recently emitted blocker signal for the current tool output. Unlike
+    # blocker_signal, this is last-wins so the activity-log projection can
+    # render the current tool result from structured product text.
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
 
 
 def mcp_to_copilot(mcp_result: dict[str, Any]) -> dict[str, Any]:
@@ -159,7 +271,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         session_id=ctx.browser_session_id,
         organization_id=ctx.organization_id,
     )
-    if not browser_state or not browser_state.browser_context:
+    if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
         # Keep the session id out of the raised message -- it can propagate
         # to LLM- or user-visible output -- but log it for operators.
         LOG.warning(
@@ -197,14 +309,23 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
 async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
     """Create a browser session if needed. Returns None on success, error dict on failure."""
     if ctx.browser_session_id:
-        # Probe attachability — a stale DB row demotes to auto-create here
-        # instead of bubbling up as a "No browser context" tool failure.
+        persistent = await _get_persistent_browser_session(ctx.browser_session_id, ctx.organization_id)
+        if persistent is not None and _browser_session_status_is_final(persistent.status):
+            LOG.warning(
+                "Supplied browser_session_id is closed or missing; auto-creating",
+                session_id=ctx.browser_session_id,
+                organization_id=ctx.organization_id,
+                status=persistent.status,
+            )
+            ctx.browser_session_id = None
+
+    if ctx.browser_session_id:
         try:
             state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
                 session_id=ctx.browser_session_id,
                 organization_id=ctx.organization_id,
             )
-            if state and state.browser_context:
+            if state and _browser_context_is_attachable(state.browser_context):
                 return None
             LOG.warning(
                 "Supplied browser_session_id is no longer attachable; auto-creating",
@@ -239,7 +360,7 @@ async def ensure_browser_session(ctx: AgentContext) -> dict[str, Any] | None:
                     session_id=ctx.browser_session_id,
                     organization_id=ctx.organization_id,
                 )
-                if state and state.browser_context:
+                if state and _browser_context_is_attachable(state.browser_context):
                     break
                 await asyncio.sleep(_BROWSER_BOOT_POLL_INTERVAL_SECONDS)
 

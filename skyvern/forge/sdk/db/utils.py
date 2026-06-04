@@ -1,6 +1,6 @@
 import json
 import typing
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pydantic
 import pydantic.json
@@ -35,6 +35,7 @@ from skyvern.forge.sdk.db.models import (
 from skyvern.forge.sdk.encrypt import encryptor
 from skyvern.forge.sdk.encrypt.base import EncryptMethod
 from skyvern.forge.sdk.models import Step, StepStatus
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import (
     AzureClientSecretCredential,
     AzureOrganizationAuthToken,
@@ -78,7 +79,10 @@ from skyvern.webeye.actions.actions import (
     CompleteAction,
     DownloadFileAction,
     DragAction,
+    ExecuteJsAction,
     ExtractAction,
+    GoBackAction,
+    GoForwardAction,
     GotoUrlAction,
     HoverAction,
     InputTextAction,
@@ -95,6 +99,9 @@ from skyvern.webeye.actions.actions import (
     VerificationCodeAction,
     WaitAction,
 )
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 
 LOG = structlog.get_logger()
 
@@ -124,7 +131,8 @@ def deserialize_proxy_location(
     Handles:
     - None -> None
     - ProxyLocation enum string (e.g., "RESIDENTIAL") -> ProxyLocation enum
-    - JSON string (e.g., '{"country": "US", ...}') -> GeoTarget object
+    - JSON string with country key (e.g., '{"country": "US", ...}') -> GeoTarget object
+    - JSON string with url key (e.g., '{"url": "http://..."}') -> dict (custom proxy URL)
     """
     if value is None:
         return None
@@ -132,12 +140,17 @@ def deserialize_proxy_location(
     value = value.strip()
     result: ProxyLocationInput = None
 
-    # Try to parse as JSON first (for GeoTarget)
+    # Try to parse as JSON first (for GeoTarget or custom proxy URL dict)
     if value.startswith("{"):
         try:
             data = json.loads(value)
             if not isinstance(data, dict):
-                raise ValueError("GeoTarget proxy_location JSON must be an object")
+                raise ValueError("proxy_location JSON must be an object")
+
+            # Custom proxy URL dict: {"url": "http://..."} for self-hosted deployments.
+            if "url" in data and "country" not in data:
+                LOG.info("Deserialized proxy_location as custom proxy URL dict", db_value=value)
+                return data
 
             # Handle malformed subdivision (e.g., boolean instead of string)
             subdivision = data.get("subdivision")
@@ -218,7 +231,24 @@ ACTION_TYPE_TO_CLASS = {
     ActionType.VERIFICATION_CODE: VerificationCodeAction,
     ActionType.LEFT_MOUSE: LeftMouseAction,
     ActionType.GOTO_URL: GotoUrlAction,
+    ActionType.GO_BACK: GoBackAction,
+    ActionType.GO_FORWARD: GoForwardAction,
+    ActionType.EXECUTE_JS: ExecuteJsAction,
 }
+
+
+def _scrub_nul_chars(obj: typing.Any) -> typing.Any:
+    # PG text/jsonb cannot store NUL; strip it pre-serialization so strings that
+    # spell out the escape sequence (\u0000) are not affected.
+    if isinstance(obj, str):
+        return obj.replace("\x00", "") if "\x00" in obj else obj
+    if isinstance(obj, dict):
+        return {_scrub_nul_chars(k): _scrub_nul_chars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_nul_chars(item) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_nul_chars(item) for item in obj)
+    return obj
 
 
 @typing.no_type_check
@@ -226,6 +256,8 @@ def _custom_json_serializer(*args, **kwargs) -> str:
     """
     Encodes json in the same way that pydantic does.
     """
+    if args:
+        args = (_scrub_nul_chars(args[0]),) + args[1:]
     return json.dumps(*args, default=pydantic.json.pydantic_encoder, **kwargs)
 
 
@@ -294,6 +326,7 @@ def convert_to_task(task_obj: TaskModel, debug_enabled: bool = False, workflow_p
         proxy_location=deserialize_proxy_location(task_obj.proxy_location),
         extracted_information_schema=task_obj.extracted_information_schema,
         extra_http_headers=task_obj.extra_http_headers,
+        cdp_connect_headers=task_obj.cdp_connect_headers,
         workflow_run_id=task_obj.workflow_run_id,
         workflow_permanent_id=workflow_permanent_id,
         order=task_obj.order,
@@ -333,7 +366,33 @@ def convert_to_workflow_copilot_chat_message(
             "Converting WorkflowCopilotChatMessage to WorkflowCopilotChatMessageSchema",
             workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
         )
-    return WorkflowCopilotChatMessageSchema.model_validate(message_model)
+    raw_outcome = message_model.turn_outcome
+    parsed_outcome: TurnOutcome | None = None
+    if isinstance(raw_outcome, dict):
+        try:
+            parsed_outcome = TurnOutcome.model_validate(raw_outcome)
+        except Exception as exc:
+            LOG.warning(
+                "Failed to parse TurnOutcome from chat row, treating as None",
+                workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+                exc_info=exc,
+            )
+            parsed_outcome = None
+    raw_narrative = message_model.narrative_payload
+    parsed_narrative = typing.cast(
+        "TurnNarrativePayload | None", raw_narrative if isinstance(raw_narrative, dict) else None
+    )
+    return WorkflowCopilotChatMessageSchema(
+        workflow_copilot_chat_message_id=message_model.workflow_copilot_chat_message_id,
+        workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
+        sender=message_model.sender,
+        content=message_model.content,
+        global_llm_context=message_model.global_llm_context,
+        turn_outcome=parsed_outcome,
+        narrative_payload=parsed_narrative,
+        created_at=message_model.created_at,
+        modified_at=message_model.modified_at,
+    )
 
 
 def convert_to_step(step_model: StepModel, debug_enabled: bool = False) -> Step:
@@ -481,6 +540,7 @@ def convert_to_workflow(
         model=workflow_model.model,
         proxy_location=deserialize_proxy_location(workflow_model.proxy_location),
         max_screenshot_scrolls=workflow_model.max_screenshot_scrolling_times,
+        max_elapsed_time_minutes=workflow_model.max_elapsed_time_minutes,
         version=workflow_model.version,
         is_saved_task=workflow_model.is_saved_task,
         is_template=is_template,
@@ -491,6 +551,7 @@ def convert_to_workflow(
         deleted_at=workflow_model.deleted_at,
         status=WorkflowStatus(workflow_model.status),
         extra_http_headers=workflow_model.extra_http_headers,
+        cdp_connect_headers=workflow_model.cdp_connect_headers,
         run_with=workflow_model.run_with,
         ai_fallback=workflow_model.ai_fallback,
         cache_key=workflow_model.cache_key,
@@ -538,7 +599,9 @@ def convert_to_workflow_run(
         modified_at=workflow_run_model.modified_at,
         workflow_title=workflow_title,
         max_screenshot_scrolls=workflow_run_model.max_screenshot_scrolling_times,
+        max_elapsed_time_minutes=workflow_run_model.max_elapsed_time_minutes,
         extra_http_headers=workflow_run_model.extra_http_headers,
+        cdp_connect_headers=workflow_run_model.cdp_connect_headers,
         browser_address=workflow_run_model.browser_address,
         job_id=workflow_run_model.job_id,
         depends_on_workflow_run_id=workflow_run_model.depends_on_workflow_run_id,

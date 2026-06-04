@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,7 @@ from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import SessionState, scoped_session
 from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
+from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +41,12 @@ def _make_ctx(**overrides: Any) -> AgentContext:
     )
     defaults.update(overrides)
     return AgentContext(**defaults)
+
+
+def test_copilot_same_page_ignoring_fragment_matches_trailing_slash_variants() -> None:
+    assert _same_page_ignoring_fragment("https://example.test/results#section", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results/", "https://example.test/results") is True
+    assert _same_page_ignoring_fragment("https://example.test/results?page=2", "https://example.test/results") is False
 
 
 @pytest.mark.asyncio
@@ -275,6 +283,43 @@ class TestScreenshotAdapter:
         assert adapted["data"]["screenshot_base64"] == "iVBOR..."
         assert adapted["data"]["url"] == "https://example.com"
         assert adapted["data"]["title"] == "Example"
+        assert ctx.composition_page_evidence["source_tool"] == "get_browser_screenshot"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com"
+
+    @pytest.mark.asyncio
+    async def test_screenshot_post_hook_does_not_verify_from_url_title_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+        from skyvern.forge.sdk.copilot.tools import _screenshot_post_hook
+
+        async def handler(**_: object) -> dict[str, object]:
+            raise AssertionError("screenshot-only observation must not invoke completion verification")
+
+        async def handler_lookup(_: object) -> object:
+            return handler
+
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", handler_lookup)
+        ctx = _make_ctx(
+            request_policy=RequestPolicy(
+                completion_criteria=[CompletionCriterion(id="c0", outcome="the requested item is visible")]
+            ),
+            last_test_ok=False,
+            last_run_blocks_workflow_run_id="wr_failed",
+            copilot_run_start_monotonic=time.monotonic(),
+        )
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {
+            "ok": True,
+            "data": {"data": "iVBOR...", "mime": "image/png", "bytes": 1234},
+        }
+
+        adapted = await _screenshot_post_hook(result, raw, ctx)
+
+        assert adapted["data"]["url"] == "https://example.com/results"
+        assert ctx.post_run_page_observation_after_failed_test is True
+        assert ctx.completion_verification_result is None
 
 
 class TestNavigateAdapter:
@@ -347,6 +392,86 @@ class TestEvaluateAdapter:
         }
         result = mcp_to_copilot(mcp_result)
         assert result["data"]["result"] == {"title": "Test"}
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_marks_browser_observation_as_composition_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {
+            "ok": True,
+            "data": {
+                "rows": [{"name": "Test User", "credential": "RBT"}],
+                "text": "Test User RBT",
+            },
+        }
+
+        adapted = await _evaluate_post_hook(result, raw, ctx)
+
+        assert adapted["data"]["url"] == "https://example.com/results"
+        assert ctx.composition_page_evidence["source_tool"] == "evaluate"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com/results"
+        assert ctx.composition_page_evidence["result_containers"] == [
+            {
+                "tag": "table",
+                "id": "",
+                "selector": "",
+                "row_count": 1,
+                "sample_rows": ["Test User"],
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_lifts_bounded_page_schema_from_mcp_observation(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        raw = {"browser_context": {"url": "https://example.com/lookup", "title": "Lookup"}}
+        result = {
+            "ok": True,
+            "data": {
+                "forms": [
+                    {
+                        "id": "search",
+                        "fields": [
+                            {"label": "First Name", "name": "first_name", "type": "text"},
+                            {"labels": ["Last", "Name"], "name": "last_name", "type": "text", "required": True},
+                        ],
+                        "submit_controls": [{"text": "Search", "selector": "#searchButton"}],
+                    }
+                ],
+                "bodyText": "credential lookup search",
+            },
+        }
+
+        await _evaluate_post_hook(result, raw, ctx)
+
+        assert ctx.composition_page_evidence["source_tool"] == "evaluate"
+        assert ctx.composition_page_evidence["evidence_sources"] == ["mcp_evaluate"]
+        assert ctx.composition_page_evidence["forms"][0]["fields"][0]["label"] == "First Name"
+        assert ctx.composition_page_evidence["forms"][0]["fields"][1]["label"] == "Last Name"
+        assert ctx.composition_page_evidence["forms"][0]["fields"][1]["required"] is True
+        assert ctx.composition_page_evidence["forms"][0]["submit_controls"][0]["selector"] == "#searchButton"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_post_hook_does_not_overwrite_typed_composition_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _evaluate_post_hook
+
+        ctx = _make_ctx()
+        ctx.composition_page_evidence = {
+            "inspected_url": "https://example.com/search",
+            "current_url": "https://example.com/search",
+            "source_tool": "inspect_page_for_composition",
+            "forms": [{"fields": [{"label": "Name"}], "submit_controls": [{"text": "Search"}]}],
+        }
+        raw = {"browser_context": {"url": "https://example.com/results", "title": "Results"}}
+        result = {"ok": True, "data": {"text": "Test User RBT"}}
+
+        await _evaluate_post_hook(result, raw, ctx)
+
+        assert ctx.composition_page_evidence["source_tool"] == "inspect_page_for_composition"
+        assert ctx.composition_page_evidence["current_url"] == "https://example.com/search"
 
 
 class TestUpdateWorkflowDirect:
@@ -541,7 +666,14 @@ workflow_definition:
 
 
 class TestWorkflowUpdatePersistence:
-    def test_record_marks_persisted_even_when_workflow_has_zero_blocks(self) -> None:
+    def test_record_marks_last_workflow_but_not_legacy_persisted(self) -> None:
+        """SKY-10318: ``_record_workflow_update_result`` no longer flips the
+        legacy ``workflow_persisted`` flag (canonical write is now gated by
+        ``_update_workflow``'s degraded-path check, not by tool success). The
+        staging-aware signal is ``ctx.has_staged_proposal``, assigned inside
+        ``_update_workflow`` itself rather than this bookkeeping helper. The
+        helper still records ``last_workflow`` and ``last_workflow_yaml`` for
+        downstream callers (e.g. frontier diff, terminal AgentResult)."""
         from skyvern.forge.sdk.copilot.tools import _record_workflow_update_result
 
         ctx = MagicMock()
@@ -563,4 +695,4 @@ class TestWorkflowUpdatePersistence:
 
         assert ctx.last_workflow is workflow
         assert ctx.last_workflow_yaml == "title: Empty workflow"
-        assert ctx.workflow_persisted is True
+        assert ctx.workflow_persisted is False

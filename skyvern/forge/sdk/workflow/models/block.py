@@ -123,7 +123,15 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
 )
 from skyvern.schemas.runs import RunEngine
-from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
+from skyvern.schemas.workflows import (
+    AIFallbackMode,
+    BlockResult,
+    BlockStatus,
+    BlockType,
+    FileStorageType,
+    FileType,
+    FileUploadDestination,
+)
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -257,6 +265,7 @@ def _format_payload_path_segment(key: str) -> str:
 
 # ForLoop constants
 DEFAULT_MAX_LOOP_ITERATIONS = 500
+MAX_LOOP_OVER_VALUE_LOG_CHARS = 2000
 # Persist accumulated loop output to DB every N iterations to survive timeouts.
 # Trades up to N-1 iterations of data loss for O(N/K) writes instead of O(N).
 PERSIST_LOOP_OUTPUT_INTERVAL = 10
@@ -2225,7 +2234,13 @@ class ForLoopBlock(Block):
                     block_outputs=block_outputs,
                     last_block=current_block,
                 )
-            LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value)
+            loop_over_value_repr = repr(loop_over_value)
+            if len(loop_over_value_repr) > MAX_LOOP_OVER_VALUE_LOG_CHARS:
+                loop_over_value_repr = (
+                    loop_over_value_repr[:MAX_LOOP_OVER_VALUE_LOG_CHARS]
+                    + f"...[truncated, original size: {len(loop_over_value_repr)}]"
+                )
+            LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
 
             # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
             loop_context = skyvern_context.current()
@@ -4149,6 +4164,49 @@ class FileUploadBlock(Block):
     def _get_azure_blob_uri(self, workflow_run_id: str, blob_name: str) -> str:
         return f"https://{self.azure_storage_account_name}.blob.core.windows.net/{self.azure_blob_container_name}/{blob_name}"
 
+    def _build_s3_destination(
+        self,
+        workflow_run_id: str,
+        file_path: str,
+        aws_access_key_id: str | None,
+        aws_secret_access_key: str | None,
+    ) -> FileUploadDestination:
+        s3_uri = self._get_s3_uri(workflow_run_id, file_path)
+        # ``_get_s3_uri`` returns ``s3://{bucket}/{key}`` — split it back out for
+        # the destination so the cloud override can compute a presigned URL.
+        without_scheme = s3_uri[len("s3://") :]
+        bucket, _, key = without_scheme.partition("/")
+        return FileUploadDestination(
+            storage_type=FileStorageType.S3,
+            customer_uri=s3_uri,
+            sdk_uri=s3_uri,
+            s3_bucket=bucket,
+            s3_key=key,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_region_name=self.region_name,
+        )
+
+    def _build_azure_destination(
+        self,
+        workflow_run_id: str,
+        file_path: str,
+        azure_storage_account_name: str,
+        azure_storage_account_key: str,
+    ) -> FileUploadDestination:
+        blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
+        customer_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
+        sdk_uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
+        return FileUploadDestination(
+            storage_type=FileStorageType.AZURE,
+            customer_uri=customer_uri,
+            sdk_uri=sdk_uri,
+            azure_storage_account_name=azure_storage_account_name,
+            azure_storage_account_key=azure_storage_account_key,
+            azure_blob_container_name=self.azure_blob_container_name,
+            azure_blob_name=blob_name,
+        )
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -4245,15 +4303,20 @@ class FileUploadBlock(Block):
                     workflow_run_context.get_original_secret_value_or_none(self.aws_secret_access_key)
                     or self.aws_secret_access_key
                 )
-                aws_client = AsyncAWSClient(
-                    aws_access_key_id=actual_aws_access_key_id,
-                    aws_secret_access_key=actual_aws_secret_access_key,
-                    region_name=self.region_name,
-                )
                 for file_path in files_to_upload:
-                    s3_uri = self._get_s3_uri(workflow_run_id, file_path)
-                    uploaded_uris.append(s3_uri)
-                    await aws_client.upload_file_from_path(uri=s3_uri, file_path=file_path, raise_exception=True)
+                    destination = self._build_s3_destination(
+                        workflow_run_id=workflow_run_id,
+                        file_path=file_path,
+                        aws_access_key_id=actual_aws_access_key_id,
+                        aws_secret_access_key=actual_aws_secret_access_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to S3", file_path=self.path)
             elif self.storage_type == FileStorageType.AZURE:
                 actual_azure_storage_account_name = (
@@ -4267,17 +4330,21 @@ class FileUploadBlock(Block):
                 if actual_azure_storage_account_name is None or actual_azure_storage_account_key is None:
                     raise AzureConfigurationError("Azure Storage is not configured")
 
-                azure_client = app.AZURE_CLIENT_FACTORY.create_storage_client(
-                    storage_account_name=actual_azure_storage_account_name,
-                    storage_account_key=actual_azure_storage_account_key,
-                )
                 for file_path in files_to_upload:
                     LOG.info("FileUploadBlock Uploading file to Azure Blob Storage", file_path=file_path)
-                    blob_name = self._get_azure_blob_name(workflow_run_id, file_path)
-                    azure_uri = self._get_azure_blob_uri(workflow_run_id, blob_name)
-                    uploaded_uris.append(azure_uri)
-                    uri = f"azure://{self.azure_blob_container_name or ''}/{blob_name}"
-                    await azure_client.upload_file_from_path(uri, file_path)
+                    destination = self._build_azure_destination(
+                        workflow_run_id=workflow_run_id,
+                        file_path=file_path,
+                        azure_storage_account_name=actual_azure_storage_account_name,
+                        azure_storage_account_key=actual_azure_storage_account_key,
+                    )
+                    customer_uri = await app.AGENT_FUNCTION.upload_file_to_customer_storage(
+                        file_path=file_path,
+                        destination=destination,
+                        organization_id=organization_id,
+                        run_id=workflow_run_id,
+                    )
+                    uploaded_uris.append(customer_uri)
                 LOG.info("FileUploadBlock File(s) uploaded to Azure Blob Storage", file_path=self.path)
             else:
                 # This case should ideally be caught by the initial validation
@@ -5046,8 +5113,7 @@ class FileParserBlock(Block):
 
         # Convert content to string for AI processing
         if isinstance(content, list):
-            # For CSV/Excel data, convert to a readable format
-            content_str = json.dumps(content, indent=2)
+            content_str = json.dumps(content, separators=(",", ":"))
         else:
             content_str = content
 
@@ -5097,6 +5163,41 @@ class FileParserBlock(Block):
             error_codes=error_codes or None,
         )
 
+    @staticmethod
+    def _extract_file_url_from_block_output(value: Any) -> str | None:
+        """Extract a file URL from a block output value.
+
+        When users pass an entire block output (e.g. ``{{ block_8_output }}``) as the
+        ``file_url``, the resolved value may be a dict or a string representation of a
+        dict that contains a ``downloaded_files`` list.  This helper unwraps that
+        structure and returns the URL of the first downloaded file.
+
+        Handles three forms:
+        - dict with a ``downloaded_files`` list
+        - JSON string encoding such a dict
+        - Python dict-repr string produced by Jinja's default ``str()`` rendering
+        """
+        if isinstance(value, dict):
+            downloaded_files = value.get("downloaded_files")
+            if isinstance(downloaded_files, list) and downloaded_files:
+                first_file = downloaded_files[0]
+                if isinstance(first_file, dict):
+                    return first_file.get("url") or None
+            return None
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            try:
+                parsed = ast.literal_eval(value)
+                if isinstance(parsed, dict):
+                    return FileParserBlock._extract_file_url_from_block_output(parsed)
+            except (ValueError, SyntaxError):
+                pass
+        return None
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -5114,12 +5215,21 @@ class FileParserBlock(Block):
         ):
             file_url_parameter_value = workflow_run_context.get_value(self.file_url)
             if file_url_parameter_value:
-                LOG.info(
-                    "FileParserBlock File URL is parameterized, using parameter value",
-                    file_url_parameter_value=file_url_parameter_value,
-                    file_url_parameter_key=self.file_url,
-                )
-                self.file_url = file_url_parameter_value
+                extracted_url = self._extract_file_url_from_block_output(file_url_parameter_value)
+                if extracted_url:
+                    LOG.info(
+                        "FileParserBlock Extracted file URL from block output parameter",
+                        extracted_url=extracted_url,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = extracted_url
+                else:
+                    LOG.info(
+                        "FileParserBlock File URL is parameterized, using parameter value",
+                        file_url_parameter_value=file_url_parameter_value,
+                        file_url_parameter_key=self.file_url,
+                    )
+                    self.file_url = file_url_parameter_value
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
@@ -5131,6 +5241,18 @@ class FileParserBlock(Block):
                 organization_id,
                 f"Failed to format jinja template: {str(e)}",
             )
+
+        # After Jinja rendering, self.file_url may be a stringified block output
+        # (e.g. when the user wrote ``{{ block_8_output }}``). Try to extract the
+        # file URL from it before attempting the download.
+        extracted_url = self._extract_file_url_from_block_output(self.file_url)
+        if extracted_url:
+            LOG.info(
+                "FileParserBlock Extracted file URL from rendered block output",
+                extracted_url=extracted_url,
+                rendered_value=self.file_url,
+            )
+            self.file_url = extracted_url
 
         try:
             # Download the file.
@@ -5671,6 +5793,9 @@ class ActionBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.ACTION] = BlockType.ACTION  # type: ignore
+
+    selector: str | None = None
+    ai_fallback: AIFallbackMode = AIFallbackMode.FALLBACK
 
 
 class NavigationBlock(BaseTaskBlock):
@@ -7499,6 +7624,21 @@ async def _evaluate_prompt_branch_conditions_batch(
             raise ValueError(f"Unexpected output format: {type(output_value)}")
 
         raw_evaluations = _find_evaluations_array(output_value)
+
+        # LLM sometimes splits compound criteria into per-clause sub-evaluations, emitting
+        # reasoning=None placeholder entries for each. Strip them and recover if the remainder
+        # matches len(branches); otherwise fall through to the existing hard-fail.
+        if len(raw_evaluations) > len(branches):
+            well_formed = [e for e in raw_evaluations if not (isinstance(e, dict) and e.get("reasoning") is None)]
+            if len(well_formed) == len(branches):
+                LOG.warning(
+                    "LLM returned extra placeholder evaluations; using well-formed subset",
+                    block_label=log_label,
+                    total_returned=len(raw_evaluations),
+                    well_formed_count=len(well_formed),
+                    num_branches=len(branches),
+                )
+                raw_evaluations = well_formed
 
         for idx, evaluation in enumerate(raw_evaluations):
             bool_result, rendered_expr = _parse_single_evaluation(

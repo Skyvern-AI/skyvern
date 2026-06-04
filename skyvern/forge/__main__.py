@@ -82,12 +82,8 @@ if __name__ == "__main__":
         "skyvern.forge.api_app:create_api_app",
         host="0.0.0.0",
         port=port,
-        log_level="info",
+        # Omit log_level= so uvicorn.Config.configure_logging() doesn't reset setup_logger()'s uvicorn.error WARNING.
         access_log=False,
-        # uvicorn's default LOGGING_CONFIG runs dictConfig() which resets the
-        # uvicorn.error / uvicorn.access levels we set in setup_logger() back to
-        # INFO, leaking WebSocket "connection open" / "WebSocket [accepted]" spam
-        # to stderr. Pass a no-op dict so structlog stays in charge.
         log_config={"version": 1, "disable_existing_loggers": False},
         reload=reload,
         reload_excludes=reload_excludes,

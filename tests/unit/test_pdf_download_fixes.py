@@ -391,3 +391,215 @@ class TestCheckPdfViewerEmbed:
         )
         result = sp.check_pdf_viewer_embed()
         assert result is None
+
+
+class TestCheckPdfViewerEmbedPerFrame:
+    def test_pdf_embed_sole_element_in_child_frame(self) -> None:
+        """Detects PDF embed when it is the only element in a child frame."""
+        data_uri = "data:application/pdf;base64,JVBERi0xLjQ="
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "NAV1", "tagName": "a", "attributes": {"href": "#"}},
+                {"id": "NAV2", "tagName": "a", "attributes": {"href": "#"}},
+                {"id": "PDF1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": data_uri}},
+            ],
+        )
+        sp.id_to_frame_dict = {"NAV1": "frame_top", "NAV2": "frame_top", "PDF1": "frame_content"}
+        result = sp.check_pdf_viewer_embed()
+        assert result == data_uri
+
+    def test_pdf_embed_with_other_elements_in_same_frame_returns_none(self) -> None:
+        """Returns None when PDF embed shares its frame with other elements (not a PDF viewer frame)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "BTN1", "tagName": "button", "attributes": {}},
+                {"id": "PDF1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"BTN1": "frame_a", "PDF1": "frame_a"}
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_backward_compat_single_element_page(self) -> None:
+        """Single-element page with PDF embed still detected (original behavior)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "E1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "test.pdf"}},
+            ],
+        )
+        result = sp.check_pdf_viewer_embed()
+        assert result == "test.pdf"
+
+    def test_no_id_to_frame_dict_falls_through(self) -> None:
+        """Without id_to_frame_dict, multi-element page returns None (no per-frame scan)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"tagName": "a", "attributes": {}},
+                {"tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_main_frame_embed_not_detected_by_per_frame_scan(self) -> None:
+        """Embed in main.frame is not detected by per-frame scan (but whole-page check catches single-element pages)."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "NAV1", "tagName": "a", "attributes": {}},
+                {"id": "E1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "file.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"NAV1": "frame_top", "E1": "main.frame"}
+        result = sp.check_pdf_viewer_embed()
+        assert result is None
+
+    def test_multiple_frames_first_pdf_wins(self) -> None:
+        """When multiple frames each have a sole PDF embed, first match is returned."""
+        sp = _make_scraped_page(
+            elements=[
+                {"id": "P1", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "first.pdf"}},
+                {"id": "P2", "tagName": "embed", "attributes": {"type": "application/pdf", "src": "second.pdf"}},
+            ],
+        )
+        sp.id_to_frame_dict = {"P1": "frame_a", "P2": "frame_b"}
+        result = sp.check_pdf_viewer_embed()
+        assert result == "first.pdf"
+
+
+class TestPdfViewerDuplicateSourceProtection:
+    @pytest.fixture(autouse=True)
+    def _setup_context(self) -> None:
+        from skyvern.forge.sdk.core import skyvern_context
+        from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+        ctx = SkyvernContext()
+        skyvern_context.set(ctx)
+        yield  # type: ignore[misc]
+        skyvern_context.reset()
+
+    def test_first_time_returns_true(self) -> None:
+        from skyvern.forge.agent import should_auto_download_pdf
+
+        assert should_auto_download_pdf("data:application/pdf;base64,JVBERi0xLjQ=") is True
+
+    def test_same_source_returns_false_after_mark(self) -> None:
+        """Same PDF source returns False only after mark_pdf_source_downloaded."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+
+        assert should_auto_download_pdf(pdf_src) is True
+        assert should_auto_download_pdf(pdf_src) is True
+        mark_pdf_source_downloaded(pdf_src)
+        assert should_auto_download_pdf(pdf_src) is False
+
+    def test_different_source_returns_true(self) -> None:
+        """Different PDF source should still auto-download even after first was downloaded."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        src_1 = "data:application/pdf;base64,JVBERi0xLjQ="
+        src_2 = "data:application/pdf;base64,DIFFERENT_CONTENT"
+
+        mark_pdf_source_downloaded(src_1)
+        assert should_auto_download_pdf(src_1) is False
+        assert should_auto_download_pdf(src_2) is True
+
+    def test_url_source(self) -> None:
+        """URL-based PDF sources are tracked the same as base64 data URIs."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_url = "https://example.com/report.pdf"
+
+        assert should_auto_download_pdf(pdf_url) is True
+        mark_pdf_source_downloaded(pdf_url)
+        assert should_auto_download_pdf(pdf_url) is False
+
+    def test_cross_task_block_dedupe(self) -> None:
+        """Same PDF source across different task blocks in one workflow run
+        should be deduplicated (run-scoped, not task-scoped). If block 1
+        downloads a PDF and the workflow proceeds to block 2 on the same
+        PDF viewer, block 2 should NOT re-download."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+
+        # Task block 1 downloads the PDF
+        mark_pdf_source_downloaded(pdf_src)
+        assert should_auto_download_pdf(pdf_src) is False
+
+        # Task block 2 (different task_id, same context/run) encounters same PDF
+        # Should still be False — dedupe is per-run, not per-task
+        assert should_auto_download_pdf(pdf_src) is False
+
+    def test_independent_per_context(self) -> None:
+        """Different SkyvernContext instances (= different runs) have independent tracking."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+        from skyvern.forge.sdk.core import skyvern_context
+        from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+
+        mark_pdf_source_downloaded(pdf_src)
+        assert should_auto_download_pdf(pdf_src) is False
+
+        # New context (different run) resets tracking
+        skyvern_context.set(SkyvernContext())
+        assert should_auto_download_pdf(pdf_src) is True
+
+    def test_survives_task_refresh(self) -> None:
+        """Dedupe survives task object replacement from DB refresh."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+        assert should_auto_download_pdf(pdf_src) is True
+        mark_pdf_source_downloaded(pdf_src)
+        # State lives on SkyvernContext, not the task object
+        assert should_auto_download_pdf(pdf_src) is False
+
+    def test_failed_download_allows_retry(self) -> None:
+        """If mark is never called (download failed), retry should proceed."""
+        from skyvern.forge.agent import should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+        assert should_auto_download_pdf(pdf_src) is True
+        # Download fails — mark NOT called
+        assert should_auto_download_pdf(pdf_src) is True
+
+    def test_production_flow_success_then_skip(self) -> None:
+        """check → action succeeds → mark → next step skips."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+        assert should_auto_download_pdf(pdf_src) is True
+        mark_pdf_source_downloaded(pdf_src)
+        assert should_auto_download_pdf(pdf_src) is False
+
+    def test_production_flow_failure_then_retry(self) -> None:
+        """check → action FAILS → no mark → retry succeeds → mark → skip."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_src = "data:application/pdf;base64,JVBERi0xLjQ="
+        assert should_auto_download_pdf(pdf_src) is True
+        # Fail — no mark
+        assert should_auto_download_pdf(pdf_src) is True
+        # Succeed
+        mark_pdf_source_downloaded(pdf_src)
+        assert should_auto_download_pdf(pdf_src) is False
+
+    def test_url_no_signal_allows_retry(self) -> None:
+        """URL-backed PDF with download_triggered=False: no mark, retry proceeds."""
+        from skyvern.forge.agent import should_auto_download_pdf
+
+        pdf_url = "https://example.com/report.pdf"
+        assert should_auto_download_pdf(pdf_url) is True
+        # No mark (download_triggered=False in production)
+        assert should_auto_download_pdf(pdf_url) is True
+
+    def test_url_with_signal_marks(self) -> None:
+        """URL-backed PDF with download_triggered=True: mark and skip."""
+        from skyvern.forge.agent import mark_pdf_source_downloaded, should_auto_download_pdf
+
+        pdf_url = "https://example.com/report.pdf"
+        assert should_auto_download_pdf(pdf_url) is True
+        mark_pdf_source_downloaded(pdf_url)
+        assert should_auto_download_pdf(pdf_url) is False

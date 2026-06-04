@@ -28,11 +28,21 @@ import {
   parameterIsOnePasswordCredential,
   ParametersState,
   parameterIsAzureVaultCredential,
+  AUTO_GENERATED_CREDENTIAL_KEY_PATTERN,
 } from "../types";
 import { getDefaultValueForParameterType } from "../workflowEditorUtils";
 import { validateBitwardenLoginCredential } from "./util";
 import { HelpTooltip } from "@/components/HelpTooltip";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
+import {
+  CredentialDataType,
+  CredentialSource,
+  detectInitialCredentialDataType,
+  detectInitialCredentialSource,
+  detectInitialParameterTypeSelection,
+  header,
+  ParameterTypeSelection,
+} from "./WorkflowParameterEditPanel.helpers";
 
 type Props = {
   type: WorkflowEditorParameterType;
@@ -50,19 +60,6 @@ const workflowParameterTypeOptions = [
   { label: "file", value: WorkflowParameterValueType.FileURL },
   { label: "JSON", value: WorkflowParameterValueType.JSON },
 ];
-
-type CredentialDataType = "password" | "secret" | "creditCard";
-type CredentialSource =
-  | "bitwarden"
-  | "skyvern"
-  | "onepassword"
-  | "azurevault"
-  | "custom";
-
-// When selecting from the Value Type dropdown, "credential" is a special value that triggers
-// credential-specific UI. This is separate from WorkflowParameterValueType which only includes
-// data types like string, integer, etc.
-type ParameterTypeSelection = WorkflowParameterValueType | "credential";
 
 // Determine available sources based on credential data type
 function getAvailableSourcesForDataType(
@@ -104,25 +101,6 @@ function getAvailableSourcesForDataType(
   }
 }
 
-function header(
-  type: WorkflowEditorParameterType,
-  isEdit: boolean,
-  isCredentialSelected: boolean,
-) {
-  const prefix = isEdit ? "Edit" : "Add";
-  if (type === "workflow" && !isEdit) {
-    // Unified add mode
-    return `${prefix} Parameter`;
-  }
-  if (type === "workflow") {
-    return `${prefix} Input Parameter`;
-  }
-  if (type === "credential" || (!isEdit && isCredentialSelected)) {
-    return `${prefix} Credential Parameter`;
-  }
-  return `${prefix} Context Parameter`;
-}
-
 /**
  * Validates that a parameter key is a valid Python/Jinja2 identifier.
  * Parameter keys are used in Jinja2 templates, so they must be valid identifiers.
@@ -142,7 +120,7 @@ function validateParameterKey(key: string): string | null {
   const validIdentifierRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
   if (!validIdentifierRegex.test(key)) {
     if (/^[0-9]/.test(key)) {
-      return "Key cannot start with a digit. Parameter keys must start with a letter or underscore.";
+      return "Key cannot start with a digit. Input keys must start with a letter or underscore.";
     }
     if (key.includes("/")) {
       return "Key cannot contain '/' characters. Use underscores instead (e.g., 'State_or_Province' instead of 'State/Province').";
@@ -157,36 +135,6 @@ function validateParameterKey(key: string): string | null {
   }
 
   return null;
-}
-
-// Helper to detect initial credential data type from existing parameter
-function detectInitialCredentialDataType(
-  initialValues: ParametersState[number] | undefined,
-): CredentialDataType {
-  if (!initialValues) return "password";
-  if (initialValues.parameterType === "secret") return "secret";
-  if (initialValues.parameterType === "creditCardData") return "creditCard";
-  return "password";
-}
-
-// Helper to detect initial credential source from existing parameter
-function detectInitialCredentialSource(
-  initialValues: ParametersState[number] | undefined,
-  isCloud: boolean,
-): CredentialSource {
-  if (!initialValues) return isCloud ? "skyvern" : "bitwarden";
-
-  if (initialValues.parameterType === "secret") return "bitwarden";
-  if (initialValues.parameterType === "creditCardData") return "bitwarden";
-  if (initialValues.parameterType === "onepassword") return "onepassword";
-
-  if (initialValues.parameterType === "credential") {
-    if (parameterIsSkyvernCredential(initialValues)) return "skyvern";
-    if (parameterIsBitwardenCredential(initialValues)) return "bitwarden";
-    if (parameterIsAzureVaultCredential(initialValues)) return "azurevault";
-  }
-
-  return isCloud ? "skyvern" : "bitwarden";
 }
 
 function WorkflowParameterEditPanel({
@@ -251,12 +199,10 @@ function WorkflowParameterEditPanel({
       ? (initialValues?.collectionId ?? "")
       : "",
   );
+  const initialParameterTypeSelection =
+    detectInitialParameterTypeSelection(initialValues);
   const [parameterType, setParameterType] = useState<ParameterTypeSelection>(
-    type === "credential"
-      ? "credential"
-      : initialValues?.parameterType === "workflow"
-        ? initialValues.dataType
-        : "string",
+    initialParameterTypeSelection ?? "string",
   );
 
   const [defaultValueState, setDefaultValueState] = useState<{
@@ -343,11 +289,8 @@ function WorkflowParameterEditPanel({
     hasCustomCredentialService,
   );
 
-  // Check if we're in unified add mode and credential is selected
   const isCredentialSelected = parameterType === "credential";
-  const showCredentialFields =
-    type === "credential" ||
-    (type === "workflow" && !isEditMode && isCredentialSelected);
+  const showCredentialFields = type === "workflow" && isCredentialSelected;
 
   // Determine what fields to show based on credential data type and source
   const showBitwardenPasswordFields =
@@ -375,10 +318,10 @@ function WorkflowParameterEditPanel({
 
   return (
     <ScrollArea>
-      <ScrollAreaViewport className="max-h-[500px]">
+      <ScrollAreaViewport className="max-h-[calc(100vh-8rem)]">
         <div className="space-y-4 p-1 px-4">
           <header className="flex items-center justify-between">
-            <span>{header(type, isEditMode, isCredentialSelected)}</span>
+            <span>{header(type, isEditMode)}</span>
             <Cross2Icon className="h-6 w-6 cursor-pointer" onClick={onClose} />
           </header>
           <div className="space-y-1">
@@ -454,22 +397,22 @@ function WorkflowParameterEditPanel({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
-                      {workflowParameterTypeOptions
-                        .filter((option) => {
-                          // In edit mode, don't show credential option
-                          if (isEditMode && option.value === "credential") {
-                            return false;
-                          }
-                          return true;
-                        })
-                        .map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
+                      {workflowParameterTypeOptions.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
                     </SelectGroup>
                   </SelectContent>
                 </Select>
+                {isEditMode &&
+                  initialParameterTypeSelection !== null &&
+                  initialParameterTypeSelection !== parameterType && (
+                    <p className="text-xs text-amber-400">
+                      Changing the type of an existing parameter may break
+                      blocks that reference it.
+                    </p>
+                  )}
               </div>
               {/* Default value section - only for non-credential types */}
               {!isCredentialSelected && (
@@ -597,7 +540,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     URL Parameter Key
                   </Label>
-                  <HelpTooltip content="Optional. The workflow parameter key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
+                  <HelpTooltip content="Optional. The agent input key that holds the URL. If provided, Skyvern will match the credential based on this URL." />
                 </div>
                 <Input
                   value={urlParameterKey}
@@ -609,7 +552,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find in the Bitwarden collection URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -621,7 +564,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports workflow parameters." />
+                  <HelpTooltip content="Find in /#/vault?itemId=[ITEM_ID]. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenLoginCredentialItemId}
@@ -682,7 +625,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Collection ID
                   </Label>
-                  <HelpTooltip content="Collection containing the credit card. Supports workflow parameters." />
+                  <HelpTooltip content="Collection containing the credit card. Supports agent inputs." />
                 </div>
                 <Input
                   value={bitwardenCollectionId}
@@ -694,7 +637,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     Bitwarden Item ID
                   </Label>
-                  <HelpTooltip content="Credit card item ID. Supports workflow parameters." />
+                  <HelpTooltip content="Credit card item ID. Supports agent inputs." />
                 </div>
                 <Input
                   value={sensitiveInformationItemId}
@@ -714,7 +657,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Vault ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password vault URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find this in the 1Password vault URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={opVaultId}
@@ -726,7 +669,7 @@ function WorkflowParameterEditPanel({
                   <Label className="text-xs text-slate-300">
                     1Password Item ID
                   </Label>
-                  <HelpTooltip content="Find this in the 1Password item URL. Supports workflow parameters." />
+                  <HelpTooltip content="Find this in the 1Password item URL. Supports agent inputs." />
                 </div>
                 <Input
                   value={opItemId}
@@ -835,7 +778,7 @@ function WorkflowParameterEditPanel({
 
           {type === "context" && (
             <div className="space-y-1">
-              <Label className="text-xs text-slate-300">Source Parameter</Label>
+              <Label className="text-xs text-slate-300">Source Input</Label>
               <SourceParameterKeySelector
                 value={sourceParameterKey}
                 onChange={setSourceParameterKey}
@@ -849,7 +792,7 @@ function WorkflowParameterEditPanel({
                 if (!key) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameter",
+                    title: "Failed to save input",
                     description: "Key is required",
                   });
                   return;
@@ -857,7 +800,7 @@ function WorkflowParameterEditPanel({
                 if (keyValidationError) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to save parameter",
+                    title: "Failed to save input",
                     description: keyValidationError,
                   });
                   return;
@@ -865,8 +808,24 @@ function WorkflowParameterEditPanel({
                 if (!isEditMode && reservedKeys.includes(key)) {
                   toast({
                     variant: "destructive",
-                    title: "Failed to add parameter",
+                    title: "Failed to add input",
                     description: `${key} is reserved, please use another key`,
+                  });
+                  return;
+                }
+                // `credentials`/`credentials_N` keys are reserved for the Login
+                // block's auto-generated credential wrappers — letting a user author
+                // one would make the auto-gen-vs-user-authored provenance heuristic
+                // ambiguous. Block only when the key is newly set to a reserved name.
+                if (
+                  (type === "credential" || isCredentialSelected) &&
+                  key !== initialValues?.key &&
+                  AUTO_GENERATED_CREDENTIAL_KEY_PATTERN.test(key)
+                ) {
+                  toast({
+                    variant: "destructive",
+                    title: "Failed to save input",
+                    description: `"${key}" is reserved for auto-generated credential variables. Please choose a different key.`,
                   });
                   return;
                 }
@@ -882,7 +841,7 @@ function WorkflowParameterEditPanel({
                     } catch (e) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description: "Invalid JSON for default value",
                       });
                       return;
@@ -931,8 +890,8 @@ function WorkflowParameterEditPanel({
                   if (!sourceParameterKey) {
                     toast({
                       variant: "destructive",
-                      title: "Failed to save parameter",
-                      description: "Source parameter key is required",
+                      title: "Failed to save input",
+                      description: "Source input key is required",
                     });
                     return;
                   }
@@ -945,8 +904,8 @@ function WorkflowParameterEditPanel({
                   return;
                 }
 
-                // Handle credential parameters based on type + source combination
-                if (type === "credential" || isCredentialSelected) {
+                // Handle credential parameters based on source + data-type combination
+                if (isCredentialSelected) {
                   // Skyvern managed credentials or Custom credential service
                   if (
                     credentialSource === "skyvern" ||
@@ -955,7 +914,7 @@ function WorkflowParameterEditPanel({
                     if (!credentialId) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description: "Credential is required",
                       });
                       return;
@@ -981,7 +940,7 @@ function WorkflowParameterEditPanel({
                       if (errorMessage) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: errorMessage,
                         });
                         return;
@@ -1009,7 +968,7 @@ function WorkflowParameterEditPanel({
                       if (!bitwardenCollectionId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Collection ID is required",
                         });
                         return;
@@ -1033,7 +992,7 @@ function WorkflowParameterEditPanel({
                       if (!bitwardenCollectionId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Collection ID is required",
                         });
                         return;
@@ -1041,7 +1000,7 @@ function WorkflowParameterEditPanel({
                       if (!sensitiveInformationItemId) {
                         toast({
                           variant: "destructive",
-                          title: "Failed to save parameter",
+                          title: "Failed to save input",
                           description: "Bitwarden Item ID is required",
                         });
                         return;
@@ -1062,7 +1021,7 @@ function WorkflowParameterEditPanel({
                     if (opVaultId.trim() === "" || opItemId.trim() === "") {
                       toast({
                         variant: "destructive",
-                        title: "Failed to save parameter",
+                        title: "Failed to save input",
                         description:
                           "1Password Vault ID and Item ID are required",
                       });
@@ -1087,7 +1046,7 @@ function WorkflowParameterEditPanel({
                     ) {
                       toast({
                         variant: "destructive",
-                        title: "Failed to add parameter",
+                        title: "Failed to add input",
                         description:
                           "Azure Vault Name, Username Key and Password Key are required",
                       });

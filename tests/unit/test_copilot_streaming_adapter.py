@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -123,6 +124,48 @@ async def test_stream_to_sse_keeps_running_after_client_disconnect() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_call_sse_uses_product_safe_activity_label() -> None:
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": "update_and_run_blocks", "arguments": "{}"}
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace()
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_calls = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_CALL]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].tool_name == "update_and_run_blocks"
+    assert tool_calls[0].display_label == "Testing workflow"
+
+    activity = ctx.narrator_state.design_activity
+    assert len(activity) == 1
+    assert activity[0]["kind"] == "tool_call"
+    assert activity[0]["toolName"] == "update_and_run_blocks"
+    assert activity[0]["displayLabel"] == "Testing workflow"
+    assert activity[0]["text"] == "Testing workflow…"
+    assert "update_and_run_blocks" not in activity[0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_stream_to_sse_propagates_cancelled_error() -> None:
     """A generic asyncio.CancelledError must propagate up from stream_to_sse so
     the event loop's cancellation machinery still works for task-group cancel,
@@ -162,14 +205,16 @@ async def test_stream_to_sse_emits_narration_on_workflow_updated_transition(
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
 
-    from skyvern.forge.sdk.copilot import narration
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
 
     async def _handler(prompt: str, prompt_name: str, **kwargs: object) -> str:
         return "Revising the workflow draft."
 
-    monkeypatch.setattr(narration, "_get_narrator_handler", lambda: _handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.streaming_adapter.resolve_narrator_handler",
+        AsyncMock(return_value=_handler),
+    )
 
     # Tool input / output raw_items matching the shapes streaming_adapter reads.
     call_raw = {"call_id": "c-upd", "name": "update_workflow", "arguments": "{}"}
@@ -291,6 +336,102 @@ async def test_tool_result_sse_summary_translates_loop_detected_failure() -> Non
     agent_summary = summarize_tool_result("click", error_payload)
     assert agent_summary.startswith("Failed:")
     assert "LOOP DETECTED" in agent_summary
+
+
+@pytest.mark.asyncio
+async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface() -> None:
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=(
+            "Less than 90 seconds remain in this Copilot turn. "
+            "Do NOT start another block-running tool call; reply from gathered progress."
+        ),
+        user_facing_reason="I'm running out of time on this turn. I'll wrap up with what I have so far.",
+        recovery_hint="stop",
+        renders_final_reply=False,
+        internal_reason_code="tool_error_late_block_running",
+        blocked_tool="update_and_run_blocks",
+    )
+
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": "update_and_run_blocks", "arguments": "{}"}
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": "update_and_run_blocks"}
+    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(tool_call_event, tool_output_event)
+    result.cancel = MagicMock()
+
+    sent: list[Any] = []
+
+    async def _send(payload: Any) -> bool:
+        sent.append(payload)
+        return True
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = _send
+    ctx = SimpleNamespace(latest_tool_blocker_signal=signal, tool_blocker_signals=[signal])
+
+    await stream_to_sse(result, stream, ctx)
+
+    tool_results = [p for p in sent if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.TOOL_RESULT]
+    assert len(tool_results) == 1
+    assert tool_results[0].summary == signal.user_facing_reason
+    assert tool_results[0].detail == signal.user_facing_reason
+    assert "Do NOT" not in tool_results[0].summary
+
+    activity = ctx.narrator_state.design_activity
+    assert len(activity) == 2
+    assert activity[-1]["kind"] == "tool_result"
+    assert activity[-1]["text"] == signal.user_facing_reason
+    assert "Do NOT" not in activity[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.enforcement import CopilotUnrecoverableToolError
+
+    error_text = "Browser session pbs_123 not found while taking screenshot (404)."
+    events = []
+    for call_id in ("c1", "c2"):
+        call_item = MagicMock(spec=RunItem)
+        call_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot", "arguments": "{}"}
+        events.append(RunItemStreamEvent(name="tool_called", item=call_item))
+
+        output_item = MagicMock(spec=RunItem)
+        output_item.raw_item = {"call_id": call_id, "name": "get_browser_screenshot"}
+        output_item.output = [{"type": "text", "text": f'{{"ok": false, "error": "{error_text}"}}'}]
+        events.append(RunItemStreamEvent(name="tool_output", item=output_item))
+
+    result = MagicMock()
+    result.stream_events = lambda: _stream_events_from(*events)
+    result.cancel = MagicMock()
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = AsyncMock(return_value=True)
+    ctx = SimpleNamespace()
+
+    with pytest.raises(CopilotUnrecoverableToolError):
+        await stream_to_sse(result, stream, ctx)
+
+    result.cancel.assert_called_once()
+    assert ctx.latest_diagnosis_repair_contract.repair_decision.next_action == "stop"
+    assert "pbs_" not in ctx.latest_diagnosis_repair_contract.verification_result.remaining_blocker
 
 
 @pytest.mark.asyncio

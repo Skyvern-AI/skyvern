@@ -38,7 +38,6 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
-    FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
     ScriptTerminationException,
@@ -62,6 +61,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
@@ -99,6 +99,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.models.run_limits import get_effective_workflow_run_max_elapsed_time_minutes
 from skyvern.forge.sdk.workflow.models.workflow import (
     Workflow,
     WorkflowDefinition,
@@ -129,8 +130,20 @@ from skyvern.schemas.workflows import (
     WorkflowStatus,
 )
 from skyvern.services import script_service, workflow_script_service
-from skyvern.services.webhook_delivery import deliver_webhook_with_retries
+from skyvern.services.script_review_cap import (
+    check_and_increment_cap_v3,
+    increment_script_review_counter_v2,
+    is_script_review_cap_exceeded_v2,
+    is_script_review_cap_exceeded_v3,
+    try_increment_script_review_counter_v3,
+    v2_script_review_cap_key,
+    v3_script_review_cap_key,
+)
+from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
+from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
+from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
+from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
 
@@ -141,10 +154,24 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 
 # Empirical S3 upload SLA; no start buffer (back-to-back leakage is worse than late uploads to the next run).
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
+# Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
+POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
 
 
 def _as_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> float:
+    effective_minutes = get_effective_workflow_run_max_elapsed_time_minutes(workflow_run.max_elapsed_time_minutes)
+    started_at = _as_utc(workflow_run.started_at or workflow_run.created_at)
+    elapsed_seconds = (datetime.now(UTC) - started_at).total_seconds()
+    return max(0.0, effective_minutes * 60 - elapsed_seconds)
+
+
+def _format_workflow_run_elapsed_timeout_failure_reason(effective_minutes: int) -> str:
+    minute_label = "minute" if effective_minutes == 1 else "minutes"
+    return f"Workflow run exceeded max elapsed runtime limit of {effective_minutes} {minute_label}."
 
 
 def _select_recording_urls_in_window(
@@ -349,6 +376,31 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
                     queue.append(item)
 
     return workflow_dict
+
+
+def _resolve_first_block_url(
+    blocks: list[BlockTypeVar],
+    workflow_run: "WorkflowRun",
+) -> str | None:
+    """Resolve the URL of the first block that has one, for proxy selection.
+
+    In script mode ``skyvern.setup()`` creates the browser before any block runs;
+    threading this URL lets the ``SKYVERN_PROXY`` flag (which matches on ``task_url``)
+    resolve instead of falling back to the org default. Best-effort: any failure
+    returns None so proxy selection degrades to the previous (url=None) behavior.
+    """
+    try:
+        wrc = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run.workflow_run_id)
+        for block in blocks:
+            url = getattr(block, "url", None)
+            if not url:
+                continue
+            resolved_url = block.format_block_parameter_template_from_workflow_run_context(url, wrc)
+            if resolved_url and isinstance(resolved_url, str):
+                return resolved_url
+    except Exception:
+        LOG.warning("Failed to resolve first block URL for proxy selection", exc_info=True)
+    return None
 
 
 class WorkflowService:
@@ -679,22 +731,14 @@ class WorkflowService:
             )
             download_id_set = set(download_ids)
             for artifact in artifacts:
-                url = app.ARTIFACT_MANAGER.build_signed_content_url(
-                    artifact_id=artifact.artifact_id,
-                    artifact_name=artifact.bundle_key,
-                    artifact_type=artifact.artifact_type,
-                    expiry_seconds=expiry_seconds,
-                )
+                url = await app.ARTIFACT_MANAGER.resolve_share_url(artifact, expiry_seconds=expiry_seconds)
+                if url is None:
+                    continue
                 url_map[artifact.artifact_id] = url
                 if artifact.artifact_id in download_id_set:
                     filename = artifact.uri.rsplit("/", 1)[-1] if artifact.uri else ""
                     fileinfo_map[artifact.artifact_id] = FileInfo(
-                        url=app.ARTIFACT_MANAGER.build_signed_content_url(
-                            artifact_id=artifact.artifact_id,
-                            artifact_name=filename,
-                            artifact_type=artifact.artifact_type,
-                            expiry_seconds=expiry_seconds,
-                        ),
+                        url=url,
                         checksum=artifact.checksum,
                         filename=filename,
                         file_size=artifact.file_size,
@@ -903,6 +947,13 @@ class WorkflowService:
                 and workflow.browser_profile_id is not None
             ):
                 workflow_request.browser_profile_id = workflow.browser_profile_id
+            if workflow_request.cdp_connect_headers is None:
+                if workflow.cdp_connect_headers is not None:
+                    workflow_request.cdp_connect_headers = workflow.cdp_connect_headers
+            else:
+                workflow_request.cdp_connect_headers = merge_masked_headers(
+                    workflow_request.cdp_connect_headers, workflow.cdp_connect_headers
+                )
             if workflow_request.run_with is None:
                 workflow_request.run_with = workflow.run_with
 
@@ -933,6 +984,11 @@ class WorkflowService:
                 if copilot_session_id is not None
                 else (ambient_context.copilot_session_id if ambient_context else None)
             )
+            resolved_trigger_type = trigger_type
+            if resolved_trigger_type is None and ambient_context:
+                resolved_trigger_type = ambient_context.trigger_type
+            if resolved_trigger_type is None:
+                resolved_trigger_type = WorkflowRunTriggerType.api
 
             # Create the workflow run and set skyvern context
             workflow_run = await self.create_workflow_run(
@@ -942,10 +998,15 @@ class WorkflowService:
                 organization_id=organization.organization_id,
                 parent_workflow_run_id=parent_workflow_run_id,
                 sequential_key=workflow.sequential_key,
+                # Run-request nulls intentionally inherit the workflow default; workflow definition updates
+                # use model_fields_set so explicit null can clear the saved workflow-level setting.
+                max_elapsed_time_minutes=workflow_request.max_elapsed_time_minutes
+                if workflow_request.max_elapsed_time_minutes is not None
+                else workflow.max_elapsed_time_minutes,
                 debug_session_id=debug_session_id,
                 code_gen=code_gen,
                 workflow_run_id=workflow_run_id,
-                trigger_type=trigger_type,
+                trigger_type=resolved_trigger_type,
                 workflow_schedule_id=workflow_schedule_id,
                 ignore_inherited_workflow_system_prompt=ignore_inherited_workflow_system_prompt,
                 copilot_session_id=resolved_copilot_session_id,
@@ -990,7 +1051,7 @@ class WorkflowService:
                     max_screenshot_scrolls=workflow_request.max_screenshot_scrolls,
                     loop_internal_state=copy.deepcopy(context.loop_internal_state) if context else None,
                     copilot_session_id=resolved_copilot_session_id,
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                 )
             )
 
@@ -1019,26 +1080,19 @@ class WorkflowService:
                 # through the same AgentFunction hook so the cloud side is the single
                 # owner of the flag name and property shape.
                 new_context.use_flex_llm_routing = await app.AGENT_FUNCTION.should_use_flex_llm_routing(
-                    trigger_type=trigger_type,
+                    trigger_type=resolved_trigger_type,
                     organization_id=organization.organization_id,
                     workflow_permanent_id=workflow_run.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                 )
 
-                if os.getenv("FORCE_DISABLE_LLM_SCREENSHOTS", "").lower() in ("true", "1", "yes"):
-                    new_context.disable_llm_screenshots = True
-                else:
-                    try:
-                        new_context.disable_llm_screenshots = (
-                            await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
-                                "DISABLE_LLM_SCREENSHOTS",
-                                workflow_run.workflow_run_id,
-                                properties={"organization_id": organization.organization_id},
-                            )
-                        )
-                    except Exception:
-                        LOG.warning("Failed to check DISABLE_LLM_SCREENSHOTS flag for workflow", exc_info=True)
-                        new_context.disable_llm_screenshots = False
+                await resolve_enrich_tree_for_context(
+                    new_context,
+                    workflow_run.workflow_run_id,
+                    organization.organization_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    log_context={"workflow_run_id": workflow_run.workflow_run_id},
+                )
 
             # Create all the workflow run parameters, AWSSecretParameter won't have workflow run parameters created.
             all_workflow_parameters = await self.get_workflow_parameters(workflow_id=workflow.workflow_id)
@@ -1309,6 +1363,83 @@ class WorkflowService:
         prompts.reverse()
         return "\n\n".join(prompts)
 
+    async def _handle_post_run_elapsed_timeout(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus | None,
+        pre_finally_failure_reason: str | None,
+        timeout_failure_reason: str,
+    ) -> tuple[WorkflowRun, WorkflowRunStatus | None, str | None]:
+        if pre_finally_status is None:
+            if refreshed_workflow_run := await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            ):
+                workflow_run = refreshed_workflow_run
+                if workflow_run.status.is_final():
+                    pre_finally_status = workflow_run.status
+                    pre_finally_failure_reason = workflow_run.failure_reason
+        if pre_finally_status and pre_finally_status.is_final():
+            LOG.info(
+                "Preserving terminal workflow run status after post-run elapsed timeout",
+                workflow_run_id=workflow_run_id,
+                pre_finally_status=pre_finally_status,
+            )
+        else:
+            workflow_run = await self.mark_workflow_run_as_timed_out(
+                workflow_run_id=workflow_run_id,
+                failure_reason=timeout_failure_reason,
+            )
+            pre_finally_status = WorkflowRunStatus.timed_out
+            pre_finally_failure_reason = timeout_failure_reason
+        return workflow_run, pre_finally_status, pre_finally_failure_reason
+
+    async def _shield_post_run_elapsed_timeout(
+        self,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+        workflow_run: WorkflowRun,
+        pre_finally_status: WorkflowRunStatus | None,
+        pre_finally_failure_reason: str | None,
+        timeout_failure_reason: str,
+    ) -> tuple[WorkflowRun, WorkflowRunStatus | None, str | None]:
+        handle_timeout_task = asyncio.create_task(
+            self._handle_post_run_elapsed_timeout(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+                workflow_run=workflow_run,
+                pre_finally_status=pre_finally_status,
+                pre_finally_failure_reason=pre_finally_failure_reason,
+                timeout_failure_reason=timeout_failure_reason,
+            ),
+            name=f"post_run_elapsed_timeout_{workflow_run_id}",
+        )
+        try:
+            return await asyncio.shield(handle_timeout_task)
+        except asyncio.CancelledError:
+            LOG.warning(
+                "Cancellation received while handling post-run elapsed timeout; waiting for status write",
+                workflow_run_id=workflow_run_id,
+            )
+            try:
+                return await handle_timeout_task
+            except Exception:
+                LOG.exception(
+                    "Post-run elapsed timeout handler failed after cancellation; falling back to direct timeout write",
+                    workflow_run_id=workflow_run_id,
+                )
+                fallback_workflow_run = await asyncio.shield(
+                    self.mark_workflow_run_as_timed_out(
+                        workflow_run_id=workflow_run_id,
+                        failure_reason=timeout_failure_reason,
+                    )
+                )
+                return fallback_workflow_run, WorkflowRunStatus.timed_out, timeout_failure_reason
+
     @traced(name="skyvern.workflow.execute", role="wrapper")
     async def execute_workflow(
         self,
@@ -1319,6 +1450,7 @@ class WorkflowService:
         block_outputs: dict[str, Any] | None = None,
         browser_session_id: str | None = None,
         need_call_webhook: bool = True,
+        workflow_override: Workflow | None = None,
     ) -> WorkflowRun:
         """Execute a workflow.
 
@@ -1340,7 +1472,9 @@ class WorkflowService:
             block_outputs=block_outputs,
         )
         workflow_run = await self.get_workflow_run(workflow_run_id=workflow_run_id, organization_id=organization_id)
-        workflow = await self.get_workflow_by_permanent_id(workflow_permanent_id=workflow_run.workflow_permanent_id)
+        workflow = workflow_override or await self.get_workflow_by_permanent_id(
+            workflow_permanent_id=workflow_run.workflow_permanent_id
+        )
         has_conditionals = workflow_script_service.workflow_has_conditionals(workflow)
         browser_profile_id = workflow_run.browser_profile_id
         close_browser_on_completion = browser_session_id is None and not workflow_run.browser_address
@@ -1357,6 +1491,16 @@ class WorkflowService:
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
+        # Short-circuit when the conditional transition was refused (cron beat us
+        # to finalization). Falling through would otherwise hit the finally-block
+        # path below, which writes ``running`` again and emits orphan children.
+        if workflow_run.status.is_final():
+            LOG.info(
+                "execute_workflow aborting — workflow_run already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=workflow_run.status,
+            )
+            return workflow_run
 
         # Get all context parameters from the workflow definition
         context_parameters = [
@@ -1504,132 +1648,193 @@ class WorkflowService:
         pre_finally_failure_reason: str | None = None
 
         try:
-            # Check if there's a related workflow script that should be used instead
-            workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
-                workflow, workflow_run, block_labels
+            effective_max_elapsed_minutes = get_effective_workflow_run_max_elapsed_time_minutes(
+                workflow_run.max_elapsed_time_minutes
             )
-            current_context = skyvern_context.current()
-            if current_context:
-                if workflow_script:
-                    current_context.generate_script = False
-                if workflow_run.code_gen:
-                    current_context.generate_script = True
-            workflow_run, blocks_to_update = await self._execute_workflow_blocks(
-                workflow=workflow,
-                workflow_run=workflow_run,
-                organization=organization,
-                browser_session_id=browser_session_id,
-                browser_profile_id=browser_profile_id,
-                block_labels=block_labels,
-                block_outputs=block_outputs,
-                script=workflow_script,
-                script_is_pinned=script_is_pinned,
-            )
-
-            # Check if there's a finally block configured
-            finally_block_label = workflow.workflow_definition.finally_block_label
-
-            # Refresh workflow_run from DB to pick up status/failure_reason
-            # set by _execute_workflow_blocks.
-            if refreshed_workflow_run := await app.DATABASE.workflow_runs.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            ):
-                workflow_run = refreshed_workflow_run
-
-            pre_finally_status = workflow_run.status
-            pre_finally_failure_reason = workflow_run.failure_reason
-
-            # Statuses that always skip script generation
-            skip_statuses = {WorkflowRunStatus.canceled, WorkflowRunStatus.failed, WorkflowRunStatus.timed_out}
-            # When generate_script_on_terminal is enabled, allow terminated runs to generate scripts
-            if not workflow.generate_script_on_terminal:
-                skip_statuses.add(WorkflowRunStatus.terminated)
-
-            if pre_finally_status not in skip_statuses:
-                await self.generate_script_if_needed(
-                    workflow=workflow,
-                    workflow_run=workflow_run,
-                    block_labels=block_labels,
-                    blocks_to_update=blocks_to_update,
-                    finalize=True,  # Force regeneration to ensure field mappings have complete action data
-                    has_conditionals=has_conditionals,
-                )
-            else:
-                LOG.info(
-                    "Skipping post-run script generation due to run status",
+            timeout_failure_reason = _format_workflow_run_elapsed_timeout_failure_reason(effective_max_elapsed_minutes)
+            max_elapsed_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
+            blocks_to_update: set[str] = set()
+            if max_elapsed_timeout_seconds <= 0:
+                workflow_run = await self.mark_workflow_run_as_timed_out(
                     workflow_run_id=workflow_run_id,
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                    pre_finally_status=pre_finally_status,
-                    blocks_to_update_count=len(blocks_to_update),
+                    failure_reason=timeout_failure_reason,
                 )
-
-            # Trigger AI Script Reviewer for adaptive caching workflows
-            # Include terminated and failed runs — the reviewer filters to only
-            # episodes where the AI fallback succeeded (actionable signal).
-            # Skip canceled (user stopped) and timed_out (infrastructure issue)
-            # Only trigger if the script was actually executed this run — reviewing based on
-            # agent-only runs provides no signal about script quality and wastes LLM tokens.
-            # Only trigger if this run used the latest script version — stale runs produce
-            # episodes that may already be fixed in newer versions, and reviewing them creates
-            # redundant/regressive versions.
-            is_script_execution = self.should_run_script(workflow, workflow_run)
-            if (
-                is_adaptive_caching(workflow, workflow_run)
-                and is_script_execution
-                and pre_finally_status
-                not in (
-                    WorkflowRunStatus.canceled,
-                    WorkflowRunStatus.timed_out,
-                )
-            ):
-                should_trigger_reviewer = True
-                current_ctx = skyvern_context.current()
-                if current_ctx and current_ctx.script_id:
-                    latest_script = await app.DATABASE.scripts.get_latest_script_version(
-                        script_id=current_ctx.script_id,
-                        organization_id=workflow.organization_id,
-                    )
-                    if latest_script and latest_script.script_revision_id != current_ctx.script_revision_id:
-                        should_trigger_reviewer = False
-                        LOG.info(
-                            "Skipping script reviewer - run used stale script version",
-                            workflow_run_id=workflow_run.workflow_run_id,
-                            used_revision=current_ctx.script_revision_id,
-                            latest_revision=latest_script.script_revision_id,
-                            latest_version=latest_script.version,
+                return workflow_run
+            else:
+                timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
+                try:
+                    async with timeout_context:
+                        # Check if there's a related workflow script that should be used instead.
+                        workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
+                            workflow, workflow_run, block_labels
                         )
-                if should_trigger_reviewer:
-                    asyncio.create_task(
-                        self._trigger_script_reviewer(workflow, workflow_run, pre_finally_status=pre_finally_status),
-                        name=f"script_reviewer_{workflow_run.workflow_run_id}",
-                    )
-            elif is_adaptive_caching(workflow, workflow_run):
-                LOG.info(
-                    "Skipping script reviewer - script was not executed this run",
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    run_with=workflow_run.run_with,
-                )
-
-            # Execute finally block if configured. Skip for: canceled (user explicitly stopped)
-            should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
-            if should_run_finally:
-                # Temporarily set to running for terminal workflows (for frontend UX)
-                if pre_finally_status in (
-                    WorkflowRunStatus.failed,
-                    WorkflowRunStatus.terminated,
-                    WorkflowRunStatus.timed_out,
-                ):
-                    workflow_run = await self._update_workflow_run_status(
+                        current_context = skyvern_context.current()
+                        if current_context:
+                            if workflow_script:
+                                current_context.generate_script = False
+                            if workflow_run.code_gen:
+                                current_context.generate_script = True
+                        workflow_run, blocks_to_update = await self._execute_workflow_blocks(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            organization=organization,
+                            browser_session_id=browser_session_id,
+                            browser_profile_id=browser_profile_id,
+                            block_labels=block_labels,
+                            block_outputs=block_outputs,
+                            script=workflow_script,
+                            script_is_pinned=script_is_pinned,
+                        )
+                except TimeoutError:
+                    if not timeout_context.expired():
+                        raise
+                    workflow_run = await self.mark_workflow_run_as_timed_out(
                         workflow_run_id=workflow_run_id,
-                        status=WorkflowRunStatus.running,
-                        failure_reason=None,
+                        failure_reason=timeout_failure_reason,
                     )
-                await self._execute_finally_block_if_configured(
-                    workflow=workflow,
+                    return workflow_run
+
+            post_run_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
+            if post_run_timeout_seconds <= POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS:
+                (
+                    workflow_run,
+                    pre_finally_status,
+                    pre_finally_failure_reason,
+                ) = await self._shield_post_run_elapsed_timeout(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
                     workflow_run=workflow_run,
-                    organization=organization,
-                    browser_session_id=browser_session_id,
+                    pre_finally_status=pre_finally_status,
+                    pre_finally_failure_reason=pre_finally_failure_reason,
+                    timeout_failure_reason=timeout_failure_reason,
+                )
+                return workflow_run
+
+            post_run_timeout_context = asyncio.timeout(post_run_timeout_seconds)
+            try:
+                async with post_run_timeout_context:
+                    # Check if there's a finally block configured
+                    finally_block_label = workflow.workflow_definition.finally_block_label
+
+                    # Refresh workflow_run from DB to pick up status/failure_reason
+                    # set by _execute_workflow_blocks.
+                    if refreshed_workflow_run := await app.DATABASE.workflow_runs.get_workflow_run(
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    ):
+                        workflow_run = refreshed_workflow_run
+
+                    pre_finally_status = workflow_run.status
+                    pre_finally_failure_reason = workflow_run.failure_reason
+
+                    # Statuses that always skip script generation
+                    skip_statuses = {WorkflowRunStatus.canceled, WorkflowRunStatus.failed, WorkflowRunStatus.timed_out}
+                    # When generate_script_on_terminal is enabled, allow terminated runs to generate scripts
+                    if not workflow.generate_script_on_terminal:
+                        skip_statuses.add(WorkflowRunStatus.terminated)
+
+                    if pre_finally_status not in skip_statuses:
+                        await self.generate_script_if_needed(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            block_labels=block_labels,
+                            blocks_to_update=blocks_to_update,
+                            finalize=True,  # Force regeneration to ensure field mappings have complete action data
+                            has_conditionals=has_conditionals,
+                        )
+                    else:
+                        LOG.info(
+                            "Skipping post-run script generation due to run status",
+                            workflow_run_id=workflow_run_id,
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            pre_finally_status=pre_finally_status,
+                            blocks_to_update_count=len(blocks_to_update),
+                        )
+
+                    # Trigger AI Script Reviewer for adaptive caching workflows
+                    # Include terminated and failed runs — the reviewer filters to only
+                    # episodes where the AI fallback succeeded (actionable signal).
+                    # Skip canceled (user stopped) and timed_out (infrastructure issue)
+                    # Only trigger if the script was actually executed this run — reviewing based on
+                    # agent-only runs provides no signal about script quality and wastes LLM tokens.
+                    # Only trigger if this run used the latest script version — stale runs produce
+                    # episodes that may already be fixed in newer versions, and reviewing them creates
+                    # redundant/regressive versions.
+                    is_script_execution = await self.should_run_script(workflow, workflow_run)
+                    if (
+                        is_adaptive_caching(workflow, workflow_run)
+                        and is_script_execution
+                        and pre_finally_status
+                        not in (
+                            WorkflowRunStatus.canceled,
+                            WorkflowRunStatus.timed_out,
+                        )
+                    ):
+                        should_trigger_reviewer = True
+                        current_ctx = skyvern_context.current()
+                        if current_ctx and current_ctx.script_id:
+                            latest_script = await app.DATABASE.scripts.get_latest_script_version(
+                                script_id=current_ctx.script_id,
+                                organization_id=workflow.organization_id,
+                            )
+                            if latest_script and latest_script.script_revision_id != current_ctx.script_revision_id:
+                                should_trigger_reviewer = False
+                                LOG.info(
+                                    "Skipping script reviewer - run used stale script version",
+                                    workflow_run_id=workflow_run.workflow_run_id,
+                                    used_revision=current_ctx.script_revision_id,
+                                    latest_revision=latest_script.script_revision_id,
+                                    latest_version=latest_script.version,
+                                )
+                        if should_trigger_reviewer:
+                            asyncio.create_task(
+                                self._trigger_script_reviewer(
+                                    workflow, workflow_run, pre_finally_status=pre_finally_status
+                                ),
+                                name=f"script_reviewer_{workflow_run.workflow_run_id}",
+                            )
+                    elif is_adaptive_caching(workflow, workflow_run):
+                        LOG.info(
+                            "Skipping script reviewer - script was not executed this run",
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            run_with=workflow_run.run_with,
+                        )
+
+                    # Execute finally block if configured. Skip only for canceled runs; elapsed-time timeouts return
+                    # before post-run work, while other timeout statuses can still run cleanup within the remaining cap.
+                    should_run_finally = finally_block_label and pre_finally_status != WorkflowRunStatus.canceled
+                    if should_run_finally:
+                        # Temporarily set to running for terminal workflows (for frontend UX)
+                        if pre_finally_status in (
+                            WorkflowRunStatus.failed,
+                            WorkflowRunStatus.terminated,
+                            WorkflowRunStatus.timed_out,
+                        ):
+                            workflow_run = await self._update_workflow_run_status(
+                                workflow_run_id=workflow_run_id,
+                                status=WorkflowRunStatus.running,
+                                failure_reason=None,
+                            )
+                        await self._execute_finally_block_if_configured(
+                            workflow=workflow,
+                            workflow_run=workflow_run,
+                            organization=organization,
+                            browser_session_id=browser_session_id,
+                        )
+            except TimeoutError:
+                if not post_run_timeout_context.expired():
+                    raise
+                (
+                    workflow_run,
+                    pre_finally_status,
+                    pre_finally_failure_reason,
+                ) = await self._shield_post_run_elapsed_timeout(
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_run=workflow_run,
+                    pre_finally_status=pre_finally_status,
+                    pre_finally_failure_reason=pre_finally_failure_reason,
+                    timeout_failure_reason=timeout_failure_reason,
                 )
         finally:
             # Shielded finalize runs even when the try body was cancelled
@@ -1744,7 +1949,11 @@ class WorkflowService:
         loaded_script_module = None
         blocks_to_update: set[str] = set()
 
-        is_script_run = self.should_run_script(workflow, workflow_run)
+        is_script_run = await self.should_run_script(workflow, workflow_run)
+
+        # skyvern.setup() below creates the browser before any block runs, so resolve the
+        # first block's URL here to drive proxy selection from task_url (see SKYVERN_PROXY).
+        first_block_url = _resolve_first_block_url(all_blocks, workflow_run) if is_script_run else None
 
         if script:
             LOG.info(
@@ -1805,6 +2014,7 @@ class WorkflowService:
                             await skyvern.setup(
                                 script_parameters,
                                 generated_parameter_cls=param_cls,
+                                url=first_block_url,
                             )
                             if loaded_script_module:
                                 # Mark static (pinned) scripts so complete() skips LLM verification
@@ -1862,6 +2072,7 @@ class WorkflowService:
                     await skyvern.setup(
                         script_parameters,
                         generated_parameter_cls=param_cls,
+                        url=first_block_url,
                     )
                     # Mark context so static scripts skip LLM completion verification
                     static_ctx = skyvern_context.current()
@@ -2355,20 +2566,11 @@ class WorkflowService:
                 organization_id=organization_id,
             ):
                 workflow_run = refreshed_workflow_run
-                if workflow_run.status == WorkflowRunStatus.canceled:
+                if workflow_run.status.is_final():
                     LOG.info(
-                        "Workflow run is canceled, stopping execution inside workflow execution loop",
+                        "Workflow run is in a final state, stopping execution inside workflow execution loop",
                         workflow_run_id=workflow_run_id,
-                        block_idx=block_idx,
-                        block_type=block.block_type,
-                        block_label=block.label,
-                    )
-                    return workflow_run, blocks_to_update, workflow_run_block_result, True, branch_metadata
-
-                if workflow_run.status == WorkflowRunStatus.timed_out:
-                    LOG.info(
-                        "Workflow run is timed out, stopping execution inside workflow execution loop",
-                        workflow_run_id=workflow_run_id,
+                        workflow_run_status=workflow_run.status,
                         block_idx=block_idx,
                         block_type=block.block_type,
                         block_label=block.label,
@@ -2529,6 +2731,7 @@ class WorkflowService:
                         block_label=block.label,
                         exc_info=True,
                     )
+
                 block_exec_start = time.monotonic()
                 try:
                     vars_dict = vars(loaded_script_module) if loaded_script_module else {}
@@ -3487,6 +3690,7 @@ class WorkflowService:
         description: str | None = None,
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
+        max_elapsed_time_minutes: int | None = None,
         webhook_callback_url: str | None = None,
         totp_verification_url: str | None = None,
         totp_identifier: str | None = None,
@@ -3498,6 +3702,7 @@ class WorkflowService:
         is_saved_task: bool = False,
         status: WorkflowStatus = WorkflowStatus.published,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         cache_key: str | None = None,
         ai_fallback: bool | None = None,
@@ -3519,6 +3724,7 @@ class WorkflowService:
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
                 totp_verification_url=totp_verification_url,
                 totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
@@ -3529,6 +3735,7 @@ class WorkflowService:
                 is_saved_task=is_saved_task,
                 status=status,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 cache_key=cache_key,
                 ai_fallback=True if ai_fallback is None else ai_fallback,
@@ -3556,6 +3763,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         max_iterations: int | None = None,
         max_steps: int | None = None,
         status: WorkflowStatus = WorkflowStatus.auto_generated,
@@ -3696,6 +3904,7 @@ class WorkflowService:
             totp_identifier=totp_identifier,
             max_screenshot_scrolling_times=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             status=status,
             run_with=run_with,
             ai_fallback=ai_fallback,
@@ -3874,6 +4083,7 @@ class WorkflowService:
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
+        workflow_tags: list[tuple[str, str]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -3881,6 +4091,7 @@ class WorkflowService:
         Args:
             search_key: Unified search term for title, folder name, and parameter metadata.
             folder_id: Filter workflows by folder ID.
+            workflow_tags: (key, value) tag filters; AND across keys, OR within a key.
         """
         return await app.DATABASE.workflows.get_workflows_by_organization_id(
             organization_id=organization_id,
@@ -3892,6 +4103,7 @@ class WorkflowService:
             search_key=search_key,
             folder_id=folder_id,
             statuses=statuses,
+            workflow_tags=workflow_tags,
         )
 
     async def update_workflow_definition(
@@ -3903,14 +4115,20 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition | None = None,
         proxy_location: ProxyLocationInput | object = _UNSET,
         webhook_callback_url: str | None | object = _UNSET,
+        totp_verification_url: str | None | object = _UNSET,
+        totp_identifier: str | None | object = _UNSET,
         persist_browser_session: bool | None = None,
         browser_profile_id: str | None | object = _UNSET,
         model: dict[str, Any] | None | object = _UNSET,
         max_screenshot_scrolling_times: int | None | object = _UNSET,
+        max_elapsed_time_minutes: int | None | object = _UNSET,
         extra_http_headers: dict[str, str] | None | object = _UNSET,
+        cdp_connect_headers: dict[str, str] | None | object = _UNSET,
         run_with: str | None = None,
         ai_fallback: bool | None = None,
         cache_key: str | None = None,
+        adaptive_caching: bool | object = _UNSET,
+        code_version: int | None | object = _UNSET,
         run_sequentially: bool | None = None,
         sequential_key: str | None | object = _UNSET,
         created_by: str | None | object = _UNSET,
@@ -3925,42 +4143,63 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 proxy_location=proxy_location,
                 webhook_callback_url=webhook_callback_url,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
                 persist_browser_session=persist_browser_session,
                 browser_profile_id=browser_profile_id,
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 run_with=run_with,
                 ai_fallback=ai_fallback,
                 cache_key=cache_key,
+                adaptive_caching=adaptive_caching,
+                code_version=code_version,
                 run_sequentially=run_sequentially,
                 sequential_key=sequential_key,
                 created_by=created_by,
                 edited_by=edited_by,
             )
-            return updated_workflow
+        else:
+            updated_workflow = await app.DATABASE.workflows.update_workflow(
+                workflow_id=workflow_id,
+                title=title,
+                organization_id=organization_id,
+                description=description,
+                workflow_definition=None,
+                proxy_location=proxy_location,
+                webhook_callback_url=webhook_callback_url,
+                totp_verification_url=totp_verification_url,
+                totp_identifier=totp_identifier,
+                persist_browser_session=persist_browser_session,
+                browser_profile_id=browser_profile_id,
+                model=model,
+                max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
+                extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
+                run_with=run_with,
+                ai_fallback=ai_fallback,
+                cache_key=cache_key,
+                adaptive_caching=adaptive_caching,
+                code_version=code_version,
+                run_sequentially=run_sequentially,
+                sequential_key=sequential_key,
+                created_by=created_by,
+                edited_by=edited_by,
+            )
 
-        updated_workflow = await app.DATABASE.workflows.update_workflow(
-            workflow_id=workflow_id,
-            title=title,
-            organization_id=organization_id,
-            description=description,
-            workflow_definition=None,
-            proxy_location=proxy_location,
-            webhook_callback_url=webhook_callback_url,
-            persist_browser_session=persist_browser_session,
-            browser_profile_id=browser_profile_id,
-            model=model,
-            max_screenshot_scrolling_times=max_screenshot_scrolling_times,
-            extra_http_headers=extra_http_headers,
-            run_with=run_with,
-            ai_fallback=ai_fallback,
-            cache_key=cache_key,
-            run_sequentially=run_sequentially,
-            sequential_key=sequential_key,
-            created_by=created_by,
-            edited_by=edited_by,
+        _edited_by: str | None = cast("str | None", edited_by) if edited_by is not _UNSET else None
+        task = asyncio.create_task(
+            app.AGENT_FUNCTION.on_workflow_saved(
+                organization_id=updated_workflow.organization_id,
+                edited_by=_edited_by,
+            ),
         )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
         return updated_workflow
 
@@ -4181,6 +4420,7 @@ class WorkflowService:
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        exclude_child_runs: bool = False,
     ) -> list[WorkflowRun]:
         return await app.DATABASE.workflow_runs.get_workflow_runs_for_workflow_permanent_id(
             workflow_permanent_id=workflow_permanent_id,
@@ -4190,6 +4430,7 @@ class WorkflowService:
             status=status,
             search_key=search_key,
             error_code=error_code,
+            exclude_child_runs=exclude_child_runs,
         )
 
     async def get_workflow_runs_for_browser_session(
@@ -4214,6 +4455,7 @@ class WorkflowService:
         organization_id: str,
         parent_workflow_run_id: str | None = None,
         sequential_key: str | None = None,
+        max_elapsed_time_minutes: int | None = None,
         debug_session_id: str | None = None,
         code_gen: bool | None = None,
         workflow_run_id: str | None = None,
@@ -4301,7 +4543,9 @@ class WorkflowService:
             totp_identifier=workflow_request.totp_identifier,
             parent_workflow_run_id=parent_workflow_run_id,
             max_screenshot_scrolling_times=workflow_request.max_screenshot_scrolls,
+            max_elapsed_time_minutes=max_elapsed_time_minutes,
             extra_http_headers=workflow_request.extra_http_headers,
+            cdp_connect_headers=workflow_request.cdp_connect_headers,
             browser_address=workflow_request.browser_address,
             sequential_key=sequential_key,
             run_with=workflow_request.run_with,
@@ -4355,6 +4599,14 @@ class WorkflowService:
                 trigger_type=workflow_run.trigger_type,
                 workflow_schedule_id=workflow_run.workflow_schedule_id,
             )
+            run_completed_task = asyncio.create_task(
+                app.AGENT_FUNCTION.on_workflow_run_completed(
+                    organization_id=workflow_run.organization_id,
+                    workflow_id=workflow_run.workflow_id,
+                ),
+            )
+            self._background_tasks.add(run_completed_task)
+            run_completed_task.add_done_callback(self._background_tasks.discard)
         # Best-effort fire-and-forget write-through to task_runs table.
         # Runs off the hot path so workflow status transitions stay fast.
         bg = asyncio.create_task(
@@ -4485,11 +4737,35 @@ class WorkflowService:
         )
 
     async def mark_workflow_run_as_running(self, workflow_run_id: str, run_with: str | None = None) -> WorkflowRun:
-        workflow_run = await self._update_workflow_run_status(
+        # Conditional UPDATE refuses to resurrect a finalized wr — prevents the
+        # cleanup cron from racing with re-entry paths and stomping timed_out
+        # back to running.
+        workflow_run = await app.DATABASE.workflow_runs.update_workflow_run_if_not_final(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.running,
             run_with=run_with,
         )
+        if workflow_run is None:
+            existing = await app.DATABASE.workflow_runs.get_workflow_run(
+                workflow_run_id=workflow_run_id, organization_id=None
+            )
+            if existing is None:
+                raise WorkflowRunNotFound(workflow_run_id)
+            LOG.info(
+                "Refusing to mark workflow_run as running — already in final state",
+                workflow_run_id=workflow_run_id,
+                current_status=existing.status,
+                run_with=run_with,
+            )
+            return existing
+
+        # Best-effort fire-and-forget write-through to task_runs table, matching
+        # the side effect that _update_workflow_run_status would have triggered.
+        bg = asyncio.create_task(
+            self._sync_task_run_from_workflow_run(workflow_run, workflow_run_id, WorkflowRunStatus.running),
+        )
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
         start_time = (
             workflow_run.started_at.replace(tzinfo=UTC)
             if workflow_run.started_at
@@ -4989,9 +5265,13 @@ class WorkflowService:
         workflow_run: WorkflowRun,
         task_v2: Any | None,
         organization_id: str | None,
-    ) -> list[str]:
-        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback."""
+    ) -> tuple[list[str], bool]:
+        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback.
+
+        Returns (recording_urls, recording_archived).
+        """
         recording_urls: list[str] = []
+        recording_archived = False
         if workflow_run.browser_session_id:
             if workflow_run.started_at is None:
                 LOG.warning(
@@ -5020,10 +5300,12 @@ class WorkflowService:
                 organization_id=workflow_run.organization_id,
             )
             if recording_artifacts:
-                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
-                recording_urls = [u for u in urls if u is not None]
+                recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifacts[0])
+                if not recording_archived:
+                    urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
+                    recording_urls = [u for u in urls if u is not None]
 
-        return recording_urls
+        return recording_urls, recording_archived
 
     async def _fetch_downloaded_files(
         self,
@@ -5111,7 +5393,7 @@ class WorkflowService:
         (
             screenshot_urls_raw,
             output_parameter_tuples,
-            recording_urls,
+            (recording_urls, recording_archived),
             (downloaded_files, downloaded_file_urls),
         ) = await asyncio.gather(
             self.get_recent_workflow_screenshot_urls(
@@ -5165,27 +5447,12 @@ class WorkflowService:
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
         total_steps = None
-        total_cost = None
         if include_step_count or include_cost:
-            if include_cost:
-                # step counts and block list are independent — fetch in parallel.
-                (step_count, completed_step_count), workflow_run_blocks = await asyncio.gather(
-                    app.DATABASE.tasks.get_step_counts_by_task_ids(
-                        task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                    ),
-                    app.DATABASE.observer.get_workflow_run_blocks(
-                        workflow_run_id=workflow_run_id, organization_id=organization_id
-                    ),
-                )
-                text_prompt_blocks = [
-                    block for block in workflow_run_blocks if block.block_type == BlockType.TEXT_PROMPT
-                ]
-                # This is a temporary cost calculation.
-                total_cost = 0.05 * (completed_step_count + len(text_prompt_blocks))
-            else:
-                step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
-                    task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
-                )
+            # `include_cost` is retained as a legacy alias for callers that
+            # previously received `total_steps` alongside deprecated cost data.
+            step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
+                task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
+            )
             total_steps = step_count
 
         return WorkflowRunResponseBase(
@@ -5200,6 +5467,7 @@ class WorkflowService:
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
+            cdp_connect_headers=workflow_run.cdp_connect_headers,
             queued_at=workflow_run.queued_at,
             started_at=workflow_run.started_at,
             finished_at=workflow_run.finished_at,
@@ -5209,11 +5477,14 @@ class WorkflowService:
             screenshot_urls=screenshot_urls,
             recording_url=recording_url,
             recording_urls=recording_urls or None,  # omit field when empty
+            recording_archived=recording_archived,
             downloaded_files=downloaded_files,
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
-            total_cost=total_cost,
+            total_cost=None,
+            credits_used=workflow_run.credits_used,
+            cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
@@ -5222,6 +5493,7 @@ class WorkflowService:
             browser_address=workflow_run.browser_address,
             run_with=workflow_run.run_with,
             script_run=workflow_run.script_run,
+            script_id=workflow_run.script_run.script_id if workflow_run.script_run else None,
             errors=errors,
         )
 
@@ -5268,14 +5540,6 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             child_workflow_run_ids=child_workflow_run_ids,
         )
-        try:
-            await app.AGENT_FUNCTION.release_proxy_session_for_owner(workflow_run.workflow_run_id)
-        except Exception:
-            LOG.warning(
-                "Failed to release proxy session for workflow run",
-                exc_info=True,
-                workflow_run_id=workflow_run.workflow_run_id,
-            )
         if browser_state:
             await self.persist_video_data(
                 browser_state, workflow, workflow_run, close_browser_on_completion=close_browser_on_completion
@@ -5289,12 +5553,22 @@ class WorkflowService:
                 and browser_state.browser_artifacts.browser_session_dir
                 and not workflow_run.browser_profile_id
             ):
-                await app.STORAGE.store_browser_session(
-                    workflow_run.organization_id,
-                    workflow.workflow_permanent_id,
-                    browser_state.browser_artifacts.browser_session_dir,
-                )
-                LOG.info("Persisted browser session for workflow run", workflow_run_id=workflow_run.workflow_run_id)
+                if workflow_run.status == WorkflowRunStatus.completed:
+                    await app.STORAGE.store_browser_session(
+                        workflow_run.organization_id,
+                        workflow.workflow_permanent_id,
+                        browser_state.browser_artifacts.browser_session_dir,
+                    )
+                    LOG.info(
+                        "Persisted browser session for workflow run",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                    )
+                else:
+                    LOG.info(
+                        "Skipped persisting browser session for non-completed workflow run",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_run_status=workflow_run.status,
+                    )
 
         await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(all_workflow_task_ids)
 
@@ -5349,11 +5623,11 @@ class WorkflowService:
 
         await self.execute_workflow_webhook(workflow_run, api_key)
 
-    async def execute_workflow_webhook(
+    async def prepare_workflow_webhook(
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
-    ) -> None:
+    ) -> PreparedWorkflowWebhook | None:
         workflow_id = workflow_run.workflow_id
         # Cleanup path: tolerate soft-deleted workflows. If the workflow row
         # has been deleted between run start and cleanup (common when an eval
@@ -5374,14 +5648,14 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
             )
-            return
+            return None
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
                 workflow_id=workflow_id,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
-            return
+            return None
 
         # Strip whitespace from the webhook URL to handle user input with leading/trailing spaces
         workflow_run.webhook_callback_url = workflow_run.webhook_callback_url.strip()
@@ -5402,7 +5676,7 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
             )
-            return
+            return None
 
         # build new schema for backward compatible webhook payload
         app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
@@ -5443,53 +5717,115 @@ class WorkflowService:
             api_key=signing_api_key,
         )
         LOG.info(
-            "Sending webhook run status to webhook callback url",
+            "Prepared webhook run status for webhook callback url",
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
             payload=signed_data.payload_for_log,
             headers=signed_data.headers,
         )
+        return PreparedWorkflowWebhook(
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run.workflow_run_id,
+            organization_id=workflow_run.organization_id,
+            webhook_callback_url=workflow_run.webhook_callback_url,
+            signed_payload=signed_data.signed_payload,
+            headers=signed_data.headers,
+            payload_for_log=signed_data.payload_for_log,
+        )
+
+    async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
+        LOG.info(
+            "Sending webhook run status to webhook callback url",
+            workflow_id=webhook.workflow_id,
+            workflow_run_id=webhook.workflow_run_id,
+            webhook_callback_url=webhook.webhook_callback_url,
+            payload=webhook.payload_for_log,
+            headers=webhook.headers,
+        )
         try:
             resp = await deliver_webhook_with_retries(
-                url=workflow_run.webhook_callback_url,
-                payload=signed_data.signed_payload,
-                headers=signed_data.headers,
+                url=webhook.webhook_callback_url,
+                payload=webhook.signed_payload,
+                headers=webhook.headers,
                 timeout_seconds=30.0,
-                organization_id=workflow_run.organization_id,
-                run_id=workflow_run.workflow_run_id,
+                organization_id=webhook.organization_id,
+                run_id=webhook.workflow_run_id,
             )
-            if resp.status_code >= 200 and resp.status_code < 300:
-                LOG.info(
-                    "Webhook sent successfully",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
-                )
+        except Exception as e:
+            LOG.warning(
+                "Workflow webhook delivery failed after attempting delivery",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                error=str(e),
+                exc_info=True,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    webhook_failure_reason=f"Webhook delivery failed before receiving a response: {e}",
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record workflow webhook delivery error",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+            return
+
+        if resp.status_code >= 200 and resp.status_code < 300:
+            LOG.info(
+                "Webhook sent successfully",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason="",
                 )
-            else:
-                LOG.info(
-                    "Webhook failed",
-                    workflow_id=workflow_id,
-                    workflow_run_id=workflow_run.workflow_run_id,
-                    webhook_data=signed_data.payload_for_log,
-                    resp=resp,
-                    resp_code=resp.status_code,
-                    resp_text=resp.text,
+            except Exception:
+                LOG.warning(
+                    "Failed to record successful workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
                 )
+        else:
+            LOG.info(
+                "Webhook failed",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+                webhook_data=webhook.payload_for_log,
+                resp=resp,
+                resp_code=resp.status_code,
+                resp_text=resp.text,
+            )
+            try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
-                    workflow_run_id=workflow_run.workflow_run_id,
+                    workflow_run_id=webhook.workflow_run_id,
                     webhook_failure_reason=f"Webhook failed with status code {resp.status_code}, error message: {resp.text}",
                 )
-        except Exception as e:
-            raise FailedToSendWebhook(
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run.workflow_run_id,
-            ) from e
+            except Exception:
+                LOG.warning(
+                    "Failed to record failed workflow webhook delivery",
+                    workflow_id=webhook.workflow_id,
+                    workflow_run_id=webhook.workflow_run_id,
+                    exc_info=True,
+                )
+
+    async def execute_workflow_webhook(
+        self,
+        workflow_run: WorkflowRun,
+        api_key: str | None = None,
+    ) -> None:
+        webhook = await self.prepare_workflow_webhook(workflow_run, api_key)
+        if webhook is None:
+            return
+        await self.deliver_prepared_workflow_webhook(webhook)
 
     async def persist_video_data(
         self,
@@ -5690,6 +6026,22 @@ class WorkflowService:
             if existing_latest_workflow:
                 existing_version = existing_latest_workflow.version
 
+                # Missing field inherits the stored dict; an explicit dict (possibly
+                # with mask sentinels for unedited keys) is resolved entry-by-entry
+                # against the stored value so newly-added keys aren't dropped.
+                if request.cdp_connect_headers is None:
+                    effective_cdp_connect_headers = existing_latest_workflow.cdp_connect_headers
+                else:
+                    effective_cdp_connect_headers = merge_masked_headers(
+                        request.cdp_connect_headers,
+                        existing_latest_workflow.cdp_connect_headers,
+                    )
+                effective_max_elapsed_time_minutes = (
+                    request.max_elapsed_time_minutes
+                    if "max_elapsed_time_minutes" in request.model_fields_set
+                    else existing_latest_workflow.max_elapsed_time_minutes
+                )
+
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5704,7 +6056,9 @@ class WorkflowService:
                     browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+                    max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
                     extra_http_headers=request.extra_http_headers,
+                    cdp_connect_headers=effective_cdp_connect_headers,
                     workflow_permanent_id=existing_latest_workflow.workflow_permanent_id,
                     version=existing_version + 1,
                     is_saved_task=request.is_saved_task,
@@ -5724,6 +6078,10 @@ class WorkflowService:
                     edited_by=edited_by,
                 )
             else:
+                # No existing workflow to inherit from; merge_masked_headers drops
+                # any keys whose value is the mask sentinel so we never persist the
+                # literal "***" placeholder from a misbehaving client.
+                new_cdp_connect_headers = merge_masked_headers(request.cdp_connect_headers, None)
                 # NOTE: it's only potential, as it may be immediately deleted!
                 potential_workflow = await self.create_workflow(
                     title=title,
@@ -5738,7 +6096,9 @@ class WorkflowService:
                     browser_profile_id=request.browser_profile_id,
                     model=request.model,
                     max_screenshot_scrolling_times=request.max_screenshot_scrolls,
+                    max_elapsed_time_minutes=request.max_elapsed_time_minutes,
                     extra_http_headers=request.extra_http_headers,
+                    cdp_connect_headers=new_cdp_connect_headers,
                     is_saved_task=request.is_saved_task,
                     status=request.status,
                     run_with=request.run_with,
@@ -5816,6 +6176,7 @@ class WorkflowService:
         proxy_location: ProxyLocationInput = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         run_with: str | None = None,
         status: WorkflowStatus = WorkflowStatus.published,
     ) -> Workflow:
@@ -5833,6 +6194,7 @@ class WorkflowService:
             status=status,
             max_screenshot_scrolls=max_screenshot_scrolling_times,
             extra_http_headers=extra_http_headers,
+            cdp_connect_headers=cdp_connect_headers,
             run_with=run_with,
         )
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
@@ -6292,20 +6654,54 @@ class WorkflowService:
                 )
                 return
 
-            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
-            # runaway revision churn when the same issue repeats every run.
-            cap_exceeded = await self._check_script_review_cap(
+            # Resolve cohort FIRST so the cap check + post-dispatch increment
+            # can route to the cohort's own counter.
+            use_v3 = await is_v3_cohort(
                 workflow_permanent_id=workflow.workflow_permanent_id,
                 organization_id=workflow.organization_id,
+                workflow_run_id=workflow_run.workflow_run_id,
             )
+
+            # Cap ALL script reviews (fallback + failure) per wpid per day to prevent
+            # runaway revision churn when the same issue repeats every run.
+            if use_v3:
+                cap_exceeded = await self._check_script_review_cap_v3(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=workflow.organization_id,
+                )
+            else:
+                cap_exceeded = await self._check_script_review_cap(
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    organization_id=workflow.organization_id,
+                )
             if cap_exceeded:
                 LOG.info(
                     "Skipping script review — daily cap exceeded for wpid",
                     workflow_permanent_id=workflow.workflow_permanent_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     pre_finally_status=pre_finally_status,
+                    cohort="v3" if use_v3 else "v2",
                 )
                 return
+
+            # Fast-path skip: v3 cohort + zero fallback episodes = nothing
+            # to review. Saves an LLM round-trip and a cap-counter increment
+            # on cold-mint runs, which produce no episodes by construction.
+            # v2 keeps its existing behavior (reviews whether or not episodes
+            # exist) — only the v3 path adds this gate.
+            if use_v3:
+                v3_episodes = await app.DATABASE.scripts.get_all_episodes_by_workflow_run_id(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    organization_id=workflow.organization_id,
+                )
+                if not v3_episodes:
+                    LOG.info(
+                        "v3_postrun_skipped_no_episodes",
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        script_revision_id=script_revision_id,
+                    )
+                    return
 
             # Non-blocking lock per script family
             cache = CacheFactory.get_cache()
@@ -6317,11 +6713,23 @@ class WorkflowService:
                 except AttributeError:
                     LOG.debug("Cache doesn't support locking for script reviewer")
 
+            async def _run_reviewer_dispatch() -> Any | None:
+                if use_v3:
+                    return await v3_review_post_run(
+                        organization_id=workflow.organization_id,
+                        workflow_run=workflow_run,
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                        script_revision_id=script_revision_id,
+                    )
+                await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                return None
+
             review_ran = False
+            review_result: Any | None = None
             if lock is not None:
                 try:
                     async with lock:
-                        await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                        review_result = await _run_reviewer_dispatch()
                         review_ran = True
                 except LockError:
                     LOG.info(
@@ -6331,15 +6739,21 @@ class WorkflowService:
                     )
             else:
                 # No Redis/cache available - proceed without lock (graceful degradation for OSS)
-                await self._run_reviewer_locked(workflow, workflow_run, script_revision_id, script_id)
+                review_result = await _run_reviewer_dispatch()
                 review_ran = True
 
-            # Increment the review counter ONLY after a review actually ran.
-            # Skipped reviews (e.g., LockError) should not consume cap budget.
             if review_ran:
-                await self._increment_script_review_counter(
-                    workflow_permanent_id=workflow.workflow_permanent_id,
-                )
+                if use_v3:
+                    v3_persist_cap_consumed = bool(getattr(review_result, "v3_persist_cap_consumed", False))
+                    if not v3_persist_cap_consumed:
+                        await self._increment_script_review_counter_v3(
+                            workflow_permanent_id=workflow.workflow_permanent_id,
+                            organization_id=workflow.organization_id,
+                        )
+                else:
+                    await self._increment_script_review_counter(
+                        workflow_permanent_id=workflow.workflow_permanent_id,
+                    )
         except Exception:
             LOG.warning(
                 "Failed to trigger script reviewer",
@@ -6349,76 +6763,38 @@ class WorkflowService:
 
     @staticmethod
     def _script_review_cap_key(workflow_permanent_id: str) -> str:
-        """Build the Redis key for the daily script-review counter."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        return f"script_reviewer:daily_cap:{workflow_permanent_id}:{today}"
+        """Build the Redis key for the daily script-review counter (v2 cohort)."""
+        return v2_script_review_cap_key(workflow_permanent_id)
 
-    async def _get_script_review_cap(self, organization_id: str | None) -> int:
-        """Return the effective daily script-review cap for an organization.
+    @staticmethod
+    def _v3_script_review_cap_key(workflow_permanent_id: str) -> str:
+        """Build the Redis key for the daily script-review counter (v3 cohort).
 
-        Checks PostHog for a per-org override via the ``script_review_daily_cap``
-        feature flag payload.  Falls back to ``settings.SCRIPT_REVIEW_DAILY_CAP``
-        (default 5) when PostHog is unavailable, the flag is unset, or the
-        payload is not a valid integer.
+        Separate from the v2 key so cohort comparisons stay clean and v3
+        traffic doesn't contaminate v2's counter.
         """
-        default_cap: int = settings.SCRIPT_REVIEW_DAILY_CAP
-        if not organization_id or not app.EXPERIMENTATION_PROVIDER:
-            return default_cap
-
-        try:
-            # Use organization_id as distinct_id (not a run-level ID) because this
-            # is an org-level feature flag — same cap for all runs in this org.
-            payload = await app.EXPERIMENTATION_PROVIDER.get_payload_cached(
-                "script_review_daily_cap",
-                organization_id,
-                properties={"organization_id": organization_id},
-            )
-            if payload is not None:
-                custom_cap = int(payload)
-                if custom_cap > 0:
-                    LOG.info(
-                        "Using custom script review daily cap from PostHog",
-                        cap=custom_cap,
-                        organization_id=organization_id,
-                    )
-                    return custom_cap
-        except (ValueError, TypeError):
-            LOG.warning(
-                "Invalid script_review_daily_cap payload, using default",
-                organization_id=organization_id,
-                exc_info=True,
-            )
-        except Exception:
-            LOG.debug(
-                "Failed to fetch script_review_daily_cap from PostHog, using default",
-                organization_id=organization_id,
-                exc_info=True,
-            )
-        return default_cap
+        return v3_script_review_cap_key(workflow_permanent_id)
 
     async def _check_script_review_cap(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
-        """Check if the daily script-review cap has been reached for this wpid.
+        """Check if the daily script-review cap has been reached for this wpid (v2 cohort).
 
         Returns True if the cap is exceeded and the review should be skipped.
         Uses Redis get/set to maintain a per-wpid daily counter.
         """
-        try:
-            cache = CacheFactory.get_cache()
-            if cache is None:
-                return False
-            cap_key = self._script_review_cap_key(workflow_permanent_id)
-            raw_count = await cache.get(cap_key)
-            if raw_count is not None:
-                count = int(raw_count)
-                cap = await self._get_script_review_cap(organization_id)
-                if count >= cap:
-                    return True
-        except Exception:
-            LOG.debug("Failed to check script review cap, allowing review", exc_info=True)
-        return False
+        return await is_script_review_cap_exceeded_v2(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+
+    async def _check_script_review_cap_v3(self, workflow_permanent_id: str, organization_id: str | None = None) -> bool:
+        """v3 cohort mirror of ``_check_script_review_cap`` reading the v3 key."""
+        return await is_script_review_cap_exceeded_v3(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
 
     async def _increment_script_review_counter(self, workflow_permanent_id: str) -> None:
-        """Increment the daily script-review counter for this wpid.
+        """Increment the daily script-review counter for this wpid (v2 cohort).
 
         Uses Redis get+set with a 48-hour TTL (covers timezone edge cases).
         Note: get+set is not atomic, so concurrent reviews for the same wpid
@@ -6427,16 +6803,48 @@ class WorkflowService:
         Acceptable because the cap is a spam guard, not a hard limit, and the
         repo restricts Redis to get/set/lock only.
         """
-        try:
-            cache = CacheFactory.get_cache()
-            if cache is None:
-                return
-            cap_key = self._script_review_cap_key(workflow_permanent_id)
-            raw_count = await cache.get(cap_key)
-            new_count = (int(raw_count) + 1) if raw_count is not None else 1
-            await cache.set(cap_key, str(new_count), ex=timedelta(hours=48))
-        except Exception:
-            LOG.debug("Failed to increment script review counter", exc_info=True)
+        await increment_script_review_counter_v2(workflow_permanent_id)
+
+    async def _increment_script_review_counter_v3(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str | None = None,
+    ) -> None:
+        """v3 cohort mirror of ``_increment_script_review_counter`` writing v3 key.
+
+        Called from ``_trigger_script_reviewer`` after a successful v3 review_ran.
+        """
+        await try_increment_script_review_counter_v3(workflow_permanent_id, organization_id=organization_id)
+
+    async def _check_and_increment_cap_v3(
+        self,
+        workflow_permanent_id: str,
+        organization_id: str | None = None,
+    ) -> int | None:
+        """Atomic check-and-increment for the v3 daily cap counter.
+
+        v3 persist skills (``persist_block_edit``, ``persist_script_rewrite``) call
+        this instead of the separate ``_check_script_review_cap`` +
+        ``_increment_script_review_counter`` pattern. A wpid-level Redis lock wraps
+        the get-check-set sequence, so concurrent v3 persists across different
+        script_ids (same wpid) serialize through it — fixes the race documented on
+        the v2 helpers.
+
+        Returns:
+            - the new counter value (1-based) on success, i.e. cap NOT exceeded.
+            - ``None`` if the cap is exceeded OR if cache is unavailable (caller
+              should treat ``None`` the same as cap-exceeded; fail closed).
+
+        Uses only the allowed Redis primitives: ``get`` / ``set`` / ``get_lock``;
+        no INCR/DECR.
+
+        v2 helpers above are intentionally unchanged; fixing v2's latent race is
+        out of scope for this PR.
+        """
+        return await check_and_increment_cap_v3(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
 
     async def _run_reviewer_locked(
         self,
@@ -6616,6 +7024,7 @@ class WorkflowService:
                         episode_id=episode.episode_id,
                         organization_id=workflow.organization_id,
                         reviewer_output=None,
+                        reviewer_version="v2",
                     )
                 return
 
@@ -6662,6 +7071,7 @@ class WorkflowService:
                     organization_id=workflow.organization_id,
                     reviewer_output=str(updated_blocks) if updated_blocks else None,
                     new_script_revision_id=new_script.script_revision_id if new_script else None,
+                    reviewer_version="v2",
                 )
 
         except Exception:
@@ -6670,21 +7080,26 @@ class WorkflowService:
                 workflow_permanent_id=workflow.workflow_permanent_id,
             )
 
-    def should_run_script(
+    async def should_run_script(
         self,
         workflow: Workflow,
         workflow_run: WorkflowRun,
     ) -> bool:
-        """Determine whether this run should attempt to execute cached scripts.
+        """Whether this run should attempt cached-script execution.
 
-        Priority: run-level run_with (if set) > workflow-level run_with.
-        Workflow.run_with is always "code" or "agent" after normalization
-        (NULL and code_version fallback resolved at read time).
-        WorkflowRun.run_with is None when not explicitly set (inherits from workflow).
+        Priority: run-level run_with > workflow-level run_with. Intended-code
+        runs are then passed through the app-level code-mode gate.
         """
         if workflow_run.run_with is not None:
-            return workflow_run.run_with == "code"
-        return workflow.run_with == "code"
+            intended_code = workflow_run.run_with == "code"
+        else:
+            intended_code = workflow.run_with == "code"
+        if not intended_code:
+            return False
+        return await app.AGENT_FUNCTION.should_keep_code_mode_for_workflow_run(
+            workflow=workflow,
+            workflow_run=workflow_run,
+        )
 
     async def _mark_script_run_loaded(self, workflow_run_id: str, script: Script) -> None:
         """Record that a cached script was loaded for this workflow run.

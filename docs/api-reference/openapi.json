@@ -168,6 +168,7 @@
       "get": {
         "tags": [
           "Agent",
+          "Workflow Runs",
           "Workflows"
         ],
         "summary": "Get a run by id",
@@ -221,6 +222,7 @@
                       "openai_cua": "#/components/schemas/TaskRunResponse",
                       "anthropic_cua": "#/components/schemas/TaskRunResponse",
                       "ui_tars": "#/components/schemas/TaskRunResponse",
+                      "yutori_navigator": "#/components/schemas/TaskRunResponse",
                       "workflow_run": "#/components/schemas/WorkflowRunResponse"
                     }
                   },
@@ -584,6 +586,224 @@
         }
       }
     },
+    "/v1/workflows/{workflow_id}/runs": {
+      "get": {
+        "tags": [
+          "Workflow Runs"
+        ],
+        "summary": "List runs for a workflow",
+        "description": "List runs for a specific workflow. Supports filtering by status, search_key, and error_code. All filters are combined with AND logic.",
+        "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
+        "parameters": [
+          {
+            "name": "workflow_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID. Workflow ID starts with `wpid_`.",
+              "example": "wpid_123",
+              "title": "Workflow Id"
+            },
+            "description": "Workflow permanent ID. Workflow ID starts with `wpid_`."
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of runs to return per page.",
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of runs to return per page."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/WorkflowRunStatus"
+              },
+              "nullable": true,
+              "description": "Filter by one or more run statuses.",
+              "title": "Status"
+            },
+            "description": "Filter by one or more run statuses."
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "maxLength": 500,
+              "description": "Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers.",
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search across workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers."
+          },
+          {
+            "name": "error_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "maxLength": 500,
+              "description": "Exact-match filter on the error_code field inside each task's errors JSON array.",
+              "title": "Error Code"
+            },
+            "description": "Exact-match filter on the error_code field inside each task's errors JSON array."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRun"
+                  },
+                  "title": "Response Get Workflow Runs By Id V1 Workflows Workflow Id Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id"
+      }
+    },
+    "/v1/workflows/runs/{workflow_run_id}/retry": {
+      "post": {
+        "tags": [
+          "Workflow Runs",
+          "Workflows"
+        ],
+        "summary": "Retry workflow run",
+        "description": "Retry a workflow run using the original run parameters.",
+        "operationId": "retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the workflow run to retry.",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "The id of the workflow run to retry."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "nullable": true,
+              "title": "X-Max-Steps-Override"
+            }
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "title": "X-User-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retried workflow run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Workflow run is not retryable"
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "retry_workflow_run"
+      }
+    },
     "/v1/workflows/{workflow_id}/delete": {
       "post": {
         "tags": [
@@ -843,6 +1063,7 @@
       "get": {
         "tags": [
           "Agent",
+          "Workflow Runs",
           "Workflows"
         ],
         "summary": "Get run timeline",
@@ -1742,6 +1963,7 @@
     },
     "/v1/run/tasks/login": {
       "post": {
+        "x-excluded": true,
         "tags": [
           "Agent"
         ],
@@ -1760,6 +1982,16 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "title": "X-User-Agent"
+            }
           }
         ],
         "requestBody": {
@@ -1793,11 +2025,13 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "login"
       }
     },
     "/v1/run/tasks/download_files": {
       "post": {
+        "x-excluded": true,
         "tags": [
           "Agent"
         ],
@@ -1816,6 +2050,16 @@
               "title": "X-Api-Key"
             },
             "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "title": "X-User-Agent"
+            }
           }
         ],
         "requestBody": {
@@ -1849,7 +2093,8 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "download_files"
       }
     },
     "/v1/scripts": {
@@ -2260,146 +2505,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CheckoutSessionResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/billing/portal": {
-      "post": {
-        "summary": "Create Portal Session",
-        "description": "Create a Stripe Customer Portal session for managing subscription.\n\nFrontend should redirect the user to the returned URL.\nThe portal allows users to:\n- Update payment methods\n- Upgrade/downgrade plans\n- Cancel subscription\n- View invoices",
-        "operationId": "create_portal_session_api_v1_billing_portal_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "nullable": true,
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PortalSessionResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/billing/state": {
-      "get": {
-        "summary": "Get Organization Billing",
-        "operationId": "get_organization_billing_api_v1_billing_state_get",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "nullable": true,
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BillingStateResponse",
-                  "nullable": true,
-                  "title": "Response Get Organization Billing Api V1 Billing State Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/billing/change-tier": {
-      "post": {
-        "summary": "Change Tier",
-        "description": "Redirect to Stripe Portal for tier changes.\nPortal handles proration based on configured settings:\n- Upgrades: Immediate proration charge\n- Downgrades: Apply at end of billing period",
-        "operationId": "change_tier_api_v1_billing_change_tier_post",
-        "parameters": [
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "nullable": true,
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChangeTierRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ChangeTierResponse"
                 }
               }
             }
@@ -10467,8 +10572,8 @@
           },
           "engine": {
             "$ref": "#/components/schemas/RunEngine",
-            "description": "\nThe engine that powers the agent task. The default value is `skyvern-2.0`, the latest Skyvern agent that performs pretty well with complex and multi-step tasks. `skyvern-1.0` is good for simple tasks like filling a form, or searching for information on Google. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
-            "default": "skyvern-2.0"
+            "description": "\nThe engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.\n",
+            "default": "skyvern-1.0"
           },
           "title": {
             "type": "string",
@@ -10579,7 +10684,8 @@
           "publish_workflow": {
             "type": "boolean",
             "title": "Publish Workflow",
-            "description": "Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
+            "description": "Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. For backwards compatibility, this routes the request through the legacy `skyvern-2.0` publish path. Prefer creating reusable workflows through the workflow APIs.",
+            "deprecated": true,
             "default": false
           },
           "include_action_history_in_verification": {
@@ -10767,10 +10873,11 @@
               "task_v2",
               "openai_cua",
               "anthropic_cua",
-              "ui_tars"
+              "ui_tars",
+              "yutori_navigator"
             ],
             "title": "Run Type",
-            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars"
+            "description": "Types of a task run - task_v1, task_v2, openai_cua, anthropic_cua, ui_tars, yutori_navigator"
           },
           "run_request": {
             "$ref": "#/components/schemas/TaskRunRequest",
@@ -12753,7 +12860,7 @@
           "run_sequentially": {
             "type": "boolean",
             "nullable": true,
-            "title": "Run Sequentially"
+            "title": "Prevent Overlapping Runs"
           },
           "sequential_key": {
             "type": "string",
@@ -12897,7 +13004,7 @@
           },
           "run_sequentially": {
             "type": "boolean",
-            "title": "Run Sequentially",
+            "title": "Prevent Overlapping Runs",
             "default": false
           },
           "sequential_key": {

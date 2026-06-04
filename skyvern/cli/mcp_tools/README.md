@@ -98,7 +98,7 @@ Supports Skyvern vault, Bitwarden, 1Password, and Azure Key Vault with automatic
 `skyvern_state_save`, `skyvern_state_load`, `skyvern_get_session_storage`, `skyvern_set_session_storage`, `skyvern_clear_session_storage`, `skyvern_clear_local_storage`, `skyvern_clipboard_read`, `skyvern_clipboard_write`
 
 ### Workflows
-`skyvern_workflow_create`, `skyvern_workflow_list`, `skyvern_workflow_get`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel`, `skyvern_workflow_update_folder`
+`skyvern_workflow_create`, `skyvern_workflow_list`, `skyvern_workflow_get`, `skyvern_workflow_run_list`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_retry`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel`, `skyvern_workflow_update_folder`
 
 ### Workflow Building Blocks
 `skyvern_block_schema`, `skyvern_block_validate` -- 23 block types for multi-step automations.

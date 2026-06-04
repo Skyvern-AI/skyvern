@@ -192,7 +192,7 @@ function PushTotpCodeForm({
           {advancedOpen && (
             <div className="grid gap-3 md:grid-cols-3">
               <div className="space-y-1">
-                <Label htmlFor="totp-workflow-run-input">Workflow run ID</Label>
+                <Label htmlFor="totp-workflow-run-input">Agent run ID</Label>
                 <Input
                   id="totp-workflow-run-input"
                   placeholder="wr_123"
@@ -203,7 +203,7 @@ function PushTotpCodeForm({
                 />
               </div>
               <div className="space-y-1">
-                <Label htmlFor="totp-workflow-id-input">Workflow ID</Label>
+                <Label htmlFor="totp-workflow-id-input">Agent ID</Label>
                 <Input
                   id="totp-workflow-id-input"
                   placeholder="wf_123"

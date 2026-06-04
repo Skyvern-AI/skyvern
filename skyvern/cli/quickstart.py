@@ -3,11 +3,13 @@
 import asyncio
 import importlib
 import importlib.metadata
+import re
+import shutil
 import subprocess
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 from rich.markup import escape
@@ -36,7 +38,7 @@ def _server_extra_install_target() -> str:
     return f"skyvern[server]=={version}"
 
 
-def _install_server_extra_for_quickstart() -> bool:
+def _install_server_extra_for_quickstart(*, assume_yes: bool = False) -> bool:
     target = _server_extra_install_target()
     console.print(
         Panel(
@@ -46,13 +48,16 @@ def _install_server_extra_for_quickstart() -> bool:
             border_style="yellow",
         )
     )
-    if not Confirm.ask("Install the missing server dependencies now?", default=True):
+    if not assume_yes and not Confirm.ask("Install the missing server dependencies now?", default=True):
         _print_server_guidance()
         return False
 
     console.print(f"📦 [bold blue]Installing {escape(target)}...[/bold blue]")
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", target], check=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--retries", "5", "--timeout", "60", target],
+            check=True,
+        )
     except subprocess.CalledProcessError as install_error:
         console.print(f"[bold red]Failed to install {target}: {install_error}[/bold red]")
         _print_server_guidance()
@@ -221,6 +226,43 @@ def _server_quickstart_flags_requested(
     return no_postgres or bool(database_string) or skip_browser_install or server_only
 
 
+def _server_quickstart_options(
+    *,
+    no_postgres: bool,
+    database_string: str,
+    skip_browser_install: bool,
+    server_only: bool,
+    skip_llm_setup: bool,
+    configure_mcp: bool | None,
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None,
+    browser_location: str | None,
+    remote_debugging_url: str | None,
+    analytics_id: str | None,
+    start_services_now: bool | None,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "no_postgres": no_postgres,
+        "database_string": database_string,
+        "skip_browser_install": skip_browser_install,
+        "server_only": server_only,
+    }
+    if skip_llm_setup:
+        options["skip_llm_setup"] = skip_llm_setup
+    if configure_mcp is not None:
+        options["configure_mcp"] = configure_mcp
+    if browser_type is not None:
+        options["browser_type"] = browser_type
+    if browser_location is not None:
+        options["browser_location"] = browser_location
+    if remote_debugging_url is not None:
+        options["remote_debugging_url"] = remote_debugging_url
+    if analytics_id is not None:
+        options["analytics_id"] = analytics_id
+    if start_services_now is not None:
+        options["start_services_now"] = start_services_now
+    return options
+
+
 def _parse_quickstart_env_scope(value: str) -> EnvScope:
     try:
         return parse_env_scope(value)
@@ -285,6 +327,13 @@ def _run_server_quickstart(
     database_string: str,
     skip_browser_install: bool,
     server_only: bool,
+    skip_llm_setup: bool = False,
+    configure_mcp: bool | None = None,
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = None,
+    browser_location: str | None = None,
+    remote_debugging_url: str | None = None,
+    analytics_id: str | None = None,
+    start_services_now: bool | None = None,
 ) -> None:
     try:
         from skyvern.cli.init_command import init_env  # noqa: PLC0415
@@ -296,11 +345,18 @@ def _run_server_quickstart(
             no_postgres=no_postgres,
             database_string=database_string,
             skip_browser_install=skip_browser_install,
+            mode="local",
+            skip_llm_setup=skip_llm_setup,
+            configure_mcp=configure_mcp,
+            browser_type=browser_type,
+            browser_location=browser_location,
+            remote_debugging_url=remote_debugging_url,
+            analytics_id=analytics_id,
             return_result=True,
         )
         run_local = bool(init_result)
         if run_local:
-            _configure_cdp_livestreaming_defaults()
+            _configure_local_browser_streaming_defaults()
 
         # Start services
         if run_local:
@@ -321,7 +377,11 @@ def _run_server_quickstart(
                 )
                 return
 
-            start_now = typer.confirm("\nDo you want to start Skyvern services now?", default=True)
+            start_now = (
+                start_services_now
+                if start_services_now is not None
+                else typer.confirm("\nDo you want to start Skyvern services now?", default=True)
+            )
             if start_now:
                 console.print("\n[bold blue]Starting Skyvern services...[/bold blue]")
                 asyncio.run(start_services(server_only=server_only))
@@ -535,8 +595,8 @@ def _handle_postgres_container_conflict() -> None:
     )
 
 
-def _configure_cdp_livestreaming_defaults() -> None:
-    """Enable local CDP livestreaming for self-hosted quickstart paths."""
+def _configure_local_browser_streaming_defaults() -> None:
+    """Enable local browser streaming for self-hosted quickstart paths."""
     from dotenv import set_key
 
     from skyvern.cli.llm_setup import update_or_add_env_var
@@ -556,6 +616,62 @@ def _configure_cdp_livestreaming_defaults() -> None:
         set_key(str(frontend_env), "VITE_BROWSER_STREAMING_MODE", "cdp", quote_mode="never")
 
 
+_LOCALHOST_DB_RE = re.compile(r"^\s*(?:export\s+)?DATABASE_STRING\s*=.*@localhost[/:\"]", re.IGNORECASE)
+_COMPOSE_DATABASE_STRING = 'DATABASE_STRING="postgresql+psycopg://skyvern:skyvern@postgres/skyvern"'
+
+
+def _rewrite_localhost_db_string(content: str) -> str | None:
+    lines = content.splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        if _LOCALHOST_DB_RE.match(line):
+            lines[i] = _COMPOSE_DATABASE_STRING
+            changed = True
+    if not changed:
+        return None
+    result = "\n".join(lines)
+    if content.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _bootstrap_compose_env_files() -> None:
+    env_path = Path(".env")
+    env_example = Path(".env.example")
+
+    if not env_path.exists():
+        if env_example.exists():
+            content = env_example.read_text()
+            rewritten = _rewrite_localhost_db_string(content)
+            env_path.write_text(rewritten if rewritten is not None else content, encoding="utf-8")
+            console.print("[green]Created .env from .env.example[/green]")
+    else:
+        try:
+            content = env_path.read_text()
+        except OSError:
+            content = ""
+        rewritten = _rewrite_localhost_db_string(content)
+        if rewritten is not None:
+            console.print(
+                Panel(
+                    "[bold yellow]DATABASE_STRING pointing to localhost detected in .env.[/bold yellow]\n\n"
+                    "Docker Compose uses its own Postgres service. The connection string will be "
+                    "rewritten to point to the compose [cyan]postgres[/cyan] host.",
+                    border_style="yellow",
+                )
+            )
+            if Confirm.ask("Rewrite DATABASE_STRING for Docker Compose?", default=True):
+                env_path.write_text(rewritten, encoding="utf-8")
+                console.print("[green]Rewrote DATABASE_STRING for Docker Compose[/green]")
+
+    frontend_env = Path("skyvern-frontend/.env")
+    frontend_example = Path("skyvern-frontend/.env.example")
+    if not frontend_env.exists() and frontend_example.exists():
+        frontend_env.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(frontend_example, frontend_env)
+        console.print("[green]Created skyvern-frontend/.env from .env.example[/green]")
+
+
 def run_docker_compose_setup() -> None:
     """Run the Docker Compose setup for Skyvern."""
     from skyvern.cli.llm_setup import setup_llm_providers  # noqa: PLC0415
@@ -563,13 +679,14 @@ def run_docker_compose_setup() -> None:
     console.print("\n[bold blue]Setting up Skyvern with Docker Compose...[/bold blue]")
     capture_setup_event("docker-compose-start")
 
+    _bootstrap_compose_env_files()
     _handle_running_compose_stack()
     _handle_postgres_container_conflict()
 
     # Configure LLM provider
     console.print("\n[bold blue]Step 1: Configure LLM Provider[/bold blue]")
     setup_llm_providers()
-    _configure_cdp_livestreaming_defaults()
+    _configure_local_browser_streaming_defaults()
 
     # Run docker compose up
     console.print("\n[bold blue]Step 2: Starting Docker Compose...[/bold blue]")
@@ -668,12 +785,78 @@ def quickstart(
         "--env-scope",
         help="Backend env location for setup writes: legacy/current, project, or global.",
     ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Automatically approve installing missing Skyvern server dependencies.",
+    ),
+    non_interactive: bool = typer.Option(
+        False,
+        "--non-interactive",
+        help=(
+            "Run the self-hosted server quickstart path without prompts. Installs missing server dependencies, "
+            "skips LLM/MCP prompts, uses headless Chromium, anonymous analytics, and does not start services."
+        ),
+    ),
+    skip_llm_setup: bool = typer.Option(
+        False,
+        "--skip-llm-setup",
+        help="Skip interactive LLM provider setup and keep/default environment values.",
+    ),
+    skip_mcp: bool = typer.Option(False, "--skip-mcp", help="Skip interactive MCP server configuration."),
+    browser_type: Literal["chromium-headful", "chromium-headless", "cdp-connect"] | None = typer.Option(
+        None,
+        "--browser-type",
+        help="Browser type to write without prompting.",
+    ),
+    browser_location: str | None = typer.Option(
+        None,
+        "--browser-location",
+        help="Chrome executable path to write when using a custom browser location.",
+    ),
+    remote_debugging_url: str | None = typer.Option(
+        None,
+        "--remote-debugging-url",
+        help="CDP URL to write when using --browser-type cdp-connect.",
+    ),
+    analytics_id: str | None = typer.Option(
+        None,
+        "--analytics-id",
+        help="Analytics identifier to write without prompting. Use 'anonymous' for agent tests.",
+    ),
+    start_services_now: bool | None = typer.Option(
+        None,
+        "--start/--no-start",
+        help="Start Skyvern services after setup. Omit to prompt.",
+    ),
 ) -> None:
     """Quickstart command to set up and run Skyvern with one command."""
     # Run initialization
     console.print(Panel("[bold green]🚀 Starting Skyvern Quickstart[/bold green]", border_style="green"))
     install_type_value = install_type if isinstance(install_type, str) else None
     env_scope_value = env_scope if isinstance(env_scope, str) else None
+    if non_interactive:
+        install_type_value = install_type_value or QuickstartPath.SERVER.value
+        yes = True
+        skip_llm_setup = True
+        skip_mcp = True
+        browser_type = browser_type or "chromium-headless"
+        analytics_id = analytics_id or "anonymous"
+        if start_services_now is None:
+            start_services_now = False
+        if not database_string:
+            no_postgres = True
+            console.print(
+                Panel(
+                    "[bold yellow]Non-interactive quickstart will not prompt to start PostgreSQL.[/bold yellow]\n\n"
+                    "No [cyan]--database-string[/cyan] was provided, so Skyvern will use any existing "
+                    "[cyan]DATABASE_STRING[/cyan] from your environment or .env file.\n\n"
+                    "For unattended agent tests, pass "
+                    "[cyan]--database-string postgresql+psycopg://user:pass@host:5432/dbname[/cyan].",
+                    border_style="yellow",
+                )
+            )
 
     has_server_extra = _has_server_quickstart_extra()
     # The server extra is a superset of the local embedded runtime dependencies.
@@ -685,6 +868,16 @@ def quickstart(
         server_only=server_only,
     )
     if docker_compose:
+        if non_interactive:
+            console.print(
+                Panel(
+                    "[bold red]Non-interactive Docker Compose quickstart is not supported yet.[/bold red]\n"
+                    "Use [cyan]--install-type server --database-string postgresql+psycopg://...[/cyan] "
+                    "for unattended agent tests.",
+                    border_style="red",
+                )
+            )
+            raise typer.Exit(1)
         selected_path = (
             QuickstartPath.SERVER if install_type_value is None else _parse_quickstart_path(install_type_value)
         )
@@ -761,7 +954,7 @@ def quickstart(
         return
 
     # If Docker Compose file exists, offer the choice
-    if docker_compose_available and check_docker() and not server_flags_requested:
+    if not non_interactive and docker_compose_available and check_docker() and not server_flags_requested:
         console.print("\n[bold blue]Setup Method[/bold blue]")
         console.print("Docker Compose file detected. Choose your setup method:\n")
         console.print("  [cyan]1.[/cyan] [green]Docker Compose (Recommended)[/green] - Full containerized setup")
@@ -777,15 +970,24 @@ def quickstart(
             return
 
     if not _has_server_quickstart_extra():
-        if not _is_interactive_input():
+        if not yes and not _is_interactive_input():
             _print_server_guidance()
             raise typer.Exit(0)
-        if not _install_server_extra_for_quickstart() or not _has_server_quickstart_extra():
+        if not _install_server_extra_for_quickstart(assume_yes=yes) or not _has_server_quickstart_extra():
             raise typer.Exit(1)
 
     _run_server_quickstart(
-        no_postgres=no_postgres,
-        database_string=database_string,
-        skip_browser_install=skip_browser_install,
-        server_only=server_only,
+        **_server_quickstart_options(
+            no_postgres=no_postgres,
+            database_string=database_string,
+            skip_browser_install=skip_browser_install,
+            server_only=server_only,
+            skip_llm_setup=skip_llm_setup,
+            configure_mcp=False if skip_mcp else None,
+            browser_type=browser_type,
+            browser_location=browser_location,
+            remote_debugging_url=remote_debugging_url,
+            analytics_id=analytics_id,
+            start_services_now=start_services_now,
+        )
     )

@@ -2,9 +2,9 @@
   background: linear-gradient(
     to bottom,
     transparent 0%,
-    rgba(51, 65, 85, 0.1) 20%,
-    rgba(51, 65, 85, 0.5) 50%,
-    rgba(51, 65, 85, 0.1) 80%,
+    rgba(115, 115, 115, 0.1) 20%,
+    rgba(115, 115, 115, 0.5) 50%,
+    rgba(115, 115, 115, 0.1) 80%,
     transparent 100%
   );
 }
@@ -13,9 +13,9 @@
   background: linear-gradient(
     to bottom,
     transparent 0%,
-    rgba(51, 65, 85, 0.3) 20%,
-    rgba(51, 65, 85, 1) 50%,
-    rgba(51, 65, 85, 0.3) 80%,
+    rgba(115, 115, 115, 0.3) 20%,
+    rgba(115, 115, 115, 1) 50%,
+    rgba(115, 115, 115, 0.3) 80%,
     transparent 100%
   );
 }
@@ -74,4 +74,23 @@
   100% {
     opacity: 0;
   }
+}
+
+.block-sidebar-resize-handle {
+  position: relative;
+}
+.block-sidebar-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 5px;
+  width: 2px;
+  border-radius: 1px;
+  background-color: rgb(148 163 184 / 0);
+  transition: background-color 120ms ease-out;
+}
+.block-sidebar-resize-handle:hover::after,
+.block-sidebar-resize-handle:active::after {
+  background-color: rgb(148 163 184 / 0.4);
 }

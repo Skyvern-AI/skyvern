@@ -402,16 +402,21 @@ or what the data looks like), not the schema.
 
 ## Caching Considerations
 
-Workflows created via MCP default to Code 2.0 (code_version=2, run_with="code").
+Workflows created via MCP default to AI agent execution (run_with="agent"). For JSON definitions \
+code_version=2 is also injected by default; YAML definitions use the backend schema (currently \
+leaves code_version unset, so pass `code_version: 2` explicitly in YAML if you want to opt into \
+the v2 caching framework). Set run_with="code" on the workflow (or at run time) to opt into cached \
+script execution.
 
 ### What this means for workflow design
 
-- **First run**: The AI agent runs all blocks, recording actions. A cached script is generated afterward.
-- **Subsequent runs**: The script replays deterministically — 10-100x faster, no LLM costs.
-- **AI fallback**: If the script encounters an element it cannot find, it falls back to the AI agent \
-for that step. The fallback episode is recorded and used to improve the script.
+- **run_with="agent" (default)**: Every run uses the AI agent end-to-end. Higher LLM cost but most \
+flexible — recommended for workflows that are still being designed or that target sites that change often.
+- **run_with="code"**: First run uses the AI agent and records a cached script; subsequent runs replay \
+the script deterministically (10-100x faster, no LLM costs). If the script encounters an element it \
+cannot find, it falls back to the AI agent for that step.
 
-### Design for cacheability
+### Design for cacheability (only matters when you opt into run_with="code")
 
 1. Use stable selectors: navigation goals that reference exact field labels cache better than vague \
 descriptions. "Fill in the 'Company Name' field" caches better than "fill in the first text box."
@@ -422,11 +427,9 @@ in navigation_goal become part of the script literally.
 
 ### Overriding execution mode at run time
 
-Pass `run_with="agent"` to `skyvern_workflow_run` to force AI execution for a specific run without \
-changing the workflow definition. This is useful for:
-- First runs when no script exists yet (the system handles this automatically)
-- Debugging: comparing AI behavior vs script behavior
-- Sites that changed layout since the last successful script run
+Pass `run_with="code"` to `skyvern_workflow_run` to force cached-script execution for a single run \
+without changing the workflow definition (only meaningful once a script exists). Pass \
+`run_with="agent"` to force AI execution for debugging or after a site redesign.
 """
 
 

@@ -29,6 +29,7 @@ from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app as forge_app
 from skyvern.forge.forge_app_initializer import start_forge_app
 from skyvern.forge.request_logging import log_raw_request_middleware
+from skyvern.forge.sdk.copilot.tracing_setup import ensure_tracing_initialized
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.exceptions import NotFoundError
@@ -44,6 +45,10 @@ from skyvern.forge.sdk.services.local_org_auth_token_service import (
     regenerate_local_api_key,
 )
 from skyvern.services.cleanup_service import start_cleanup_scheduler, stop_cleanup_scheduler
+from skyvern.services.workflow_schedule_service import (
+    start_workflow_schedule_scheduler,
+    stop_workflow_schedule_scheduler,
+)
 
 LOG = structlog.get_logger()
 
@@ -147,6 +152,14 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
 
     LOG.info("Server started")
 
+    # Initialize tracing eagerly so OTel spans (`@traced(...)`) ship from the
+    # first request. Without this, the tracer provider is configured lazily on
+    # first copilot-agent invocation, so any request that hits a non-copilot
+    # path before then (e.g. workflow runs from the caching benchmark) records
+    # no-op spans. Uvicorn's `--reload` resets module-level state on edits, so
+    # the lazy path also fails after every code change in dev.
+    ensure_tracing_initialized()
+
     # Auto-bootstrap SQLite database on first server start.
     # Re-raise on failure — a server with no tables/org/API key is
     # useless and would produce confusing 401s on every request.
@@ -171,6 +184,10 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
     if cleanup_task:
         LOG.info("Cleanup scheduler started")
 
+    workflow_schedule_task = start_workflow_schedule_scheduler()
+    if workflow_schedule_task:
+        LOG.info("Workflow schedule scheduler started")
+
     # Start MCP sub-application lifespan if mounted. Starlette Mount does NOT
     # forward lifespan events to sub-apps, so we must enter the MCP app's
     # lifespan here. This initializes the streamable-http session manager's
@@ -185,6 +202,7 @@ async def lifespan(fastapi_app: FastAPI) -> AsyncGenerator[None, Any]:
         yield
 
     # Stop cleanup scheduler
+    await stop_workflow_schedule_scheduler()
     await stop_cleanup_scheduler()
 
     if forge_app.api_app_shutdown_event:

@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import select
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.context import TurnNarrativePayload
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.base_repository import BaseRepository
@@ -38,6 +39,7 @@ from skyvern.forge.sdk.db.utils import (
     hydrate_action,
 )
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.task_generations import TaskGeneration
 from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_copilot import (
@@ -519,6 +521,8 @@ class WorkflowParametersRepository(BaseRepository):
         sender: WorkflowCopilotChatSender,
         content: str,
         global_llm_context: str | None = None,
+        turn_outcome: TurnOutcome | None = None,
+        narrative_payload: TurnNarrativePayload | dict[str, Any] | None = None,
     ) -> WorkflowCopilotChatMessage:
         async with self.Session() as session:
             new_message = WorkflowCopilotChatMessageModel(
@@ -527,6 +531,8 @@ class WorkflowParametersRepository(BaseRepository):
                 sender=sender,
                 content=content,
                 global_llm_context=global_llm_context,
+                turn_outcome=turn_outcome.model_dump(mode="json") if turn_outcome is not None else None,
+                narrative_payload=narrative_payload,
             )
             session.add(new_message)
             await session.commit()

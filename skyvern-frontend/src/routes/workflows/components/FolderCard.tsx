@@ -73,7 +73,7 @@ function FolderCard({ folder, isSelected, onClick }: FolderCardProps) {
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400">
               {folder.workflow_count}{" "}
-              {folder.workflow_count === 1 ? "workflow" : "workflows"}
+              {folder.workflow_count === 1 ? "agent" : "agents"}
             </p>
           </div>
         </div>

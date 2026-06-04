@@ -109,6 +109,32 @@ def test_load_prompt_with_elements_respects_ceiling_for_small_prompts() -> None:
     assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
 
 
+def test_load_prompt_with_elements_tracked_drops_extracted_text_as_last_resort() -> None:
+    from skyvern.forge.prompts import prompt_engine as engine_module
+    from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, load_prompt_with_elements_tracked
+    from skyvern.utils.token_counter import count_tokens
+
+    oversized_extracted_text = "UNIQUE_EXTRACTED_TEXT " * 300_000
+
+    rendered, post_kwargs = load_prompt_with_elements_tracked(
+        element_tree_builder=_make_element_tree_builder(),
+        prompt_engine=engine_module,
+        template_name="extract-information",
+        data_extraction_goal="Extract documents",
+        extracted_information_schema=None,
+        current_url="https://example.test",
+        extracted_text=oversized_extracted_text,
+        error_code_mapping_str=None,
+        navigation_payload=None,
+        local_datetime="2026-04-14T12:00:00",
+        previous_extracted_information=None,
+    )
+
+    assert count_tokens(rendered) <= PROMPT_HARD_CEILING_TOKENS
+    assert "UNIQUE_EXTRACTED_TEXT" not in rendered
+    assert post_kwargs["extracted_text"] is None
+
+
 def test_enforce_prompt_ceiling_tracked_reports_dropped_keys() -> None:
     from skyvern.forge.prompts import prompt_engine as engine_module
     from skyvern.utils.prompt_engine import PROMPT_HARD_CEILING_TOKENS, enforce_prompt_ceiling_tracked

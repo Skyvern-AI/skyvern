@@ -23,7 +23,7 @@ You have three ways to connect a client to Skyvern:
 
 | | OAuth (sign in with browser) | API key | Local mode |
 |---|---|---|---|
-| **Best for** | Claude Code, Codex CLI, Cursor, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern |
+| **Best for** | Claude Code, Codex CLI, Cursor, ChatGPT, and other clients that support MCP OAuth | Claude Desktop, Windsurf, Hermes, OpenClaw, headless/CI flows, or any client where you prefer a static key | Self-hosting Skyvern |
 | **Install required** | None | None | Python 3.11+ and `pip install "skyvern[server]"` |
 | **Credential** | Browser sign-in with your Skyvern account | API key from [app.skyvern.com](https://app.skyvern.com) | API key from your self-hosted instance |
 | **Where it runs** | Directly against Skyvern Cloud over HTTPS | Directly against Skyvern Cloud over HTTPS | Local Python process talking to your Skyvern server |
@@ -32,7 +32,7 @@ If your client appears in the OAuth section below, start there. Otherwise use th
 
 ## Option A: Sign in with browser (OAuth)
 
-Supported clients today: **Claude Code**, **Codex CLI**, **Cursor**, and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
+Supported clients today: **Claude Code**, **Codex CLI**, **Cursor**, **ChatGPT** (custom connector), and other MCP clients that support remote HTTP servers with OAuth. Skyvern Cloud publishes standard MCP OAuth discovery metadata, so supported clients can start browser sign-in without a static `CLIENT_ID` or `CLIENT_SECRET` in your config.
 
 There is **no install step**. You do not need `pip install skyvern`, Node.js, or an API key.
 
@@ -67,6 +67,14 @@ If you previously configured Skyvern with an `x-api-key` header, run `codex mcp 
 </Tab>
 <Tab title="Cursor">
 
+**One-click install** (Cursor 0.43+):
+
+[Install Skyvern in Cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=Skyvern&config=eyJ0eXBlIjoic3RyZWFtYWJsZS1odHRwIiwidXJsIjoiaHR0cHM6Ly9hcGkuc2t5dmVybi5jb20vbWNwLyJ9)
+
+Click the link above (or copy-paste it into your browser's address bar). Cursor opens and prompts you to authenticate via browser sign-in. No manual JSON editing needed.
+
+**Manual fallback** (any Cursor release):
+
 Add to `~/.cursor/mcp.json`:
 
 ```json
@@ -81,6 +89,21 @@ Add to `~/.cursor/mcp.json`:
 ```
 
 Use a current Cursor release. Restart Cursor, open MCP settings, and authenticate the Skyvern server when prompted. If the prompt does not appear, update Cursor and reopen MCP settings. Cursor opens your browser for Skyvern sign-in and stores the token for future sessions.
+
+</Tab>
+<Tab title="ChatGPT">
+
+**ChatGPT custom connector (Developer Mode)**
+
+This is not the ChatGPT App Directory. You can add Skyvern as a custom MCP connector immediately without marketplace approval, provided your ChatGPT plan has the custom connector feature available (Plus, Team, and Enterprise plans).
+
+1. In ChatGPT, open **Settings → Connectors** (the path may vary by plan; look under **Integrations** or **Beta features** if Connectors is not visible).
+2. Click **Add connector** and choose the **MCP** type.
+3. Enter the Skyvern MCP URL: `https://api.skyvern.com/mcp/`
+4. ChatGPT detects OAuth support automatically. Follow the browser sign-in prompt to authenticate with your Skyvern account.
+5. Once connected, Skyvern tools appear in the tool panel. You can ask ChatGPT to navigate pages, fill forms, extract data, or run multi-step workflows.
+
+No API key is required — OAuth handles authentication. If your account does not yet show the Connectors option, check **Settings → Beta features** to enable it.
 
 </Tab>
 </Tabs>

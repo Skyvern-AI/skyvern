@@ -41,7 +41,7 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
   return (
     <div className="cursor-auto space-y-3">
       <header className="flex justify-between">
-        <h1>Add Parameter</h1>
+        <h1>Add Input</h1>
       </header>
       <SwitchBar
         className="w-full"
@@ -49,7 +49,7 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
         value={content}
         options={[
           {
-            label: "Parameters",
+            label: "Inputs",
             value: "parameters",
           },
           {
@@ -81,7 +81,7 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
                 );
               })}
               {allParameterKeys.length === 0 && (
-                <div className="text-xs">No parameters</div>
+                <div className="text-xs">No inputs</div>
               )}
             </div>
           )}
@@ -102,7 +102,7 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
                 );
               })}
               {outputParameterKeys.length === 0 && (
-                <div className="text-xs">No output parameters</div>
+                <div className="text-xs">No outputs</div>
               )}
             </div>
           )}
@@ -126,7 +126,7 @@ function WorkflowBlockParameterSelect({ nodeId, onAdd }: Props) {
                 </div>
               ))}
               {reservedParameters.length === 0 && (
-                <div className="text-xs">No reserved parameters</div>
+                <div className="text-xs">No system values</div>
               )}
             </div>
           )}

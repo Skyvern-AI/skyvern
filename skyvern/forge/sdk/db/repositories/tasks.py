@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, Sequence
 
 import structlog
@@ -10,6 +11,7 @@ from sqlalchemy import and_, delete, distinct, func, select, tuple_, update
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.db.models import (
@@ -64,6 +66,7 @@ class TasksRepository(BaseRepository):
         model: dict[str, Any] | None = None,
         max_screenshot_scrolling_times: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_session_id: str | None = None,
         browser_address: str | None = None,
         download_timeout: float | None = None,
@@ -110,6 +113,7 @@ class TasksRepository(BaseRepository):
                 model=model,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_session_id=browser_session_id,
                 browser_address=browser_address,
                 download_timeout=download_timeout,
@@ -484,7 +488,7 @@ class TasksRepository(BaseRepository):
                     step.status = status
 
                     if status.is_terminal() and step.finished_at is None:
-                        step.finished_at = datetime.now(timezone.utc)
+                        step.finished_at = naive_utc_now()
                 if output is not None:
                     step.output = output.model_dump(exclude_none=True)
                 if is_last is not None:
@@ -563,11 +567,11 @@ class TasksRepository(BaseRepository):
                 if status is not None:
                     task.status = status
                     if status == TaskStatus.queued and task.queued_at is None:
-                        task.queued_at = datetime.now(timezone.utc)
+                        task.queued_at = naive_utc_now()
                     if status == TaskStatus.running and task.started_at is None:
-                        task.started_at = datetime.now(timezone.utc)
+                        task.started_at = naive_utc_now()
                     if status.is_final() and task.finished_at is None:
-                        task.finished_at = datetime.now(timezone.utc)
+                        task.finished_at = naive_utc_now()
                 if extracted_information is not None:
                     task.extracted_information = extracted_information
                 if failure_reason is not None:
@@ -665,6 +669,40 @@ class TasksRepository(BaseRepository):
                 update_stmt = update(TaskModel).where(TaskModel.task_id.in_(task_ids)).values(**update_values)
                 await session.execute(update_stmt)
                 await session.commit()
+
+    @db_operation("bulk_update_tasks_by_workflow_run_ids")
+    async def bulk_update_tasks_by_workflow_run_ids(
+        self,
+        workflow_run_ids: list[str],
+        new_status: TaskStatus,
+        only_if_status_in: list[TaskStatus],
+        failure_reason: str | None = None,
+    ) -> int:
+        """Cascade-update child tasks of the given workflow_runs.
+
+        The standalone-task cleanup cron skips rows with workflow_run_id set;
+        this method sweeps their children when a parent is finalized. Stamps
+        ``finished_at`` via COALESCE on terminal transitions. Returns row count.
+        """
+        if not workflow_run_ids or not only_if_status_in:
+            return 0
+
+        async with self.Session() as session:
+            update_values: dict[str, Any] = {"status": new_status.value}
+            if new_status.is_final():
+                update_values["finished_at"] = func.coalesce(TaskModel.finished_at, naive_utc_now())
+            if failure_reason is not None:
+                update_values["failure_reason"] = failure_reason
+
+            update_stmt = (
+                update(TaskModel)
+                .where(TaskModel.workflow_run_id.in_(workflow_run_ids))
+                .where(TaskModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(update_stmt)
+            await session.commit()
+            return result.rowcount or 0
 
     @db_operation("get_tasks")
     async def get_tasks(
@@ -764,7 +802,7 @@ class TasksRepository(BaseRepository):
         """
         async with self.Session() as session:
             running_statuses = [TaskStatus.created, TaskStatus.queued, TaskStatus.running]
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_threshold_hours)
+            stale_cutoff = naive_utc_now() - timedelta(hours=stale_threshold_hours)
 
             # Count active tasks (recently updated)
             active_query = (
@@ -876,9 +914,9 @@ class TasksRepository(BaseRepository):
             async with self.Session() as session:
                 vals: dict[str, Any] = {"status": status}
                 if started_at is not None:
-                    vals["started_at"] = started_at
+                    vals["started_at"] = to_naive_utc(started_at)
                 if finished_at is not None:
-                    vals["finished_at"] = finished_at
+                    vals["finished_at"] = to_naive_utc(finished_at)
                 stmt = (
                     update(TaskRunModel)
                     .where(TaskRunModel.run_id == run_id)
@@ -962,9 +1000,9 @@ class TasksRepository(BaseRepository):
             if status is not None:
                 task_run.status = status
             if started_at is not None:
-                task_run.started_at = started_at
+                task_run.started_at = to_naive_utc(started_at)
             if finished_at is not None:
-                task_run.finished_at = finished_at
+                task_run.finished_at = to_naive_utc(finished_at)
 
             # Recompute searchable_text when title or url changes
             if title is not None or url is not None:
@@ -981,7 +1019,10 @@ class TasksRepository(BaseRepository):
         vcpu_millicores: int | None = None,
         memory_mb: int | None = None,
         duration_ms: int | None = None,
-        compute_cost: float | None = None,
+        compute_cost: Decimal | None = None,
+        llm_cost: Decimal | None = None,
+        proxy_cost: Decimal | None = None,
+        captcha_cost: Decimal | None = None,
     ) -> None:
         """Update compute cost metrics for a job run."""
         async with self.Session() as session:
@@ -1008,6 +1049,12 @@ class TasksRepository(BaseRepository):
                 task_run.duration_ms = duration_ms
             if compute_cost is not None:
                 task_run.compute_cost = compute_cost
+            if llm_cost is not None:
+                task_run.llm_cost = llm_cost
+            if proxy_cost is not None:
+                task_run.proxy_cost = proxy_cost
+            if captcha_cost is not None:
+                task_run.captcha_cost = captcha_cost
             await session.commit()
 
     @db_operation("cache_task_run")

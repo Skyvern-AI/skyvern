@@ -5,28 +5,31 @@
 @layer base {
   :root {
     --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --foreground: 0 0% 7%;
 
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 0 0% 7%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
+    --popover-foreground: 0 0% 7%;
 
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
+    --primary: 0 0% 7%;
+    --primary-foreground: 0 0% 98%;
+    --cta: 0 0% 7%;
+    --cta-hover: 0 0% 14%;
+    --cta-foreground: 0 0% 98%;
 
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 7%;
 
-    --tertiary: 227.6 11.6% 48.8%;
-    --tertiary-foreground: 213 27% 84%;
+    --tertiary: 0 0% 46%;
+    --tertiary-foreground: 0 0% 12%;
 
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 42%;
 
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
+    --accent: 0 0% 94%;
+    --accent-foreground: 0 0% 7%;
 
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 210 40% 98%;
@@ -38,26 +41,17 @@
     --success: 142.1 76.2% 36.3%; /* green-600 */
     --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 5%;
+    --border: 0 0% 88%;
+    --input: 0 0% 88%;
+    --ring: 0 0% 9%;
 
     --radius: 0.5rem;
 
-    --tertiary: 227.6 11.6% 48.8%;
-    --tertiary-foreground: 213 27% 84%;
-
-    --warning: 32.1 94.6% 43.7%; /* amber-600 */
-    --warning-foreground: 36 100% 97.1%; /* amber-50 */
-
-    --success: 142.1 76.2% 36.3%; /* green-600 */
-    --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
-
-    --slate-elevation-1: 222 47% 96%;
-    --slate-elevation-2: 222 40% 93%;
-    --slate-elevation-3: 222 35% 90%;
-    --slate-elevation-4: 222 30% 87%;
-    --slate-elevation-5: 222 25% 84%;
+    --slate-elevation-1: 0 0% 98%;
+    --slate-elevation-2: 0 0% 96%;
+    --slate-elevation-3: 0 0% 93%;
+    --slate-elevation-4: 0 0% 90%;
+    --slate-elevation-5: 0 0% 86%;
   }
 
   .dark {
@@ -72,9 +66,15 @@
 
     --primary: 210 40% 98%;
     --primary-foreground: 222.2 47.4% 11.2%;
+    --cta: 210 40% 98%;
+    --cta-hover: 210 40% 92%;
+    --cta-foreground: 222.2 47.4% 11.2%;
 
     --secondary: 217.2 32.6% 17.5%;
     --secondary-foreground: 210 40% 98%;
+
+    --tertiary: 227.6 11.6% 48.8%;
+    --tertiary-foreground: 213 27% 84%;
 
     --muted: 217.2 32.6% 17.5%;
     --muted-foreground: 215 20.2% 65.1%;

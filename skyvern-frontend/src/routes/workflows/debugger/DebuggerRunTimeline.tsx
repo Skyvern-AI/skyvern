@@ -59,12 +59,22 @@ function DebuggerRunTimeline({
         "animate-pulse": firstActionOrThoughtIsPending,
       })}
     >
-      <div className="grid w-full grid-cols-2 gap-2">
+      <div className="grid w-full grid-cols-3 gap-2">
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Actions: {numberOfActions}
         </div>
         <div className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs">
           Steps: {workflowRun.total_steps ?? 0}
+        </div>
+        <div
+          className="flex items-center justify-center rounded bg-slate-elevation3 px-4 py-3 text-xs"
+          title="Credits consumed by this run (live + cached)"
+        >
+          Credits:{" "}
+          {(
+            (workflowRun.credits_used ?? 0) +
+            (workflowRun.cached_credits_used ?? 0)
+          ).toLocaleString()}
         </div>
       </div>
       <ScrollArea>
@@ -93,7 +103,8 @@ function DebuggerRunTimeline({
                       block={timelineItem.block}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
-                      onThoughtCardClick={onObserverThoughtCardSelected}
+                      onThoughtClick={onObserverThoughtCardSelected}
+                      renderThoughts
                     />
                   </div>
                 );

@@ -1,5 +1,5 @@
 import { AxiosError } from "axios";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getClient } from "@/api/AxiosClient";
 import { ProxyLocation, Status } from "@/api/types";
 import { FailureCategoryBadge } from "@/components/FailureCategoryBadge";
@@ -37,10 +37,14 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useSearchParams } from "react-router-dom";
 import { statusIsCancellable, statusIsFinalized } from "../tasks/types";
 import { useWorkflowRunWithWorkflowQuery } from "./hooks/useWorkflowRunWithWorkflowQuery";
+import { WorkflowRunBlockDetail } from "./workflowRun/WorkflowRunBlockDetail";
 import { WorkflowRunTimeline } from "./workflowRun/WorkflowRunTimeline";
 import { useWorkflowRunTimelineQuery } from "./hooks/useWorkflowRunTimelineQuery";
-import { findActiveItem } from "./workflowRun/workflowTimelineUtils";
-import { filenameForDownloadedFileUrl } from "./workflowRun/blockDownloadedFiles";
+import {
+  findActiveItem,
+  parseActiveIterationParam,
+} from "./workflowRun/workflowTimelineUtils";
+import { pickDownloadedFileFilename } from "./workflowRun/blockDownloadedFiles";
 import { isBlockItem } from "./types/workflowRunTypes";
 import { Label } from "@/components/ui/label";
 import { CodeEditor } from "./components/CodeEditor";
@@ -58,11 +62,74 @@ import { WorkflowRunVerificationCodeForm } from "@/routes/workflows/workflowRun/
 import { ScriptUpdateCard } from "@/routes/workflows/workflowRun/ScriptUpdateCard";
 import { useFallbackEpisodesQuery } from "@/routes/workflows/hooks/useFallbackEpisodesQuery";
 
+function WorkflowRunRightColumn({
+  activeItem,
+  activeIteration,
+  timeline,
+  timelineReady,
+  onSetActiveItem,
+  onSetActiveIteration,
+}: {
+  activeItem: ReturnType<typeof findActiveItem>;
+  activeIteration: number | null;
+  timeline: NonNullable<ReturnType<typeof useWorkflowRunTimelineQuery>["data"]>;
+  timelineReady: boolean;
+  onSetActiveItem: (id: string) => void;
+  onSetActiveIteration: (loopBlockId: string, iterationIndex: number) => void;
+}) {
+  return (
+    <div className="grid min-h-0 w-[clamp(28rem,34vw,36rem)] shrink-0 grid-rows-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
+      <div className="min-h-0 w-full overflow-hidden">
+        <WorkflowRunTimeline
+          activeItem={activeItem}
+          activeIteration={activeIteration}
+          onActionItemSelected={(item) => {
+            onSetActiveItem(item.action.action_id);
+          }}
+          onBlockItemSelected={(item) => {
+            onSetActiveItem(item.workflow_run_block_id);
+          }}
+          onThoughtItemSelected={(item) => {
+            onSetActiveItem(item.thought_id);
+          }}
+          onLiveStreamSelected={() => {
+            onSetActiveItem("stream");
+          }}
+          onIterationSelected={(loopBlock, iterationIndex) => {
+            onSetActiveIteration(
+              loopBlock.workflow_run_block_id,
+              iterationIndex,
+            );
+          }}
+        />
+      </div>
+      <div className="flex min-h-0 w-full flex-col overflow-hidden rounded-md border border-slate-700 bg-slate-elevation1">
+        <WorkflowRunBlockDetail
+          activeItem={activeItem}
+          activeIteration={activeIteration}
+          timeline={timeline}
+          timelineReady={timelineReady}
+          onActionSelect={(item) => {
+            onSetActiveItem(item.action.action_id);
+          }}
+          onThoughtSelect={(thought) => {
+            onSetActiveItem(thought.thought_id);
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function WorkflowRun() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const searchParamsRef = useRef(searchParams);
+  searchParamsRef.current = searchParams;
   const embed = searchParams.get("embed");
   const isEmbedded = embed === "true";
   const active = searchParams.get("active");
+  const iterationParam = searchParams.get("iteration");
+  const activeIteration = parseActiveIterationParam(iterationParam);
   const workflowRunId = useFirstParam("workflowRunId", "runId");
   const workflowPermanentIdParam = useFirstParam("workflowPermanentId");
   const credentialGetter = useCredentialGetter();
@@ -141,8 +208,8 @@ function WorkflowRun() {
       });
       toast({
         variant: "success",
-        title: "Workflow Canceled",
-        description: "The workflow has been successfully canceled.",
+        title: "Agent Canceled",
+        description: "The agent has been successfully canceled.",
       });
     },
     onError: (error) => {
@@ -259,10 +326,35 @@ function WorkflowRun() {
     </div>
   ) : null;
 
+  const updateSearchParams = useCallback(
+    (mutate: (params: URLSearchParams) => void) => {
+      setSearchParams(
+        () => {
+          const next = new URLSearchParams(searchParamsRef.current);
+          mutate(next);
+          searchParamsRef.current = next;
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
   function handleSetActiveItem(id: string) {
-    searchParams.set("active", id);
-    setSearchParams(searchParams, {
-      replace: true,
+    updateSearchParams((next) => {
+      next.set("active", id);
+      next.delete("iteration");
+    });
+  }
+
+  function handleSetActiveIteration(
+    loopBlockId: string,
+    iterationIndex: number,
+  ) {
+    updateSearchParams((next) => {
+      next.set("active", loopBlockId);
+      next.set("iteration", String(iterationIndex));
     });
   }
 
@@ -303,6 +395,16 @@ function WorkflowRun() {
   const fileUrls = hasFileUrls
     ? (workflowRun.downloaded_file_urls as string[])
     : [];
+  // Prefer the rich downloaded_files array (carries filename, checksum, size)
+  // when the backend sends it; falls back to URL parsing otherwise.
+  const filenameByUrl = new Map<string, string>();
+  if (workflowRun?.downloaded_files) {
+    for (const file of workflowRun.downloaded_files) {
+      if (file.filename) {
+        filenameByUrl.set(file.url, file.filename);
+      }
+    }
+  }
 
   const showBoth =
     (hasSomeExtractedInformation || hasTaskv2Output) && hasFileUrls;
@@ -327,7 +429,7 @@ function WorkflowRun() {
       to: "output",
     },
     {
-      label: "Parameters",
+      label: "Inputs",
       to: "parameters",
     },
     {
@@ -365,12 +467,14 @@ function WorkflowRun() {
                 />
               ) : null}
             </div>
-            <h2 className="text-2xl text-slate-400">{workflowRunId}</h2>
+            <h2 className="text-2xl text-neutral-600 dark:text-slate-400">
+              {workflowRunId}
+            </h2>
             {workflowRun &&
               (workflowRun.started_at ||
                 workflowRun.finished_at ||
                 isWorkflowDeleted) && (
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-slate-400">
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm text-neutral-600 dark:text-slate-400">
                   {workflowRun.started_at && (
                     <span title={basicTimeFormat(workflowRun.started_at)}>
                       Started: {basicLocalTimeFormat(workflowRun.started_at)}
@@ -383,7 +487,7 @@ function WorkflowRun() {
                   )}
                   {isWorkflowDeleted && (
                     <span title={basicTimeFormat(workflow!.deleted_at!)}>
-                      Workflow deleted on{" "}
+                      Agent deleted on{" "}
                       {basicLocalTimeFormat(workflow!.deleted_at!)}
                     </span>
                   )}
@@ -391,7 +495,7 @@ function WorkflowRun() {
               )}
             {workflowRun?.browser_session_id && (
               <Link
-                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200"
                 to={`/browser-session/${workflowRun.browser_session_id}/stream`}
               >
                 Browser Session: {workflowRun.browser_session_id}
@@ -399,7 +503,7 @@ function WorkflowRun() {
             )}
             {workflowRun?.browser_profile_id && (
               <Link
-                className="font-mono text-sm text-slate-400 hover:text-slate-200 hover:underline hover:underline-offset-2"
+                className="font-mono text-sm text-neutral-600 hover:text-neutral-950 hover:underline hover:underline-offset-2 dark:text-slate-400 dark:hover:text-slate-200"
                 to={`/browser-profiles/${workflowRun.browser_profile_id}`}
               >
                 Browser Profile: {workflowRun.browser_profile_id}
@@ -452,7 +556,10 @@ function WorkflowRun() {
                   hideTrigger
                 />
                 <Button asChild variant="secondary">
-                  <Link to={`/workflows/${workflowPermanentId}/build`}>
+                  <Link
+                    to={`/workflows/${workflowPermanentId}/build`}
+                    data-testid="workflow-open-editor-link"
+                  >
                     <Pencil2Icon className="mr-2 h-4 w-4" />
                     Edit
                   </Link>
@@ -468,7 +575,7 @@ function WorkflowRun() {
                   <DialogHeader>
                     <DialogTitle>Are you sure?</DialogTitle>
                     <DialogDescription>
-                      Are you sure you want to cancel this workflow run?
+                      Are you sure you want to cancel this agent run?
                     </DialogDescription>
                   </DialogHeader>
                   <DialogFooter>
@@ -485,7 +592,7 @@ function WorkflowRun() {
                       {cancelWorkflowMutation.isPending && (
                         <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
                       )}
-                      Cancel Workflow Run
+                      Cancel Agent Run
                     </Button>
                   </DialogFooter>
                 </DialogContent>
@@ -544,7 +651,10 @@ function WorkflowRun() {
                 <ScrollAreaViewport className="max-h-[250px] space-y-2">
                   {fileUrls.length > 0 ? (
                     fileUrls.map((url) => {
-                      const filename = filenameForDownloadedFileUrl(url);
+                      const filename = pickDownloadedFileFilename(
+                        url,
+                        filenameByUrl,
+                      );
                       return (
                         <div key={url} title={url} className="flex gap-2">
                           <FileIcon className="size-6" />
@@ -586,27 +696,19 @@ function WorkflowRun() {
           )}
         </div>
       )}
-      <div className="flex h-[42rem] gap-6">
+      {/* 18rem accounts for nav, run metadata, tabs, and page gutters above this work area. */}
+      <div className="flex h-[calc(100vh-18rem)] max-h-[52rem] min-h-[34rem] gap-6">
         <div className="min-w-0 flex-[2]">
           <Outlet />
         </div>
-        <div className="min-w-0 flex-1 overflow-hidden">
-          <WorkflowRunTimeline
-            activeItem={selection}
-            onActionItemSelected={(item) => {
-              handleSetActiveItem(item.action.action_id);
-            }}
-            onBlockItemSelected={(item) => {
-              handleSetActiveItem(item.workflow_run_block_id);
-            }}
-            onLiveStreamSelected={() => {
-              handleSetActiveItem("stream");
-            }}
-            onObserverThoughtCardSelected={(item) => {
-              handleSetActiveItem(item.thought_id);
-            }}
-          />
-        </div>
+        <WorkflowRunRightColumn
+          activeItem={selection}
+          activeIteration={activeIteration}
+          timeline={workflowRunTimeline ?? []}
+          timelineReady={workflowRunTimeline !== undefined}
+          onSetActiveItem={handleSetActiveItem}
+          onSetActiveIteration={handleSetActiveIteration}
+        />
       </div>
     </div>
   );

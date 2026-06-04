@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -25,6 +26,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
+    _frontier_run_size_error,
     _plan_frontier,
     _referenced_output_labels,
 )
@@ -44,6 +46,8 @@ class _FakeBlock:
 
         self.block_type = _BT(block_type)
         self._config = config or {}
+        for key, value in self._config.items():
+            setattr(self, key, value)
 
     def model_dump(self, mode: str = "json", exclude_none: bool = True) -> dict[str, Any]:
         return {
@@ -68,16 +72,45 @@ class _FakeWorkflow:
     def __init__(self, definition: _FakeDefinition) -> None:
         self.workflow_definition = definition
 
+    def model_copy(self, *, deep: bool = False) -> _FakeWorkflow:
+        return copy.deepcopy(self) if deep else _FakeWorkflow(self.workflow_definition)
+
 
 class _FakeStream:
     async def is_disconnected(self) -> bool:
         return False
 
-    async def send(self, event: Any) -> None:
+    async def send(self, event: object) -> None:
         return None
 
 
-def _make_ctx(**kwargs: Any) -> CopilotContext:
+class _FakePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _FakeBrowserState:
+    def __init__(self, page: _FakePage | None) -> None:
+        self._page = page
+
+    async def get_working_page(self) -> _FakePage | None:
+        return self._page
+
+
+class _FakePersistentSessionsManager:
+    def __init__(self, browser_state: _FakeBrowserState | None) -> None:
+        self._browser_state = browser_state
+
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        return self._browser_state
+
+
+class _FakeFailingPersistentSessionsManager:
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
+        raise RuntimeError("browser state unavailable")
+
+
+def _make_ctx(**kwargs: object) -> CopilotContext:
     defaults: dict[str, Any] = dict(
         organization_id="org",
         workflow_id="wf_id",
@@ -134,6 +167,461 @@ def test_plan_frontier_append_after_success_runs_only_appended() -> None:
     labels, _seed, frontier = _plan_frontier(ctx, ["a", "b", "c"], old, new)
     assert labels == ["c"]
     assert frontier == "c"
+
+
+def test_plan_frontier_append_walks_back_when_workflow_prefix_is_not_verified() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"prompt": "Fill search fields"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"prompt": "Fill updated search fields"}),
+            _FakeBlock("submit_search", "navigation", {"prompt": "Click Search"}),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_block_outputs = {"open": "opened"}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["submit_search"], old, new)
+
+    assert labels == ["open", "set_search", "submit_search"]
+    assert seed == {}
+    assert frontier == "open"
+
+
+def test_plan_frontier_unchanged_workflow_continues_from_first_unverified_label() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open", "set_search", "submit_search", "extract"],
+        definition,
+        definition,
+    )
+
+    assert labels == ["submit_search", "extract"]
+    assert seed == {}
+    assert frontier == "submit_search"
+
+
+def test_plan_frontier_verified_only_request_advances_to_next_unverified_workflow_label() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open", "set_search"],
+        definition,
+        definition,
+    )
+
+    assert labels == ["submit_search"]
+    assert seed == {}
+    assert frontier == "submit_search"
+
+
+def test_plan_frontier_suffix_only_request_seeds_prior_browser_state_outputs() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("search", "navigation"),
+            _FakeBlock("expand", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "search"]
+    ctx.verified_block_outputs = {
+        "open": {"current_url": "https://example.com/search"},
+        "search": {"current_url": "https://example.com/search/results"},
+    }
+
+    labels, seed, frontier = _plan_frontier(ctx, ["expand"], definition, definition)
+
+    assert labels == ["expand"]
+    assert seed == {
+        "open": {"current_url": "https://example.com/search"},
+        "search": {"current_url": "https://example.com/search/results"},
+    }
+    assert frontier == "expand"
+
+
+def test_runtime_frontier_anchor_keeps_url_empty_to_preserve_live_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_blank_browser_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search", "extract"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_fills_when_browser_state_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeFailingPersistentSessionsManager(),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is not workflow
+    assert seeded.workflow_definition.blocks[1].url == "https://example.com/search"
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_frontier_starter_url_seed_preserves_attached_live_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("https://example.com/search/results"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_url", ["start_url", "{{ start_url }}", "example.com"])
+async def test_runtime_frontier_starter_url_seed_preserves_runtime_resolved_url(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_url: str,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": explicit_url}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx(browser_session_id="pbs_123")
+
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakePersistentSessionsManager(_FakeBrowserState(_FakePage("about:blank"))),
+    )
+
+    seeded = await tools._workflow_with_runtime_frontier_starter_url_seed(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        runtime_frontier_anchor_url="https://example.com/search",
+    )
+
+    assert seeded is workflow
+    assert workflow.workflow_definition.blocks[1].url == explicit_url
+
+
+def test_runtime_frontier_anchor_requires_verified_prefix() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": None}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url is None
+
+
+def test_runtime_frontier_anchor_does_not_override_explicit_block_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("search", "navigation", {"url": "https://example.com/explicit"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["search"],
+        frontier_start_label="search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/explicit"
+
+
+def test_runtime_frontier_anchor_clears_same_page_url_to_preserve_state() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("set_search", "navigation", {"url": None}),
+            _FakeBlock("submit_search", "navigation", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open", "set_search"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["submit_search"],
+        frontier_start_label="submit_search",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url == "https://example.com/search"
+    assert anchored is not workflow
+    assert anchored.workflow_definition.blocks[2].url is None
+    assert workflow.workflow_definition.blocks[2].url == "https://example.com/search"
+
+
+def test_runtime_frontier_anchor_does_not_clear_same_page_goto_url() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url", {"url": "https://example.com/search"}),
+            _FakeBlock("refresh", "goto_url", {"url": "https://example.com/search"}),
+        ]
+    )
+    workflow = _FakeWorkflow(definition)
+    ctx = _make_ctx()
+    ctx.verified_prefix_labels = ["open"]
+    ctx.verified_prefix_current_url = "https://example.com/search"
+
+    anchored, anchor_url = tools._workflow_with_runtime_frontier_anchor(
+        workflow,  # type: ignore[arg-type]
+        ctx,
+        labels_to_execute=["refresh"],
+        frontier_start_label="refresh",
+        block_outputs_to_seed={},
+    )
+
+    assert anchor_url is None
+    assert anchored is workflow
+    assert workflow.workflow_definition.blocks[1].url == "https://example.com/search"
+
+
+def test_frontier_run_size_error_limits_long_page_changing_frontier() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+            _FakeBlock("expand_results", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    error = _frontier_run_size_error(
+        ctx,
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        definition,
+    )
+
+    assert error is not None
+    assert "Keep the same complete workflow YAML" in error
+    assert "['open', 'set_search']" in error
+    assert "Do not remove later blocks" in error
+
+
+def test_frontier_run_size_result_steers_to_smaller_saved_frontier() -> None:
+    result = tools._frontier_run_size_result(
+        "frontier too long",
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+    )
+
+    data = result["data"]
+    assert result["ok"] is False
+    assert data["workflow_run_skipped"] is True
+    assert data["suggested_block_labels"] == ["open", "set_search"]
+    assert data["deferred_block_labels"] == ["submit_search", "expand_results", "extract"]
+    assert data["control_signal"] == {
+        "kind": "intermediate_success",
+        "user_facing_summary": data["user_facing_summary"],
+        "next_tool": "run_blocks_and_collect_debug",
+        "next_block_labels": ["open", "set_search"],
+        "preserve_workflow_yaml": True,
+    }
+
+
+def test_frontier_run_size_error_allows_tool_expanded_runtime_anchor() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("set_search", "navigation"),
+            _FakeBlock("submit_search", "navigation"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["submit_search"],
+            ["open", "set_search", "submit_search"],
+            definition,
+        )
+        is None
+    )
+
+
+def test_frontier_run_size_error_allows_small_or_single_action_frontiers() -> None:
+    single_action_definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("search", "navigation"),
+            _FakeBlock("extract", "extraction"),
+        ]
+    )
+    long_read_definition = _FakeDefinition(
+        [
+            _FakeBlock("open", "goto_url"),
+            _FakeBlock("extract_a", "extraction"),
+            _FakeBlock("extract_b", "extraction"),
+            _FakeBlock("extract_c", "extraction"),
+        ]
+    )
+    ctx = _make_ctx()
+
+    assert _frontier_run_size_error(ctx, ["open", "search"], ["open", "search"], single_action_definition) is None
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["open", "search", "extract"],
+            ["open", "search", "extract"],
+            single_action_definition,
+        )
+        is None
+    )
+    assert (
+        _frontier_run_size_error(
+            ctx,
+            ["open", "extract_a", "extract_b", "extract_c"],
+            ["open", "extract_a", "extract_b", "extract_c"],
+            long_read_definition,
+        )
+        is None
+    )
 
 
 def test_plan_frontier_edit_walks_back_to_upstream_navigation_anchor() -> None:
@@ -196,7 +684,7 @@ def test_plan_frontier_cold_start_no_old_definition_uses_first_requested() -> No
 def test_plan_frontier_ambiguous_diff_falls_back_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     from skyvern.forge.sdk.copilot import tools
 
-    def _blow_up(*args: Any, **kwargs: Any) -> set[str]:
+    def _blow_up(*args: object, **kwargs: object) -> set[str]:
         raise RuntimeError("parse failure in diff")
 
     monkeypatch.setattr(tools, "_find_invalidated_labels", _blow_up)
@@ -324,7 +812,10 @@ def test_plan_frontier_append_seeds_output_parameter_jinja_ref() -> None:
     )
 
     assert labels == ["summarize_article"]
-    assert seed == {"extract_article_info": {"extracted_information": {"abstract": "Prior output"}}}
+    assert seed == {
+        "open_page": "nav_ok",
+        "extract_article_info": {"extracted_information": {"abstract": "Prior output"}},
+    }
     assert frontier == "summarize_article"
 
 
@@ -671,7 +1162,7 @@ def test_plan_frontier_append_only_with_workflow_param_does_not_fall_back() -> N
     labels, seed, frontier = _plan_frontier(ctx, ["open_page", "search"], old, new)
 
     assert labels == ["search"]
-    assert seed == {}
+    assert seed == {"open_page": "nav_ok"}
     assert frontier == "search"
 
 

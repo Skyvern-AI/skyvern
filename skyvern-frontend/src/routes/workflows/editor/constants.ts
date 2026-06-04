@@ -1,6 +1,13 @@
 // nodes have 1000 Z index and we want edges above
 export const REACT_FLOW_EDGE_Z_INDEX = 1001;
 
+// Mirrors xyflow's internal SELECTED_NODE_Z constant (see @xyflow/system
+// adoptUserNodes). Edges inside parent nodes (e.g. for-loop) get
+// `edge.zIndex + sourceNode.internals.z` applied, where internals.z bubbles
+// up from the parent and tops out near this value. Edge labels need to clear
+// it to stay above the elevated edge SVG.
+export const REACT_FLOW_SELECTED_NODE_Z = 1000;
+
 export const SKYVERN_DOWNLOAD_DIRECTORY = "SKYVERN_DOWNLOAD_DIRECTORY";
 
 export const SMTP_HOST_PARAMETER_KEY = "smtp_host";
@@ -28,12 +35,12 @@ export const GLOBAL_RESERVED_PARAMETERS = [
     description: "Merged summary of all block outputs",
   },
   { key: "workflow_run_id", description: "Unique ID of the current run" },
-  { key: "workflow_id", description: "The workflow's ID" },
+  { key: "workflow_id", description: "The agent's ID" },
   {
     key: "workflow_permanent_id",
-    description: "The workflow's permanent ID",
+    description: "The agent's permanent ID",
   },
-  { key: "workflow_title", description: "The workflow's title" },
+  { key: "workflow_title", description: "The agent's title" },
 ] as const;
 
 // Reserved parameters only available inside loop blocks

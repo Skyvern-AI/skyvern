@@ -322,7 +322,11 @@ async def execution_for_message_channel(
     if session is None:
         raise RuntimeError(f"execution_for_message_channel: session {browser_session_id} not found")
 
-    browser_state = await wait_for_browser_state(browser_session_id, "browser_session")
+    browser_state = await wait_for_browser_state(
+        browser_session_id,
+        "browser_session",
+        organization_id=message_channel.organization_id,
+    )
     if browser_state is None:
         raise RuntimeError(f"execution_for_message_channel: browser state timeout for {browser_session_id}")
 

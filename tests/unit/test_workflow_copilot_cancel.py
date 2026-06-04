@@ -189,12 +189,25 @@ def _setup_route_mocks(
     original_workflow: SimpleNamespace,
     agent_result: SimpleNamespace,
 ) -> tuple[AsyncMock, SimpleNamespace]:
+    if not hasattr(agent_result, "total_tokens"):
+        agent_result.total_tokens = None
+    if not hasattr(agent_result, "response_type"):
+        agent_result.response_type = "REPLY"
+    if not hasattr(agent_result, "output_policy_diagnostics"):
+        agent_result.output_policy_diagnostics = None
+    if not hasattr(agent_result, "turn_id"):
+        agent_result.turn_id = None
+    if not hasattr(agent_result, "narrative_summary"):
+        agent_result.narrative_summary = None
+    if not hasattr(agent_result, "narrative_payload"):
+        agent_result.narrative_payload = None
+
     async def fake_llm_handler(*args: object, **kwargs: object) -> None:
         del args, kwargs
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
 
@@ -302,6 +315,7 @@ async def test_route_cancel_branch_persists_user_and_cancelled_messages(
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -351,7 +365,8 @@ async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
         cancelled=True,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=True,
+        proposal_disposition="review_untested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -380,7 +395,7 @@ async def test_route_cancel_branch_persists_wip_proposal_and_response_frame(
     frame = response_frames[0]
     assert frame.message == "Cancelled. I have a draft workflow you can keep."
     assert frame.updated_workflow == {"workflow_id": "wf-canonical", "title": "Draft"}
-    assert frame.unvalidated is True
+    assert frame.proposal_disposition == "review_untested"
     assert frame.cancelled is True
 
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
@@ -406,7 +421,8 @@ async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
         cancelled=True,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
         monkeypatch, chat, original_workflow, agent_result
@@ -426,7 +442,52 @@ async def test_route_cancel_tested_wip_with_auto_accept_still_persists_proposal(
         p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
     ]
     assert len(response_frames) == 1
-    assert response_frames[0].unvalidated is False
+    assert response_frames[0].proposal_disposition == "auto_applicable"
+    assert response_frames[0].cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_route_cancel_review_tested_persists_proposal_without_unvalidated_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancel + WIP-rescue: persisted proposal must NOT carry the ``_copilot_unvalidated`` marker."""
+    chat = _make_chat(auto_accept=True)
+    original_workflow = _make_original_workflow()
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.return_value = {"workflow_id": "wf-canonical", "title": "Last Good Draft"}
+    agent_result = SimpleNamespace(
+        user_response="Cancelled. I have a tested draft for you. Accept it to save, or discard.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: Last Good Draft",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=True,
+        total_tokens=456,
+        response_type="REPLY",
+        proposal_disposition="review_tested",
+        turn_outcome=None,
+    )
+    restore_mock, workflow_params, sent_payloads = await _drive_cancel_route(
+        monkeypatch, chat, original_workflow, agent_result
+    )
+
+    restore_mock.assert_awaited_once()
+
+    workflow_params.update_workflow_copilot_chat.assert_awaited_once()
+    proposed_workflow = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposed_workflow == {
+        "workflow_id": "wf-canonical",
+        "title": "Last Good Draft",
+        "_copilot_yaml": "title: Last Good Draft",
+    }
+    assert "_copilot_unvalidated" not in proposed_workflow
+
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].proposal_disposition == "review_tested"
     assert response_frames[0].cancelled is True
 
 
@@ -450,7 +511,8 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip(
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -479,7 +541,8 @@ async def test_route_cancel_clears_stale_proposed_workflow_when_no_wip_and_no_pe
         cancelled=True,
         total_tokens=None,
         response_type="REPLY",
-        unvalidated=False,
+        proposal_disposition="auto_applicable",
+        turn_outcome=None,
     )
     restore_mock, workflow_params, _sent = await _drive_cancel_route(monkeypatch, chat, original_workflow, agent_result)
 
@@ -557,7 +620,8 @@ async def test_timeout_wip_result_streams_normal_response_frame(
         cancelled=False,
         total_tokens=123,
         response_type="REPLY",
-        unvalidated=True,
+        proposal_disposition="review_untested",
+        turn_outcome=None,
     )
     restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
 
@@ -592,13 +656,85 @@ async def test_timeout_wip_result_streams_normal_response_frame(
     ]
     assert len(response_frames) == 1
     assert response_frames[0].updated_workflow == {"workflow_id": "wf-draft", "title": "Draft"}
-    assert response_frames[0].unvalidated is True
+    assert response_frames[0].proposal_disposition == "review_untested"
     assert response_frames[0].total_tokens == 123
 
     error_frames = [p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.ERROR]
     assert error_frames == []
     contents = [c.kwargs.get("content") for c in workflow_params.create_workflow_copilot_chat_message.await_args_list]
     assert "Cancelled by user." not in contents
+
+
+@pytest.mark.asyncio
+async def test_timeout_wip_review_tested_propagates_to_response_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-cancel WIP rescue propagates ``review_tested`` so the frontend skips auto-apply."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    captured = _install_fake_create(monkeypatch)
+
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+        proposed_workflow=None,
+        auto_accept=True,
+    )
+    original_workflow = SimpleNamespace(
+        workflow_id="wf-canonical",
+        title="Original",
+        description="Original description",
+        workflow_definition=None,
+    )
+    updated_workflow = MagicMock()
+    updated_workflow.model_dump.side_effect = lambda mode="json": {"workflow_id": "wf-good", "title": "Last Good"}
+    agent_result = SimpleNamespace(
+        user_response="I ran out of time, but I have a tested draft for you. Accept it to save, or discard.",
+        updated_workflow=updated_workflow,
+        global_llm_context=None,
+        workflow_yaml="title: Last Good",
+        workflow_was_persisted=True,
+        clear_proposed_workflow=False,
+        cancelled=False,
+        total_tokens=789,
+        response_type="REPLY",
+        proposal_disposition="review_tested",
+        turn_outcome=None,
+    )
+    restore_mock, workflow_params = _setup_route_mocks(monkeypatch, chat, original_workflow, agent_result)
+
+    request = MagicMock()
+    request.headers = {"x-api-key": "sk-test"}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
+    assert response is captured["sentinel"]
+
+    sent_payloads: list[Any] = []
+    stream = MagicMock()
+
+    async def _send(payload: Any) -> bool:
+        sent_payloads.append(payload)
+        return True
+
+    stream.send = _send
+    stream.is_disconnected = AsyncMock(return_value=False)
+
+    handler = captured["handler"]
+    assert callable(handler)
+    await handler(stream)
+
+    restore_mock.assert_awaited_once()
+    proposal = workflow_params.update_workflow_copilot_chat.await_args.kwargs["proposed_workflow"]
+    assert proposal["_copilot_yaml"] == "title: Last Good"
+    assert "_copilot_unvalidated" not in proposal
+
+    response_frames = [
+        p for p in sent_payloads if getattr(p, "type", None) == WorkflowCopilotStreamMessageType.RESPONSE
+    ]
+    assert len(response_frames) == 1
+    assert response_frames[0].proposal_disposition == "review_tested"
+    assert response_frames[0].cancelled is False
 
 
 # ---------------------------------------------------------------------------
@@ -688,7 +824,7 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
     monkeypatch.setattr(

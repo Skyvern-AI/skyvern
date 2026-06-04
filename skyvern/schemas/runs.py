@@ -3,9 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from skyvern.forge.sdk.schemas.files import FileInfo
+from skyvern.forge.sdk.workflow.models.run_limits import (
+    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    reject_bool_max_elapsed_time_minutes,
+)
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
 from skyvern.schemas.docs.doc_examples import (
     BROWSER_SESSION_ID_EXAMPLES,
@@ -45,12 +49,15 @@ from skyvern.schemas.run_enums import (  # noqa: F401
     RunStatus,
     RunType,
 )
+from skyvern.utils.secret_headers import mask_header_values
 from skyvern.utils.url_validators import validate_url
 
 # Type checkers need string Literal values, while pydantic's discriminated
 # union preserves enum instances when runtime Literals use the enum members.
 if TYPE_CHECKING:
-    TaskRunTypeField: TypeAlias = Literal["task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars"]
+    TaskRunTypeField: TypeAlias = Literal[
+        "task_v1", "task_v2", "openai_cua", "anthropic_cua", "ui_tars", "yutori_navigator"
+    ]
     WorkflowRunTypeField: TypeAlias = Literal["workflow_run"]
 else:
     TaskRunTypeField = Literal[
@@ -59,6 +66,7 @@ else:
         RunType.openai_cua,
         RunType.anthropic_cua,
         RunType.ui_tars,
+        RunType.yutori_navigator,
     ]
     WorkflowRunTypeField = Literal[RunType.workflow_run]
 
@@ -128,9 +136,23 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="The extra HTTP headers for the requests in browser.",
     )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to "
+            "a remote browser via browser_address. Use this for browser-provider auth "
+            "(e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers "
+            "are NEVER forwarded to target websites."
+        ),
+    )
     publish_workflow: bool = Field(
         default=False,
-        description="Whether to publish this task as a reusable workflow. Only available for skyvern-2.0.",
+        description=(
+            "Deprecated. Whether to publish a `skyvern-2.0` task as a reusable workflow. "
+            "For backwards compatibility, this routes the request through the legacy `skyvern-2.0` "
+            "publish path. Prefer creating reusable workflows through the workflow APIs."
+        ),
+        json_schema_extra={"deprecated": True},
     )
     include_action_history_in_verification: bool | None = Field(
         default=False, description="Whether to include action history when verifying that the task is complete"
@@ -174,8 +196,12 @@ class TaskRunRequest(BaseModel):
 
         return validate_url(url)
 
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
+
     @model_validator(mode="after")
-    def _force_v2_for_publish_workflow(self) -> TaskRunRequest:
+    def _route_publish_workflow_to_v2(self) -> TaskRunRequest:
         if self.publish_workflow and self.engine != RunEngine.skyvern_v2:
             self.engine = RunEngine.skyvern_v2
         return self
@@ -218,9 +244,24 @@ class WorkflowRunRequest(BaseModel):
         default=None,
         description="The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.",
     )
+    max_elapsed_time_minutes: int | None = Field(
+        default=None,
+        ge=1,
+        le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+        description="Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.",
+    )
     extra_http_headers: dict[str, str] | None = Field(
         default=None,
         description="The extra HTTP headers for the requests in browser.",
+    )
+    cdp_connect_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "HTTP headers attached ONLY to the CDP WebSocket handshake when connecting to "
+            "a remote browser via browser_address. Use this for browser-provider auth "
+            "(e.g., x-api-key for Skyvern Cloud, Browserless, or similar). These headers "
+            "are NEVER forwarded to target websites."
+        ),
     )
     browser_address: str | None = Field(
         default=None,
@@ -248,6 +289,11 @@ class WorkflowRunRequest(BaseModel):
             return None
         return normalize_run_with(v)
 
+    @field_validator("max_elapsed_time_minutes", mode="before")
+    @classmethod
+    def validate_max_elapsed_time_minutes(cls, value: object) -> object:
+        return reject_bool_max_elapsed_time_minutes(value)
+
     @field_validator("run_metadata")
     @classmethod
     def _validate_run_metadata(cls, v: dict[str, str] | None) -> dict[str, str] | None:
@@ -259,6 +305,10 @@ class WorkflowRunRequest(BaseModel):
         if not url:
             return url
         return validate_url(url)
+
+    @field_serializer("cdp_connect_headers")
+    def _mask_cdp_connect_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        return mask_header_values(headers)
 
 
 class BlockRunRequest(WorkflowRunRequest):
@@ -332,6 +382,10 @@ class BaseRunResponse(BaseModel):
     )
     downloaded_files: list[FileInfo] | None = Field(default=None, description="List of files downloaded during the run")
     recording_url: str | None = Field(default=None, description="URL to the recording of the run")
+    recording_archived: bool = Field(
+        default=False,
+        description="True when the recording exists but has been archived to cold storage and is not currently accessible.",
+    )
     screenshot_urls: list[str] | None = Field(
         default=None,
         description="List of last n screenshot URLs in reverse chronological order - the first one the list is the latest screenshot.",
@@ -401,6 +455,10 @@ class WorkflowRunResponse(BaseRunResponse):
         default=None,
         description="Whether to fallback to AI if code run fails.",
     )
+    script_id: str | None = Field(
+        default=None,
+        description="ID of the cached script used for this workflow run, if any.",
+    )
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
@@ -440,3 +498,12 @@ class TaskRunListItem(BaseModel):
         endpoint's Run.script_run field.  Do not rely on dict contents here.
         """
         return bool(v)
+
+
+class BulkCancelRunsRequest(BaseModel):
+    run_ids: list[str] = Field(max_length=100, description="List of run IDs to cancel")
+
+
+class BulkCancelRunsResponse(BaseModel):
+    cancelled: list[str] = Field(description="Run IDs that were successfully cancelled")
+    failed: list[str] = Field(description="Run IDs that could not be cancelled")

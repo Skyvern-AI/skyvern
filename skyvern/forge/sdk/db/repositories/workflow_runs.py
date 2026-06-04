@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
+from typing import cast as typing_cast
 
 import structlog
 from sqlalchemy import Text, and_, cast, exists, func, literal, literal_column, or_, select, update
@@ -12,6 +13,7 @@ from skyvern.exceptions import WorkflowParameterNotFound, WorkflowRunNotFound
 from skyvern.forge.sdk.db._error_handling import db_operation
 from skyvern.forge.sdk.db.base_alchemy_db import read_retry
 from skyvern.forge.sdk.db.base_repository import BaseRepository
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 
@@ -118,7 +120,7 @@ class WorkflowRunsRepository(BaseRepository):
                 WorkflowRunStatus.running,
                 WorkflowRunStatus.paused,
             ]
-            stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=stale_threshold_hours)
+            stale_cutoff = naive_utc_now() - timedelta(hours=stale_threshold_hours)
 
             # Count active workflow runs (recently updated)
             active_query = (
@@ -154,7 +156,9 @@ class WorkflowRunsRepository(BaseRepository):
         totp_identifier: str | None = None,
         parent_workflow_run_id: str | None = None,
         max_screenshot_scrolling_times: int | None = None,
+        max_elapsed_time_minutes: int | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         sequential_key: str | None = None,
         run_with: str | None = None,
@@ -184,7 +188,9 @@ class WorkflowRunsRepository(BaseRepository):
                 totp_identifier=totp_identifier,
                 parent_workflow_run_id=parent_workflow_run_id,
                 max_screenshot_scrolling_times=max_screenshot_scrolling_times,
+                max_elapsed_time_minutes=max_elapsed_time_minutes,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 sequential_key=sequential_key,
                 run_with=run_with,
@@ -224,6 +230,7 @@ class WorkflowRunsRepository(BaseRepository):
         browser_profile_id: str | None | object = _UNSET,
         browser_address: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         failure_category: list[dict[str, Any]] | None = None,
         started_at: datetime | None | object = _UNSET,
         queued_at: datetime | None | object = _UNSET,
@@ -237,11 +244,11 @@ class WorkflowRunsRepository(BaseRepository):
                 if status:
                     workflow_run.status = status
                 if status and status == WorkflowRunStatus.queued and workflow_run.queued_at is None:
-                    workflow_run.queued_at = datetime.now(timezone.utc)
+                    workflow_run.queued_at = naive_utc_now()
                 if status and status == WorkflowRunStatus.running and workflow_run.started_at is None:
-                    workflow_run.started_at = datetime.now(timezone.utc)
+                    workflow_run.started_at = naive_utc_now()
                 if status and status.is_final() and workflow_run.finished_at is None:
-                    workflow_run.finished_at = datetime.now(timezone.utc)
+                    workflow_run.finished_at = naive_utc_now()
                 if failure_reason:
                     workflow_run.failure_reason = failure_reason
                 if webhook_failure_reason is not None:
@@ -269,6 +276,8 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.browser_address = browser_address
                 if extra_http_headers is not None:
                     workflow_run.extra_http_headers = extra_http_headers
+                if cdp_connect_headers is not None:
+                    workflow_run.cdp_connect_headers = cdp_connect_headers
                 # 2FA verification code waiting state updates
                 if waiting_for_verification_code is not None:
                     workflow_run.waiting_for_verification_code = waiting_for_verification_code
@@ -286,11 +295,11 @@ class WorkflowRunsRepository(BaseRepository):
                     workflow_run.failure_category = failure_category
                 # Explicit timestamp overrides (used when resetting workflow runs)
                 if started_at is not _UNSET:
-                    workflow_run.started_at = started_at
+                    workflow_run.started_at = to_naive_utc(typing_cast(datetime | None, started_at))
                 if queued_at is not _UNSET:
-                    workflow_run.queued_at = queued_at
+                    workflow_run.queued_at = to_naive_utc(typing_cast(datetime | None, queued_at))
                 if finished_at is not _UNSET:
-                    workflow_run.finished_at = finished_at
+                    workflow_run.finished_at = to_naive_utc(typing_cast(datetime | None, finished_at))
                 await session.commit()
                 await save_workflow_run_logs(workflow_run_id)
                 await session.refresh(workflow_run)
@@ -327,19 +336,30 @@ class WorkflowRunsRepository(BaseRepository):
         workflow_run_id: str,
         status: WorkflowRunStatus,
         failure_reason: str | None = None,
+        run_with: str | None = None,
     ) -> WorkflowRun | None:
         """Transition a workflow run to ``status`` only if it is not already in a
         terminal state. Returns the updated row, or ``None`` when the row was
         already terminal (or missing). Implemented as a single conditional
         ``UPDATE ... WHERE status IN (<non-terminal>)`` so a concurrent
         finalization write cannot be clobbered by a late cancel.
+
+        Mirrors the timestamp side effects of :meth:`update_workflow_run`:
+        ``finished_at`` is stamped on terminal transitions and ``started_at``
+        is stamped on the first ``running`` transition (preserving any
+        existing value via ``COALESCE``).
         """
         non_terminal = [s.value for s in WorkflowRunStatus if not s.is_final()]
+        now = naive_utc_now()
         values: dict[str, Any] = {"status": status}
         if status.is_final():
-            values["finished_at"] = datetime.now(timezone.utc)
+            values["finished_at"] = now
+        if status == WorkflowRunStatus.running:
+            values["started_at"] = func.coalesce(WorkflowRunModel.started_at, now)
         if failure_reason is not None:
             values["failure_reason"] = failure_reason
+        if run_with is not None:
+            values["run_with"] = run_with
 
         async with self.Session() as session:
             result = await session.execute(
@@ -950,6 +970,7 @@ class WorkflowRunsRepository(BaseRepository):
         status: list[WorkflowRunStatus] | None = None,
         search_key: str | None = None,
         error_code: str | None = None,
+        exclude_child_runs: bool = False,
     ) -> list[WorkflowRun]:
         """
         Get runs for a workflow, with optional `search_key` on run ID, parameter key/description/value,
@@ -964,6 +985,8 @@ class WorkflowRunsRepository(BaseRepository):
                 .filter(WorkflowRunModel.organization_id == organization_id)
                 .filter(WorkflowRunModel.copilot_session_id.is_(None))
             )
+            if exclude_child_runs:
+                query = query.filter(WorkflowRunModel.parent_workflow_run_id.is_(None))
             query = self._apply_search_key_filter(query, search_key)
             query = self._apply_error_code_filter(query, error_code)
             if status:

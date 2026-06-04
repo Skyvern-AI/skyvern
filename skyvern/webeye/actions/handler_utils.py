@@ -39,7 +39,7 @@ async def input_sequentially(locator: Locator, text: str, timeout: float = setti
     await EventStrategyFactory.type_text(locator.page, locator, text)
 
 
-async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0) -> None:
+async def keypress(page: Page, keys: list[str], hold: bool = False, duration: float = 0, repeat: int = 1) -> None:
     updated_keys = []
     for key in keys:
         key_lower_case = key.lower()
@@ -83,12 +83,14 @@ async def keypress(page: Page, keys: list[str], hold: bool = False, duration: fl
         else:
             updated_keys.append(key)
     keypress_str = "+".join(updated_keys)
+    n = max(1, repeat)
     if hold:
         await page.keyboard.down(keypress_str)
         await asyncio.sleep(duration)
         await page.keyboard.up(keypress_str)
     else:
-        await page.keyboard.press(keypress_str)
+        for _ in range(n):
+            await page.keyboard.press(keypress_str)
 
 
 async def drag(

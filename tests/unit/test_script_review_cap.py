@@ -7,6 +7,7 @@ Validates that:
 4. Counter only increments after a review actually runs (not on LockError)
 """
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,7 @@ except ImportError:
 from skyvern.forge.sdk.cache.factory import CacheFactory
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.forge.sdk.workflow.service import WorkflowService
+from skyvern.services import script_review_cap
 
 
 def _make_workflow(wpid: str = "wpid_test123") -> MagicMock:
@@ -38,16 +40,172 @@ def _make_workflow_run(run_id: str = "wr_test1") -> MagicMock:
     return wr
 
 
+class TestScriptReviewCapModule:
+    """Direct contract tests for skyvern.services.script_review_cap."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self) -> Iterator[None]:
+        self.mock_cache = AsyncMock()
+        self._original_cache = CacheFactory.get_cache()
+        CacheFactory.set_cache(self.mock_cache)
+        yield
+        CacheFactory.set_cache(self._original_cache)
+
+    def test_exported_surface_is_intentional(self) -> None:
+        assert set(script_review_cap.__all__) == {
+            "CapGetter",
+            "ReviewerVersion",
+            "check_and_increment_cap_v3",
+            "get_script_review_cap",
+            "increment_script_review_counter_v2",
+            "is_script_review_cap_exceeded_v2",
+            "is_script_review_cap_exceeded_v3",
+            "try_increment_script_review_counter_v3",
+            "v2_script_review_cap_key",
+            "v3_script_review_cap_key",
+        }
+
+    def test_key_constructors_include_version_prefix_wpid_and_date(self) -> None:
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+        assert script_review_cap.v2_script_review_cap_key("wpid_abc") == (f"script_reviewer:daily_cap:wpid_abc:{today}")
+        assert script_review_cap.v3_script_review_cap_key("wpid_abc") == (f"script_review_counter:v3:wpid_abc:{today}")
+
+    def test_private_version_router_rejects_unknown_versions(self) -> None:
+        assert "script_reviewer:daily_cap:" in script_review_cap._cap_key_for_version("wpid_abc", "v2")
+        assert "script_review_counter:v3:" in script_review_cap._cap_key_for_version("wpid_abc", "v3")
+
+        with pytest.raises(ValueError):
+            script_review_cap._cap_key_for_version("wpid_abc", "bogus")  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    async def test_direct_read_check_uses_injected_cap_getter(self) -> None:
+        self.mock_cache.get = AsyncMock(return_value="4")
+        cap_getter = AsyncMock(return_value=5)
+
+        result = await script_review_cap.is_script_review_cap_exceeded_v2(
+            workflow_permanent_id="wpid_abc",
+            organization_id="org_1",
+            cap_getter=cap_getter,
+        )
+
+        assert result is False
+        cap_getter.assert_awaited_once_with("org_1")
+
+    @pytest.mark.asyncio
+    async def test_direct_read_check_at_cap_returns_true(self) -> None:
+        self.mock_cache.get = AsyncMock(return_value="5")
+
+        result = await script_review_cap.is_script_review_cap_exceeded_v3(
+            workflow_permanent_id="wpid_abc",
+            cap_getter=AsyncMock(return_value=5),
+        )
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_direct_read_check_cache_missing_honors_fail_mode(self) -> None:
+        CacheFactory.set_cache(None)
+
+        assert (
+            await script_review_cap.is_script_review_cap_exceeded_v2(
+                workflow_permanent_id="wpid_abc",
+                fail_closed=False,
+            )
+            is False
+        )
+        assert (
+            await script_review_cap.is_script_review_cap_exceeded_v2(
+                workflow_permanent_id="wpid_abc",
+                fail_closed=True,
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_read_check_cache_error_honors_fail_mode(self) -> None:
+        self.mock_cache.get = AsyncMock(side_effect=RuntimeError("redis down"))
+
+        assert (
+            await script_review_cap.is_script_review_cap_exceeded_v3(
+                workflow_permanent_id="wpid_abc",
+                fail_closed=False,
+            )
+            is False
+        )
+        assert (
+            await script_review_cap.is_script_review_cap_exceeded_v3(
+                workflow_permanent_id="wpid_abc",
+                fail_closed=True,
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_v3_check_and_increment_acquires_slot_under_cap(self) -> None:
+        self.mock_cache.get = AsyncMock(return_value="4")
+        mock_lock = AsyncMock()
+        mock_lock.__aenter__ = AsyncMock(return_value=mock_lock)
+        mock_lock.__aexit__ = AsyncMock(return_value=False)
+        self.mock_cache.get_lock = MagicMock(return_value=mock_lock)
+
+        result = await script_review_cap.check_and_increment_cap_v3(
+            workflow_permanent_id="wpid_abc",
+            organization_id="org_1",
+            cap_getter=AsyncMock(return_value=5),
+        )
+
+        assert result == 5
+        self.mock_cache.get_lock.assert_called_once_with("v3_cap:wpid_abc", blocking_timeout=2, timeout=5)
+        self.mock_cache.set.assert_awaited_once()
+        args, kwargs = self.mock_cache.set.call_args
+        assert "script_review_counter:v3:wpid_abc" in args[0]
+        assert args[1] == "5"
+        assert kwargs.get("ex") == timedelta(hours=48)
+
+    @pytest.mark.asyncio
+    async def test_direct_v3_check_and_increment_returns_none_at_cap(self) -> None:
+        self.mock_cache.get = AsyncMock(return_value="5")
+        mock_lock = AsyncMock()
+        mock_lock.__aenter__ = AsyncMock(return_value=mock_lock)
+        mock_lock.__aexit__ = AsyncMock(return_value=False)
+        self.mock_cache.get_lock = MagicMock(return_value=mock_lock)
+
+        result = await script_review_cap.check_and_increment_cap_v3(
+            workflow_permanent_id="wpid_abc",
+            cap_getter=AsyncMock(return_value=5),
+        )
+
+        assert result is None
+        self.mock_cache.set.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_direct_v3_check_and_increment_lock_error_fails_closed(self) -> None:
+        mock_lock = AsyncMock()
+        mock_lock.__aenter__ = AsyncMock(side_effect=script_review_cap._RedisLockError("busy"))
+        mock_lock.__aexit__ = AsyncMock(return_value=False)
+        self.mock_cache.get_lock = MagicMock(return_value=mock_lock)
+
+        result = await script_review_cap.check_and_increment_cap_v3(
+            workflow_permanent_id="wpid_abc",
+            cap_getter=AsyncMock(return_value=5),
+        )
+
+        assert result is None
+        self.mock_cache.get.assert_not_called()
+        self.mock_cache.set.assert_not_called()
+
+
 class TestCheckScriptReviewCap:
     """Tests for _check_script_review_cap."""
 
     @pytest.fixture(autouse=True)
-    def setup(self) -> None:
+    def setup(self) -> Iterator[None]:
         self.service = WorkflowService()
         self.mock_cache = AsyncMock()
         self._original_cache = CacheFactory.get_cache()
         CacheFactory.set_cache(self.mock_cache)
-        yield  # type: ignore[misc]
+        yield
         CacheFactory.set_cache(self._original_cache)
 
     @pytest.mark.asyncio
@@ -111,12 +269,12 @@ class TestIncrementScriptReviewCounter:
     """Tests for _increment_script_review_counter."""
 
     @pytest.fixture(autouse=True)
-    def setup(self) -> None:
+    def setup(self) -> Iterator[None]:
         self.service = WorkflowService()
         self.mock_cache = AsyncMock()
         self._original_cache = CacheFactory.get_cache()
         CacheFactory.set_cache(self.mock_cache)
-        yield  # type: ignore[misc]
+        yield
         CacheFactory.set_cache(self._original_cache)
 
     @pytest.mark.asyncio
@@ -151,7 +309,7 @@ class TestTriggerScriptReviewerCap:
     """Integration tests for _trigger_script_reviewer daily cap logic."""
 
     @pytest.fixture(autouse=True)
-    def setup(self) -> None:
+    def setup(self) -> Iterator[None]:
         self.service = WorkflowService()
         self.mock_cache = AsyncMock()
         self._original_cache = CacheFactory.get_cache()
@@ -168,16 +326,13 @@ class TestTriggerScriptReviewerCap:
             return_value=False,
         )
         self._pin_patcher.start()
-        # Mock _get_script_review_cap to return the default cap (5) so PostHog
-        # doesn't interfere with cap arithmetic in these tests.
-        self._cap_patcher = patch.object(
-            self.service,
-            "_get_script_review_cap",
+        self._cap_patcher = patch(
+            "skyvern.services.script_review_cap.get_script_review_cap",
             new_callable=AsyncMock,
             return_value=5,
         )
         self._cap_patcher.start()
-        yield  # type: ignore[misc]
+        yield
         self._cap_patcher.stop()
         self._pin_patcher.stop()
         CacheFactory.set_cache(self._original_cache)
@@ -435,56 +590,55 @@ class TestTriggerScriptReviewerCap:
 
 
 class TestGetScriptReviewCap:
-    """Unit tests for _get_script_review_cap PostHog integration."""
+    """Unit tests for script-review cap experimentation-provider integration."""
 
     @pytest.fixture(autouse=True)
-    def setup(self) -> None:
+    def setup(self) -> Iterator[None]:
         from skyvern.forge import app
 
-        self.service = WorkflowService()
         self.mock_provider = AsyncMock()
         # AppHolder proxies to _inst; set a mock ForgeApp so attribute access works
         self._mock_app = MagicMock()
         self._mock_app.EXPERIMENTATION_PROVIDER = self.mock_provider
         object.__setattr__(app, "_inst", self._mock_app)
-        yield  # type: ignore[misc]
+        yield
         object.__setattr__(app, "_inst", None)
 
     @pytest.mark.asyncio
     async def test_no_organization_id_returns_default(self) -> None:
-        assert await self.service._get_script_review_cap(None) == 5
+        assert await script_review_cap.get_script_review_cap(None) == 5
 
     @pytest.mark.asyncio
     async def test_no_provider_returns_default(self) -> None:
         self._mock_app.EXPERIMENTATION_PROVIDER = None
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5
 
     @pytest.mark.asyncio
     async def test_valid_payload_returns_custom_cap(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(return_value="20")
-        assert await self.service._get_script_review_cap("org_1") == 20
+        assert await script_review_cap.get_script_review_cap("org_1") == 20
 
     @pytest.mark.asyncio
     async def test_invalid_payload_returns_default(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(return_value="not-a-number")
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5
 
     @pytest.mark.asyncio
     async def test_zero_returns_default(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(return_value="0")
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5
 
     @pytest.mark.asyncio
     async def test_negative_returns_default(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(return_value="-5")
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5
 
     @pytest.mark.asyncio
-    async def test_posthog_exception_returns_default(self) -> None:
+    async def test_provider_exception_returns_default(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(side_effect=RuntimeError("network"))
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5
 
     @pytest.mark.asyncio
     async def test_none_payload_returns_default(self) -> None:
         self.mock_provider.get_payload_cached = AsyncMock(return_value=None)
-        assert await self.service._get_script_review_cap("org_1") == 5
+        assert await script_review_cap.get_script_review_cap("org_1") == 5

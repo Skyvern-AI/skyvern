@@ -6,11 +6,14 @@ from typing import Any, cast
 import pytest
 from playwright.async_api import Playwright
 
+import skyvern.webeye.browser_factory as browser_factory
 import skyvern.webeye.cdp_connection as cdp_connection
 from skyvern.webeye.cdp_connection import (
     build_cdp_connect_headers,
     build_cdp_connection_candidates,
     connect_over_cdp_with_diagnostics,
+    merge_cdp_connect_headers,
+    parse_default_cdp_connect_headers,
     resolve_host_docker_internal_url,
 )
 
@@ -22,6 +25,56 @@ def test_build_cdp_connect_headers_uses_host_header() -> None:
 def test_build_cdp_connect_headers_ignores_empty_host_header() -> None:
     assert build_cdp_connect_headers(None) is None
     assert build_cdp_connect_headers(" ") is None
+
+
+def test_parse_default_cdp_connect_headers_empty() -> None:
+    assert parse_default_cdp_connect_headers(None) == {}
+    assert parse_default_cdp_connect_headers("") == {}
+
+
+def test_parse_default_cdp_connect_headers_returns_dict() -> None:
+    assert parse_default_cdp_connect_headers('{"x-api-key": "secret"}') == {"x-api-key": "secret"}
+
+
+def test_parse_default_cdp_connect_headers_ignores_invalid_json() -> None:
+    assert parse_default_cdp_connect_headers("not-json") == {}
+
+
+def test_parse_default_cdp_connect_headers_ignores_non_object_json() -> None:
+    assert parse_default_cdp_connect_headers('["x-api-key"]') == {}
+    assert parse_default_cdp_connect_headers('"raw-string"') == {}
+
+
+def test_parse_default_cdp_connect_headers_skips_non_string_values() -> None:
+    assert parse_default_cdp_connect_headers('{"x-api-key": "secret", "x-bad": 42, "x-null": null}') == {
+        "x-api-key": "secret",
+    }
+
+
+def test_merge_cdp_connect_headers_per_row_overrides_default() -> None:
+    merged = merge_cdp_connect_headers(
+        default_headers={"x-api-key": "env-secret", "x-shared": "env"},
+        per_row_headers={"x-api-key": "row-secret", "x-row-only": "row"},
+        managed_host_header={},
+    )
+    assert merged == {"x-api-key": "row-secret", "x-shared": "env", "x-row-only": "row"}
+
+
+def test_merge_cdp_connect_headers_managed_host_always_wins() -> None:
+    merged = merge_cdp_connect_headers(
+        default_headers={"host": "env-host", "x-api-key": "env"},
+        per_row_headers={"Host": "row-host", "x-api-key": "row"},
+        managed_host_header={"Host": "127.0.0.1:9222"},
+    )
+    assert merged == {"Host": "127.0.0.1:9222", "x-api-key": "row"}
+
+
+def test_merge_cdp_connect_headers_no_inputs() -> None:
+    assert merge_cdp_connect_headers({}, None, {}) == {}
+
+
+def test_merge_cdp_connect_headers_defaults_only() -> None:
+    assert merge_cdp_connect_headers({"x-api-key": "env"}, None, {}) == {"x-api-key": "env"}
 
 
 def test_resolve_host_docker_internal_url_uses_resolved_ipv4(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -104,6 +157,37 @@ async def test_connect_over_cdp_retries_resolved_host_with_headers(monkeypatch: 
     assert fake_playwright.chromium.calls == [
         ("http://host.docker.internal:9222/", 120000, headers),
         ("http://192.168.65.254:9222/", 120000, headers),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_cdp_connection_browser_passes_headers_to_configured_cdp_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, str] | None, dict[str, str] | None]] = []
+
+    async def fake_connect_to_cdp_browser(
+        playwright: Playwright,
+        remote_browser_url: str,
+        extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
+        apply_download_behaviour: bool = False,
+    ) -> tuple[object, object, object]:
+        calls.append((remote_browser_url, extra_http_headers, cdp_connect_headers))
+        return object(), object(), object()
+
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_TYPE", "chromium-headful")
+    monkeypatch.setattr(browser_factory.settings, "BROWSER_REMOTE_DEBUGGING_URL", "http://browser.example:9222")
+    monkeypatch.setattr(browser_factory, "_connect_to_cdp_browser", fake_connect_to_cdp_browser)
+
+    await browser_factory._create_cdp_connection_browser(
+        cast(Playwright, object()),
+        extra_http_headers={"user-agent": "test"},
+        cdp_connect_headers={"x-api-key": "secret"},
+    )
+
+    assert calls == [
+        ("http://browser.example:9222", {"user-agent": "test"}, {"x-api-key": "secret"}),
     ]
 
 

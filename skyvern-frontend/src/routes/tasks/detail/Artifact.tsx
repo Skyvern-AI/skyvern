@@ -53,6 +53,11 @@ type Props = {
 };
 
 function Artifact({ type, artifacts }: Props) {
+  const total = artifacts.length;
+  const archivedCount = artifacts.filter((a) => a.archived).length;
+  const allArchived = total > 0 && archivedCount === total;
+  const partiallyArchived = archivedCount > 0 && archivedCount < total;
+
   function fetchArtifact(artifact: ArtifactApiResponse) {
     if (artifact.signed_url) {
       return axios.get(artifact.signed_url).then((response) => response.data);
@@ -75,29 +80,48 @@ function Artifact({ type, artifacts }: Props) {
         return {
           queryKey: ["artifact", artifact.artifact_id],
           queryFn: () => fetchArtifact(artifact),
+          enabled: !artifact.archived,
         };
       }) ?? [],
   });
+
+  if (allArchived) {
+    return (
+      <div className="p-4 text-muted-foreground">
+        This data has been archived. To request restoration, please contact
+        support@skyvern.com
+      </div>
+    );
+  }
 
   if (results.some((result) => result.isLoading)) {
     return <Skeleton className="h-48 w-full" />;
   }
 
   return (
-    <CodeEditor
-      language={type === "text" ? undefined : type}
-      className="w-full"
-      value={
-        results.some((result) => result.isError)
-          ? JSON.stringify(results.find((result) => result.isError)?.error)
-          : results
-              .map((result) => getFormattedResult(type, result.data))
-              .join(",\n")
-      }
-      minHeight="96px"
-      maxHeight="500px"
-      readOnly
-    />
+    <div className="flex flex-col gap-2">
+      {partiallyArchived && (
+        <div className="text-sm text-muted-foreground">
+          {archivedCount} of {total} items archived and not shown. Contact
+          support@skyvern.com to request restoration.
+        </div>
+      )}
+      <CodeEditor
+        language={type === "text" ? undefined : type}
+        className="w-full"
+        value={
+          results.some((result) => result.isError)
+            ? JSON.stringify(results.find((result) => result.isError)?.error)
+            : results
+                .filter((_, i) => !artifacts[i]?.archived)
+                .map((result) => getFormattedResult(type, result.data))
+                .join(",\n")
+        }
+        minHeight="96px"
+        maxHeight="500px"
+        readOnly
+      />
+    </div>
   );
 }
 

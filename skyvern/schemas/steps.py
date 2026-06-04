@@ -21,6 +21,8 @@ class AgentStepOutput(BaseModel):
     # Nullable for backwards compatibility, once backfill is done, this won't be nullable anymore
     actions_and_results: list[tuple[Action, list[ActionResult]]] | None = None
     errors: list[UserDefinedError] = []
+    # Explicit no-retry signal; historical/plain errors still use the normal retry budget.
+    terminal_user_errors: bool = False
     browser_metadata: BrowserMetadata | None = None
     step_exception: str | None = None
 

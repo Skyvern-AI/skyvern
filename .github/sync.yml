@@ -19,6 +19,8 @@ Skyvern-AI/skyvern-cloud:
   - source: skyvern-frontend/src/
     dest: skyvern-frontend/src/
     deleteOrphaned: true
+  - source: skyvern-frontend/tailwind.config.js
+    dest: skyvern-frontend/tailwind.config.js
   - source: evaluation/
     dest: evaluation/
     deleteOrphaned: true

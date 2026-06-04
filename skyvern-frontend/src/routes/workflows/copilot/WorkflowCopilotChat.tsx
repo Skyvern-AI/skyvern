@@ -2,6 +2,7 @@ import {
   useState,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useCallback,
   memo,
@@ -9,7 +10,7 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { ReloadIcon, Cross2Icon, ChevronDownIcon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -19,6 +20,8 @@ import { getSseClient } from "@/api/sse";
 import {
   WorkflowCopilotCancelRequest,
   WorkflowCopilotChatHistoryResponse,
+  WorkflowCopilotDesignEndUpdate,
+  WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotProcessingUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
@@ -27,33 +30,110 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotTurnStartUpdate,
+  WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
 } from "./workflowCopilotTypes";
+import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
-  ToolActivity,
-  applyBlockProgress,
-  applyToolCall,
-  applyToolResult,
-  getActivityDotClass,
-} from "./toolActivity";
+  QueuedPromptReason,
+  resolveDrainAction,
+  resolveSendAction,
+} from "./sendQueue";
+import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
+import { NarrativeView } from "./NarrativeView";
 import {
-  shouldQueuePromptForLiveBrowser,
-  shouldWaitForLiveBrowser,
-} from "./browserReadiness";
+  EMPTY_NARRATIVE,
+  TurnNarrativeState,
+  applyNarrativeEvent,
+  hydrateNarrativeFromPayload,
+  parseUtcIsoMs,
+} from "./narrativeState";
+import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+
+// Cap on retained per-turn snap-back snapshots. A typical session has a
+// handful of turns; this ceiling guards a runaway long-running chat.
+const MAX_TURN_SNAPSHOTS = 20;
+
+function formatElapsedSeconds(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function ConvoAggregatePill({
+  messages,
+  isInFlight,
+}: {
+  messages: ChatMessage[];
+  isInFlight: boolean;
+}) {
+  const turnsWithNarrative = messages.filter(
+    (m) => m.sender === "ai" && m.narrative,
+  );
+  if (turnsWithNarrative.length < 2) return null;
+  let earliestMs: number | null = null;
+  let latestMs: number | null = null;
+  for (const m of turnsWithNarrative) {
+    const startMs = parseUtcIsoMs(m.narrative?.startedAt);
+    if (startMs !== null) {
+      earliestMs =
+        earliestMs === null ? startMs : Math.min(earliestMs, startMs);
+    }
+    const endMs =
+      parseUtcIsoMs(m.narrative?.endedAt) ?? parseUtcIsoMs(m.timestamp);
+    if (endMs !== null) {
+      latestMs = latestMs === null ? endMs : Math.max(latestMs, endMs);
+    }
+  }
+  const elapsedLabel =
+    earliestMs !== null && latestMs !== null && latestMs > earliestMs
+      ? formatElapsedSeconds(latestMs - earliestMs)
+      : null;
+  const anyError = turnsWithNarrative.some(
+    (m) => m.narrative?.terminal === "error",
+  );
+  const status = isInFlight ? "In flight" : anyError ? "Halted" : "Done";
+  const dotClass = isInFlight
+    ? "bg-blue-400"
+    : anyError
+      ? "bg-rose-400"
+      : "bg-emerald-400";
+  return (
+    <div className="flex justify-center pb-1">
+      <span className="inline-flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-0.5 text-[11px] text-slate-300">
+        <span
+          aria-hidden="true"
+          className={`inline-block h-1.5 w-1.5 rounded-full ${dotClass}`}
+        />
+        {turnsWithNarrative.length} turns
+        {elapsedLabel ? ` · ${elapsedLabel} elapsed` : ""}
+        {" · "}
+        {status}
+      </span>
+    </div>
+  );
+}
 
 interface ChatMessage {
   id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
   timestamp?: string;
+  // frozen narrative-bubble state captured at terminal RESPONSE
+  // so the per-block cards persist as the user scrolls back through past
+  // turns. Live in-flight narrative is rendered separately at the bottom.
+  narrative?: TurnNarrativeState;
 }
 
 type QueuedPrompt = {
   id: string;
   content: string;
+  reason: QueuedPromptReason;
 };
 
 type SendOptions = {
@@ -69,26 +149,11 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotToolResultUpdate
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
-  | WorkflowCopilotBlockProgressUpdate;
-
-const TOOL_DISPLAY_NAMES: Record<string, string> = {
-  update_workflow: "Updating workflow",
-  update_and_run_blocks: "Updating & running blocks",
-  list_credentials: "Listing credentials",
-  get_block_schema: "Looking up block schema",
-  validate_block: "Validating block",
-  run_blocks_and_collect_debug: "Running blocks",
-  get_run_results: "Getting run results",
-  get_browser_screenshot: "Taking screenshot",
-  navigate_browser: "Navigating browser",
-  evaluate: "Inspecting the page",
-  click: "Clicking on the page",
-  type_text: "Filling a field",
-  scroll: "Scrolling",
-  console_messages: "Reading console",
-  select_option: "Selecting option",
-  press_key: "Pressing key",
-};
+  | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotTurnStartUpdate
+  | WorkflowCopilotDesignStartUpdate
+  | WorkflowCopilotDesignEndUpdate
+  | WorkflowCopilotWorkflowDraftUpdate;
 
 const formatChatTimestamp = (value: string) => {
   let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
@@ -107,26 +172,28 @@ interface MessageItemProps {
 }
 
 const MessageItem = memo(({ message, footer }: MessageItemProps) => {
+  if (message.sender === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="relative max-w-[85%] rounded-xl border border-white/5 bg-slate-elevation4 px-3.5 py-2.5 text-[13.5px] leading-[1.5] text-foreground">
+          <p className="whitespace-pre-wrap pr-12">{message.content}</p>
+          {message.timestamp ? (
+            <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-elevation1/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              {formatChatTimestamp(message.timestamp)}
+            </span>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className="flex items-start gap-3">
-      <div
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ${
-          message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
-        }`}
-      >
-        {message.sender === "ai" ? "AI" : "U"}
-      </div>
-      <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
-        <p className="whitespace-pre-wrap pr-3 text-sm text-slate-200">
-          {message.content}
-        </p>
-        {footer ? <div className="mt-3 flex gap-2">{footer}</div> : null}
-        {message.timestamp ? (
-          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
-            {formatChatTimestamp(message.timestamp)}
-          </span>
-        ) : null}
-      </div>
+    <div className="flex flex-col gap-2">
+      <p className="whitespace-pre-wrap pl-1 text-[13px] leading-[1.55] text-slate-200">
+        {message.content}
+      </p>
+      {footer ? (
+        <div className="flex flex-wrap gap-2 pl-1">{footer}</div>
+      ) : null}
     </div>
   );
 });
@@ -141,6 +208,10 @@ interface WorkflowCopilotChatProps {
     workflow: WorkflowApiResponse,
     clearPending: () => void,
   ) => void;
+  // parent receives the block label when the user clicks a block
+  // card in the narrative bubble. The editor uses this to flash-highlight
+  // the matching canvas node.
+  onBlockSelect?: (blockLabel: string) => void;
   isOpen?: boolean;
   onClose?: () => void;
   onMessageCountChange?: (count: number) => void;
@@ -150,6 +221,15 @@ interface WorkflowCopilotChatProps {
   isLiveBrowserReady?: boolean;
   initialMessage?: string;
   onInitialMessageConsumed?: () => void;
+}
+
+// Snap-back state keyed by turn_id so rapid resubmits don't clobber a prior
+// turn's snapshot before its terminal frame lands. The snapshot captures
+// pre-submit canvas state (including unsaved local edits) so Reject / Cancel /
+// ERROR can revert exactly what the user submitted.
+interface TurnSnapshot {
+  snapshot: WorkflowApiResponse | null;
+  hadStagedDraft: boolean;
 }
 
 const AUTO_SEND_TIMEOUT_MS = 5000;
@@ -199,6 +279,7 @@ const constrainPosition = (
 export function WorkflowCopilotChat({
   onWorkflowUpdate,
   onReviewWorkflow,
+  onBlockSelect,
   isOpen = true,
   onClose,
   onMessageCountChange,
@@ -216,11 +297,24 @@ export function WorkflowCopilotChat({
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
-  const [processingStatus, setProcessingStatus] = useState<string>("");
-  const [latestNarration, setLatestNarration] = useState<string>("");
-  const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
+  const [narrative, setNarrative] =
+    useState<TurnNarrativeState>(EMPTY_NARRATIVE);
+  // mirror of the latest narrative state so async SSE handlers
+  // closed over `handleSend`'s scope can read the live value instead of the
+  // stale closure capture from submit time.
+  const narrativeRef = useRef<TurnNarrativeState>(EMPTY_NARRATIVE);
+  useEffect(() => {
+    narrativeRef.current = narrative;
+  }, [narrative]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
+  // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
+  // rapid double-submit would run a stale closure and start a second stream;
+  // this ref is set before the first await and read at the top of handleSend.
+  const inFlightRef = useRef(false);
+  // Synchronous mirror of queuedPrompt (like inFlightRef) so a same-tick double
+  // submit can't queue twice and orphan the first message. Set via updateQueuedPrompt.
+  const queuedPromptRef = useRef<QueuedPrompt | null>(null);
   const pendingMessageId = useRef<string | null>(null);
   const pendingCancelToken = useRef<string | null>(null);
   const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -233,6 +327,13 @@ export function WorkflowCopilotChat({
   // Mirrors workflowCopilotChatId for async handlers that would otherwise
   // close over a stale value across renders (e.g. clearProposedWorkflow).
   const workflowCopilotChatIdRef = useRef<string | null>(null);
+  const turnSnapshots = useRef<Map<string, TurnSnapshot>>(new Map());
+  // Snapshot captured at submit time. Moved into turnSnapshots once
+  // turn_start lands and we know the BE-assigned turn_id.
+  const pendingSubmitSnapshot = useRef<WorkflowApiResponse | null>(null);
+  // Most recent turn_id observed via turn_start; used by Reject and by
+  // legacy error frames that don't carry a turn_id.
+  const latestTurnId = useRef<string | null>(null);
   useEffect(() => {
     workflowCopilotChatIdRef.current = workflowCopilotChatId;
   }, [workflowCopilotChatId]);
@@ -272,11 +373,9 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
-  const hasScrolledOnLoad = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
     requiresLiveBrowser,
@@ -296,9 +395,27 @@ export function WorkflowCopilotChat({
   // messages, and so auto-send has a synchronous "history loaded" gate.
   const historyLoadedForRef = useRef<string | null>(null);
 
-  const scrollToBottom = (behavior: ScrollBehavior) => {
-    messagesEndRef.current?.scrollIntoView({ behavior });
-  };
+  const followSignature = useMemo(
+    () =>
+      computeFollowSignature(
+        messages,
+        narrative,
+        isLoading,
+        isLoadingHistory,
+        queuedPrompt,
+        Boolean(proposedWorkflow),
+      ),
+    [
+      messages,
+      narrative,
+      isLoading,
+      isLoadingHistory,
+      queuedPrompt,
+      proposedWorkflow,
+    ],
+  );
+  const { scrollRef, isPinned, jumpToLatest, repin } =
+    useStickToBottom<HTMLDivElement>(followSignature, { enabled: isOpen });
 
   const adjustTextareaHeight = useCallback(() => {
     const textarea = textareaRef.current;
@@ -312,13 +429,22 @@ export function WorkflowCopilotChat({
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
 
+  const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
+    queuedPromptRef.current = next;
+    setQueuedPrompt(next);
+  }, []);
+
   const handleNewChat = () => {
     setMessages([]);
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
     setWorkflowCopilotChatId(null);
     setProposedWorkflow(null);
     setAutoAccept(false);
-    hasScrolledOnLoad.current = false;
+    setNarrative(EMPTY_NARRATIVE);
+    turnSnapshots.current.clear();
+    pendingSubmitSnapshot.current = null;
+    latestTurnId.current = null;
+    repin();
   };
 
   const applyWorkflowUpdate = useCallback(
@@ -336,7 +462,7 @@ export function WorkflowCopilotChat({
         console.error("Failed to update workflow:", updateError);
         toast({
           title: "Update failed",
-          description: "Failed to apply workflow changes. Please try again.",
+          description: "Failed to apply agent changes. Please try again.",
           variant: "destructive",
         });
         return false;
@@ -403,8 +529,7 @@ export function WorkflowCopilotChat({
       if (!applyWorkflowUpdate(workflow)) {
         toast({
           title: "Accept failed",
-          description:
-            "Could not apply the proposed workflow. Please try again.",
+          description: "Could not apply the proposed agent. Please try again.",
           variant: "destructive",
         });
         return;
@@ -418,6 +543,14 @@ export function WorkflowCopilotChat({
   };
 
   const handleRejectWorkflow = () => {
+    // The staged proposal was rendered onto the canvas mid-turn (via
+    // WORKFLOW_DRAFT). Reject must revert the canvas to the pre-submit
+    // canvas state captured client-side at submit time.
+    const turnId = latestTurnId.current;
+    const entry = turnId ? turnSnapshots.current.get(turnId) : null;
+    if (entry?.snapshot) {
+      applyWorkflowUpdate(entry.snapshot);
+    }
     setProposedWorkflow(null);
     void clearProposedWorkflow(false);
   };
@@ -491,7 +624,7 @@ export function WorkflowCopilotChat({
       toast({
         title: "Copilot update failed",
         description: autoAcceptValue
-          ? "Workflow was applied, but auto-accept did not update."
+          ? "Agent was applied, but auto-accept did not update."
           : "Failed to clear copilot proposal. Please try again.",
         variant: "destructive",
       });
@@ -509,28 +642,13 @@ export function WorkflowCopilotChat({
   }, [messages.length, onMessageCountChange]);
 
   useEffect(() => {
-    if (!isOpen) {
-      hasScrolledOnLoad.current = false;
-      return;
-    }
-    if (isLoadingHistory) {
-      return;
-    }
-    if (!hasScrolledOnLoad.current) {
-      scrollToBottom("auto");
-      hasScrolledOnLoad.current = true;
-      return;
-    }
-    scrollToBottom("smooth");
-  }, [messages, isLoading, isLoadingHistory, isOpen]);
-
-  useEffect(() => {
     if (!workflowPermanentId) {
       setMessages([]);
-      setQueuedPrompt(null);
+      updateQueuedPrompt(null);
       setWorkflowCopilotChatId(null);
       setProposedWorkflow(null);
       setAutoAccept(false);
+      setNarrative(EMPTY_NARRATIVE);
       historyLoadedForRef.current = null;
       return;
     }
@@ -543,7 +661,7 @@ export function WorkflowCopilotChat({
 
     const fetchHistory = async () => {
       setIsLoadingHistory(true);
-      hasScrolledOnLoad.current = false;
+      repin();
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
         const response = await client.get<WorkflowCopilotChatHistoryResponse>(
@@ -561,6 +679,23 @@ export function WorkflowCopilotChat({
             sender: message.sender,
             content: message.content,
             timestamp: message.created_at,
+            narrative: (() => {
+              const hydrated = hydrateNarrativeFromPayload(
+                message.narrative_payload,
+              );
+              if (!hydrated) return undefined;
+              // Fall back to the legacy message body when the persisted
+              // payload predates terminal-text capture.
+              if (!hydrated.terminalMessage && message.content) {
+                return {
+                  ...hydrated,
+                  terminalMessage: message.content,
+                  narrativeSummary:
+                    hydrated.narrativeSummary ?? message.content,
+                };
+              }
+              return hydrated;
+            })(),
           }),
         );
         setMessages(historyMessages);
@@ -582,7 +717,7 @@ export function WorkflowCopilotChat({
     return () => {
       isMounted = false;
     };
-  }, [credentialGetter, workflowPermanentId]);
+  }, [credentialGetter, repin, updateQueuedPrompt, workflowPermanentId]);
 
   const cancelSend = useCallback(async () => {
     // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
@@ -593,9 +728,6 @@ export function WorkflowCopilotChat({
     pendingCancelToken.current = null;
     if (!cancelToken) return;
 
-    setProcessingStatus("Cancelling...");
-    setLatestNarration("");
-    setToolActivity([]);
     cancelInFlightController.current = controllerAtCancel;
 
     const appendCancelledBubble = () => {
@@ -608,6 +740,8 @@ export function WorkflowCopilotChat({
           timestamp: new Date().toISOString(),
         },
       ]);
+      // Otherwise the bubble freezes mid-state next to the Cancelled message.
+      setNarrative(EMPTY_NARRATIVE);
     };
 
     try {
@@ -634,14 +768,14 @@ export function WorkflowCopilotChat({
       controllerAtCancel.abort();
       appendCancelledBubble();
     }
-  }, [credentialGetter, setToolActivity]);
+  }, [credentialGetter]);
 
   const cancelQueuedPrompt = useCallback(() => {
     if (!queuedPrompt) {
       return;
     }
 
-    setQueuedPrompt(null);
+    updateQueuedPrompt(null);
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -650,7 +784,7 @@ export function WorkflowCopilotChat({
       textareaRef.current?.focus();
       adjustTextareaHeight();
     });
-  }, [adjustTextareaHeight, queuedPrompt]);
+  }, [adjustTextareaHeight, queuedPrompt, updateQueuedPrompt]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -675,50 +809,59 @@ export function WorkflowCopilotChat({
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
       const candidate = messageOverride ?? inputValue;
-      if (
-        !candidate.trim() ||
-        isLoading ||
-        (queuedPrompt && !options.queuedMessageId)
-      )
+      const isDrain = Boolean(options.queuedMessageId);
+      const action = resolveSendAction({
+        inFlight: inFlightRef.current,
+        hasQueuedPrompt: Boolean(queuedPromptRef.current),
+        requiresLiveBrowser,
+        isLiveBrowserReady,
+        candidate,
+        isDrain,
+        skipQueue: Boolean(options.skipQueue),
+      });
+      if (action === "noop") {
         return;
+      }
       if (!workflowPermanentId) {
         toast({
-          title: "Missing workflow",
-          description: "Workflow permanent ID is required to chat.",
+          title: "Missing agent",
+          description: "Agent permanent ID is required to chat.",
           variant: "destructive",
         });
         return;
       }
-      if (
-        !options.skipQueue &&
-        shouldQueuePromptForLiveBrowser({
-          requiresLiveBrowser,
-          isLiveBrowserReady,
-          message: candidate,
-        })
-      ) {
-        const queued: QueuedPrompt = {
-          id: `${Date.now()}-queued`,
-          content: candidate,
-        };
-
-        setQueuedPrompt(queued);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: queued.id,
-            sender: "user",
-            content: queued.content,
-          },
-        ]);
+      if (action === "queue_working" || action === "queue_live_browser") {
+        const reason: QueuedPromptReason =
+          action === "queue_working" ? "working" : "live_browser";
+        const queuedId = options.queuedMessageId ?? crypto.randomUUID();
+        updateQueuedPrompt({ id: queuedId, content: candidate, reason });
+        // First queue adds the user bubble; a re-queue (a working drain that
+        // then had to wait for the browser) reuses the existing bubble.
+        if (!options.queuedMessageId) {
+          setMessages((prev) => [
+            ...prev,
+            { id: queuedId, sender: "user", content: candidate },
+          ]);
+        }
         setProposedWorkflow(null);
         if (messageOverride === undefined) {
           setInputValue("");
         }
-        toast({
-          title: "Prompt queued",
-          description: "Copilot will start once the live browser connects.",
-        });
+        if (!options.queuedMessageId) {
+          toast(
+            reason === "working"
+              ? {
+                  title: "Message queued",
+                  description:
+                    "Copilot is finishing the current turn — it will send next.",
+                }
+              : {
+                  title: "Prompt queued",
+                  description:
+                    "Copilot will start once the live browser connects.",
+                },
+          );
+        }
         return;
       }
 
@@ -742,9 +885,7 @@ export function WorkflowCopilotChat({
         setInputValue("");
       }
       setIsLoading(true);
-      setProcessingStatus("Starting...");
-      setLatestNarration("");
-      setToolActivity([]);
+      inFlightRef.current = true;
 
       const abortController = new AbortController();
       streamingAbortController.current?.abort();
@@ -757,8 +898,8 @@ export function WorkflowCopilotChat({
 
         if (!workflowId) {
           toast({
-            title: "Missing workflow",
-            description: "Workflow ID is required to chat.",
+            title: "Missing agent",
+            description: "Agent ID is required to chat.",
             variant: "destructive",
           });
           return;
@@ -802,6 +943,8 @@ export function WorkflowCopilotChat({
             browser_profile_id: saveData.settings.browserProfileId,
             model: saveData.settings.model,
             max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+            max_elapsed_time_minutes:
+              saveData.settings.maxElapsedTimeMinutes ?? null,
             totp_verification_url: saveData.workflow.totp_verification_url,
             extra_http_headers: extraHttpHeaders,
             run_with: saveData.settings.runWith,
@@ -823,15 +966,25 @@ export function WorkflowCopilotChat({
           };
 
           workflowYaml = convertToYAML(requestBody);
+
+          // Snapshot pre-submit canvas state (including unsaved local edits)
+          // so Reject / Cancel / ERROR can revert the canvas to exactly what
+          // the user submitted. ``saveData.workflow`` is the last-loaded
+          // canonical; overlay it with the live canvas blocks/parameters.
+          pendingSubmitSnapshot.current = {
+            ...saveData.workflow,
+            title: saveData.title,
+            workflow_definition: {
+              ...saveData.workflow.workflow_definition,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+            },
+          } as WorkflowApiResponse;
         }
 
         const handleProcessingUpdate = (
           payload: WorkflowCopilotProcessingUpdate,
         ) => {
-          if (payload.status) {
-            setProcessingStatus(payload.status);
-          }
-
           const pendingId = pendingMessageId.current;
           if (!pendingId || !payload.timestamp) {
             return;
@@ -853,37 +1006,91 @@ export function WorkflowCopilotChat({
           pendingCancelToken.current = null;
           setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
 
+          // freeze the current narrative state into the AI message
+          // so per-block cards persist as the user scrolls past this turn.
+          // Read via narrativeRef because this callback was closed over at
+          // handleSend time (pre-turn_start), so the React state binding is
+          // stale here.
+          const liveNarrative = narrativeRef.current;
+          const hasNarrativePayload =
+            response.narrative_payload !== null &&
+            typeof response.narrative_payload === "object";
+          const frozenNarrative: TurnNarrativeState | undefined =
+            liveNarrative.turnId !== null || hasNarrativePayload
+              ? applyNarrativeEvent(
+                  liveNarrative.turnId !== null
+                    ? liveNarrative
+                    : EMPTY_NARRATIVE,
+                  response,
+                )
+              : undefined;
+
           const aiMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
             content: response.message,
             timestamp: response.response_time,
+            narrative: frozenNarrative,
           };
 
           setMessages((prev) => [...prev, aiMessage]);
           const userCancelledThisTurn =
             cancelInFlightController.current === abortController;
+          const responseTurnId =
+            response.turn_id ?? latestTurnId.current ?? null;
+          const responseEntry = responseTurnId
+            ? (turnSnapshots.current.get(responseTurnId) ?? null)
+            : null;
           if (
             response.updated_workflow &&
-            autoAccept &&
-            !response.unvalidated &&
-            !response.cancelled &&
-            !userCancelledThisTurn
+            shouldAutoApplyWorkflowResponse(
+              response,
+              autoAccept,
+              userCancelledThisTurn,
+            )
           ) {
             applyWorkflowUpdate(response.updated_workflow);
+          } else if (
+            // Cancel/error terminal on a turn that produced staged content →
+            // snap canvas back to the pre-submit client snapshot.
+            (response.cancelled || frozenNarrative?.terminal === "error") &&
+            responseEntry?.hadStagedDraft &&
+            responseEntry?.snapshot
+          ) {
+            applyWorkflowUpdate(responseEntry.snapshot);
+            setProposedWorkflow(null);
           } else {
+            // Informational reply OR proposal pending review. For
+            // proposals, the Accept/Reject card is the user's next gate;
+            // canvas keeps the staged content until the user acts.
             setProposedWorkflow(response.updated_workflow ?? null);
           }
         };
 
         const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
           pendingCancelToken.current = null;
+          const liveNarrative = narrativeRef.current;
+          const frozenNarrative: TurnNarrativeState | undefined =
+            liveNarrative.turnId !== null
+              ? applyNarrativeEvent(liveNarrative, payload)
+              : undefined;
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
             content: payload.error,
+            narrative: frozenNarrative,
           };
           setMessages((prev) => [...prev, errorMessage]);
+          // Error on a turn that produced staged content → snap canvas
+          // back. Errors on no-draft turns leave the canvas alone.
+          const errorTurnId = payload.turn_id ?? latestTurnId.current ?? null;
+          const errorEntry = errorTurnId
+            ? (turnSnapshots.current.get(errorTurnId) ?? null)
+            : null;
+          if (errorEntry?.hadStagedDraft && errorEntry?.snapshot) {
+            applyWorkflowUpdate(errorEntry.snapshot);
+            setProposedWorkflow(null);
+          }
         };
 
         const client = await getSseClient(credentialGetter);
@@ -904,33 +1111,63 @@ export function WorkflowCopilotChat({
               case "processing_update":
                 handleProcessingUpdate(payload);
                 return false;
-              case "tool_call":
-                setProcessingStatus(
-                  TOOL_DISPLAY_NAMES[payload.tool_name] ??
-                    payload.tool_name + "...",
-                );
-                setToolActivity((prev) => applyToolCall(prev, payload));
-                return false;
-              case "tool_result":
-                setToolActivity((prev) => applyToolResult(prev, payload));
-                return false;
               case "condensing":
-                if (payload.status === "started") {
-                  setProcessingStatus("Condensing context...");
-                }
                 return false;
+              case "tool_call":
+              case "tool_result":
               case "narration":
-                if (payload.narration) {
-                  setLatestNarration(payload.narration);
-                }
-                return false;
               case "block_progress":
-                setToolActivity((prev) => applyBlockProgress(prev, payload));
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 return false;
+              case "turn_start": {
+                // Move the pre-submit canvas snapshot into the per-turn
+                // map keyed by the BE-assigned turn_id; cap the map so a
+                // long-running chat does not retain every turn's snapshot.
+                const map = turnSnapshots.current;
+                map.set(payload.turn_id, {
+                  snapshot: pendingSubmitSnapshot.current,
+                  hadStagedDraft: false,
+                });
+                pendingSubmitSnapshot.current = null;
+                while (map.size > MAX_TURN_SNAPSHOTS) {
+                  const oldest = map.keys().next().value;
+                  if (oldest === undefined) break;
+                  map.delete(oldest);
+                }
+                latestTurnId.current = payload.turn_id;
+                setNarrative(() =>
+                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
+                );
+                return false;
+              }
+              case "design_start":
+              case "design_end":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                return false;
+              case "workflow_draft": {
+                // Render the staged workflow on the canvas mid-turn. Only
+                // mark the turn as having staged content if applyWorkflowUpdate
+                // succeeds — a swallowed update would otherwise trigger a
+                // spurious snap-back at terminal.
+                if (payload.workflow) {
+                  const applied = applyWorkflowUpdate(payload.workflow);
+                  if (applied) {
+                    const turnId = latestTurnId.current;
+                    if (turnId) {
+                      const entry = turnSnapshots.current.get(turnId);
+                      if (entry) entry.hadStagedDraft = true;
+                    }
+                  }
+                }
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                return false;
+              }
               case "response":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleResponse(payload);
                 return true;
               case "error":
+                setNarrative((prev) => applyNarrativeEvent(prev, payload));
                 handleError(payload);
                 return true;
               default:
@@ -950,9 +1187,13 @@ export function WorkflowCopilotChat({
           content: "Sorry, I encountered an error. Please try again.",
         };
         setMessages((prev) => [...prev, errorMessage]);
+        // A thrown stream never emits a terminal narrative event, so clear the
+        // bubble or its Working/elapsed indicator would tick forever.
+        setNarrative(EMPTY_NARRATIVE);
       } finally {
         if (streamingAbortController.current === abortController) {
           streamingAbortController.current = null;
+          inFlightRef.current = false;
         }
         if (cancelInFlightController.current === abortController) {
           cancelInFlightController.current = null;
@@ -964,9 +1205,6 @@ export function WorkflowCopilotChat({
         pendingMessageId.current = null;
         pendingCancelToken.current = null;
         setIsLoading(false);
-        setProcessingStatus("");
-        setLatestNarration("");
-        setToolActivity([]);
       }
     },
     [
@@ -976,10 +1214,9 @@ export function WorkflowCopilotChat({
       getSaveData,
       inputValue,
       isLiveBrowserReady,
-      isLoading,
       liveBrowserSessionId,
-      queuedPrompt,
       requiresLiveBrowser,
+      updateQueuedPrompt,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
@@ -994,24 +1231,27 @@ export function WorkflowCopilotChat({
   };
 
   useEffect(() => {
-    // Drain only when the browser is actually ready (non-null session id from
-    // the parent). If requiresLiveBrowser flips to false without a session
-    // (rate-limit, pane hidden), the queue stays so user intent isn't sent
-    // with browser_session_id=null.
-    if (
-      !queuedPrompt ||
-      !liveBrowserSessionId ||
-      isLoading ||
-      !workflowPermanentId
-    ) {
+    // isLoading (reactive state) is the in-flight signal here so the effect
+    // re-runs when a turn ends; handleSend uses the synchronous ref instead.
+    const drainAction = resolveDrainAction({
+      queuedReason: queuedPrompt?.reason ?? null,
+      inFlight: isLoading,
+      hasLiveBrowserSession: Boolean(liveBrowserSessionId),
+      hasWorkflowPermanentId: Boolean(workflowPermanentId),
+    });
+    if (!queuedPrompt || drainAction === "wait") {
       return;
     }
 
     const promptToSend = queuedPrompt;
-    setQueuedPrompt(null);
+    // Clear before re-entering handleSend so a 'send' resolution leaves no
+    // stale queued prompt for the effect to re-drain in a loop. A working
+    // prompt that still needs the browser re-queues under the same id and
+    // drains via the live_browser path once the session arrives.
+    updateQueuedPrompt(null);
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
-      skipQueue: true,
+      skipQueue: drainAction === "drain_skip_queue",
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
@@ -1020,6 +1260,7 @@ export function WorkflowCopilotChat({
     isLoading,
     liveBrowserSessionId,
     queuedPrompt,
+    updateQueuedPrompt,
     workflowPermanentId,
   ]);
 
@@ -1243,18 +1484,24 @@ export function WorkflowCopilotChat({
     return null;
   }
 
-  const inputDisabled = isLoading || Boolean(queuedPrompt);
+  // Input stays usable while Copilot works; only a parked queued prompt
+  // disables it (the message is already captured).
+  const inputDisabled = Boolean(queuedPrompt);
   const queuedPromptWaitingStatus =
-    "Prompt queued. Waiting for live browser...";
+    queuedPrompt?.reason === "working"
+      ? "Queued — sends when this turn finishes."
+      : "Prompt queued. Waiting for live browser...";
   const browserStatusText = queuedPrompt
     ? queuedPromptWaitingStatus
-    : isWaitingForLiveBrowser
-      ? "Live browser is starting. Send now to queue your prompt."
-      : null;
+    : isLoading
+      ? "Copilot is working — message will queue…"
+      : isWaitingForLiveBrowser
+        ? "Live browser is starting. Send now to queue your prompt."
+        : null;
 
   return (
     <div
-      className="fixed z-50 flex flex-col rounded-lg border border-slate-700 bg-slate-900 shadow-2xl"
+      className="fixed z-50 flex flex-col rounded-lg border border-border bg-slate-elevation1 text-foreground shadow-2xl"
       style={{
         left: `${position.x}px`,
         top: `${position.y}px`,
@@ -1264,28 +1511,28 @@ export function WorkflowCopilotChat({
     >
       {/* Header */}
       <div
-        className="flex cursor-move items-center justify-between border-b border-slate-700 px-4 py-2"
+        className="flex cursor-move items-center justify-between border-b border-border px-4 py-2"
         onMouseDown={handleMouseDown}
       >
-        <h3 className="text-sm font-semibold text-slate-200">
-          Workflow Copilot (Beta)
+        <h3 className="text-sm font-semibold text-foreground">
+          Agent Copilot (Beta)
         </h3>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={handleNewChat}
             onMouseDown={(e) => e.stopPropagation()}
-            className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+            className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground"
           >
             New chat
           </button>
-          <div className="h-2 w-2 rounded-full bg-green-500"></div>
-          <span className="text-xs text-slate-400">Active</span>
+          <div className="h-2 w-2 rounded-full bg-emerald-500"></div>
+          <span className="text-xs text-muted-foreground">Active</span>
           <button
             type="button"
             onClick={() => onClose?.()}
             onMouseDown={(e) => e.stopPropagation()}
-            className="ml-2 rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+            className="ml-2 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
             title="Close"
           >
             <Cross2Icon className="h-4 w-4" />
@@ -1294,140 +1541,174 @@ export function WorkflowCopilotChat({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="space-y-3">
-          {!isLoadingHistory && messages.length === 0 && !isLoading ? (
-            <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-300">
-              <p className="font-semibold text-slate-200">Start a new chat</p>
-              <p className="mt-2 text-slate-400">
-                Ask the copilot to draft or edit your workflow. Provide a goal,
-                the target site, and any credentials it should use.
-              </p>
-              <p className="mt-2 text-slate-400">
-                Example: "Build workflow to find the top post on hackernews
-                today"
-              </p>
-            </div>
-          ) : null}
-          {messages.map((message, index) => {
-            const isLastMessage = index === messages.length - 1;
-            const showProposedPanel = isLastMessage && proposedWorkflow;
-            const showQueuedFooter =
-              isQueuedPromptWaiting && message.id === queuedPrompt?.id;
-            return (
-              <MessageItem
-                key={message.id}
-                message={message}
-                footer={
-                  showQueuedFooter ? (
-                    <div className="flex items-center gap-2 text-xs text-slate-400">
-                      <ReloadIcon className="h-3 w-3 animate-spin" />
-                      <span>{queuedPromptWaitingStatus}</span>
-                    </div>
-                  ) : showProposedPanel ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
-                        className="rounded border border-blue-500/60 bg-blue-500/10 px-3 py-1 text-xs text-blue-100 hover:bg-blue-500/20"
-                      >
-                        Review
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
-                        className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
-                      >
-                        Accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleAcceptWorkflow(proposedWorkflow, true)
-                        }
-                        className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
-                      >
-                        Always accept
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleRejectWorkflow}
-                        className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
-                      >
-                        Reject
-                      </button>
-                    </>
-                  ) : null
-                }
-              />
-            );
-          })}
-          {(isLoading || isQueuedPromptWaiting) && (
-            <div className="flex items-start gap-3">
-              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
-                AI
+      <div className="relative min-h-0 flex-1">
+        <div ref={scrollRef} className="h-full overflow-y-auto p-4">
+          <div className="space-y-3">
+            {!isLoadingHistory && messages.length === 0 && !isLoading ? (
+              <div className="rounded-lg border border-border bg-slate-elevation2 p-4 text-sm text-muted-foreground">
+                <p className="font-semibold text-foreground">
+                  Start a new chat
+                </p>
+                <p className="mt-2 text-muted-foreground">
+                  Ask the copilot to draft or edit your agent. Provide a goal,
+                  the target site, and any credentials it should use.
+                </p>
+                <p className="mt-2 text-muted-foreground">
+                  Example: "Build an agent to find the top post on hackernews
+                  today"
+                </p>
               </div>
-              <div className="flex-1 rounded-lg bg-slate-800 p-3">
-                <div className="flex items-center gap-2 text-sm text-slate-300">
-                  <ReloadIcon className="h-4 w-4 animate-spin" />
-                  <span>
-                    {isQueuedPromptWaiting
-                      ? queuedPromptWaitingStatus
-                      : latestNarration || processingStatus || "Processing..."}
-                  </span>
-                </div>
-                {isQueuedPromptWaiting ? (
-                  <div className="mt-2 text-xs text-slate-500">
-                    Copilot will start automatically once the browser is ready.
-                  </div>
-                ) : null}
-                {!isQueuedPromptWaiting && toolActivity.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    {toolActivity.map((activity) => {
-                      const isRetrySuccess =
-                        activity.status === "success" &&
-                        activity.linkedRecovery === true;
-                      const tooltip = activity.detail ?? activity.summary;
-                      const displayName =
-                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
-                        activity.tool_name;
-                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
-                        activity.linkedRecovery
-                          ? " border-l border-amber-400/40 pl-2"
-                          : ""
-                      }`;
-                      return (
-                        <div
-                          key={activity.tool_call_id}
-                          className={containerClass}
+            ) : null}
+            <ConvoAggregatePill
+              messages={messages}
+              isInFlight={
+                isLoading ||
+                (narrative.turnId !== null && narrative.terminal === null)
+              }
+            />
+            {messages.map((message, index) => {
+              const isLastMessage = index === messages.length - 1;
+              const showQueuedFooter =
+                isQueuedPromptWaiting && message.id === queuedPrompt?.id;
+              // Per-message frozen narrative. When an AI message carries a
+              // frozen narrative, render the narrative card stack in place
+              // of the legacy text bubble so the per-block cards survive
+              // subsequent turns. The Accept/Reject controls render only on
+              // the latest message AND while the proposal is pending review.
+              if (message.sender === "ai" && message.narrative) {
+                const showProposalActions =
+                  isLastMessage && Boolean(proposedWorkflow);
+                return (
+                  <div
+                    key={message.id}
+                    className="flex flex-col gap-2"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <NarrativeView
+                      turn={message.narrative}
+                      onBlockSelect={onBlockSelect}
+                    />
+                    {showProposalActions && proposedWorkflow ? (
+                      <div className="flex flex-wrap gap-2 pl-1">
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
                         >
-                          <span
-                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
-                          />
-                          <span
-                            className="line-clamp-2 min-w-0 flex-1"
-                            title={tooltip}
-                          >
-                            {isRetrySuccess ? "↻ " : ""}
-                            {displayName}
-                            {activity.summary ? ` — ${activity.summary}` : ""}
-                          </span>
-                        </div>
-                      );
-                    })}
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reject
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
-                )}
+                );
+              }
+              const showProposedPanel = isLastMessage && proposedWorkflow;
+              return (
+                <MessageItem
+                  key={message.id}
+                  message={message}
+                  footer={
+                    showQueuedFooter ? (
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <ReloadIcon className="h-3 w-3 animate-spin" />
+                        <span>{queuedPromptWaitingStatus}</span>
+                      </div>
+                    ) : showProposedPanel ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                          className="rounded border border-cta/60 bg-cta/10 px-3 py-1 text-xs text-foreground hover:bg-cta/20"
+                        >
+                          Review
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/90"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleAcceptWorkflow(proposedWorkflow, true)
+                          }
+                          className="rounded bg-success px-3 py-1 text-xs text-success-foreground hover:bg-success/80"
+                        >
+                          Always accept
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRejectWorkflow}
+                          className="rounded bg-destructive px-3 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+                        >
+                          Reject
+                        </button>
+                      </>
+                    ) : null
+                  }
+                />
+              );
+            })}
+            {/*
+            Bottom in-flight narrative bubble. Suppressed once the terminal
+            RESPONSE has frozen the narrative into the latest AI message —
+            otherwise the same turn would render twice.
+          */}
+            {narrative.turnId !== null && narrative.terminal === null && (
+              <div
+                className="flex flex-col gap-2"
+                role="status"
+                aria-live="polite"
+              >
+                <NarrativeView turn={narrative} onBlockSelect={onBlockSelect} />
               </div>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
+            )}
+          </div>
         </div>
+        {!isPinned ? (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border bg-slate-elevation3 px-3 py-1 text-xs text-foreground shadow-md hover:bg-slate-elevation4"
+          >
+            <ChevronDownIcon className="h-3 w-3" />
+            Jump to latest
+          </button>
+        ) : null}
       </div>
 
       {/* Input */}
-      <div className="border-t border-slate-700 p-3">
+      <div className="border-t border-border p-3">
         {browserStatusText ? (
-          <div className="mb-2 text-xs text-slate-400">{browserStatusText}</div>
+          <div className="mb-2 text-xs text-muted-foreground">
+            {browserStatusText}
+          </div>
         ) : null}
         <div className="flex items-end gap-2">
           <textarea
@@ -1435,34 +1716,70 @@ export function WorkflowCopilotChat({
             placeholder={
               queuedPrompt
                 ? "Prompt queued..."
-                : isWaitingForLiveBrowser
-                  ? "Type a prompt to queue..."
-                  : "Type your message... (Shift+Enter for new line)"
+                : isLoading
+                  ? "Type a message to queue for the next turn…"
+                  : isWaitingForLiveBrowser
+                    ? "Type a prompt to queue..."
+                    : "Type your message... (Shift+Enter for new line)"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex-1 resize-none rounded-md border border-input bg-slate-elevation2 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
               minHeight: "38px",
               maxHeight: "150px",
               overflow: "auto",
             }}
           />
-          {isLoading || Boolean(queuedPrompt) ? (
+          {isLoading && queuedPrompt ? (
+            <>
+              <button
+                onClick={cancelQueuedPrompt}
+                title="Edit queued message"
+                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              >
+                Edit queued
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : isLoading ? (
+            <>
+              <button
+                onClick={() => handleSend()}
+                title="Queue for the next turn"
+                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+              >
+                Queue
+              </button>
+              <button
+                onClick={cancelSend}
+                title="Cancel run"
+                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              >
+                Cancel run
+              </button>
+            </>
+          ) : queuedPrompt ? (
             <button
-              onClick={isLoading ? cancelSend : cancelQueuedPrompt}
-              title={isLoading ? "Stop Copilot" : "Edit queued prompt"}
-              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              onClick={cancelQueuedPrompt}
+              title="Edit queued prompt"
+              className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
               Cancel
             </button>
           ) : (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+              className="rounded-md bg-cta px-4 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
             >
               Send
             </button>

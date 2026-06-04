@@ -18,12 +18,13 @@ import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
 import {
   findActiveItem,
+  parseActiveIterationParam,
   resolveScreenshotBlockId,
 } from "./workflowTimelineUtils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { browserStreamingMode } from "@/util/env";
+import { useBrowserStreamingMode } from "@/hooks/useRuntimeConfig";
 
 export type ActionItem = {
   block: WorkflowRunBlock;
@@ -40,8 +41,11 @@ export type WorkflowRunOverviewActiveElement =
 function WorkflowRunOverview() {
   const [searchParams] = useSearchParams();
   const active = searchParams.get("active");
+  const iterationParam = searchParams.get("iteration");
+  const activeIteration = parseActiveIterationParam(iterationParam);
   const queryClient = useQueryClient();
   const [vncFailed, setVncFailed] = useState(false);
+  const { browserStreamingMode } = useBrowserStreamingMode();
   const { data: workflowRun, isLoading: workflowRunIsLoading } =
     useWorkflowRunWithWorkflowQuery();
 
@@ -156,7 +160,9 @@ function WorkflowRunOverview() {
           workflowRunBlockId={resolveScreenshotBlockId(
             workflowRunTimeline,
             selection,
+            activeIteration,
           )}
+          runStatus={workflowRun?.status}
         />
       )}
       {isObserverThought(selection) && (

@@ -37,6 +37,7 @@ import {
   TableCell,
   TableHead,
   TableHeader,
+  TableMessageRow,
   TableRow,
 } from "@/components/ui/table";
 import { useRunsQuery } from "@/hooks/useRunsQuery";
@@ -238,13 +239,7 @@ function RunHistory() {
 
     // No runs found
     if (runs?.length === 0) {
-      return (
-        <TableRow>
-          <TableCell colSpan={6}>
-            <div className="text-center">No runs found</div>
-          </TableCell>
-        </TableRow>
-      );
+      return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
     }
 
     return runs?.map((run) => {
@@ -267,13 +262,13 @@ function RunHistory() {
               </Tip>
             )}
             {run.workflow_deleted && (
-              <Tip content="Source workflow deleted">
+              <Tip content="Source agent deleted">
                 <ExclamationTriangleIcon className="text-amber-400" />
               </Tip>
             )}
             <span
               className={cn(
-                run.workflow_deleted && "text-slate-400",
+                run.workflow_deleted && "text-neutral-600 dark:text-slate-400",
                 "truncate",
               )}
             >
@@ -305,7 +300,9 @@ function RunHistory() {
               {isKnownStatus(run.status) ? (
                 <StatusBadge status={run.status} />
               ) : (
-                <span className="text-sm text-slate-400">{run.status}</span>
+                <span className="text-sm text-neutral-600 dark:text-slate-400">
+                  {run.status}
+                </span>
               )}
             </TableCell>
             <TableCell
@@ -314,7 +311,7 @@ function RunHistory() {
             >
               {basicLocalTimeFormat(run.created_at)}
             </TableCell>
-            <TableCell className="text-slate-400">
+            <TableCell className="text-neutral-600 dark:text-slate-400">
               {executionTime ?? "-"}
             </TableCell>
             <TableCell>
@@ -325,18 +322,21 @@ function RunHistory() {
                       <TooltipTrigger asChild>
                         <Button
                           size="icon"
-                          variant="outline"
+                          variant="ghost"
                           onClick={(event) => {
                             event.stopPropagation();
                             toggleParametersExpanded(run.run_id);
                           }}
-                          className={cn(isExpanded && "text-blue-400")}
+                          className={cn(
+                            "text-muted-foreground hover:text-foreground",
+                            isExpanded && "text-blue-400",
+                          )}
                         >
                           <MixerHorizontalIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>
-                        {isExpanded ? "Hide Parameters" : "Show Parameters"}
+                        {isExpanded ? "Hide Inputs" : "Show Inputs"}
                       </TooltipContent>
                     </Tooltip>
                   </TooltipProvider>
@@ -383,7 +383,7 @@ function RunHistory() {
           data-testid="workflow-filter-banner"
         >
           <span className="truncate">
-            Filtering runs for workflow{" "}
+            Filtering runs for agent{" "}
             <span className="font-mono">{workflowPermanentIdFilter}</span>
           </span>
           <Button
@@ -407,8 +407,8 @@ function RunHistory() {
           }}
           placeholder={
             workflowPermanentIdFilter
-              ? "Clear the workflow filter above to search"
-              : "Search by run ID or parameter..."
+              ? "Clear the agent filter above to search"
+              : "Search by run ID or input..."
           }
           disabled={!!workflowPermanentIdFilter}
           className="w-48 lg:w-72"
@@ -427,27 +427,25 @@ function RunHistory() {
           }}
         />
       </div>
-      <div className="rounded-lg border">
+      <div className="overflow-hidden rounded-lg border border-border">
         <Table className="sm:table-fixed">
-          <TableHeader className="rounded-t-lg bg-slate-elevation2">
+          <TableHeader>
             <TableRow>
-              <TableHead className="w-[20%] rounded-tl-lg text-slate-400">
-                Run ID
-              </TableHead>
-              <TableHead className="w-[20%] text-slate-400">Detail</TableHead>
-              <TableHead className="w-[16%] text-slate-400">Status</TableHead>
-              <TableHead className="w-[27%] text-slate-400">
-                Created At
-              </TableHead>
-              <TableHead className="w-[8%] text-slate-400">Duration</TableHead>
-              <TableHead className="w-[8%] rounded-tr-lg text-slate-400"></TableHead>
+              <TableHead className="w-[20%]">Run ID</TableHead>
+              <TableHead className="w-[20%]">Detail</TableHead>
+              <TableHead className="w-[16%]">Status</TableHead>
+              <TableHead className="w-[27%]">Created At</TableHead>
+              <TableHead className="w-[8%]">Duration</TableHead>
+              <TableHead className="w-[8%]"></TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>{displayTableBody()}</TableBody>
         </Table>
         <div className="relative px-3 py-3">
           <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-slate-400">Items per page</span>
+            <span className="text-neutral-600 dark:text-slate-400">
+              Items per page
+            </span>
             <Select
               value={String(itemsPerPage)}
               onValueChange={(size) => {
@@ -557,8 +555,8 @@ function WorkflowRunParametersInline({
 
   if (!hasParameters && !hasExtraHeaders) {
     return (
-      <div className="ml-8 py-4 text-sm text-slate-400">
-        No parameters for this run
+      <div className="ml-8 py-4 text-sm text-neutral-600 dark:text-slate-400">
+        No inputs for this run
       </div>
     );
   }
@@ -584,7 +582,7 @@ function WorkflowRunParametersInline({
     <div className="space-y-4">
       {hasParameters && (
         <ParameterDisplayInline
-          title="Run Parameters"
+          title="Run Inputs"
           parameters={parameterItems}
           searchQuery={searchQuery}
           keywordMatchesParameter={keywordMatchesParameter}

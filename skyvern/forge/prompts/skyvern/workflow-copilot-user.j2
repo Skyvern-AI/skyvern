@@ -20,6 +20,14 @@ Workflow block summary:
 Use this summary as a block-label index, then inspect the full workflow definition above for exact block details.
 {% endif %}
 
+{% if user_workflow_change_summary is defined and user_workflow_change_summary %}
+USER WORKFLOW CHANGES SINCE LAST COPILOT TURN:
+
+```
+{{ user_workflow_change_summary }}
+```
+{% endif %}
+
 PREVIOUS CONTEXT:
 
 {% if chat_history %}
@@ -62,6 +70,13 @@ If there's a failure, analyze the failure reason and visible elements to provide
 No debugger run information available. The workflow hasn't been run yet, or no run data is accessible.
 {% endif %}
 
+{% if repeated_reply_warning is defined and repeated_reply_warning %}
+REPEATED REPLY WARNING:
+
+```
+{{ repeated_reply_warning }}
+```
+{% endif %}
 USER MESSAGE:
 
 The user says:

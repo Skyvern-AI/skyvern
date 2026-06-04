@@ -1,6 +1,7 @@
 import { ReactFlowProvider } from "@xyflow/react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useEffect } from "react";
+import { usePostHog } from "posthog-js/react";
 import { useWorkflowQuery } from "../hooks/useWorkflowQuery";
 import {
   getElements,
@@ -17,6 +18,8 @@ import { useMountEffect } from "@/hooks/useMountEffect";
 
 function WorkflowEditor() {
   const { workflowPermanentId } = useParams();
+  const [searchParams] = useSearchParams();
+  const posthog = usePostHog();
   const { data: workflow, isLoading } = useWorkflowQuery({
     workflowPermanentId,
   });
@@ -31,6 +34,13 @@ function WorkflowEditor() {
   const blockOutputStore = useBlockOutputStore();
 
   useMountEffect(() => blockOutputStore.reset());
+
+  useMountEffect(() => {
+    const via = searchParams.get("via");
+    if (via) {
+      posthog?.capture("copilot.discover.started", { entry_point: via });
+    }
+  });
 
   useEffect(() => {
     if (workflow) {
@@ -72,8 +82,12 @@ function WorkflowEditor() {
     webhookCallbackUrl: workflow.webhook_callback_url,
     model: workflow.model,
     maxScreenshotScrolls: workflow.max_screenshot_scrolls,
+    maxElapsedTimeMinutes: workflow.max_elapsed_time_minutes ?? null,
     extraHttpHeaders: workflow.extra_http_headers
       ? JSON.stringify(workflow.extra_http_headers)
+      : null,
+    cdpConnectHeaders: workflow.cdp_connect_headers
+      ? JSON.stringify(workflow.cdp_connect_headers)
       : null,
     runWith: workflow.run_with ?? "agent",
     codeVersion: workflow.code_version ?? null,
@@ -90,16 +104,30 @@ function WorkflowEditor() {
   const elements = getElements(blocksToRender, settings, !isGlobalWorkflow);
 
   return (
-    <div className="relative flex h-screen w-full">
-      <ReactFlowProvider>
-        <Workspace
-          initialEdges={elements.edges}
-          initialNodes={elements.nodes}
-          initialTitle={workflow.title}
-          showBrowser={false}
-          workflow={workflow}
-        />
-      </ReactFlowProvider>
+    <div className="relative flex h-screen w-full flex-col">
+      {elements.validationError ? (
+        <div
+          role="alert"
+          className="z-10 border-b border-amber-700/40 bg-amber-950/50 px-4 py-2 text-sm text-amber-200"
+        >
+          <strong className="font-semibold">
+            Workflow validation warning:
+          </strong>{" "}
+          {elements.validationError.message}
+        </div>
+      ) : null}
+      <div className="relative flex flex-1">
+        <ReactFlowProvider>
+          <Workspace
+            key={workflowPermanentId}
+            initialEdges={elements.edges}
+            initialNodes={elements.nodes}
+            initialTitle={workflow.title}
+            showBrowser={false}
+            workflow={workflow}
+          />
+        </ReactFlowProvider>
+      </div>
     </div>
   );
 }

@@ -1,8 +1,4 @@
-import { useEffect, useRef } from "react";
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { Label } from "@/components/ui/label";
-import { WorkflowBlockInput } from "@/components/WorkflowBlockInput";
-import { WorkflowDataSchemaInputGroup } from "@/components/DataSchemaInputGroup/WorkflowDataSchemaInputGroup";
+import { useCallback, useEffect, useRef } from "react";
 import {
   Handle,
   NodeProps,
@@ -11,27 +7,27 @@ import {
   useReactFlow,
   type Node,
 } from "@xyflow/react";
-import { AppNode } from "..";
-import {
-  helpTooltips,
-  buildWhileLoopConditionTooltip,
-} from "../../helpContent";
-import { dataSchemaExampleValue } from "../types";
-import type { LoopNode } from "./types";
-import { useIsFirstBlockInWorkflow } from "../../hooks/useIsFirstNodeInWorkflow";
-import { Checkbox } from "@/components/ui/checkbox";
-import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
-import {
-  inferBranchCriteriaTypeFromExpression,
-  getLoopNodeWidth,
-} from "../../workflowEditorUtils";
-import { cn } from "@/util/utils";
-import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
-import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { cn } from "@/util/utils";
+
+import { AppNode } from "..";
+import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
+import { useCollapseContext } from "../../collapse/CollapseContext";
+import {
+  isBlockCollapsedAt,
+  useIsBlockCollapsed,
+  useNodeCollapseStore,
+} from "../../collapse/useNodeCollapseStore";
+import type { WorkflowBlockType } from "@/routes/workflows/types/workflowTypes";
+import { getLoopNodeWidth } from "../../workflowEditorUtils";
+import { BuildModeOnly } from "../BuildModeOnly";
+import { NodeHeader } from "../components/NodeHeader";
+import { LoopEditor } from "./LoopEditor";
+import type { LoopNode } from "./types";
 
 function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const nodes = useNodes<AppNode>();
@@ -40,7 +36,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     throw new Error("Node not found"); // not possible
   }
   const { editable, label } = data;
-  const { blockLabel: urlBlockLabel } = useParams();
+  const { blockLabel: urlBlockLabel, workflowPermanentId } = useParams();
   const { data: workflowRun } = useWorkflowRunQuery();
   const workflowRunIsRunningOrQueued =
     workflowRun && statusIsRunningOrQueued(workflowRun);
@@ -48,32 +44,72 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
-  const update = useUpdate<LoopNode["data"]>({ id, editable });
-  const isFirstWorkflowBlock = useIsFirstBlockInWorkflow({ id });
   const children = nodes.filter((node) => node.parentId === id);
   const recordingStore = useRecordingStore();
-  const headerRef = useRef<HTMLDivElement>(null);
-  const { updateNodeData } = useReactFlow();
+  const observerRef = useRef<ResizeObserver | null>(null);
+  const { updateNodeData, setNodes } = useReactFlow<AppNode>();
   const lastHeaderHeight = useRef<number | undefined>(data._headerHeight);
+  const isCollapsed = useIsBlockCollapsed(label);
+  const prevIsCollapsed = useRef<boolean | null>(null);
+  const { open } = useCollapseContext();
 
-  useEffect(() => {
-    const el = headerRef.current;
-    if (!el) return;
-
-    const observer = new ResizeObserver(() => {
-      // Use offsetHeight to include padding (py-4 = 32px) in the measurement
-      const height = Math.round(el.offsetHeight);
-      if (lastHeaderHeight.current !== height) {
-        lastHeaderHeight.current = height;
-        updateNodeData(id, { _headerHeight: height });
-        // Trigger re-layout after React processes the data update
-        window.dispatchEvent(new Event("loop-header-resized"));
+  // Callback ref re-runs on every mount/unmount of the inner card, which is
+  // exactly when collapse/expand swaps the JSX subtree. A useEffect-captured
+  // ref would freeze on the original element and stop firing after the first
+  // collapse, causing _headerHeight to drift across cycles.
+  const headerRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (observerRef.current) {
+        observerRef.current.disconnect();
+        observerRef.current = null;
       }
-    });
+      if (!el) return;
+      lastHeaderHeight.current = undefined;
+      const observer = new ResizeObserver(() => {
+        const height = Math.round(el.offsetHeight);
+        if (lastHeaderHeight.current !== height) {
+          lastHeaderHeight.current = height;
+          updateNodeData(id, { _headerHeight: height });
+          window.dispatchEvent(new Event("loop-header-resized"));
+        }
+      });
+      observer.observe(el);
+      observerRef.current = observer;
+    },
+    [id, updateNodeData],
+  );
 
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [id, updateNodeData]);
+  // Hide/show all descendants when collapse state flips. Walks recursively
+  // so a nested conditional's branch contents (whose parentId is the
+  // conditional, not this loop) also hide. On expand, respects any inner
+  // collapsed block in the zustand store so a previously-collapsed inner
+  // block stays collapsed. Skip on initial mount when already expanded to
+  // avoid creating new node objects before the ResizeObserver fires (which
+  // would reset RF's `measured` and cause marginy to fall back to the
+  // 225px default, producing a large gap above the start block).
+  useEffect(() => {
+    if (prevIsCollapsed.current === null && !isCollapsed) {
+      prevIsCollapsed.current = false;
+      return;
+    }
+    const wasCollapsed = prevIsCollapsed.current === true;
+    prevIsCollapsed.current = isCollapsed;
+    setNodes((prev) => {
+      const collapsedSet = useNodeCollapseStore.getState().collapsed;
+      const wpid = workflowPermanentId ?? "__global__";
+      return applyDescendantCollapseVisibility(prev, id, isCollapsed, (label) =>
+        isBlockCollapsedAt(collapsedSet, wpid, label),
+      );
+    });
+    // After expanding, fire a re-layout so children land at the correct
+    // marginy even if debouncedLayoutForDimensions already ran with stale
+    // data before the header's ResizeObserver had a chance to update
+    // _headerHeight. The handler has a built-in 10ms delay that lets the
+    // ResizeObserver win the race.
+    if (wasCollapsed && !isCollapsed) {
+      window.dispatchEvent(new Event("loop-header-resized"));
+    }
+  }, [id, isCollapsed, setNodes, workflowPermanentId]);
 
   const furthestDownChild: Node | null = children.reduce(
     (acc, child) => {
@@ -97,6 +133,49 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
   const loopKind = data.loopKind;
   const headerBlockType: WorkflowBlockType =
     loopKind === "while" ? "while_loop" : "for_loop";
+
+  if (isCollapsed) {
+    return (
+      <div
+        className={cn({
+          "pointer-events-none opacity-50": recordingStore.isRecording,
+        })}
+      >
+        <Handle
+          type="source"
+          position={Position.Bottom}
+          id="a"
+          className="opacity-0"
+        />
+        <Handle
+          type="target"
+          position={Position.Top}
+          id="b"
+          className="opacity-0"
+        />
+        <div
+          className={cn(
+            "w-[30rem] rounded-lg bg-slate-elevation3 px-6 py-4 shadow-sm transition-shadow motion-reduce:transition-none",
+            {
+              "pointer-events-none": thisBlockIsPlaying,
+              "bg-slate-950 outline outline-2 outline-slate-300":
+                thisBlockIsTargetted,
+            },
+            data.comparisonColor,
+          )}
+        >
+          <NodeHeader
+            blockLabel={label}
+            editable={editable}
+            nodeId={id}
+            totpIdentifier={null}
+            totpUrl={null}
+            type={headerBlockType}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -127,7 +206,8 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
           <div
             ref={headerRef}
             className={cn(
-              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+              "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
+              open ? "shadow-md" : "shadow-sm",
               {
                 "pointer-events-none": thisBlockIsPlaying,
                 "bg-slate-950 outline outline-2 outline-slate-300":
@@ -144,218 +224,9 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
               totpUrl={null}
               type={headerBlockType}
             />
-            <div
-              role="tablist"
-              aria-label="Loop type"
-              className="grid h-9 w-full grid-cols-2 rounded-lg bg-muted p-1 text-muted-foreground"
-            >
-              {(["for_each", "while"] as const).map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="tab"
-                  aria-selected={loopKind === value}
-                  disabled={!data.editable}
-                  className={cn(
-                    "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",
-                    {
-                      "bg-background text-foreground shadow":
-                        loopKind === value,
-                    },
-                  )}
-                  onClick={() => {
-                    if (!data.editable || value === loopKind) {
-                      return;
-                    }
-                    if (value === "while") {
-                      const expr =
-                        data.whileConditionExpression.trim() === ""
-                          ? "{{ true }}"
-                          : data.whileConditionExpression;
-                      update({
-                        loopKind: "while",
-                        whileConditionExpression: expr,
-                        whileConditionCriteriaType:
-                          inferBranchCriteriaTypeFromExpression(expr),
-                      });
-                    } else {
-                      update({ loopKind: "for_each" });
-                    }
-                  }}
-                >
-                  {value === "for_each" ? "For each" : "While"}
-                </button>
-              ))}
-            </div>
-            {loopKind === "for_each" ? (
-              <>
-                <div className="space-y-2">
-                  <div className="flex justify-between">
-                    <div className="flex gap-2">
-                      <Label className="text-xs text-slate-300">
-                        Loop Value
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["loop"]["loopValue"]}
-                      />
-                    </div>
-                    {isFirstWorkflowBlock ? (
-                      <div className="flex justify-end text-xs text-slate-400">
-                        Tip: Use the {"+"} button to add parameters!
-                      </div>
-                    ) : null}
-                  </div>
-                  <WorkflowBlockInput
-                    nodeId={id}
-                    value={data.loopVariableReference}
-                    onChange={(value) => {
-                      update({ loopVariableReference: value });
-                    }}
-                  />
-                </div>
-                <WorkflowDataSchemaInputGroup
-                  value={data.dataSchema}
-                  onChange={(value) => {
-                    update({ dataSchema: value });
-                  }}
-                  suggestionContext={{
-                    loop_variable_reference: data.loopVariableReference,
-                  }}
-                  exampleValue={dataSchemaExampleValue}
-                  helpTooltip={helpTooltips["loop"]["loopDataSchema"]}
-                />
-              </>
-            ) : (
-              <div className="space-y-2">
-                <div className="flex justify-between">
-                  <div className="flex gap-2">
-                    <Label className="text-xs text-slate-300">
-                      Loop Condition
-                    </Label>
-                    <HelpTooltip content={buildWhileLoopConditionTooltip()} />
-                  </div>
-                  {isFirstWorkflowBlock ? (
-                    <div className="flex justify-end text-xs text-slate-400">
-                      Tip: Use the {"+"} button to add parameters!
-                    </div>
-                  ) : null}
-                </div>
-                <WorkflowBlockInput
-                  nodeId={id}
-                  value={data.whileConditionExpression}
-                  onChange={(value) => {
-                    update({
-                      whileConditionExpression: value,
-                      whileConditionCriteriaType:
-                        inferBranchCriteriaTypeFromExpression(value),
-                    });
-                  }}
-                />
-              </div>
-            )}
-            <div className="space-y-2">
-              {loopKind === "for_each" ? (
-                <>
-                  <div className="flex flex-wrap justify-between gap-x-4 gap-y-3">
-                    <div className="flex items-center gap-2">
-                      <Checkbox
-                        checked={data.completeIfEmpty}
-                        disabled={!data.editable}
-                        onCheckedChange={(checked) => {
-                          update({
-                            completeIfEmpty:
-                              checked === "indeterminate" ? false : checked,
-                          });
-                        }}
-                      />
-                      <Label className="text-xs text-slate-300">
-                        Continue if Empty
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["loop"]["completeIfEmpty"]}
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Checkbox
-                        checked={data.continueOnFailure}
-                        disabled={!data.editable}
-                        onCheckedChange={(checked) => {
-                          update({
-                            continueOnFailure:
-                              checked === "indeterminate" ? false : checked,
-                          });
-                        }}
-                      />
-                      <Label className="text-xs text-slate-300">
-                        Continue Workflow if Loop Fails
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["loop"]["continueOnFailure"]}
-                      />
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap gap-x-4 gap-y-3">
-                    <div className="flex items-center gap-2">
-                      <Checkbox
-                        checked={data.nextLoopOnFailure ?? false}
-                        disabled={!data.editable}
-                        onCheckedChange={(checked) => {
-                          update({
-                            nextLoopOnFailure:
-                              checked === "indeterminate" ? false : checked,
-                          });
-                        }}
-                      />
-                      <Label className="text-xs text-slate-300">
-                        Skip Iterations that Fail
-                      </Label>
-                      <HelpTooltip
-                        content={helpTooltips["loop"]["nextLoopOnFailure"]}
-                      />
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      checked={data.continueOnFailure}
-                      disabled={!data.editable}
-                      onCheckedChange={(checked) => {
-                        update({
-                          continueOnFailure:
-                            checked === "indeterminate" ? false : checked,
-                        });
-                      }}
-                    />
-                    <Label className="text-xs text-slate-300">
-                      Continue Workflow if Loop Fails
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["while_loop"]["continueOnFailure"]}
-                    />
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Checkbox
-                      checked={data.nextLoopOnFailure ?? false}
-                      disabled={!data.editable}
-                      onCheckedChange={(checked) => {
-                        update({
-                          nextLoopOnFailure:
-                            checked === "indeterminate" ? false : checked,
-                        });
-                      }}
-                    />
-                    <Label className="text-xs text-slate-300">
-                      Skip Iterations that Fail
-                    </Label>
-                    <HelpTooltip
-                      content={helpTooltips["while_loop"]["nextLoopOnFailure"]}
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
+            <BuildModeOnly>
+              <LoopEditor blockId={id} />
+            </BuildModeOnly>
           </div>
         </div>
       </div>

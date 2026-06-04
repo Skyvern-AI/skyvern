@@ -20,6 +20,11 @@ from mcp.types import (
     TextContent,
 )
 
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    build_loop_blocker_signal,
+    stash_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -55,6 +60,10 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+
+
+def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
+    return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
 
 
 def _apply_schema_overlay(
@@ -105,7 +114,7 @@ def _copilot_to_call_tool_result(
 ) -> CallToolResult:
     sanitized = sanitize_tool_result_for_llm("", copilot_result)
     content: list[TextContent] = [TextContent(type="text", text=json.dumps(sanitized))]
-    is_error = not copilot_result.get("ok", True)
+    is_error = copilot_result.get("ok", True) is not True
     return CallToolResult(content=content, isError=is_error)
 
 
@@ -200,13 +209,26 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_ctx = self._context_provider()
         overlay = self._overlays.get(tool_name, SchemaOverlay())
 
+        # MCP-side phase gate; mirror of `_authority_tool_error` in tools.py for MCP-only tools.
+        phase_signal = _phase_blocker_signal(copilot_ctx, tool_name)
+        if phase_signal is not None:
+            LOG.warning(
+                "Phase-gated MCP tool call rejected",
+                tool_name=tool_name,
+                build_phase=getattr(getattr(copilot_ctx, "build_phase", None), "value", None),
+            )
+            payload = stash_blocker_signal(copilot_ctx, phase_signal)
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
+
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
                 "Failed tool step loop detected, skipping execution",
                 tool_name=tool_name,
             )
-            return _copilot_to_call_tool_result({"ok": False, "error": loop_error})
+            payload = _stash_and_emit_loop_blocker(copilot_ctx, loop_error, tool_name)
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         tracker = getattr(copilot_ctx, "consecutive_tool_tracker", None)
         loop_error = detect_tool_loop(tracker, tool_name) if isinstance(tracker, list) else None
@@ -215,20 +237,8 @@ class SkyvernOverlayMCPServer(MCPServer):
                 "Tool loop detected, skipping execution",
                 tool_name=tool_name,
             )
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "ok": False,
-                                "error": loop_error,
-                            }
-                        ),
-                    )
-                ],
-                isError=True,
-            )
+            payload = _stash_and_emit_loop_blocker(copilot_ctx, loop_error, tool_name)
+            return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
         if overlay.pre_hook:
             hook_result = await overlay.pre_hook(arguments, copilot_ctx)
@@ -247,12 +257,11 @@ class SkyvernOverlayMCPServer(MCPServer):
             mcp_args["session_id"] = copilot_ctx.browser_session_id
 
         try:
-            call = self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
             if overlay.requires_browser:
                 async with mcp_browser_context(copilot_ctx):
-                    raw_result = await call
+                    raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
             else:
-                raw_result = await call
+                raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
         except Exception as e:
             LOG.warning(
                 "MCP tool call failed",
@@ -282,6 +291,49 @@ class SkyvernOverlayMCPServer(MCPServer):
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)
         return _copilot_to_call_tool_result(copilot_result)
+
+    async def call_internal_tool(
+        self,
+        mcp_tool_name: str,
+        mcp_args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Raw FastMCP call for internal copilot subsystems (discovery walker).
+
+        Bypasses overlay hooks, loop detection, and screenshot recording —
+        those are model-facing concerns. Still routes through
+        ``ensure_browser_session`` and ``mcp_browser_context`` for session/auth
+        scoping. Mirrors the error-handling block from ``call_tool`` so MCP-
+        side validation or tool errors surface as ``ok=False`` with an
+        extracted error string rather than silently defaulting to
+        ``ok=True``.
+        """
+        if not self._client:
+            return {"ok": False, "error": "MCP client not connected"}
+        ctx = self._context_provider()
+        err = await ensure_browser_session(ctx)
+        if err:
+            return err
+        merged_args = {**mcp_args, "session_id": ctx.browser_session_id}
+        try:
+            async with mcp_browser_context(ctx):
+                raw = await self._client.call_tool(mcp_tool_name, merged_args, raise_on_error=False)
+        except Exception as exc:
+            LOG.warning(
+                "Internal MCP tool call failed",
+                tool=mcp_tool_name,
+                error=str(exc),
+                exc_info=True,
+            )
+            return {"ok": False, "error": f"{mcp_tool_name} failed: {exc}"}
+        raw_mcp = dict(raw.structured_content or {})
+        if raw.is_error:
+            raw_mcp["ok"] = False
+            if not raw.structured_content and raw.content:
+                text_parts = [c.text for c in raw.content if hasattr(c, "text")]
+                raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
+            else:
+                raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        return mcp_to_copilot(raw_mcp)
 
     async def list_prompts(self) -> ListPromptsResult:
         return ListPromptsResult(prompts=[])

@@ -1,14 +1,17 @@
-import { HelpTooltip } from "@/components/HelpTooltip";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Handle, NodeProps, Position } from "@xyflow/react";
-import { helpTooltips } from "../../helpContent";
-import { type UploadNode } from "./types";
-import { cn } from "@/util/utils";
-import { NodeHeader } from "../components/NodeHeader";
 import { useParams } from "react-router-dom";
+
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { cn } from "@/util/utils";
+
+import { useCollapseContext } from "../../collapse/CollapseContext";
+import { NodeBody } from "../../collapse/NodeBody";
+import { BuildModeOnly } from "../BuildModeOnly";
+import { NodeHeader } from "../components/NodeHeader";
+import { UploadEditor } from "./UploadEditor";
+import { type UploadNode } from "./types";
+
 function UploadNode({ id, data }: NodeProps<UploadNode>) {
   const { editable, label } = data;
   const { blockLabel: urlBlockLabel } = useParams();
@@ -19,6 +22,7 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
     urlBlockLabel !== undefined && urlBlockLabel === label;
   const thisBlockIsPlaying =
     workflowRunIsRunningOrQueued && thisBlockIsTargetted;
+  const { open } = useCollapseContext();
 
   return (
     <div>
@@ -36,7 +40,8 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
       />
       <div
         className={cn(
-          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-all",
+          "transform-origin-center w-[30rem] space-y-4 rounded-lg bg-slate-elevation3 px-6 py-4 transition-shadow motion-reduce:transition-none",
+          open ? "shadow-md" : "shadow-sm",
           {
             "pointer-events-none": thisBlockIsPlaying,
             "bg-slate-950 outline outline-2 outline-slate-300":
@@ -50,17 +55,13 @@ function UploadNode({ id, data }: NodeProps<UploadNode>) {
           nodeId={id}
           totpIdentifier={null}
           totpUrl={null}
-          type="upload_to_s3" // sic: the naming is not consistent
+          type="upload_to_s3"
         />
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <Label className="text-sm text-slate-400">File Path</Label>
-              <HelpTooltip content={helpTooltips["upload"]["path"]} />
-            </div>
-            <Input value={data.path} className="nopan text-xs" disabled />
-          </div>
-        </div>
+        <NodeBody>
+          <BuildModeOnly>
+            <UploadEditor blockId={id} />
+          </BuildModeOnly>
+        </NodeBody>
       </div>
     </div>
   );

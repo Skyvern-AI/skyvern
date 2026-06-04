@@ -64,10 +64,10 @@ async def test_resolve_browser_state_for_browser_session(monkeypatch: pytest.Mon
     )
     monkeypatch.setattr(screencast, "app", fake_app)
 
-    result = await screencast._resolve_browser_state("bs_123", "browser_session")
+    result = await screencast._resolve_browser_state("bs_123", "browser_session", organization_id="o_123")
 
     assert result is expected_state
-    fake_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with("bs_123")
+    fake_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state.assert_awaited_once_with("bs_123", "o_123")
     fake_app.BROWSER_MANAGER.get_for_workflow_run.assert_not_called()
     fake_app.BROWSER_MANAGER.get_for_task.assert_not_called()
 
@@ -101,7 +101,7 @@ async def test_wait_for_browser_state_returns_when_working_page_is_available(
     result = await screencast.wait_for_browser_state("wr_123", "workflow_run", timeout=1, poll_interval=0.1)
 
     assert result is browser_state
-    resolve_mock.assert_awaited_once_with("wr_123", "workflow_run", None)
+    resolve_mock.assert_awaited_once_with("wr_123", "workflow_run", None, organization_id=None)
     browser_state.get_working_page.assert_awaited_once()
     sleep_mock.assert_not_awaited()
 

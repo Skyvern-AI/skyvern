@@ -16,6 +16,7 @@ type CredentialFilter = "password" | "credit_card" | "secret";
 
 type Props = {
   filter?: CredentialFilter;
+  search?: string;
   onStartBackgroundTest?: (
     credentialId: string,
     url: string,
@@ -31,11 +32,27 @@ const EMPTY_MESSAGE: Record<CredentialFilter, string> = {
 
 const PAGE_SIZE = 25;
 
-function CredentialsList({ filter, onStartBackgroundTest }: Props = {}) {
+function CredentialsList({
+  filter,
+  search,
+  onStartBackgroundTest,
+}: Props = {}) {
+  const trimmedSearch = search?.trim() ?? "";
   const [page, setPage] = useState(1);
+  const [prevSearch, setPrevSearch] = useState(trimmedSearch);
+
+  // Reset to page 1 synchronously when the search changes — avoids the extra
+  // fetch with the stale page that a post-render effect would trigger.
+  if (prevSearch !== trimmedSearch) {
+    setPrevSearch(trimmedSearch);
+    setPage(1);
+  }
+
   const { data: credentials, isLoading } = useCredentialsQuery({
     page,
     page_size: PAGE_SIZE,
+    credential_type: filter,
+    search: trimmedSearch || undefined,
   });
 
   if (isLoading) {
@@ -51,22 +68,15 @@ function CredentialsList({ filter, onStartBackgroundTest }: Props = {}) {
     return null;
   }
 
-  const filteredCredentials = (() => {
-    if (!credentials) {
-      return [];
-    }
-    if (!filter) {
-      return credentials;
-    }
-    return credentials.filter(
-      (credential) => credential.credential_type === filter,
-    );
-  })();
-
-  if (filteredCredentials.length === 0 && page === 1) {
+  if (credentials.length === 0 && page === 1) {
+    const emptyMessage = trimmedSearch
+      ? `No credentials match “${trimmedSearch}”.`
+      : filter
+        ? EMPTY_MESSAGE[filter]
+        : "No credentials stored yet.";
     return (
-      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-slate-300">
-        {filter ? EMPTY_MESSAGE[filter] : "No credentials stored yet."}
+      <div className="rounded-md border border-slate-700 bg-slate-elevation1 p-6 text-sm text-neutral-600 dark:text-slate-300">
+        {emptyMessage}
       </div>
     );
   }
@@ -76,7 +86,7 @@ function CredentialsList({ filter, onStartBackgroundTest }: Props = {}) {
   return (
     <div className="space-y-5">
       <div className="space-y-5">
-        {filteredCredentials.map((credential) => (
+        {credentials.map((credential) => (
           <CredentialItem
             key={credential.credential_id}
             credential={credential}

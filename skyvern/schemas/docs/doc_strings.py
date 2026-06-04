@@ -7,7 +7,7 @@ The starting URL for the task. If not provided, Skyvern will attempt to determin
 """
 
 TASK_ENGINE_DOC_STRING = """
-The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` is the latest Skyvern agent that performs well with complex and multi-step tasks. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
+The engine that powers the agent task. The default value is `skyvern-1.0`, which is good for simple tasks like filling a form, or searching for information on Google. `skyvern-2.0` remains available for existing V2 workflows and explicitly requested V2 task runs. The `openai-cua` engine uses OpenAI's CUA model. The `anthropic-cua` uses Anthropic's Claude Sonnet 3.7 model with the computer use tool.
 """
 
 PROXY_LOCATION_DOC_STRING = """
@@ -42,6 +42,8 @@ Available geotargeting options:
 - US-FL: Florida (deprecated, routes through RESIDENTIAL_ISP)
 - US-WA: Washington (deprecated, routes through RESIDENTIAL_ISP)
 - NONE: No proxy
+
+For self-hosted deployments, you can pass a custom proxy URL as a dict: {"url": "http://user:password@proxy.example.com:8080"}. This routes the browser through your own proxy server and takes precedence over any globally configured proxy pool.
 """
 
 DATA_EXTRACTION_SCHEMA_DOC_STRING = """

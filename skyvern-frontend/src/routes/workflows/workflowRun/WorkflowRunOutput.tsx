@@ -18,7 +18,7 @@ import { SummarizeOutput } from "@/components/SummarizeOutput";
 import { isTaskVariantBlock } from "../types/workflowTypes";
 import { statusIsAFailureType } from "@/routes/tasks/types";
 import {
-  filenameForDownloadedFileUrl,
+  pickDownloadedFileFilename,
   getBlockDownloadedFileUrls,
 } from "./blockDownloadedFiles";
 
@@ -154,6 +154,15 @@ function WorkflowRunOutput() {
       activeBlock.status === Status.Canceled);
 
   const allFileUrls = workflowRun?.downloaded_file_urls ?? [];
+
+  // Prefer the rich downloaded_files array (carries filename) when the backend
+  // sends it; falls back to URL parsing otherwise.
+  const filenameByUrl = new Map<string, string>();
+  for (const file of workflowRun?.downloaded_files ?? []) {
+    if (file.filename) {
+      filenameByUrl.set(file.url, file.filename);
+    }
+  }
 
   // Scope to the surrounding block whenever the user explicitly selected a
   // block or any action inside it, so drilling from a block into its child
@@ -291,7 +300,7 @@ function WorkflowRunOutput() {
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <h1 className="text-lg font-bold">Workflow Run Outputs</h1>
+            <h1 className="text-lg font-bold">Agent Run Outputs</h1>
             {outputs && (
               <SummarizeOutput
                 key={runContextKey}
@@ -329,7 +338,7 @@ function WorkflowRunOutput() {
             <h1 className="text-lg font-bold">
               {showBlockFiles
                 ? "Block Downloaded Files"
-                : "Workflow Run Downloaded Files"}
+                : "Agent Run Downloaded Files"}
             </h1>
             {userSelectedBlock ? (
               <Button
@@ -340,14 +349,14 @@ function WorkflowRunOutput() {
               >
                 {showAllFilesOverride
                   ? "Show block files"
-                  : "Show all workflow files"}
+                  : "Show all agent files"}
               </Button>
             ) : null}
           </div>
           <div className="space-y-2">
             {fileUrls.length > 0 ? (
               fileUrls.map((url) => {
-                const filename = filenameForDownloadedFileUrl(url);
+                const filename = pickDownloadedFileFilename(url, filenameByUrl);
                 return (
                   <div key={url} title={url} className="flex gap-2">
                     <FileIcon className="size-6" />

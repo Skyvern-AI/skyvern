@@ -21,18 +21,32 @@ from skyvern.exceptions import (
 from skyvern.forge import app
 from skyvern.forge.sdk.trace import traced
 from skyvern.schemas.runs import ProxyLocationInput
-from skyvern.webeye.browser_artifacts import BrowserArtifacts, VideoArtifact
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 from skyvern.webeye.browser_factory import BrowserCleanupFunc, BrowserContextFactory
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
 
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
+
+
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
 
 
 class RealBrowserState(BrowserState):
@@ -83,6 +97,7 @@ class RealBrowserState(BrowserState):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> None:
@@ -102,6 +117,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -115,7 +131,7 @@ class RealBrowserState(BrowserState):
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
-                if len(pages) > 0:
+                if pages:
                     page = pages[-1]
                     use_existing_page = True
             if page is None:
@@ -125,7 +141,7 @@ class RealBrowserState(BrowserState):
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url and page.url.rstrip("/") != url.rstrip("/"):
+            if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
 
     async def _wait_for_settle(self) -> None:
@@ -241,33 +257,6 @@ class RealBrowserState(BrowserState):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
-        if page is None:
-            return
-        if len(self.browser_artifacts.video_artifacts) > index:
-            if self.browser_artifacts.video_artifacts[index].video_path is None:
-                try:
-                    async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                        if page.video:
-                            self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-                except asyncio.TimeoutError:
-                    LOG.info("Timeout to get the page video, skip the exception")
-                except Exception:
-                    LOG.exception("Error while getting the page video", exc_info=True)
-            return
-
-        target_length = index + 1
-        self.browser_artifacts.video_artifacts.extend(
-            [VideoArtifact()] * (target_length - len(self.browser_artifacts.video_artifacts))
-        )
-        try:
-            async with asyncio.timeout(settings.BROWSER_ACTION_TIMEOUT_MS / 1000):
-                if page.video:
-                    self.browser_artifacts.video_artifacts[index].video_path = await page.video.path()
-        except asyncio.TimeoutError:
-            LOG.info("Timeout to get the page video, skip the exception")
-        except Exception:
-            LOG.exception("Error while getting the page video", exc_info=True)
-        return
 
     async def get_or_create_page(
         self,
@@ -279,6 +268,7 @@ class RealBrowserState(BrowserState):
         script_id: str | None = None,
         organization_id: str | None = None,
         extra_http_headers: dict[str, str] | None = None,
+        cdp_connect_headers: dict[str, str] | None = None,
         browser_address: str | None = None,
         browser_profile_id: str | None = None,
     ) -> Page:
@@ -296,6 +286,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -317,6 +308,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -335,6 +327,7 @@ class RealBrowserState(BrowserState):
                 script_id=script_id,
                 organization_id=organization_id,
                 extra_http_headers=extra_http_headers,
+                cdp_connect_headers=cdp_connect_headers,
                 browser_address=browser_address,
                 browser_profile_id=browser_profile_id,
             )
@@ -367,23 +360,50 @@ class RealBrowserState(BrowserState):
             raise EmptyBrowserContext()
         return await self.browser_context.new_page()
 
-    async def reload_page(self) -> None:
+    async def reload_page(self, degradation: bool = False) -> None:
         page = await self.__assert_page()
+        url = page.url
 
-        LOG.info("Reload page", url=page.url)
-        try:
-            start_time = time.time()
-            await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-            end_time = time.time()
-            LOG.info(
-                "Page loading time",
-                loading_time=end_time - start_time,
-            )
-            await self._wait_for_settle()
-            await self._wait_for_challenge_solver(page=page)
-        except Exception as e:
-            LOG.exception(f"Error while reload url: {repr(e)}")
-            raise FailedToReloadPage(url=page.url, error_message=repr(e))
+        if not degradation:
+            LOG.info("Reload page", url=url)
+            try:
+                start_time = time.time()
+                await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+                LOG.info("Page loading time", loading_time=time.time() - start_time)
+                await self._wait_for_settle()
+                await self._wait_for_challenge_solver(page=page)
+            except Exception as e:
+                LOG.exception("Error while reload url", error=repr(e))
+                raise FailedToReloadPage(url=url, error_message=repr(e))
+            return
+
+        strategies: list[str] = ["load", "domcontentloaded", "commit"]
+        for i, strategy in enumerate(strategies):
+            try:
+                LOG.info("Reload page", url=url, wait_until=strategy, degradation_attempt=i)
+                start_time = time.time()
+                await page.reload(timeout=settings.BROWSER_LOADING_TIMEOUT_MS, wait_until=strategy)
+                LOG.info(
+                    "Page loading time",
+                    loading_time=time.time() - start_time,
+                    wait_until=strategy,
+                    degraded=i > 0,
+                )
+                await self._wait_for_settle()
+                await self._wait_for_challenge_solver(page=page)
+                return
+            except Exception as e:
+                if i < len(strategies) - 1:
+                    LOG.warning(
+                        "Reload timed out, degrading wait strategy",
+                        url=url,
+                        wait_until=strategy,
+                        next_strategy=strategies[i + 1],
+                        error=repr(e),
+                    )
+                    continue
+                LOG.exception("Error while reload url after degradation", error=repr(e))
+                raise FailedToReloadPage(url=url, error_message=repr(e))
 
     async def scrape_website(
         self,
@@ -426,6 +446,8 @@ class RealBrowserState(BrowserState):
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
+                    session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+                    await persist_session_cookies(self.browser_context, session_dir)
                     try:
                         await self.browser_context.close()
                     except Exception:

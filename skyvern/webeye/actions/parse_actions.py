@@ -145,11 +145,13 @@ def parse_action(
         click_context = action.get("click_context", None)
         if click_context:
             click_context = ClickContext.model_validate(click_context)
+        double_click = action.get("double_click", False)
         return ClickAction(
             **base_action_dict,
             file_url=file_url,
-            download=action.get("download", False),
+            download=action.get("download") or False,
             click_context=click_context,
+            repeat=2 if double_click else 1,
         )
 
     if action_type == ActionType.INPUT_TEXT:
@@ -198,7 +200,7 @@ def parse_action(
                 index=index,
             ),
             input_or_select_context=input_or_select_context,
-            download=action.get("download", False),
+            download=action.get("download") or False,
         )
 
     if action_type == ActionType.CHECKBOX:
@@ -246,7 +248,8 @@ def parse_action(
             keys = [key]
         else:
             keys = action.get("keys", ["Enter"])
-        return KeypressAction(**base_action_dict, keys=keys)
+        repeat = max(1, int(action.get("repeat", 1) or 1))
+        return KeypressAction(**base_action_dict, keys=keys, repeat=repeat)
 
     if action_type == ActionType.SCROLL:
         # SCROLL from extract-action prompt provides a direction and optionally an element_id

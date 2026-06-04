@@ -104,6 +104,15 @@ function ActionScreenshot({ artifactId, stepId, index, taskStatus }: Props) {
     );
   }
 
+  if (screenshot.archived) {
+    return (
+      <div className="flex h-full items-center justify-center bg-slate-elevation1 text-muted-foreground">
+        This screenshot has been archived. To request restoration, please
+        contact support@skyvern.com
+      </div>
+    );
+  }
+
   return (
     <figure className="mx-auto flex max-w-full flex-col items-center gap-2 overflow-hidden rounded">
       <ZoomableImage src={getImageURL(screenshot)} alt="llm-screenshot" />

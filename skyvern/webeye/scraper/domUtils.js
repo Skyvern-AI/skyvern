@@ -452,11 +452,27 @@ function isHoverOnlyElement(element) {
 // from playwright: https://github.com/microsoft/playwright/blob/1b65f26f0287c0352e76673bc5f85bc36c934b55/packages/playwright-core/src/server/injected/domUtils.ts#L100-L119
 // NOTE: According this logic, some elements with aria-hidden won't be considered as invisible. And the result shows they are indeed interactable.
 function isElementVisible(element) {
+  const tagLower = element.tagName.toLowerCase();
+
+  // Web Component libraries often hide native form inputs inside shadow DOM
+  // with CSS while rendering a styled overlay.
+  if (
+    element.getRootNode() instanceof ShadowRoot &&
+    (tagLower === "input" ||
+      tagLower === "textarea" ||
+      tagLower === "select") &&
+    !element.disabled
+  ) {
+    if (tagLower !== "input" || element.type !== "hidden") {
+      return true;
+    }
+  }
+
   // TODO: This is a hack to not check visibility for option elements
   // because they are not visible by default. We check their parent instead for visibility.
   if (
-    element.tagName.toLowerCase() === "option" ||
-    (element.tagName.toLowerCase() === "input" &&
+    tagLower === "option" ||
+    (tagLower === "input" &&
       (element.type === "radio" || element.type === "checkbox"))
   )
     return element.parentElement && isElementVisible(element.parentElement);
@@ -1513,6 +1529,84 @@ async function uniqueId() {
   return result;
 }
 
+const ENRICHED_ELEMENT_TEXT_LIMIT = 120;
+
+function truncateEnrichedText(value) {
+  const text = (value || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > ENRICHED_ELEMENT_TEXT_LIMIT
+    ? text.slice(0, ENRICHED_ELEMENT_TEXT_LIMIT) + "..."
+    : text;
+}
+
+function textFromElementIds(ids) {
+  if (!ids) {
+    return "";
+  }
+  return ids
+    .split(/\s+/)
+    .map((id) => {
+      const ref = document.getElementById(id);
+      return ref ? ref.innerText || ref.textContent || "" : "";
+    })
+    .join(" ");
+}
+
+function resolveErrorText(element) {
+  const errMsgId = element.getAttribute("aria-errormessage");
+  if (errMsgId) {
+    const text = truncateEnrichedText(textFromElementIds(errMsgId));
+    if (text) {
+      return text;
+    }
+  }
+  const describedBy = element.getAttribute("aria-describedby");
+  if (describedBy) {
+    return truncateEnrichedText(textFromElementIds(describedBy));
+  }
+  return "";
+}
+
+function enrichValidationState(attrs, element, elementTagNameLower) {
+  if (window.GlobalEnableEnrichedElementTree !== true) {
+    return;
+  }
+
+  if (attrs["aria-invalid"] !== undefined) {
+    const ariaInvalid = attrs["aria-invalid"];
+    if (
+      ariaInvalid === false ||
+      (typeof ariaInvalid === "string" && ariaInvalid.toLowerCase() === "false")
+    ) {
+      delete attrs["aria-invalid"];
+    } else if (
+      ariaInvalid === true ||
+      (typeof ariaInvalid === "string" &&
+        ["true", "grammar", "spelling"].includes(ariaInvalid.toLowerCase()))
+    ) {
+      attrs["aria-invalid"] = true;
+      attrs["invalid"] = true;
+    }
+  }
+
+  if (element.validity && element.validity.valid === false) {
+    attrs["invalid"] = true;
+    if (element.type !== "password") {
+      const validationMessage = truncateEnrichedText(element.validationMessage);
+      if (validationMessage) {
+        attrs["validationMessage"] = validationMessage;
+      }
+    }
+  }
+
+  const errorText = resolveErrorText(element);
+  if (errorText) {
+    attrs["errorText"] = errorText;
+  }
+}
+
 async function buildElementObject(
   frame,
   element,
@@ -1537,7 +1631,9 @@ async function buildElementObject(
         attr.name === "readonly" ||
         attr.name === "aria-readonly" ||
         attr.name === "disabled" ||
-        attr.name === "aria-disabled"
+        attr.name === "aria-disabled" ||
+        attr.name === "aria-invalid" ||
+        attr.name === "aria-expanded"
       ) {
         if (attrValue && attrValue.toLowerCase() === "false") {
           attrValue = false;
@@ -1620,6 +1716,8 @@ async function buildElementObject(
       attrs["value"] = element.value;
     }
   }
+
+  enrichValidationState(attrs, element, elementTagNameLower);
 
   let elementObj = {
     id: element_id,

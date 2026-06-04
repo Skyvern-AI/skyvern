@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -14,24 +15,34 @@ from skyvern.forge.request_logging import redact_sensitive_fields
 from skyvern.forge.sdk.copilot.narration import (
     NarratorState,
     TransitionKind,
+    build_tool_call_activity,
+    build_tool_result_activity,
     cancel_in_flight,
     detect_transitions,
     extract_tool_details,
     resolve_narrator_handler,
     schedule_narration,
     snapshot_ctx,
+    tool_activity_display_label,
 )
 from skyvern.forge.sdk.copilot.output_utils import format_tool_result_for_user, summarize_tool_result_detail
 from skyvern.forge.sdk.schemas.workflow_copilot import (
+    WorkflowCopilotDesignEndUpdate,
+    WorkflowCopilotDesignStartUpdate,
     WorkflowCopilotStreamMessageType,
     WorkflowCopilotToolCallUpdate,
     WorkflowCopilotToolResultUpdate,
+    WorkflowCopilotTurnMode,
+    WorkflowCopilotTurnStartUpdate,
+    WorkflowCopilotWorkflowDraftUpdate,
 )
 
 if TYPE_CHECKING:
     from agents.result import RunResultStreaming
 
+    from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 LOG = structlog.get_logger()
 
@@ -72,6 +83,11 @@ async def stream_to_sse(
     """
     from agents.stream_events import RunItemStreamEvent
 
+    from skyvern.forge.sdk.copilot.enforcement import (
+        CopilotUnrecoverableToolError,
+        _maybe_raise_unrecoverable_tool_error,
+    )
+
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
     # raw stream events. Both TOOL_CALL and TOOL_RESULT for the same round
@@ -105,11 +121,22 @@ async def stream_to_sse(
             # finish. stream.send below would drop the payload anyway.
             client_gone = await stream.is_disconnected()
 
+            # Edge-trigger DESIGN_START on the first user-visible agent event —
+            # message_output_created is the canonical signal, tool_called the
+            # fallback when the agent goes straight to a tool. Best-effort: a
+            # serialization failure here cannot abort the agent run.
+            if event.name in ("message_output_created", "tool_called") and not client_gone:
+                try:
+                    await maybe_emit_design_start(stream, ctx)
+                except Exception as emit_err:
+                    LOG.warning("copilot_narrative_design_start_emit_failed", error=str(emit_err))
+
             if event.name == "tool_called":
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
                 call_id_to_name[call_id] = tool_name
+                narrator_state.record_activity(build_tool_call_activity(tool_name, iteration, call_id))
 
                 if not client_gone:
                     raw_args = _get_raw_field(raw, "arguments")
@@ -126,6 +153,7 @@ async def stream_to_sse(
                         WorkflowCopilotToolCallUpdate(
                             type=WorkflowCopilotStreamMessageType.TOOL_CALL,
                             tool_name=tool_name,
+                            display_label=tool_activity_display_label(tool_name),
                             tool_input=_sanitize_input(tool_input),
                             iteration=iteration,
                             tool_call_id=call_id,
@@ -150,9 +178,13 @@ async def stream_to_sse(
 
                 output = getattr(event.item, "output", None)
                 parsed = parse_tool_output(output)
-                summary = format_tool_result_for_user(tool_name, parsed)
+                blocker_signals = _tool_blocker_signal_candidates(ctx)
+                summary = format_tool_result_for_user(tool_name, parsed, blocker_signal=blocker_signals)
                 success = parsed.get("ok", True)
-                detail = summarize_tool_result_detail(parsed)
+                detail = summarize_tool_result_detail(parsed, tool_name=tool_name, blocker_signal=blocker_signals)
+                narrator_state.record_activity(
+                    build_tool_result_activity(tool_name, summary, success, iteration, call_id)
+                )
 
                 if not client_gone:
                     await stream.send(
@@ -188,6 +220,15 @@ async def stream_to_sse(
                     schedule_narration(narrator_state, stream, iteration)
                 else:
                     _update_enforcement_from_tool(ctx, tool_name, parsed)
+
+                try:
+                    _maybe_raise_unrecoverable_tool_error(ctx, tool_name, parsed)
+                except CopilotUnrecoverableToolError:
+                    result.cancel()
+                    raise
+                # Keep latest_tool_blocker_signal scoped to the tool result
+                # that immediately follows the blocker-producing tool call.
+                ctx.latest_tool_blocker_signal = None
                 iteration += 1
     except asyncio.CancelledError:
         # Real cancellation (server shutdown, upstream abort). Propagate so
@@ -205,6 +246,28 @@ def _get_raw_field(raw: Any, key: str) -> Any:
     if isinstance(raw, dict):
         return raw.get(key)
     return getattr(raw, key, None)
+
+
+def _tool_blocker_signal_candidates(ctx: Any) -> list[Any]:
+    candidates: list[Any] = []
+    latest = getattr(ctx, "latest_tool_blocker_signal", None)
+    if latest is not None:
+        candidates.append(latest)
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if isinstance(history, list):
+        candidates.extend(reversed(history))
+    sticky = getattr(ctx, "blocker_signal", None)
+    if sticky is not None:
+        candidates.append(sticky)
+    deduped: list[Any] = []
+    seen_ids: set[int] = set()
+    for candidate in candidates:
+        candidate_id = id(candidate)
+        if candidate_id in seen_ids:
+            continue
+        seen_ids.add(candidate_id)
+        deduped.append(candidate)
+    return deduped
 
 
 def _extract_text_content(item: Any) -> str | None:
@@ -305,3 +368,73 @@ def _sanitize_input(raw_args: dict[str, Any]) -> dict[str, Any]:
     if isinstance(redacted, dict):
         return redacted
     return trimmed
+
+
+async def emit_turn_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    mode_value = ctx.turn_intent.mode.value if ctx.turn_intent is not None else WorkflowCopilotTurnMode.UNKNOWN.value
+    now = datetime.now(timezone.utc)
+    if ctx.turn_started_at is None:
+        ctx.turn_started_at = now.isoformat()
+    await stream.send(
+        WorkflowCopilotTurnStartUpdate(
+            turn_id=ctx.turn_id,
+            turn_index=ctx.turn_index,
+            mode=WorkflowCopilotTurnMode(mode_value),
+            timestamp=now,
+            prior_block_count=ctx.prior_block_count,
+        )
+    )
+
+
+async def maybe_emit_design_start(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    if ctx.design_start_emitted:
+        return
+    ctx.design_start_emitted = True
+    await stream.send(WorkflowCopilotDesignStartUpdate(timestamp=datetime.now(timezone.utc)))
+
+
+async def maybe_emit_design_end(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    # Guard: never emit DESIGN_END without a matching DESIGN_START. Both flags
+    # are turn-scoped, so a turn that exits before the streaming adapter sees
+    # its first user-visible event simply skips the design phase entirely.
+    if not ctx.design_start_emitted or ctx.design_end_emitted:
+        return
+    ctx.design_end_emitted = True
+    await stream.send(WorkflowCopilotDesignEndUpdate(timestamp=datetime.now(timezone.utc)))
+
+
+async def emit_workflow_draft(
+    stream: EventSourceStream,
+    ctx: CopilotContext,
+    workflow: Workflow,
+    *,
+    include_workflow: bool = True,
+) -> None:
+    """Emit a WORKFLOW_DRAFT envelope; ``include_workflow=False`` suppresses
+    the canvas auto-render for untested paths (inline REPLACE_WORKFLOW).
+    """
+    block_count = 0
+    block_labels: list[str] = []
+    try:
+        for block in workflow.workflow_definition.blocks:
+            block_count += 1
+            label = getattr(block, "label", None)
+            if isinstance(label, str) and label:
+                block_labels.append(label)
+    except AttributeError:
+        pass
+    workflow_dump: dict | None = None
+    if include_workflow:
+        try:
+            workflow_dump = workflow.model_dump(mode="json")
+        except Exception as dump_err:
+            LOG.warning("copilot_workflow_draft_serialization_failed", error=str(dump_err))
+    await stream.send(
+        WorkflowCopilotWorkflowDraftUpdate(
+            block_count=block_count,
+            block_labels=block_labels,
+            summary=None,
+            timestamp=datetime.now(timezone.utc),
+            workflow=workflow_dump,
+        )
+    )

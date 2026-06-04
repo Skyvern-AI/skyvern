@@ -3,20 +3,78 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import BaseModel, Field
+from typing_extensions import NotRequired, TypedDict
 
+from skyvern.forge.sdk.copilot.build_phase import BuildPhase
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 
 ResponseType = Literal["REPLY", "ASK_QUESTION", "REPLACE_WORKFLOW"]
-COPILOT_RESPONSE_TYPES: tuple[str, ...] = get_args(ResponseType)
+COPILOT_RESPONSE_TYPES: tuple[ResponseType, ...] = get_args(ResponseType)
+ProposalDisposition = Literal["no_proposal", "auto_applicable", "review_untested", "review_tested"]
+
+
+class NarrativeDraft(TypedDict):
+    blockCount: int
+    blockLabels: list[str]
+    summary: str | None
+
+
+# Shape must match the FE ``ActivityEntry`` in narrativeState.ts; toolName is
+# present only for tool_call/tool_result and success only for tool_result.
+class NarrativeActivityEntry(TypedDict):
+    kind: str
+    text: str
+    iteration: int
+    toolName: NotRequired[str]
+    displayLabel: NotRequired[str]
+    success: NotRequired[bool]
+    id: str
+
+
+class NarrativeBlock(TypedDict):
+    label: str
+    blockType: str
+    state: str
+    lastSeenIteration: int
+    activity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
+
+# Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
+class TurnNarrativePayload(TypedDict):
+    turnId: str | None
+    turnIndex: int
+    mode: str
+    responseType: NotRequired[ResponseType]
+    designStarted: bool
+    designEnded: bool
+    draft: NarrativeDraft | None
+    blocks: list[NarrativeBlock]
+    terminal: str
+    terminalMessage: str | None
+    narrativeSummary: str | None
+    priorBlockCount: int | None
+    designActivity: list[NarrativeActivityEntry]
+    startedAt: str | None
+    endedAt: str | None
+
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
+    from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
+    from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
 class UrlVisit(BaseModel):
@@ -36,6 +94,21 @@ class CredentialCheck(BaseModel):
     found: bool = False
 
 
+class ObservedPage(BaseModel):
+    """Compact cross-turn record of a page the agent scouted (SKY-10562).
+
+    Carries only what the composition gate needs to credit a prior observation:
+    the full scheme-bearing url (so urlparse-based _same_page/_same_origin match),
+    whether bounded page schema was captured, and how the state was reached. Full
+    page schemas stay within-turn; this keeps a resumed turn from re-scouting (or
+    deadlocking against a spent inspection budget) for pages already observed.
+    """
+
+    url: str = ""
+    had_bounded_schema: bool = False
+    reached_via: str = ""
+
+
 class StructuredContext(BaseModel):
     user_goal: str = ""
     urls_visited: list[UrlVisit] = Field(default_factory=list)
@@ -43,6 +116,12 @@ class StructuredContext(BaseModel):
     credentials_checked: list[CredentialCheck] = Field(default_factory=list)
     decisions_made: list[str] = Field(default_factory=list)
     workflow_state: str = ""
+    # Per-chat discovery budget. Survives turn boundaries via
+    # AgentResult.global_llm_context — finalized deterministically at every
+    # AgentResult exit by `finalize_discovery_counter_in_global_llm_context`.
+    discovery_calls_made: int = 0
+    page_inspection_calls_made: int = 0
+    observed_acted_pages: list[ObservedPage] = Field(default_factory=list)
 
     def to_json_str(self) -> str:
         return self.model_dump_json(indent=2)
@@ -83,7 +162,13 @@ class StructuredContext(BaseModel):
             elif tool == "update_workflow":
                 self.workflow_state = summary
 
-            elif tool in ("click", "evaluate", "run_blocks_and_collect_debug", "get_run_results"):
+            elif tool in (
+                "click",
+                "evaluate",
+                "run_blocks_and_collect_debug",
+                "update_and_run_blocks",
+                "get_run_results",
+            ):
                 self.decisions_made.append(f"{tool}: {summary}")
 
             elif tool == "get_browser_screenshot":
@@ -93,7 +178,7 @@ class StructuredContext(BaseModel):
                         self.urls_visited.append(UrlVisit(url=url, summary="screenshot"))
 
             output = entry.get("output_preview")
-            if output and tool in ("run_blocks_and_collect_debug", "get_run_results"):
+            if output and tool in ("run_blocks_and_collect_debug", "update_and_run_blocks", "get_run_results"):
                 preview = output[:300] if len(output) > 300 else output
                 self.decisions_made.append(f"  output: {preview}")
 
@@ -105,6 +190,59 @@ class StructuredContext(BaseModel):
             self.fields_filled = self.fields_filled[-40:]
         if len(self.credentials_checked) > 50:
             self.credentials_checked = self.credentials_checked[-40:]
+
+
+_MAX_OBSERVED_ACTED_PAGES = 20
+
+
+def _merge_observed_acted_pages(prior: list[ObservedPage], flow_evidence: list[dict[str, Any]]) -> list[ObservedPage]:
+    """Fold this turn's flow-evidence trajectory into the persisted summary.
+
+    Keyed by url; a later observation of the same url replaces the earlier one,
+    and a bounded-schema or interaction observation never regresses to a weaker
+    one for the same page.
+    """
+    by_url: dict[str, ObservedPage] = {page.url: page for page in prior if page.url}
+    for entry in flow_evidence:
+        evidence = entry.get("evidence")
+        url = entry.get("url")
+        if (not isinstance(url, str) or not url.strip()) and isinstance(evidence, dict):
+            url = evidence.get("current_url") or evidence.get("inspected_url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        existing = by_url.get(url)
+        had_schema = bool(entry.get("had_bounded_schema")) or (existing.had_bounded_schema if existing else False)
+        reached_via = str(entry.get("reached_via") or (existing.reached_via if existing else ""))
+        if existing and existing.reached_via == "interaction":
+            reached_via = "interaction"
+        by_url[url] = ObservedPage(url=url, had_bounded_schema=had_schema, reached_via=reached_via)
+    return list(by_url.values())[-_MAX_OBSERVED_ACTED_PAGES:]
+
+
+def finalize_discovery_counter_in_global_llm_context(ctx: Any, raw_context: str | None) -> str | None:
+    """Fold the per-chat discovery counter into the outgoing global_llm_context.
+
+    Called from agent.py's `_make_agent_result` factory so every AgentResult
+    exit path — timeout, cancel, max-turns, output-policy block, request-
+    policy clarification, feasibility clarification, non-retriable nav error,
+    normal translate-result, missing-SDK fallback, unexpected-error fallback —
+    carries the updated count.
+
+    Returns None when there is nothing to record and no prior context, so the
+    pre-existing 'no global_llm_context' behaviour is preserved.
+    """
+    prior = int(getattr(ctx, "prior_discovery_calls_made", 0) or 0)
+    this_turn = int(getattr(ctx, "discovery_calls_this_turn", 0) or 0)
+    prior_inspections = int(getattr(ctx, "prior_page_inspection_calls_made", 0) or 0)
+    inspections_this_turn = int(getattr(ctx, "page_inspection_calls_this_turn", 0) or 0)
+    flow_evidence = getattr(ctx, "flow_evidence", None) or []
+    if not raw_context and this_turn == 0 and inspections_this_turn == 0 and not flow_evidence:
+        return None
+    sc = StructuredContext.from_json_str(raw_context)
+    sc.discovery_calls_made = prior + this_turn
+    sc.page_inspection_calls_made = prior_inspections + inspections_this_turn
+    sc.observed_acted_pages = _merge_observed_acted_pages(sc.observed_acted_pages, flow_evidence)
+    return sc.to_json_str()
 
 
 @dataclass
@@ -128,8 +266,20 @@ class AgentResult:
     # persistence path (rollback + ``Cancelled by user.`` chat row) without
     # losing ``workflow_was_persisted`` the way a re-raise would.
     cancelled: bool = False
-    # The route forces Accept/Reject regardless of ``auto_accept`` when this is True.
-    unvalidated: bool = False
+    # Controls whether the route may auto-apply the proposal or must force explicit review.
+    proposal_disposition: ProposalDisposition = "auto_applicable"
+    output_policy_diagnostics: dict[str, Any] | None = None
+    turn_outcome: TurnOutcome | None = None
+    turn_id: str | None = None
+    narrative_summary: str | None = None
+    # Persisted on the assistant chat message so the bubble survives a reload.
+    narrative_payload: TurnNarrativePayload | None = None
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
 
 
 @dataclass
@@ -167,10 +317,16 @@ class CopilotContext(AgentContext):
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    turn_intent: TurnIntent | None = None
+    turn_context_packet: TurnContextPacket | None = None
+    latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
+    blocked_reply_signatures: list[str] = field(default_factory=list)
 
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
+    tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -181,6 +337,7 @@ class CopilotContext(AgentContext):
     # Workflow state
     last_workflow: Workflow | None = None
     last_workflow_yaml: str | None = None
+    # Always False under staging; ``has_staged_proposal`` carries the signal.
     workflow_persisted: bool = False
     last_update_block_count: int | None = None
     last_test_ok: bool | None = None
@@ -198,6 +355,13 @@ class CopilotContext(AgentContext):
     # retry" requests.
     pending_reconciliation_run_id: str | None = None
     pending_reconciliation_requires_user_input: bool = False
+    # Block-running tools make their own run context available for same-turn
+    # reporting. This is deliberately not persisted across turns. The
+    # successful variant is kept for "default to the last clean result"; the
+    # generic variant allows the agent to re-read the same failed/canceled run
+    # after a watchdog reconciliation read has cleared the retry guard.
+    last_run_blocks_workflow_run_id: str | None = None
+    last_successful_run_blocks_workflow_run_id: str | None = None
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck
@@ -219,6 +383,12 @@ class CopilotContext(AgentContext):
     # label away from navigation. Prevents rerunning the same oversized
     # navigation block unchanged.
     per_tool_budget_problem_block_labels: list[str] = field(default_factory=list)
+    # Armed when a PER_TOOL_BUDGET run leaves the browser on a meaningful page.
+    # The next block-running call must be preceded by page inspection so the
+    # agent recovers from observed state instead of replaying the same search.
+    post_budget_page_inspection_required: bool = False
+    post_budget_page_inspection_url: str | None = None
+    post_budget_page_inspection_run_id: str | None = None
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -227,8 +397,12 @@ class CopilotContext(AgentContext):
     # state and the prefix labels can no longer be trusted as an anchor.
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    verified_prefix_current_url: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
+    last_full_workflow_test_ok: bool = False
+    last_unverified_block_labels: list[str] = field(default_factory=list)
+    workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
     last_frontier_start_label: str | None = None
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
@@ -273,3 +447,46 @@ class CopilotContext(AgentContext):
     # retries. Declared here (rather than attached dynamically) so future
     # refactors can't strip it silently.
     narrator_state: NarratorState | None = None
+
+    # Default COMPOSING is the safe non-BUILD value; the orchestrator
+    # overrides at turn start via `initial_build_phase`.
+    build_phase: BuildPhase = BuildPhase.COMPOSING
+    # Hydrated from inbound StructuredContext.discovery_calls_made at turn start.
+    prior_discovery_calls_made: int = 0
+    discovery_calls_this_turn: int = 0
+    prior_page_inspection_calls_made: int = 0
+    page_inspection_calls_this_turn: int = 0
+    discovery_step_count: int = 0
+    discovery_started_monotonic: float | None = None
+    discovery_evidence_trail: list[dict[str, Any]] = field(default_factory=list)
+    resolved_discovery_entrypoint_url: str | None = None
+    resolved_discovery_failure_reason: str | None = None
+    resolved_discovery_entrypoint_inspection_baseline: int = 0
+    discovery_entrypoint_url_question_nudge_count: int = 0
+    # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
+    # The discovery tool reaches the connected FastMCP client through this.
+    discovery_mcp_server: Any | None = None
+
+    # default_factory is the safety net — Python dataclass inheritance
+    # disallows non-default fields after default ones, and the parent
+    # ``AgentContext`` has many defaulted fields. The route generates the
+    # canonical turn_id and passes it as an explicit kwarg at every
+    # construction site, overriding this default.
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    turn_index: int = 0
+    design_start_emitted: bool = False
+    design_end_emitted: bool = False
+    narrative_summary: str | None = None
+
+    staged_workflow_yaml: str | None = None
+    staged_workflow: Workflow | None = None
+    has_staged_proposal: bool = False
+    # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
+    # settings changes); terminal handlers roll back on non-auto-accept.
+    canonical_was_persisted_due_to_param_change: bool = False
+    prior_block_count: int | None = None
+    block_state_map: dict[str, str] = field(default_factory=dict)
+    block_started_at_map: dict[str, str] = field(default_factory=dict)
+    block_ended_at_map: dict[str, str] = field(default_factory=dict)
+    turn_started_at: str | None = None
+    turn_ended_at: str | None = None

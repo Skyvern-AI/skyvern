@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _repeated_frontier_failure_nudge,
 )
 from skyvern.forge.sdk.copilot.tools import (
+    _challenge_http_request_reject_message,
     _detect_probable_site_block_wall,
     _detect_timing_only_challenge_wait_blocks,
     _record_run_blocks_result,
@@ -421,3 +422,52 @@ def test_allows_conditional_challenge_action_after_block_evidence() -> None:
     ctx.last_test_anti_bot = "challenge page detected"
 
     assert _timing_only_challenge_wait_reject_message(ctx, _CONDITIONAL_ACTION_WORKFLOW) is None
+
+
+def test_rejects_new_http_request_after_observed_challenge_evidence() -> None:
+    existing_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_lookup
+      block_type: goto_url
+      url: https://example.com/registry/search
+"""
+    submitted_yaml = """
+workflow_definition:
+  blocks:
+    - label: open_lookup
+      block_type: goto_url
+      url: https://example.com/registry/search
+    - label: submit_lookup
+      block_type: http_request
+      method: POST
+      url: https://example.com/registry/search?s=1
+"""
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {
+        "anti_bot_indicators": ["human-verification"],
+        "challenge_controls": [{"selector": "#human-verification"}],
+    }
+    ctx.workflow_yaml = existing_yaml
+
+    message = _challenge_http_request_reject_message(ctx, submitted_yaml, ctx.workflow_yaml)
+
+    assert message is not None
+    assert "submit_lookup" in message
+    assert "raw http_request blocks are not allowed" in message
+
+
+def test_allows_existing_http_request_when_challenge_evidence_is_added_later() -> None:
+    existing_yaml = """
+workflow_definition:
+  blocks:
+    - label: submit_lookup
+      block_type: http_request
+      method: POST
+      url: https://example.com/search
+"""
+    ctx = _fresh_context()
+    ctx.composition_page_evidence = {"anti_bot_indicators": ["human-verification"]}
+    ctx.workflow_yaml = existing_yaml
+
+    assert _challenge_http_request_reject_message(ctx, existing_yaml, ctx.workflow_yaml) is None

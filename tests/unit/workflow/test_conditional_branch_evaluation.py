@@ -482,6 +482,136 @@ async def test_extraction_failure_with_reason_preserves_original_message() -> No
             )
 
 
+@pytest.mark.asyncio
+async def test_extra_placeholder_evals_recovered_when_well_formed_subset_matches() -> None:
+    """LLM sometimes returns N+k evaluations for N branches, where the k extras have
+    reasoning=None. Matches the exact shape observed in production (wr_530455567744647688):
+    1 branch, 8 evaluations returned, entry 0 has real reasoning, entries 1-7 are
+    reasoning=None placeholders. The fix should strip the extras and return [False]."""
+    block = _conditional_block()
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(
+            expression="Does one of the accounts have both a reader_name not ending with 'pdf' and a purpose of 'Invoice'"
+        ),
+        next_block_label="invoice_branch",
+    )
+
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    # One well-formed entry followed by 7 reasoning=None placeholders — exact production shape.
+    raw_evals = [
+        {"reasoning": "Neither account has purpose 'Invoice', so the condition is False.", "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+        {"reasoning": None, "result": False},
+    ]
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=[branch],
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="org_test",
+        )
+
+    assert results == [False]
+
+
+@pytest.mark.asyncio
+async def test_extra_evals_not_recovered_when_well_formed_count_does_not_match() -> None:
+    """If stripping reasoning=None entries does NOT yield exactly len(branches) results,
+    the function should still raise ValueError rather than silently returning wrong data."""
+    block = _conditional_block()
+    branch = BranchCondition(
+        criteria=PromptBranchCriteria(expression="some condition"),
+        next_block_label="branch_a",
+    )
+
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    # 2 well-formed + 1 placeholder for 1 branch — filter yields 2, not 1, so no recovery.
+    raw_evals = [
+        {"reasoning": "sub-eval A", "result": True},
+        {"reasoning": "sub-eval B", "result": False},
+        {"reasoning": None, "result": False},
+    ]
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        with pytest.raises(ValueError, match="3 results for 1 branches"):
+            await block._evaluate_prompt_branches(
+                branches=[branch],
+                evaluation_context=evaluation_context,
+                workflow_run_id="wr_test",
+                workflow_run_block_id="wrb_test",
+                organization_id="org_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_extra_placeholder_evals_multi_branch_preserves_order() -> None:
+    """With 2 branches and interleaved placeholders, the filter must preserve the order
+    of well-formed entries so results[0] maps to branch 0 and results[1] maps to branch 1."""
+    block = ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(criteria=PromptBranchCriteria(expression="condition A"), next_block_label="a"),
+            BranchCondition(criteria=PromptBranchCriteria(expression="condition B"), next_block_label="b"),
+        ],
+    )
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    evaluation_context = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    evaluation_context.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+
+    # Real evals for branch 0 (True) and branch 1 (False) interleaved with placeholders.
+    raw_evals = [
+        {"reasoning": "branch 0 reasoning", "result": True},
+        {"reasoning": None, "result": False},
+        {"reasoning": "branch 1 reasoning", "result": False},
+        {"reasoning": None, "result": False},
+    ]
+
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=evaluation_context,
+            workflow_run_id="wr_test",
+            workflow_run_block_id="wrb_test",
+            organization_id="org_test",
+        )
+
+    assert results == [True, False]
+
+
 def test_prompt_template_includes_count_and_atomicity_for_compound_conditions() -> None:
     rendered_one = prompt_engine.load_prompt(
         "conditional-prompt-branch-evaluation",

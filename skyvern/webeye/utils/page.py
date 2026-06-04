@@ -15,6 +15,7 @@ from playwright.async_api import ElementHandle, Frame, Page
 
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
+from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
 
@@ -50,7 +51,7 @@ async def _wait_for_navigation_settle(frame: Page | Frame, timeout_ms: float) ->
     if timeout_ms <= 0:
         return
     try:
-        await frame.wait_for_load_state("load", timeout=timeout_ms)
+        await frame.wait_for_load_state("networkidle", timeout=timeout_ms)
     except PlaywrightError:
         return
 
@@ -225,7 +226,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            await skyvern_page.safe_wait_for_animation_end()
+            await skyvern_page.safe_wait_for_animation_end(caller="scrolling_screenshot")
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -697,6 +698,15 @@ class SkyvernFrame:
         js_script = "() => removeAllUniqueIds()"
         await self.evaluate(frame=self.frame, expression=js_script)
 
+    async def _set_enriched_element_tree_flag(self) -> None:
+        context = skyvern_context.current()
+        enriched_enabled = bool(context and context.enriched_tree_enabled())
+        await self.evaluate(
+            frame=self.frame,
+            expression="([enabled]) => { window.GlobalEnableEnrichedElementTree = enabled; }",
+            arg=[enriched_enabled],
+        )
+
     @traced(name="skyvern.browser.element_tree_from_body")
     async def build_tree_from_body(
         self,
@@ -706,6 +716,7 @@ class SkyvernFrame:
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
         must_included_tags = must_included_tags or []
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([frame_name, frame_index, must_included_tags]) => await buildTreeFromBody(frame_name, frame_index, must_included_tags)"
         return await self.evaluate(
             frame=self.frame,
@@ -720,6 +731,7 @@ class SkyvernFrame:
         wait_until_finished: bool = True,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([wait_until_finished]) => await getIncrementElements(wait_until_finished)"
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[wait_until_finished]
@@ -733,16 +745,25 @@ class SkyvernFrame:
         full_tree: bool = False,
         timeout_ms: float = SettingsManager.get_settings().BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS,
     ) -> tuple[list[dict], list[dict]]:
+        await self._set_enriched_element_tree_flag()
         js_script = "async ([starter, frame, full_tree]) => await buildElementTree(starter, frame, full_tree)"
         return await self.evaluate(
             frame=self.frame, expression=js_script, timeout_ms=timeout_ms, arg=[starter, frame, full_tree]
         )
 
     @traced(name="skyvern.browser.wait_for_animation")
-    async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
-        # Separates the fast finished-quickly path from the timeout/error paths
-        # that burn the full timeout budget — explains the 124x p95/p50 ratio.
+    async def safe_wait_for_animation_end(
+        self,
+        before_wait_sec: float = 0,
+        timeout_ms: float = 3000,
+        caller: str = "unknown",
+    ) -> None:
+        # Fast finished-quickly path vs timeout/error paths that burn the full
+        # timeout budget — the 124x p95/p50 ratio in production traces.
         _span = otel_trace.get_current_span()
+        _span.set_attribute("before_wait_sec", before_wait_sec)
+        _span.set_attribute("timeout_ms", timeout_ms)
+        _span.set_attribute("caller", caller)
         try:
             await asyncio.sleep(before_wait_sec)
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)
@@ -789,12 +810,9 @@ class SkyvernFrame:
         This is designed for cached action execution to ensure the page is ready
         before attempting to interact with elements.
         """
-        total_start_time = time.time()
         _tracer = otel_trace.get_tracer("skyvern")
 
         # 1. Wait for loading indicators to disappear (longest timeout first)
-        loading_indicator_duration_ms = 0.0
-        step_start_time = time.time()
         loading_indicator_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.loading_indicators") as _li_span:
             apply_context_attrs(_li_span)
@@ -808,19 +826,9 @@ class SkyvernFrame:
                 loading_indicator_result = "error"
                 LOG.warning("Failed to check loading indicators, proceeding", exc_info=True)
             finally:
-                loading_indicator_duration_ms = (time.time() - step_start_time) * 1000
                 _li_span.set_attribute("result", loading_indicator_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="loading_indicators",
-                    result=loading_indicator_result,
-                    duration_ms=loading_indicator_duration_ms,
-                    timeout_ms=loading_indicator_timeout_ms,
-                )
 
         # 2. Wait for network idle (with short timeout - some pages never go idle)
-        network_idle_duration_ms = 0.0
-        step_start_time = time.time()
         network_idle_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.network_idle") as _ni_span:
             apply_context_attrs(_ni_span)
@@ -831,19 +839,9 @@ class SkyvernFrame:
                 network_idle_result = "timeout"
                 LOG.warning("Network idle timeout - page may have constant activity, proceeding")
             finally:
-                network_idle_duration_ms = (time.time() - step_start_time) * 1000
                 _ni_span.set_attribute("result", network_idle_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="network_idle",
-                    result=network_idle_result,
-                    duration_ms=network_idle_duration_ms,
-                    timeout_ms=network_idle_timeout_ms,
-                )
 
         # 3. Wait for DOM to stabilize
-        dom_stability_duration_ms = 0.0
-        step_start_time = time.time()
         dom_stability_result = "success"
         with _tracer.start_as_current_span("skyvern.browser.page_ready.dom_stability") as _ds_span:
             apply_context_attrs(_ds_span)
@@ -858,29 +856,7 @@ class SkyvernFrame:
                 dom_stability_result = "error"
                 LOG.warning("Failed to check DOM stability, proceeding", exc_info=True)
             finally:
-                dom_stability_duration_ms = (time.time() - step_start_time) * 1000
                 _ds_span.set_attribute("result", dom_stability_result)
-                LOG.info(
-                    "page_readiness_check",
-                    step="dom_stability",
-                    result=dom_stability_result,
-                    duration_ms=dom_stability_duration_ms,
-                    timeout_ms=dom_stability_timeout_ms,
-                    stable_ms=dom_stable_ms,
-                )
-
-        # Log total page readiness check duration
-        total_duration_ms = (time.time() - total_start_time) * 1000
-        LOG.info(
-            "page_readiness_check_complete",
-            total_duration_ms=total_duration_ms,
-            loading_indicator_duration_ms=loading_indicator_duration_ms,
-            network_idle_duration_ms=network_idle_duration_ms,
-            dom_stability_duration_ms=dom_stability_duration_ms,
-            loading_indicator_result=loading_indicator_result,
-            network_idle_result=network_idle_result,
-            dom_stability_result=dom_stability_result,
-        )
 
     async def _wait_for_loading_indicators_gone(self, timeout_ms: float = 5000) -> None:
         """

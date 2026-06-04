@@ -1,5 +1,11 @@
 import { AxiosError } from "axios";
-import { ReloadIcon, PlayIcon, StopIcon } from "@radix-ui/react-icons";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  PlayIcon,
+  ReloadIcon,
+  StopIcon,
+} from "@radix-ui/react-icons";
 import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -51,6 +57,13 @@ import {
   statusIsRunningOrQueued,
 } from "@/routes/tasks/types";
 
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
 import { EditableNodeTitle } from "../components/EditableNodeTitle";
 import { NodeActionMenu } from "../NodeActionMenu";
 import { WorkflowBlockIcon } from "../WorkflowBlockIcon";
@@ -59,6 +72,20 @@ import { MicroDropdown } from "./MicroDropdown";
 import { BlockParametersDialog } from "./BlockParametersDialog";
 import type { AppNode } from "..";
 import { getWorkflowErrors } from "../../workflowEditorUtils";
+import { NodeGripHandle } from "./NodeGripHandle";
+import {
+  getDragGateReason,
+  isDragGatedByMode,
+} from "../../sortable/dragModeGate";
+import { useIsCanvasLocked } from "../../controls/useIsCanvasLocked";
+import { isBlockFinallyGated } from "../../sortable/finallyBlockGate";
+import { collapsibleWorkflowBlockTypes } from "../../collapse/collapsibleBlockTypes";
+import {
+  useIsBlockCollapsed,
+  useNodeCollapseStore,
+} from "../../collapse/useNodeCollapseStore";
+import { useWorkflowEditorMode } from "../../hooks/useWorkflowEditorMode";
+import { useWorkflowScopeReadOnly } from "../../WorkflowScopeContext";
 
 class ValidationFailureError extends Error {
   readonly isValidationFailure = true;
@@ -92,6 +119,9 @@ interface Props {
   disabled?: boolean;
   editable: boolean;
   extraActions?: React.ReactNode;
+  // Driven by useSortable in the parent HOC; defaults to false so this
+  // file ships a static affordance with no behavioural change at call sites.
+  isDragging?: boolean;
   nodeId: string;
   totpIdentifier: string | null;
   totpUrl: string | null;
@@ -185,6 +215,7 @@ function NodeHeader({
   disabled = false,
   editable,
   extraActions,
+  isDragging = false,
   nodeId,
   totpIdentifier,
   totpUrl,
@@ -192,6 +223,7 @@ function NodeHeader({
   type,
 }: Props) {
   const log = useLogging();
+  const mode = useWorkflowEditorMode();
   const {
     blockLabel: urlBlockLabel,
     workflowPermanentId,
@@ -200,6 +232,9 @@ function NodeHeader({
   const blockOutputsStore = useBlockOutputStore();
   const debugStore = useDebugStore();
   const recordingStore = useRecordingStore();
+  const isCollapsed = useIsBlockCollapsed(blockLabel);
+  const toggleBlockCollapsed = useNodeCollapseStore((s) => s.toggleBlock);
+  const isCollapsible = collapsibleWorkflowBlockTypes.has(type);
   const { closeWorkflowPanel } = useWorkflowPanelStore();
   const workflowSettingsStore = useWorkflowSettingsStore();
   const [label, setLabel] = useNodeLabelChangeHandler({
@@ -303,13 +338,13 @@ function NodeHeader({
       if (statusIsAFailureType(workflowRun)) {
         toast({
           variant: "destructive",
-          title: `Workflow Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
           description: `Reason: ${workflowRun.failure_reason}`,
         });
       } else if (statusIsFinalized(workflowRun)) {
         toast({
           variant: "success",
-          title: `Workflow Block ${urlBlockLabel}: ${workflowRun.status}`,
+          title: `Agent Block ${urlBlockLabel}: ${workflowRun.status}`,
         });
       }
     }
@@ -362,7 +397,7 @@ function NodeHeader({
         log.error("Run block: there is no workflowPermanentId");
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "There is no workflowPermanentId",
         });
         return;
@@ -376,7 +411,7 @@ function NodeHeader({
         log.error("Run block: there is no debug session, yet");
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "There is no debug session, yet",
         });
         return;
@@ -439,7 +474,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "Could not construct run payload",
         });
         return;
@@ -467,7 +502,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to start workflow block run",
+          title: "Failed to start agent block run",
           description: "No response",
         });
         return;
@@ -483,8 +518,8 @@ function NodeHeader({
 
       toast({
         variant: "success",
-        title: "Workflow block run started",
-        description: "The workflow block run has been started successfully",
+        title: "Agent block run started",
+        description: "The agent block run has been started successfully",
       });
 
       navigate(
@@ -508,7 +543,7 @@ function NodeHeader({
       });
       toast({
         variant: "destructive",
-        title: "Failed to start workflow block run",
+        title: "Failed to start agent block run",
         description: detail ?? error.message,
       });
     },
@@ -523,7 +558,7 @@ function NodeHeader({
         });
         toast({
           variant: "destructive",
-          title: "Failed to cancel workflow block run",
+          title: "Failed to cancel agent block run",
           description: "Missing debug session",
         });
         return;
@@ -544,8 +579,8 @@ function NodeHeader({
       });
       toast({
         variant: "success",
-        title: "Workflow Canceled",
-        description: "The workflow has been successfully canceled.",
+        title: "Agent Canceled",
+        description: "The agent has been successfully canceled.",
       });
     },
     onError: (error: AxiosError) => {
@@ -622,6 +657,86 @@ function NodeHeader({
       ? formatDate(createdAt)
       : null;
 
+  const isReadOnlyScope = useWorkflowScopeReadOnly();
+  const isCanvasLocked = useIsCanvasLocked();
+  const dragGatedByMode = isDragGatedByMode({ isRecording, isCanvasLocked });
+
+  // Read-only canvases (compare/diff) drop the grip entirely - the handle
+  // is inert there, so a faded button is just visual noise.
+  let gripHandle: React.ReactNode = null;
+  if (!isReadOnlyScope) {
+    const gripHandleElement = (
+      <NodeGripHandle
+        isDragging={isDragging}
+        disabled={dragGatedByMode}
+        blockLabel={blockLabel}
+      />
+    );
+    const dragGateReason = dragGatedByMode
+      ? getDragGateReason({ isRecording, isCanvasLocked })
+      : null;
+    gripHandle = dragGatedByMode ? (
+      <TooltipProvider delayDuration={200}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={0} className="inline-flex">
+              {gripHandleElement}
+            </span>
+          </TooltipTrigger>
+          {dragGateReason && <TooltipContent>{dragGateReason}</TooltipContent>}
+        </Tooltip>
+      </TooltipProvider>
+    ) : (
+      gripHandleElement
+    );
+  }
+
+  // Recording mid-collapse would change captured DOM, so freeze only on
+  // isRecording. Read-only renders (comparison canvases) must not mutate
+  // the workflow's persisted collapse state — `isReadOnlyScope` (read
+  // above) is true when FlowRenderer is mounted with `readOnly`, in
+  // which case the toggle is disabled so a compare-canvas click cannot
+  // persist collapse state into the editor view the user returns to.
+  const collapseToggleGated = isRecording || isReadOnlyScope;
+  const collapseLabel = isCollapsed ? "Expand block" : "Collapse block";
+  const collapseToggleButton =
+    isCollapsible &&
+    (mode === "build" ||
+      type === "for_loop" ||
+      type === "while_loop" ||
+      type === "conditional") ? (
+      <TooltipProvider delayDuration={300}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={collapseLabel}
+              aria-expanded={!isCollapsed}
+              disabled={collapseToggleGated}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (collapseToggleGated) return;
+                toggleBlockCollapsed(
+                  workflowPermanentId ?? "__global__",
+                  blockLabel,
+                );
+              }}
+              className={cn("nodrag nopan rounded p-1 hover:bg-muted", {
+                "pointer-events-none opacity-50": collapseToggleGated,
+              })}
+            >
+              {isCollapsed ? (
+                <ChevronDownIcon className="size-5" />
+              ) : (
+                <ChevronUpIcon className="size-5" />
+              )}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{collapseLabel}</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    ) : null;
+
   return (
     <>
       {thisBlockIsTargetted ? (
@@ -638,12 +753,32 @@ function NodeHeader({
         </div>
       ) : null}
 
-      <header className="!mt-0 flex h-[2.75rem] justify-between gap-2">
+      <header className="group !mt-0 flex h-[2.75rem] justify-between gap-2">
         <div
           className={cn("flex min-w-0 gap-2", {
             "opacity-50": thisBlockIsPlaying,
           })}
         >
+          {!isReadOnlyScope &&
+            (isBlockFinallyGated(
+              blockLabel,
+              workflowSettingsStore.finallyBlockLabel,
+            ) ? (
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div>
+                      <NodeGripHandle blockLabel={blockLabel} disabled />
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    Finally block runs last - reorder to a different position
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ) : (
+              gripHandle
+            ))}
           <div className="flex h-[2.75rem] w-[2.75rem] items-center justify-center rounded border border-slate-600">
             <WorkflowBlockIcon workflowBlockType={type} className="size-6" />
           </div>
@@ -737,6 +872,7 @@ function NodeHeader({
               )}
             </button>
           )}
+          {collapseToggleButton}
           {disabled ? null : (
             <div>
               <div
@@ -747,6 +883,7 @@ function NodeHeader({
               >
                 <NodeActionMenu
                   isScriptable={isScriptable}
+                  isCanvasLocked={isCanvasLocked}
                   onDelete={() => {
                     requestDeleteNodeCallback(nodeId, blockLabel);
                   }}

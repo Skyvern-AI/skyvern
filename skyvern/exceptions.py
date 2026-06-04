@@ -8,9 +8,11 @@ from typing import NoReturn
 # the heavy modules users commonly have partially installed.
 _LOCAL_EXTRA_SENTINELS = (
     "fastapi",
+    "fuzzysearch",
     "jinja2",
     "libcst",
     "litellm",
+    "openai",
     "playwright",
     "sqlalchemy",
     "starlette",
@@ -22,7 +24,7 @@ _LOCAL_EXTRA_SENTINELS = (
 # server sentinels local-compatible so those imports continue to work in
 # skyvern[local]. Full server entrypoints pass server-only module_names such as
 # "uvicorn" when they need to fail for local-only installs.
-_SERVER_EXTRA_SENTINELS = tuple(_LOCAL_EXTRA_SENTINELS)
+_SERVER_EXTRA_SENTINELS = tuple(dict.fromkeys((*_LOCAL_EXTRA_SENTINELS, "alembic", "anthropic")))
 
 _EXTRA_SUPPORT_LABELS = {
     "local": "local embedded/browser support",
@@ -533,6 +535,14 @@ class ScrapingFailed(SkyvernException):
         super().__init__("Scraping failed.")
 
 
+class SkyvernActionFailed(SkyvernException):
+    """Operationally-expected failure during an SDK action execution."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class ScrapingFailedBlankPage(ScrapingFailed):
     def __init__(self) -> None:
         super().__init__(reason="It's a blank page. Please ensure there is a non-blank page for Skyvern to work with.")
@@ -557,6 +567,16 @@ class DownloadFileMaxSizeExceeded(SkyvernException):
     def __init__(self, max_size: int) -> None:
         self.max_size = max_size
         super().__init__(f"Download file size exceeded the maximum allowed size of {max_size} MB.")
+
+
+class UploadFileMaxSizeExceeded(SkyvernException):
+    def __init__(self, file_size_bytes: int, max_size_bytes: int) -> None:
+        self.file_size_bytes = file_size_bytes
+        self.max_size_bytes = max_size_bytes
+        super().__init__(
+            f"Upload file size {file_size_bytes / 1024 / 1024:.1f} MB exceeded the maximum "
+            f"allowed size of {max_size_bytes / 1024 / 1024:.0f} MB."
+        )
 
 
 class DownloadFileMaxWaitingTime(SkyvernException):

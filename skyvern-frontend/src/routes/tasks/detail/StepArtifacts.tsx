@@ -21,6 +21,67 @@ import { apiPathPrefix } from "@/util/env";
 const enable_log_artifacts =
   import.meta.env.VITE_ENABLE_LOG_ARTIFACTS === "true";
 
+type ScreenshotsTabContentProps = {
+  screenshots: Array<ArtifactApiResponse> | undefined;
+  isFetching: boolean;
+  gridCols: string;
+  skeletonCount: number;
+};
+
+function ScreenshotsTabContent({
+  screenshots,
+  isFetching,
+  gridCols,
+  skeletonCount,
+}: ScreenshotsTabContentProps) {
+  if (!screenshots || screenshots.length === 0) {
+    if (isFetching) {
+      return (
+        <div className={`grid ${gridCols} gap-4 p-4`}>
+          {Array.from({ length: skeletonCount }).map((_, i) => (
+            <Skeleton key={i} className="h-full w-full" />
+          ))}
+        </div>
+      );
+    }
+    return <div>No screenshots found</div>;
+  }
+
+  const total = screenshots.length;
+  const archivedCount = screenshots.filter((a) => a.archived).length;
+  const visible = screenshots.filter((a) => !a.archived);
+
+  if (archivedCount === total) {
+    return (
+      <div className="p-4 text-muted-foreground">
+        These screenshots have been archived. To request restoration, please
+        contact support@skyvern.com
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-2 p-4">
+      {archivedCount > 0 && (
+        <div className="text-sm text-muted-foreground">
+          {archivedCount} of {total} screenshots archived and not shown. Contact
+          support@skyvern.com to request restoration.
+        </div>
+      )}
+      <div className={`grid ${gridCols} gap-4`}>
+        {visible.map((artifact, index) => (
+          <ZoomableImage
+            key={index}
+            src={getImageURL(artifact)}
+            className="h-full w-full object-cover"
+            alt="action-screenshot"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 type Props = {
   id: string;
   stepProps: StepApiResponse;
@@ -152,48 +213,20 @@ function StepArtifacts({ id, stepProps }: Props) {
         </div>
       </TabsContent>
       <TabsContent value="screenshot_llm">
-        {llmScreenshots && llmScreenshots.length > 0 ? (
-          <div className="grid grid-cols-2 gap-4 p-4">
-            {llmScreenshots.map((artifact, index) => (
-              <ZoomableImage
-                key={index}
-                src={getImageURL(artifact)}
-                className="h-full w-full object-cover"
-                alt="action-screenshot"
-              />
-            ))}
-          </div>
-        ) : isFetching ? (
-          <div className="grid grid-cols-2 gap-4 p-4">
-            <Skeleton className="h-full w-full" />
-            <Skeleton className="h-full w-full" />
-            <Skeleton className="h-full w-full" />
-          </div>
-        ) : (
-          <div>No screenshots found</div>
-        )}
+        <ScreenshotsTabContent
+          screenshots={llmScreenshots}
+          isFetching={isFetching}
+          gridCols="grid-cols-2"
+          skeletonCount={3}
+        />
       </TabsContent>
       <TabsContent value="screenshot_action">
-        {actionScreenshots && actionScreenshots.length > 0 ? (
-          <div className="grid grid-cols-2 gap-4 p-4">
-            {actionScreenshots.map((artifact, index) => (
-              <ZoomableImage
-                key={index}
-                src={getImageURL(artifact)}
-                className="h-full w-full object-cover"
-                alt="action-screenshot"
-              />
-            ))}
-          </div>
-        ) : isFetching ? (
-          <div className="grid grid-cols-3 gap-4 p-4">
-            <Skeleton className="h-full w-full" />
-            <Skeleton className="h-full w-full" />
-            <Skeleton className="h-full w-full" />
-          </div>
-        ) : (
-          <div>No screenshots found</div>
-        )}
+        <ScreenshotsTabContent
+          screenshots={actionScreenshots}
+          isFetching={isFetching}
+          gridCols="grid-cols-3"
+          skeletonCount={3}
+        />
       </TabsContent>
       <TabsContent value="element_tree_trimmed">
         {visibleElementsTreeInPrompt ? (

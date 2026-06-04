@@ -37,12 +37,14 @@ def classify_from_failure_reason(
     _antibot_keywords = [
         "captcha",
         "cloudflare",
+        "turnstile",
         "bot detect",
         "bot block",
         "ip block",
         "request block",
         "anti-bot",
         "human verification",
+        "verify you are human",
     ]
     # "access denied" is ambiguous: it can be bot blocking OR auth failure.
     # Only treat it as bot detection when there are no auth-related keywords nearby.

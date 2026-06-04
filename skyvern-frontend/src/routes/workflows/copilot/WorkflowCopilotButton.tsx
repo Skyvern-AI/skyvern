@@ -14,13 +14,13 @@ export const WorkflowCopilotButton = forwardRef<
     <button
       ref={ref}
       onClick={onClick}
-      className="flex items-center gap-2"
-      title="Open Workflow Copilot"
+      className="flex items-center gap-2 text-muted-foreground transition-colors hover:text-foreground"
+      title="Open Agent Copilot"
     >
       <ChatBubbleIcon className="h-4 w-4" />
       <span>Copilot</span>
       {messageCount > 0 && (
-        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-cta text-xs font-bold text-cta-foreground">
           {messageCount}
         </span>
       )}

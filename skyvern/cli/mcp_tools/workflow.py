@@ -25,13 +25,15 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 from ._common import ErrorCode, Timer, make_error, make_result
 from ._session import get_skyvern
-from ._validation import validate_folder_id, validate_run_id, validate_workflow_id
+from ._validation import validate_folder_id, validate_run_id, validate_workflow_id, validate_workflow_run_id
 from ._workflow_http import (
     coerce_timestamp,
     create_workflow_raw,
     get_workflow_by_id,
     get_workflow_run_status,
+    list_workflow_runs_raw,
     list_workflows_raw,
+    retry_workflow_run_raw,
     update_workflow_folder_raw,
     update_workflow_raw,
 )
@@ -146,6 +148,22 @@ def _get_value(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _api_error_body_message(body: Any) -> str:
+    detail = _get_value(body, "detail")
+    if isinstance(detail, str):
+        return detail
+    if detail is not None:
+        return json.dumps(_jsonable(detail))
+    if isinstance(body, str):
+        return body
+    if body is None:
+        return "Bad request"
+    try:
+        return json.dumps(_jsonable(body))
+    except TypeError:
+        return str(body)
 
 
 def _get_run_id(run: Any) -> str | None:
@@ -420,7 +438,7 @@ def _validate_definition_structure(json_def: dict[str, Any] | None, action: str)
 
 _CODE_V2_DEFAULTS: dict[str, Any] = {
     "code_version": 2,
-    "run_with": "code",
+    "run_with": "agent",
 }
 _DEFAULT_MCP_PROXY_LOCATION = ProxyLocation.RESIDENTIAL
 
@@ -558,7 +576,7 @@ def _inject_missing_top_level_defaults(definition: str, fmt: str, defaults: dict
 
 
 def _inject_code_v2_defaults(definition: str, fmt: str) -> str:
-    """Inject Code 2.0 defaults (code_version=2, run_with=code) when not explicitly set.
+    """Inject Code 2.0 defaults (code_version=2, run_with=agent) when not explicitly set.
 
     Only modifies JSON definitions (or auto-detected JSON). YAML is returned unchanged.
     """
@@ -895,6 +913,71 @@ async def skyvern_workflow_get(
     )
 
 
+async def skyvern_workflow_run_list(
+    workflow_id: Annotated[str, "Workflow permanent ID (starts with wpid_)"],
+    page: Annotated[int, Field(description="Page number (1-based)", ge=1)] = 1,
+    page_size: Annotated[int, Field(description="Results per page", ge=1, le=100)] = 10,
+    status: Annotated[list[str] | None, "Filter by one or more workflow run statuses"] = None,
+    search_key: Annotated[str | None, Field(description="Search workflow run IDs, parameters, and headers")] = None,
+    error_code: Annotated[str | None, Field(description="Filter by task error code")] = None,
+) -> dict[str, Any]:
+    """List runs for a specific workflow. Use this when you have a workflow permanent ID
+    and need to browse its run history with pagination and optional filters."""
+    if err := validate_workflow_id(workflow_id, "skyvern_workflow_run_list"):
+        return err
+
+    with Timer() as timer:
+        try:
+            requested_page_size = page_size
+            runs = await list_workflow_runs_raw(
+                workflow_id,
+                page=page,
+                page_size=requested_page_size + 1,
+                status=status,
+                search_key=search_key,
+                error_code=error_code,
+            )
+            timer.mark("sdk")
+        except NotFoundError:
+            return make_result(
+                "skyvern_workflow_run_list",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.WORKFLOW_NOT_FOUND,
+                    f"Workflow {workflow_id!r} not found",
+                    "Verify the workflow ID with skyvern_workflow_list",
+                ),
+            )
+        except Exception as e:
+            return make_result(
+                "skyvern_workflow_run_list",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.API_ERROR, str(e), "Check your API key and workflow run filters"),
+            )
+
+    has_more = len(runs) > page_size
+    runs = runs[:page_size]
+
+    return make_result(
+        "skyvern_workflow_run_list",
+        data={
+            "workflow_id": workflow_id,
+            "runs": [_serialize_run_summary(run) for run in runs],
+            "page": page,
+            "page_size": page_size,
+            "count": len(runs),
+            "has_more": has_more,
+            "sdk_equivalent": (
+                f"await skyvern.get_workflow_runs_by_id(workflow_id={workflow_id!r}, "
+                f"page={page}, page_size={page_size})"
+            ),
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
 async def skyvern_workflow_create(
     definition: Annotated[str, "Workflow definition as a YAML or JSON string"],
     format: Annotated[  # noqa: A002
@@ -907,7 +990,16 @@ async def skyvern_workflow_create(
 
     One block per step: "navigation" for actions, "extraction" for data. Do NOT use deprecated "task" type.
     Call skyvern_block_schema() for block types and schemas. Use {{parameter_key}} for input references.
-    Defaults to Code 2.0 (run_with="code"). Blocks share a browser session automatically.
+    Defaults to AI agent execution (run_with="agent"). For JSON definitions, code_version=2 is also
+    injected (YAML definitions go through the backend schema, which currently leaves code_version unset).
+    Pass run_with="code" to opt into cached script execution. Blocks share a browser session automatically.
+
+    Leave optional toggles and overrides unset unless the user explicitly asks for them. This
+    applies to workflow-level fields (persist_browser_session, extra_http_headers,
+    totp_verification_url, totp_identifier, etc.) AND block-level overrides (max_retries,
+    max_steps_per_run, totp_identifier, complete_criterion, error_code_mapping,
+    continue_on_failure, engine, model, etc.). The schema defaults are intentional; silently
+    flipping them changes behavior the user did not request.
     """
     if format not in ("json", "yaml", "auto"):
         return make_result(
@@ -1390,6 +1482,62 @@ async def skyvern_workflow_cancel(
             "run_id": run_id,
             "cancelled": True,
             "sdk_equivalent": f"await skyvern.cancel_run({run_id!r})",
+        },
+        timing_ms=timer.timing_ms,
+    )
+
+
+async def skyvern_workflow_retry(
+    workflow_run_id: Annotated[str, "Workflow run ID to retry (wr_...)"],
+) -> dict[str, Any]:
+    """Retry a terminal workflow run. Creates a new workflow run using the original run
+    parameters and run settings."""
+    if err := validate_workflow_run_id(workflow_run_id, "skyvern_workflow_retry"):
+        return err
+
+    with Timer() as timer:
+        try:
+            run = await retry_workflow_run_raw(workflow_run_id)
+            timer.mark("sdk")
+        except NotFoundError:
+            return make_result(
+                "skyvern_workflow_retry",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.RUN_NOT_FOUND,
+                    f"Workflow run {workflow_run_id!r} not found",
+                    "Verify the workflow run ID with skyvern_workflow_run_list or skyvern_workflow_status",
+                ),
+            )
+        except BadRequestError as e:
+            return make_result(
+                "skyvern_workflow_retry",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(
+                    ErrorCode.INVALID_INPUT,
+                    _api_error_body_message(e.body),
+                    "Only terminal workflow runs can be retried.",
+                ),
+            )
+        except Exception as e:
+            LOG.error("workflow_retry_failed", workflow_run_id=workflow_run_id, error=str(e))
+            return make_result(
+                "skyvern_workflow_retry",
+                ok=False,
+                timing_ms=timer.timing_ms,
+                error=make_error(ErrorCode.API_ERROR, str(e), "Check the workflow run ID and your API key"),
+            )
+
+    retry_run_id = _get_value(run, "run_id") or _get_value(run, "workflow_run_id")
+    LOG.info("workflow_retried", workflow_run_id=workflow_run_id, retry_run_id=retry_run_id)
+    return make_result(
+        "skyvern_workflow_retry",
+        data={
+            "workflow_run_id": workflow_run_id,
+            "retry_run": _serialize_run_summary(run),
+            "sdk_equivalent": f"await skyvern.retry_workflow_run({workflow_run_id!r})",
         },
         timing_ms=timer.timing_ms,
     )

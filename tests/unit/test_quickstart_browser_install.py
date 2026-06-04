@@ -81,7 +81,7 @@ def test_quickstart_does_not_start_services_when_required_browser_is_missing(
     monkeypatch.setattr(quickstart_module, "check_docker_compose_file", lambda: False)
     monkeypatch.setattr(quickstart_module, "_has_server_quickstart_extra", lambda: True)
     monkeypatch.setattr(init_command, "init_env", lambda **_kwargs: init_result)
-    monkeypatch.setattr(quickstart_module, "_configure_cdp_livestreaming_defaults", lambda: None)
+    monkeypatch.setattr(quickstart_module, "_configure_local_browser_streaming_defaults", lambda: None)
     monkeypatch.setattr(
         quickstart_module.typer,
         "confirm",

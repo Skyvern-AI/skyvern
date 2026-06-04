@@ -27,6 +27,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.api.llm.exceptions import (
     DuplicateCustomLLMProviderError,
     InvalidLLMConfigError,
+    LLMOutputTruncatedError,
     LLMProviderError,
     LLMProviderErrorRetryableTask,
 )
@@ -34,6 +35,7 @@ from skyvern.forge.sdk.api.llm.litellm_transport import configure_litellm_transp
 from skyvern.forge.sdk.api.llm.ui_tars_response import UITarsResponse
 from skyvern.forge.sdk.api.llm.utils import (
     is_image_message,
+    is_truncated_response,
     llm_messages_builder,
     llm_messages_builder_with_history,
     parse_api_response,
@@ -41,7 +43,8 @@ from skyvern.forge.sdk.api.llm.utils import (
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
+from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -67,6 +70,12 @@ LLM_REQUEST_COMPLETED_EVENT = "llm.request.completed"
 
 EXTRACT_ACTION_PROMPT_NAME = "extract-actions"
 CHECK_USER_GOAL_PROMPT_NAMES = {"check-user-goal", "check-user-goal-with-termination"}
+VISION_FALLBACK_PROMPT_NAMES = {
+    "anthropic-cua",
+    "css-shape-convert",
+    "extract-text-from-image",
+    "ui-tars-system-prompt",
+}
 
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
@@ -164,14 +173,49 @@ def _llm_screenshots_for_call(
     screenshots: list[bytes] | None,
     llm_config: LLMConfig | LLMRouterConfig,
     context: SkyvernContext | None,
+    prompt_name: str | None = None,
+    step: Step | None = None,
 ) -> list[bytes] | None:
-    if not llm_config.supports_vision or (context and context.disable_llm_screenshots):
+    if not llm_config.supports_vision:
+        return None
+    if context and not context.llm_screenshots_enabled_for_prompt(
+        is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES,
+        retry_index=step.retry_index if step else None,
+    ):
         return None
     return screenshots
 
 
-def _llm_screenshots_enabled_metric(llm_config: LLMConfig | LLMRouterConfig, context: SkyvernContext | None) -> bool:
-    return llm_config.supports_vision and not bool(context and context.disable_llm_screenshots)
+def _llm_screenshots_enabled_metric(
+    llm_config: LLMConfig | LLMRouterConfig,
+    context: SkyvernContext | None,
+    prompt_name: str | None = None,
+    step: Step | None = None,
+) -> bool:
+    if not llm_config.supports_vision:
+        return False
+    if context and not context.llm_screenshots_enabled_for_prompt(
+        is_vision_fallback_prompt=prompt_name in VISION_FALLBACK_PROMPT_NAMES,
+        retry_index=step.retry_index if step else None,
+    ):
+        return False
+    return True
+
+
+def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
+    if context is None:
+        return {
+            "enrich_tree_mode": EnrichTreeMode.CONTROL.value,
+            "enrich_tree_fallback_active": False,
+            "enriched_tree_enabled": False,
+        }
+
+    retry_index = step.retry_index if step else None
+    return {
+        "enrich_tree_mode": context.enrich_tree_mode.value,
+        "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
+        "enriched_tree_enabled": context.enriched_tree_enabled(),
+    }
 
 
 @runtime_checkable
@@ -697,6 +741,36 @@ class LLMAPIHandlerFactory:
             return None
 
     @staticmethod
+    def _maybe_get_non_flex_handler(default: LLMAPIHandler) -> LLMAPIHandler | None:
+        """Mirror of `_maybe_get_flex_handler` for the inverse direction: swap a flex
+        default for its non-flex twin when `trigger_type == manual` (UI/MCP)."""
+        ctx = skyvern_context.current()
+        if ctx is None or ctx.trigger_type != WorkflowRunTriggerType.manual:
+            return None
+        effective_key = (
+            getattr(default, "llm_key", None)
+            or getattr(getattr(default, "__self__", None), "llm_key", None)
+            or settings.LLM_KEY
+        )
+        non_flex_key = app.AGENT_FUNCTION.get_non_flex_llm_key(effective_key)
+        if not non_flex_key or not LLMConfigRegistry.is_registered(non_flex_key):
+            return None
+        try:
+            non_flex_handler = LLMAPIHandlerFactory.get_llm_api_handler(non_flex_key)
+            span = otel_trace.get_current_span()
+            span.set_attribute("non_flex_routing_applied", True)
+            span.set_attribute("non_flex_routing_resolved_key", non_flex_key)
+            return non_flex_handler
+        except Exception:
+            LOG.warning(
+                "Failed to get non-flex LLM API handler, falling back to default (flex) resolution.",
+                non_flex_key=non_flex_key,
+                effective_key=effective_key,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
     def wrap_for_flex_routing(handler: LLMAPIHandler) -> LLMAPIHandler:
         """Wrap a default LLM handler so it applies flex routing when context says so.
 
@@ -707,6 +781,9 @@ class LLMAPIHandlerFactory:
         """
 
         async def flex_aware_handler(*args: Any, **kwargs: Any) -> Any:
+            non_flex_handler = LLMAPIHandlerFactory._maybe_get_non_flex_handler(handler)
+            if non_flex_handler is not None:
+                return await non_flex_handler(*args, **kwargs)
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(handler)
             target = flex_handler if flex_handler is not None else handler
             return await target(*args, **kwargs)
@@ -731,6 +808,9 @@ class LLMAPIHandlerFactory:
         # Flex routing is treated as default-path tier optimization, not a model rewriter.
         # Treat empty string as "no override" — block models persist `llm_key=""` rather than NULL.
         if not override_llm_key:
+            non_flex_handler = LLMAPIHandlerFactory._maybe_get_non_flex_handler(default)
+            if non_flex_handler is not None:
+                return non_flex_handler
             flex_handler = LLMAPIHandlerFactory._maybe_get_flex_handler(default)
             if flex_handler is not None:
                 return flex_handler
@@ -763,13 +843,28 @@ class LLMAPIHandlerFactory:
         else:
             fallback_groups = list(llm_config.fallback_model_group)
 
+        # Emit one fallbacks entry per non-terminal hop so secondary entry points
+        # (e.g. truncation retry that calls router.acompletion(model=fallback_groups[0]))
+        # also benefit from the remaining chain. For the primary entry point
+        # this is equivalent to the legacy single-dict shape because litellm's
+        # run_async_fallback outer loop iterates either form end-to-end. SKY-10200.
+        chain = [llm_config.main_model_group, *fallback_groups]
+        fallbacks_payload: list[dict[str, list[str]]] = [{chain[i]: chain[i + 1 :]} for i in range(len(chain) - 1)]
+
         router = litellm.Router(
             model_list=[dataclasses.asdict(model) for model in llm_config.model_list],
             redis_host=llm_config.redis_host,
             redis_port=llm_config.redis_port,
             redis_password=llm_config.redis_password,
             routing_strategy=llm_config.routing_strategy,
-            fallbacks=([{llm_config.main_model_group: fallback_groups}] if fallback_groups else []),
+            fallbacks=fallbacks_payload,
+            # Router-level default timeout. Per litellm router precedence
+            # (litellm/router.py:_get_non_stream_timeout) this is the fallback
+            # used when neither the caller kwarg nor the per-deployment
+            # litellm_params['timeout'] is set. Setting it here (and dropping
+            # the per-call timeout kwarg below) lets per-deployment timeouts
+            # actually apply — previously the call-site value clobbered them.
+            timeout=settings.LLM_CONFIG_TIMEOUT,
             num_retries=llm_config.num_retries,
             retry_after=llm_config.retry_delay_seconds,
             disable_cooldowns=llm_config.disable_cooldowns,
@@ -903,8 +998,8 @@ class LLMAPIHandlerFactory:
                                     **artifact_targets,
                                 )
                             )
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -986,11 +1081,13 @@ class LLMAPIHandlerFactory:
 
                 model_used = main_model_group
                 llm_request_json = ""
+                llm_duration_seconds = 0.0
 
                 async def _call_primary_with_vertex_cache(
                     cache_name: str,
                     cache_variant_name: str | None,
                 ) -> tuple[ModelResponse, str, str]:
+                    nonlocal llm_duration_seconds
                     if primary_model_dict is None:
                         raise ValueError("Primary router model missing configuration")
                     litellm_params = copy.deepcopy(primary_model_dict.get("litellm_params") or {})
@@ -1029,23 +1126,34 @@ class LLMAPIHandlerFactory:
                         cache_variant=cache_variant_name,
                     )
                     request_payload_json = await _log_llm_request_artifact(request_model, True)
-                    response = await litellm.acompletion(
-                        model=request_model,
-                        messages=active_messages,
-                        drop_params=True,
-                        **active_params,
-                    )
+                    _llm_call_start = time.perf_counter()
+                    try:
+                        response = await litellm.acompletion(
+                            model=request_model,
+                            messages=active_messages,
+                            drop_params=True,
+                            **active_params,
+                        )
+                    finally:
+                        llm_duration_seconds += time.perf_counter() - _llm_call_start
                     return response, request_model, request_payload_json
 
                 async def _call_router_without_cache() -> tuple[ModelResponse, str]:
+                    nonlocal llm_duration_seconds
                     request_payload_json = await _log_llm_request_artifact(llm_key, False)
-                    response = await router.acompletion(
-                        model=main_model_group,
-                        messages=messages,
-                        timeout=settings.LLM_CONFIG_TIMEOUT,
-                        drop_params=True,
-                        **parameters,
-                    )
+                    _llm_call_start = time.perf_counter()
+                    try:
+                        # No timeout= kwarg: per-deployment litellm_params['timeout']
+                        # wins, falling through to the Router-level default for
+                        # deployments without an explicit value. See SKY-10200.
+                        response = await router.acompletion(
+                            model=main_model_group,
+                            messages=messages,
+                            drop_params=True,
+                            **parameters,
+                        )
+                    finally:
+                        llm_duration_seconds += time.perf_counter() - _llm_call_start
                     return response, request_payload_json
 
                 try:
@@ -1081,6 +1189,51 @@ class LLMAPIHandlerFactory:
                                 primary_model=main_model_group,
                                 fallback_model=response_model,
                             )
+
+                    if (
+                        is_truncated_response(response)
+                        and fallback_groups
+                        and LLMAPIHandlerFactory._models_equivalent(model_used, main_model_group)
+                    ):
+                        fallback_model = fallback_groups[0]
+                        _usage = response.usage if hasattr(response, "usage") and response.usage else None
+                        LOG.warning(
+                            "LLM output truncated on primary model, retrying with fallback",
+                            llm_key=llm_key,
+                            prompt_name=prompt_name,
+                            primary_model=main_model_group,
+                            fallback_model=fallback_model,
+                            prompt_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
+                            completion_tokens=getattr(_usage, "completion_tokens", 0) if _usage else 0,
+                        )
+                        fallback_params = {
+                            k: v for k, v in parameters.items() if k not in ("max_completion_tokens", "max_tokens")
+                        }
+                        _llm_call_start = time.perf_counter()
+                        try:
+                            # No timeout= kwarg here either; see SKY-10200 note on
+                            # the primary call site above.
+                            response = await router.acompletion(
+                                model=fallback_model,
+                                messages=messages,
+                                drop_params=True,
+                                **fallback_params,
+                            )
+                        finally:
+                            llm_duration_seconds += time.perf_counter() - _llm_call_start
+                        model_used = response.model or fallback_model
+                        if is_truncated_response(response):
+                            _fb_usage = response.usage if hasattr(response, "usage") and response.usage else None
+                            _fb_detail = getattr(_fb_usage, "completion_tokens_details", None) if _fb_usage else None
+                            raise LLMOutputTruncatedError(
+                                model=fallback_model,
+                                prompt_tokens=getattr(_fb_usage, "prompt_tokens", 0) if _fb_usage else 0,
+                                completion_tokens=(getattr(_fb_usage, "completion_tokens", 0) if _fb_usage else 0),
+                                reasoning_tokens=(
+                                    (getattr(_fb_detail, "reasoning_tokens", 0) or 0) if _fb_detail else 0
+                                ),
+                            )
+
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
@@ -1286,6 +1439,7 @@ class LLMAPIHandlerFactory:
                     model=model_used,
                     prompt_name=prompt_name,
                     duration_seconds=duration_seconds,
+                    llm_duration_seconds=llm_duration_seconds,
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
@@ -1298,6 +1452,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -1509,8 +1664,8 @@ class LLMAPIHandlerFactory:
                                 )
                             )
 
-                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context)
-                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context)
+                screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
+                llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
 
                 model_name = llm_config.model_name
 
@@ -1627,6 +1782,7 @@ class LLMAPIHandlerFactory:
                         LOG.warning("Could not find static prompt to strip from cached request")
 
                 t_llm_request = time.perf_counter()
+                llm_duration_seconds = 0.0
                 try:
                     # TODO (kerem): add a retry mechanism to this call (acompletion_with_retries)
                     # TODO (kerem): use litellm fallbacks? https://litellm.vercel.app/docs/tutorials/fallbacks#how-does-completion_with_fallbacks-work
@@ -1636,6 +1792,7 @@ class LLMAPIHandlerFactory:
                         drop_params=True,  # Drop unsupported parameters gracefully
                         **active_parameters,
                     )
+                    llm_duration_seconds = time.perf_counter() - t_llm_request
                 # Error paths only set status=error, not token/cost attrs via
                 # _enrich_llm_span — no response object exists so there's nothing to report.
                 except litellm.exceptions.APIError as e:
@@ -1824,6 +1981,7 @@ class LLMAPIHandlerFactory:
                     prompt_name=prompt_name,
                     model=llm_config.model_name,
                     duration_seconds=duration_seconds,
+                    llm_duration_seconds=llm_duration_seconds,
                     step_id=step.step_id if step else None,
                     thought_id=thought.observer_thought_id if thought else None,
                     organization_id=organization_id,
@@ -1836,6 +1994,7 @@ class LLMAPIHandlerFactory:
                     llm_cost=llm_cost if llm_cost > 0 else None,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2143,8 +2302,8 @@ class LLMCaller:
                             )
                         )
 
-            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context)
-            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context)
+            screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
+            llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2184,6 +2343,7 @@ class LLMCaller:
                     )
 
             t_llm_request = time.perf_counter()
+            llm_duration_seconds = 0.0
             try:
                 # `timeout` may already live in active_parameters via litellm_params (flex configs
                 # carry their own); passing it explicitly too collides on kwarg unpacking.
@@ -2192,6 +2352,7 @@ class LLMCaller:
                     tools=tools,
                     **active_parameters,
                 )
+                llm_duration_seconds = time.perf_counter() - t_llm_request
                 if use_message_history:
                     # only update message_history when the request is successful
                     self.message_history = messages
@@ -2295,6 +2456,7 @@ class LLMCaller:
                 prompt_name=prompt_name,
                 model=self.llm_config.model_name,
                 duration_seconds=duration_seconds,
+                llm_duration_seconds=llm_duration_seconds,
                 step_id=step.step_id if step else None,
                 thought_id=thought.observer_thought_id if thought else None,
                 organization_id=organization_id,
@@ -2308,6 +2470,7 @@ class LLMCaller:
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
                 llm_screenshots_enabled=llm_screenshots_enabled,
+                **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
             )
 
@@ -2466,6 +2629,10 @@ class LLMCaller:
         if self.llm_key and "UI_TARS" in self.llm_key:
             return await self._call_ui_tars(messages, tools, timeout, **active_parameters)
 
+        # Route Yutori Navigator models to Yutori SDK
+        if self.llm_key and "YUTORI" in self.llm_key:
+            return await self._call_yutori_navigator(messages, timeout, **active_parameters)
+
         return await litellm.acompletion(
             model=self.llm_config.model_name,
             messages=messages,
@@ -2573,6 +2740,48 @@ class LLMCaller:
             timeout=timeout,
         )
         return response
+
+    async def _call_yutori_navigator(
+        self,
+        messages: list[dict[str, Any]],
+        timeout: float = settings.LLM_CONFIG_TIMEOUT,
+        **active_parameters: dict[str, Any],
+    ) -> ModelResponse:
+        """Call the Yutori Navigator API via the Yutori SDK client."""
+        from yutori.navigator import estimate_messages_size_bytes, trimmed_messages_to_fit
+
+        if not app.YUTORI_CLIENT:
+            raise ValueError("YUTORI_CLIENT not initialized. Ensure ENABLE_YUTORI=true and YUTORI_API_KEY is set.")
+
+        # Trim old screenshots if payload exceeds size limit
+        max_bytes = 9_500_000
+        if estimate_messages_size_bytes(messages) > max_bytes:
+            messages, _, removed = trimmed_messages_to_fit(messages, max_bytes=max_bytes)
+            if removed:
+                LOG.info("Trimmed old screenshots for payload size", removed=removed)
+
+        model_name = self.llm_config.model_name
+        tool_set = settings.YUTORI_TOOL_SET or None
+        max_tokens = active_parameters.get("max_completion_tokens") or active_parameters.get("max_tokens") or 4096
+
+        LOG.info(
+            "Yutori Navigator request",
+            model_name=model_name,
+            tool_set=tool_set,
+            messages_length=len(messages),
+        )
+
+        completion = await app.YUTORI_CLIENT.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+            tool_set=tool_set,
+            timeout=timeout,
+        )
+
+        # Convert to litellm ModelResponse for standard cost/stats tracking
+        response_dict = completion.model_dump()
+        return litellm.ModelResponse(**response_dict)
 
     async def get_call_stats(
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse

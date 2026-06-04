@@ -69,7 +69,7 @@ function DebuggerPostRunParameters() {
     workflowRunTimelineIsLoading ||
     workflowIsLoading
   ) {
-    return <div>Loading workflow parameters...</div>;
+    return <div>Loading workflow inputs...</div>;
   }
 
   if (!workflowRun || !workflowRunTimeline) {
@@ -95,7 +95,7 @@ function DebuggerPostRunParameters() {
       {activeBlock && isTaskVariantBlock(activeBlock) ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Task Block Parameters</h1>
+            <h1 className="text-sm font-bold">Task Block Inputs</h1>
             <DebuggerTaskBlockParameters block={activeBlock} />
           </div>
         </div>
@@ -104,7 +104,7 @@ function DebuggerPostRunParameters() {
       activeBlock.block_type === WorkflowBlockTypes.SendEmail ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Email Block Parameters</h1>
+            <h1 className="text-sm font-bold">Email Block Inputs</h1>
             <DebuggerSendEmailBlockParameters
               body={activeBlock?.body ?? ""}
               recipients={activeBlock?.recipients ?? []}
@@ -116,7 +116,7 @@ function DebuggerPostRunParameters() {
       {activeBlock && isWorkflowRunLoopContainerBlock(activeBlock) ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Loop Block Parameters</h1>
+            <h1 className="text-sm font-bold">Loop Block Inputs</h1>
             {activeBlock.block_type === WorkflowBlockTypes.ForLoop ? (
               <div className="flex flex-col gap-2">
                 <div className="flex w-full items-center justify-start gap-2">
@@ -149,7 +149,7 @@ function DebuggerPostRunParameters() {
       {activeBlock && activeBlock.block_type === WorkflowBlockTypes.Wait ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Wait Block Parameters</h1>
+            <h1 className="text-sm font-bold">Wait Block Inputs</h1>
             <div className="flex flex-col gap-2">
               <div className="flex w-full items-center justify-start gap-2">
                 <h1 className="text-sm">Wait Duration</h1>
@@ -172,7 +172,7 @@ function DebuggerPostRunParameters() {
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
             <h1 className="text-sm font-bold">
-              Human Interaction Block Parameters
+              Human Interaction Block Inputs
             </h1>
             {activeBlock.instructions ? (
               <div className="flex flex-col gap-2">
@@ -205,7 +205,7 @@ function DebuggerPostRunParameters() {
       activeBlock.block_type === WorkflowBlockTypes.Conditional ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Conditional Block Parameters</h1>
+            <h1 className="text-sm font-bold">Conditional Block Inputs</h1>
             {activeBlock.executed_branch_expression ? (
               <div className="flex flex-col gap-2">
                 <div className="flex w-full items-center justify-start gap-2">
@@ -254,7 +254,7 @@ function DebuggerPostRunParameters() {
       activeBlock.block_type === WorkflowBlockTypes.TextPrompt ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Text Prompt Block Parameters</h1>
+            <h1 className="text-sm font-bold">Text Prompt Block Inputs</h1>
             {activeBlock.prompt ? (
               <div className="flex flex-col gap-2">
                 <div className="flex w-full items-center justify-start gap-2">
@@ -269,13 +269,13 @@ function DebuggerPostRunParameters() {
       ) : null}
       <div className="rounded bg-slate-elevation2 p-6">
         <div className="space-y-4">
-          <h1 className="text-sm font-bold">Workflow Parameters</h1>
+          <h1 className="text-sm font-bold">Workflow Inputs</h1>
           {Object.entries(parameters).map(([key, value]) => {
             return (
               <div key={key} className="flex flex-col gap-2">
                 <div className="flex w-full items-center justify-start gap-2">
                   <h1 className="text-sm">{key}</h1>
-                  <HelpTooltip content="The value of the parameter." />
+                  <HelpTooltip content="The value of the input." />
                 </div>
                 {typeof value === "string" ||
                 typeof value === "number" ||
@@ -295,11 +295,9 @@ function DebuggerPostRunParameters() {
             );
           })}
           {Object.entries(parameters).length === 0 ? (
-            <div className="text-sm">
-              No input parameters found for this workflow
-            </div>
+            <div className="text-sm">No inputs found for this workflow</div>
           ) : null}
-          <h1 className="text-sm font-bold">Other Workflow Parameters</h1>
+          <h1 className="text-sm font-bold">Other Workflow Inputs</h1>
           <div className="flex flex-col gap-2">
             <div className="flex w-full items-center justify-start gap-2">
               <h1 className="text-sm">Webhook Callback URL</h1>
@@ -360,7 +358,7 @@ function DebuggerPostRunParameters() {
       {workflowRun.task_v2 ? (
         <div className="rounded bg-slate-elevation2 p-6">
           <div className="space-y-4">
-            <h1 className="text-sm font-bold">Task 2.0 Parameters</h1>
+            <h1 className="text-sm font-bold">Task 2.0 Inputs</h1>
             <div className="flex flex-col gap-2">
               <div className="flex w-full items-center justify-start gap-2">
                 <h1 className="text-sm">Task 2.0 Prompt</h1>

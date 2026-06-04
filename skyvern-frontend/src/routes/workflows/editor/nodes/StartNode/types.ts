@@ -11,7 +11,9 @@ export type WorkflowStartNodeData = {
   browserProfileId: string | null;
   model: WorkflowModel | null;
   maxScreenshotScrolls: number | null;
+  maxElapsedTimeMinutes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
+  cdpConnectHeaders: string | Record<string, unknown> | null;
   editable: boolean;
   runWith: string;
   codeVersion: number | null;
