@@ -713,6 +713,32 @@
             }
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`.",
+              "examples": [
+                "env:prod",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`."
+          },
+          {
             "name": "template",
             "in": "query",
             "required": false,
@@ -4227,6 +4253,43 @@
               "title": "Vault Type"
             },
             "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
+          },
+          {
+            "name": "credential_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/skyvern__forge__sdk__schemas__credentials__CredentialType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')",
+              "title": "Credential Type"
+            },
+            "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "title": "Search"
+            },
+            "description": "Case-insensitive search across credential name, username, secret label, and card details"
           },
           {
             "name": "x-api-key",
