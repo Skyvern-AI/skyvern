@@ -9,3 +9,11 @@ paths:
     x-fern-ignore: true
   /api/v1/billing/change-tier:
     x-fern-ignore: true
+components:
+  schemas:
+    # folder_id is returned at runtime for the internal folder UI, but credential
+    # folders are not part of the public API, so keep it out of the generated SDK.
+    CredentialResponse:
+      properties:
+        folder_id:
+          x-fern-ignore: true
