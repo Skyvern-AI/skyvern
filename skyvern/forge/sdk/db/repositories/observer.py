@@ -601,6 +601,32 @@ class ObserverRepository(BaseRepository):
             task = await self._task_reader.get_task(task_id, organization_id=workflow_run_block.organization_id)
         return convert_to_workflow_run_block(workflow_run_block, task=task)
 
+    @db_operation("bulk_update_workflow_run_blocks_by_workflow_run_id")
+    async def bulk_update_workflow_run_blocks_by_workflow_run_id(
+        self,
+        workflow_run_id: str,
+        new_status: str,
+        only_if_status_in: list[str],
+        failure_reason: str | None = None,
+    ) -> int:
+        if not only_if_status_in:
+            return 0
+
+        async with self.Session() as session:
+            update_values: dict[str, Any] = {"status": new_status}
+            if failure_reason is not None:
+                update_values["failure_reason"] = failure_reason
+
+            stmt = (
+                update(WorkflowRunBlockModel)
+                .where(WorkflowRunBlockModel.workflow_run_id == workflow_run_id)
+                .where(WorkflowRunBlockModel.status.in_(only_if_status_in))
+                .values(**update_values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
+
     @db_operation("get_workflow_run_block")
     async def get_workflow_run_block(
         self,

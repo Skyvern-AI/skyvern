@@ -327,7 +327,7 @@ async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
             dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
         )
     else:
-        await skyvern_frame.safe_wait_for_animation_end()
+        await skyvern_frame.safe_wait_for_animation_end(caller="scraper.scrape_ready")
 
 
 @traced(name="skyvern.agent.scrape")
@@ -617,6 +617,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         self.element_tree: list[dict] = list()
         self.element_tree_trimmed: list[dict] = list()
         self.skyvern_frame = skyvern_frame
+        self.last_used_element_tree_html: str | None = None
 
     def set_element_tree_trimmed(self, element_tree_trimmed: list[dict]) -> None:
         self.element_tree_trimmed = element_tree_trimmed

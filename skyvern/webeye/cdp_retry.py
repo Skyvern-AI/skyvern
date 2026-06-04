@@ -41,20 +41,28 @@ async def connect_over_cdp_with_retry(
     playwright: Playwright,
     browser_address: str,
     headers: dict[str, str] | None = None,
+    log_browser_address: str | None = None,
 ) -> Browser:
     browser_address = strip_browser_address_discriminator(browser_address)
+    browser_address_for_logs = log_browser_address or browser_address
     for attempt in range(1, _CDP_RETRY_ATTEMPTS + 1):
         try:
             browser = await playwright.chromium.connect_over_cdp(browser_address, headers=headers)
             if attempt > 1:
                 LOG.info(
                     "CDP connection recovered after retry",
-                    browser_address=browser_address,
+                    browser_address=browser_address_for_logs,
                     successful_attempt=attempt,
                 )
             return browser
         except Exception as e:
             if not is_cdp_connection_error(e) or attempt == _CDP_RETRY_ATTEMPTS:
+                # When the caller passed log_browser_address as a safe label, the raw
+                # browser_address may carry session tokens in path/query — Playwright's
+                # exception text would otherwise expose them. Re-raise a RuntimeError
+                # with only the safe label + error class name.
+                if log_browser_address is not None:
+                    raise RuntimeError(f"CDP connection to {log_browser_address} failed ({type(e).__name__})") from None
                 raise
             backoff = (
                 _CDP_RETRY_BACKOFF_SECONDS[attempt - 1]
@@ -63,7 +71,7 @@ async def connect_over_cdp_with_retry(
             )
             LOG.warning(
                 "CDP connection failed, retrying",
-                browser_address=browser_address,
+                browser_address=browser_address_for_logs,
                 attempt=attempt,
                 max_attempts=_CDP_RETRY_ATTEMPTS,
                 backoff_seconds=backoff,

@@ -21,10 +21,6 @@ function WorkflowRunBlockScreenshot({ workflowRunBlockId, runStatus }: Props) {
   const credentialGetter = useCredentialGetter();
   const [imageFailed, setImageFailed] = useState(false);
 
-  useEffect(() => {
-    setImageFailed(false);
-  }, [workflowRunBlockId]);
-
   const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["workflowRunBlock", workflowRunBlockId, "artifacts"],
     queryFn: async () => {
@@ -52,6 +48,10 @@ function WorkflowRunBlockScreenshot({ workflowRunBlockId, runStatus }: Props) {
   );
 
   const screenshot = llmScreenshots?.[0];
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [workflowRunBlockId, screenshot?.signed_url]);
 
   if (isLoading) {
     return (

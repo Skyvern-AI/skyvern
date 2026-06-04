@@ -62,11 +62,11 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -110,6 +110,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     is_adaptive_caching,
+)
+from skyvern.forge.sdk.workflow.status_mapping import (
+    BLOCK_STATUS_MAP,
+    NONFINAL_BLOCK_STATUSES,
+    STEP_STATUS_MAP,
+    TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.runs import (
@@ -1653,6 +1659,14 @@ class WorkflowService:
             )
             timeout_failure_reason = _format_workflow_run_elapsed_timeout_failure_reason(effective_max_elapsed_minutes)
             max_elapsed_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
+            LOG.debug(
+                "Workflow run elapsed timeout computed",
+                workflow_run_id=workflow_run_id,
+                max_elapsed_time_minutes_raw=workflow_run.max_elapsed_time_minutes,
+                effective_max_elapsed_minutes=effective_max_elapsed_minutes,
+                max_elapsed_timeout_seconds=max_elapsed_timeout_seconds,
+                started_at=workflow_run.started_at,
+            )
             blocks_to_update: set[str] = set()
             if max_elapsed_timeout_seconds <= 0:
                 workflow_run = await self.mark_workflow_run_as_timed_out(
@@ -4559,6 +4573,51 @@ class WorkflowService:
             copilot_session_id=copilot_session_id,
         )
 
+    async def _cascade_child_entities_on_terminal(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+        if status != WorkflowRunStatus.timed_out:
+            return
+
+        try:
+            await self._do_cascade_child_entities(workflow_run_id, status)
+        except Exception:
+            LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
+
+    async def _do_cascade_child_entities(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+        block_status = BLOCK_STATUS_MAP[status]
+        task_status = TASK_STATUS_MAP[status]
+        step_status = STEP_STATUS_MAP[status]
+        failure_reason = f"Workflow run {status.value}: child entity cascade cleanup."
+
+        blocks_updated = await app.DATABASE.observer.bulk_update_workflow_run_blocks_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            new_status=block_status.value,
+            only_if_status_in=NONFINAL_BLOCK_STATUSES,
+            failure_reason=failure_reason,
+        )
+        tasks_updated = await app.DATABASE.tasks.bulk_update_tasks_by_workflow_run_ids(
+            workflow_run_ids=[workflow_run_id],
+            new_status=task_status,
+            only_if_status_in=[TaskStatus.created, TaskStatus.queued, TaskStatus.running],
+            failure_reason=failure_reason,
+        )
+        steps_updated = await app.DATABASE.tasks.bulk_update_steps_by_workflow_run_ids(
+            workflow_run_ids=[workflow_run_id],
+            new_status=step_status,
+            only_if_status_in=[StepStatus.created, StepStatus.running],
+        )
+        if blocks_updated or tasks_updated or steps_updated:
+            LOG.info(
+                "Cascaded terminal status to child entities",
+                workflow_run_id=workflow_run_id,
+                workflow_run_status=status,
+                block_target_status=block_status,
+                task_target_status=task_status,
+                step_target_status=step_status,
+                blocks_updated=blocks_updated,
+                tasks_updated=tasks_updated,
+                steps_updated=steps_updated,
+            )
+
     async def _update_workflow_run_status(
         self,
         workflow_run_id: str,
@@ -4688,12 +4747,14 @@ class WorkflowService:
             return await self.mark_workflow_run_as_completed(workflow_run_id)
 
         if workflow_run.status == WorkflowRunStatus.running:
-            # We temporarily set to running for finally block, restore terminal status
-            return await self._update_workflow_run_status(
+            workflow_run = await self._update_workflow_run_status(
                 workflow_run_id=workflow_run_id,
                 status=pre_finally_status,
                 failure_reason=pre_finally_failure_reason,
             )
+            if pre_finally_status == WorkflowRunStatus.timed_out:
+                await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+            return workflow_run
 
         return workflow_run
 
@@ -4935,13 +4996,15 @@ class WorkflowService:
             failure_category_source="code_level",
         )
 
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.timed_out,
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
         )
+        await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+        return workflow_run
 
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(

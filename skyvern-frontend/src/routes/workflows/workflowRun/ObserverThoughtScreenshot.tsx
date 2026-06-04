@@ -21,10 +21,6 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
   const credentialGetter = useCredentialGetter();
   const [imageFailed, setImageFailed] = useState(false);
 
-  useEffect(() => {
-    setImageFailed(false);
-  }, [observerThoughtId]);
-
   const { data: artifacts, isLoading } = useQuery<Array<ArtifactApiResponse>>({
     queryKey: ["observerThought", observerThoughtId, "artifacts"],
     queryFn: async () => {
@@ -51,6 +47,10 @@ function ObserverThoughtScreenshot({ observerThoughtId, taskStatus }: Props) {
 
   // use the last screenshot as the llmScreenshots are in reverse order
   const screenshot = llmScreenshots?.[llmScreenshots.length - 1];
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [observerThoughtId, screenshot?.signed_url]);
 
   if (isLoading) {
     return (

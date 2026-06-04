@@ -31,5 +31,6 @@ def test_unset_query_params_are_passed_as_none() -> None:
     assert kwargs["search"] is None
     assert kwargs["credential_type"] is None
     assert kwargs["vault_type"] is None
+    assert kwargs["folder_id"] is None
     assert kwargs["page"] == 1
     assert kwargs["page_size"] == 10

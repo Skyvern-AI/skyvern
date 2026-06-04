@@ -195,6 +195,89 @@ def test_composition_parse_html_ignores_hidden_modal_overlay_markup() -> None:
     assert parsed["page_obstructions"] == []
 
 
+def test_composition_parse_html_marks_generic_fullscreen_barrier_for_visual_fallback() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <form id="search">
+            <input id="query" name="query" type="text" />
+            <button>Search</button>
+          </form>
+          <section
+            id="interruption"
+            style="position: fixed; inset: 0; z-index: 1200; background: rgba(0,0,0,.35);"
+          >
+            <article>
+              <p>Finish this checkpoint before continuing.</p>
+              <button>Continue</button>
+            </article>
+          </section>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["modal_overlays"] == []
+    assert parsed["page_obstructions"] == []
+    assert parsed["visual_obstruction_candidates"] == [
+        {
+            "source": "dom_style",
+            "position": "fixed",
+            "coverage": "viewport",
+            "has_visible_controls": True,
+        }
+    ]
+    assert has_bounded_page_schema(parsed) is True
+    assert page_evidence_needs_visual_fallback(parsed) is True
+
+    merged = merge_visual_composition_evidence(
+        parsed,
+        visual_summary={
+            "summary": "A centered checkpoint panel blocks the search form.",
+            "challenge_detected": False,
+            "submit_blocked": False,
+            "page_obstruction_detected": True,
+            "obstruction_kind": "checkpoint_panel",
+            "obstruction_location": "Centered over the search form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
+        },
+    )
+
+    assert merged["page_obstructions"] == [
+        {
+            "kind": "checkpoint_panel",
+            "source": "vision_summary",
+            "visual_location": "Centered over the search form.",
+            "visible_controls": [{"text": "Continue"}],
+            "underlying_page_blocked": True,
+        }
+    ]
+
+
+def test_composition_parse_html_does_not_screenshot_normal_fixed_footer() -> None:
+    parsed = parse_composition_html(
+        """
+        <html><body>
+          <form id="search">
+            <input id="query" name="query" type="text" />
+            <button>Search</button>
+          </form>
+          <footer style="position: fixed; bottom: 0; left: 0; right: 0; z-index: 1200;">
+            <button>Accept</button>
+          </footer>
+        </body></html>
+        """,
+        inspected_url="https://example.com/results",
+        current_url="https://example.com/results",
+    )
+
+    assert parsed["visual_obstruction_candidates"] == []
+    assert has_bounded_page_schema(parsed) is True
+    assert page_evidence_needs_visual_fallback(parsed) is False
+
+
 def test_composition_parse_html_ignores_empty_modal_root_as_bounded_schema() -> None:
     parsed = parse_composition_html(
         """
