@@ -45,6 +45,38 @@ def _make_chat_request() -> WorkflowCopilotChatRequest:
     )
 
 
+def test_terminal_narrative_metadata_preserves_payload_and_adds_contract_fields() -> None:
+    payload = {
+        "turnId": "turn-1",
+        "turnIndex": 0,
+        "mode": "build",
+        "designStarted": True,
+        "designEnded": True,
+        "draft": {"blockCount": 1, "blockLabels": ["open_page"], "summary": None},
+        "blocks": [],
+        "terminal": "response",
+        "terminalMessage": "Cancelled.",
+        "narrativeSummary": "Cancelled.",
+        "priorBlockCount": None,
+        "designActivity": [],
+        "startedAt": "2026-05-25T00:00:00Z",
+        "endedAt": "2026-05-25T00:00:05Z",
+    }
+
+    enriched = workflow_copilot_route._with_terminal_narrative_metadata(
+        payload,
+        cancelled=True,
+        proposal_disposition="review_untested",
+    )
+
+    assert enriched is not None
+    assert enriched["cancelled"] is True
+    assert enriched["proposalDisposition"] == "review_untested"
+    assert enriched["draft"] == payload["draft"]
+    assert "cancelled" not in payload
+    assert "proposalDisposition" not in payload
+
+
 def _install_fake_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Capture the stream handler that the route hands to EventSourceStream."""
     captured: dict[str, object] = {}
