@@ -45,3 +45,16 @@ if (localStorageNeedsShim) {
     value: storage,
   });
 }
+
+// Radix focus primitives create CustomEvent via the global constructor, then
+// dispatch on jsdom elements. Keep those constructors from the same realm.
+if (typeof window !== "undefined") {
+  Object.defineProperty(globalThis, "Event", {
+    configurable: true,
+    value: window.Event,
+  });
+  Object.defineProperty(globalThis, "CustomEvent", {
+    configurable: true,
+    value: window.CustomEvent,
+  });
+}

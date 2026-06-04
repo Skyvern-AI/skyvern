@@ -6,6 +6,11 @@ function isFirstNode(nodes: Array<AppNode>, edges: Array<Edge>, id: string) {
   if (!node) {
     return false; // doesn't make sense but for TS
   }
+  // Blocks nested inside a conditional or loop always show the tip since they
+  // are never connected to the top-level start node.
+  if (node.parentId) {
+    return true;
+  }
   const incomingEdge = edges.find((edge) => edge.target === node.id);
   if (!incomingEdge) {
     return false;
@@ -15,7 +20,7 @@ function isFirstNode(nodes: Array<AppNode>, edges: Array<Edge>, id: string) {
   if (!sourceNode) {
     return false;
   }
-  return !node.parentId && sourceNode.type === "start";
+  return sourceNode.type === "start";
 }
 
 type Props = {

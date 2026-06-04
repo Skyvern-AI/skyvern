@@ -395,11 +395,11 @@ function BrowserStream({
               prev ??
               (clean
                 ? {
-                    title: "The stream packed up and left",
+                    title: "The browser stream packed up and left",
                     detail: "The browser stream closed cleanly.",
                   }
                 : {
-                    title: "The connection slipped away",
+                    title: "The browser stream slipped away",
                     detail:
                       "The browser stream dropped before everything wrapped up.",
                     hint: "Refresh the page or switch to local browser streaming.",
@@ -503,13 +503,13 @@ function BrowserStream({
             prev ??
             (code === 1006
               ? {
-                  title: "The connection slipped away",
+                  title: "The messages channel slipped away",
                   detail:
                     "The messages channel dropped before sending a frame.",
                   hint: "Check that the API server is reachable from the UI.",
                 }
               : {
-                  title: "The stream packed up and left",
+                  title: "The messages channel packed up and left",
                   detail: `Messages channel closed with code ${code}${reason ? ` (${reason})` : ""}.`,
                 }),
         );

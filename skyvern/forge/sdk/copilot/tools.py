@@ -55,6 +55,15 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     evaluate_completion_criteria,
     summarize_unsatisfied_outcomes,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_EXPRESSION as _COMPOSITION_STRIPPED_HTML_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     has_bounded_page_schema,
@@ -81,7 +90,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
-from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
+from skyvern.forge.sdk.copilot.llm_config import resolve_fast_copilot_handler, resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import (
     clear_failed_step_tracker_for_tools_in_ctx,
     detect_failed_tool_step_loop_for_ctx,
@@ -7066,6 +7075,7 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "form_count": len(evidence.get("forms") or []),
         "result_container_count": len(evidence.get("result_containers") or []),
         "page_obstruction_count": len(evidence.get("page_obstructions") or []),
+        "visual_obstruction_candidate_count": len(evidence.get("visual_obstruction_candidates") or []),
         "schema_empty_page": evidence.get("schema_empty_page") is True,
     }
     return (
@@ -7089,7 +7099,7 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
 
 
 async def _composition_visual_handler(ctx: CopilotContext) -> Any | None:
-    return await resolve_main_copilot_handler(
+    return await resolve_fast_copilot_handler(
         getattr(ctx, "workflow_permanent_id", None),
         getattr(ctx, "organization_id", None),
     )
@@ -7225,6 +7235,7 @@ async def _composition_evidence_after_navigation_failure(
         )
         if html_truncated:
             evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
+        evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(ctx, evidence)
         if page_evidence_needs_visual_fallback(evidence):
             evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
         return evidence
@@ -7362,26 +7373,6 @@ _COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS = 2.5
 _COMPOSITION_NAVIGATE_TIMEOUT_SECONDS = 30.0
 
 
-# Body HTML stripped of script/style/svg/comments and whitespace-collapsed so the
-# evaluate result clears the shared MCP response size cap (MCP_MAX_RESPONSE_CHARS,
-# 140k). The aggressive strip is what lets a heavy commerce body (e.g. ~360KB raw,
-# ~155k stripped) fit whole (~113k) so the FULL page is parsed; the slice is only a
-# last resort for pages still over budget, and is set as high as the cap allows so it
-# loses as little below-fold structure (results/cart controls) as possible.
-_COMPOSITION_STRIPPED_HTML_MAX_CHARS = 135000
-_COMPOSITION_STRIPPED_HTML_EXPRESSION = (
-    "(() => {"
-    "  const b = document.body; if (!b) return '';"
-    "  const c = b.cloneNode(true);"
-    "  c.querySelectorAll('script,style,noscript,svg,template,iframe,canvas,link').forEach(n => n.remove());"
-    "  const w = document.createTreeWalker(c, NodeFilter.SHOW_COMMENT, null);"
-    "  const comments = []; while (w.nextNode()) comments.push(w.currentNode); comments.forEach(n => n.remove());"
-    "  const h = c.innerHTML.replace(/>\\s+</g, '><').replace(/\\s{2,}/g, ' ');"
-    f"  return h.length > {_COMPOSITION_STRIPPED_HTML_MAX_CHARS} ? h.slice(0, {_COMPOSITION_STRIPPED_HTML_MAX_CHARS}) : h;"
-    "})()"
-)
-
-
 async def _composition_get_stripped_html(copilot_ctx: Any) -> tuple[str | None, bool]:
     """Return (stripped_body_html, truncated). truncated is True when the expression sliced
     the body at the cap, so the tail (below-fold forms/controls) is missing from the evidence."""
@@ -7401,6 +7392,77 @@ async def _composition_get_stripped_html(copilot_ctx: Any) -> tuple[str | None, 
     if not isinstance(value, str):
         return None, False
     return value, len(value) >= _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+
+
+def _normalize_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in value:
+        if len(candidates) >= 5:
+            break
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position")
+        coverage = item.get("coverage")
+        if position not in {"fixed", "sticky"} or coverage != "viewport":
+            continue
+        candidates.append(
+            {
+                "source": "computed_style",
+                "position": position,
+                "coverage": "viewport",
+                "has_visible_controls": item.get("has_visible_controls") is True,
+            }
+        )
+    return candidates
+
+
+def _merge_visual_obstruction_candidates(
+    evidence: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not candidates:
+        return evidence
+    merged = dict(evidence)
+    existing = [item for item in merged.get("visual_obstruction_candidates") or [] if isinstance(item, dict)]
+    for candidate in candidates:
+        if len(existing) >= 5:
+            break
+        if candidate not in existing:
+            existing.append(candidate)
+    merged["visual_obstruction_candidates"] = existing[:5]
+    return merged
+
+
+async def _composition_get_computed_visual_obstruction_candidates(copilot_ctx: Any) -> list[dict[str, Any]]:
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return []
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION},
+            ),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return []
+    if not isinstance(result, dict) or not result.get("ok"):
+        return []
+    value = (result.get("data") or {}).get("result")
+    return _normalize_visual_obstruction_candidates(value)
+
+
+async def _augment_composition_evidence_with_computed_obstruction_candidates(
+    copilot_ctx: Any,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    if page_evidence_needs_visual_fallback(evidence) or not has_bounded_page_schema(evidence):
+        return evidence
+    candidates = await _composition_get_computed_visual_obstruction_candidates(copilot_ctx)
+    return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
 async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool]:
@@ -7457,6 +7519,8 @@ async def _capture_composition_evidence(
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
     if evidence is not None and html_truncated:
         evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
+    if evidence is not None:
+        evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
         or (evidence.get("schema_empty_page") is True and not has_bounded_page_schema(evidence))
