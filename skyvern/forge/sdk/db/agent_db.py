@@ -17,6 +17,7 @@ from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError  # noqa: 
 from skyvern.forge.sdk.db.models import PersistentBrowserSessionModel
 from skyvern.forge.sdk.db.repositories.artifacts import ArtifactsRepository
 from skyvern.forge.sdk.db.repositories.browser_sessions import BrowserSessionsRepository
+from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
 from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
 from skyvern.forge.sdk.db.repositories.debug import DebugRepository
 from skyvern.forge.sdk.db.repositories.folders import FoldersRepository
@@ -127,6 +128,7 @@ class AgentDB(BaseAlchemyDB):
         self.workflows = WorkflowsRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.workflow_params = WorkflowParametersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.credentials = CredentialRepository(self.Session, debug_enabled, self.is_retryable_error)
+        self.credential_folders = CredentialFoldersRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.otp = OTPRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.debug = DebugRepository(self.Session, debug_enabled, self.is_retryable_error)
         self.organizations = OrganizationsRepository(self.Session, debug_enabled, self.is_retryable_error)
