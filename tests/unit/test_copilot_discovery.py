@@ -180,6 +180,63 @@ class _CurrentPageServer:
                     "html": "<html><body><form><input name='firstName'><button>Search</button></form></body></html>"
                 },
             }
+        if tool_name == "skyvern_evaluate":
+            assert "getComputedStyle" in arguments["expression"]
+            return {"ok": True, "data": {"result": []}}
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
+class _GenericBarrierServer:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_navigate":
+            return {"ok": True, "data": {"url": arguments["url"]}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {
+                "ok": True,
+                "data": {
+                    "html": """
+                    <html><head>
+                      <style>
+                        .checkpoint-shell {
+                          position: fixed;
+                          inset: 0;
+                          z-index: 2000;
+                          background: rgba(0,0,0,.4);
+                        }
+                      </style>
+                    </head><body>
+                      <form id="search"><input name="q"><button>Search</button></form>
+                      <section id="checkpoint" class="checkpoint-shell">
+                        <p>Complete this checkpoint before continuing.</p>
+                        <button>Continue</button>
+                      </section>
+                    </body></html>
+                    """
+                },
+            }
+        if tool_name == "skyvern_evaluate":
+            assert "getComputedStyle" in arguments["expression"]
+            return {
+                "ok": True,
+                "data": {
+                    "result": [
+                        {
+                            "source": "computed_style",
+                            "position": "fixed",
+                            "coverage": "viewport",
+                            "has_visible_controls": True,
+                        }
+                    ]
+                },
+            }
+        if tool_name == "skyvern_screenshot":
+            assert arguments == {"inline": True}
+            return {"ok": True, "data": {"screenshot_base64": "aGVsbG8="}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -201,6 +258,9 @@ class _TargetThenCurrentPageServer:
                     "html": "<html><body><form><input name='firstName'><button>Search</button></form></body></html>"
                 },
             }
+        if tool_name == "skyvern_evaluate":
+            assert "getComputedStyle" in arguments["expression"]
+            return {"ok": True, "data": {"result": []}}
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
@@ -314,7 +374,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    assert server.calls == ["skyvern_get_html"]
+    assert server.calls == ["skyvern_get_html", "skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
@@ -403,6 +463,57 @@ async def test_inspection_budget_steers_progress_check_instead_of_authoring() ->
     assert "browser action on the current page" in result["error"]
     assert "Do not author downstream result" in result["error"]
     assert "Compose from existing evidence" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _GenericBarrierServer()
+    ctx = _Ctx(server)
+
+    async def fake_visual_summary(
+        _ctx: object,
+        *,
+        evidence: dict[str, Any],
+        screenshot_b64: str,
+    ) -> tuple[dict[str, Any], None]:
+        assert screenshot_b64 == "aGVsbG8="
+        assert evidence["visual_obstruction_candidates"][0]["coverage"] == "viewport"
+        return {
+            "summary": "A checkpoint panel blocks the search form.",
+            "challenge_detected": False,
+            "challenge_kind": "",
+            "challenge_location": "",
+            "submit_blocked": False,
+            "blocked_submit_controls": [],
+            "empty_page_visible": False,
+            "loading_state_visible": False,
+            "page_obstruction_detected": True,
+            "obstruction_kind": "checkpoint_panel",
+            "obstruction_location": "Centered over the form.",
+            "underlying_page_blocked": True,
+            "visible_dismiss_controls": ["Continue"],
+            "omissions": [],
+        }, None
+
+    monkeypatch.setattr(tools_module, "_composition_summarize_screenshot", fake_visual_summary)
+
+    result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/search")
+
+    assert result["ok"] is True
+    assert "skyvern_evaluate" in server.calls
+    assert "skyvern_screenshot" in server.calls
+    assert result["data"]["screenshot_used"] is True
+    assert result["data"]["page_obstructions"] == [
+        {
+            "kind": "checkpoint_panel",
+            "source": "vision_summary",
+            "visual_location": "Centered over the form.",
+            "visible_controls": [{"text": "Continue"}],
+            "underlying_page_blocked": True,
+        }
+    ]
 
 
 @pytest.mark.asyncio
