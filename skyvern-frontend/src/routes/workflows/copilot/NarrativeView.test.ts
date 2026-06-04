@@ -444,6 +444,31 @@ describe("applyNarrativeEvent — terminal", () => {
     expect(effectiveMode(s)).toBe("clarify");
   });
 
+  it("preserves cancelled responses with drafts as response terminals", () => {
+    let s = applyNarrativeEvent(EMPTY_NARRATIVE, turnStart());
+    s = applyNarrativeEvent(
+      s,
+      workflowDraft({
+        block_count: 2,
+        block_labels: ["open_page", "add_to_cart"],
+      }),
+    );
+    s = applyNarrativeEvent(
+      s,
+      response({
+        cancelled: true,
+        message:
+          "Cancelled. I have a draft workflow you can keep -- accept it to save, or discard.",
+        proposal_disposition: "review_untested",
+      }),
+    );
+
+    expect(s.terminal).toBe("response");
+    expect(s.draft?.blockCount).toBe(2);
+    expect(s.blocks.map((b) => b.state)).toEqual(["drafted", "drafted"]);
+    expect(effectiveMode(s)).toBe("build");
+  });
+
   it("response closes design even when design_end was never emitted (CORR-3)", () => {
     let s = applyNarrativeEvent(EMPTY_NARRATIVE, designStart());
     expect(s.designEnded).toBe(false);

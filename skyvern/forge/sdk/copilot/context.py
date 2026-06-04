@@ -54,6 +54,8 @@ class TurnNarrativePayload(TypedDict):
     turnIndex: int
     mode: str
     responseType: NotRequired[ResponseType]
+    cancelled: NotRequired[bool]
+    proposalDisposition: NotRequired[ProposalDisposition]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None

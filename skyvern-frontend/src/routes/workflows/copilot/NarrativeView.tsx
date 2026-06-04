@@ -422,6 +422,7 @@ interface TurnSummary {
   glyph: string;
   isFail: boolean;
   isQA: boolean;
+  isStoppedWithDraft: boolean;
 }
 
 function asksUserForInput(turn: TurnNarrativeState): boolean {
@@ -452,22 +453,30 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
   const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const hasReviewableDraft =
+    hasDrafts &&
+    (turn.proposalDisposition === "review_untested" ||
+      turn.proposalDisposition === "review_tested" ||
+      (turn.cancelled && turn.proposalDisposition !== "no_proposal"));
+  const isStoppedWithDraft = hasReviewableDraft && (isFail || turn.cancelled);
 
-  const headline = isFail
-    ? "Run halted"
-    : needsInput
-      ? "Question"
-      : isQA
-        ? mode === "refuse"
-          ? "Declined"
-          : mode === "clarify"
-            ? "Question"
-            : "Answered"
-        : hasEdited
-          ? "Applied edits and re-tested"
-          : hasDrafts
-            ? "Built and tested the workflow"
-            : "Completed the run";
+  const headline = isStoppedWithDraft
+    ? "Stopped with a draft"
+    : isFail
+      ? "Run halted"
+      : needsInput
+        ? "Question"
+        : isQA
+          ? mode === "refuse"
+            ? "Declined"
+            : mode === "clarify"
+              ? "Question"
+              : "Answered"
+          : hasEdited
+            ? "Applied edits and re-tested"
+            : hasDrafts
+              ? "Built and tested the workflow"
+              : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
@@ -481,13 +490,21 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     if (failed) stats.push(`${failed} failed`);
   }
 
+  const accent = isStoppedWithDraft
+    ? "qa"
+    : isFail
+      ? "fail"
+      : isQA
+        ? "qa"
+        : "ok";
   return {
     headline,
     stats,
-    accent: isFail ? "fail" : isQA ? "qa" : "ok",
-    glyph: isFail ? "✕" : isQA ? "✦" : "✓",
+    accent,
+    glyph: isStoppedWithDraft ? "!" : isFail ? "✕" : isQA ? "✦" : "✓",
     isFail,
     isQA,
+    isStoppedWithDraft,
   };
 }
 
@@ -572,7 +589,9 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
           closing ? (
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
-                summary.isFail ? "text-rose-200/90" : "text-slate-400"
+                summary.isFail && !summary.isStoppedWithDraft
+                  ? "text-rose-200/90"
+                  : "text-slate-400"
               }`}
             >
               {closing}
