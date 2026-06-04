@@ -178,8 +178,9 @@ function BrowserSessions() {
           <h1 className="text-2xl">Browsers</h1>
         </div>
         <p className="text-sm leading-6 text-muted-foreground">
-          Create your own live browsers to interact with websites, or run agents
-          in.
+          Live browser instances you can drive interactively or attach to agent
+          runs. They stay warm between runs — best for fast, back-to-back runs
+          as the same user. You're billed while a browser is alive.
         </p>
       </div>
 
