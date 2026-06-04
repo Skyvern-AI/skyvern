@@ -25,6 +25,24 @@ def strip_query_params(url: str) -> str:
     return f"{parsed.scheme}://{host}{port_str}{parsed.path}"
 
 
+def collapse_duplicate_www_prefix(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+
+    if not parts.netloc:
+        return url
+
+    userinfo, separator, host_port = parts.netloc.rpartition("@")
+    if not host_port.lower().startswith("www.www."):
+        return url
+
+    host_port = host_port[4:]
+    netloc = f"{userinfo}{separator}{host_port}" if separator else host_port
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 def prepend_scheme_and_validate_url(url: str) -> str:
     if not url:
         return url
@@ -36,6 +54,8 @@ def prepend_scheme_and_validate_url(url: str) -> str:
     # if url doesn't contain any scheme, we prepend `https` to it by default
     if not parsed_url.scheme:
         url = f"https://{url}"
+
+    url = collapse_duplicate_www_prefix(url)
 
     try:
         HttpUrl(url)
