@@ -177,8 +177,9 @@ vi.mock(
   }),
 );
 
+const isFirstBlockMock = vi.fn<() => boolean>(() => false);
 vi.mock("../../hooks/useIsFirstNodeInWorkflow", () => ({
-  useIsFirstBlockInWorkflow: () => false,
+  useIsFirstBlockInWorkflow: () => isFirstBlockMock(),
 }));
 
 // shadcn Switch is a Radix primitive that depends on PointerEvent semantics
@@ -225,6 +226,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   mockNodes.clear();
   updateNodeData.mockReset();
+  isFirstBlockMock.mockReset();
+  isFirstBlockMock.mockReturnValue(false);
   usePendingCommitsStore.setState({ commits: {} });
   useSidebarSaveStateStore.getState().reset();
 });
@@ -270,6 +273,24 @@ describe("ValidationBlockForm (SKY-9361)", () => {
     mockNodes.set("v1", { id: "v1", type: "task", data: {} });
     const { container } = render(<ValidationBlockForm blockId="v1" />);
     expect(container.firstChild).toBeNull();
+  });
+
+  test("shows parameter tip when isFirstBlockInWorkflow returns true (e.g. nested block)", () => {
+    isFirstBlockMock.mockReturnValue(true);
+    setValidationNode("v1");
+    render(<ValidationBlockForm blockId="v1" />);
+    expect(
+      screen.getByText("Tip: Use the + button to add parameters!"),
+    ).toBeDefined();
+  });
+
+  test("hides parameter tip when isFirstBlockInWorkflow returns false", () => {
+    isFirstBlockMock.mockReturnValue(false);
+    setValidationNode("v1");
+    render(<ValidationBlockForm blockId="v1" />);
+    expect(
+      screen.queryByText("Tip: Use the + button to add parameters!"),
+    ).toBeNull();
   });
 
   test("renders both top-level textareas with current values", () => {
