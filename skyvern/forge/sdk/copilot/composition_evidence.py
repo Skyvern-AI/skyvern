@@ -62,6 +62,7 @@ _MODAL_DISMISS_HINTS: frozenset[str] = frozenset(
 )
 _MODAL_DISMISS_SYMBOLS: frozenset[str] = frozenset({"x", "\u00d7"})
 DOM_EVIDENCE_SOURCE = "dom_html"
+DOM_STYLE_EVIDENCE_SOURCE = "dom_style"
 SCREENSHOT_EVIDENCE_SOURCE = "screenshot"
 VISION_EVIDENCE_SOURCE = "vision_summary"
 _ANTI_BOT_PATTERNS = (
@@ -213,6 +214,9 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
 
     challenge_state = evidence.get("challenge_state")
     if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
+        return True
+    visual_obstruction_candidates = evidence.get("visual_obstruction_candidates")
+    if isinstance(visual_obstruction_candidates, list) and visual_obstruction_candidates:
         return True
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
@@ -1005,6 +1009,7 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "challenge_controls": [],
         "modal_overlays": [],
         "page_obstructions": [],
+        "visual_obstruction_candidates": [],
         "schema_empty_page": False,
         "observed_empty_page": False,
         "empty_page_visual_state": None,
@@ -1037,6 +1042,99 @@ def _classes_for(node: Any) -> list[str]:
     if isinstance(class_value, str):
         return [part for part in class_value.split() if part]
     return []
+
+
+def _inline_style_properties(node: Any) -> dict[str, str]:
+    style = _attr_value(node, "style")
+    if not style:
+        return {}
+    properties: dict[str, str] = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        key, value = declaration.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip().lower()
+        if key and value:
+            properties[key] = value
+    return properties
+
+
+def _css_zero(value: str) -> bool:
+    return value.replace(" ", "") in {"0", "0px", "0%", "0rem", "0em", "0vh", "0vw"}
+
+
+def _css_full_width(value: str) -> bool:
+    compact = value.replace(" ", "")
+    return compact in {"100%", "100vw", "100dvw", "100lvw", "100svw"}
+
+
+def _css_full_height(value: str) -> bool:
+    compact = value.replace(" ", "")
+    return compact in {"100%", "100vh", "100dvh", "100lvh", "100svh"}
+
+
+def _z_index_is_high(value: str) -> bool:
+    try:
+        return int(float(value)) >= 10
+    except (TypeError, ValueError):
+        return False
+
+
+def _style_covers_viewport(properties: dict[str, str]) -> bool:
+    inset = properties.get("inset")
+    if inset is not None and all(_css_zero(part) for part in inset.split()):
+        return True
+    covers_edges = all(_css_zero(properties.get(edge, "")) for edge in ("top", "right", "bottom", "left"))
+    if covers_edges:
+        return True
+    starts_at_origin = _css_zero(properties.get("top", "")) and _css_zero(properties.get("left", ""))
+    return (
+        starts_at_origin
+        and _css_full_width(properties.get("width", ""))
+        and _css_full_height(properties.get("height", "") or properties.get("min-height", ""))
+    )
+
+
+def _node_has_clickable_descendant(node: Any) -> bool:
+    if not hasattr(node, "find_all"):
+        return False
+    for control in node.find_all(["button", "a", "input"]):
+        tag_name = str(getattr(control, "name", "") or "").lower()
+        if tag_name == "input":
+            field_type = str(control.get("type") or "").lower()
+            if field_type not in {"button", "submit", "reset"}:
+                continue
+        if _node_text(control) or _attr_value(control, "value") or _attr_value(control, "aria-label"):
+            return True
+    for control in node.find_all(attrs={"role": "button"}):
+        if _node_text(control) or _attr_value(control, "aria-label"):
+            return True
+    return False
+
+
+def _visual_obstruction_candidates(soup: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for node in soup.find_all(True):
+        if len(candidates) >= _MAX_PAGE_OBSTRUCTIONS:
+            break
+        properties = _inline_style_properties(node)
+        position = properties.get("position", "")
+        if position not in {"fixed", "sticky"}:
+            continue
+        if not _z_index_is_high(properties.get("z-index", "")):
+            continue
+        if not _style_covers_viewport(properties):
+            continue
+        candidates.append(
+            {
+                "source": DOM_STYLE_EVIDENCE_SOURCE,
+                "position": position,
+                "coverage": "viewport",
+                "has_visible_controls": _node_has_clickable_descendant(node),
+            }
+        )
+    return candidates
 
 
 def _css_attr(value: str) -> str:
@@ -1394,6 +1492,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
     all_nodes = soup.find_all(True)
     modal_overlays = _modal_overlays(all_nodes)
     page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
+    visual_obstruction_candidates = _visual_obstruction_candidates(soup)
 
     forms: list[dict[str, Any]] = []
     for form in soup.find_all("form")[:_MAX_FORMS]:
@@ -1505,6 +1604,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "challenge_controls": challenge_controls,
         "modal_overlays": modal_overlays,
         "page_obstructions": page_obstructions,
+        "visual_obstruction_candidates": visual_obstruction_candidates,
         "schema_empty_page": schema_empty_page,
         "observed_empty_page": False,
         "empty_page_visual_state": None,
