@@ -326,6 +326,21 @@ def _make_error_narrative_payload(turn_id: str | None, turn_index: int | None, m
     }
 
 
+def _with_terminal_narrative_metadata(
+    narrative_payload: TurnNarrativePayload | None,
+    *,
+    cancelled: bool,
+    proposal_disposition: ProposalDisposition,
+) -> TurnNarrativePayload | None:
+    if narrative_payload is None:
+        return None
+    return {
+        **narrative_payload,
+        "cancelled": cancelled,
+        "proposalDisposition": proposal_disposition,
+    }
+
+
 def _build_recoverable_route_agent_result(
     error: BaseException,
     *,
@@ -458,6 +473,13 @@ async def _persist_cancel_turn(
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
 
+    proposal_disposition = _proposal_disposition(agent_result)
+    narrative_payload = _with_terminal_narrative_metadata(
+        narrative_payload,
+        cancelled=True,
+        proposal_disposition=proposal_disposition,
+    )
+
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
             organization_id=chat.organization_id,
@@ -477,7 +499,6 @@ async def _persist_cancel_turn(
             narrative_payload=narrative_payload,
         )
     )
-    proposal_disposition = _proposal_disposition(agent_result)
     try:
         await asyncio.shield(
             stream.send(
@@ -559,6 +580,12 @@ async def _finalise_normal_turn(
             raise
 
     await _persist_proposed_workflow_state(chat, agent_result, restored)
+    proposal_disposition = _proposal_disposition(agent_result)
+    narrative_payload = _with_terminal_narrative_metadata(
+        agent_result.narrative_payload,
+        cancelled=False,
+        proposal_disposition=proposal_disposition,
+    )
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
         organization_id=chat.organization_id,
@@ -574,10 +601,9 @@ async def _finalise_normal_turn(
         content=user_response,
         global_llm_context=updated_global_llm_context,
         turn_outcome=agent_result.turn_outcome,
-        narrative_payload=agent_result.narrative_payload,
+        narrative_payload=narrative_payload,
     )
 
-    proposal_disposition = _proposal_disposition(agent_result)
     await stream.send(
         WorkflowCopilotStreamResponseUpdate(
             type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -591,7 +617,7 @@ async def _finalise_normal_turn(
             output_policy_diagnostics=agent_result.output_policy_diagnostics,
             turn_id=agent_result.turn_id,
             narrative_summary=agent_result.narrative_summary,
-            narrative_payload=agent_result.narrative_payload,
+            narrative_payload=narrative_payload,
         )
     )
 
