@@ -96,6 +96,12 @@ async def _get_persistent_browser_session(session_id: str, organization_id: str)
 
 
 @dataclass
+class PendingBrowserInteractionObservation:
+    tool_name: str
+    url: str = ""
+
+
+@dataclass
 class AgentContext:
     organization_id: str
     workflow_id: str
@@ -178,6 +184,7 @@ class AgentContext:
     # while scouting the goal path, each tagged with how that state was reached.
     # Feeds the per-acted-page composition gate; never persisted into workflow YAML.
     flow_evidence: list[dict[str, Any]] = field(default_factory=list)
+    pending_browser_interaction_observation: PendingBrowserInteractionObservation | None = None
     # In-turn side channel from workflow mutation calls: block label -> flow_evidence
     # observation step used to ground the newly authored page-acting block.
     block_observation_refs: dict[str, int] = field(default_factory=dict)

@@ -1205,6 +1205,48 @@ workflow_definition:
 
 
 @pytest.mark.asyncio
+async def test_update_workflow_runs_composition_evidence_precheck_before_saving(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot import tools as tools_module
+
+    workflow_yaml = """
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_lookup
+      url: https://example.com/lookup
+    - block_type: navigation
+      label: search_lookup
+      navigation_goal: Enter the observed field and submit.
+    - block_type: action
+      label: expand_first_result
+      navigation_goal: Expand the first result row.
+"""
+    ctx = _ctx(
+        build_phase=BuildPhase.COMPOSING,
+        turn_intent=TurnIntent(mode=TurnIntentMode.BUILD),
+        request_policy=RequestPolicy(),
+    )
+
+    async def unexpected_update_workflow(*args: object, **kwargs: object) -> object:
+        raise AssertionError("composition evidence precheck must run before update_workflow saves")
+
+    monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tools_module, "_update_workflow", unexpected_update_workflow)
+    monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+
+    result = await tools_module.update_workflow_tool.on_invoke_tool(
+        SimpleNamespace(context=ctx, tool_name="update_workflow"),
+        json.dumps({"workflow_yaml": workflow_yaml}),
+    )
+
+    payload = json.loads(result)
+    assert payload["ok"] is False
+    assert "page-dependent build blocks need observed page evidence" in payload["error"]
+    assert "https://example.com/lookup" in payload["error"]
+
+
+@pytest.mark.asyncio
 async def test_update_and_run_blocks_precheck_uses_proposed_block_observation_refs(monkeypatch) -> None:
     from skyvern.forge.sdk.copilot import tools as tools_module
 

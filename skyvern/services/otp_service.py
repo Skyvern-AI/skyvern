@@ -29,6 +29,10 @@ _MFA_PARAMETER_KEY_HINTS = ("mfa", "otp", "verification")
 _MFA_METADATA_KEY_HINTS = ("identifier", "url", "secret", "seed", "key")
 _NON_ALNUM_PATTERN = re.compile(r"[^a-z0-9]")
 _EXPECTED_TOTP_WEBHOOK_RESPONSE_SHAPE = '{"verification_code":"123456"}'
+# Recovers the verification_code value when the surrounding JSON is malformed
+# (e.g. unescaped quotes inside a relayed email). Assumes verification_code is
+# the final field, which is the common shape.
+_VERIFICATION_CODE_FIELD_PATTERN = re.compile(r'"verification_code"\s*:\s*"(?P<value>.*)"\s*}\s*\Z', re.DOTALL)
 _TOTP_WEBHOOK_BODY_PREVIEW_LIMIT = 200
 _TOTP_WEBHOOK_REQUEST_MAX_ATTEMPTS = 3
 _TOTP_WEBHOOK_REQUEST_RETRY_TIMEOUT_SECONDS = 5
@@ -170,6 +174,30 @@ def _totp_webhook_contract_error_reason(
     )
 
 
+def _coerce_totp_response_body(body: str) -> tuple[Any, bool]:
+    """Decode a TOTP webhook body into a JSON value, tolerating the malformations
+    customers produce when relaying a raw OTP email into ``verification_code``.
+
+    Returns ``(value, True)`` when a JSON value is recovered, else ``(body, False)``.
+    The downstream extractor runs the value through the LLM, so an imperfectly
+    recovered string is still useful — better than failing the whole login.
+    """
+    try:
+        return json.loads(body), True
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Literal control characters (raw email newlines/tabs) are the most common
+    # malformation; strict=False tolerates them inside string values.
+    try:
+        return json.loads(body, strict=False), True
+    except (json.JSONDecodeError, ValueError):
+        pass
+    match = _VERIFICATION_CODE_FIELD_PATTERN.search(body)
+    if match is not None:
+        return {"verification_code": match.group("value")}, True
+    return body, False
+
+
 async def _post_totp_verification_url(
     *,
     url: str,
@@ -193,15 +221,13 @@ async def _post_totp_verification_url(
             )
             # Content-Type gate: only trust an explicit non-JSON header to mean
             # "this is not JSON". Missing header (e.g. proxy responses, which
-            # don't preserve upstream headers) falls through to optimistic JSON
+            # don't preserve upstream headers) falls through to tolerant JSON
             # parsing — customer TOTP endpoints contractually return JSON.
             content_type = response.headers.get("content-type", "").lower()
             if content_type and "json" not in content_type:
                 return response.status_code, response.headers, response.body, False
-            try:
-                return response.status_code, response.headers, json.loads(response.body), True
-            except (json.JSONDecodeError, ValueError):
-                return response.status_code, response.headers, response.body, False
+            parsed, is_json = _coerce_totp_response_body(response.body)
+            return response.status_code, response.headers, parsed, is_json
         except Exception:
             LOG.debug(
                 "TOTP webhook request attempt failed",

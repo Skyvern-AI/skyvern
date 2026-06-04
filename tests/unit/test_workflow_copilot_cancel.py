@@ -207,7 +207,7 @@ def _setup_route_mocks(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
 
@@ -824,7 +824,7 @@ async def test_operational_cancel_does_not_persist_cancelled_message(
         return None
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+        "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
         fake_llm_handler,
     )
     monkeypatch.setattr(
