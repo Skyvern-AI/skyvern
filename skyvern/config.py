@@ -115,6 +115,13 @@ class Settings(BaseSettings):
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.
     LLM_IMAGE_COST_TRACKING_ENABLED: bool = True
+    # Global on-switch: when true, downscales screenshots for ALL orgs/runs in the environment
+    # (cuts vision-token + storage cost; viewport stays full-res). For a single-org / per-run A/B,
+    # leave false and use the screenshot_downscale flag.
+    SCREENSHOT_DOWNSCALE_ENABLED: bool = False
+    # Capped at a vision-token tile boundary: providers bill screenshots in fixed-size tiles, so
+    # raising this past the boundary can sharply increase per-image cost for little fidelity gain.
+    SCREENSHOT_DOWNSCALE_MAX_HEIGHT: int = 768
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95

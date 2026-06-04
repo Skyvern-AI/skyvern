@@ -1,7 +1,10 @@
 import io
 from typing import TypedDict
 
+import structlog
 from PIL import Image
+
+LOG = structlog.get_logger()
 
 
 class Resolution(TypedDict):
@@ -47,6 +50,33 @@ def resize_screenshots(screenshots: list[bytes], target_dimension: Resolution) -
         img_byte = img_byte_arr.getvalue()
 
         new_screenshots.append(img_byte)
+    return new_screenshots
+
+
+def downscale_screenshots_to_height(screenshots: list[bytes], max_height: int) -> list[bytes]:
+    """Downscale each screenshot to a max height (aspect-preserving).
+
+    Images already at or below ``max_height`` pass through unchanged.
+    """
+    if max_height <= 0:
+        return screenshots
+    new_screenshots: list[bytes] = []
+    for screenshot in screenshots:
+        try:
+            img = Image.open(io.BytesIO(screenshot))
+            if img.height <= max_height:
+                new_screenshots.append(screenshot)
+                continue
+            target_width = max(1, round(img.width * max_height / img.height))
+            resized_img = img.resize((target_width, max_height), Image.Resampling.LANCZOS)
+            img_byte_arr = io.BytesIO()
+            resized_img.save(img_byte_arr, format="PNG")
+            new_screenshots.append(img_byte_arr.getvalue())
+        except Exception:
+            # Keep the original so one unreadable screenshot can't abort the batch or leave a
+            # treatment-run LLM call screenshot-less.
+            LOG.warning("Failed to downscale screenshot; using original", exc_info=True)
+            new_screenshots.append(screenshot)
     return new_screenshots
 
 

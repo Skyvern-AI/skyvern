@@ -45,6 +45,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.screenshot_downscale import effective_downscale_height
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -248,6 +249,15 @@ def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = 
         "enrich_tree_mode": context.enrich_tree_mode.value,
         "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
         "enriched_tree_enabled": context.enriched_tree_enabled(),
+    }
+
+
+def _screenshot_downscale_log_fields(context: SkyvernContext | None) -> dict[str, Any]:
+    # variant is the raw A/B arm ("control"/"treatment"/None); max_height is the effective applied
+    # height (also non-null when the static kill-switch downscales outside the flag).
+    return {
+        "screenshot_downscale_variant": context.screenshot_downscale_variant if context else None,
+        "screenshot_downscale_max_height": effective_downscale_height(context),
     }
 
 
@@ -1493,6 +1503,7 @@ class LLMAPIHandlerFactory:
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_enrich_tree_log_fields(context, step),
+                    **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2045,6 +2056,7 @@ class LLMAPIHandlerFactory:
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_enrich_tree_log_fields(context, step),
+                    **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2531,6 +2543,7 @@ class LLMCaller:
                 image_tokens_source=image_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_enrich_tree_log_fields(context, step),
+                **_screenshot_downscale_log_fields(context),
                 **_consume_prompt_breakdown(context),
             )
 
