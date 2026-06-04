@@ -28,16 +28,17 @@ exact threat the vault architecture is designed to prevent.
 import asyncio
 import json
 from datetime import datetime
+from typing import Annotated
 
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
@@ -57,6 +58,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
     CancelTestResponse,
     CreateCredentialRequest,
@@ -496,6 +498,7 @@ async def test_login(
         description="The login credentials and URL to test",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
     organization_id = current_org.organization_id
@@ -584,7 +587,7 @@ async def test_login(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
-            trigger_type=WorkflowRunTriggerType.api,
+            trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -680,6 +683,7 @@ async def test_credential(
         description="Test configuration including the login URL",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
 
@@ -776,7 +780,7 @@ async def test_credential(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
-            trigger_type=WorkflowRunTriggerType.api,
+            trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
