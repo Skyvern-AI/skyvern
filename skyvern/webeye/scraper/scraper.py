@@ -327,7 +327,7 @@ async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
             dom_stability_timeout_ms=settings.PAGE_READY_DOM_STABILITY_TIMEOUT_MS,
         )
     else:
-        await skyvern_frame.safe_wait_for_animation_end()
+        await skyvern_frame.safe_wait_for_animation_end(caller="scraper.scrape_ready")
 
 
 @traced(name="skyvern.agent.scrape")
