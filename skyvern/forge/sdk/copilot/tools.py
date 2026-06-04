@@ -1803,16 +1803,19 @@ def _request_policy_allows_update_and_skip_run(ctx: AgentContext, tool_name: str
 
 def _turn_intent_has_edit_target(intent: TurnIntent) -> bool:
     # Keep this aligned with TurnIntent target kinds that make an edit specific enough to mutate safely.
-    return any(
+    if any(
         intent.target_entities.get(entity_type)
         for entity_type in (
-            "workflow",
             "block",
             "run",
             "proposed_workflow",
             "latest_assistant_proposal",
+            "proposal",
+            "workflow_change",
         )
-    )
+    ):
+        return True
+    return any(target != "current_workflow" for target in intent.target_entities.get("workflow", []))
 
 
 def _turn_intent_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
