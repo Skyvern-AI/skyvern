@@ -100,8 +100,10 @@ from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
     TurnIntent,
+    TurnIntentClassification,
     TurnIntentMode,
     build_turn_intent,
+    classify_turn_intent,
 )
 from skyvern.forge.sdk.copilot.turn_outcome import (
     apply_repeated_reply_guard,
@@ -328,6 +330,7 @@ def _store_request_policy_on_context(
     ctx: CopilotContext,
     policy: RequestPolicy,
     policy_inputs: RequestPolicyGuardrailInputs,
+    turn_intent_classification: TurnIntentClassification | None = None,
 ) -> None:
     agent_user_message, policy_chat_history_text = _request_policy_agent_inputs(
         policy,
@@ -353,6 +356,7 @@ def _store_request_policy_on_context(
         workflow_permanent_id=policy_inputs.workflow_permanent_id,
         workflow_run_id=policy_inputs.workflow_run_id,
         browser_session_id=policy_inputs.browser_session_id,
+        classification=turn_intent_classification,
     )
 
 
@@ -2342,7 +2346,22 @@ def _build_copilot_input_guardrails(
                 handler=policy_inputs.handler,
             )
             if isinstance(ctx, CopilotContext):
-                _store_request_policy_on_context(ctx, policy, policy_inputs)
+                turn_intent_classification = None
+                if policy.user_response_policy != "ask_clarification" or policy.raw_secret_handling == "redacted_draft":
+                    turn_intent_classification = await classify_turn_intent(
+                        user_message=policy_inputs.user_message,
+                        workflow_yaml=policy_inputs.workflow_yaml,
+                        chat_history=policy_inputs.chat_history_messages,
+                        global_llm_context=policy_inputs.global_llm_context,
+                        request_policy=policy,
+                        handler=policy_inputs.handler,
+                    )
+                _store_request_policy_on_context(
+                    ctx,
+                    policy,
+                    policy_inputs,
+                    turn_intent_classification=turn_intent_classification,
+                )
         blocked = isinstance(policy, RequestPolicy) and policy.user_response_policy == "ask_clarification"
         if isinstance(policy, RequestPolicy):
             turn_intent = ctx.turn_intent if isinstance(ctx, CopilotContext) else None

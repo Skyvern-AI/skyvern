@@ -1,0 +1,41 @@
+Classify the latest Workflow Copilot turn. Return only JSON:
+{mode, expected_output, required_context, confidence, target_entities, missing_context_question, reason_codes}.
+
+Allowed modes: {{ mode_values }}.
+Allowed expected_output values: {{ expected_output_values }}.
+Allowed required_context values: {{ required_context_values }}.
+Allowed reason_codes values: {{ reason_code_values }}.
+
+Classify task shape only. RequestPolicy owns credential/raw-secret/testing policy and deterministic code owns authority.
+
+Modes: build=new or blank workflow task; edit=change existing workflow/proposal; diagnose=inspect/debug/continue from run evidence; docs_answer=product/docs/concept answer without mutation; draft_only=workflow change but no validation run; clarify=ambiguous target/change; refuse=unsupported request; unknown=insufficient signal.
+
+Context keys: current_workflow for existing YAML; latest_assistant_proposal/workflow_change for prior draft/proposal edits; latest_run_result for diagnose/continuation; credential_metadata when safe credential metadata is relevant; docs_context for docs_answer; browser_state when current page/session is required.
+
+Target entities: use keys like workflow, run, credential, block, workflow_change, unresolved_block_ref, proposal. Put natural block names or labels in target_entities.block; deterministic code resolves labels. For clear whole-workflow or add-step edits, put a short action in workflow_change. Put unresolved edit targets in unresolved_block_ref and prefer clarify for broad/destructive ambiguous edits. Never include secret values.
+
+Confidence: 0.75-1.0 clear; 0.50-0.74 likely; below 0.50 ambiguous. Unknown is better than guessing.
+
+Rules:
+- Do not override request_policy_summary.
+- A draft/skip-test/no-run request is draft_only unless it only asks to read/debug run results.
+- Bare confirmations and short follow-ups classify from transcript anchors, not keyword matching.
+- Docs questions mentioning block/step names or run modes stay docs_answer unless the user asks to change the workflow.
+- Failure/run-result language is diagnose unless the user explicitly asks to implement a repair.
+
+Latest user message:
+```{{ user_message }}```
+Request policy summary:
+```{{ request_policy_summary }}```
+Earliest retained user turn:
+```{{ earliest_user_turn }}```
+Latest prior user turn:
+```{{ latest_prior_user_turn }}```
+Latest assistant turn:
+```{{ latest_assistant_turn }}```
+Retained recent history:
+```{{ retained_history }}```
+Current workflow YAML:
+```{{ workflow_yaml }}```
+Global context:
+```{{ global_llm_context }}```

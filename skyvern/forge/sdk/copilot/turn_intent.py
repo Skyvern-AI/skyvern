@@ -1,23 +1,40 @@
 from __future__ import annotations
 
-import functools
+import asyncio
 import re
+from collections.abc import Mapping
 from difflib import SequenceMatcher
 from enum import StrEnum
-from typing import Any
 
+import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from skyvern.config import settings
+from skyvern.forge.prompts import prompt_engine
+from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.copilot.context import StructuredContext
-from skyvern.forge.sdk.copilot.request_policy import RequestPolicy, redact_raw_secrets_for_prompt
+from skyvern.forge.sdk.copilot.output_utils import parse_final_response
+from skyvern.forge.sdk.copilot.request_policy import (
+    RequestPolicy,
+    build_transcript_context,
+    redact_raw_secrets_for_prompt,
+)
+from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatSender,
 )
+from skyvern.utils.strings import escape_code_fences
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
+LOG = structlog.get_logger()
+PROMPT_NAME = "workflow-copilot-turn-intent"
 UNRESOLVED_BLOCK_REF_TARGET_ENTITY = "unresolved_block_ref"
+_WORKFLOW_YAML_PROMPT_MAX_CHARS = 4096
+_GLOBAL_CONTEXT_PROMPT_MAX_CHARS = 2048
+_TARGET_ENTITY_MAX_VALUES = 12
+_TARGET_ENTITY_VALUE_MAX_CHARS = 160
 
 
 class TurnIntentMode(StrEnum):
@@ -29,6 +46,13 @@ class TurnIntentMode(StrEnum):
     CLARIFY = "clarify"
     REFUSE = "refuse"
     UNKNOWN = "unknown"
+
+
+_LOW_CONFIDENCE_MUTATION_THRESHOLD = 0.5
+_MUTATING_CLASSIFIER_MODES = frozenset((TurnIntentMode.BUILD, TurnIntentMode.EDIT, TurnIntentMode.DRAFT_ONLY))
+_EDIT_SPECIFIC_TARGET_ENTITY_TYPES = frozenset(
+    ("block", "run", "proposed_workflow", "latest_assistant_proposal", "proposal", "workflow_change")
+)
 
 
 NO_MUTATION_TURN_INTENT_MODES = frozenset(
@@ -80,11 +104,26 @@ class TurnIntentReasonCode(StrEnum):
     CHAT_HISTORY_PRESENT = "chat_history_present"
     RUN_CONTEXT_PRESENT = "run_context_present"
     BROWSER_CONTEXT_PRESENT = "browser_context_present"
-    KEYWORD_HEURISTIC = "keyword_heuristic"
     CONFIRMATION_CARRYOVER = "confirmation_carryover"
     RAW_SECRET_REFUSAL = "raw_secret_refusal"
     USER_NON_PROGRESS = "user_non_progress"
     RECOVERY_FROM_RUN_CONTEXT = "recovery_from_run_context"
+    LLM_CLASSIFIER = "llm_classifier"
+    LOW_CONFIDENCE_CLARIFICATION = "low_confidence_clarification"
+    TARGET_ENTITY_RESOLVED = "target_entity_resolved"
+    MISSING_EDIT_TARGET = "missing_edit_target"
+
+
+_DEFAULT_EXPECTED_OUTPUT_BY_MODE: dict[TurnIntentMode, TurnIntentExpectedOutput] = {
+    TurnIntentMode.BUILD: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
+    TurnIntentMode.EDIT: TurnIntentExpectedOutput.WORKFLOW_UPDATE,
+    TurnIntentMode.DIAGNOSE: TurnIntentExpectedOutput.RUN_RESULT,
+    TurnIntentMode.DOCS_ANSWER: TurnIntentExpectedOutput.EXPLANATION,
+    TurnIntentMode.DRAFT_ONLY: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
+    TurnIntentMode.CLARIFY: TurnIntentExpectedOutput.CLARIFICATION,
+    TurnIntentMode.REFUSE: TurnIntentExpectedOutput.REFUSAL,
+    TurnIntentMode.UNKNOWN: TurnIntentExpectedOutput.EXPLANATION,
+}
 
 
 class TurnIntentAuthority(BaseModel):
@@ -134,19 +173,12 @@ class TurnIntent(BaseModel):
     def _align_expected_output_with_mode(self) -> TurnIntent:
         if self.expected_output != TurnIntentExpectedOutput.EXPLANATION:
             return self
-        expected_output_by_mode = {
-            TurnIntentMode.BUILD: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
-            TurnIntentMode.EDIT: TurnIntentExpectedOutput.WORKFLOW_UPDATE,
-            TurnIntentMode.DRAFT_ONLY: TurnIntentExpectedOutput.WORKFLOW_DRAFT,
-            TurnIntentMode.CLARIFY: TurnIntentExpectedOutput.CLARIFICATION,
-            TurnIntentMode.REFUSE: TurnIntentExpectedOutput.REFUSAL,
-        }
-        if mapped_expected_output := expected_output_by_mode.get(self.mode):
+        if mapped_expected_output := _DEFAULT_EXPECTED_OUTPUT_BY_MODE.get(self.mode):
             self.expected_output = mapped_expected_output
         return self
 
-    def to_trace_data(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
+    def to_trace_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
             "mode": self.mode.value,
             "expected_output": self.expected_output.value,
             "required_context": [key.value for key in self.required_context],
@@ -165,58 +197,61 @@ class TurnIntent(BaseModel):
         return data
 
 
+class TurnIntentClassification(BaseModel):
+    """Typed, model-produced task-shape classification.
+
+    Deterministic code consumes this as an input contract; it still decides
+    authority, context availability, and safety overrides.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: TurnIntentMode = TurnIntentMode.UNKNOWN
+    expected_output: TurnIntentExpectedOutput | None = None
+    required_context: list[RequiredContextKey] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    target_entities: dict[str, list[str]] = Field(default_factory=dict)
+    missing_context_question: str | None = None
+    reason_codes: list[TurnIntentReasonCode] = Field(default_factory=list)
+
+    @field_validator("required_context", mode="after")
+    @classmethod
+    def _dedupe_required_context(cls, value: list[RequiredContextKey]) -> list[RequiredContextKey]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("reason_codes", mode="after")
+    @classmethod
+    def _dedupe_reason_codes(cls, value: list[TurnIntentReasonCode]) -> list[TurnIntentReasonCode]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("target_entities", mode="after")
+    @classmethod
+    def _dedupe_target_entities(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        return {
+            str(entity_type): list(dict.fromkeys(str(entity).strip() for entity in entities if str(entity).strip()))
+            for entity_type, entities in value.items()
+            if str(entity_type).strip()
+        }
+
+    def expected_output_or_default(self) -> TurnIntentExpectedOutput:
+        return self.expected_output or _DEFAULT_EXPECTED_OUTPUT_BY_MODE[self.mode]
+
+    def to_trace_data(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "mode": self.mode.value,
+            "expected_output": self.expected_output_or_default().value,
+            "required_context": [key.value for key in self.required_context],
+            "confidence": self.confidence,
+            "reason_codes": [reason.value for reason in self.reason_codes],
+        }
+        if self.target_entities:
+            data["target_entity_types"] = sorted(self.target_entities)
+        if self.missing_context_question:
+            data["has_missing_context_question"] = True
+        return data
+
+
 _GOAL_MAX_CHARS = 240
-_BUILD_TERMS = ("build", "create", "make", "generate")
-_NEW_BROWSER_TASK_TERMS = ("go to", "navigate to", "open", "visit", "search for")
-_EDIT_TERMS = ("edit", "update", "change", "modify", "replace", "fix")
-# Verbs that also commonly appear as step/block names ("the delete step").
-_EDIT_NOUNY_TERMS = ("add", "insert", "remove", "delete")
-_DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error", "result")
-_RUN_CONTEXT_REQUEST_TERMS = ("get_run_results", "workflow_run_id", "run result", "run results")
-# Subset of _DIAGNOSE_TERMS that name unambiguous diagnose intent. "result" is in
-# _DIAGNOSE_TERMS but absent here: a browser task on a no-blocks workflow that
-# mentions "results" is a build request, not a run-result inspection.
-_CLEAR_DIAGNOSE_TERMS = ("debug", "diagnose", "failed", "failure", "error")
-_DOCS_TERMS = (
-    "explain",
-    "tell me what",
-    "how do",
-    "how does",
-    "what is",
-    "what are",
-    "what does",
-    "why",
-    "docs",
-    "documentation",
-    "where should",
-    " vs ",
-    " versus ",
-    "difference between",
-)
-_LEADING_NOUNY_FAILURE_RE = re.compile(
-    rf"^\s*(?:the\s+)?(?:{'|'.join(_EDIT_NOUNY_TERMS)})\s+(?:steps?|blocks?)\s+"
-    r"(?:failed|failure|errored?|errors?)\b",
-    re.I,
-)
-# Anchored structure requests catch "I need a step..." without treating
-# reference/help questions like "where should a step go?" as mutation.
-_STRUCTURE_REQUEST_RE = re.compile(
-    r"^\s*(?:(?:please|pls)\s+)?(?:"
-    r"(?:i|we)\s+(?:need|want|would\s+like)\s+"
-    r"(?:(?:(?:you\s+to|to)\s+(?:create|make|build|generate|add|insert)\s+)?)"
-    r"|(?:can|could|would)\s+you\s+(?:(?:please)\s+)?(?:create|make|build|generate|add|insert)\s+"
-    r"|(?:create|make|build|generate|add|insert)\s+"
-    r")(?:(?:a|an|another|extra|new|some)\s+)?(?:steps?|blocks?)\b",
-    re.I,
-)
-_IDENTIFIER_REF_RE = r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+"
-_CODE_IDENTIFIER_REF_RE = re.compile(rf"`(?P<ref>{_IDENTIFIER_REF_RE})`")
-_BLOCK_IDENTIFIER_REF_RE = re.compile(
-    rf"\b(?:(?:block|step)\s+(?P<after>{_IDENTIFIER_REF_RE})|(?P<before>{_IDENTIFIER_REF_RE})\s+(?:block|step))\b",
-    re.I,
-)
-_WF_IDENTIFIER_REF_RE = re.compile(r"\bWF_[A-Za-z0-9_]+\b")
-_ANY_IDENTIFIER_REF_RE = re.compile(rf"\b{_IDENTIFIER_REF_RE}\b")
 
 
 def _normalize_user_goal(user_message: str) -> str:
@@ -232,24 +267,6 @@ def _has_latest_assistant_turn(chat_history: list[WorkflowCopilotChatHistoryMess
     )
 
 
-@functools.lru_cache(maxsize=None)
-def _word_boundary_pattern(terms: tuple[str, ...]) -> re.Pattern[str]:
-    alternation = "|".join(re.escape(term.strip()) for term in terms)
-    # Boundaries are alphanumeric-only so `_` separates words: the edit
-    # term `update` matches a block label like `update_card`. Optional
-    # trailing `s` matches plurals (`errors`) but deliberately not `-ed`
-    # forms (`fixed` must not match `fix`).
-    return re.compile(rf"(?<![a-z0-9])(?:{alternation})s?(?![a-z0-9])")
-
-
-def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
-    return _word_boundary_pattern(terms).search(text.lower()) is not None
-
-
-def _is_explicit_run_context_request(user_message: str) -> bool:
-    return _contains_any(user_message, _RUN_CONTEXT_REQUEST_TERMS)
-
-
 def _workflow_definition_dict(workflow_yaml: str | None) -> dict | None:
     if not workflow_yaml:
         return None
@@ -261,16 +278,6 @@ def _workflow_definition_dict(workflow_yaml: str | None) -> dict | None:
         return None
     workflow_definition = parsed.get("workflow_definition")
     return workflow_definition if isinstance(workflow_definition, dict) else None
-
-
-def _workflow_has_blocks(workflow_yaml: str | None) -> bool:
-    workflow_definition = _workflow_definition_dict(workflow_yaml)
-    if workflow_definition is None:
-        return False
-    blocks = workflow_definition.get("blocks")
-    if not isinstance(blocks, list):
-        return False
-    return any(isinstance(block, dict) for block in blocks)
 
 
 def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
@@ -290,97 +297,283 @@ def _workflow_block_labels(workflow_yaml: str | None) -> set[str]:
     return labels
 
 
-def _workflow_parameter_keys(workflow_yaml: str | None) -> set[str]:
-    workflow_definition = _workflow_definition_dict(workflow_yaml)
-    if workflow_definition is None:
-        return set()
-    parameters = workflow_definition.get("parameters")
-    if not isinstance(parameters, list):
-        return set()
-    keys: set[str] = set()
-    for parameter in parameters:
-        if not isinstance(parameter, dict):
+def _normalize_ref_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _add_block_label_lookup(
+    lookup: dict[tuple[str, str | None], list[str]],
+    key: tuple[str, str | None],
+    label: str,
+) -> None:
+    lookup.setdefault(key, [])
+    if label not in lookup[key]:
+        lookup[key].append(label)
+
+
+def _workflow_block_label_lookup(workflow_yaml: str | None) -> dict[tuple[str, str | None], list[str]]:
+    lookup: dict[tuple[str, str | None], list[str]] = {}
+    for label in sorted(_workflow_block_labels(workflow_yaml)):
+        normalized = _normalize_ref_text(label)
+        if not normalized:
             continue
-        key = parameter.get("key")
-        if isinstance(key, str) and key:
-            keys.add(key)
-    return keys
+        _add_block_label_lookup(lookup, (normalized, None), label)
+        for kind in ("block", "step"):
+            suffix = f" {kind}"
+            if normalized.endswith(suffix):
+                alias = normalized[: -len(suffix)].strip()
+                if alias:
+                    _add_block_label_lookup(lookup, (alias, kind), label)
+    return lookup
 
 
-def _explicit_identifier_refs(user_message: str) -> set[str]:
-    refs = {match.group("ref") for match in _CODE_IDENTIFIER_REF_RE.finditer(user_message or "")}
-    refs.update(
-        match.group("after") or match.group("before")
-        for match in _BLOCK_IDENTIFIER_REF_RE.finditer(user_message or "")
-        if match.group("after") or match.group("before")
-    )
-    wf_refs = set(_WF_IDENTIFIER_REF_RE.findall(user_message or ""))
-    refs.update(wf_refs)
-    if wf_refs:
-        # If the turn already contains a generated workflow-style ref, include the other
-        # identifier-shaped tokens as companion refs. This catches "WF_x worked but y failed"
-        # without treating every snake_case field name as a workflow block target.
-        refs.update(_ANY_IDENTIFIER_REF_RE.findall(user_message or ""))
-    return refs
-
-
-def _unresolved_explicit_block_refs(user_message: str, workflow_yaml: str | None) -> list[str]:
-    explicit_refs = _explicit_identifier_refs(user_message)
-    if not explicit_refs:
-        return []
-    known_labels = {label.lower() for label in _workflow_block_labels(workflow_yaml)}
-    parameter_keys = {key.lower() for key in _workflow_parameter_keys(workflow_yaml)}
-    known_non_block_refs = {"workflow_run_id", "browser_session_id"}
-    unresolved: list[str] = []
-    for ref in sorted(explicit_refs):
-        normalized = ref.lower()
-        if normalized in known_labels or normalized in parameter_keys or normalized in known_non_block_refs:
-            continue
-        unresolved.append(ref)
-    return unresolved
-
-
-def _mutation_mode(has_workflow: bool) -> tuple[TurnIntentMode, TurnIntentExpectedOutput]:
-    if has_workflow:
-        return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
-    return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
-
-
-def _mode_from_keywords(
-    user_message: str,
+def _lookup_block_label(
+    lookup: dict[tuple[str, str | None], list[str]],
+    normalized_ref: str,
     *,
-    has_workflow: bool,
-    has_workflow_blocks: bool,
-    has_prior_run_signal: bool,
-) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
-    if _LEADING_NOUNY_FAILURE_RE.search(user_message or ""):
-        return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
-    if has_workflow and _contains_any(user_message, _EDIT_TERMS):
-        return TurnIntentMode.EDIT, TurnIntentExpectedOutput.WORKFLOW_UPDATE
-    # A browser-task verb on a saved workflow with no buildable blocks is a new
-    # build request even when the message mentions "results"; suppress only when
-    # the user names diagnosis or docs intent, or a prior run is attached. The
-    # no-yaml case still falls through to the trailing browser-task fallback.
-    if (
-        has_workflow
-        and not has_workflow_blocks
-        and not has_prior_run_signal
-        and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS)
-        and not _contains_any(user_message, _CLEAR_DIAGNOSE_TERMS)
-        and not _contains_any(user_message, _DOCS_TERMS)
-    ):
-        return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
-    if _contains_any(user_message, _DIAGNOSE_TERMS):
-        return TurnIntentMode.DIAGNOSE, TurnIntentExpectedOutput.RUN_RESULT
-    if _contains_any(user_message, _DOCS_TERMS):
-        return TurnIntentMode.DOCS_ANSWER, TurnIntentExpectedOutput.EXPLANATION
-    if _STRUCTURE_REQUEST_RE.search(user_message or ""):
-        return _mutation_mode(has_workflow)
-    if _contains_any(user_message, _BUILD_TERMS):
-        return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
-    if not has_workflow and _contains_any(user_message, _NEW_BROWSER_TASK_TERMS):
-        return TurnIntentMode.BUILD, TurnIntentExpectedOutput.WORKFLOW_DRAFT
+    kind: str | None = None,
+) -> str | None:
+    keys: list[tuple[str, str | None]] = []
+    if kind:
+        keys.append((normalized_ref, kind))
+    keys.append((normalized_ref, None))
+    for key in keys:
+        labels = lookup.get(key, [])
+        if len(labels) == 1:
+            return labels[0]
     return None
+
+
+def _merge_target_entities(target_entities: dict[str, list[str]], additions: dict[str, list[str]]) -> None:
+    for entity_type, entities in additions.items():
+        target_entities[entity_type] = list(dict.fromkeys([*target_entities.get(entity_type, []), *entities]))
+
+
+def _clean_string_list(raw: object, *, max_values: int = _TARGET_ENTITY_MAX_VALUES) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    for item in raw:
+        value = str(item).strip()[:_TARGET_ENTITY_VALUE_MAX_CHARS]
+        if value:
+            values.append(value)
+        if len(values) >= max_values:
+            break
+    return list(dict.fromkeys(values))
+
+
+def _coerce_confidence(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int, str)):
+        return 0.0
+    try:
+        confidence = float(value)
+    except ValueError:
+        return 0.0
+    return min(1.0, max(0.0, confidence))
+
+
+def _coerce_mode(value: object) -> TurnIntentMode | None:
+    try:
+        return TurnIntentMode(str(value))
+    except ValueError:
+        return None
+
+
+def _coerce_expected_output(value: object) -> TurnIntentExpectedOutput | None:
+    if value is None:
+        return None
+    try:
+        return TurnIntentExpectedOutput(str(value))
+    except ValueError:
+        return None
+
+
+def _coerce_required_context(raw: object) -> list[RequiredContextKey]:
+    values = _clean_string_list(raw, max_values=len(RequiredContextKey))
+    required_context: list[RequiredContextKey] = []
+    for value in values:
+        try:
+            required_context.append(RequiredContextKey(value))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(required_context))
+
+
+def _coerce_reason_codes(raw: object) -> list[TurnIntentReasonCode]:
+    values = _clean_string_list(raw, max_values=len(TurnIntentReasonCode))
+    reason_codes: list[TurnIntentReasonCode] = []
+    for value in values:
+        try:
+            reason_codes.append(TurnIntentReasonCode(value))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(reason_codes))
+
+
+def _coerce_target_entities(raw: object) -> dict[str, list[str]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    entities: dict[str, list[str]] = {}
+    for entity_type, values in raw.items():
+        key = str(entity_type).strip()
+        if not key:
+            continue
+        cleaned_values = _clean_string_list(values)
+        if cleaned_values:
+            entities[key] = cleaned_values
+    return entities
+
+
+def _decode_classifier_response(raw: object) -> dict[str, object] | None:
+    if isinstance(raw, str):
+        raw = parse_final_response(raw)
+    if not isinstance(raw, Mapping):
+        return None
+    return {str(key): value for key, value in raw.items()}
+
+
+def _turn_intent_classification_from_raw(raw: object) -> TurnIntentClassification | None:
+    payload = _decode_classifier_response(raw)
+    if payload is None:
+        return None
+    mode = _coerce_mode(payload.get("mode"))
+    if mode is None:
+        return None
+    missing_context_question = payload.get("missing_context_question")
+    return TurnIntentClassification(
+        mode=mode,
+        expected_output=_coerce_expected_output(payload.get("expected_output")),
+        required_context=_coerce_required_context(payload.get("required_context")),
+        confidence=_coerce_confidence(payload.get("confidence")),
+        target_entities=_coerce_target_entities(payload.get("target_entities")),
+        missing_context_question=missing_context_question.strip()
+        if isinstance(missing_context_question, str) and missing_context_question.strip()
+        else None,
+        reason_codes=_coerce_reason_codes(payload.get("reason_codes")),
+    )
+
+
+def _block_ref_candidates(value: str) -> list[tuple[str, str | None]]:
+    normalized = _normalize_ref_text(value)
+    if not normalized:
+        return []
+    candidates: list[tuple[str, str | None]] = []
+    for article in ("the ", "a ", "an "):
+        if normalized.startswith(article):
+            normalized = normalized[len(article) :].strip()
+            break
+    for kind in ("block", "step"):
+        suffix = f" {kind}"
+        if normalized.endswith(suffix):
+            alias = normalized[: -len(suffix)].strip()
+            if alias:
+                candidates.append((alias, kind))
+    candidates.append((normalized, None))
+    return list(dict.fromkeys(candidates))
+
+
+def _resolve_classified_block_targets(values: list[str], workflow_yaml: str | None) -> tuple[list[str], list[str]]:
+    lookup = _workflow_block_label_lookup(workflow_yaml)
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for value in values:
+        label = None
+        for normalized_ref, kind in _block_ref_candidates(value):
+            label = _lookup_block_label(lookup, normalized_ref, kind=kind)
+            if label:
+                break
+        if label:
+            resolved.append(label)
+        else:
+            unresolved.append(value)
+    return list(dict.fromkeys(resolved)), list(dict.fromkeys(unresolved))
+
+
+def _normalize_classified_target_entities(
+    target_entities: dict[str, list[str]],
+    workflow_yaml: str | None,
+) -> dict[str, list[str]]:
+    normalized_entities = {key: list(values) for key, values in target_entities.items() if values}
+    block_values = normalized_entities.pop("block", [])
+    if block_values:
+        resolved, unresolved = _resolve_classified_block_targets(block_values, workflow_yaml)
+        if resolved:
+            _merge_target_entities(normalized_entities, {"block": resolved})
+        if unresolved:
+            _merge_target_entities(normalized_entities, {UNRESOLVED_BLOCK_REF_TARGET_ENTITY: unresolved})
+    return normalized_entities
+
+
+def _has_specific_edit_target(target_entities: dict[str, list[str]]) -> bool:
+    if any(target_entities.get(entity_type) for entity_type in _EDIT_SPECIFIC_TARGET_ENTITY_TYPES):
+        return True
+    return any(target != "current_workflow" for target in target_entities.get("workflow", []))
+
+
+async def classify_turn_intent(
+    *,
+    user_message: str,
+    workflow_yaml: str,
+    chat_history: list[WorkflowCopilotChatHistoryMessage],
+    global_llm_context: str,
+    request_policy: RequestPolicy,
+    handler: LLMAPIHandler | None,
+) -> TurnIntentClassification | None:
+    if not isinstance(user_message, str) or not user_message.strip():
+        return None
+    if handler is None:
+        LOG.info("turn-intent classifier has no LLM handler available")
+        return None
+
+    safe_user_message = redact_raw_secrets_for_prompt(user_message)
+    transcript = build_transcript_context(chat_history, safe_user_message)
+    try:
+        prompt = prompt_engine.load_prompt(
+            template=PROMPT_NAME,
+            mode_values=", ".join(mode.value for mode in TurnIntentMode),
+            expected_output_values=", ".join(output.value for output in TurnIntentExpectedOutput),
+            required_context_values=", ".join(key.value for key in RequiredContextKey),
+            reason_code_values=", ".join(reason.value for reason in TurnIntentReasonCode),
+            user_message=escape_code_fences(safe_user_message),
+            request_policy_summary=escape_code_fences(request_policy.prompt_summary()),
+            workflow_yaml=escape_code_fences(
+                redact_raw_secrets_for_prompt(workflow_yaml)[:_WORKFLOW_YAML_PROMPT_MAX_CHARS]
+            ),
+            earliest_user_turn=transcript.earliest_user_turn,
+            latest_prior_user_turn=transcript.latest_prior_user_turn,
+            latest_assistant_turn=transcript.latest_assistant_turn,
+            retained_history=transcript.retained_history,
+            global_llm_context=escape_code_fences(
+                redact_raw_secrets_for_prompt(global_llm_context)[:_GLOBAL_CONTEXT_PROMPT_MAX_CHARS]
+            ),
+        )
+    except Exception as exc:
+        LOG.warning("turn-intent classifier prompt render failed", error=str(exc))
+        return None
+
+    try:
+        raw = await asyncio.wait_for(
+            handler(prompt=prompt, prompt_name=PROMPT_NAME),
+            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOG.warning(
+            "turn-intent classifier timed out",
+            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+        )
+        return None
+    except Exception as exc:
+        LOG.warning("turn-intent classifier failed", error=str(exc))
+        return None
+
+    classification = _turn_intent_classification_from_raw(raw)
+    if classification is None:
+        LOG.warning("turn-intent classifier returned malformed output")
+        return None
+
+    with copilot_span("turn_intent_classifier", data=classification.to_trace_data()):
+        LOG.info("turn-intent classifier decision", **classification.to_trace_data())
+    return classification
 
 
 _PRIOR_RUN_OUTPUT_PREFIX = "  output:"
@@ -412,38 +605,6 @@ def _has_structured_prior_run_signal(global_llm_context: str) -> bool:
         return False
     structured = StructuredContext.from_json_str(global_llm_context)
     return any(isinstance(entry, str) and _decision_records_prior_run(entry) for entry in structured.decisions_made)
-
-
-_AFFIRMATIVE_REPLIES = frozenset(
-    {
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "yup",
-        "sure",
-        "ok",
-        "okay",
-        "confirm",
-        "confirmed",
-        "i confirm",
-        "correct",
-        "right",
-        "thats right",
-        "that's right",
-        "go ahead",
-        "do it",
-        "please do",
-        "sounds good",
-        "affirmative",
-    }
-)
-
-
-def _is_bare_affirmative(user_message: str) -> bool:
-    """True when the message is only a confirmation token (no new instruction)."""
-    normalized = (user_message or "").strip().lower().rstrip(".!,;: ")
-    return normalized in _AFFIRMATIVE_REPLIES
 
 
 _NON_PROGRESS_MARKER_RE = re.compile(
@@ -505,33 +666,6 @@ def _user_signals_non_progress(user_message: str, chat_history: list[WorkflowCop
     return SequenceMatcher(None, current_norm, prior_norm).ratio() >= _NON_PROGRESS_RESTATE_THRESHOLD
 
 
-def _carryover_mode_from_prior_turn(
-    chat_history: list[WorkflowCopilotChatHistoryMessage],
-    *,
-    has_workflow: bool,
-    has_workflow_blocks: bool,
-    has_prior_run_signal: bool,
-) -> tuple[TurnIntentMode, TurnIntentExpectedOutput] | None:
-    """Mode of the most recent prior user turn that keyword-classifies. A bare
-    confirmation carries no keywords of its own, so it inherits the turn it confirms."""
-    for message in reversed(chat_history):
-        if message.sender != WorkflowCopilotChatSender.USER:
-            continue
-        content = (message.content or "").strip()
-        # Skip earlier confirmations so a chain of "yes"/"confirm" turns walks
-        # back to the substantive request, not to the nearest confirmation.
-        if not content or _is_bare_affirmative(content):
-            continue
-        if carried := _mode_from_keywords(
-            content,
-            has_workflow=has_workflow,
-            has_workflow_blocks=has_workflow_blocks,
-            has_prior_run_signal=has_prior_run_signal,
-        ):
-            return carried
-    return None
-
-
 def build_turn_intent(
     *,
     user_message: str,
@@ -543,9 +677,9 @@ def build_turn_intent(
     workflow_permanent_id: str | None = None,
     workflow_run_id: str | None = None,
     browser_session_id: str | None = None,
+    classification: TurnIntentClassification | None = None,
 ) -> TurnIntent:
     has_workflow = bool((workflow_yaml or "").strip())
-    has_workflow_blocks = _workflow_has_blocks(workflow_yaml)
     has_prior_context = bool((global_llm_context or "").strip())
     target_entities: dict[str, list[str]] = {}
     required_context: list[RequiredContextKey] = []
@@ -600,44 +734,52 @@ def build_turn_intent(
         confidence = 0.8
         missing_context_question = request_policy.clarification_question
         reason_codes.append(TurnIntentReasonCode.REQUEST_POLICY_CLARIFICATION)
-    elif has_prior_run_signal and _is_explicit_run_context_request(user_message):
-        mode = TurnIntentMode.DIAGNOSE
-        expected_output = TurnIntentExpectedOutput.RUN_RESULT
-        confidence = 0.45
-        reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
+    elif classification is not None and classification.mode != TurnIntentMode.UNKNOWN:
+        mode = classification.mode
+        expected_output = classification.expected_output_or_default()
+        confidence = classification.confidence
+        missing_context_question = classification.missing_context_question
+        required_context.extend(classification.required_context)
+        _merge_target_entities(
+            target_entities,
+            _normalize_classified_target_entities(classification.target_entities, workflow_yaml),
+        )
+        reason_codes.append(TurnIntentReasonCode.LLM_CLASSIFIER)
+        reason_codes.extend(classification.reason_codes)
     elif request_policy.testing_intent == "skip_test":
         mode = TurnIntentMode.DRAFT_ONLY
         expected_output = TurnIntentExpectedOutput.WORKFLOW_DRAFT
         confidence = 0.6
         reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_SKIP_TEST)
-    elif keyword_mode := _mode_from_keywords(
-        user_message,
-        has_workflow=has_workflow,
-        has_workflow_blocks=has_workflow_blocks,
-        has_prior_run_signal=has_prior_run_signal,
-    ):
-        mode, expected_output = keyword_mode
-        confidence = 0.35
-        reason_codes.append(TurnIntentReasonCode.KEYWORD_HEURISTIC)
-    elif _is_bare_affirmative(user_message) and (
-        carried_mode := _carryover_mode_from_prior_turn(
-            chat_history,
-            has_workflow=has_workflow,
-            has_workflow_blocks=has_workflow_blocks,
-            has_prior_run_signal=has_prior_run_signal,
+    elif classification is not None:
+        confidence = classification.confidence
+        required_context.extend(classification.required_context)
+        _merge_target_entities(
+            target_entities,
+            _normalize_classified_target_entities(classification.target_entities, workflow_yaml),
         )
+        reason_codes.append(TurnIntentReasonCode.LLM_CLASSIFIER)
+        reason_codes.extend(classification.reason_codes)
+
+    if (
+        classification is not None
+        and mode in _MUTATING_CLASSIFIER_MODES
+        and confidence < _LOW_CONFIDENCE_MUTATION_THRESHOLD
     ):
-        mode, expected_output = carried_mode
-        confidence = 0.3
-        reason_codes.append(TurnIntentReasonCode.CONFIRMATION_CARRYOVER)
+        mode = TurnIntentMode.CLARIFY
+        expected_output = TurnIntentExpectedOutput.CLARIFICATION
+        missing_context_question = missing_context_question or "What workflow should I build or change?"
+        reason_codes.append(TurnIntentReasonCode.LOW_CONFIDENCE_CLARIFICATION)
+
+    if mode == TurnIntentMode.EDIT and not _has_specific_edit_target(target_entities):
+        mode = TurnIntentMode.CLARIFY
+        expected_output = TurnIntentExpectedOutput.CLARIFICATION
+        confidence = min(confidence, _LOW_CONFIDENCE_MUTATION_THRESHOLD - 0.01)
+        missing_context_question = missing_context_question or "What change should I make to this workflow?"
+        reason_codes.append(TurnIntentReasonCode.MISSING_EDIT_TARGET)
 
     if _user_signals_non_progress(user_message, chat_history):
         reason_codes.append(TurnIntentReasonCode.USER_NON_PROGRESS)
-
-    if mode == TurnIntentMode.EDIT:
-        unresolved_block_refs = _unresolved_explicit_block_refs(user_message, workflow_yaml)
-        if unresolved_block_refs:
-            target_entities[UNRESOLVED_BLOCK_REF_TARGET_ENTITY] = unresolved_block_refs
 
     if mode == TurnIntentMode.UNKNOWN and has_prior_run_signal:
         mode = TurnIntentMode.DIAGNOSE
@@ -648,6 +790,16 @@ def build_turn_intent(
         authority.may_update_workflow = False
         authority.may_run_blocks = False
         required_context.append(RequiredContextKey.DOCS_CONTEXT)
+    elif mode == TurnIntentMode.DRAFT_ONLY:
+        authority.may_run_blocks = False
+    elif mode == TurnIntentMode.CLARIFY:
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
+        authority.requires_user_input = True
+    elif mode == TurnIntentMode.REFUSE:
+        authority.may_update_workflow = False
+        authority.may_run_blocks = False
+        authority.requires_user_input = True
     elif mode == TurnIntentMode.DIAGNOSE and RequiredContextKey.LATEST_RUN_RESULT not in required_context:
         authority.may_update_workflow = False
         authority.may_run_blocks = False
