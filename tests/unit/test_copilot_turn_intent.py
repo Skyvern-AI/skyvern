@@ -321,6 +321,20 @@ def test_build_turn_intent_marks_run_context_for_diagnose() -> None:
     assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
 
 
+def test_build_turn_intent_does_not_require_unassembled_browser_state() -> None:
+    intent = build_turn_intent(
+        user_message="Continue in the open browser",
+        workflow_yaml="workflow_definition:\n  blocks: []",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(),
+        browser_session_id="pbs_123",
+    )
+
+    assert RequiredContextKey.BROWSER_STATE not in intent.required_context
+    assert TurnIntentReasonCode.BROWSER_CONTEXT_PRESENT in intent.reason_codes
+
+
 def test_build_turn_intent_keeps_explicit_fix_as_edit() -> None:
     intent = build_turn_intent(
         user_message="Fix the error after login.",

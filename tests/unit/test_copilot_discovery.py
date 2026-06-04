@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from skyvern.forge.sdk.copilot import tools as tools_module
+from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
 from skyvern.forge.sdk.copilot.tools import _discovery_walk, _inspect_page_for_composition_impl
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 
@@ -18,6 +19,9 @@ class _Ctx:
         self.discovery_step_count = 0
         self.prior_page_inspection_calls_made = 0
         self.page_inspection_calls_this_turn = 0
+        self.flow_evidence: list[dict[str, Any]] = []
+        self.composition_page_evidence = None
+        self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
 
 
@@ -179,6 +183,27 @@ class _CurrentPageServer:
         raise AssertionError(f"unexpected tool: {tool_name}")
 
 
+class _TargetThenCurrentPageServer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.current_url = ""
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((tool_name, arguments))
+        if tool_name == "skyvern_navigate":
+            self.current_url = arguments["url"]
+            return {"ok": True, "data": {"url": self.current_url}}
+        if tool_name == "skyvern_get_html":
+            assert arguments == {"selector": "body"}
+            return {
+                "ok": True,
+                "data": {
+                    "html": "<html><body><form><input name='firstName'><button>Search</button></form></body></html>"
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool_name}")
+
+
 @pytest.mark.asyncio
 async def test_discovery_navigation_failure_falls_back_to_entry_url() -> None:
     result = await _discovery_walk(
@@ -319,6 +344,94 @@ async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_c
     assert result["data"]["observed_after_workflow_run"] is True
     assert ctx.page_inspection_calls_this_turn == 0
     assert ctx.post_run_current_page_inspection_workflow_run_id == "wr_123"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspection_without_earned_interaction_is_not_click_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["reached_via"] == "current_page"
+    assert ctx.flow_evidence[0]["reached_via"] == "current_page"
+
+
+@pytest.mark.asyncio
+async def test_current_page_inspection_after_browser_action_is_click_reached_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _CurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.pending_browser_interaction_observation = PendingBrowserInteractionObservation(
+        tool_name="click",
+        url="https://www.example.com/results",
+    )
+
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is True
+    assert result["reached_via"] == "interaction"
+    assert ctx.flow_evidence[0]["reached_via"] == "interaction"
+    assert ctx.pending_browser_interaction_observation is None
+
+
+@pytest.mark.asyncio
+async def test_inspection_budget_steers_progress_check_instead_of_authoring() -> None:
+    ctx = _Ctx(server=object())
+    ctx.page_inspection_calls_this_turn = 999
+
+    result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert result["ok"] is False
+    assert "not evidence that scouting is complete" in result["error"]
+    assert "evaluate" in result["error"]
+    assert "get_browser_screenshot" in result["error"]
+    assert "browser action on the current page" in result["error"]
+    assert "Do not author downstream result" in result["error"]
+    assert "Compose from existing evidence" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_target_url_inspection_clears_pending_interaction_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _TargetThenCurrentPageServer()
+    ctx = _Ctx(server)
+    ctx.pending_browser_interaction_observation = PendingBrowserInteractionObservation(
+        tool_name="click",
+        url="https://www.example.com/results",
+    )
+
+    target_result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/results")
+
+    assert target_result["ok"] is True
+    assert target_result["reached_via"] == "navigate"
+    assert ctx.pending_browser_interaction_observation is None
+
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+        return "https://www.example.com/results", "Results"
+
+    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+
+    current_result = await _inspect_page_for_composition_impl(ctx, "current_page")
+
+    assert current_result["ok"] is True
+    assert current_result["reached_via"] == "current_page"
+    assert [entry["reached_via"] for entry in ctx.flow_evidence] == ["navigate", "current_page"]
 
 
 class _SizeCappedHtmlStrippedFallbackServer:

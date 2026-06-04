@@ -543,6 +543,27 @@ def test_frontier_run_size_error_limits_long_page_changing_frontier() -> None:
     assert "Do not remove later blocks" in error
 
 
+def test_frontier_run_size_result_steers_to_smaller_saved_frontier() -> None:
+    result = tools._frontier_run_size_result(
+        "frontier too long",
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+        ["open", "set_search", "submit_search", "expand_results", "extract"],
+    )
+
+    data = result["data"]
+    assert result["ok"] is False
+    assert data["workflow_run_skipped"] is True
+    assert data["suggested_block_labels"] == ["open", "set_search"]
+    assert data["deferred_block_labels"] == ["submit_search", "expand_results", "extract"]
+    assert data["control_signal"] == {
+        "kind": "intermediate_success",
+        "user_facing_summary": data["user_facing_summary"],
+        "next_tool": "run_blocks_and_collect_debug",
+        "next_block_labels": ["open", "set_search"],
+        "preserve_workflow_yaml": True,
+    }
+
+
 def test_frontier_run_size_error_allows_tool_expanded_runtime_anchor() -> None:
     definition = _FakeDefinition(
         [

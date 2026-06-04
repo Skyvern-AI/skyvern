@@ -75,9 +75,7 @@ from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.api.llm.schema_validator import validate_and_fill_extraction_result
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener
-from skyvern.forge.sdk.core.skyvern_context import current as skyvern_current
-from skyvern.forge.sdk.core.skyvern_context import ensure_context
+from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.models import Step
@@ -1784,41 +1782,12 @@ async def handle_input_text_action(
     incremental_element: list[dict] = []
     auto_complete_hacky_flag: bool = False
 
-    # OPTIMIZATION: Skip expensive LLM context parsing for TOTP and secret values
-    # TOTP inputs don't need autocomplete detection - we already have the generated code
-    # This saves ~4-5s per TOTP digit (6 digits = ~27s saved for 2FA!)
-    # Gated by ENABLE_SPEED_OPTIMIZATIONS feature flag
-    skip_context_parsing = False
-    if (
-        is_totp_value
-        or is_secret_value
-        or (action.totp_timing_info and action.totp_timing_info.get("is_totp_sequence"))
-    ):
-        try:
-            current_context = skyvern_current()
-            enable_speed_optimizations = current_context.enable_speed_optimizations if current_context else False
-
-            if enable_speed_optimizations:
-                skip_context_parsing = True
-                LOG.info(
-                    "Speed optimization: Skipping input context parsing for TOTP/secret input",
-                    element_id=skyvern_element.get_id(),
-                    is_totp=is_totp_value,
-                    is_secret=is_secret_value,
-                    is_multi_field_totp=bool(action.totp_timing_info),
-                )
-        except Exception:
-            LOG.warning("Failed to read ENABLE_SPEED_OPTIMIZATIONS from context for TOTP optimization", exc_info=True)
-
-    if skip_context_parsing:
-        input_or_select_context = None
-    else:
-        input_or_select_context = await _get_input_or_select_context(
-            action=action,
-            element_tree_builder=scraped_page,
-            skyvern_element=skyvern_element,
-            step=step,
-        )
+    input_or_select_context = await _get_input_or_select_context(
+        action=action,
+        element_tree_builder=scraped_page,
+        skyvern_element=skyvern_element,
+        step=step,
+    )
 
     # check if it's selectable
     if (

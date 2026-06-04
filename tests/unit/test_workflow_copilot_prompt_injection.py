@@ -223,7 +223,7 @@ class TestCopilotCallLLMWiring:
 
         with (
             patch(
-                "skyvern.forge.sdk.routes.workflow_copilot.get_llm_handler_for_prompt_type",
+                "skyvern.forge.sdk.routes.workflow_copilot.resolve_main_copilot_handler",
                 return_value=mock_handler,
             ),
             patch("skyvern.forge.sdk.routes.workflow_copilot.app") as mock_app,

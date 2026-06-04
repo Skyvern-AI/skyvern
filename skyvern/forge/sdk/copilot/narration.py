@@ -27,8 +27,7 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.forge import app
-from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
+from skyvern.forge.sdk.copilot.llm_config import get_fast_copilot_handler, resolve_fast_copilot_handler
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotBlockProgressUpdate,
     WorkflowCopilotNarrationUpdate,
@@ -426,34 +425,11 @@ async def _call_narrator_llm(prompt_ctx: _NarratorPromptContext, handler: Any) -
 
 
 def _get_narrator_handler() -> Any:
-    # SECONDARY also serves the scraper and other non-copilot paths; prefer
-    # the copilot-scoped fast handler so narration tunes independently.
-    try:
-        handler = app.WORKFLOW_COPILOT_FAST_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        handler = None
-    if handler is not None:
-        return handler
-    try:
-        return app.SECONDARY_LLM_API_HANDLER
-    except (RuntimeError, AttributeError):
-        return None
+    return get_fast_copilot_handler()
 
 
 async def resolve_narrator_handler(workflow_permanent_id: str | None, organization_id: str | None) -> Any:
-    # Resolution order: PostHog LLM_CONFIG_BY_PROMPT_TYPE["workflow-copilot-narration"]
-    # → env-driven WORKFLOW_COPILOT_FAST_LLM_API_HANDLER → SECONDARY_LLM_API_HANDLER.
-    if workflow_permanent_id and organization_id:
-        try:
-            posthog_handler = await get_llm_handler_for_prompt_type(
-                "workflow-copilot-narration", workflow_permanent_id, organization_id
-            )
-        except Exception as exc:
-            LOG.warning("narrator PostHog lookup failed, falling back", error=str(exc))
-            posthog_handler = None
-        if posthog_handler is not None:
-            return posthog_handler
-    return _get_narrator_handler()
+    return await resolve_fast_copilot_handler(workflow_permanent_id, organization_id)
 
 
 def handler_available() -> bool:

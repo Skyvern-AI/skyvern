@@ -714,3 +714,69 @@ class TestVerifyScoutTypeLanded:
 
         assert result is None
         ctx.discovery_mcp_server.call_internal_tool.assert_not_awaited()
+
+
+class TestBrowserInteractionObservationHooks:
+    @pytest.mark.asyncio
+    async def test_click_hook_marks_pending_interaction_observation(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = SimpleNamespace(pending_browser_interaction_observation=None, discovery_mcp_server=None)
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert result["data"] == {
+            "selector": "#add-to-cart",
+            "url": "https://example.com/results",
+            "title": "Results",
+        }
+        assert ctx.pending_browser_interaction_observation is not None
+        assert ctx.pending_browser_interaction_observation.tool_name == "click"
+        assert ctx.pending_browser_interaction_observation.url == "https://example.com/results"
+
+    @pytest.mark.asyncio
+    async def test_failed_click_hook_clears_stale_pending_interaction_observation(self) -> None:
+        from skyvern.forge.sdk.copilot.runtime import PendingBrowserInteractionObservation
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=PendingBrowserInteractionObservation(
+                tool_name="click",
+                url="https://example.com/results",
+            ),
+            discovery_mcp_server=None,
+        )
+
+        result = await _click_post_hook(
+            {"ok": False, "error": "element not found"},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert result == {"ok": False, "error": "element not found"}
+        assert ctx.pending_browser_interaction_observation is None
+
+    @pytest.mark.asyncio
+    async def test_type_hook_does_not_mark_pending_interaction_when_readback_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def fake_verify(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"ok": False, "error": "field is still empty"}
+
+        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", fake_verify)
+        ctx = SimpleNamespace(pending_browser_interaction_observation=None, discovery_mcp_server=None)
+
+        result = await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 12}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+
+        assert result == {"ok": False, "error": "field is still empty"}
+        assert ctx.pending_browser_interaction_observation is None

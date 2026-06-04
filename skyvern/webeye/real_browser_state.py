@@ -27,12 +27,26 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.navigation import is_permanent_navigation_error, navigate_with_retry
 from skyvern.webeye.scraper import scraper
 from skyvern.webeye.scraper.scraped_page import CleanupElementTreeFunc, ScrapedPage, ScrapeExcludeFunc
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.utils.page import ScreenshotMode, SkyvernFrame
 
 LOG = structlog.get_logger()
 
 SETTLE_TIME_MS = 750
 SETTLE_JITTER_MS = 500
+
+
+def _same_page_ignoring_fragment(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        left_parsed = urlparse(left)
+        right_parsed = urlparse(right)
+    except Exception:
+        return False
+    left_url = left_parsed._replace(fragment="").geturl().rstrip("/")
+    right_url = right_parsed._replace(fragment="").geturl().rstrip("/")
+    return left_url == right_url
 
 
 class RealBrowserState(BrowserState):
@@ -117,7 +131,7 @@ class RealBrowserState(BrowserState):
             use_existing_page = False
             if browser_address and len(self.browser_context.pages) > 0:
                 pages = await self.list_valid_pages()
-                if len(pages) > 0:
+                if pages:
                     page = pages[-1]
                     use_existing_page = True
             if page is None:
@@ -127,7 +141,7 @@ class RealBrowserState(BrowserState):
             if not use_existing_page:
                 await self._close_all_other_pages()
 
-            if url and page.url.rstrip("/") != url.rstrip("/"):
+            if url and not _same_page_ignoring_fragment(page.url, url):
                 await self.navigate_to_url(page=page, url=url)
 
     async def _wait_for_settle(self) -> None:
@@ -432,6 +446,8 @@ class RealBrowserState(BrowserState):
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
                     LOG.info("Closing browser context and its pages")
+                    session_dir = self.browser_artifacts.browser_session_dir if self.browser_artifacts else None
+                    await persist_session_cookies(self.browser_context, session_dir)
                     try:
                         await self.browser_context.close()
                     except Exception:

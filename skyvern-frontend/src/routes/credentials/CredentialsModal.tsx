@@ -69,8 +69,8 @@ const SECRET_CREDENTIAL_INITIAL_VALUES = {
   secretValue: "",
 };
 
-// Maximum polling duration: 5 minutes
-const MAX_POLL_DURATION_MS = 5 * 60 * 1000;
+// Maximum polling duration: 10 minutes (matches the backend profile-creation budget)
+const MAX_POLL_DURATION_MS = 10 * 60 * 1000;
 
 // Progressive status messages during test — each advances once at a real interval
 const TEST_STATUS_MESSAGES = [
@@ -364,12 +364,12 @@ function CredentialsModal({
         pollIntervalRef.current = null;
         setTestStatus("failed");
         setTestFailureReason(
-          "The test timed out after 5 minutes. The login may be taking too long or requires manual interaction.",
+          "The test timed out after 10 minutes. The login may be taking too long or requires manual interaction.",
         );
         toast({
           title: "Credential test timed out",
           description:
-            "The test did not complete within 5 minutes. Please try again.",
+            "The test did not complete within 10 minutes. Please try again.",
           variant: "destructive",
         });
         // Cancel the backend workflow run so it stops consuming resources
