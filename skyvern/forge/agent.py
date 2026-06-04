@@ -2969,7 +2969,7 @@ class ForgeAgent:
         skyvern_frame: SkyvernFrame | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
-            await skyvern_frame.safe_wait_for_animation_end()
+            await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
         except Exception:
             LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
 
