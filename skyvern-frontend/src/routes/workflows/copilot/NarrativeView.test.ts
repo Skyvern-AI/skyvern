@@ -372,6 +372,14 @@ describe("applyNarrativeEvent — terminal", () => {
     expect(s.narrativeSummary).toBe("full text");
   });
 
+  it("captures proposal disposition from response events", () => {
+    const s = applyNarrativeEvent(
+      EMPTY_NARRATIVE,
+      response({ proposal_disposition: "review_untested" }),
+    );
+    expect(s.proposalDisposition).toBe("review_untested");
+  });
+
   it("response uses backend error narrative payload when present", () => {
     const s = applyNarrativeEvent(
       EMPTY_NARRATIVE,

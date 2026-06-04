@@ -45,6 +45,8 @@ const inFlightTurn = (): TurnNarrativeState => ({
 });
 
 const HEADLINE = "Built and tested the workflow";
+const REVIEW_HEADLINE = "Draft needs review";
+const REVIEW_TESTED_HEADLINE = "Workflow ready for review";
 
 afterEach(() => {
   cleanup();
@@ -60,6 +62,43 @@ describe("NarrativeView collapse default", () => {
         .getByRole("button", { name: new RegExp(HEADLINE) })
         .getAttribute("aria-expanded"),
     ).toBe("false");
+  });
+
+  it("does not present an unverified review proposal as built and tested", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          proposalDisposition: "review_untested",
+          terminalMessage:
+            "I reached the requested browser state, but the reusable workflow still needs a clean verification run before it is ready.",
+          narrativeSummary:
+            "I reached the requested browser state, but the reusable workflow still needs a clean verification run before it is ready.",
+        }}
+      />,
+    );
+
+    expect(screen.getByText(REVIEW_HEADLINE)).toBeTruthy();
+    expect(screen.queryByText(HEADLINE)).toBeNull();
+  });
+
+  it("does not present a tested review proposal with a success badge", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          proposalDisposition: "review_tested",
+          narrativeSummary: "Workflow ready for review.",
+        }}
+      />,
+    );
+
+    const summaryButton = screen.getByRole("button", {
+      name: new RegExp(REVIEW_TESTED_HEADLINE),
+    });
+    expect(summaryButton.textContent).toContain("!");
+    expect(summaryButton.textContent).not.toContain("✓");
+    expect(screen.queryByText(HEADLINE)).toBeNull();
   });
 
   it("keeps the in-flight turn expanded in the detail view", () => {

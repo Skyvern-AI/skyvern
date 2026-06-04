@@ -452,6 +452,10 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     mode === "clarify" ||
     mode === "refuse";
   const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
+  const needsUntestedProposalReview =
+    hasDrafts && turn.proposalDisposition === "review_untested";
+  const needsTestedProposalReview =
+    hasDrafts && turn.proposalDisposition === "review_tested";
   const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
   const hasReviewableDraft =
     hasDrafts &&
@@ -466,17 +470,21 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
       ? "Run halted"
       : needsInput
         ? "Question"
-        : isQA
-          ? mode === "refuse"
-            ? "Declined"
-            : mode === "clarify"
-              ? "Question"
-              : "Answered"
-          : hasEdited
-            ? "Applied edits and re-tested"
-            : hasDrafts
-              ? "Built and tested the workflow"
-              : "Completed the run";
+        : needsUntestedProposalReview
+          ? "Draft needs review"
+          : needsTestedProposalReview
+            ? "Workflow ready for review"
+            : isQA
+              ? mode === "refuse"
+                ? "Declined"
+                : mode === "clarify"
+                  ? "Question"
+                  : "Answered"
+              : hasEdited
+                ? "Applied edits and re-tested"
+                : hasDrafts
+                  ? "Built and tested the workflow"
+                  : "Completed the run";
 
   const stats: string[] = [];
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
@@ -494,14 +502,23 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
     ? "qa"
     : isFail
       ? "fail"
-      : isQA
+      : needsUntestedProposalReview || needsTestedProposalReview || isQA
         ? "qa"
         : "ok";
   return {
     headline,
     stats,
     accent,
-    glyph: isStoppedWithDraft ? "!" : isFail ? "✕" : isQA ? "✦" : "✓",
+    glyph:
+      isStoppedWithDraft ||
+      needsUntestedProposalReview ||
+      needsTestedProposalReview
+        ? "!"
+        : isFail
+          ? "✕"
+          : isQA
+            ? "✦"
+            : "✓",
     isFail,
     isQA,
     isStoppedWithDraft,
