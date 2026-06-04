@@ -34,6 +34,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_browser_profile_id,
+    generate_credential_folder_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
@@ -1229,8 +1230,31 @@ class OrganizationBitwardenCollectionModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class CredentialFolderModel(Base):
+    __tablename__ = "credential_folders"
+    __table_args__ = (
+        Index("credential_folder_organization_id_idx", "organization_id"),
+        Index("credential_folder_organization_title_idx", "organization_id", "title"),
+    )
+
+    folder_id = Column(String, primary_key=True, default=generate_credential_folder_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class CredentialModel(Base):
     __tablename__ = "credentials"
+    __table_args__ = (Index("credential_folder_id_idx", "folder_id"),)
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
@@ -1249,6 +1273,7 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)

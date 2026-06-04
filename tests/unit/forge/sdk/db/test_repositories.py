@@ -1,4 +1,4 @@
-"""Tests for all 14 OSS repository instantiations + dependency injection."""
+"""Tests for all OSS repository instantiations + dependency injection."""
 
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +16,22 @@ def test_credential_repository_instantiation():
     assert hasattr(repo, "delete_credential")
     assert hasattr(repo, "create_organization_bitwarden_collection")
     assert hasattr(repo, "get_organization_bitwarden_collection")
+
+
+def test_credential_folders_repository_instantiation():
+    from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
+
+    mock_session = MagicMock()
+    repo = CredentialFoldersRepository(session_factory=mock_session, debug_enabled=False)
+    assert repo.Session is mock_session
+    assert hasattr(repo, "create_credential_folder")
+    assert hasattr(repo, "get_credential_folder")
+    assert hasattr(repo, "get_credential_folders")
+    assert hasattr(repo, "update_credential_folder")
+    assert hasattr(repo, "soft_delete_credential_folder")
+    assert hasattr(repo, "get_credential_folder_credential_count")
+    assert hasattr(repo, "get_credential_folder_credential_counts_batch")
+    assert hasattr(repo, "set_credential_folder")
 
 
 def test_otp_repository_instantiation():
@@ -192,6 +208,7 @@ def test_observer_repository_with_dependency():
 
 def test_agent_db_has_typed_repo_attributes():
     """After refactoring, AgentDB should expose typed repository attributes."""
+    from skyvern.forge.sdk.db.repositories.credential_folders import CredentialFoldersRepository
     from skyvern.forge.sdk.db.repositories.credentials import CredentialRepository
     from skyvern.forge.sdk.db.repositories.tasks import TasksRepository
 
@@ -201,6 +218,7 @@ def test_agent_db_has_typed_repo_attributes():
         db = AgentDB("postgresql+asyncpg://test", debug_enabled=True)
         assert isinstance(db.tasks, TasksRepository)
         assert isinstance(db.credentials, CredentialRepository)
+        assert isinstance(db.credential_folders, CredentialFoldersRepository)
         assert hasattr(db, "get_task")  # backward compat delegate
         # Migrated domains no longer have delegates on AgentDB:
         assert not hasattr(db, "create_workflow")

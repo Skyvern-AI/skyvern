@@ -1351,7 +1351,7 @@ async def handle_click_action(
                     LOG.info(
                         "The element has onclick attribute, waiting for 1 second to load new elements", action=action
                     )
-                    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+                    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="click.onclick")
 
                 if sequential_click_result := await handle_sequential_click_for_dropdown(
                     action=action,
@@ -1406,7 +1406,7 @@ async def handle_sequential_click_for_dropdown(
     if await incremental_scraped.get_incremental_elements_num() == 0:
         return None
 
-    await skyvern_frame.safe_wait_for_animation_end()
+    await skyvern_frame.safe_wait_for_animation_end(caller="click.dropdown")
     if page.url != scraped_page.url:
         LOG.info("Page URL changed after clicking, exiting the sequential click logic")
         return None
@@ -1825,7 +1825,7 @@ async def handle_input_text_action(
             LOG.info("The element has onclick attribute, waiting for 1 second to load new elements", action=action)
             wait_sec = 1
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=wait_sec, caller="input_text.autocomplete")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -1971,7 +1971,7 @@ async def handle_input_text_action(
             return [ActionFailure(InvalidElementForTextInput(element_id=action.element_id, tag_name=tag_name))]
 
     # wait for blocking element to show up
-    await skyvern_frame.safe_wait_for_animation_end()
+    await skyvern_frame.safe_wait_for_animation_end(caller="input_text.blocking_check")
     try:
         blocking_element, exist = await skyvern_element.find_blocking_element(
             dom=dom, incremental_page=incremental_scraped
@@ -2572,7 +2572,7 @@ async def handle_select_option_action(
 
         await skyvern_element.click(page=page, dom=dom, timeout=timeout)
         # wait for options to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.open")
 
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
@@ -2588,7 +2588,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
             # wait for options to load
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(
                 clean_and_remove_element_tree_factory(
                     task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -2682,7 +2682,7 @@ async def handle_select_option_action(
             await skyvern_element.scroll_into_view()
             await skyvern_element.press_key("ArrowDown")
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="select_option.fallback")
         is_open = True
 
         result = await select_from_dropdown_by_value(
@@ -3258,7 +3258,7 @@ async def _did_page_respond(
 ) -> bool:
     try:
         if skyvern_frame:
-            await skyvern_frame.safe_wait_for_animation_end()
+            await skyvern_frame.safe_wait_for_animation_end(caller="page_respond")
         return (await incremental_scraped.get_incremental_elements_num()) > 0
     except Exception:
         LOG.debug("Failed to check incremental elements after click", exc_info=True)
@@ -3617,7 +3617,7 @@ async def choose_auto_completion_dropdown(
     try:
         await skyvern_element.press_fill(text)
         # wait for new elemnts to load
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="autocomplete.fill")
         incremental_element = await incremental_scraped.get_incremental_element_tree(
             clean_and_remove_element_tree_factory(
                 task=task, step=step, check_filter_funcs=[check_existed_but_not_option_element_in_dom_factory(dom)]
@@ -4016,7 +4016,7 @@ async def discover_and_select_from_full_dropdown(
                 element_id=skyvern_element.get_id(),
             )
 
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.click")
 
         cleanup_func = clean_and_remove_element_tree_factory(
             task=task,
@@ -4039,7 +4039,7 @@ async def discover_and_select_from_full_dropdown(
                     element_id=skyvern_element.get_id(),
                 )
 
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.arrowdown")
             incremental_element = await incremental_scraped.get_incremental_element_tree(cleanup_func)
 
         # If incremental detection failed (e.g. options in a different shadow root),
@@ -4135,7 +4135,7 @@ async def discover_and_select_from_full_dropdown(
         # filter will show it as the only option. Then find and click it directly via Playwright.
         await skyvern_element.input_clear()
         await skyvern_element.press_fill(discovered_value)
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=1, caller="dropdown_discover.exact_match")
 
         # Select the first matching option via keyboard: ArrowDown highlights it, Enter confirms.
         # This avoids needing to locate the option element in shadow DOM.
@@ -4221,7 +4221,7 @@ async def sequentially_select_from_dropdown(
         select_history.append(single_select_result)
         values.append(single_select_result.value)
         # wait 1s until DOM finished updating
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="sequential_select.pick")
 
         if await single_select_result.is_done():
             return single_select_result
@@ -4238,7 +4238,7 @@ async def sequentially_select_from_dropdown(
             selected_time=i + 1,
         )
         # wait to load new options
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="sequential_select.next_level")
 
         check_filter_funcs.append(
             check_disappeared_element_id_in_incremental_factory(incremental_scraped=incremental_scraped)
@@ -4959,13 +4959,13 @@ async def scroll_down_to_load_all_options(
         else:
             await skyvern_frame.scroll_to_element_bottom(dropdown_menu_element_handle, page_by_page)
             # wait until animation ends, otherwise the scroll operation could be overwritten
-            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+            await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.scroll")
 
         # scroll a little back and scroll down to trigger the loading
         await page.mouse.wheel(0, -1e-5)
         await page.mouse.wheel(0, 1e-5)
         # wait for while to load new options
-        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+        await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.trigger")
 
         current_num = await incremental_scraped.get_incremental_elements_num()
         LOG.info(
@@ -4988,7 +4988,7 @@ async def scroll_down_to_load_all_options(
         await page.mouse.wheel(0, -scroll_pace)
     else:
         await skyvern_frame.scroll_to_element_top(dropdown_menu_element_handle)
-    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5)
+    await skyvern_frame.safe_wait_for_animation_end(before_wait_sec=0.5, caller="scroll_options.top")
 
 
 async def normal_select(
@@ -5335,7 +5335,9 @@ async def extract_information_for_navigation_goal(
         # extracted_text). When those fields are dropped, two requests that
         # differ only in the dropped values render identical final prompts and
         # must share a cache key. `extracted_text` also respects
-        # include_extracted_text (None when disabled).
+        # include_extracted_text (None when disabled). Only `element_tree` is
+        # hashed post-sanitization; the other fields hash pre-filter, which can
+        # cost an extra miss but never a wrong hit.
         cache_key = extraction_cache.compute_cache_key(
             call_path="handler",
             element_tree=scraped_page_refreshed.last_used_element_tree_html

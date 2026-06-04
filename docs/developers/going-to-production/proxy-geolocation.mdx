@@ -1,7 +1,7 @@
 ---
 title: Proxy & Geolocation
 subtitle: Route browser traffic through residential proxies worldwide
-description: Route Skyvern browser traffic through residential proxies in 20 countries to bypass geo-restrictions, avoid bot detection, and access region-locked content. Configure proxy_location for tasks, workflows, and browser sessions.
+description: Route Skyvern browser traffic through residential proxies in 20 countries to bypass geo-restrictions, avoid bot detection, and access region-locked content. Configure proxy_location for tasks, agents, and browser sessions.
 slug: developers/going-to-production/proxy-geolocation
 keywords:
   - proxy_location
@@ -427,7 +427,7 @@ Proxy routing is only available in Skyvern Cloud. Self-hosted deployments requir
 
 ## Set `proxy_location`
 
-Pass `proxy_location` when creating or running tasks, workflows or browser sessions to route browser traffic through a specific region.
+Pass `proxy_location` when creating or running tasks, agents or browser sessions to route browser traffic through a specific region.
 
 <ProxyMapSelector />
 
@@ -464,7 +464,7 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-For workflows, set a default `proxy_location` when creating the workflow, then you can also override it when starting the run:
+For agents, set a default `proxy_location` when creating the agent, then you can also override it when starting the run:
 
 <CodeGroup>
 ```python Python

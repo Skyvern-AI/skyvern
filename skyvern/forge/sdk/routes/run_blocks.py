@@ -122,9 +122,10 @@ async def _run_workflow_and_build_response(
 
 @base_router.post(
     "/run/tasks/login",
-    tags=["Agent"],
+    tags=["Agents"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-hidden": True,
         "x-excluded": True,
         "x-fern-sdk-method-name": "login",
         "x-fern-examples": [
@@ -289,9 +290,10 @@ async def login(
 
 @base_router.post(
     "/run/tasks/download_files",
-    tags=["Agent"],
+    tags=["Agents"],
     response_model=WorkflowRunResponse,
     openapi_extra={
+        "x-hidden": True,
         "x-excluded": True,
         "x-fern-sdk-method-name": "download_files",
         "x-fern-examples": [

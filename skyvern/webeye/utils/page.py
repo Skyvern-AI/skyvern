@@ -226,7 +226,7 @@ async def _scrolling_screenshots_helper(
 
         if mode == ScreenshotMode.DETAILED:
             # wait until animation ends, which is triggered by scrolling
-            await skyvern_page.safe_wait_for_animation_end()
+            await skyvern_page.safe_wait_for_animation_end(caller="scrolling_screenshot")
     else:
         if draw_boxes:
             await skyvern_page.build_elements_and_draw_bounding_boxes(frame=frame, frame_index=frame_index)
@@ -752,10 +752,18 @@ class SkyvernFrame:
         )
 
     @traced(name="skyvern.browser.wait_for_animation")
-    async def safe_wait_for_animation_end(self, before_wait_sec: float = 0, timeout_ms: float = 3000) -> None:
-        # Separates the fast finished-quickly path from the timeout/error paths
-        # that burn the full timeout budget — explains the 124x p95/p50 ratio.
+    async def safe_wait_for_animation_end(
+        self,
+        before_wait_sec: float = 0,
+        timeout_ms: float = 3000,
+        caller: str = "unknown",
+    ) -> None:
+        # Fast finished-quickly path vs timeout/error paths that burn the full
+        # timeout budget — the 124x p95/p50 ratio in production traces.
         _span = otel_trace.get_current_span()
+        _span.set_attribute("before_wait_sec", before_wait_sec)
+        _span.set_attribute("timeout_ms", timeout_ms)
+        _span.set_attribute("caller", caller)
         try:
             await asyncio.sleep(before_wait_sec)
             await self.frame.wait_for_load_state("load", timeout=timeout_ms)

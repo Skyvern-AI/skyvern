@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, List
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, computed_field, field_serializer, field_validator
 from typing_extensions import deprecated
 
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
@@ -67,6 +67,16 @@ class RunWorkflowResponse(BaseModel):
     workflow_id: str
     workflow_run_id: str
 
+    @computed_field(description="Alias of `workflow_id` (the agent's `wpid_` permanent ID).")  # type: ignore[prop-decorator]
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_id
+
+    @computed_field(description="Alias of `workflow_run_id`.")  # type: ignore[prop-decorator]
+    @property
+    def agent_run_id(self) -> str:
+        return self.workflow_run_id
+
 
 class WorkflowDefinition(BaseModel):
     version: int = 1
@@ -110,6 +120,14 @@ class Workflow(BaseModel):
     title: str
     workflow_permanent_id: str
     version: int
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description="Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`)."
+    )
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_permanent_id
+
     is_saved_task: bool
     is_template: bool = False
     description: str | None = None
@@ -308,6 +326,17 @@ class WorkflowRunOutputParameter(BaseModel):
 class WorkflowRunResponseBase(BaseModel):
     workflow_id: str
     workflow_run_id: str
+
+    @computed_field(description="Alias of `workflow_id` (the agent's `wpid_` permanent ID).")  # type: ignore[prop-decorator]
+    @property
+    def agent_id(self) -> str:
+        return self.workflow_id
+
+    @computed_field(description="Alias of `workflow_run_id`.")  # type: ignore[prop-decorator]
+    @property
+    def agent_run_id(self) -> str:
+        return self.workflow_run_id
+
     status: WorkflowRunStatus
     failure_reason: str | None = None
     failure_category: list[dict[str, Any]] | None = None

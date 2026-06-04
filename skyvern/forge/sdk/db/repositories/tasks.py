@@ -704,6 +704,34 @@ class TasksRepository(BaseRepository):
             await session.commit()
             return result.rowcount or 0
 
+    @db_operation("bulk_update_steps_by_workflow_run_ids")
+    async def bulk_update_steps_by_workflow_run_ids(
+        self,
+        workflow_run_ids: list[str],
+        new_status: StepStatus,
+        only_if_status_in: list[StepStatus],
+    ) -> int:
+        # No failure_reason parameter: StepModel has no failure_reason column.
+        if not workflow_run_ids or not only_if_status_in:
+            return 0
+
+        task_id_subquery = (
+            select(TaskModel.task_id).where(TaskModel.workflow_run_id.in_(workflow_run_ids)).scalar_subquery()
+        )
+        update_values: dict[str, Any] = {"status": new_status.value}
+        if new_status.is_terminal():
+            update_values["finished_at"] = func.coalesce(StepModel.finished_at, naive_utc_now())
+        async with self.Session() as session:
+            stmt = (
+                update(StepModel)
+                .where(StepModel.task_id.in_(task_id_subquery))
+                .where(StepModel.status.in_([s.value for s in only_if_status_in]))
+                .values(**update_values)
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
+
     @db_operation("get_tasks")
     async def get_tasks(
         self,

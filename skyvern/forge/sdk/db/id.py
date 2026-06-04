@@ -41,6 +41,7 @@ CREDENTIAL_ONEPASSWORD_PARAMETER_PREFIX = "opp"
 CREDENTIAL_AZURE_VAULT_PARAMETER_PREFIX = "azcp"
 CREDENTIAL_PARAMETER_PREFIX = "cp"
 CREDENTIAL_PREFIX = "cred"
+CREDENTIAL_FOLDER_PREFIX = "cfld"
 DEBUG_SESSION_PREFIX = "ds"
 FOLDER_PREFIX = "fld"
 BROWSER_PROFILE_PREFIX = "bp"
@@ -247,6 +248,11 @@ def generate_debug_session_id() -> str:
 def generate_folder_id() -> str:
     int_id = generate_id()
     return f"{FOLDER_PREFIX}_{int_id}"
+
+
+def generate_credential_folder_id() -> str:
+    int_id = generate_id()
+    return f"{CREDENTIAL_FOLDER_PREFIX}_{int_id}"
 
 
 def generate_tag_event_id() -> str:

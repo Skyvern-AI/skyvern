@@ -275,22 +275,18 @@ describe("ValidationBlockForm (SKY-9361)", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  test("shows parameter tip when isFirstBlockInWorkflow returns true (e.g. nested block)", () => {
+  test("shows input tip when isFirstBlockInWorkflow returns true (e.g. nested block)", () => {
     isFirstBlockMock.mockReturnValue(true);
     setValidationNode("v1");
     render(<ValidationBlockForm blockId="v1" />);
-    expect(
-      screen.getByText("Tip: Use the + button to add parameters!"),
-    ).toBeDefined();
+    expect(screen.getByText(/Use the \+ button to add inputs/i)).toBeDefined();
   });
 
-  test("hides parameter tip when isFirstBlockInWorkflow returns false", () => {
+  test("hides input tip when isFirstBlockInWorkflow returns false", () => {
     isFirstBlockMock.mockReturnValue(false);
     setValidationNode("v1");
     render(<ValidationBlockForm blockId="v1" />);
-    expect(
-      screen.queryByText("Tip: Use the + button to add parameters!"),
-    ).toBeNull();
+    expect(screen.queryByText(/Use the \+ button to add inputs/i)).toBeNull();
   });
 
   test("renders both top-level textareas with current values", () => {

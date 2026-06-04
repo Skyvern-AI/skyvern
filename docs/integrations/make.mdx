@@ -1,7 +1,7 @@
 ---
 title: Make.com
 subtitle: Integrate browser automations into Make scenarios
-description: Connect Skyvern to 2,000+ apps through Make.com. Run tasks or workflows, retrieve results, and integrate browser automations into any Make scenario.
+description: Connect Skyvern to 2,000+ apps through Make.com. Run tasks or agents, retrieve results, and integrate browser automations into any Make scenario.
 slug: integrations/make
 keywords:
   - Make.com
@@ -18,9 +18,9 @@ Connect Skyvern to 2,000+ apps through Make. Trigger browser automations from an
 
 - **Run a Task**: Run an automation using **Skyvern 1.0** (simple, single-step goals)
 - **Run a Task V2**: Legacy module for explicitly requested V2 task runs
-- **Run a Workflow**: Run a pre-built Skyvern workflow with parameters
+- **Run an Agent**: Run a pre-built Skyvern agent with parameters
 - **Get a Task / Get a Task V2**: Retrieve results from a previously run task
-- **Get a Workflow**: Retrieve results from a previously run workflow
+- **Get an Agent**: Retrieve results from a previously run agent
 - **List Organizations**: List all organizations in your account
 - **Make an API Call**: Execute a custom API request with your credentials
 
@@ -86,35 +86,35 @@ The navigation goal describes what to do *after* loading the URL. Don't include 
   <img src="/images/make/make3.png" alt="Configure task fields in Make.com" />
 </Frame>
 
-### Run a Workflow
+### Run an Agent
 
-First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
+First, create your agent in the [Skyvern UI](https://app.skyvern.com).
 
-- **Workflow** (required): Select the workflow to run
-- **Parameters**: Fill in any parameters defined in your workflow
+- **Agent** (required): Select the agent to run
+- **Parameters**: Fill in any parameters defined in your agent
 
 <Frame>
-  <img src="/images/make/make4.png" alt="Configure workflow fields in Make.com" />
+  <img src="/images/make/make4.png" alt="Configure agent fields in Make.com" />
 </Frame>
 
-### Get a Task / Workflow
+### Get a Task / Agent
 
 Retrieve the output of a completed run.
 
 - **Task ID** (required): Starts with `tsk_`
-- **Workflow Run ID** (required): Starts with `wr_`
+- **Agent Run ID** (required): Starts with `wr_`
 
 <Frame>
-  <img src="/images/make/make5.png" alt="Enter Task ID or Workflow Run ID in Make.com" />
+  <img src="/images/make/make5.png" alt="Enter Task ID or Agent Run ID in Make.com" />
 </Frame>
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card
-    title="Build Workflows"
+    title="Build Agents"
     icon="diagram-project"
-    href="/cloud/manage-workflows"
+    href="/cloud/building-agents/manage-agents"
   >
     Create reusable multi-step automations in Skyvern
   </Card>
