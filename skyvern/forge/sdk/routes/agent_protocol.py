@@ -180,8 +180,9 @@ class AISuggestionType(str, Enum):
 ################# /v1 Endpoints #################
 @base_router.post(
     "/run/tasks",
-    tags=["Agent"],
+    tags=["Agents"],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
             {
@@ -435,8 +436,8 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
 
 
 @base_router.post(
-    "/run/workflows",
-    tags=["Workflow Runs"],
+    "/run/agents",
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
@@ -448,13 +449,17 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
             }
         ],
     },
-    description="Run a workflow",
-    summary="Run a workflow",
+    description="Run an agent",
+    summary="Run an agent",
     responses={
-        200: {"description": "Successfully run workflow"},
-        400: {"description": "Invalid workflow run request"},
+        200: {"description": "Successfully ran agent"},
+        400: {"description": "Invalid agent run request"},
     },
 )
+@base_router.post("/run/agents/", include_in_schema=False)
+# Backwards-compatible aliases: an agent is a workflow. These keep responding but are hidden from the
+# public schema in favor of /run/agents.
+@base_router.post("/run/workflows", include_in_schema=False)
 @base_router.post("/run/workflows/", include_in_schema=False)
 async def run_workflow(
     request: Request,
@@ -532,10 +537,10 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agent", "Workflow Runs", "Workflows"],
+    tags=["Agents"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
-    summary="Get a run by id",
+    summary="Get run info by id",
     openapi_extra={
         "x-fern-sdk-method-name": "get_run",
         "x-fern-examples": [
@@ -574,7 +579,7 @@ async def get_run(
 
 @base_router.post(
     "/runs/{run_id}/cancel",
-    tags=["Agent", "Workflow Runs"],
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
@@ -602,7 +607,7 @@ async def cancel_run(
 
 @base_router.post(
     "/runs/cancel",
-    tags=["Agent", "Workflow Runs"],
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "bulk_cancel_runs",
         "x-fern-examples": [
@@ -686,9 +691,9 @@ async def create_workflow_legacy(
 
 
 @base_router.post(
-    "/workflows",
+    "/agents",
     response_model=Workflow,
-    tags=["Workflows"],
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "create_workflow",
         "x-fern-examples": [
@@ -701,18 +706,17 @@ async def create_workflow_legacy(
             }
         ],
     },
-    description="Create a new workflow",
-    summary="Create a new workflow",
+    description="Create a new agent",
+    summary="Create a new agent",
     responses={
-        200: {"description": "Successfully created workflow"},
-        422: {"description": "Invalid workflow definition"},
+        200: {"description": "Successfully created agent"},
+        422: {"description": "Invalid agent definition"},
     },
 )
-@base_router.post(
-    "/workflows/",
-    response_model=Workflow,
-    include_in_schema=False,
-)
+@base_router.post("/agents/", response_model=Workflow, include_in_schema=False)
+# Backwards-compatible aliases: an agent is a workflow. Hidden from schema in favor of /agents.
+@base_router.post("/workflows", response_model=Workflow, include_in_schema=False)
+@base_router.post("/workflows/", response_model=Workflow, include_in_schema=False)
 async def create_workflow(
     data: WorkflowRequest,
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
@@ -1094,9 +1098,9 @@ async def update_workflow_legacy(
 
 
 @base_router.post(
-    "/workflows/{workflow_id}",
+    "/agents/{workflow_id}",
     response_model=Workflow,
-    tags=["Workflows"],
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow",
         "x-fern-examples": [
@@ -1109,15 +1113,15 @@ async def update_workflow_legacy(
             }
         ],
     },
-    description="Update a workflow",
-    summary="Update a workflow",
+    description="Update an agent",
+    summary="Update an agent",
     responses={
-        200: {"description": "Successfully updated workflow"},
-        422: {"description": "Invalid workflow definition"},
+        200: {"description": "Successfully updated agent"},
+        422: {"description": "Invalid agent definition"},
     },
 )
 @base_router.post(
-    "/workflows/{workflow_id}/",
+    "/agents/{workflow_id}/",
     openapi_extra={
         "requestBody": {
             "content": {"application/x-yaml": {"schema": WorkflowCreateYAMLRequest.model_json_schema()}},
@@ -1127,10 +1131,13 @@ async def update_workflow_legacy(
     response_model=Workflow,
     include_in_schema=False,
 )
+# Backwards-compatible aliases: an agent is a workflow. Hidden from schema in favor of /agents/{...}.
+@base_router.post("/workflows/{workflow_id}", response_model=Workflow, include_in_schema=False)
+@base_router.post("/workflows/{workflow_id}/", response_model=Workflow, include_in_schema=False)
 async def update_workflow(
     data: WorkflowRequest,
     workflow_id: str = Path(
-        ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+        ..., description="The ID of the agent to update. Starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> Workflow:
@@ -1179,8 +1186,8 @@ async def update_workflow(
 )
 @legacy_base_router.delete("/workflows/{workflow_id}/", include_in_schema=False)
 @base_router.post(
-    "/workflows/{workflow_id}/delete",
-    tags=["Workflows"],
+    "/agents/{workflow_id}/delete",
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_workflow",
         "x-fern-examples": [
@@ -1192,14 +1199,17 @@ async def update_workflow(
             }
         ],
     },
-    description="Delete a workflow",
-    summary="Delete a workflow",
-    responses={200: {"description": "Successfully deleted workflow"}},
+    description="Delete an agent",
+    summary="Delete an agent",
+    responses={200: {"description": "Successfully deleted agent"}},
 )
+@base_router.post("/agents/{workflow_id}/delete/", include_in_schema=False)
+# Backwards-compatible aliases: an agent is a workflow. Hidden from schema in favor of /agents/{...}/delete.
+@base_router.post("/workflows/{workflow_id}/delete", include_in_schema=False)
 @base_router.post("/workflows/{workflow_id}/delete/", include_in_schema=False)
 async def delete_workflow(
     workflow_id: str = Path(
-        ..., description="The ID of the workflow to delete. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+        ..., description="The ID of the agent to delete. Starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> None:
@@ -1213,7 +1223,7 @@ async def delete_workflow(
 @base_router.post(
     "/folders",
     response_model=Folder,
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "create_folder",
     },
@@ -1255,7 +1265,7 @@ async def create_folder(
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folder",
     },
@@ -1299,7 +1309,7 @@ async def get_folder(
 @base_router.get(
     "/folders",
     response_model=list[Folder],
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folders",
     },
@@ -1356,7 +1366,7 @@ async def get_folders(
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_folder",
     },
@@ -1402,7 +1412,7 @@ async def update_folder(
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_folder",
     },
@@ -1438,12 +1448,12 @@ async def delete_folder(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
-    tags=["Workflow Folders"],
+    tags=["Agent Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow_folder",
     },
     description="Update a workflow's folder assignment for the latest version",
-    summary="Update workflow folder",
+    summary="Update agent folder",
     responses={
         200: {"description": "Successfully updated workflow folder"},
         404: {"description": "Workflow not found"},
@@ -1548,11 +1558,11 @@ async def _apply_tag_changes_with_retry(
 @base_router.post(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
-    summary="Apply workflow tags",
+    summary="Apply agent tags",
     responses={
         200: {"description": "Successfully applied tag changes"},
         404: {"description": "Workflow not found"},
@@ -1598,10 +1608,10 @@ async def apply_workflow_tags(
 @base_router.delete(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
-    summary="Delete workflow tag",
+    summary="Delete agent tag",
     responses={
         200: {"description": "Successfully deleted tag (or no-op if absent)"},
         404: {"description": "Workflow not found"},
@@ -1647,10 +1657,10 @@ async def delete_workflow_tag(
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
-    summary="Get workflow tags",
+    summary="Get agent tags",
     responses={
         200: {"description": "Successfully retrieved tags"},
         404: {"description": "Workflow not found"},
@@ -1694,10 +1704,10 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
-    summary="Get workflow tag history",
+    summary="Get agent tag history",
     responses={
         200: {"description": "Successfully retrieved tag history"},
         404: {"description": "Workflow not found"},
@@ -1735,7 +1745,7 @@ async def get_workflow_tag_history(
 @base_router.get(
     "/tag-keys",
     response_model=list[TagKey],
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
@@ -1754,7 +1764,7 @@ async def list_tag_keys(
 @base_router.patch(
     "/tag-keys/{key}",
     response_model=TagKey,
-    tags=["Workflow Tags"],
+    tags=["Agent Tags"],
     openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
@@ -1839,10 +1849,10 @@ async def _resolve_active_batch_wpids(requested_wpids: list[str], organization_i
 @base_router.get(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Workflow Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "batch_get_workflow_tags"},
+    tags=["Agent Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags"},
     description="Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
-    summary="Batch get workflow tags",
+    summary="Batch get agent tags",
     responses={
         200: {"description": "Successfully retrieved tags"},
         400: {"description": "Too many workflow IDs requested"},
@@ -1874,10 +1884,10 @@ async def batch_get_workflow_tags(
 @base_router.post(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Workflow Tags"],
-    openapi_extra={"x-fern-sdk-method-name": "batch_get_workflow_tags_post"},
+    tags=["Agent Tags"],
+    openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags_post"},
     description="Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
-    summary="Batch get workflow tags (POST)",
+    summary="Batch get agent tags (POST)",
     responses={
         200: {"description": "Successfully retrieved tags"},
         400: {"description": "Too many workflow IDs requested"},
@@ -2301,7 +2311,7 @@ async def get_run_artifacts(
 
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
-    tags=["Agent", "Workflow Runs"],
+    tags=["Agents"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
@@ -2314,7 +2324,7 @@ async def get_run_artifacts(
         ],
     },
     description="Retry sending the webhook for a run",
-    summary="Retry run webhook",
+    summary="Replay a run webhook",
     response_model=RunWebhookReplayResponse,
 )
 @base_router.post("/runs/{run_id}/retry_webhook/", include_in_schema=False)
@@ -2335,7 +2345,7 @@ async def retry_run_webhook(
 
 @base_router.get(
     "/runs/{run_id}/timeline",
-    tags=["Agent", "Workflow Runs", "Workflows"],
+    tags=["Agents"],
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
@@ -2771,13 +2781,13 @@ def _workflow_run_request_from_workflow_request(
 
 @base_router.post(
     "/workflows/runs/{workflow_run_id}/retry",
-    tags=["Workflow Runs", "Workflows"],
+    tags=["Agents"],
     response_model=WorkflowRunResponse,
     openapi_extra={
         "x-fern-sdk-method-name": "retry_workflow_run",
     },
     description="Retry a workflow run using the original run parameters.",
-    summary="Retry workflow run",
+    summary="Retry a run",
     responses={
         200: {"description": "Successfully retried workflow run"},
         400: {"description": "Workflow run is not retryable"},
@@ -3108,6 +3118,7 @@ async def get_runs(
     tags=["agent"],
     response_model=list[TaskRunListItem],
     openapi_extra={
+        "x-hidden": True,
         "x-fern-sdk-method-name": "get_runs_v2",
     },
 )
@@ -3344,7 +3355,7 @@ async def run_workflow_legacy(
 @base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
-    tags=["Workflow Runs"],
+    tags=["Agents"],
     description=(
         "List workflow runs across all workflows for the current organization.\n\n"
         "Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. "
@@ -3371,7 +3382,7 @@ async def run_workflow_legacy(
         "- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n"
         "- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match"
     ),
-    summary="List workflow runs",
+    summary="Get all runs",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs",
     },
@@ -3494,9 +3505,9 @@ async def _get_workflow_runs_by_id(
 @base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
-    tags=["Workflow Runs", "Workflows"],
+    tags=["Agents"],
     description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
-    summary="List runs for a workflow",
+    summary="Get all runs by agent",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
@@ -3557,7 +3568,7 @@ async def get_workflow_runs_by_id(
     response_model=list[WorkflowRun],
     tags=["agent"],
     description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
-    summary="List runs for a workflow",
+    summary="Get all runs by agent",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_runs_by_id",
     },
@@ -3753,7 +3764,8 @@ async def get_workflow_run(
 @base_router.get(
     "/workflows",
     response_model=list[Workflow],
-    tags=["Workflows"],
+    tags=["Agents"],
+    summary="Get all agents",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflows",
         "x-fern-examples": [
@@ -3886,7 +3898,7 @@ async def get_workflows(
 
 @base_router.put(
     "/workflows/{workflow_permanent_id}/template",
-    tags=["Workflows"],
+    tags=["Agents"],
     include_in_schema=False,
 )
 async def set_workflow_template_status(
@@ -3943,7 +3955,8 @@ async def get_workflow_templates() -> list[Workflow]:
 @base_router.get(
     "/workflows/{workflow_permanent_id}",
     response_model=Workflow,
-    tags=["Workflows"],
+    tags=["Agents"],
+    summary="Get an agent by id",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow",
     },
@@ -3978,7 +3991,8 @@ async def get_workflow(
 @base_router.get(
     "/workflows/{workflow_permanent_id}/versions",
     response_model=list[Workflow],
-    tags=["Workflows"],
+    tags=["Agents"],
+    summary="Get agent versions",
     openapi_extra={
         "x-fern-sdk-method-name": "get_workflow_versions",
     },
@@ -4006,8 +4020,9 @@ async def get_workflow_versions(
 @base_router.post(
     "/workflows/{workflow_permanent_id}/browser_session/reset_profile",
     status_code=http_status.HTTP_204_NO_CONTENT,
-    tags=["Workflows"],
+    tags=["Agents"],
     summary="Reset persisted browser profile",
+    openapi_extra={"x-hidden": True},
     description=(
         "Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. "
         "The next run will start from a fresh browser state. Use when a saved profile is corrupted."
