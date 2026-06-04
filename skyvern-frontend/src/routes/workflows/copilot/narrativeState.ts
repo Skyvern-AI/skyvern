@@ -5,6 +5,7 @@
 
 import {
   CopilotResponseType,
+  ProposalDisposition,
   WorkflowCopilotBlockProgressUpdate,
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
@@ -91,6 +92,8 @@ export interface TurnNarrativeState {
   terminal: "response" | "error" | null;
   terminalMessage: string | null;
   narrativeSummary: string | null;
+  cancelled: boolean;
+  proposalDisposition: ProposalDisposition | null;
   // Block count of the canonical workflow at turn entry. Drives the edit-
   // vs-build chip derivation; the snap-back source is captured client-side
   // at submit so unsaved local canvas edits survive.
@@ -116,6 +119,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   terminal: null,
   terminalMessage: null,
   narrativeSummary: null,
+  cancelled: false,
+  proposalDisposition: null,
   priorBlockCount: null,
   startedAt: null,
   endedAt: null,
@@ -411,6 +416,9 @@ export function applyNarrativeEvent(
         return {
           ...hydrated,
           responseType: event.response_type ?? hydrated.responseType,
+          cancelled: event.cancelled ?? hydrated.cancelled,
+          proposalDisposition:
+            event.proposal_disposition ?? hydrated.proposalDisposition,
           terminalMessage: hydrated.terminalMessage ?? event.message,
           narrativeSummary:
             hydrated.narrativeSummary ??
@@ -435,6 +443,8 @@ export function applyNarrativeEvent(
       return {
         ...prev,
         responseType: event.response_type ?? prev.responseType,
+        cancelled: event.cancelled ?? false,
+        proposalDisposition: event.proposal_disposition,
         designEnded: true,
         terminal: "response",
         terminalMessage: event.message,
@@ -520,6 +530,14 @@ export function hydrateNarrativeFromPayload(
     rawResponseType === "ASK_QUESTION" ||
     rawResponseType === "REPLACE_WORKFLOW"
       ? rawResponseType
+      : null;
+  const rawProposalDisposition = payload.proposalDisposition;
+  const proposalDisposition: ProposalDisposition | null =
+    rawProposalDisposition === "no_proposal" ||
+    rawProposalDisposition === "auto_applicable" ||
+    rawProposalDisposition === "review_untested" ||
+    rawProposalDisposition === "review_tested"
+      ? rawProposalDisposition
       : null;
   const draftRaw = payload.draft;
   const draft =
@@ -607,6 +625,8 @@ export function hydrateNarrativeFromPayload(
     turnIndex,
     mode: mode as TurnNarrativeState["mode"],
     responseType,
+    cancelled: payload.cancelled === true,
+    proposalDisposition,
     designStarted: true,
     designEnded: true,
     draft,

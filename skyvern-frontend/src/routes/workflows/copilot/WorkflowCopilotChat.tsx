@@ -47,6 +47,7 @@ import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
 import {
   EMPTY_NARRATIVE,
+  NarrativeEvent,
   TurnNarrativeState,
   applyNarrativeEvent,
   hydrateNarrativeFromPayload,
@@ -306,6 +307,15 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     narrativeRef.current = narrative;
   }, [narrative]);
+  const applyStoredNarrativeEvent = useCallback(
+    (event: NarrativeEvent, base?: TurnNarrativeState) => {
+      const next = applyNarrativeEvent(base ?? narrativeRef.current, event);
+      narrativeRef.current = next;
+      setNarrative(next);
+      return next;
+    },
+    [],
+  );
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
@@ -1001,6 +1011,7 @@ export function WorkflowCopilotChat({
 
         const handleResponse = (
           response: WorkflowCopilotStreamResponseUpdate,
+          responseNarrative?: TurnNarrativeState,
         ) => {
           // Stream completed; a Cancel click after this point should no-op.
           pendingCancelToken.current = null;
@@ -1011,19 +1022,20 @@ export function WorkflowCopilotChat({
           // Read via narrativeRef because this callback was closed over at
           // handleSend time (pre-turn_start), so the React state binding is
           // stale here.
-          const liveNarrative = narrativeRef.current;
+          const liveNarrative = responseNarrative ?? narrativeRef.current;
           const hasNarrativePayload =
             response.narrative_payload !== null &&
             typeof response.narrative_payload === "object";
           const frozenNarrative: TurnNarrativeState | undefined =
-            liveNarrative.turnId !== null || hasNarrativePayload
+            responseNarrative ??
+            (liveNarrative.turnId !== null || hasNarrativePayload
               ? applyNarrativeEvent(
                   liveNarrative.turnId !== null
                     ? liveNarrative
                     : EMPTY_NARRATIVE,
                   response,
                 )
-              : undefined;
+              : undefined);
 
           const aiMessage: ChatMessage = {
             id: Date.now().toString(),
@@ -1050,6 +1062,8 @@ export function WorkflowCopilotChat({
             )
           ) {
             applyWorkflowUpdate(response.updated_workflow);
+          } else if (response.updated_workflow) {
+            setProposedWorkflow(response.updated_workflow);
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
             // snap canvas back to the pre-submit client snapshot.
@@ -1067,13 +1081,17 @@ export function WorkflowCopilotChat({
           }
         };
 
-        const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        const handleError = (
+          payload: WorkflowCopilotStreamErrorUpdate,
+          errorNarrative?: TurnNarrativeState,
+        ) => {
           pendingCancelToken.current = null;
-          const liveNarrative = narrativeRef.current;
+          const liveNarrative = errorNarrative ?? narrativeRef.current;
           const frozenNarrative: TurnNarrativeState | undefined =
-            liveNarrative.turnId !== null
+            errorNarrative ??
+            (liveNarrative.turnId !== null
               ? applyNarrativeEvent(liveNarrative, payload)
-              : undefined;
+              : undefined);
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
@@ -1117,7 +1135,7 @@ export function WorkflowCopilotChat({
               case "tool_result":
               case "narration":
               case "block_progress":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
               case "turn_start": {
                 // Move the pre-submit canvas snapshot into the per-turn
@@ -1135,14 +1153,12 @@ export function WorkflowCopilotChat({
                   map.delete(oldest);
                 }
                 latestTurnId.current = payload.turn_id;
-                setNarrative(() =>
-                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
-                );
+                applyStoredNarrativeEvent(payload, EMPTY_NARRATIVE);
                 return false;
               }
               case "design_start":
               case "design_end":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {
                 // Render the staged workflow on the canvas mid-turn. Only
@@ -1159,17 +1175,19 @@ export function WorkflowCopilotChat({
                     }
                   }
                 }
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
               }
-              case "response":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleResponse(payload);
+              case "response": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleResponse(payload, frozenNarrative);
                 return true;
-              case "error":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleError(payload);
+              }
+              case "error": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleError(payload, frozenNarrative);
                 return true;
+              }
               default:
                 return false;
             }
@@ -1208,6 +1226,7 @@ export function WorkflowCopilotChat({
       }
     },
     [
+      applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
       credentialGetter,

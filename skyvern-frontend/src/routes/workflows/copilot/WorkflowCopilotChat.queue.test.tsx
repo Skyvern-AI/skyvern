@@ -18,21 +18,41 @@ type StreamCall = {
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const { streamCalls, postStreaming, cancelPost } = vi.hoisted(() => {
-  const calls: StreamCall[] = [];
-  const post = vi.fn().mockResolvedValue({});
-  const streaming = vi.fn(
-    (
-      _path: string,
-      body: { message: string },
-      onMessage: (payload: unknown) => boolean,
-    ) =>
-      new Promise<void>((resolve, reject) => {
-        calls.push({ body, onMessage, resolve, reject });
-      }),
-  );
-  return { streamCalls: calls, postStreaming: streaming, cancelPost: post };
-});
+const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
+  () => {
+    const calls: StreamCall[] = [];
+    const post = vi.fn().mockResolvedValue({});
+    const streaming = vi.fn(
+      (
+        _path: string,
+        body: { message: string },
+        onMessage: (payload: unknown) => boolean,
+      ) =>
+        new Promise<void>((resolve, reject) => {
+          calls.push({ body, onMessage, resolve, reject });
+        }),
+    );
+    const history = {
+      data: {
+        workflow_copilot_chat_id: null as string | null,
+        chat_history: [] as {
+          sender: "user" | "ai";
+          content: string;
+          created_at: string;
+          narrative_payload?: Record<string, unknown> | null;
+        }[],
+        proposed_workflow: null as Record<string, unknown> | null,
+        auto_accept: false,
+      },
+    };
+    return {
+      streamCalls: calls,
+      postStreaming: streaming,
+      cancelPost: post,
+      historyResponse: history,
+    };
+  },
+);
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -40,14 +60,7 @@ vi.mock("@/api/sse", () => ({
 
 vi.mock("@/api/AxiosClient", () => ({
   getClient: vi.fn().mockResolvedValue({
-    get: vi.fn().mockResolvedValue({
-      data: {
-        workflow_copilot_chat_id: null,
-        chat_history: [],
-        proposed_workflow: null,
-        auto_accept: false,
-      },
-    }),
+    get: vi.fn().mockImplementation(() => Promise.resolve(historyResponse)),
     post: cancelPost,
   }),
 }));
@@ -124,6 +137,15 @@ const turnStart = () => ({
   timestamp: "2026-05-25T00:00:00Z",
 });
 
+const workflowDraft = () => ({
+  type: "workflow_draft" as const,
+  block_count: 2,
+  block_labels: ["open_page", "add_to_cart"],
+  summary: "two block workflow",
+  timestamp: "2026-05-25T00:00:03Z",
+  workflow: { workflow_id: "wf_draft" },
+});
+
 async function renderChat() {
   const view = render(<WorkflowCopilotChat />);
   // Let the mount-time chat-history fetch settle.
@@ -161,6 +183,12 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  historyResponse.data = {
+    workflow_copilot_chat_id: null,
+    chat_history: [],
+    proposed_workflow: null,
+    auto_accept: false,
+  };
 });
 
 afterEach(() => {
@@ -283,6 +311,160 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(screen.getByText("Run halted")).toBeTruthy();
     expect(screen.queryByText("Completed the run")).toBeNull();
+  });
+
+  it("keeps proposal actions after user-cancelled turns with staged drafts", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+
+    await act(async () => {
+      call.onMessage(turnStart());
+      call.onMessage(workflowDraft());
+      call.onMessage({
+        ...terminalResponse(
+          "Cancelled. I have a draft workflow you can keep -- accept it to save, or discard.",
+        ),
+        updated_workflow: { workflow_id: "wf_draft" },
+        proposal_disposition: "review_untested",
+        cancelled: true,
+      });
+      call.resolve();
+    });
+
+    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByText("Run halted")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("shows budget-halted draft turns as reviewable draft state", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+
+    await act(async () => {
+      call.onMessage(turnStart());
+      call.onMessage(workflowDraft());
+      call.onMessage({
+        type: "block_progress",
+        workflow_run_block_id: "wrb_add_to_cart",
+        block_label: "add_to_cart",
+        block_type: "task",
+        status: "canceled",
+        iteration: 1,
+        timestamp: "2026-05-25T00:00:04Z",
+      });
+      call.onMessage({
+        ...terminalResponse(
+          "The draft made progress but the test exceeded its tool budget. Review the draft before accepting it.",
+        ),
+        updated_workflow: { workflow_id: "wf_draft" },
+        proposal_disposition: "review_untested",
+      });
+      call.resolve();
+    });
+
+    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByText("Run halted")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+  });
+
+  it("does not show proposal actions after cancelled turns without a draft", async () => {
+    await renderChat();
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    const call = streamCalls[0];
+    if (!call) throw new Error("no pending stream to complete");
+
+    await act(async () => {
+      call.onMessage(turnStart());
+      call.onMessage({
+        ...terminalResponse("Cancelled by user."),
+        proposal_disposition: "no_proposal",
+        cancelled: true,
+      });
+      call.resolve();
+    });
+
+    expect(screen.queryByRole("button", { name: "Review" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  it("hydrates cancelled pending draft controls from chat history", async () => {
+    historyResponse.data = {
+      workflow_copilot_chat_id: "chat-1",
+      chat_history: [
+        {
+          sender: "user",
+          content: "build me a workflow",
+          created_at: "2026-05-25T00:00:00Z",
+        },
+        {
+          sender: "ai",
+          content:
+            "Cancelled. I have a draft workflow you can keep -- accept it to save, or discard.",
+          created_at: "2026-05-25T00:00:05Z",
+          narrative_payload: {
+            turnId: "turn-1",
+            turnIndex: 0,
+            mode: "build",
+            responseType: "REPLY",
+            cancelled: true,
+            proposalDisposition: "review_untested",
+            designStarted: true,
+            designEnded: true,
+            draft: {
+              blockCount: 2,
+              blockLabels: ["open_page", "add_to_cart"],
+              summary: null,
+            },
+            blocks: [
+              {
+                workflowRunBlockId: "",
+                label: "open_page",
+                blockType: "goto_url",
+                state: "drafted",
+                lastSeenIteration: 0,
+                activity: [],
+                startedAt: null,
+                endedAt: null,
+              },
+            ],
+            terminal: "response",
+            terminalMessage:
+              "Cancelled. I have a draft workflow you can keep -- accept it to save, or discard.",
+            narrativeSummary:
+              "Cancelled. I have a draft workflow you can keep -- accept it to save, or discard.",
+            priorBlockCount: null,
+            designActivity: [],
+            startedAt: "2026-05-25T00:00:00Z",
+            endedAt: "2026-05-25T00:00:05Z",
+          },
+        },
+      ],
+      proposed_workflow: { workflow_id: "wf_draft" },
+      auto_accept: false,
+    };
+
+    await renderChat();
+
+    expect(screen.getByText("Stopped with a draft")).toBeTruthy();
+    expect(screen.queryByText("Run halted")).toBeNull();
+    expect(screen.getByRole("button", { name: "Review" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Accept" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
   });
 
   it("renders an ASK_QUESTION response payload as a question", async () => {
