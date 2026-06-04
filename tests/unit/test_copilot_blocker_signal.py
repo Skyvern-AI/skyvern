@@ -253,6 +253,20 @@ def test_stash_blocker_signal_first_wins_returns_llm_payload() -> None:
     assert ctx.tool_blocker_signals == [first, second]
 
 
+def test_stash_blocker_signal_active_terminal_replaces_per_tool_budget() -> None:
+    ctx = _Ctx()
+    budget = _make(internal_reason_code="tool_error_per_tool_budget_rerun")
+    active_terminal = _make(internal_reason_code="tool_error_active_run_terminal_evidence")
+
+    stash_blocker_signal(ctx, budget)
+    payload = stash_blocker_signal(ctx, active_terminal)
+
+    assert payload == active_terminal.agent_steering_text
+    assert ctx.blocker_signal is active_terminal
+    assert ctx.latest_tool_blocker_signal is active_terminal
+    assert ctx.tool_blocker_signals == [budget, active_terminal]
+
+
 def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> None:
     """The field is declared on both AgentContext (parent) and CopilotContext
     (child) per the field-shadowing convention. Default values must stay in
