@@ -1,10 +1,10 @@
 ---
-title: Build a Workflow
-subtitle: Create multi-step automations with the visual workflow editor
-description: Create multi-step browser automations in the Skyvern Cloud UI using the visual workflow editor with blocks for navigation, extraction, loops, conditionals, and email.
+title: Build an Agent
+subtitle: Create multi-step automations with the visual agent editor
+description: Create multi-step browser automations in the Skyvern Cloud UI using the visual agent editor with blocks for navigation, extraction, loops, conditionals, and email.
 slug: cloud/build-a-workflow
 keywords:
-  - workflow editor
+  - agent editor
   - drag and drop
   - navigation block
   - extract block
@@ -14,19 +14,19 @@ keywords:
   - visual builder
 ---
 
-Workflows are multi-step automations built visually in the Cloud UI. You drag blocks onto a canvas, wire them together, configure each one, and run the whole sequence with a click. No code required. Workflows can be versioned, shared across your team, scheduled on a cron, and run with different parameters each time.
+Agents are multi-step automations built visually in the Cloud UI. You drag blocks onto a canvas, wire them together, configure each one, and run the whole sequence with a click. No code required. Agents can be versioned, shared across your team, scheduled on a cron, and run with different parameters each time.
 
-If you prefer writing automation code in Python or TypeScript, see [Browser Automation](/developers/browser-automations/overview) in the developer docs. Both approaches handle multi-step work across pages. Workflows are the visual path, browser automations are the code path.
+If you prefer writing automation code in Python or TypeScript, see [Browser Automation](/developers/browser-automations/overview) in the developer docs. Both approaches handle multi-step work across pages. Agents are the visual path, browser automations are the code path.
 
 <Info>
-**Workflows vs. Browser Automation:** Workflows are defined in this visual editor and run from the Cloud UI (or [triggered from code](/cloud/building-workflows/run-from-code)). Browser automations are written in Python/TypeScript using Page, Agent, and Browser. Choose based on whether your team prefers a visual editor or a code editor.
+**Agents vs. Browser Automation:** Agents are defined in this visual editor and run from the Cloud UI (or [triggered from code](/cloud/building-agents/run-from-code)). Browser automations are written in Python/TypeScript using Page, Agent, and Browser. Choose based on whether your team prefers a visual editor or a code editor.
 </Info>
 
-This page explains how workflows work, walks you through building one from scratch, and covers the editor's features.
+This page explains how agents work, walks you through building one from scratch, and covers the editor's features.
 
-## How workflows work
+## How agents work
 
-A workflow is a sequence of **blocks** that run one after another. Each block does one thing: navigate to a page, extract data, send an email, run custom code, loop, or branch. You connect blocks on a visual canvas, pass data between them, and run the whole chain with one click.
+An agent is a sequence of **blocks** that run one after another. Each block does one thing: navigate to a page, extract data, send an email, run custom code, loop, or branch. You connect blocks on a visual canvas, pass data between them, and run the whole chain with one click.
 
 ```
 [Browser Task] → [Extraction] → [Loop] → [Send Email]
@@ -51,7 +51,7 @@ For example, an Extraction block labeled `scrape_listings` produces output that 
 | **Files** | Download and upload files | File Download, Cloud Storage Upload |
 | **Communication** | Send data to external services or humans | Send Email, HTTP Request, Human Interaction |
 
-See [Block Reference](/cloud/building-workflows/configure-blocks) for every block type and its configuration fields.
+See [Block Reference](/cloud/building-agents/configure-blocks) for every block type and its configuration fields.
 
 <Tip>
 If your block needs a browser, pick a browser automation block. If it just needs to process data, use Text Prompt or Code. If you need to repeat or branch, use control flow.
@@ -61,18 +61,18 @@ If your block needs a browser, pick a browser automation block. If it just needs
 
 ## Tutorial: Build a job listing tracker
 
-Let's build a real workflow. You'll create an automation that finds the top 5 job listings from Hacker News's monthly "Who is Hiring" thread, summarizes each one, and emails you a digest.
+Let's build a real agent. You'll create an automation that finds the top 5 job listings from Hacker News's monthly "Who is Hiring" thread, summarizes each one, and emails you a digest.
 
 This uses 5 blocks across 3 categories: browser automation, data and extraction, and communication.
 
 <Steps>
-  <Step title="Create a new workflow">
+  <Step title="Create a new agent">
 
-    Go to **Workflows** in the left sidebar and click **Create → Blank Workflow**.
+    Go to **Agents** in the left sidebar and click **Create → Blank Agent**.
 
-    <img src="/images/cloud/create-workflow-dropdown.png" alt="Create workflow dropdown showing Blank Workflow and From Template options" />
+    <img src="/images/cloud/create-workflow-dropdown.png" alt="Create agent dropdown showing Blank Agent and From Template options" />
 
-    The editor opens with an empty canvas showing a single start node. Click the workflow title at the top left and rename it to **HN Job Tracker**.
+    The editor opens with an empty canvas showing a single start node. Click the agent title at the top left and rename it to **HN Job Tracker**.
 
   </Step>
 
@@ -206,10 +206,10 @@ This uses 5 blocks across 3 categories: browser automation, data and extraction,
   <Step title="Save and run">
 
     <Warning>
-    Workflows are **not** auto-saved. Click the **Save** button (disk icon) in the header bar before navigating away or you'll lose your work.
+    Agents are **not** auto-saved. Click the **Save** button (disk icon) in the header bar before navigating away or you'll lose your work.
     </Warning>
 
-    Click **Save**, then click **Run** in the top right. A parameters page opens where you can review and confirm the workflow's settings. Click **Run Workflow** to start execution.
+    Click **Save**, then click **Run** in the top right. A parameters page opens where you can review and confirm the agent's settings. Click **Run Agent** to start execution.
 
     The [live execution view](/cloud/getting-started/monitor-a-run) opens. Watch as Skyvern navigates Hacker News, extracts listings, summarizes each one, and sends your email.
 
@@ -226,7 +226,7 @@ flowchart LR
     D --> E["send_digest<br/>Send Email"]
 ```
 
-Five blocks, three categories, zero code. You can now re-run this workflow anytime, tweak the extraction schema to pull different fields, swap the email for an HTTP Request to post to Slack, or add a Conditional block to only email when listings match certain criteria.
+Five blocks, three categories, zero code. You can now re-run this agent anytime, tweak the extraction schema to pull different fields, swap the email for an HTTP Request to post to Slack, or add a Conditional block to only email when listings match certain criteria.
 
 ---
 
@@ -234,11 +234,11 @@ Five blocks, three categories, zero code. You can now re-run this workflow anyti
 
 ### Layout
 
-<img src="/images/cloud/workflow-editor-overview.png" alt="Workflow editor overview" />
+<img src="/images/cloud/workflow-editor-overview.png" alt="Agent editor overview" />
 
 | Area | What it shows |
 |------|---------------|
-| **Header bar** (top) | Workflow title (click to rename), Parameters button, Save button, Template toggle, History button, Run button |
+| **Header bar** (top) | Agent title (click to rename), Parameters button, Save button, Template toggle, History button, Run button |
 | **Canvas** (center) | Visual graph of blocks connected in sequence. Zoom with the scroll wheel, pan by dragging the background. |
 | **Configuration panel** (right) | Opens when you click a block. Shows that block's settings form. |
 
@@ -246,9 +246,9 @@ Five blocks, three categories, zero code. You can now re-run this workflow anyti
 
 Hover over the **+** button on any edge (the connecting line between blocks) to reveal the menu. Select **Add Block** to open the block library, a searchable list of all available block types. Click a block to insert it at that position.
 
-The menu also offers **Record Browser** (record actions in a live browser to generate blocks) and **Upload SOP** (upload a PDF procedure to auto-generate a workflow).
+The menu also offers **Record Browser** (record actions in a live browser to generate blocks) and **Upload SOP** (upload a PDF procedure to auto-generate an agent).
 
-When you create a blank workflow, hover over the **+** on the start edge to add your first block.
+When you create a blank agent, hover over the **+** on the start edge to add your first block.
 
 <img src="/images/cloud/add-block-panel.png" alt="Add block panel" />
 
@@ -256,7 +256,7 @@ When you create a blank workflow, hover over the **+** on the start edge to add 
 
 Click any block on the canvas to open its configuration panel on the right. Each block has a **Label** field (which determines its output variable name) and block-specific settings. Browser-based blocks share additional fields like URL, Engine, and Max Retries.
 
-See [Block Reference](/cloud/building-workflows/configure-blocks) for the full list of fields on each block type.
+See [Block Reference](/cloud/building-agents/configure-blocks) for the full list of fields on each block type.
 
 ### Connecting and reordering blocks
 
@@ -275,7 +275,7 @@ Click the **three-dot menu** on a block's header and select **Delete Block**. Do
 ### Saving
 
 <Warning>
-Workflows are **not** auto-saved. Click the **Save** button (disk icon) in the header bar to persist your changes. The editor warns you if you try to navigate away with unsaved work.
+Agents are **not** auto-saved. Click the **Save** button (disk icon) in the header bar to persist your changes. The editor warns you if you try to navigate away with unsaved work.
 </Warning>
 
 The **Run** button also saves before starting execution.
@@ -284,12 +284,12 @@ The **Run** button also saves before starting execution.
 
 | Button | Description |
 |--------|-------------|
-| **Save** (disk icon) | Save the current workflow definition |
-| **Template** (bookmark icon) | Toggle whether this workflow is saved as an organization template |
-| **History** (clock icon) | View past runs of this workflow |
-| **Schedule** (clock icon) | Create or manage recurring schedules for this workflow (see [Create a Schedule](/cloud/building-workflows/scheduling)) |
-| **Parameters** | Open the parameters panel (see [Workflow Parameters](/cloud/building-workflows/add-parameters)) |
-| **Run** (play icon) | Save and start a new execution (see [Running Workflows](/cloud/building-workflows/run-a-workflow)) |
+| **Save** (disk icon) | Save the current agent definition |
+| **Template** (bookmark icon) | Toggle whether this agent is saved as an organization template |
+| **History** (clock icon) | View past runs of this agent |
+| **Schedule** (clock icon) | Create or manage recurring schedules for this agent (see [Create a Schedule](/cloud/building-agents/scheduling)) |
+| **Parameters** | Open the parameters panel (see [Agent Parameters](/cloud/building-agents/add-parameters)) |
+| **Run** (play icon) | Save and start a new execution (see [Running Agents](/cloud/building-agents/run-an-agent)) |
 
 ---
 
@@ -299,28 +299,28 @@ The **Run** button also saves before starting execution.
   <Card
     title="Block Reference"
     icon="cube"
-    href="/cloud/building-workflows/configure-blocks"
+    href="/cloud/building-agents/configure-blocks"
   >
     Configuration fields for every block type
   </Card>
   <Card
     title="Add Parameters"
     icon="sliders"
-    href="/cloud/building-workflows/add-parameters"
+    href="/cloud/building-agents/add-parameters"
   >
-    Pass dynamic values into your workflows
+    Pass dynamic values into your agents
   </Card>
   <Card
-    title="Run Your Workflow"
+    title="Run Your Agent"
     icon="play"
-    href="/cloud/building-workflows/run-a-workflow"
+    href="/cloud/building-agents/run-an-agent"
   >
-    Execute workflows and track results
+    Execute agents and track results
   </Card>
   <Card
-    title="Schedule This Workflow"
+    title="Schedule This Agent"
     icon="calendar"
-    href="/cloud/building-workflows/scheduling"
+    href="/cloud/building-agents/scheduling"
   >
     Set up recurring cron-based execution
   </Card>

@@ -1,7 +1,7 @@
 ---
 title: n8n
 subtitle: Run browser automations in your n8n workflows
-description: Connect Skyvern to n8n's open-source automation platform. Dispatch tasks and workflows, retrieve results, and integrate browser automations into any n8n workflow.
+description: Connect Skyvern to n8n's open-source automation platform. Dispatch tasks and agents, retrieve results, and integrate browser automations into any n8n workflow.
 slug: integrations/n8n
 keywords:
   - n8n
@@ -18,8 +18,8 @@ Connect Skyvern to n8n's open-source automation platform. Trigger browser automa
 
 - **Task → Dispatch a Task**: Run a browser automation with a prompt
 - **Task → Get a Task**: Retrieve results from a previously run task
-- **Workflow → Dispatch a Workflow Run**: Run a pre-built Skyvern workflow with parameters
-- **Workflow → Get a Workflow Run**: Retrieve results from a previously run workflow
+- **Agent → Dispatch an Agent Run**: Run a pre-built Skyvern agent with parameters
+- **Agent → Get an Agent Run**: Retrieve results from a previously run agent
 
 ## Setup
 
@@ -71,17 +71,17 @@ Under **Task Options**:
   - **Skyvern 2.0**: Existing V2 workflows or explicitly requested V2 task runs
   - **OpenAI CUA** / **Anthropic CUA**: Third-party computer-use agents
 
-### Dispatch a Workflow Run
+### Dispatch an Agent Run
 
 <Frame>
-  <img src="/images/n8n/n8n3.png" alt="Configure Dispatch a Workflow Run fields in n8n" />
+  <img src="/images/n8n/n8n3.png" alt="Configure Dispatch an Agent Run fields in n8n" />
 </Frame>
 
-First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
+First, create your agent in the [Skyvern UI](https://app.skyvern.com).
 
-- **Workflow Name or ID** (required): Select from the dropdown or specify an ID with an expression
-- **Workflow Run Parameters**: Loaded dynamically from the selected workflow
-- **Webhook Callback URL**: URL to notify when the workflow finishes
+- **Agent Name or ID** (required): Select from the dropdown or specify an ID with an expression
+- **Agent Run Parameters**: Loaded dynamically from the selected agent
+- **Webhook Callback URL**: URL to notify when the agent finishes
 
 ### Get a Task
 
@@ -91,22 +91,22 @@ First, create your workflow in the [Skyvern UI](https://app.skyvern.com).
 
 - **Task ID** (required): The ID of the task run
 
-### Get a Workflow Run
+### Get an Agent Run
 
 <Frame>
-  <img src="/images/n8n/n8n4.png" alt="Enter Workflow Run ID field in n8n" />
+  <img src="/images/n8n/n8n4.png" alt="Enter Agent Run ID field in n8n" />
 </Frame>
 
-- **Workflow Name or ID** (required): Select the workflow from the dropdown
-- **Workflow Run ID** (required): Starts with `wr_`
+- **Agent Name or ID** (required): Select the agent from the dropdown
+- **Agent Run ID** (required): Starts with `wr_`
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card
-    title="Build Workflows"
+    title="Build Agents"
     icon="diagram-project"
-    href="/cloud/manage-workflows"
+    href="/cloud/building-agents/manage-agents"
   >
     Create reusable multi-step automations in Skyvern
   </Card>

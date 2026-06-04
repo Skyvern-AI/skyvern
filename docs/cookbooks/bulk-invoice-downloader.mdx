@@ -1,7 +1,7 @@
 ---
 title: Bulk Invoice Downloader
 subtitle: Automate invoice collection from any vendor portal
-description: Build a workflow that logs into vendor portals, finds order history, filters by date, and downloads invoices as PDFs.
+description: Build an agent that logs into vendor portals, finds order history, filters by date, and downloads invoices as PDFs.
 slug: cookbooks/bulk-invoice-downloader
 keywords:
   - invoice
@@ -15,13 +15,13 @@ keywords:
 
 Automate invoice collection from any vendor portal.
 
-This cookbook creates a workflow that takes in a vendor portal URL, logs in using saved credentials, finds order history, filters by date and finally downloads and emails the invoices as PDFs.
+This cookbook creates an agent that takes in a vendor portal URL, logs in using saved credentials, finds order history, filters by date and finally downloads and emails the invoices as PDFs.
 
 ---
 
 ## What you'll build
 
-A workflow that:
+An agent that:
 
 1. Logs into a customer account portal
 2. Navigates to order history and filters by date
@@ -72,7 +72,7 @@ Change `portal_url` to use your vendor's portal URL.
 
 ## Step 1: Store credentials
 
-Before defining the workflow, store the login email and password Skyvern will use. This keeps secrets out of your workflow definition and away from LLMs.
+Before defining the agent, store the login email and password Skyvern will use. This keeps secrets out of your agent definition and away from LLMs.
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -86,7 +86,7 @@ Before defining the workflow, store the login email and password Skyvern will us
         <img src="/images/cookbooks/er-creds.png" alt="Fill username and password to add a credential to Skyvern" />
       </Step>
       <Step title="Copy the credential ID">
-        Copy the credential ID (here: `cred_504291305450505900`). You'll use this when configuring the workflow.
+        Copy the credential ID (here: `cred_504291305450505900`). You'll use this when configuring the agent.
         <img src="/images/cookbooks/creds-id-copy.png" alt="Fill username and password to add a credential to Skyvern" />
       </Step>
     </Steps>
@@ -154,14 +154,14 @@ Before defining the workflow, store the login email and password Skyvern will us
 
 ---
 
-## Step 2: Create a new workflow
+## Step 2: Create a new agent
 
 <Tabs>
   <Tab title="Cloud UI">
     <Steps>
-      <Step title="Create the workflow">
-        Go to **Workflows** → **Create Workflow**. Name it "Bulk Invoice Downloader".
-        <img src="/images/cookbooks/create-workflow.png" alt="Create a new workflow from Skyvern Dashboard" />
+      <Step title="Create the agent">
+        Go to **Agents** → **Create Agent**. Name it "Bulk Invoice Downloader".
+        <img src="/images/cookbooks/create-workflow.png" alt="Create a new agent from Skyvern Dashboard" />
       </Step>
       <Step title="Configure the Start node">
         Click the **Start** node. Set **Proxy Location** to **Residential**.
@@ -169,7 +169,7 @@ Before defining the workflow, store the login email and password Skyvern will us
     </Steps>
   </Tab>
   <Tab title="API / SDK">
-    A **workflow definition** is a JSON or YAML file that describes your entire workflow: its metadata, parameters, and blocks. 
+    An **agent definition** is a JSON or YAML file that describes your entire agent: its metadata, parameters, and blocks. 
     
     This definition file contains no sensitive information (like credentials or input values) and can be shared publicly. Once we make this, it can either be uploaded via the Cloud UI or sent as an input parameter to `create_workflow()`. We'll do this in Step 4.
 
@@ -202,7 +202,7 @@ Before defining the workflow, store the login email and password Skyvern will us
 
 ### Set parameters
 
-Parameters are the inputs your workflow accepts. Defining them upfront lets you reuse the same workflow against different portals, date ranges, or recipients.
+Parameters are the inputs your agent accepts. Defining them upfront lets you reuse the same agent against different portals, date ranges, or recipients.
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -216,7 +216,7 @@ Parameters are the inputs your workflow accepts. Defining them upfront lets you 
     | `recipient_email` | String | Email recipient for the summary |
     | `credentials` | Credential ID | Select the credential you created in Step 1 |
 
-    <img src="/images/cookbooks/add-params.png" alt="Setting input parameters in a workflow in Skyvern" />
+    <img src="/images/cookbooks/add-params.png" alt="Setting input parameters in an agent in Skyvern" />
 
     <Note>
     SMTP parameters are configured automatically by Skyvern Cloud. For self-hosted deployments, add them as AWS Secret parameters.
@@ -282,9 +282,9 @@ Parameters are the inputs your workflow accepts. Defining them upfront lets you 
 
 ---
 
-## Step 3: Add workflow blocks
+## Step 3: Add agent blocks
 
-The workflow chains together several blocks to automate the full invoice collection process:
+The agent chains together several blocks to automate the full invoice collection process:
 
 1. **Login block**: Authenticates to the vendor portal using stored credentials
 2. **Navigation block**: Navigates to order history and applies date filters
@@ -293,7 +293,7 @@ The workflow chains together several blocks to automate the full invoice collect
 5. **For loop + File parser**: Parses each downloaded PDF to extract structured data
 6. **Send email**: Sends a summary with PDFs attached to the recipient
 
-In the Cloud UI, click the **+** button after the Start node to add blocks sequentially. For SDK users, add each block to the `blocks` array in your workflow definition file.
+In the Cloud UI, click the **+** button after the Start node to add blocks sequentially. For SDK users, add each block to the `blocks` array in your agent definition file.
 
 ### Login block
 
@@ -310,7 +310,7 @@ The `login` block authenticates using stored credentials. Skyvern injects the us
       - `INVALID_CREDENTIALS`: "Login failed - incorrect email or password"
       - `ACCOUNT_LOCKED`: "Account has been locked or suspended"
 
-    <img src="/images/cookbooks/add-block.png" alt="Adding a block in a workflow in Skyvern" />
+    <img src="/images/cookbooks/add-block.png" alt="Adding a block in an agent in Skyvern" />
 
   </Tab>
   <Tab title="API / SDK">
@@ -353,7 +353,7 @@ The `login` block authenticates using stored credentials. Skyvern injects the us
   </Tab>
 </Tabs>
 
-**Why `error_code_mapping`?** It surfaces specific failures in your workflow output, so you can handle "wrong password" differently from "account locked."
+**Why `error_code_mapping`?** It surfaces specific failures in your agent output, so you can handle "wrong password" differently from "account locked."
 
 ### Navigation block
 
@@ -514,7 +514,7 @@ The output is accessible as `data_extraction_block_output.orders` in subsequent 
 
 ### Download invoices block
 
-Iterate over each order and click its "Download Invoice" button. `continue_on_failure: true` ensures one failed download doesn't stop the entire workflow.
+Iterate over each order and click its "Download Invoice" button. `continue_on_failure: true` ensures one failed download doesn't stop the entire agent.
 
 <Tabs>
   <Tab title="Cloud UI">
@@ -732,15 +732,15 @@ Send a summary email with PDFs attached.
 
 ---
 
-## Complete workflow
+## Complete agent
 
 <Tabs>
   <Tab title="Cloud UI">
-    Here's a summary of the complete workflow you've built in the visual editor:
+    Here's a summary of the complete agent you've built in the visual editor:
 
     <Steps>
-      <Step title="Create the workflow">
-        Go to **Workflows** and click **Create Workflow**. Name it "Bulk Invoice Downloader." On the **Start** node, set **Proxy Location** to **Residential** and add the parameters: `portal_url`, `start_date`, `end_date`, `recipient_email`, and `credentials`.
+      <Step title="Create the agent">
+        Go to **Agents** and click **Create Agent**. Name it "Bulk Invoice Downloader." On the **Start** node, set **Proxy Location** to **Residential** and add the parameters: `portal_url`, `start_date`, `end_date`, `recipient_email`, and `credentials`.
       </Step>
       <Step title="Block 1: Login">
         Add a **Login** block. Set **URL** to the `portal_url` parameter. Select the `credentials` parameter. Set the goal: "Log in using the provided credentials. Handle any cookie consent popups. COMPLETE when on the account dashboard or orders page." In **Advanced Settings**, add error messages for `INVALID_CREDENTIALS` and `ACCOUNT_LOCKED`.
@@ -1067,13 +1067,13 @@ workflow_definition:
 
 ## Step 4: Run and monitor
 
-Create the workflow from your definition file and execute it.
+Create the agent from your definition file and execute it.
 
 <Tabs>
   <Tab title="Cloud UI">
     <Steps>
-      <Step title="Run the workflow">
-        Click **Run** in the workflow editor. Fill in the parameters:
+      <Step title="Run the agent">
+        Click **Run** in the agent editor. Fill in the parameters:
 
         - **portal_url**: `https://ember--roasters.vercel.app/`
         - **start_date**: `2025-01-01`
@@ -1230,14 +1230,14 @@ Create the workflow from your definition file and execute it.
 ## Resources
 
 <CardGroup cols={2}>
-  <Card title="Workflow Blocks Reference" icon="cube" href="/cloud/building-workflows/configure-blocks">
+  <Card title="Agent Blocks Reference" icon="cube" href="/cloud/building-agents/configure-blocks">
     Complete parameter reference for all block types
   </Card>
   <Card title="Credential Management" icon="key" href="/sdk-reference/credentials/create-credential">
     Securely store and use login credentials
   </Card>
-  <Card title="File Operations" icon="file" href="/cloud/building-workflows/configure-blocks">
-    Download, parse, and upload files in workflows
+  <Card title="File Operations" icon="file" href="/cloud/building-agents/configure-blocks">
+    Download, parse, and upload files in agents
   </Card>
   <Card title="Error Handling" icon="triangle-exclamation" href="/developers/going-to-production/error-handling">
     Handle failures and retries in production

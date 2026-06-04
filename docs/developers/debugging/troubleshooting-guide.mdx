@@ -198,7 +198,7 @@ See [Using Artifacts](/developers/debugging/using-artifacts) for the full list o
 **Fix:**
 - Increase `max_steps` if the task genuinely needs more steps
 - Add explicit completion criteria: "COMPLETE when you see 'Order confirmed'"
-- Break complex tasks into multiple workflow blocks
+- Break complex tasks into multiple agent blocks
 </Accordion>
 
 <Accordion title="Run stuck in queued state">
@@ -330,7 +330,7 @@ See [Using Artifacts](/developers/debugging/using-artifacts) for the full list o
 - Set language in URL: `https://example.com/en/`
 </Accordion>
 
-<Accordion title="Workflow gets stuck in a loop">
+<Accordion title="Agent gets stuck in a loop">
 **Symptom:** Recording shows AI repeating the same actions without progressing.
 
 **Check:** `recording` (what pattern is repeating?) and conditional block exit conditions

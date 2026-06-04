@@ -16,7 +16,7 @@ keywords:
 
 In a browser automation, `agent.download_files` navigates a page, finds the download link, and captures the file. Downloaded files are stored in Skyvern's cloud storage and returned as presigned URLs in the response.
 
-If you're building workflows in the Cloud UI instead, use the File Download block. See [Block Types and Configuration](/cloud/building-workflows/configure-blocks).
+If you're building agents in the Cloud UI instead, use the File Download block. See [Block Types and Configuration](/cloud/building-agents/configure-blocks).
 
 ---
 
@@ -159,19 +159,19 @@ for (const file of result.downloadedFiles ?? []) {
 
 ---
 
-## File operations in workflows
+## File operations in agents
 
-If you build workflows in the Cloud UI, file operations use dedicated blocks instead of `agent.download_files`:
+If you build agents in the Cloud UI, file operations use dedicated blocks instead of `agent.download_files`:
 
 | Block | Purpose |
 |-------|---------|
-| **File Download** | Download files during workflow execution |
+| **File Download** | Download files during agent execution |
 | **File Parser** | Parse PDFs, CSVs, and Excel files |
 | **Download to S3** | Save files from URLs to Skyvern's S3 |
-| **Upload to S3** | Upload workflow files to S3 |
+| **Upload to S3** | Upload agent files to S3 |
 | **File Upload** | Upload to your own S3 or Azure Blob Storage |
 
-Files downloaded during a workflow accumulate in a temporary directory and can be passed between blocks using workflow parameters. See [Workflow Blocks Reference](/cloud/building-workflows/configure-blocks) for block configuration details.
+Files downloaded during an agent run accumulate in a temporary directory and can be passed between blocks using agent parameters. See [Agent Blocks Reference](/cloud/building-agents/configure-blocks) for block configuration details.
 
 ---
 

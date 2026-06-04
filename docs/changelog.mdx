@@ -43,9 +43,11 @@ keywords:
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
 <a id="week-jun-1-2026"></a>
-<Update label="Week of June 1, 2026" description="Feature preview, tag filters, OSS schedules, captcha improvements, bug fixes">
+<Update label="Week of June 1, 2026" description="Workflows are now Agents, feature preview, tag filters, OSS schedules, captcha improvements">
 
 ## New features
+
+- **Workflows are now Agents** — We've renamed "Workflows" to "Agents" across the product, public API, and docs. The API is now served under `/agents` (e.g. `POST /v1/run/agents`) and accepts an `agent_id` alias for `workflow_id` (same `wpid_` value), with `agent_id` echoed in responses. Fully backwards-compatible: existing `workflow_id` inputs, `/workflows` endpoints, SDK methods, and bookmarked doc URLs all keep working.
 
 - **Feature Preview Section in Settings** — A new "Feature Preview" panel in account settings lets you opt into upcoming features before they are fully released. ([#6318](https://github.com/Skyvern-AI/skyvern/pull/6318))
 - **Filter Workflows by Tags** — The `GET /workflows` API now accepts a `?tags=` query parameter to filter results by tag. ([#6334](https://github.com/Skyvern-AI/skyvern/pull/6334))

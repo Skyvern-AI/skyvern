@@ -48,7 +48,7 @@ New tasks created from the Discover page use the default Skyvern 1.0 task engine
 | **Anthropic CUA** | Computer-use tasks powered by Anthropic's Claude model |
 
 <Tip>
-Start with the default. Move repeated automations into workflows when you need scheduling, reusable parameters, or cached code replays.
+Start with the default. Move repeated automations into agents when you need scheduling, reusable parameters, or cached code replays.
 </Tip>
 
 ---
@@ -67,7 +67,7 @@ Click the **gear icon** next to the prompt box to expand the settings panel.
 | **CDP Address** | Connect to your own browser via Chrome DevTools Protocol (e.g., `http://127.0.0.1:9222`). For local development. |
 | **2FA Identifier** | Links your TOTP credentials to this task. Skyvern uses it to retrieve the correct code when a 2FA prompt appears. |
 | **Extra HTTP Headers** | Custom headers sent with every browser request, as JSON (e.g., `{"Authorization": "Bearer token"}`). |
-| **Publish Workflow** | Save a reusable workflow alongside the task run. Re-run the same automation later from the Workflows page. |
+| **Publish Agent** | Save a reusable agent alongside the task run. Re-run the same automation later from the Agents page. |
 | **Max Steps Override** | Cap the number of AI reasoning steps. Each step = one screenshot-analyze-act cycle. Useful for controlling cost during development. |
 | **Max Screenshot Scrolls** | Number of scrolls for post-action screenshots. Increase for pages with lazy-loaded content. `0` = viewport only. |
 
@@ -135,11 +135,11 @@ Use the `description` field on each property to guide the AI on what to extract.
 
 ---
 
-## Workflow templates
+## Agent templates
 
-Below the prompt box, the Discover page shows a gallery of **workflow templates**: pre-built automations for common use cases.
+Below the prompt box, the Discover page shows a gallery of **agent templates**: pre-built automations for common use cases.
 
-<img src="/images/cloud/workflow-templates.png" alt="Workflow template gallery" />
+<img src="/images/cloud/workflow-templates.png" alt="Agent template gallery" />
 
 Click any template to launch it with pre-filled configuration, or use it as a starting point and customize.
 
@@ -186,10 +186,10 @@ Click any template to launch it with pre-filled configuration, or use it as a st
     Monitor runs, take control of the browser, and review results
   </Card>
   <Card
-    title="Build a Workflow"
+    title="Build an Agent"
     icon="diagram-project"
-    href="/cloud/building-workflows/build-a-workflow"
+    href="/cloud/building-agents/build-an-agent"
   >
-    Turn a successful task into a reusable multi-step workflow
+    Turn a successful task into a reusable multi-step agent
   </Card>
 </CardGroup>

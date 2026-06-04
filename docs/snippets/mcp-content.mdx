@@ -1,4 +1,4 @@
-The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Codex, Cursor, and Windsurf control a browser. Your AI can fill out forms, extract data, download files, and run multi-step workflows, all through natural language.
+The Skyvern MCP server lets AI assistants like Claude Desktop, Claude Code, Codex, Cursor, and Windsurf control a browser. Your AI can fill out forms, extract data, download files, and run multi-step agents, all through natural language.
 
 ## What you can do
 
@@ -11,7 +11,7 @@ The MCP server exposes 75+ tools across many categories. Here are the key ones:
 | **Data extraction** | `skyvern_extract`, `skyvern_screenshot`, `skyvern_evaluate` | Pull structured JSON from pages, capture screenshots, run JavaScript |
 | **Validation** | `skyvern_validate` | Assert page conditions in natural language (returns true/false with reasoning) |
 | **Credentials & login** | `skyvern_login`, `skyvern_credential_list`, `skyvern_credential_get`, `skyvern_credential_delete` | Log in with stored credentials (supports Skyvern vault, Bitwarden, 1Password, Azure Key Vault) with automatic 2FA/TOTP |
-| **Workflows** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types |
+| **Agents** | `skyvern_workflow_create`, `skyvern_workflow_run`, `skyvern_workflow_status`, `skyvern_workflow_get`, `skyvern_workflow_update`, `skyvern_workflow_delete`, `skyvern_workflow_cancel` | Build, run, and manage multi-step automations with 23 block types |
 
 Additional tools cover tab management, iframe switching, drag-and-drop, file upload, clipboard access, network/console inspection, HAR recording, web storage, auth state persistence, folder management, and cached script management.
 
@@ -101,7 +101,7 @@ This is not the ChatGPT App Directory. You can add Skyvern as a custom MCP conne
 2. Click **Add connector** and choose the **MCP** type.
 3. Enter the Skyvern MCP URL: `https://api.skyvern.com/mcp/`
 4. ChatGPT detects OAuth support automatically. Follow the browser sign-in prompt to authenticate with your Skyvern account.
-5. Once connected, Skyvern tools appear in the tool panel. You can ask ChatGPT to navigate pages, fill forms, extract data, or run multi-step workflows.
+5. Once connected, Skyvern tools appear in the tool panel. You can ask ChatGPT to navigate pages, fill forms, extract data, or run multi-step agents.
 
 No API key is required — OAuth handles authentication. If your account does not yet show the Connectors option, check **Settings → Beta features** to enable it.
 
@@ -545,7 +545,7 @@ The `/qa` skill uses `skyvern_evaluate` for fast DOM assertions (~10ms each) and
 
 Skyvern MCP follows Skyvern's [Privacy Policy](https://app.termly.io/policy-viewer/policy.html?policyUUID=1d7aaa1b-5565-415a-8984-7146d254f738).
 
-When you use MCP, Skyvern processes the information needed to run the automations you request. This can include prompts, URLs, page content, screenshots, uploaded or downloaded files, workflow definitions, browser/session artifacts, and credentials you explicitly connect through Skyvern. Skyvern may store workflows, run history, artifacts, credentials, and browser/session state as needed to provide the service and support repeatable automations.
+When you use MCP, Skyvern processes the information needed to run the automations you request. This can include prompts, URLs, page content, screenshots, uploaded or downloaded files, agent definitions, browser/session artifacts, and credentials you explicitly connect through Skyvern. Skyvern may store agents, run history, artifacts, credentials, and browser/session state as needed to provide the service and support repeatable automations.
 
 Only connect accounts, credentials, and websites that you are authorized to automate.
 
