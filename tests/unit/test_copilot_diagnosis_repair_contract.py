@@ -116,6 +116,37 @@ def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
     assert "hunter2" not in contract.model_dump_json()
 
 
+def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_success() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Active run terminal evidence was observed.",
+            "data": {
+                "workflow_run_id": "wr_active",
+                "overall_status": "canceled",
+                "active_run_terminal_evidence_detected": True,
+                "active_run_terminal_completion_verification": {
+                    "status": "evaluated",
+                    "criterion_count": 1,
+                    "satisfied_count": 1,
+                    "fully_satisfied": True,
+                    "reason_codes": ["evidence_confirms"],
+                },
+                "failure_categories": [{"category": "ACTIVE_RUN_TERMINAL_EVIDENCE"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert "not verified end-to-end" in contract.repair_decision.proposed_change_summary
+
+
 def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:
     ctx = _ctx()
     ctx.last_test_suspicious_success = True

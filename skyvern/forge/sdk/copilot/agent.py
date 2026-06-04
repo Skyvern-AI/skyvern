@@ -816,8 +816,15 @@ def _make_agent_result(
     )
     narrative_payload = kwargs.get("narrative_payload")
     response_type = kwargs.get("response_type", "REPLY")
-    if isinstance(narrative_payload, dict) and "responseType" not in narrative_payload:
-        kwargs["narrative_payload"] = {**narrative_payload, "responseType": response_type}
+    proposal_disposition = kwargs.get("proposal_disposition")
+    if isinstance(narrative_payload, dict):
+        payload_updates: dict[str, Any] = {}
+        if "responseType" not in narrative_payload:
+            payload_updates["responseType"] = response_type
+        if proposal_disposition is not None and "proposalDisposition" not in narrative_payload:
+            payload_updates["proposalDisposition"] = proposal_disposition
+        if payload_updates:
+            kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
 
 
@@ -1192,8 +1199,14 @@ def _finalize_result_with_blocker_override(
         else CopilotOutputKind.INFORMATIONAL_ANSWER
     )
     preserve_draft = local_signal.preserves_workflow_draft
-    preserved_workflow_yaml = result.workflow_yaml if preserve_draft else None
-    if preserve_draft and result.updated_workflow is not None:
+    preserved_workflow = None
+    preserved_workflow_yaml = None
+    if preserve_draft:
+        preserved_workflow = result.updated_workflow or result.staged_workflow or ctx.staged_workflow
+        if preserved_workflow is not None:
+            preserved_workflow_yaml = result.workflow_yaml or result.staged_workflow_yaml or ctx.staged_workflow_yaml
+    preserved_proposal = preserve_draft and preserved_workflow is not None
+    if preserved_proposal:
         rendered_reply = _ensure_unvalidated_proposal_affordance(rendered_reply)
     rendered_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
@@ -1201,10 +1214,10 @@ def _finalize_result_with_blocker_override(
         user_response=rendered_reply,
         global_llm_context=None,
         workflow_yaml=preserved_workflow_yaml,
-        has_workflow_proposal=preserve_draft and result.updated_workflow is not None,
+        has_workflow_proposal=preserved_proposal,
         workflow_was_persisted=False,
         workflow_attempted=False,
-        unvalidated=preserve_draft,
+        unvalidated=preserved_proposal,
         output_kind=rendered_kind,
     )
     raw_verdict = _copy_output_policy_verdict(rendered_verdict)
@@ -1237,6 +1250,9 @@ def _finalize_result_with_blocker_override(
                 **blocker_signal_to_trace_data(local_signal),
             )
             preserve_draft = False
+            preserved_workflow = None
+            preserved_workflow_yaml = None
+            preserved_proposal = False
 
     # ResponseKind has no "REPLY" member; CLARIFY matches the convention other
     # turn-end exits (timeout, max-turns, cancel, non-retriable-nav) use.
@@ -1260,14 +1276,13 @@ def _finalize_result_with_blocker_override(
         soft_rewrite_reason_codes=[],
     )
     # A blocker turn is never auto-applicable; even a preserved draft is surfaced as review_untested.
-    preserved_proposal = preserve_draft and result.updated_workflow is not None
     return _make_agent_result(
         ctx,
         user_response=final_text,
-        updated_workflow=result.updated_workflow if preserve_draft else None,
+        updated_workflow=preserved_workflow if preserve_draft else None,
         global_llm_context=result.global_llm_context,
         response_type=rendered_resp_type,
-        workflow_yaml=result.workflow_yaml if preserve_draft else None,
+        workflow_yaml=preserved_workflow_yaml if preserve_draft else None,
         workflow_was_persisted=result.workflow_was_persisted,
         clear_proposed_workflow=not preserve_draft,
         total_tokens=result.total_tokens,

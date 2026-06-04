@@ -36,6 +36,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_failure_signature,
 )
 from skyvern.forge.sdk.copilot.tools import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     WatchdogExitReason,
     _composition_anti_bot_reason,
     _last_run_has_terminal_anti_bot_blocker,
@@ -198,6 +199,15 @@ def test_watchdog_user_failure_reason_excludes_next_tool_instruction() -> None:
     assert "Run ID: wr_safe" in reason
     assert "get_run_results" not in reason
     assert "update_and_run_blocks" not in reason
+
+
+def test_watchdog_user_failure_reason_for_active_terminal_evidence_is_not_success() -> None:
+    exit_reason: WatchdogExitReason = "active_run_terminal_evidence"
+    reason = _watchdog_user_failure_reason(exit_reason, "wr_active", 240, None)
+
+    assert "requested browser state" in reason
+    assert "Full workflow verification is still required" in reason
+    assert "Run ID: wr_active" in reason
 
 
 def test_record_clears_top_category_on_run_with_different_category() -> None:
@@ -434,6 +444,16 @@ def test_reconciliation_clears_for_per_tool_budget_even_on_canceled_status() -> 
     ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
 
     _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_1", "canceled"))
+
+    assert ctx.pending_reconciliation_run_id is None
+
+
+def test_reconciliation_clears_for_active_terminal_evidence_cancel() -> None:
+    ctx = _fresh_context()
+    ctx.pending_reconciliation_run_id = "wr_active"
+    ctx.last_failure_category_top = ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+
+    _maybe_clear_reconciliation_flag(ctx, _get_run_results_response("wr_active", "canceled"))
 
     assert ctx.pending_reconciliation_run_id is None
 

@@ -81,6 +81,7 @@ export interface TurnNarrativeState {
   turnIndex: number | null;
   mode: string;
   responseType: CopilotResponseType | null;
+  proposalDisposition: ProposalDisposition | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -93,7 +94,6 @@ export interface TurnNarrativeState {
   terminalMessage: string | null;
   narrativeSummary: string | null;
   cancelled: boolean;
-  proposalDisposition: ProposalDisposition | null;
   // Block count of the canonical workflow at turn entry. Drives the edit-
   // vs-build chip derivation; the snap-back source is captured client-side
   // at submit so unsaved local canvas edits survive.
@@ -112,6 +112,7 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   turnIndex: null,
   mode: "unknown",
   responseType: null,
+  proposalDisposition: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -120,7 +121,6 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   terminalMessage: null,
   narrativeSummary: null,
   cancelled: false,
-  proposalDisposition: null,
   priorBlockCount: null,
   startedAt: null,
   endedAt: null,
@@ -443,8 +443,9 @@ export function applyNarrativeEvent(
       return {
         ...prev,
         responseType: event.response_type ?? prev.responseType,
-        cancelled: event.cancelled ?? false,
-        proposalDisposition: event.proposal_disposition,
+        cancelled: event.cancelled ?? prev.cancelled,
+        proposalDisposition:
+          event.proposal_disposition ?? prev.proposalDisposition,
         designEnded: true,
         terminal: "response",
         terminalMessage: event.message,
