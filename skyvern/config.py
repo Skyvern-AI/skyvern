@@ -112,6 +112,9 @@ class Settings(BaseSettings):
     MAX_STEPS_PER_TASK_V2: int = 25
     MAX_ITERATIONS_PER_TASK_V2: int = 10
     MAX_NUM_SCREENSHOTS: int = 10
+    # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
+    # screenshot spend can be monitored independently of the provider's blended tokens.
+    LLM_IMAGE_COST_TRACKING_ENABLED: bool = True
     # Ratio should be between 0 and 1.
     # If the task has been running for more steps than this ratio of the max steps per run, then we'll log a warning.
     LONG_RUNNING_TASK_WARNING_RATIO: float = 0.95

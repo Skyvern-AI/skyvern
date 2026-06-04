@@ -55,6 +55,7 @@ from skyvern.schemas.llm import (
     LLMRouterConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
+from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
 
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
@@ -93,6 +94,9 @@ def _enrich_llm_span(
     cached_tokens: int = 0,
     latency_ms: int,
     llm_cost: float = 0.0,
+    image_tokens: int = 0,
+    image_cost: float = 0.0,
+    image_count: int = 0,
 ) -> None:
     """Set canonical attributes + emit llm.request.completed event on an LLM span.
 
@@ -109,6 +113,9 @@ def _enrich_llm_span(
     span.set_attribute("status", "ok")
     span.set_attribute("cache_hit", bool(cached_tokens))
     span.set_attribute("llm_cost", llm_cost)
+    span.set_attribute("image_tokens", image_tokens)
+    span.set_attribute("image_cost", image_cost)
+    span.set_attribute("image_count", image_count)
     # Gen AI OTEL semantic conventions — enables auto-dashboards in providers
     # that support the spec (Logfire, SigNoz gen_ai module).
     # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
@@ -131,6 +138,9 @@ def _enrich_llm_span(
             "cached_tokens": cached_tokens,
             "latency_ms": latency_ms,
             "llm_cost": llm_cost,
+            "image_tokens": image_tokens,
+            "image_cost": image_cost,
+            "image_count": image_count,
             "prompt_name": prompt_name,
         },
     )
@@ -200,6 +210,29 @@ def _llm_screenshots_enabled_metric(
     ):
         return False
     return True
+
+
+def _image_metrics_for_call(
+    screenshots: list[bytes] | None, model: str | None, response: Any = None
+) -> tuple[int, int, float, str | None]:
+    """(image_count, image_tokens, image_cost, source) for the screenshots sent in one call.
+
+    Prefers the provider's billed image tokens (Gemini/Vertex report them) and falls back
+    to the deterministic estimator. Best-effort: failures degrade to zeros.
+    """
+    if not screenshots or not settings.LLM_IMAGE_COST_TRACKING_ENABLED:
+        return 0, 0, 0.0, None
+    try:
+        billed_tokens = provider_image_tokens(response)
+        if billed_tokens is not None:
+            image_tokens, source = billed_tokens, "provider"
+        else:
+            image_tokens, source = estimate_image_tokens(screenshots, model or ""), "estimate"
+        image_cost = estimate_image_cost(image_tokens, model or "")
+        return len(screenshots), image_tokens, image_cost, source
+    except Exception:
+        LOG.debug("Failed to compute image token cost", exc_info=True)
+        return len(screenshots), 0, 0.0, None
 
 
 def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
@@ -1433,6 +1466,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, model_used or main_model_group, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1450,6 +1486,10 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_enrich_tree_log_fields(context, step),
@@ -1466,6 +1506,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -1975,6 +2018,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, actual_model or llm_config.model_name, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1992,6 +2038,10 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_enrich_tree_log_fields(context, step),
@@ -2012,6 +2062,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -2450,6 +2503,9 @@ class LLMCaller:
             )
             # Track LLM API handler duration, token counts, and cost
             duration_seconds = time.perf_counter() - start_time
+            image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                screenshots, actual_model or self.llm_config.model_name, response
+            )
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -2469,6 +2525,10 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                image_count=image_count if image_count > 0 else None,
+                image_tokens=image_tokens if image_tokens > 0 else None,
+                image_cost=image_cost if image_cost > 0 else None,
+                image_tokens_source=image_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
@@ -2486,6 +2546,9 @@ class LLMCaller:
                 cached_tokens=int(call_stats.cached_tokens or 0),
                 latency_ms=int(duration_seconds * 1000),
                 llm_cost=float(call_stats.llm_cost or 0.0),
+                image_tokens=int(image_tokens or 0),
+                image_cost=float(image_cost or 0.0),
+                image_count=int(image_count or 0),
             )
 
             # Raw response is used for CUA engine LLM calls.
