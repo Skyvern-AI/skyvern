@@ -17,6 +17,8 @@ type CredentialFilter = "password" | "credit_card" | "secret";
 type Props = {
   filter?: CredentialFilter;
   search?: string;
+  folderId?: string | null;
+  isResolvingFolder?: boolean;
   onStartBackgroundTest?: (
     credentialId: string,
     url: string,
@@ -35,16 +37,20 @@ const PAGE_SIZE = 25;
 function CredentialsList({
   filter,
   search,
+  folderId,
+  isResolvingFolder,
   onStartBackgroundTest,
 }: Props = {}) {
   const trimmedSearch = search?.trim() ?? "";
   const [page, setPage] = useState(1);
   const [prevSearch, setPrevSearch] = useState(trimmedSearch);
+  const [prevFolderId, setPrevFolderId] = useState(folderId);
 
-  // Reset to page 1 synchronously when the search changes — avoids the extra
-  // fetch with the stale page that a post-render effect would trigger.
-  if (prevSearch !== trimmedSearch) {
+  // Reset to page 1 synchronously when the search or folder filter changes —
+  // avoids the extra fetch with the stale page that a post-render effect would trigger.
+  if (prevSearch !== trimmedSearch || prevFolderId !== folderId) {
     setPrevSearch(trimmedSearch);
+    setPrevFolderId(folderId);
     setPage(1);
   }
 
@@ -53,9 +59,13 @@ function CredentialsList({
     page_size: PAGE_SIZE,
     credential_type: filter,
     search: trimmedSearch || undefined,
+    folder_id: folderId || undefined,
+    // Hold the query until a deep-linked ?folder= slug resolves, so the
+    // unfiltered credential bank doesn't flash before the filter applies.
+    enabled: !isResolvingFolder,
   });
 
-  if (isLoading) {
+  if (isResolvingFolder || isLoading) {
     return (
       <div className="space-y-5">
         <Skeleton className="h-20 w-full" />

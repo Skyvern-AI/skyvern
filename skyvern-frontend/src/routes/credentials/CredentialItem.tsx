@@ -18,6 +18,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { DeleteCredentialButton } from "./DeleteCredentialButton";
+import { CredentialFolderSelector } from "./CredentialFolderSelector";
 import { getHostname } from "@/util/getHostname";
 import { CredentialsModal } from "./CredentialsModal";
 import { credentialTypeToModalType } from "./useCredentialModalState";
@@ -176,6 +177,19 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
       </div>
       {credentialDetails}
       <div className="ml-auto flex gap-1">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div>
+                <CredentialFolderSelector
+                  credentialId={credential.credential_id}
+                  currentFolderId={credential.folder_id ?? null}
+                />
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>Assign to Folder</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
