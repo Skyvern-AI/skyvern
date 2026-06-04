@@ -181,11 +181,28 @@ def test_turn_intent_gate_blocks_edit_without_target_context() -> None:
 def test_turn_intent_gate_allows_edit_with_target_context() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["wfp-1"]},
+        target_entities={"workflow_change": ["add_invoice_download_step"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
 
     assert _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks") is None
+
+
+def test_turn_intent_gate_blocks_edit_with_default_current_workflow_only() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.EDIT,
+        target_entities={"workflow": ["current_workflow"]},
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+
+    signal = _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks")
+
+    _assert_signal(
+        signal,
+        internal_reason_code="turn_intent_missing_edit_target",
+        classifier_mode="edit",
+        blocked_tool="update_and_run_blocks",
+    )
 
 
 def test_turn_intent_gate_blocks_edit_with_unresolved_label_reference() -> None:
@@ -233,7 +250,7 @@ workflow_definition:
 def test_turn_intent_gate_does_not_scan_raw_user_message_for_snake_case_refs() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["current_workflow"]},
+        target_entities={"workflow_change": ["extract_last_name"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent)
@@ -245,7 +262,7 @@ def test_turn_intent_gate_does_not_scan_raw_user_message_for_snake_case_refs() -
 def test_turn_intent_gate_allows_edit_with_parameter_reference() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["current_workflow"]},
+        target_entities={"workflow_change": ["use_account_number_in_search"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent)
