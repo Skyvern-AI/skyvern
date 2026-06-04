@@ -16,6 +16,7 @@ type Props = UseQueryOptions & {
   vault_type?: string;
   credential_type?: "password" | "credit_card" | "secret";
   search?: string;
+  folder_id?: string | null;
 };
 
 function useCredentialsQuery(props: Props = {}) {
@@ -25,6 +26,7 @@ function useCredentialsQuery(props: Props = {}) {
     vault_type,
     credential_type,
     search,
+    folder_id,
     ...queryOptions
   } = props;
   const credentialGetter = useCredentialGetter();
@@ -39,6 +41,7 @@ function useCredentialsQuery(props: Props = {}) {
       vault_type,
       credential_type,
       search,
+      folder_id,
     ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -53,6 +56,9 @@ function useCredentialsQuery(props: Props = {}) {
       }
       if (search) {
         params.set("search", search);
+      }
+      if (folder_id) {
+        params.set("folder_id", folder_id);
       }
       return client.get("/credentials", { params }).then((res) => res.data);
     },
