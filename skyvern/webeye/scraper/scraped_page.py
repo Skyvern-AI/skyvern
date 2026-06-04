@@ -160,6 +160,11 @@ class ElementTreeBuilder(ABC):
     ) -> str:
         pass
 
+    # Sanitized HTML of the last element tree built for the LLM; None when the
+    # last build was JSON or none has run yet. Builders that never render HTML
+    # (e.g. IncrementalScrapePage) leave it None.
+    last_used_element_tree_html: str | None
+
 
 class ScrapedPage(BaseModel, ElementTreeBuilder):
     """
@@ -187,10 +192,6 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     # different combos each pay the walk cost once.
     lean_element_tree_cache: dict[tuple[bool, bool, bool], list[dict]] = {}
     last_used_element_tree: list[dict] | None = None
-    # Last HTML variant built for the LLM (captures economy / truncation).
-    # None when the last build used fmt=JSON or no build has run yet. The
-    # extraction cache reads this to hash the exact HTML the LLM saw; JSON
-    # callers fall back to a fresh HTML rebuild at the cache callsite.
     last_used_element_tree_html: str | None = None
     screenshots: list[bytes] = []
     url: str = ""

@@ -5335,7 +5335,9 @@ async def extract_information_for_navigation_goal(
         # extracted_text). When those fields are dropped, two requests that
         # differ only in the dropped values render identical final prompts and
         # must share a cache key. `extracted_text` also respects
-        # include_extracted_text (None when disabled).
+        # include_extracted_text (None when disabled). Only `element_tree` is
+        # hashed post-sanitization; the other fields hash pre-filter, which can
+        # cost an extra miss but never a wrong hit.
         cache_key = extraction_cache.compute_cache_key(
             call_path="handler",
             element_tree=scraped_page_refreshed.last_used_element_tree_html
