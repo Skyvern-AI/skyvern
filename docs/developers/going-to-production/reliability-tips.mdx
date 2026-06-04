@@ -160,7 +160,7 @@ TERMINATE if any validation error cannot be resolved.
 
 ## Validation strategies
 
-Workflows can silently produce wrong results. The AI might fill a form with incorrect data, navigate to the wrong page, or extract stale information. Validation blocks let you assert conditions at critical points and fail fast when something goes wrong, rather than discovering the problem downstream.
+Agents can silently produce wrong results. The AI might fill a form with incorrect data, navigate to the wrong page, or extract stale information. Validation blocks let you assert conditions at critical points and fail fast when something goes wrong, rather than discovering the problem downstream.
 
 ### Add validation blocks at critical points
 
@@ -215,7 +215,7 @@ if result.output["submitted_email"] != expected_email:
 
 Loops are especially prone to cascading failures: when one iteration fails, it can leave the browser in an unexpected state that breaks subsequent iterations. For example, if iteration 3 navigates to an error page and fails, iteration 4 starts from that error page instead of the expected list view, causing it to fail too. One bad item can take down your entire loop.
 
-Use a For Loop when you have a known list of items before the loop begins. Use a While Loop when the workflow should keep running until page state changes, such as paginating while a Next button is enabled or polling until a status changes. While loops need an especially clear exit condition because the number of iterations is discovered at run time.
+Use a For Loop when you have a known list of items before the loop begins. Use a While Loop when the agent should keep running until page state changes, such as paginating while a Next button is enabled or polling until a status changes. While loops need an especially clear exit condition because the number of iterations is discovered at run time.
 
 ### Always set `continue_on_failure`
 
@@ -289,15 +289,15 @@ The first condition check uses `current_index == 0` to enter the loop before `ex
 
 ## Session timeouts and human-in-the-loop
 
-Browser sessions have a default timeout. If you're using human-in-the-loop workflows where a person must approve an action before proceeding, the session can expire while waiting for approval, especially if the approver is slow or in a different timezone.
+Browser sessions have a default timeout. If you're using human-in-the-loop agents where a person must approve an action before proceeding, the session can expire while waiting for approval, especially if the approver is slow or in a different timezone.
 
-**Symptoms:** Runs that worked during testing fail in production with session expiry errors. The workflow waits for human approval, but by the time approval comes, the browser session has timed out.
+**Symptoms:** Runs that worked during testing fail in production with session expiry errors. The agent waits for human approval, but by the time approval comes, the browser session has timed out.
 
 **Solutions:**
 
-1. **Increase session timeout**: Set a longer `timeout` when creating browser sessions for workflows that include human approval steps
-2. **Remove the human step for time-sensitive flows**: If session expiry is causing failures, consider making the workflow fully automated and reviewing results after completion
-3. **Split into multiple workflows**: Run the pre-approval steps, wait for human approval outside Skyvern, then trigger a second workflow for post-approval steps using a browser profile to maintain login state
+1. **Increase session timeout**: Set a longer `timeout` when creating browser sessions for agents that include human approval steps
+2. **Remove the human step for time-sensitive flows**: If session expiry is causing failures, consider making the agent fully automated and reviewing results after completion
+3. **Split into multiple agents**: Run the pre-approval steps, wait for human approval outside Skyvern, then trigger a second agent for post-approval steps using a browser profile to maintain login state
 
 ```python
 # Longer timeout for human-in-the-loop workflows
@@ -308,7 +308,7 @@ session = await client.create_browser_session(
 ```
 
 <Note>
-For workflows with predictable human approval times, schedule runs to arrive in the approver's inbox during working hours when they can act quickly.
+For agents with predictable human approval times, schedule runs to arrive in the approver's inbox during working hours when they can act quickly.
 </Note>
 
 ---
@@ -369,7 +369,7 @@ When a run fails:
 | **Loop stuck** | No reset between iterations | Add reset block at loop start |
 | **Autocomplete cycling** | AI second-guessing dropdown selections | Add "select and move on; don't modify" to prompt |
 | **Task navigates too far** | Task block continues until goal complete | Use Action/Navigation block for single-step actions |
-| **Session expired** | Human-in-the-loop timeout | Increase timeout or split into multiple workflows |
+| **Session expired** | Human-in-the-loop timeout | Increase timeout or split into multiple agents |
 | **Max steps reached** | Complex page or AI retrying actions | Increase `max_steps_per_run` or simplify the goal |
 
 ### When to adjust prompts vs file a bug
@@ -397,9 +397,9 @@ When a run fails:
     Map errors to custom codes for programmatic handling
   </Card>
   <Card
-    title="Workflow Blocks Reference"
+    title="Agent Blocks Reference"
     icon="cube"
-    href="/cloud/building-workflows/configure-blocks"
+    href="/cloud/building-agents/configure-blocks"
   >
     Detailed documentation for validation and other blocks
   </Card>

@@ -170,7 +170,7 @@ If you configured headful mode during `skyvern quickstart`, a Chromium window op
 
 ## Waiting for completion
 
-By default, task and workflow runs return immediately after queuing. You get a run ID and need to poll for results yourself. Pass `wait_for_completion` to have the SDK poll automatically until the run reaches a terminal state (`completed`, `failed`, `terminated`, `timed_out`, or `canceled`):
+By default, task and agent runs return immediately after queuing. You get a run ID and need to poll for results yourself. Pass `wait_for_completion` to have the SDK poll automatically until the run reaches a terminal state (`completed`, `failed`, `terminated`, `timed_out`, or `canceled`):
 
 <CodeGroup>
 ```python Python
@@ -217,7 +217,7 @@ console.log(task.run_id); // poll with skyvern.getRun(task.run_id)
 | `wait_for_completion` / `waitForCompletion` | `bool` / `boolean` | `false` | Poll until the run finishes. |
 | `timeout` | `float` / `number` | `1800` | Maximum wait time in seconds. |
 
-Supported on task runs, workflow runs, and login. In TypeScript, also supported on file downloads.
+Supported on task runs, agent runs, and login. In TypeScript, also supported on file downloads.
 
 ---
 

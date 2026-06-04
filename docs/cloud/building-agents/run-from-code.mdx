@@ -1,8 +1,8 @@
 ---
 title: Run from Code
-subtitle: Execute and schedule workflows via the API or SDK
-description: Run workflows programmatically, pass parameters, poll for results, and create recurring schedules using the Python SDK, TypeScript SDK, or REST API.
-slug: cloud/building-workflows/run-from-code
+subtitle: Execute and schedule agents via the API or SDK
+description: Run agents programmatically, pass parameters, poll for results, and create recurring schedules using the Python SDK, TypeScript SDK, or REST API.
+slug: cloud/building-agents/run-from-code
 keywords:
   - run_workflow
   - get_run
@@ -15,15 +15,15 @@ keywords:
   - API
 ---
 
-If you've built a workflow in the Cloud UI and want to trigger it from your codebase, this page shows how. You can run workflows on demand, poll for results, and set up recurring schedules using the Python SDK, TypeScript SDK, or REST API.
+If you've built an agent in the Cloud UI and want to trigger it from your codebase, this page shows how. You can run agents on demand, poll for results, and set up recurring schedules using the Python SDK, TypeScript SDK, or REST API.
 
-This is for workflows defined in the visual editor. If you're writing your entire automation in code (no workflow editor involved), see [Browser Automation](/developers/browser-automations/overview) instead.
+This is for agents defined in the visual editor. If you're writing your entire automation in code (no agent editor involved), see [Browser Automation](/developers/browser-automations/overview) instead.
 
 ---
 
-## Run a workflow
+## Run an agent
 
-Pass values for the workflow's input parameters. The call returns immediately with a `run_id` -- the workflow runs asynchronously in the background.
+Pass values for the agent's input parameters. The call returns immediately with a `run_id` -- the agent runs asynchronously in the background.
 
 <CodeGroup>
 ```python Python
@@ -98,11 +98,11 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `workflow_id` | string | Yes | The `workflow_permanent_id` returned when creating the workflow |
-| `parameters` | object | No | Values for the workflow's input parameters. Keys must match the `key` field in the workflow's parameter definitions |
+| `workflow_id` | string | Yes | The `workflow_permanent_id` returned when creating the agent |
+| `parameters` | object | No | Values for the agent's input parameters. Keys must match the `key` field in the agent's parameter definitions |
 | `title` | string | No | Display name for this specific run |
-| `proxy_location` | string or object | No | Override the workflow's default proxy location |
-| `webhook_url` | string | No | URL to receive a POST request when the workflow completes |
+| `proxy_location` | string or object | No | Override the agent's default proxy location |
+| `webhook_url` | string | No | URL to receive a POST request when the agent completes |
 | `browser_session_id` | string | No | Reuse a persistent browser session (prefix `pbs_`) |
 | `browser_profile_id` | string | No | Reuse a browser profile with saved cookies and storage (prefix `bp_`) |
 
@@ -110,7 +110,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 
 ## Get results
 
-Workflows run asynchronously, so you need to check back for results. You have two options: poll the API, or receive a webhook when the workflow completes.
+Agents run asynchronously, so you need to check back for results. You have two options: poll the API, or receive a webhook when the agent completes.
 
 ### Option 1: Polling
 
@@ -171,7 +171,7 @@ done
 
 ### Option 2: Webhooks
 
-Pass a `webhook_url` when running the workflow. Skyvern sends a POST request to your URL when the workflow reaches a terminal state.
+Pass a `webhook_url` when running the agent. Skyvern sends a POST request to your URL when the agent reaches a terminal state.
 
 <CodeGroup>
 ```python Python
@@ -262,9 +262,9 @@ The webhook payload contains the same data as the polling response. See [Webhook
 
 ---
 
-## Schedule a workflow
+## Schedule an agent
 
-Schedules let you run any workflow automatically on a recurring basis. Define a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+Schedules let you run any agent automatically on a recurring basis. Define a cron expression and timezone, and Skyvern triggers the agent at each interval.
 
 ### Create a schedule
 
@@ -319,7 +319,7 @@ curl -X POST "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedules"
 | `timezone` | string | Yes | IANA timezone identifier (e.g., `America/New_York`) |
 | `name` | string | No | Human-readable name for the schedule |
 | `description` | string | No | Description of what this schedule does |
-| `parameters` | object | No | Workflow parameters to pass on each run |
+| `parameters` | object | No | Agent parameters to pass on each run |
 | `enabled` | boolean | No | Whether the schedule is active. Defaults to `true` |
 
 ### Enable and disable a schedule
@@ -370,9 +370,9 @@ curl -X DELETE "https://api.skyvern.com/api/v1/workflows/wpid_123456789/schedule
 
 ---
 
-## List workflows
+## List agents
 
-Retrieve all workflows in your organization.
+Retrieve all agents in your organization.
 
 <CodeGroup>
 ```python Python

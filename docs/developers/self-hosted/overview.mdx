@@ -39,7 +39,7 @@ flowchart LR
 | Component | Role |
 |-----------|------|
 | **Skyvern API Server** | Orchestrates tasks, processes LLM responses, stores results. Includes an embedded Playwright-managed Chromium browser that executes web automation. |
-| **Skyvern Web UI** | Browser-based dashboard for building workflows, running tasks, viewing recordings, and managing credentials. Docker Compose starts it alongside the API server. |
+| **Skyvern Web UI** | Browser-based dashboard for building agents, running tasks, viewing recordings, and managing credentials. Docker Compose starts it alongside the API server. |
 | **PostgreSQL** | Stores task history, workflows, credentials, and organization data |
 | **LLM Provider** | Analyzes screenshots and determines actions. You provide the API key (OpenAI, Anthropic, Azure OpenAI, Google Vertex AI, Amazon Bedrock, Groq, OpenRouter, or local via Ollama) |
 

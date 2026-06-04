@@ -1,7 +1,7 @@
 ---
 title: Webhooks
-subtitle: Get notified when tasks and workflows complete
-description: Configure webhook URLs for tasks and workflows to receive notifications when runs reach terminal status. Includes payload structure, HMAC-SHA256 signature verification, failure handling, and retry mechanisms.
+subtitle: Get notified when tasks and agents complete
+description: Configure webhook URLs for tasks and agents to receive notifications when runs reach terminal status. Includes payload structure, HMAC-SHA256 signature verification, failure handling, and retry mechanisms.
 slug: developers/going-to-production/webhooks
 keywords:
   - webhook_url
@@ -14,7 +14,7 @@ keywords:
   - failure handling
 ---
 
-Workflows and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
+Agents and task runs are asynchronous. When you call `run_task` or `run_workflow`, the API returns immediately with a run ID, but the actual execution happens in the background and can take variable time.
 
 Instead of polling the `get_runs` endpoint, you can use Webhooks to get notified when they finish. Webhooks fire only when a run reaches a terminal status: `completed`, `failed`, `terminated`, `timed_out`, or `canceled`.
 
@@ -56,8 +56,8 @@ curl -X POST "https://api.skyvern.com/v1/run/tasks" \
 ```
 </CodeGroup>
 
-### For workflows
-Set a default webhook when creating the workflow, or override it per-run:
+### For agents
+Set a default webhook when creating the agent, or override it per-run:
 
 <CodeGroup>
 ```python Python
@@ -156,7 +156,7 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 </CodeGroup>
 
 <Info>
-When creating a workflow, use `webhook_callback_url` inside `json_definition`; this sets the default for all runs. When running a workflow, use `webhook_url` at the top level to override for that specific run.
+When creating an agent, use `webhook_callback_url` inside `json_definition`; this sets the default for all runs. When running an agent, use `webhook_url` at the top level to override for that specific run.
 </Info>
 
 **Quick reference:**
@@ -164,11 +164,11 @@ When creating a workflow, use `webhook_callback_url` inside `json_definition`; t
 | Context | Parameter | Location |
 |---------|-----------|----------|
 | Task run | `webhook_url` | Top-level parameter |
-| Workflow creation | `webhook_callback_url` | Inside `json_definition` |
-| Workflow run (override) | `webhook_url` | Top-level parameter |
+| Agent creation | `webhook_callback_url` | Inside `json_definition` |
+| Agent run (override) | `webhook_url` | Top-level parameter |
 
 <Warning>
-**Watch the parameter names.** Using `webhook_url` when creating a workflow (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error. Your runs will just complete without notifications.
+**Watch the parameter names.** Using `webhook_url` when creating an agent (instead of `webhook_callback_url` inside `json_definition`) silently results in no webhook being sent. The API won't return an error. Your runs will just complete without notifications.
 </Warning>
 
 ---
@@ -462,7 +462,7 @@ Even when webhook delivery fails, the task's `output` field may still contain ex
 - **Server returns an error**: Your endpoint received the payload but responded with a non-2xx status code (e.g., 500). Check your server logs to identify the issue.
 - **Signature validation fails**: If your verification logic rejects the request, make sure you're validating against the raw request body, not parsed-and-re-serialized JSON (re-serializing changes the byte representation). Also verify you're using the same API key that created the run.
 
-**Recommended pattern:** Always have a fallback polling mechanism for critical workflows. If you don't receive a webhook within your expected window, call `get_run` to check if the run completed and retrieve the data directly.
+**Recommended pattern:** Always have a fallback polling mechanism for critical agents. If you don't receive a webhook within your expected window, call `get_run` to check if the run completed and retrieve the data directly.
 
 ### Retrying webhooks
 

@@ -1,7 +1,7 @@
 ---
 title: Browser Profiles
 subtitle: Save and reuse authenticated browser state across runs
-description: Save browser state snapshots including cookies, localStorage, and session files as reusable profiles. Skip login steps and restore authenticated state instantly across workflow runs.
+description: Save browser state snapshots including cookies, localStorage, and session files as reusable profiles. Skip login steps and restore authenticated state instantly across agent runs.
 slug: developers/optimization/browser-profiles
 keywords:
   - create_browser_profile
@@ -16,27 +16,27 @@ keywords:
 A **Browser Profile** is a saved snapshot of browser state (cookies, localStorage, and session files) that you can reuse across multiple runs. Profiles let you skip login steps and restore authenticated state instantly.
 
 Profiles are ideal when you:
-- Run the same workflow repeatedly with the same account (daily data extraction, scheduled reports)
-- Want multiple workflows to share the same authenticated state
+- Run the same agent repeatedly with the same account (daily data extraction, scheduled reports)
+- Want multiple agents to share the same authenticated state
 - Need to avoid repeated authentication to save time and steps
 
 ---
 
 ## How profiles work
 
-When a workflow runs with `persist_browser_session=true`, Skyvern archives the browser state (cookies, storage, session files) after the run completes. This archiving happens asynchronously in the background. Once the archive is ready, you can create a profile from it, then pass that profile to future workflow runs to restore the saved state.
+When an agent runs with `persist_browser_session=true`, Skyvern archives the browser state (cookies, storage, session files) after the run completes. This archiving happens asynchronously in the background. Once the archive is ready, you can create a profile from it, then pass that profile to future agent runs to restore the saved state.
 
 ---
 
 ## Create a Browser Profile
 
-Create a workflow with `persist_browser_session=true` in the workflow definition, run it, wait for completion, then create a profile from the run. Session archiving happens asynchronously, so add brief retry logic when creating the profile.
+Create an agent with `persist_browser_session=true` in the agent definition, run it, wait for completion, then create a profile from the run. Session archiving happens asynchronously, so add brief retry logic when creating the profile.
 
 <Note>
-`persist_browser_session` must be set when **creating the workflow**, not when running it. It is a workflow definition property, not a runtime parameter.
+`persist_browser_session` must be set when **creating the agent**, not when running it. It is an agent definition property, not a runtime parameter.
 </Note>
 
-### From a workflow run
+### From an agent run
 
 <CodeGroup>
 ```python Python
@@ -224,10 +224,10 @@ done
 
 ### From a browser session
 
-You can also create a profile from a [Browser Session](/developers/optimization/browser-sessions) that was used inside a workflow with `persist_browser_session=true`. After the workflow run completes and the session is closed, pass the session ID instead of the workflow run ID.
+You can also create a profile from a [Browser Session](/developers/optimization/browser-sessions) that was used inside an agent with `persist_browser_session=true`. After the agent run completes and the session is closed, pass the session ID instead of the workflow run ID.
 
 <Warning>
-Only sessions that were part of a workflow with `persist_browser_session=true` produce an archive. A session created with `create_browser_session()` alone does not archive its state. Archiving happens asynchronously after the session closes, so add retry logic.
+Only sessions that were part of an agent with `persist_browser_session=true` produce an archive. A session created with `create_browser_session()` alone does not archive its state. Archiving happens asynchronously after the session closes, so add retry logic.
 </Warning>
 
 <CodeGroup>
@@ -322,14 +322,14 @@ done
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | string | Required. Display name for the profile. Must be unique within your organization |
-| `browser_session_id` | string | ID of the closed browser session (starts with `pbs_`). The session must have been part of a workflow with `persist_browser_session=true` |
+| `browser_session_id` | string | ID of the closed browser session (starts with `pbs_`). The session must have been part of an agent with `persist_browser_session=true` |
 | `description` | string | Optional description of the profile's purpose |
 
 ---
 
 ## Use a Browser Profile
 
-Pass `browser_profile_id` when running a workflow to restore the saved state. Skyvern restores cookies, localStorage, and session files before the first step runs.
+Pass `browser_profile_id` when running an agent to restore the saved state. Skyvern restores cookies, localStorage, and session files before the first step runs.
 
 <CodeGroup>
 ```python Python
@@ -398,19 +398,19 @@ curl -X POST "https://api.skyvern.com/v1/run/workflows" \
 ```
 
 <Note>
-`browser_profile_id` is supported for workflows only. It is not available for standalone tasks via `run_task`. You also cannot use both `browser_profile_id` and `browser_session_id` in the same request.
+`browser_profile_id` is supported for agents only. It is not available for standalone tasks via `run_task`. You also cannot use both `browser_profile_id` and `browser_session_id` in the same request.
 </Note>
 
 ---
 
 ## Tutorial: save and reuse browsing state
 
-This walkthrough demonstrates the full profile lifecycle: create a workflow that saves browser state, capture that state as a profile, then reuse it in a second workflow. Each step shows the code and the actual API response.
+This walkthrough demonstrates the full profile lifecycle: create an agent that saves browser state, capture that state as a profile, then reuse it in a second agent. Each step shows the code and the actual API response.
 
 <Steps>
-  <Step title="Create a workflow with persist_browser_session">
+  <Step title="Create an agent with persist_browser_session">
 
-  The workflow must have `persist_browser_session=true` so Skyvern archives the browser state after the run.
+  The agent must have `persist_browser_session=true` so Skyvern archives the browser state after the run.
 
   <CodeGroup>
   ```python Python
@@ -492,9 +492,9 @@ This walkthrough demonstrates the full profile lifecycle: create a workflow that
 
   </Step>
 
-  <Step title="Run the workflow">
+  <Step title="Run the agent">
 
-  Run the workflow and wait for it to complete. Skyvern opens a browser, executes the navigation block, then archives the browser state in the background.
+  Run the agent and wait for it to complete. Skyvern opens a browser, executes the navigation block, then archives the browser state in the background.
 
   <CodeGroup>
   ```python Python
@@ -666,9 +666,9 @@ This walkthrough demonstrates the full profile lifecycle: create a workflow that
 
   </Step>
 
-  <Step title="Reuse the profile in a second workflow">
+  <Step title="Reuse the profile in a second agent">
 
-  Pass `browser_profile_id` when running a workflow. Skyvern restores the saved cookies, localStorage, and session files before the first block runs. The second workflow starts with the browser state from step 2, no repeat navigation needed.
+  Pass `browser_profile_id` when running an agent. Skyvern restores the saved cookies, localStorage, and session files before the first block runs. The second agent starts with the browser state from step 2, no repeat navigation needed.
 
   <CodeGroup>
   ```python Python
@@ -742,7 +742,7 @@ This walkthrough demonstrates the full profile lifecycle: create a workflow that
 </Steps>
 
 <Tip>
-In a real scenario, step 1 would be a login workflow that authenticates with a site. The saved profile then lets all future workflows skip the login step entirely.
+In a real scenario, step 1 would be a login agent that authenticates with a site. The saved profile then lets all future agents skip the login step entirely.
 </Tip>
 
 ---
@@ -787,7 +787,7 @@ const badProfile = await client.createBrowserProfile({
 
 ### Refresh profiles periodically
 
-Session tokens and cookies expire. Re-run your login workflow and create fresh profiles before they go stale. Adding the date to the name makes it easy to track which profile is current.
+Session tokens and cookies expire. Re-run your login agent and create fresh profiles before they go stale. Adding the date to the name makes it easy to track which profile is current.
 
 <CodeGroup>
 ```python Python
@@ -832,7 +832,7 @@ curl -X DELETE "https://api.skyvern.com/v1/browser_profiles/$OLD_PROFILE_ID" \
 
 ### Capture updated state after each run
 
-To capture state changes during a run (like token refreshes), the workflow must have `persist_browser_session=true` in its definition. This lets you create a fresh profile from each completed run.
+To capture state changes during a run (like token refreshes), the agent must have `persist_browser_session=true` in its definition. This lets you create a fresh profile from each completed run.
 
 <CodeGroup>
 ```python Python

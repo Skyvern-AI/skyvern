@@ -1,7 +1,7 @@
 ---
 title: Block Types and Configuration
-subtitle: Reference for every block available in the workflow editor
-description: Reference guide for every workflow block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, While Loop, Conditional, Code, HTTP Request, and more.
+subtitle: Reference for every block available in the agent editor
+description: Reference guide for every agent block type in the Skyvern Cloud UI, including Browser Task, Extraction, Login, Loop, While Loop, Conditional, Code, HTTP Request, and more.
 slug: cloud/configure-blocks
 keywords:
   - navigation block
@@ -18,12 +18,12 @@ keywords:
   - conditional block
 ---
 
-Workflows are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the Cloud UI [workflow editor](/cloud/building-workflows/build-a-workflow), grouped by category.
+Agents are built from blocks. Each block performs one specific operation: navigating a page, extracting data, making an API call, or branching logic. This page covers every block type available in the Cloud UI [agent editor](/cloud/building-agents/build-an-agent), grouped by category.
 
 If you're writing automations in code instead, the equivalent operations are Page and Agent methods. See the [Actions Reference](/developers/browser-automations/actions-reference) for the code-first counterparts to these blocks.
 
-<Frame caption="To add a block in your workflow, click the **+** button, click on Add block, then select the block type from the menu.">
-<img src="/images/cloud/add-block-ui.png" alt="how to add a block to a workflow in Skyvern" />
+<Frame caption="To add a block in your agent, click the **+** button, click on Add block, then select the block type from the menu.">
+<img src="/images/cloud/add-block-ui.png" alt="how to add a block to an agent in Skyvern" />
 </Frame>
 
 ## Quick reference
@@ -45,7 +45,7 @@ These fields appear on most blocks:
 | Field | Description |
 |-------|-------------|
 | **Label** | Display name on the canvas. Also determines how downstream blocks reference this block's output (`{{ label_output }}`). |
-| **Continue on Failure** | Allow the workflow to continue if this block fails |
+| **Continue on Failure** | Allow the agent to continue if this block fails |
 | **Next Loop on Failure** | Only inside loops. Skip to the next iteration on failure. |
 | **Model** | Override the default LLM model for this block (Advanced Settings on most blocks) |
 
@@ -69,7 +69,7 @@ Browser-based blocks (Browser Task, Browser Action, Extraction, Login, File Down
 
 The primary block for browser automation. Accepts a natural-language prompt and autonomously navigates the browser to accomplish the goal.
 
-The block uses Skyvern 1.0 by default. Existing workflows that already contain V2 browser blocks remain editable and may show a reduced field set.
+The block uses Skyvern 1.0 by default. Existing agents that already contain V2 browser blocks remain editable and may show a reduced field set.
 
 **Skyvern 1.0:**
 
@@ -167,7 +167,7 @@ Navigate the browser directly to a specific URL without AI interaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| **URL** | text | **(Required)** The URL to navigate to. Supports [parameter references](/cloud/building-workflows/add-parameters#referencing-parameters-in-blocks). |
+| **URL** | text | **(Required)** The URL to navigate to. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks). |
 
 <Frame>
 <img width="400" src="/images/cloud/url_block.png" alt="Go to URL block configuration with URL field" />
@@ -239,7 +239,7 @@ Repeat a sequence of blocks for each item in a list. Child blocks are placed ins
 | **Loop Value** | text | The list to iterate over. Use a parameter reference (e.g., `{{ my_list }}`) or a natural language description (e.g., "Extract links of the top 5 posts") which triggers automatic extraction. |
 | **Continue if Empty** | boolean | Mark the loop as complete if the list is empty |
 
-Inside loop blocks, use these [reserved variables](/cloud/building-workflows/add-parameters#reserved-variables):
+Inside loop blocks, use these [reserved variables](/cloud/building-agents/add-parameters#reserved-variables):
 - `{{ current_value }}`: the current item
 - `{{ current_index }}`: the iteration number (0-based)
 
@@ -247,7 +247,7 @@ Inside loop blocks, use these [reserved variables](/cloud/building-workflows/add
 <img width="400" src="/images/cloud/block-loop-config.png" alt="Loop block configuration" />
 </Frame>
 
-Use Loop when the item list is already known before the loop starts, such as rows extracted from a table, files uploaded by a user, or URLs passed as workflow parameters.
+Use Loop when the item list is already known before the loop starts, such as rows extracted from a table, files uploaded by a user, or URLs passed as agent parameters.
 
 ### While Loop
 
@@ -257,14 +257,14 @@ Repeat a sequence of blocks while a condition remains true. Child blocks are pla
 |-------|------|-------------|
 | **Condition** | expression | Jinja2 template or natural-language prompt evaluated before each iteration |
 
-Inside while-loop blocks, use these [reserved variables](/cloud/building-workflows/add-parameters#reserved-variables):
+Inside while-loop blocks, use these [reserved variables](/cloud/building-agents/add-parameters#reserved-variables):
 - `{{ current_index }}`: the iteration number (0-based)
 
 Use While Loop for flows where the number of iterations is discovered during the run, such as pagination, polling, or retrying until a recoverable page state clears. For pagination, a common pattern is to extract a `has_next_page` boolean inside the loop, click Next, and let the next condition check decide whether to continue.
 
 ### Conditional
 
-Branch the workflow based on conditions. The UI shows branches as tabs (A, B, C, etc.). Each branch has an expression that determines when it executes. Expressions can be Jinja2 templates or natural language prompts.
+Branch the agent based on conditions. The UI shows branches as tabs (A, B, C, etc.). Each branch has an expression that determines when it executes. Expressions can be Jinja2 templates or natural language prompts.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -282,7 +282,7 @@ Branch the workflow based on conditions. The UI shows branches as tabs (A, B, C,
 
 ### AI Validation
 
-Assert conditions using AI and halt the workflow on failure. Useful for checking that a previous block produced expected results before continuing.
+Assert conditions using AI and halt the agent on failure. Useful for checking that a previous block produced expected results before continuing.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -315,7 +315,7 @@ Execute custom Python code. Input parameters are available as global variables. 
 
 ### Wait
 
-Pause workflow execution for a specified duration.
+Pause agent execution for a specified duration.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -397,7 +397,7 @@ Send an email notification, optionally with file attachments from previous block
 |-------|------|-------------|
 | **Recipients** | text | Comma-separated email addresses |
 | **Subject** | text | Email subject line |
-| **Body** | text | Email body. Supports [parameter references](/cloud/building-workflows/add-parameters#referencing-parameters-in-blocks). |
+| **Body** | text | Email body. Supports [parameter references](/cloud/building-agents/add-parameters#referencing-parameters-in-blocks). |
 | **File Attachments** | text | Path to files to attach |
 
 <Frame>
@@ -422,7 +422,7 @@ Additional fields in **Advanced Settings:**
 |-------|------|-------------|
 | **Timeout** | number | Request timeout in seconds (1–300, default: 30) |
 | **Follow Redirects** | boolean | Automatically follow HTTP redirects (default: true) |
-| **Continue on Failure** | boolean | Continue workflow if the request fails |
+| **Continue on Failure** | boolean | Continue agent if the request fails |
 | **Save Response as File** | boolean | Save the response body as a downloadable file |
 | **Download Filename** | text | Filename for the saved response (shown when Save Response as File is enabled) |
 
@@ -432,7 +432,7 @@ Additional fields in **Advanced Settings:**
 
 ### Human Interaction
 
-Pause the workflow and request human input. Optionally sends an email notification to reviewers.
+Pause the agent and request human input. Optionally sends an email notification to reviewers.
 
 | Field | Type | Description |
 |-------|------|-------------|

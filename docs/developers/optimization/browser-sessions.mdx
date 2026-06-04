@@ -1,7 +1,7 @@
 ---
 title: Browser Sessions
-subtitle: Persist live browser state across multiple tasks and workflows
-description: Create and manage live browser sessions that persist cookies, local storage, and page state between task or workflow runs. Use sessions for back-to-back tasks, human-in-the-loop approval, and real-time agents.
+subtitle: Persist live browser state across multiple tasks and agents
+description: Create and manage live browser sessions that persist cookies, local storage, and page state between task or agent runs. Use sessions for back-to-back tasks, human-in-the-loop approval, and real-time agents.
 slug: developers/optimization/browser-sessions
 keywords:
   - create_browser_session
@@ -14,7 +14,7 @@ keywords:
   - real-time agent
 ---
 
-A **Browser Session** is a live browser instance that persists cookies, local storage, and page state between task or workflow runs. Think of it as keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, human-in-the-loop approval, or real-time agents.
+A **Browser Session** is a live browser instance that persists cookies, local storage, and page state between task or agent runs. Think of it as keeping a browser tab open. Use sessions when you need back-to-back tasks to share state, human-in-the-loop approval, or real-time agents.
 
 ---
 
@@ -242,9 +242,9 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions/$SESSION_ID/close" 
 
 ---
 
-## Run workflows with a session
+## Run agents with a session
 
-Pass `browser_session_id` to `run_workflow` to execute a workflow in an existing session. This is useful when you need to run a predefined workflow but want it to continue from your current browser state.
+Pass `browser_session_id` to `run_workflow` to execute an agent in an existing session. This is useful when you need to run a predefined agent but want it to continue from your current browser state.
 
 <CodeGroup>
 ```python Python
@@ -581,9 +581,9 @@ curl -s -X POST "https://api.skyvern.com/v1/browser_sessions" \
 ```
 </CodeGroup>
 
-### Use workflows for predetermined sequences
+### Use agents for predetermined sequences
 
-If your steps don't need pauses between them, a workflow runs them in a single browser instance without the overhead of creating and managing a session. Each task in a session incurs its own startup cost, while workflow blocks share one browser.
+If your steps don't need pauses between them, an agent runs them in a single browser instance without the overhead of creating and managing a session. Each task in a session incurs its own startup cost, while agent blocks share one browser.
 
 <CodeGroup>
 ```python Python
@@ -691,7 +691,7 @@ Skyvern also offers [Browser Profiles](/developers/optimization/browser-profiles
 | **Lifetime** | Minutes to hours | Days to months |
 | **State** | Current page, cookies, open connections | Cookies, storage, session files |
 | **Billing** | Charged while open | No cost when not in use |
-| **Best for** | Back-to-back tasks, human-in-the-loop, real-time agents | Repeated logins, scheduled workflows, shared auth state |
+| **Best for** | Back-to-back tasks, human-in-the-loop, real-time agents | Repeated logins, scheduled agents, shared auth state |
 
 <Tip>
 You can create a [Browser Profile](/developers/optimization/browser-profiles) from a completed session to save its authenticated state for future reuse.

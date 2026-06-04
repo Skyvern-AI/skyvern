@@ -1,7 +1,7 @@
 ---
 title: External Credential Providers
 subtitle: Connect Bitwarden, 1Password, Azure Key Vault, or your own vault API
-description: Connect external credential vaults like Bitwarden, 1Password, Azure Key Vault, or a custom webhook API to the Skyvern Cloud UI so workflows can pull secrets at runtime.
+description: Connect external credential vaults like Bitwarden, 1Password, Azure Key Vault, or a custom webhook API to the Skyvern Cloud UI so agents can pull secrets at runtime.
 slug: cloud/managing-credentials/external-providers
 keywords:
   - Bitwarden
@@ -13,10 +13,10 @@ keywords:
   - runtime secrets
 ---
 
-Instead of copying secrets into Skyvern, you can point Skyvern at your existing vault and it pulls credentials at runtime. If your organization already manages secrets in a dedicated vault, connect it as a credential source and reference items directly from workflow parameters.
+Instead of copying secrets into Skyvern, you can point Skyvern at your existing vault and it pulls credentials at runtime. If your organization already manages secrets in a dedicated vault, connect it as a credential source and reference items directly from agent parameters.
 
 <Note>
-External providers are configured per-organization. Once connected, any workflow in the organization can reference credentials from that provider.
+External providers are configured per-organization. Once connected, any agent in the organization can reference credentials from that provider.
 </Note>
 
 ## Choosing a provider
@@ -29,7 +29,7 @@ External providers are configured per-organization. Once connected, any workflow
 | **Azure Key Vault** | Password (with optional TOTP) | Settings page setup | Enterprise Azure environments |
 | **Webhook (Custom API)** | Password, Credit Card | Settings page setup | Organizations with custom vaults |
 
-You can mix sources within the same workflow. For example, one Login block can use Skyvern-stored credentials while another uses Azure Key Vault.
+You can mix sources within the same agent. For example, one Login block can use Skyvern-stored credentials while another uses Azure Key Vault.
 
 ---
 
@@ -60,8 +60,8 @@ Make sure your Bitwarden account is on `bitwarden.com`, not `bitwarden.eu`. The 
   <Step title="Grab your Collection ID">
     Click into the collection and find the collection UUID in the URL bar.
   </Step>
-  <Step title="Add to a workflow">
-    In the Skyvern workflow editor, click **Parameters → Add Parameter → Credential Parameter** and select the **Bitwarden** tab. Enter your **Collection ID** and optionally an **Item ID** to target a specific vault item.
+  <Step title="Add to an agent">
+    In the Skyvern agent editor, click **Parameters → Add Parameter → Credential Parameter** and select the **Bitwarden** tab. Enter your **Collection ID** and optionally an **Item ID** to target a specific vault item.
   </Step>
 </Steps>
 
@@ -71,7 +71,7 @@ Make sure your Bitwarden account is on `bitwarden.com`, not `bitwarden.eu`. The 
 |-------|------------|
 | **Collection ID** | The UUID of your Bitwarden collection (found in the URL when viewing the collection) |
 | **Item ID** | Target a specific vault item. Leave blank to use URL matching instead. |
-| **URL Parameter Key** | Match credentials by the target URL. Useful when the same workflow runs against different sites. |
+| **URL Parameter Key** | Match credentials by the target URL. Useful when the same agent runs against different sites. |
 
 ### Identity data
 
@@ -144,9 +144,9 @@ Connects via a [service account token](https://developer.1password.com/docs/serv
 If the status does not turn Active, verify that your service account token has access to the target vault and has not expired.
 </Tip>
 
-### Using in a workflow
+### Using in an agent
 
-In the workflow editor, add a **Credential Parameter** and select **1Password** as the source. Provide the **Vault ID** and **Item ID**. You can find both IDs in the URL when viewing an item in the 1Password web app.
+In the agent editor, add a **Credential Parameter** and select **1Password** as the source. Provide the **Vault ID** and **Item ID**. You can find both IDs in the URL when viewing an item in the 1Password web app.
 
 <Warning>
 Credit cards from 1Password need a custom text field named **"Expire Date"**, **"Expiry Date"**, or **"Expiration Date"** in `MM/YYYY` or `MM/YY` format. 1Password does not expose the native expiration field through its API, so Skyvern reads this custom text field instead.
@@ -172,9 +172,9 @@ Pulls credentials stored as Azure secrets. Supports passwords with optional TOTP
   </Step>
 </Steps>
 
-### Using in a workflow
+### Using in an agent
 
-In the workflow editor, add a **Credential Parameter** and select **Azure Key Vault** as the source. Provide the vault name and the **secret names** that store the username, password, and optionally a TOTP secret. Enter the secret names, not the values themselves.
+In the agent editor, add a **Credential Parameter** and select **Azure Key Vault** as the source. Provide the vault name and the **secret names** that store the username, password, and optionally a TOTP secret. Enter the secret names, not the values themselves.
 
 For example, if your vault stores secrets named `salesforce-username`, `salesforce-password`, and `salesforce-totp`, enter those three names in the corresponding fields.
 
@@ -383,10 +383,10 @@ Restart Skyvern after setting these variables.
     Store login details with optional 2FA
   </Card>
   <Card
-    title="Workflow Parameters"
+    title="Agent Parameters"
     icon="sliders"
-    href="/cloud/building-workflows/add-parameters"
+    href="/cloud/building-agents/add-parameters"
   >
-    Configure credential parameters in the workflow editor
+    Configure credential parameters in the agent editor
   </Card>
 </CardGroup>

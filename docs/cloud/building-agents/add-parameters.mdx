@@ -1,7 +1,7 @@
 ---
-title: Workflow Parameters
-subtitle: Pass dynamic values into your workflows at runtime
-description: Define input and credential parameters in the Skyvern Cloud UI workflow editor to pass dynamic values like URLs, JSON data, and vault credentials into workflows at runtime.
+title: Agent Parameters
+subtitle: Pass dynamic values into your agents at runtime
+description: Define input and credential parameters in the Skyvern Cloud UI agent editor to pass dynamic values like URLs, JSON data, and vault credentials into agents at runtime.
 slug: cloud/add-parameters
 keywords:
   - input parameter
@@ -13,15 +13,15 @@ keywords:
   - JSON
 ---
 
-Parameters let you create reusable workflows that accept different input values each time they run. Instead of hardcoding a URL or search term into a block, you reference a parameter and fill in the value when you run the workflow.
+Parameters let you create reusable agents that accept different input values each time they run. Instead of hardcoding a URL or search term into a block, you reference a parameter and fill in the value when you run the agent.
 
-This page covers parameters in the Cloud UI workflow editor. If you're building automations in code, parameters are just function arguments. See [Browser Automation](/developers/browser-automations/overview) for the code-first approach.
+This page covers parameters in the Cloud UI agent editor. If you're building automations in code, parameters are just function arguments. See [Browser Automation](/developers/browser-automations/overview) for the code-first approach.
 
 ---
 
 ## Opening the parameters panel
 
-In the [workflow editor](/cloud/building-workflows/build-a-workflow), click the **Parameters** button in the header bar. A panel appears below the header showing all defined parameters and controls to add new ones.
+In the [agent editor](/cloud/building-agents/build-an-agent), click the **Parameters** button in the header bar. A panel appears below the header showing all defined parameters and controls to add new ones.
 
 <img src="/images/cloud/parameters-panel-open.png" alt="Parameters panel" />
 
@@ -33,7 +33,7 @@ Click **Add Parameter** in the panel. Two types are available:
 
 | Type | Use for |
 |------|---------|
-| **Input Parameter** | Values the user provides when running the workflow (text, numbers, JSON, etc.) |
+| **Input Parameter** | Values the user provides when running the agent (text, numbers, JSON, etc.) |
 | **Credential Parameter** | Securely inject login credentials from a vault (Bitwarden, 1Password, Azure, AWS, or Skyvern) |
 
 Each parameter requires a unique **key**. This is the name you use to reference it in blocks. Keys cannot contain spaces and cannot use [reserved names](#reserved-variables).
@@ -101,7 +101,7 @@ Credential parameters securely inject login credentials into blocks without expo
 | **AWS Secret** | Secrets stored in AWS Secrets Manager |
 | **Azure Secret** | Secrets stored in Azure Secret |
 
-When you add a credential parameter, you configure the source and connection details (collection ID, vault ID, etc.). At runtime, Skyvern fetches the real credentials from the vault and injects them into the workflow. Credential values are masked in logs and outputs.
+When you add a credential parameter, you configure the source and connection details (collection ID, vault ID, etc.). At runtime, Skyvern fetches the real credentials from the vault and injects them into the agent. Credential values are masked in logs and outputs.
 
 ---
 
@@ -150,15 +150,15 @@ Process item {{ current_index }}: {{ current_value.name }}
   <Card
     title="Block Reference"
     icon="cube"
-    href="/cloud/building-workflows/configure-blocks"
+    href="/cloud/building-agents/configure-blocks"
   >
     Configuration fields for every block type
   </Card>
   <Card
-    title="Run Your Workflow"
+    title="Run Your Agent"
     icon="play"
-    href="/cloud/building-workflows/run-a-workflow"
+    href="/cloud/building-agents/run-an-agent"
   >
-    Execute workflows and fill in parameter values
+    Execute agents and fill in parameter values
   </Card>
 </CardGroup>

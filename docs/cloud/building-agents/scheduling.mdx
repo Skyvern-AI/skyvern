@@ -1,7 +1,7 @@
 ---
-title: Schedule a Workflow
+title: Schedule an Agent
 subtitle: Set up recurring cron-based execution from the UI
-description: Set up recurring cron-based workflow schedules in the Skyvern Cloud UI, including creating, editing, pausing, and deleting schedules with timezone support.
+description: Set up recurring cron-based agent schedules in the Skyvern Cloud UI, including creating, editing, pausing, and deleting schedules with timezone support.
 slug: cloud/scheduling
 keywords:
   - schedule
@@ -14,16 +14,16 @@ keywords:
   - disable
 ---
 
-You can schedule any workflow built in the Cloud UI to run automatically on a recurring basis. Schedules are configured with a cron expression and timezone, and Skyvern triggers the workflow at each interval.
+You can schedule any agent built in the Cloud UI to run automatically on a recurring basis. Schedules are configured with a cron expression and timezone, and Skyvern triggers the agent at each interval.
 
-This page covers scheduling through the Cloud UI. You can also create schedules programmatically via the SDK or API. See [Run from Code](/cloud/building-workflows/run-from-code) for the code approach.
+This page covers scheduling through the Cloud UI. You can also create schedules programmatically via the SDK or API. See [Run from Code](/cloud/building-agents/run-from-code) for the code approach.
 
 Schedules are created as **active** by default: they start triggering runs immediately after creation.
 
 When creating a schedule you'll fill in these fields:
 
-- **Workflow** (required): The workflow to run. When creating from the workflow editor this is pre-selected.
-- **Cron Expression** (required): A standard 5-field cron expression that defines how often the workflow runs (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation. Quick presets are available for common patterns like hourly, daily, and weekly.
+- **Agent** (required): The agent to run. When creating from the agent editor this is pre-selected.
+- **Cron Expression** (required): A standard 5-field cron expression that defines how often the agent runs (e.g., `0 9 * * 1-5` for every weekday at 9 AM). The UI validates the expression in real time and shows a human-readable translation. Quick presets are available for common patterns like hourly, daily, and weekly.
 - **Timezone** (required): The IANA timezone the cron expression is evaluated in (e.g., `America/New_York`). Defaults to your browser's local timezone. The dropdown is searchable by city name.
 - **Name**: A human-readable label to identify this schedule in the table and run history.
 - **Description**: Optional notes about what this schedule does or why it exists.
@@ -46,10 +46,10 @@ The minimum interval between runs is **5 minutes**. Expressions that resolve to 
         Click <kbd>Create Schedule</kbd> in the top right corner.
         <img src="/images/cloud/create-schedule-button.png" alt="Schedules page with Create Schedule button in the top right corner" />
       </Step>
-      <Step title="Select a workflow and configure the schedule">
-        Choose the workflow you want to schedule from the dropdown. Only saved workflows appear in this list. Then fill in the cron expression, timezone, and optionally a name and description. Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
+      <Step title="Select an agent and configure the schedule">
+        Choose the agent you want to schedule from the dropdown. Only saved agents appear in this list. Then fill in the cron expression, timezone, and optionally a name and description. Check the **Next Scheduled Runs** preview to verify the upcoming execution times match your expectations.
         <Frame>
-        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with workflow dropdown, cron expression, timezone, name, and description fields" width="300" />
+        <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with agent dropdown, cron expression, timezone, name, and description fields" width="300" />
         </Frame>
       </Step>
       <Step title="Create">
@@ -57,17 +57,17 @@ The minimum interval between runs is **5 minutes**. Expressions that resolve to 
       </Step>
     </Steps>
   </Tab>
-  <Tab title="From the workflow editor">
+  <Tab title="From the agent editor">
     <Steps>
-      <Step title="Open the workflow">
-        Navigate to [**Workflows**](https://app.skyvern.com/workflows/) in the sidebar and click the workflow you want to schedule.
+      <Step title="Open the agent">
+        Navigate to [**Agents**](https://app.skyvern.com/workflows/) in the sidebar and click the agent you want to schedule.
       </Step>
       <Step title="Click the Schedule button">
         In the editor header bar, click the <kbd>Schedule</kbd> button (clock icon).
-        <img src="/images/cloud/wf-page-sched.png" alt="Workflow editor page with Schedule button (clock icon) in the header bar" />
+        <img src="/images/cloud/wf-page-sched.png" alt="Agent editor page with Schedule button (clock icon) in the header bar" />
       </Step>
       <Step title="Click Add and configure the schedule">
-        A panel opens showing any existing schedules for this workflow. Click <kbd>Add</kbd> to create a new one. Fill in the cron expression, timezone, and optionally a name and description. The workflow is already selected.
+        A panel opens showing any existing schedules for this agent. Click <kbd>Add</kbd> to create a new one. Fill in the cron expression, timezone, and optionally a name and description. The agent is already selected.
         <Frame>
         <img src="/images/cloud/create-sched-form.png" alt="Schedule creation form with cron expression, timezone, name, and description fields" width="300" />
         </Frame>
@@ -83,19 +83,19 @@ The minimum interval between runs is **5 minutes**. Expressions that resolve to 
 
 ## The Schedules page
 
-Click **Schedules** in the left sidebar to see every schedule across all workflows.
+Click **Schedules** in the left sidebar to see every schedule across all agents.
 
 Each row shows:
 
 | Column | What it shows |
 |--------|--------------|
-| **Workflow** | The workflow this schedule triggers |
+| **Agent** | The agent this schedule triggers |
 | **Name** | Schedule name |
 | **Schedule** | Human-readable cron description (e.g., "Every weekday at 9:00 AM") |
 | **Next Run** | Next execution time in your local timezone |
 | **Status** | **Active** (green) or **Paused** (gray) |
 
-Use the search bar to filter by schedule name or workflow title. The status filter narrows to Active or Paused schedules.
+Use the search bar to filter by schedule name or agent title. The status filter narrows to Active or Paused schedules.
 
 ---
 
@@ -114,7 +114,7 @@ On this page, you can:
 - **Delete the schedule**: Use the delete button (trash icon) in the header. Deletion is permanent. Runs already triggered by the schedule are not affected.
 
 <Info>
-To change which workflow a schedule runs, delete the schedule and create a new one for the target workflow.
+To change which agent a schedule runs, delete the schedule and create a new one for the target agent.
 </Info>
 
 ---
@@ -125,7 +125,7 @@ To change which workflow a schedule runs, delete the schedule and create a new o
   <Card
     title="Scheduling API"
     icon="code"
-    href="/cloud/building-workflows/run-from-code#create-a-schedule"
+    href="/cloud/building-agents/run-from-code#create-a-schedule"
   >
     Create and manage schedules programmatically
   </Card>
