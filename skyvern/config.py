@@ -151,6 +151,9 @@ class Settings(BaseSettings):
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
     # Per-environment canary; default off until we are confident.
     ENABLE_WORKFLOW_COPILOT_V2: bool = False
+    # Experimental Workflow Copilot v2 branch mode.
+    # Off = standard block authoring. On = prefer code blocks for browser work.
+    WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]
