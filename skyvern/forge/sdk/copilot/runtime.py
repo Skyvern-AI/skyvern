@@ -25,6 +25,7 @@ from skyvern.cli.core.session_manager import (
     unregister_copilot_session,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -172,7 +173,7 @@ class AgentContext:
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
-    block_authoring_policy: Any = "standard"
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
