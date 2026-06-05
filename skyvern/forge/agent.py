@@ -3730,7 +3730,7 @@ class ForgeAgent:
         cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
             EXTRACT_ACTION_TEMPLATE
         )
-        LOG.info(
+        LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
             cache_enabled=cache_enabled,
@@ -4812,12 +4812,6 @@ class ForgeAgent:
         Note: This should only be called when verification is needed (i.e., when
         the standard flow would have called check_user_goal_complete in agent_step).
         """
-        LOG.info(
-            "Starting parallel user goal verification with speculative extract-actions",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-
         verification_task = asyncio.create_task(
             self.check_user_goal_complete(
                 page=page,
