@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -121,6 +122,12 @@ class SkyvernContext:
     screenshot_downscale_variant: str | None = None
     screenshot_downscale_max_height: int | None = None
     step_retry_index: int = 0
+
+    # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
+    # The lock makes first-use resolution single-flight under parallel prompt builds.
+    slim_output_variant_assigned: str | None = None
+    slim_output_variant_resolved: bool = False
+    slim_output_variant_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it

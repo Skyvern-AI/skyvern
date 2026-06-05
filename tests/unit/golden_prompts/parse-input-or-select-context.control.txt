@@ -1,11 +1,10 @@
-You are a browser agent performing actions on the web. You are instructed to take an INPUT or SELECT action on the element(id: "{{ element_id }}"). Extract some detailed information from the context/reasoning, and double-check the information by analysing the HTML elements.
+You are a browser agent performing actions on the web. You are instructed to take an INPUT or SELECT action on the element(id: "elem_1"). Extract some detailed information from the context/reasoning, and double-check the information by analysing the HTML elements.
 
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in the following JSON format:
 {
-{%- if slim_output not in ('safe', 'terse') %}
-    "thought": str, // A string to describe how you double-check the information to ensure the accuracy.{% endif %}
+    "thought": str, // A string to describe how you double-check the information to ensure the accuracy.
     "field": str, // Which field is this action intended to fill out?
     "is_required": bool, // True if this is a required field, otherwise false.
     "is_search_bar": bool, // True if the element to take the action is a search bar, otherwise false.
@@ -17,11 +16,10 @@ Reply in the following JSON format:
 
 Existing reasoning context:
 ```
-{{ action_reasoning }}
+test reasoning
 ```
 
 HTML elements:
 ```
-{{ elements }}
+<html></html>
 ```
-
