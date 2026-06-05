@@ -51,9 +51,10 @@ fi
 
 echo "Injecting runtime environment variables into pre-built assets..."
 
-# NOTE: Placeholder replacement is one-shot (sed -i modifies files in place).
-# If environment variables change, the container must be recreated (not just
-# restarted) to apply new values.
+# Rebuild from the pristine template each start so sed sees fresh placeholders
+# and `docker restart` re-applies current env values (e.g. rotated API key).
+rm -rf /app/dist
+cp -r /app/dist.template /app/dist
 
 # Escape all values for safe use in sed replacement patterns
 ESC_API_BASE_URL=$(escape_sed "$VITE_API_BASE_URL")
