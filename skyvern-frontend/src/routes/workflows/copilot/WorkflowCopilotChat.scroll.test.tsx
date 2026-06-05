@@ -57,10 +57,6 @@ vi.mock("react-router-dom", async (importOriginal) => {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => ({}) }),
-  useWorkflowSave: () => ({
-    isPending: false,
-    mutateAsync: vi.fn(),
-  }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";

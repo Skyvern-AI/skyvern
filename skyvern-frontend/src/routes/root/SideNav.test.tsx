@@ -6,6 +6,7 @@ import { SideNav } from "./SideNav";
 import { useSidebarStore } from "@/store/SidebarStore";
 
 const capture = vi.fn();
+const mutate = vi.fn();
 
 function LocationProbe() {
   const location = useLocation();
@@ -24,6 +25,13 @@ vi.mock("posthog-js/react", () => ({
   }),
 }));
 
+vi.mock("@/routes/workflows/hooks/useCreateWorkflowMutation", () => ({
+  useCreateWorkflowMutation: () => ({
+    isPending: false,
+    mutate,
+  }),
+}));
+
 describe("SideNav", () => {
   function setViewportHeight(height: number) {
     Object.defineProperty(window, "innerHeight", {
@@ -38,21 +46,28 @@ describe("SideNav", () => {
     window.localStorage.clear();
     useSidebarStore.setState({ collapsed: false });
     setViewportHeight(1024);
+    mutate.mockClear();
     capture.mockClear();
   });
 
-  it("opens the draft agent builder from the sidebar", () => {
+  it("creates a new agent from the sidebar", () => {
     render(
       <MemoryRouter>
         <SideNav />
-        <LocationProbe />
       </MemoryRouter>,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "New Agent" }));
 
-    expect(screen.getByTestId("location").textContent).toBe(
-      "/workflows/new/build?via=sidebar",
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        _via: "sidebar",
+        title: "New Agent",
+        workflow_definition: expect.objectContaining({
+          blocks: [],
+          parameters: [],
+        }),
+      }),
     );
   });
 

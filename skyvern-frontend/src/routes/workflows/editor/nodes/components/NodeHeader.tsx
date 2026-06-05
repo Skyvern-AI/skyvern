@@ -156,7 +156,7 @@ const getPayload = (opts: {
   workflowPermanentId: string;
   workflowSettings: WorkflowSettingsState;
 }): Payload | null => {
-  const webhook_url = (opts.workflowSettings.webhookCallbackUrl ?? "").trim();
+  const webhook_url = opts.workflowSettings.webhookCallbackUrl.trim();
 
   let extraHttpHeaders = null;
 

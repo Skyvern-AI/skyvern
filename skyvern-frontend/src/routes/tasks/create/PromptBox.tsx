@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
-import { buildBlankAgentBuildPath } from "@/routes/workflows/blankAgentNavigation";
+import { stringify as convertToYAML } from "yaml";
+import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -118,6 +119,24 @@ function deriveHandoffTitle(prompt: string): string {
   return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
 }
 
+function buildBlankWorkflowRequest(
+  title: string,
+  runWith: "agent" | "code" = "agent",
+): WorkflowCreateYAMLRequest {
+  return {
+    title,
+    description: "",
+    ai_fallback: true,
+    code_version: 2,
+    run_with: runWith,
+    workflow_definition: {
+      version: 2,
+      blocks: [],
+      parameters: [],
+    },
+  };
+}
+
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState<string>("");
@@ -230,7 +249,50 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     },
   });
 
-  const isSubmitting = generateWorkflowMutation.isPending;
+  const handoffWorkflowMutation = useMutation({
+    mutationFn: async ({
+      prompt,
+      runWith,
+    }: {
+      prompt: string;
+      runWith: "agent" | "code";
+    }) => {
+      const client = await getClient(credentialGetter);
+      const yaml = convertToYAML(
+        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
+      );
+      const result = await client.post<string, { data: WorkflowApiResponse }>(
+        "/workflows",
+        yaml,
+        {
+          headers: {
+            "Content-Type": "text/plain",
+          },
+        },
+      );
+      return { data: result.data, prompt };
+    },
+    onSuccess: ({ data: workflow, prompt }) => {
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      navigate(`/workflows/${workflow.workflow_permanent_id}/build`, {
+        state: { copilotMessage: prompt },
+      });
+    },
+    onError: (error: AxiosError) => {
+      toast({
+        variant: "destructive",
+        title: "Error creating agent",
+        description: error.message,
+      });
+    },
+    onSettled: () => {
+      submitInFlightRef.current = false;
+    },
+  });
+
+  const isSubmitting =
+    generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
 
   const {
     isSupported: isSpeechSupported,
@@ -249,14 +311,7 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     }
     submitInFlightRef.current = true;
     if (enableCopilotHandoff) {
-      navigate(buildBlankAgentBuildPath({ via: "copilot" }), {
-        state: {
-          copilotMessage: prompt,
-          draftTitle: deriveHandoffTitle(prompt),
-          draftRunWith: "agent",
-        },
-      });
-      submitInFlightRef.current = false;
+      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
       return;
     }
     generateWorkflowMutation.mutate({ prompt });

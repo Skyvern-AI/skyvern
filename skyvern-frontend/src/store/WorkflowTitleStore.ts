@@ -20,18 +20,15 @@ const useWorkflowTitleStore = create<WorkflowTitleStore>((set, get) => {
       return get().title === DEFAULT_WORKFLOW_TITLE;
     },
     setTitle: (title: string) => {
-      const normalizedTitle = (title ?? "").trim();
-      set({ title: normalizedTitle, titleHasBeenGenerated: true });
+      set({ title: title.trim(), titleHasBeenGenerated: true });
     },
     setTitleFromGeneration: (title: string) => {
-      const normalizedTitle = (title ?? "").trim();
-      set({ title: normalizedTitle, titleHasBeenGenerated: true });
+      set({ title: title.trim(), titleHasBeenGenerated: true });
     },
     initializeTitle: (title: string) => {
-      const normalizedTitle = (title ?? "").trim();
       set({
-        title: normalizedTitle,
-        titleHasBeenGenerated: normalizedTitle !== DEFAULT_WORKFLOW_TITLE,
+        title: title.trim(),
+        titleHasBeenGenerated: title.trim() !== DEFAULT_WORKFLOW_TITLE,
       });
     },
     resetTitle: () => {

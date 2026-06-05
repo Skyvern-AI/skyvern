@@ -2,7 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { isDraftWorkflowPermanentId } from "../draftWorkflow";
 import { CacheKeyValuesResponse } from "../types/scriptTypes";
 
 type Props = {
@@ -56,11 +55,7 @@ function useCacheKeyValuesQuery({
 
       return result;
     },
-    enabled:
-      !!workflowPermanentId &&
-      !isDraftWorkflowPermanentId(workflowPermanentId) &&
-      !!cacheKey &&
-      cacheKey.length > 0,
+    enabled: !!workflowPermanentId && !!cacheKey && cacheKey.length > 0,
     placeholderData: keepPreviousData,
     staleTime: 5 * 60 * 1000,
   });
