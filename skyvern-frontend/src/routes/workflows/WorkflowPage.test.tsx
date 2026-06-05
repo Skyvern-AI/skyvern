@@ -63,6 +63,14 @@ vi.mock("./hooks/useWorkflowRunsQuery", () => ({
   }),
 }));
 
+vi.mock("./hooks/useWorkflowTagsBatchQuery", () => ({
+  useWorkflowTagsBatchQuery: () => ({ data: {} }),
+}));
+
+vi.mock("./hooks/useTagKeysQuery", () => ({
+  useTagKeysQuery: () => ({ data: [] }),
+}));
+
 vi.mock("./hooks/useKeywordSearch", () => ({
   useKeywordSearch: () => ({
     matchesParameter: () => false,

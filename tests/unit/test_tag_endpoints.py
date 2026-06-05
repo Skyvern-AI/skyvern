@@ -286,6 +286,45 @@ def test_patch_tag_key_description_too_long_returns_422(client: TestClient) -> N
     assert resp.status_code == 422
 
 
+def test_list_tag_keys_includes_workflow_count(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": {"env": "prod", "team": "growth"}})
+    resp = client.get("/v1/tag-keys")
+    assert resp.status_code == 200
+    by_key = {row["key"]: row for row in resp.json()}
+    assert by_key["env"]["workflow_count"] == 1
+    assert by_key["team"]["workflow_count"] == 1
+
+
+# ----------------------------- DELETE /tag-keys/{key} --------------------------------
+
+
+def test_delete_tag_key_removes_from_registry_and_workflow(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": {"env": "prod", "team": "growth"}})
+    resp = client.delete("/v1/tag-keys/env")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "env", "removed_from_workflow_count": 1}
+    assert [row["key"] for row in client.get("/v1/tag-keys").json()] == ["team"]
+    assert set(client.get(f"/v1/workflows/{WPID}/tags").json()["tags"].keys()) == {"team"}
+
+
+def test_delete_tag_key_404_when_unknown(client: TestClient) -> None:
+    resp = client.delete("/v1/tag-keys/never_registered")
+    assert resp.status_code == 404
+
+
+def test_delete_tag_key_reserved_prefix_returns_400(client: TestClient) -> None:
+    resp = client.delete("/v1/tag-keys/skyvern.system")
+    assert resp.status_code == 400
+
+
+def test_delete_tag_key_legacy_route_works(client: TestClient) -> None:
+    client.post(f"/v1/workflows/{WPID}/tags", json={"tags": {"env": "prod"}})
+    resp = client.delete("/api/v1/tag-keys/env")
+    assert resp.status_code == 200
+    assert resp.json()["removed_from_workflow_count"] == 1
+
+
 # ----------------------------- Batch endpoints ---------------------------------------
 
 

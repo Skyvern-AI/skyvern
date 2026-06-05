@@ -146,6 +146,7 @@ from skyvern.schemas.tags import (
     TagHistoryItem,
     TagHistoryResponse,
     TagKey,
+    TagKeyDeleteResponse,
     TagKeyUpdate,
     TagResponse,
     TagsResponse,
@@ -1755,8 +1756,10 @@ async def get_workflow_tag_history(
 async def list_tag_keys(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> list[TagKey]:
-    rows = await app.DATABASE.tags.list_tag_keys(organization_id=current_org.organization_id)
-    return [TagKey.model_validate(r) for r in rows]
+    organization_id = current_org.organization_id
+    rows = await app.DATABASE.tags.list_tag_keys(organization_id=organization_id)
+    counts = await app.DATABASE.tags.count_active_workflows_per_key(organization_id=organization_id)
+    return [TagKey(key=row.key, description=row.description, workflow_count=counts.get(row.key, 0)) for row in rows]
 
 
 @legacy_base_router.patch("/tag-keys/{key}", response_model=TagKey, tags=["agent"], include_in_schema=False)
@@ -1781,16 +1784,59 @@ async def update_tag_key(
     current_org: Organization = Depends(org_auth_service.get_current_org),
 ) -> TagKey:
     _validate_path_key(key)
+    organization_id = current_org.organization_id
     row = await app.DATABASE.tags.update_tag_key_description(
-        organization_id=current_org.organization_id,
+        organization_id=organization_id,
         key=key,
         description=data.description,
     )
     if row is None:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
-    return TagKey.model_validate(row)
+    # Populate the real count so PATCH and GET /tag-keys agree (the ORM row
+    # has no count attribute, so model_validate would default it to 0).
+    counts = await app.DATABASE.tags.count_active_workflows_per_key(organization_id=organization_id)
+    return TagKey(key=row.key, description=row.description, workflow_count=counts.get(row.key, 0))
 
 
+@legacy_base_router.delete("/tag-keys/{key}", tags=["agent"], include_in_schema=False)
+@legacy_base_router.delete("/tag-keys/{key}/", include_in_schema=False)
+@base_router.delete(
+    "/tag-keys/{key}",
+    response_model=TagKeyDeleteResponse,
+    tags=["Workflow Tags"],
+    openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
+    description="Delete a tag key from the organization registry and remove that tag from every workflow that "
+    "currently has it (cascade). Returns how many workflows the tag was removed from.",
+    summary="Delete tag key",
+    responses={
+        200: {"description": "Successfully deleted tag key"},
+        404: {"description": "Tag key not found"},
+    },
+)
+@base_router.delete("/tag-keys/{key}/", response_model=TagKeyDeleteResponse, include_in_schema=False)
+async def delete_tag_key(
+    key: str = Path(..., description="Tag key to delete", examples=["env"]),
+    caller: org_auth_service.CallerContext = Depends(org_auth_service.get_current_caller_context),
+) -> TagKeyDeleteResponse:
+    analytics.capture("skyvern-oss-tag-key-delete")
+    _validate_path_key(key)
+    context = TagWriteContext(
+        caller_id=caller.caller_id,
+        source=TagSource.MANUAL,
+        caller_type=caller.caller_type,
+    )
+    removed_count = await app.DATABASE.tags.delete_tag_key(
+        organization_id=caller.organization.organization_id,
+        key=key,
+        context=context,
+    )
+    if removed_count is None:
+        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"Tag key '{key}' not found")
+    return TagKeyDeleteResponse(key=key, removed_from_workflow_count=removed_count)
+
+
+# Keep in sync with BATCH_TAGS_MAX_WPIDS in the frontend
+# useWorkflowTagsBatchQuery hook, which chunks requests to this size.
 _BATCH_TAGS_MAX_WPIDS = 200
 
 

@@ -38,7 +38,7 @@ import {
 } from "@radix-ui/react-icons";
 import { FolderIcon } from "@/components/icons/FolderIcon";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
@@ -56,7 +56,17 @@ import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { HighlightText } from "./components/HighlightText";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
+import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
+import { TagChipList } from "./components/tagging/TagChipList";
+import { WorkflowTagFilter } from "./components/tagging/WorkflowTagFilter";
+import { WorkflowTagEditor } from "./components/tagging/WorkflowTagEditor";
+import {
+  parseTagFilter,
+  serializeTagFilter,
+  type TagFilterPair,
+} from "./types/tagTypes";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { convert } from "./editor/workflowEditorUtils";
 import { WorkflowApiResponse } from "./types/workflowTypes";
@@ -122,6 +132,33 @@ function Workflows() {
 
   // Folder slug from query param (e.g., /workflows?folder=my-folder-name)
   const folderSlug = searchParams.get("folder");
+
+  // Tag filter from query param (e.g., /workflows?tags=env:prod,env:staging).
+  // The backend accepts both comma-separated pairs and repeated `tags` params,
+  // so read every occurrence. The serialized form is canonical (sorted) and is
+  // used for both the request and the query key so cache hits are
+  // order-independent.
+  const tagFilterParam = searchParams.getAll("tags").join(",");
+  const tagFilters = useMemo(
+    () => parseTagFilter(tagFilterParam),
+    [tagFilterParam],
+  );
+  const serializedTagFilter = serializeTagFilter(tagFilters);
+
+  const setTagFilters = useCallback(
+    (pairs: TagFilterPair[]) => {
+      const params = new URLSearchParams(searchParams);
+      const serialized = serializeTagFilter(pairs);
+      if (serialized) {
+        params.set("tags", serialized);
+      } else {
+        params.delete("tags");
+      }
+      params.set("page", "1");
+      setSearchParams(params, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
 
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [isViewAllFoldersOpen, setIsViewAllFoldersOpen] = useState(false);
@@ -221,6 +258,7 @@ function Workflows() {
       page,
       itemsPerPage,
       selectedFolderId,
+      serializedTagFilter,
     ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -233,6 +271,9 @@ function Workflows() {
       }
       if (selectedFolderId) {
         params.append("folder_id", selectedFolderId);
+      }
+      if (serializedTagFilter) {
+        params.append("tags", serializedTagFilter);
       }
       return client
         .get(`/workflows`, {
@@ -250,6 +291,7 @@ function Workflows() {
       page + 1,
       itemsPerPage,
       selectedFolderId,
+      serializedTagFilter,
     ],
     queryFn: async () => {
       const client = await getClient(credentialGetter);
@@ -263,6 +305,9 @@ function Workflows() {
       if (selectedFolderId) {
         params.append("folder_id", selectedFolderId);
       }
+      if (serializedTagFilter) {
+        params.append("tags", serializedTagFilter);
+      }
       return client
         .get(`/workflows`, {
           params,
@@ -274,6 +319,49 @@ function Workflows() {
 
   const isNextDisabled =
     isFetching || !nextPageWorkflows || nextPageWorkflows.length === 0;
+
+  // Tag-key registry: supplies chip-hover descriptions and the filter's key list.
+  // Keyed with a Map so tag keys like "constructor"/"toString" can't resolve to
+  // inherited Object prototype members when looked up.
+  const { data: tagKeys = [] } = useTagKeysQuery();
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+
+  // One batch fetch of current tags for every workflow on the page (no N+1).
+  const workflowIds = useMemo(
+    () => workflows.map((workflow) => workflow.workflow_permanent_id),
+    [workflows],
+  );
+  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(workflowIds);
+
+  // Distinct values per key observed on the page, used as filter suggestions.
+  // Maps avoid prototype-key collisions from user-controlled tag keys.
+  const tagValueSuggestions = useMemo(() => {
+    const collected = new Map<string, Set<string>>();
+    for (const tags of Object.values(workflowTagsMap)) {
+      for (const [key, value] of Object.entries(tags)) {
+        let values = collected.get(key);
+        if (!values) {
+          values = new Set<string>();
+          collected.set(key, values);
+        }
+        values.add(value);
+      }
+    }
+    const suggestions = new Map<string, string[]>();
+    for (const [key, values] of collected) {
+      suggestions.set(key, [...values].sort());
+    }
+    return suggestions;
+  }, [workflowTagsMap]);
 
   const { matchesParameter, isSearchActive } =
     useKeywordSearch(debouncedSearch);
@@ -485,15 +573,23 @@ function Workflows() {
           )}
         </header>
         <div className="flex justify-between">
-          <TableSearchInput
-            value={search}
-            onChange={(value) => {
-              setSearch(value);
-              setParamPatch({ page: "1" });
-            }}
-            placeholder="Search by title or input..."
-            className="w-48 lg:w-72"
-          />
+          <div className="flex items-center gap-3">
+            <TableSearchInput
+              value={search}
+              onChange={(value) => {
+                setSearch(value);
+                setParamPatch({ page: "1" });
+              }}
+              placeholder="Search by title or input..."
+              className="w-48 lg:w-72"
+            />
+            <WorkflowTagFilter
+              tagKeys={tagKeys}
+              value={tagFilters}
+              onChange={setTagFilters}
+              valueSuggestions={tagValueSuggestions}
+            />
+          </div>
           <div className="flex items-center gap-4">
             <Link
               to="/discover"
@@ -600,6 +696,8 @@ function Workflows() {
                   );
                   // Check if this is an importing agent
                   const isUploading = workflow.status === "importing";
+                  const workflowTags =
+                    workflowTagsMap[workflow.workflow_permanent_id];
 
                   return (
                     <React.Fragment key={workflow.workflow_permanent_id}>
@@ -665,23 +763,35 @@ function Workflows() {
                               );
                             }}
                           >
-                            <div className="flex min-w-0 items-center gap-2">
-                              <span className="truncate" title={workflow.title}>
-                                <HighlightText
-                                  text={workflow.title}
-                                  query={debouncedSearch}
+                            <div className="flex min-w-0 flex-col gap-1">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span
+                                  className="truncate"
+                                  title={workflow.title}
+                                >
+                                  <HighlightText
+                                    text={workflow.title}
+                                    query={debouncedSearch}
+                                  />
+                                </span>
+                                {workflow.is_template && (
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+                                      </TooltipTrigger>
+                                      <TooltipContent>Template</TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                )}
+                              </div>
+                              {workflowTags &&
+                              Object.keys(workflowTags).length > 0 ? (
+                                <TagChipList
+                                  tags={workflowTags}
+                                  descriptions={tagDescriptions}
                                 />
-                              </span>
-                              {workflow.is_template && (
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <BookmarkFilledIcon className="h-3.5 w-3.5 shrink-0 text-blue-500" />
-                                    </TooltipTrigger>
-                                    <TooltipContent>Template</TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                              )}
+                              ) : null}
                             </div>
                           </TableCell>
                           <TableCell
@@ -746,6 +856,14 @@ function Workflows() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
+                              <WorkflowTagEditor
+                                workflowPermanentId={
+                                  workflow.workflow_permanent_id
+                                }
+                                tags={workflowTags ?? {}}
+                                tagKeys={tagKeys}
+                                valueSuggestions={tagValueSuggestions}
+                              />
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>

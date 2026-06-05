@@ -506,3 +506,60 @@ async def test_apply_tag_changes_registers_new_key_when_absent(repo: TagsReposit
     and the registry gets the new entry."""
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     assert await _registered_keys(repo) == ["env"]
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_key(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg", "team": "core"}, deletes=set(), context=_ctx())
+
+    counts = await repo.count_active_workflows_per_key(ORG_ID)
+    assert counts == {"env": 2, "team": 1}
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_key_ignores_deleted_tags(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={}, deletes={"env"}, context=_ctx())
+
+    assert await repo.count_active_workflows_per_key(ORG_ID) == {}
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_cascades_across_workflows(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg", "team": "core"}, deletes=set(), context=_ctx())
+
+    removed = await repo.delete_tag_key(ORG_ID, "env", _ctx())
+
+    assert removed == 2
+    # Tag gone from both workflows...
+    assert await repo.get_active_tags_for_workflow("wpid_a", ORG_ID) == {}
+    assert await repo.get_active_tags_for_workflow("wpid_b", ORG_ID) == {"team": "core"}
+    # ...and the key no longer appears in the active registry.
+    assert [row.key for row in await repo.list_tag_keys(ORG_ID)] == ["team"]
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_unknown_returns_none(repo: TagsRepository) -> None:
+    assert await repo.delete_tag_key(ORG_ID, "never_seen", _ctx()) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_idempotent(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+
+    assert await repo.delete_tag_key(ORG_ID, "env", _ctx()) == 1
+    # Second call: key already soft-deleted, no active SETs left.
+    assert await repo.delete_tag_key(ORG_ID, "env", _ctx()) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_key_then_reapply_reregisters(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
+    await repo.delete_tag_key(ORG_ID, "env", _ctx())
+
+    await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "dev"}, deletes=set(), context=_ctx())
+
+    assert await repo.get_active_tags_for_workflow("wpid_a", ORG_ID) == {"env": "dev"}
+    assert [row.key for row in await repo.list_tag_keys(ORG_ID)] == ["env"]
