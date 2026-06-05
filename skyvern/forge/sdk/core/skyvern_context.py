@@ -133,6 +133,12 @@ class SkyvernContext:
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
     # without taking a dependency on the public-API request shape.
     trigger_type: WorkflowRunTriggerType | None = None
+
+    # Screenshot attribution: set by the agent before calling scrape so the
+    # scraper can tag screenshot spans with the originating workflow phase
+    # and whether the LLM will consume the screenshots.
+    scrape_trigger: str | None = None
+    scrape_screenshots_consumed: bool | None = None
     # When true, downstream LLM handler selection may swap the resolved handler to a
     # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
     # OSS keeps it False because OSS has no flex routers registered.
