@@ -45,8 +45,10 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
+    MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
     MissingStarterUrl,
@@ -7293,6 +7295,145 @@ def _parse_single_evaluation(
         return (bool_result, rendered_expression)
 
 
+# Number of times to evaluate the prompt-based conditional branches before giving up.
+# The dominant failure is a transient malformed/under-returned LLM batch; one re-roll
+# recovers most of them while still failing loudly when the model is persistently wrong.
+MAX_PROMPT_BRANCH_EVAL_ATTEMPTS = 2
+
+
+def _build_branch_evaluation_schema(num_branches: int) -> dict[str, Any]:
+    """Strict JSON schema for the batched branch-evaluation LLM call.
+
+    ``additionalProperties: false`` plus a required ``condition_index`` stop the model from
+    injecting hallucinated fields and force one self-identifying result per condition.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evaluations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "condition_index": {
+                            "type": "integer",
+                            "description": (
+                                "The 1-based index of the condition this object evaluates "
+                                "(Condition 1 -> 1, Condition 2 -> 2, ...)."
+                            ),
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Explanation of the reasoning behind evaluating the condition.",
+                        },
+                        "result": {
+                            "type": "boolean",
+                            "description": "TRUE if the condition is satisfied, FALSE otherwise.",
+                        },
+                    },
+                    "required": ["condition_index", "reasoning", "result"],
+                },
+                "description": "Exactly one evaluation per condition, covering condition_index 1..N.",
+                "minItems": num_branches,
+                "maxItems": num_branches,
+            }
+        },
+        "required": ["evaluations"],
+    }
+
+
+def _coerce_condition_index(raw: Any) -> int | None:
+    """Read a 1-based ``condition_index`` the LLM may have typed loosely.
+
+    Accepts ints, integral floats (``2.0``), and digit strings (``"2"``); returns ``None`` for
+    bools (an int subclass that must not read as 0/1) and non-integral/garbage values. The schema
+    is a prompt-level hint, not provider-enforced, so a model that under-returns can equally
+    mistype the index; coercing keeps a loosely-typed index on the order-safe alignment path
+    instead of misrouting via positional fallback.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _align_branch_evaluations(
+    *,
+    output_value: Any,
+    branches: list[BranchCondition],
+    rendered_expressions: list[str],
+) -> tuple[list[bool], list[str], dict[str, Any]]:
+    """Align the LLM evaluations to ``branches``.
+
+    Returns ``(results, rendered_expressions, normalized_output)``, where ``normalized_output``
+    is the evaluations wrapped in a dict for recording/UI. Prefers the LLM-provided 1-based
+    ``condition_index`` (coerced from ints, integral floats, or digit strings): this is order-safe
+    and immune to hallucinated extra entries that would shift positional alignment. Falls back to
+    positional parsing only when no usable index is present and the count matches exactly. A
+    wrong-length or mis-indexed batch is discarded wholesale (never gap-filled) by raising
+    ``MalformedBranchEvaluationError`` so the caller can retry or fail loudly.
+    """
+    n = len(branches)
+
+    if isinstance(output_value, list):
+        output_value = {"evaluations": output_value}
+    if not isinstance(output_value, dict):
+        raise MalformedBranchEvaluationError(f"unexpected output format: {type(output_value)}")
+    try:
+        raw_evaluations = _find_evaluations_array(output_value)
+    except ValueError as exc:
+        raise MalformedBranchEvaluationError(str(exc)) from exc
+
+    by_index: dict[int, Any] = {}
+    saw_condition_index = False
+    for evaluation in raw_evaluations:
+        if not isinstance(evaluation, dict):
+            continue
+        raw_index = _coerce_condition_index(evaluation.get("condition_index"))
+        if raw_index is None:
+            continue
+        saw_condition_index = True
+        if not (1 <= raw_index <= n):
+            continue
+        if raw_index in by_index:
+            raise MalformedBranchEvaluationError(f"duplicate condition_index {raw_index}")
+        by_index[raw_index] = evaluation
+
+    if saw_condition_index:
+        if set(by_index.keys()) != set(range(1, n + 1)):
+            raise MalformedBranchEvaluationError(f"condition_index set {sorted(by_index.keys())} does not cover 1..{n}")
+        ordered: list[Any] = [by_index[i] for i in range(1, n + 1)]
+    else:
+        # Legacy path (no condition_index): the LLM occasionally appends reasoning=None
+        # placeholder entries. Strip them and accept only when the remainder is exactly N.
+        well_formed = [e for e in raw_evaluations if not (isinstance(e, dict) and e.get("reasoning") is None)]
+        ordered = well_formed if len(well_formed) == n else list(raw_evaluations)
+        if len(ordered) != n:
+            raise MalformedBranchEvaluationError(f"returned {len(ordered)} results for {n} branches")
+
+    results_array: list[bool] = []
+    llm_rendered_expressions: list[str] = []
+    for idx, evaluation in enumerate(ordered):
+        bool_result, rendered_expr = _parse_single_evaluation(
+            evaluation=evaluation,
+            idx=idx,
+            fallback_rendered_expressions=rendered_expressions,
+        )
+        results_array.append(bool_result)
+        llm_rendered_expressions.append(rendered_expr)
+    return results_array, llm_rendered_expressions, output_value
+
+
 # Pattern to find Jinja template blocks like {{ variable_name }}
 _JINJA_BLOCK_RE = re.compile(r"\{\{(.*?)\}\}")
 # Marker inserted into rendered expressions when a Jinja variable resolved to
@@ -7522,63 +7663,52 @@ async def _evaluate_prompt_branch_conditions_batch(
         context_json=context_json,
     )
 
-    data_schema = {
-        "type": "object",
-        "properties": {
-            "evaluations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "reasoning": {
-                            "type": "string",
-                            "description": "Explanation of the reasoning behind evaluating the condition.",
-                        },
-                        "result": {
-                            "type": "boolean",
-                            "description": "TRUE if the condition is satisfied, FALSE otherwise.",
-                        },
-                    },
-                    "required": ["reasoning", "result"],
-                },
-                "description": "Array of evaluation results for each condition in the same order.",
-                "minItems": len(branches),
-                "maxItems": len(branches),
-            }
-        },
-        "required": ["evaluations"],
-    }
+    data_schema = _build_branch_evaluation_schema(len(branches))
 
     desc_suffix = extraction_description_suffix or f"{len(branches)} conditions"
-    prompt_branch_eval_id = generate_random_string()
-    output_param = OutputParameter(
-        output_parameter_id=str(uuid.uuid4()),
-        key=f"prompt_branch_eval_{prompt_branch_eval_id}",
-        workflow_id=workflow_id,
-        created_at=datetime.now(),
-        modified_at=datetime.now(),
-        parameter_type=ParameterType.OUTPUT,
-        description=f"Conditional branch evaluation results ({desc_suffix})",
-    )
-    extraction_block = ExtractionBlock(
-        label=f"prompt_branch_eval_{prompt_branch_eval_id}",
-        data_extraction_goal=extraction_goal,
-        data_schema=data_schema,
-        output_parameter=output_param,
-    )
 
-    LOG.info(
-        "Conditional branch ExtractionBlock created (batched)",
-        block_label=log_label,
-        prompt_branch_eval_id=prompt_branch_eval_id,
-        num_conditions=len(branches),
-        extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-        has_browser_session=browser_session_id is not None,
-        has_any_pure_natlang=has_any_pure_natlang,
-        has_context=context_json is not None,
-    )
+    last_malformed: MalformedBranchEvaluationError | None = None
+    for attempt in range(MAX_PROMPT_BRANCH_EVAL_ATTEMPTS):
+        # Vary the goal on retries so the extraction cache key (which includes
+        # data_extraction_goal) changes and we get a genuine re-roll instead of replaying
+        # the malformed cached result that just failed validation.
+        attempt_goal = extraction_goal
+        if attempt > 0:
+            attempt_goal = (
+                f"{extraction_goal}\n\n"
+                f"Re-evaluation attempt {attempt + 1}: return exactly {len(branches)} results, "
+                f"one object per numbered condition, each tagged with its condition_index."
+            )
 
-    try:
+        prompt_branch_eval_id = generate_random_string()
+        output_param = OutputParameter(
+            output_parameter_id=str(uuid.uuid4()),
+            key=f"prompt_branch_eval_{prompt_branch_eval_id}",
+            workflow_id=workflow_id,
+            created_at=datetime.now(),
+            modified_at=datetime.now(),
+            parameter_type=ParameterType.OUTPUT,
+            description=f"Conditional branch evaluation results ({desc_suffix})",
+        )
+        extraction_block = ExtractionBlock(
+            label=f"prompt_branch_eval_{prompt_branch_eval_id}",
+            data_extraction_goal=attempt_goal,
+            data_schema=data_schema,
+            output_parameter=output_param,
+        )
+
+        LOG.info(
+            "Conditional branch ExtractionBlock created (batched)",
+            block_label=log_label,
+            prompt_branch_eval_id=prompt_branch_eval_id,
+            num_conditions=len(branches),
+            attempt=attempt,
+            extraction_goal_preview=attempt_goal[:500] if attempt_goal else None,
+            has_browser_session=browser_session_id is not None,
+            has_any_pure_natlang=has_any_pure_natlang,
+            has_context=context_json is not None,
+        )
+
         extraction_result = await extraction_block.execute(
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
@@ -7587,22 +7717,45 @@ async def _evaluate_prompt_branch_conditions_batch(
         )
 
         if not extraction_result.success:
+            # Extraction-level failures already retry at the step level inside the task;
+            # surface them immediately rather than re-rolling the whole batch.
             LOG.error(
                 "Conditional branch ExtractionBlock failed",
                 block_label=log_label,
                 failure_reason=extraction_result.failure_reason,
             )
-            raise ValueError(
+            raise ConditionalBranchEvaluationError(
                 f"Branch evaluation failed: "
                 f"{extraction_result.failure_reason or 'Unknown error (no failure reason provided)'}"
             )
 
+        raw_output_value = extraction_result.output_parameter_value
+        try:
+            results_array, llm_rendered_expressions, normalized_output = _align_branch_evaluations(
+                output_value=raw_output_value,
+                branches=branches,
+                rendered_expressions=rendered_expressions,
+            )
+        except MalformedBranchEvaluationError as malformed:
+            last_malformed = malformed
+            LOG.warning(
+                "Conditional branch evaluation output malformed",
+                block_label=log_label,
+                attempt=attempt,
+                will_retry=attempt + 1 < MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
+                error=str(malformed),
+                raw_output=raw_output_value,
+            )
+            continue
+
+        # Record the output parameter only for the attempt we actually accept, so a failed
+        # attempt's payload never lands in the workflow context when a later attempt succeeds.
         if workflow_run_context:
             try:
                 await extraction_block.record_output_parameter_value(
                     workflow_run_context=workflow_run_context,
                     workflow_run_id=workflow_run_id,
-                    value=extraction_result.output_parameter_value,
+                    value=normalized_output,
                 )
             except Exception:
                 LOG.warning(
@@ -7612,66 +7765,23 @@ async def _evaluate_prompt_branch_conditions_batch(
                     exc_info=True,
                 )
 
-        output_value = extraction_result.output_parameter_value
-
-        results_array: list[bool] = []
-        llm_rendered_expressions: list[str] = []
-
-        if isinstance(output_value, list):
-            output_value = {"evaluations": output_value}
-
-        if not isinstance(output_value, dict):
-            raise ValueError(f"Unexpected output format: {type(output_value)}")
-
-        raw_evaluations = _find_evaluations_array(output_value)
-
-        # LLM sometimes splits compound criteria into per-clause sub-evaluations, emitting
-        # reasoning=None placeholder entries for each. Strip them and recover if the remainder
-        # matches len(branches); otherwise fall through to the existing hard-fail.
-        if len(raw_evaluations) > len(branches):
-            well_formed = [e for e in raw_evaluations if not (isinstance(e, dict) and e.get("reasoning") is None)]
-            if len(well_formed) == len(branches):
-                LOG.warning(
-                    "LLM returned extra placeholder evaluations; using well-formed subset",
-                    block_label=log_label,
-                    total_returned=len(raw_evaluations),
-                    well_formed_count=len(well_formed),
-                    num_branches=len(branches),
-                )
-                raw_evaluations = well_formed
-
-        for idx, evaluation in enumerate(raw_evaluations):
-            bool_result, rendered_expr = _parse_single_evaluation(
-                evaluation=evaluation,
-                idx=idx,
-                fallback_rendered_expressions=rendered_expressions,
-            )
-            results_array.append(bool_result)
-            llm_rendered_expressions.append(rendered_expr)
-
         LOG.info(
             "Conditional branch evaluation results",
             block_label=log_label,
             results=results_array,
             llm_rendered_expressions=llm_rendered_expressions,
-            raw_output=output_value,
+            attempt=attempt,
+            raw_output=normalized_output,
         )
+        return (results_array, llm_rendered_expressions, extraction_goal, normalized_output)
 
-        if len(results_array) != len(branches):
-            raise ValueError(
-                f"Conditional branch evaluation returned {len(results_array)} results for {len(branches)} branches"
-            )
-
-        return (results_array, llm_rendered_expressions, extraction_goal, output_value)
-
-    except Exception as exc:
-        LOG.error(
-            "Conditional branch evaluation failed",
-            block_label=log_label,
-            error=str(exc),
-            exc_info=True,
-        )
-        raise ValueError(f"Conditional branch evaluation failed: {str(exc)}") from exc
+    LOG.error(
+        "Conditional branch evaluation failed after retries",
+        block_label=log_label,
+        attempts=MAX_PROMPT_BRANCH_EVAL_ATTEMPTS,
+        error=str(last_malformed),
+    )
+    raise ConditionalBranchEvaluationError(f"Conditional branch evaluation failed: {last_malformed}")
 
 
 class ConditionalBlock(Block):
