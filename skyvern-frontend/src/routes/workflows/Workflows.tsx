@@ -54,6 +54,7 @@ import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog"
 import { ViewAllFoldersDialog } from "./components/ViewAllFoldersDialog";
 import { WorkflowFolderSelector } from "./components/WorkflowFolderSelector";
 import { HighlightText } from "./components/HighlightText";
+import { navigateToBlankAgentEditor } from "./blankAgentNavigation";
 import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
 import { useFoldersQuery } from "./hooks/useFoldersQuery";
 import { useActiveImportsPolling } from "./hooks/useActiveImportsPolling";
@@ -68,7 +69,6 @@ import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { useKeywordSearch } from "./hooks/useKeywordSearch";
 import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { Folder } from "./types/folderTypes";
-import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
 
 // Utility function to create URL-safe folder slugs from folder names
 function slugifyFolderName(name: string): string {
@@ -507,12 +507,8 @@ function Workflows() {
             />
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
-                <Button disabled={createWorkflowMutation.isPending}>
-                  {createWorkflowMutation.isPending ? (
-                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                  ) : (
-                    <PlusIcon className="mr-2 h-4 w-4" />
-                  )}
+                <Button>
+                  <PlusIcon className="mr-2 h-4 w-4" />
                   Create
                   <ChevronDownIcon className="ml-2 h-4 w-4" />
                 </Button>
@@ -520,10 +516,9 @@ function Workflows() {
               <DropdownMenuContent align="end">
                 <DropdownMenuItem
                   onSelect={() => {
-                    createWorkflowMutation.mutate({
-                      ...defaultWorkflowRequest,
-                      folder_id: selectedFolderId,
-                      _via: "blank",
+                    navigateToBlankAgentEditor(navigate, {
+                      via: "blank",
+                      folderId: selectedFolderId,
                     });
                   }}
                 >

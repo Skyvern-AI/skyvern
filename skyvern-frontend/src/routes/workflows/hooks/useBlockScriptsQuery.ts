@@ -1,6 +1,7 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
+import { isDraftWorkflowPermanentId } from "../draftWorkflow";
 import { ScriptBlocksResponse } from "../types/scriptTypes";
 
 type Props = {
@@ -49,7 +50,8 @@ function useBlockScriptsQuery({
       }
       return Math.max(2000, pollIntervalMs);
     },
-    enabled: !!workflowPermanentId,
+    enabled:
+      !!workflowPermanentId && !isDraftWorkflowPermanentId(workflowPermanentId),
   });
 }
 
