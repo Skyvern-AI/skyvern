@@ -73,13 +73,6 @@ async def get_llm_handler_for_prompt_type(
     llm_config_name = config[prompt_type]
     try:
         handler = LLMAPIHandlerFactory.get_llm_api_handler(llm_config_name)
-        LOG.info(
-            "Using LLM handler for prompt type from experiment",
-            prompt_type=prompt_type,
-            llm_config_name=llm_config_name,
-            distinct_id=distinct_id,
-            organization_id=organization_id,
-        )
         return handler
     except Exception:
         LOG.error(

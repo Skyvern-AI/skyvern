@@ -106,10 +106,8 @@ class VertexCacheManager:
             # Check if still valid
             expire_time = datetime.fromisoformat(cache_data["expireTime"].replace("Z", "+00:00"))
             if expire_time > datetime.now(expire_time.tzinfo):
-                LOG.info("Reusing existing cache", cache_key=cache_key, cache_name=cache_data["name"])
                 return cache_data
             else:
-                LOG.info("Cache expired, creating new one", cache_key=cache_key)
                 # Clean up expired cache
                 try:
                     self.delete_cache(cache_key)
