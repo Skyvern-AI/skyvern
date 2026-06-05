@@ -1,11 +1,11 @@
 import { Button } from "@/components/ui/button";
-import { PlusIcon, ReloadIcon } from "@radix-ui/react-icons";
-import { useCreateWorkflowMutation } from "./hooks/useCreateWorkflowMutation";
+import { PlusIcon } from "@radix-ui/react-icons";
+import { useNavigate } from "react-router-dom";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
-import { defaultWorkflowRequest } from "./defaultWorkflowRequest";
+import { navigateToBlankAgentEditor } from "./blankAgentNavigation";
 
 function WorkflowsPageBanner() {
-  const createNewWorkflowMutation = useCreateWorkflowMutation();
+  const navigate = useNavigate();
 
   return (
     <div className="space-y-8 bg-slate-elevation1 p-12">
@@ -15,16 +15,11 @@ function WorkflowsPageBanner() {
       <div className="flex justify-center gap-4">
         <ImportWorkflowButton />
         <Button
-          disabled={createNewWorkflowMutation.isPending}
           onClick={() => {
-            createNewWorkflowMutation.mutate(defaultWorkflowRequest);
+            navigateToBlankAgentEditor(navigate, { via: "banner" });
           }}
         >
-          {createNewWorkflowMutation.isPending ? (
-            <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <PlusIcon className="mr-2 h-4 w-4" />
-          )}
+          <PlusIcon className="mr-2 h-4 w-4" />
           Create Agent
         </Button>
       </div>
