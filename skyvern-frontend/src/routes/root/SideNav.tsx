@@ -13,6 +13,7 @@ import {
   PersonIcon,
   PlusIcon,
   ReaderIcon,
+  ReloadIcon,
   Share1Icon,
 } from "@radix-ui/react-icons";
 
@@ -31,10 +32,10 @@ import {
   SidebarTreeNav,
   type SidebarNavItem,
 } from "@/components/SidebarTreeNav";
-import { navigateToBlankAgentEditor } from "@/routes/workflows/blankAgentNavigation";
+import { defaultWorkflowRequest } from "@/routes/workflows/defaultWorkflowRequest";
+import { useCreateWorkflowMutation } from "@/routes/workflows/hooks/useCreateWorkflowMutation";
 import { shouldDefaultRecipesOpen } from "./sidebarDefaults";
 import { usePostHog } from "posthog-js/react";
-import { useNavigate } from "react-router-dom";
 
 const recipeAnalyticsByPath: Record<string, { beta: boolean; badge?: string }> =
   {
@@ -54,7 +55,7 @@ type Props = {
 };
 
 function SideNav({ collapsed }: Props = {}) {
-  const navigate = useNavigate();
+  const createWorkflowMutation = useCreateWorkflowMutation();
   const postHog = usePostHog();
   const captureRecipeClick = (label: string, to: string) => {
     const analytics = recipeAnalyticsByPath[to] ?? { beta: false };
@@ -80,11 +81,22 @@ function SideNav({ collapsed }: Props = {}) {
       icon: <LightningBoltIcon className="size-4" />,
       children: [
         {
-          label: "New Agent",
-          icon: <PlusIcon className="size-3.5" />,
+          label: createWorkflowMutation.isPending ? "Creating..." : "New Agent",
+          icon: createWorkflowMutation.isPending ? (
+            <ReloadIcon className="size-3.5 animate-spin" />
+          ) : (
+            <PlusIcon className="size-3.5" />
+          ),
           onClick: () => {
-            navigateToBlankAgentEditor(navigate, { via: "sidebar" });
+            if (createWorkflowMutation.isPending) {
+              return;
+            }
+            createWorkflowMutation.mutate({
+              ...defaultWorkflowRequest,
+              _via: "sidebar",
+            });
           },
+          disabled: createWorkflowMutation.isPending,
         },
         {
           label: "All Agents",

@@ -2,7 +2,6 @@ import { getClient } from "@/api/AxiosClient";
 import { DebugSessionApiResponse } from "@/api/types";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import { isDraftWorkflowPermanentId } from "../draftWorkflow";
 
 interface Opts {
   workflowPermanentId?: string;
@@ -18,10 +17,9 @@ function useDebugSessionQuery({
   const credentialGetter = useCredentialGetter();
 
   const baseEnabled =
-    (enabled !== undefined
+    enabled !== undefined
       ? enabled && !!workflowPermanentId
-      : !!workflowPermanentId) &&
-    !isDraftWorkflowPermanentId(workflowPermanentId);
+      : !!workflowPermanentId;
 
   return useQuery<DebugSessionApiResponse>({
     queryKey: ["debugSession", workflowPermanentId],

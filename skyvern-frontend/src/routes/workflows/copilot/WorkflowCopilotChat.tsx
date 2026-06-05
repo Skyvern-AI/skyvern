@@ -10,13 +10,9 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { isDraftWorkflowPermanentId } from "@/routes/workflows/draftWorkflow";
 import { ReloadIcon, Cross2Icon, ChevronDownIcon } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
-import {
-  useWorkflowHasChangesStore,
-  useWorkflowSave,
-} from "@/store/WorkflowHasChangesStore";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -391,7 +387,6 @@ export function WorkflowCopilotChat({
   const { workflowRunId, workflowPermanentId } = useParams();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
-  const saveWorkflowMutation = useWorkflowSave();
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
   const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
@@ -858,23 +853,6 @@ export function WorkflowCopilotChat({
         });
         return;
       }
-      let persistedWorkflow: WorkflowApiResponse | null = null;
-      if (isDraftWorkflowPermanentId(workflowPermanentId)) {
-        if (saveWorkflowMutation.isPending) {
-          return;
-        }
-        try {
-          const saveResult = await saveWorkflowMutation.mutateAsync();
-          if (!saveResult) {
-            return;
-          }
-          persistedWorkflow = saveResult.createdWorkflow;
-        } catch {
-          return;
-        }
-      }
-      const activeWorkflowPermanentId =
-        persistedWorkflow?.workflow_permanent_id ?? workflowPermanentId;
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
@@ -938,11 +916,10 @@ export function WorkflowCopilotChat({
 
       try {
         const saveData = getSaveData();
-        const workflowId =
-          persistedWorkflow?.workflow_id ?? saveData?.workflow.workflow_id;
+        const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
 
-        if (!workflowId || !activeWorkflowPermanentId) {
+        if (!workflowId) {
           toast({
             title: "Missing agent",
             description: "Agent ID is required to chat.",
@@ -1152,7 +1129,7 @@ export function WorkflowCopilotChat({
           "/workflow/copilot/chat-post",
           {
             workflow_id: workflowId,
-            workflow_permanent_id: activeWorkflowPermanentId,
+            workflow_permanent_id: workflowPermanentId,
             workflow_copilot_chat_id: workflowCopilotChatId,
             workflow_run_id: workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
@@ -1272,7 +1249,6 @@ export function WorkflowCopilotChat({
       liveBrowserSessionId,
       requiresLiveBrowser,
       updateQueuedPrompt,
-      saveWorkflowMutation,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
