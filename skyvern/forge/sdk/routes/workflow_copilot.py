@@ -1629,7 +1629,9 @@ async def _new_copilot_chat_post(
                 )
                 return
 
-            copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
+            copilot_config = (
+                await app.AGENT_FUNCTION.get_copilot_config_for_request(organization.organization_id)
+            ) or CopilotConfig()
 
             # Spawn the cancel watcher only after the chat row exists; cancels
             # that land during pre-agent setup are not user-cancellable

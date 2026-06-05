@@ -26,7 +26,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -1192,7 +1192,14 @@ class AgentFunction:
 
     def get_copilot_config(self) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
-        return None
+        return CopilotConfig(
+            block_authoring_policy=block_authoring_policy_from_code_only_mode(settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE)
+        )
+
+    async def get_copilot_config_for_request(self, organization_id: str | None = None) -> CopilotConfig | None:
+        """Return a request-scoped workflow copilot config override."""
+        del organization_id
+        return self.get_copilot_config()
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.
