@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 from agents.agent import AgentBase
@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.loop_detection import (
     detect_failed_tool_step_loop_for_ctx,
     detect_tool_loop,
@@ -38,6 +39,9 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+
+if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.context import CopilotContext
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -60,6 +64,13 @@ class SchemaOverlay:
 
 LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
+
+
+def _hide_code_only_tool(ctx: CopilotContext, tool_name: str) -> bool:
+    return (
+        normalize_block_authoring_policy(ctx.block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and tool_name == "validate_block"
+    )
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
@@ -140,7 +151,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._context_provider = context_provider
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
-        self._cached_tools: list[MCPTool] | None = None
+        self._cached_raw_tools: list[MCPTool] | None = None
 
     @property
     def name(self) -> str:
@@ -159,27 +170,30 @@ class SkyvernOverlayMCPServer(MCPServer):
             await self._exit_stack.__aexit__(None, None, None)
         self._client = None
         self._exit_stack = None
-        self._cached_tools = None
+        self._cached_raw_tools = None
 
     async def list_tools(
         self,
         run_context: RunContextWrapper[Any] | None = None,
         agent: AgentBase | None = None,
     ) -> list[MCPTool]:
-        if self._cached_tools is not None:
-            return self._cached_tools
-
         if not self._client:
             raise RuntimeError("Not connected — call connect() first")
 
-        raw_tools = await self._client.list_tools()
+        if self._cached_raw_tools is None:
+            self._cached_raw_tools = await self._client.list_tools()
+        raw_tools = self._cached_raw_tools
         result: list[MCPTool] = []
+        copilot_ctx = self._context_provider()
 
         for tool in raw_tools:
             if tool.name not in self._allowlist:
                 continue
 
             copilot_name = self._reverse_alias.get(tool.name, tool.name)
+            if _hide_code_only_tool(copilot_ctx, copilot_name):
+                continue
+
             overlay = self._overlays.get(copilot_name, SchemaOverlay())
 
             schema = _apply_schema_overlay(tool.inputSchema, overlay)
@@ -192,7 +206,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                     inputSchema=schema,
                 )
             )
-        self._cached_tools = result
         return result
 
     async def call_tool(
