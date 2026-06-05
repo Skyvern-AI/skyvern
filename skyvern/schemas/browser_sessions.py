@@ -5,6 +5,7 @@ from skyvern.client.types.workflow_definition_yaml_parameters_item import Workfl
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
+from skyvern.services.browser_recording.types import RecordingDraftStep
 
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 24  # 24 hours
@@ -61,6 +62,10 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
     workflow_permanent_id: str = Field(
         default="no-such-wpid",
         description="Permanent ID of the workflow associated with the browser session recording.",
+    )
+    draft_steps: list[RecordingDraftStep] | None = Field(
+        default=None,
+        description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
     )
 
 

@@ -292,6 +292,7 @@ async def process_recording(
         browser_session_id=browser_session_id,
         compressed_chunks=recording_request.compressed_chunks,
         workflow_permanent_id=recording_request.workflow_permanent_id,
+        draft_steps=recording_request.draft_steps,
     )
 
     return ProcessBrowserSessionRecordingResponse(blocks=blocks, parameters=parameters)
