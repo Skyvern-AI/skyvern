@@ -114,6 +114,10 @@ const saveData = {
 
 vi.mock("@/store/WorkflowHasChangesStore", () => ({
   useWorkflowHasChangesStore: () => ({ getSaveData: () => saveData }),
+  useWorkflowSave: () => ({
+    isPending: false,
+    mutateAsync: vi.fn(),
+  }),
 }));
 
 import { WorkflowCopilotChat } from "./WorkflowCopilotChat";

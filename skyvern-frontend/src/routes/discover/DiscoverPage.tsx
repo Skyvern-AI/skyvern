@@ -1,15 +1,14 @@
 import { useFeatureFlag } from "@/hooks/useFeatureFlag";
 import { PromptBox } from "../tasks/create/PromptBox";
 import { WorkflowTemplates } from "./WorkflowTemplates";
-import { useCreateWorkflowMutation } from "../workflows/hooks/useCreateWorkflowMutation";
 import { Button } from "@/components/ui/button";
-import { ReloadIcon } from "@radix-ui/react-icons";
-import { defaultWorkflowRequest } from "../workflows/defaultWorkflowRequest";
+import { useNavigate } from "react-router-dom";
+import { navigateToBlankAgentEditor } from "../workflows/blankAgentNavigation";
 
 function DiscoverPage() {
   const enableCopilotHandoff =
     useFeatureFlag("ENABLE_DISCOVER_COPILOT_HANDOFF") === true;
-  const createWorkflowMutation = useCreateWorkflowMutation();
+  const navigate = useNavigate();
 
   return (
     <div className="space-y-10">
@@ -20,17 +19,10 @@ function DiscoverPage() {
             variant="ghost"
             size="sm"
             className="text-slate-400 hover:text-slate-200"
-            disabled={createWorkflowMutation.isPending}
             onClick={() =>
-              createWorkflowMutation.mutate({
-                ...defaultWorkflowRequest,
-                _via: "blank",
-              })
+              navigateToBlankAgentEditor(navigate, { via: "blank" })
             }
           >
-            {createWorkflowMutation.isPending && (
-              <ReloadIcon className="mr-2 h-3 w-3 animate-spin" />
-            )}
             Skip — start with blank canvas →
           </Button>
         </div>

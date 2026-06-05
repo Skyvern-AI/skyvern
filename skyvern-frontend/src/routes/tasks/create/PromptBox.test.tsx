@@ -170,14 +170,7 @@ describe("PromptBox", () => {
     expect(body.request.url).toBe("https://google.com");
   });
 
-  test("hands Discover prompts to workflow copilot with agent execution", async () => {
-    mockPost.mockResolvedValue({
-      data: {
-        workflow_permanent_id: "wpid_copilot",
-        workflow_definition: { blocks: [] },
-      },
-    });
-
+  test("hands Discover prompts to the draft builder without creating an agent", async () => {
     renderPromptBox(true);
 
     fireEvent.change(screen.getByPlaceholderText("Enter your prompt..."), {
@@ -185,16 +178,16 @@ describe("PromptBox", () => {
     });
     fireEvent.click(screen.getByLabelText("submit-prompt"));
 
-    await waitFor(() => expect(mockPost).toHaveBeenCalledTimes(1));
-    const call = mockPost.mock.calls[0];
-    expect(call).toBeDefined();
-    const [path, yaml] = call!;
-
-    expect(path).toBe("/workflows");
-    expect(yaml).toContain("run_with: agent");
-    expect(yaml).not.toContain("run_with: code");
-    expect(mockNavigate).toHaveBeenCalledWith("/workflows/wpid_copilot/build", {
-      state: { copilotMessage: "Build this workflow" },
-    });
+    await waitFor(() => expect(mockPost).not.toHaveBeenCalled());
+    expect(mockNavigate).toHaveBeenCalledWith(
+      "/workflows/new/build?via=copilot",
+      {
+        state: {
+          copilotMessage: "Build this workflow",
+          draftTitle: "Build this workflow",
+          draftRunWith: "agent",
+        },
+      },
+    );
   });
 });
