@@ -38,7 +38,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
@@ -128,6 +128,39 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
 _USER_MESSAGE_PREVIEW_MAX_CHARS = 40
+
+_CODE_ONLY_BROWSER_AUTHORING_PROMPT = """
+ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
+
+Browser/page workflow block types are unavailable in this mode: `navigation`,
+`action`, `login`, `extraction`, `goto_url`, `validation`, `file_download`,
+`file_upload`, `print_page`, `task`, `task_v2`, and `browser_task`.
+
+If a durable step touches the browser page or browser session, author it as a
+focused `code` block. Allowed non-browser helper blocks remain available when
+they do not directly interact with the browser page, such as `conditional`,
+`for_loop`, `while_loop`, `send_email`, S3/Google Sheets helpers, and workflow
+triggers.
+
+Do not call `validate_block`, do not create dummy/probe code blocks, and do not
+call `get_run_results` before a real workflow run exists.
+
+Code block runtime facts:
+- `code` is async Python executed with a Playwright `page` object and workflow
+  parameters available by key.
+- Workflow parameter keys that are valid Python identifiers are available as
+  local variables. Normalize them with locals such as
+  `name = str(person_name).strip()` before using them in page inputs.
+- Use deterministic, bounded Playwright calls such as `await page.goto(...)`,
+  `await page.click(...)`, `await page.fill(...)`, `await page.press(...)`,
+  `await page.wait_for_load_state(...)`, and `await page.evaluate(...)`.
+- For extraction blocks, return precise JSON-safe structured data and the
+  visible evidence text used to confirm it. Do not return only booleans for
+  visible records, products, totals, confirmations, or identifiers.
+- For multi-line code in workflow YAML, always use a YAML block scalar
+  (`code: |`). Never include placeholder text such as `[... truncated ...]`;
+  pass complete workflow YAML to update tools.
+"""
 
 
 @runtime_checkable
@@ -414,13 +447,16 @@ def _build_system_prompt(
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-    return prompt_engine.load_prompt(
+    prompt = prompt_engine.load_prompt(
         template=template,
         workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=datetime.now(timezone.utc).isoformat(),
         tool_usage_guide=tool_usage_guide,
         security_rules=copilot_config.security_rules,
     )
+    if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        prompt = f"{prompt}\n\n{_CODE_ONLY_BROWSER_AUTHORING_PROMPT.strip()}"
+    return prompt
 
 
 def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
@@ -2749,6 +2785,7 @@ async def _run_copilot_turn_impl(
         turn_id=turn_id,
         turn_index=turn_index,
         prior_block_count=prior_block_count,
+        block_authoring_policy=copilot_config.block_authoring_policy,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
