@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import structlog
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -341,3 +341,108 @@ class TagsRepository(BaseRepository):
             await session.commit()
             await session.refresh(row)
             return row
+
+    @db_operation("count_active_workflows_per_key")
+    async def count_active_workflows_per_key(self, organization_id: str) -> dict[str, int]:
+        """Map of tag key -> number of workflows currently carrying it. The
+        partial UNIQUE guarantees one active SET per (workflow, key), so a plain
+        row count per key already equals the distinct-workflow count."""
+        async with self.Session() as session:
+            stmt = (
+                select(WorkflowTagEventModel.key, func.count(WorkflowTagEventModel.tag_event_id))
+                .where(
+                    and_(
+                        WorkflowTagEventModel.organization_id == organization_id,
+                        WorkflowTagEventModel.superseded_at.is_(None),
+                        WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                        WorkflowTagEventModel.deleted_at.is_(None),
+                    )
+                )
+                .group_by(WorkflowTagEventModel.key)
+            )
+            rows = await session.execute(stmt)
+            return {key: count for key, count in rows.all()}
+
+    @db_operation("delete_tag_key")
+    async def delete_tag_key(
+        self,
+        organization_id: str,
+        key: str,
+        context: TagWriteContext,
+    ) -> int | None:
+        """Cascade-delete a tag key: write a DELETE event for every workflow that
+        currently has it, then soft-delete the registry row. Returns the number
+        of workflows the tag was removed from, or None when the key is not
+        registered (caller should 404). Idempotent: a second call returns None.
+
+        DELETE events don't match the SET-only partial UNIQUE, so superseding the
+        SET and inserting the DELETE in one transaction needs no flush ordering.
+
+        Accepted race (mirrors the soft-cap tolerance in apply_tag_changes): a
+        concurrent apply of the same key can insert a fresh active SET after this
+        method reads the active set, leaving that tag active while the registry
+        row is soft-deleted — i.e. a tag present on a workflow but absent from
+        /tag-keys. It is not data loss (the tag still resolves on the workflow)
+        and self-heals on the next apply (which re-registers the key via the
+        deleted_at IS NULL partial unique). Serializing delete-vs-SET would need
+        dialect-specific row/advisory locking, which is disproportionate for a
+        rare manual admin action.
+
+        Scale note: this loads the key's active SET rows into the session and
+        iterates in Python. Fine for realistic key fan-out (a key on at most a
+        few hundred workflows) and a one-off admin action; if a key ever spans
+        thousands of workflows, switch to a bulk UPDATE (supersede) + batched
+        INSERT for the DELETE events to avoid the ORM round-trip."""
+        now = datetime.now(timezone.utc)
+        async with self.Session() as session:
+            key_row = (
+                await session.execute(
+                    select(TagKeyModel).where(
+                        and_(
+                            TagKeyModel.organization_id == organization_id,
+                            TagKeyModel.key == key,
+                            TagKeyModel.deleted_at.is_(None),
+                        )
+                    )
+                )
+            ).scalar_one_or_none()
+            if key_row is None:
+                return None
+
+            active_sets = (
+                (
+                    await session.execute(
+                        select(WorkflowTagEventModel).where(
+                            and_(
+                                WorkflowTagEventModel.organization_id == organization_id,
+                                WorkflowTagEventModel.key == key,
+                                WorkflowTagEventModel.superseded_at.is_(None),
+                                WorkflowTagEventModel.event_type == TagEventType.SET.value,
+                                WorkflowTagEventModel.deleted_at.is_(None),
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            for existing in active_sets:
+                existing.superseded_at = now
+                session.add(
+                    WorkflowTagEventModel(
+                        workflow_permanent_id=existing.workflow_permanent_id,
+                        organization_id=organization_id,
+                        key=key,
+                        value=None,
+                        event_type=TagEventType.DELETE.value,
+                        set_at=now,
+                        set_by=context.caller_id,
+                        source=context.source.value,
+                        caller_type=context.caller_type.value if context.caller_type else None,
+                    )
+                )
+
+            key_row.deleted_at = now
+            await session.commit()
+            return len(active_sets)

@@ -137,6 +137,16 @@ class TagKey(BaseModel):
 
     key: str
     description: str | None = None
+    # Number of workflows currently carrying this tag. Powers the dropdown count
+    # and the delete-key confirmation ("removes it from N workflows").
+    workflow_count: int = 0
+
+
+class TagKeyDeleteResponse(BaseModel):
+    """Response for ``DELETE /v1/tag-keys/{key}``."""
+
+    key: str
+    removed_from_workflow_count: int
 
 
 class TagKeyUpdate(BaseModel):
