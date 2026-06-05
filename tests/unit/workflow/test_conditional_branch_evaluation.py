@@ -6,12 +6,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import skyvern.forge.sdk.workflow.models.block as block_module
+from skyvern.exceptions import ConditionalBranchEvaluationError
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.workflow.models.block import (
     BranchCondition,
     BranchEvaluationContext,
     ConditionalBlock,
     PromptBranchCriteria,
+    _build_branch_evaluation_schema,
+    _coerce_condition_index,
     _make_empty_params_explicit,
 )
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter
@@ -439,7 +442,7 @@ async def test_extraction_failure_with_none_reason_produces_informative_error() 
         )
         mock_extraction_cls.return_value = mock_extraction
 
-        with pytest.raises(ValueError, match="Unknown error"):
+        with pytest.raises(ConditionalBranchEvaluationError, match="Unknown error"):
             await block._evaluate_prompt_branches(
                 branches=[branch],
                 evaluation_context=evaluation_context,
@@ -472,7 +475,7 @@ async def test_extraction_failure_with_reason_preserves_original_message() -> No
         )
         mock_extraction_cls.return_value = mock_extraction
 
-        with pytest.raises(ValueError, match="LLM rate limited"):
+        with pytest.raises(ConditionalBranchEvaluationError, match="LLM rate limited"):
             await block._evaluate_prompt_branches(
                 branches=[branch],
                 evaluation_context=evaluation_context,
@@ -558,7 +561,7 @@ async def test_extra_evals_not_recovered_when_well_formed_count_does_not_match()
         mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
         mock_extraction_cls.return_value = mock_extraction
 
-        with pytest.raises(ValueError, match="3 results for 1 branches"):
+        with pytest.raises(ConditionalBranchEvaluationError, match="3 results for 1 branches"):
             await block._evaluate_prompt_branches(
                 branches=[branch],
                 evaluation_context=evaluation_context,
@@ -629,3 +632,322 @@ def test_prompt_template_includes_count_and_atomicity_for_compound_conditions() 
 
     # Wording-coupled: if rephrased, confirm the replacement still conveys atomicity.
     assert "split" in rendered_one.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests for condition_index alignment + malformed-batch retry (SKY-10682)
+# ---------------------------------------------------------------------------
+
+
+def _two_branch_block() -> ConditionalBlock:
+    return ConditionalBlock(
+        label="cond",
+        output_parameter=_output_parameter("out"),
+        branch_conditions=[
+            BranchCondition(criteria=PromptBranchCriteria(expression="condition A"), next_block_label="a"),
+            BranchCondition(criteria=PromptBranchCriteria(expression="condition B"), next_block_label="b"),
+        ],
+    )
+
+
+def _no_context() -> BranchEvaluationContext:
+    ctx = BranchEvaluationContext(workflow_run_context=None, template_renderer=lambda expr: expr)
+    ctx.build_llm_safe_context_snapshot = MagicMock(return_value={})  # type: ignore[method-assign]
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_condition_index_alignment_is_order_independent() -> None:
+    """Evaluations carrying condition_index must align by index, not position, so a
+    reversed-order LLM response still maps each result to the correct branch."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    # Returned out of order: condition 2 first (True), then condition 1 (False).
+    raw_evals = [
+        {"condition_index": 2, "reasoning": "B", "result": True},
+        {"condition_index": 1, "reasoning": "A", "result": False},
+    ]
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]  # branch 0 (index 1) -> False, branch 1 (index 2) -> True
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_unindexed_entry_does_not_misroute() -> None:
+    """A hallucinated extra entry WITHOUT a condition_index (the shape that shifted
+    positional alignment in SKY-10682) must be ignored; indexed entries align to the
+    correct branches instead of misrouting."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    raw_evals = [
+        {"reasoning": "hallucinated off-topic text", "result": True},  # junk, no condition_index
+        {"condition_index": 1, "reasoning": "A", "result": False},
+        {"condition_index": 2, "reasoning": "B", "result": True},
+    ]
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_under_return_retries_then_succeeds() -> None:
+    """The SKY-10682 failure shape: the LLM returns fewer results than branches on the
+    first attempt, then a clean response on retry. The batch must retry and succeed
+    rather than failing the whole run."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    first = _extraction_result(block.output_parameter, [{"condition_index": 1, "reasoning": "A", "result": False}])
+    second = _extraction_result(
+        block.output_parameter,
+        [
+            {"condition_index": 1, "reasoning": "A", "result": False},
+            {"condition_index": 2, "reasoning": "B", "result": True},
+        ],
+    )
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(side_effect=[first, second])
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]
+    assert mock_extraction.execute.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_under_return_fails_loudly_after_retries_exhausted() -> None:
+    """If every attempt returns a malformed batch, the evaluation must fail loudly
+    (raise) rather than silently routing to a default/wrong branch."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    bad = _extraction_result(block.output_parameter, [{"condition_index": 1, "reasoning": "A", "result": False}])
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=bad)
+        mock_extraction_cls.return_value = mock_extraction
+
+        with pytest.raises(ConditionalBranchEvaluationError):
+            await block._evaluate_prompt_branches(
+                branches=branches,
+                evaluation_context=_no_context(),
+                workflow_run_id="wr",
+                workflow_run_block_id="wrb",
+                organization_id="org",
+            )
+        assert mock_extraction.execute.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_retry_varies_extraction_goal_for_true_reroll() -> None:
+    """On retry the extraction goal must differ from the first attempt so the extraction
+    cache key (which includes data_extraction_goal) changes and we get a genuine re-roll
+    instead of replaying a cached malformed result (SKY-10682)."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    bad = _extraction_result(block.output_parameter, [{"condition_index": 1, "reasoning": "A", "result": False}])
+    good = _extraction_result(
+        block.output_parameter,
+        [
+            {"condition_index": 1, "reasoning": "A", "result": False},
+            {"condition_index": 2, "reasoning": "B", "result": True},
+        ],
+    )
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(side_effect=[bad, good])
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    goals = [call.kwargs["data_extraction_goal"] for call in mock_extraction_cls.call_args_list]
+    assert len(goals) == 2
+    assert goals[0] != goals[1]
+
+
+@pytest.mark.asyncio
+async def test_branch_eval_schema_is_strict_and_indexed() -> None:
+    """The data_schema must require condition_index and forbid extra keys
+    (additionalProperties: false) so the LLM cannot inject hallucinated fields like the
+    off-topic `including` key seen in production (SKY-10682)."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    good = _extraction_result(
+        block.output_parameter,
+        [
+            {"condition_index": 1, "reasoning": "A", "result": False},
+            {"condition_index": 2, "reasoning": "B", "result": True},
+        ],
+    )
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=good)
+        mock_extraction_cls.return_value = mock_extraction
+
+        await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    schema = mock_extraction_cls.call_args.kwargs["data_schema"]
+    item_schema = schema["properties"]["evaluations"]["items"]
+    assert item_schema["additionalProperties"] is False
+    assert "condition_index" in item_schema["properties"]
+    assert "condition_index" in item_schema["required"]
+
+
+def test_prompt_template_requests_condition_index() -> None:
+    rendered = prompt_engine.load_prompt(
+        "conditional-prompt-branch-evaluation",
+        conditions=["A", "B"],
+        context_json=None,
+    )
+    assert "condition_index" in rendered
+
+
+def test_build_branch_evaluation_schema_is_strict_and_indexed() -> None:
+    schema = _build_branch_evaluation_schema(3)
+    evaluations = schema["properties"]["evaluations"]
+    assert evaluations["minItems"] == 3
+    assert evaluations["maxItems"] == 3
+    item = evaluations["items"]
+    assert item["additionalProperties"] is False
+    assert item["required"] == ["condition_index", "reasoning", "result"]
+    assert schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_string_condition_index_out_of_order_aligns_by_index() -> None:
+    """The schema requests an integer condition_index but isn't provider-enforced, so the model
+    may type it as a string. Out of order, positional alignment would misroute; digit strings must
+    coerce to int and stay on the index-aligned path (SKY-10682)."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    raw_evals = [
+        {"condition_index": "2", "reasoning": "B", "result": True},
+        {"condition_index": "1", "reasoning": "A", "result": False},
+    ]
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_float_condition_index_out_of_order_aligns_by_index() -> None:
+    """An integral-float condition_index (e.g. 2.0) must align by index too, not fall back to
+    positional ordering, which would misroute on a reversed batch (SKY-10682)."""
+    block = _two_branch_block()
+    branches = [c for c in block.branch_conditions if not c.is_default]
+
+    raw_evals = [
+        {"condition_index": 2.0, "reasoning": "B", "result": True},
+        {"condition_index": 1.0, "reasoning": "A", "result": False},
+    ]
+    with (
+        patch("skyvern.forge.sdk.workflow.models.block.prompt_engine.load_prompt", return_value="goal"),
+        patch("skyvern.forge.sdk.workflow.models.block.ExtractionBlock") as mock_extraction_cls,
+    ):
+        mock_extraction = MagicMock()
+        mock_extraction.execute = AsyncMock(return_value=_extraction_result(block.output_parameter, raw_evals))
+        mock_extraction_cls.return_value = mock_extraction
+
+        results, _, _, _ = await block._evaluate_prompt_branches(
+            branches=branches,
+            evaluation_context=_no_context(),
+            workflow_run_id="wr",
+            workflow_run_block_id="wrb",
+            organization_id="org",
+        )
+
+    assert results == [False, True]
+
+
+def test_coerce_condition_index_handles_loose_types() -> None:
+    assert _coerce_condition_index(2) == 2
+    assert _coerce_condition_index(2.0) == 2
+    assert _coerce_condition_index("2") == 2
+    assert _coerce_condition_index("  3 ") == 3
+    # bool is an int subclass but is never a valid index
+    assert _coerce_condition_index(True) is None
+    assert _coerce_condition_index(False) is None
+    # non-integral / unparseable values are rejected
+    assert _coerce_condition_index(2.5) is None
+    assert _coerce_condition_index("two") is None
+    assert _coerce_condition_index("") is None
+    assert _coerce_condition_index(None) is None
