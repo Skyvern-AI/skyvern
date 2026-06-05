@@ -99,6 +99,7 @@ from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
 from skyvern.forge.sdk.experimentation.screenshot_downscale import resolve_screenshot_downscale_for_context
+from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -2811,6 +2812,8 @@ class ForgeAgent:
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
         prompt_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
 
+        slim_output = await get_slim_output_template_value(template_name)
+
         # SKY-9718 Layer 1: gate the lean recipe on the PostHog flag at the
         # call site. complete_verify only needs the visual page state to
         # decide is_complete / is_terminate / continue — no element-id refs,
@@ -2827,6 +2830,7 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion,
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
+            slim_output=slim_output,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             without_screenshots=not llm_screenshots_enabled,
             html_need_skyvern_attrs=False,
@@ -3458,11 +3462,12 @@ class ForgeAgent:
         complete_criterion: str | None,
         enriched_tree_enabled: bool = False,
         llm_screenshots_enabled: bool = True,
+        slim_output: str | None = None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria) do not reuse
-        the same Vertex cache object.
+        differ meaningfully (OTP, close-page availability, complete criteria, slim output)
+        do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
@@ -3477,6 +3482,8 @@ class ForgeAgent:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
             variant_parts.append(f"cc{digest}")
+        if slim_output:
+            variant_parts.append(f"slim_{slim_output}")
         return "-".join(variant_parts) if variant_parts else "std"
 
     async def _create_vertex_cache_for_task(
@@ -3692,6 +3699,8 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
 
+        slim_output = await get_slim_output_template_value(template)
+
         # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
         # This prevents extract-action cache from being attached to other prompts like decisive-criterion-validate.
         context.cached_static_prompt = None
@@ -3767,6 +3776,7 @@ class ForgeAgent:
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                     "llm_screenshots_enabled": llm_screenshots_enabled,
                     "enriched_tree_enabled": enriched_tree_enabled,
+                    "slim_output": slim_output,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
@@ -3774,6 +3784,7 @@ class ForgeAgent:
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    slim_output=slim_output,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3863,6 +3874,7 @@ class ForgeAgent:
             recent_dialog_messages_str=recent_dialog_messages_str,
             llm_screenshots_enabled=llm_screenshots_enabled,
             enriched_tree_enabled=enriched_tree_enabled,
+            slim_output=slim_output,
             lean_compress_long_href=False,
             lean_compress_image_src=context.enable_lean_element_tree,
             lean_strip_url_query_strings=context.enable_lean_element_tree,

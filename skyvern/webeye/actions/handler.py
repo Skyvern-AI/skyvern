@@ -78,6 +78,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import PendingFileChooserListener, ensure_context
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
@@ -1451,6 +1452,7 @@ async def handle_sequential_click_for_dropdown(
     # rendered. Gate lean on the PostHog flag.
     _ctx = skyvern_context.current()
     lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
+    slim_output = await get_slim_output_template_value("check-user-goal")
     prompt = load_prompt_with_elements(
         element_tree_builder=scraped_page_after_open,
         prompt_engine=prompt_engine,
@@ -1460,6 +1462,7 @@ async def handle_sequential_click_for_dropdown(
         new_elements_ids=new_element_ids,
         without_screenshots=True,
         action_history=action_history_str,
+        slim_output=slim_output,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
         lean_compress_long_href=lean_enabled,
         lean_compress_image_src=lean_enabled,
@@ -3711,6 +3714,7 @@ async def choose_auto_completion_dropdown(
             )
             html = scraped_page_after_open.build_element_tree()
 
+        slim_output = await get_slim_output_template_value("auto-completion-choose-option")
         auto_completion_confirm_prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
@@ -3721,6 +3725,7 @@ async def choose_auto_completion_dropdown(
             elements=html,
             new_elements_ids=new_interactable_element_ids,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            slim_output=slim_output,
         )
         LOG.info("Confirm if it's an auto completion dropdown")
         json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
@@ -4083,6 +4088,7 @@ async def discover_and_select_from_full_dropdown(
         new_element_ids = [e.get("id", "") for e in cleaned_elements if e.get("id")]
 
         field_information = context.field if not context.intention else context.intention
+        slim_output = await get_slim_output_template_value("auto-completion-choose-option")
         prompt = prompt_engine.load_prompt(
             "auto-completion-choose-option",
             is_search=context.is_search_bar,
@@ -4093,6 +4099,7 @@ async def discover_and_select_from_full_dropdown(
             elements=html,
             new_elements_ids=new_element_ids,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
+            slim_output=slim_output,
         )
 
         LOG.info(
@@ -5717,12 +5724,14 @@ async def _get_input_or_select_context(
         except Exception:
             LOG.warning("Failed to get sub element tree, using the original element tree", exc_info=True, path=path)
 
+    slim_output = await get_slim_output_template_value("parse-input-or-select-context")
     prompt = load_prompt_with_elements(
         element_tree_builder=element_tree_builder,
         prompt_engine=prompt_engine,
         template_name="parse-input-or-select-context",
         action_reasoning=action.reasoning,
         element_id=action.element_id,
+        slim_output=slim_output,
     )
     # Use centralized parse-select handler (set at init or via scripts)
     json_response = await app.PARSE_SELECT_LLM_API_HANDLER(

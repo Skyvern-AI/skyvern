@@ -45,6 +45,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
 from skyvern.forge.sdk.experimentation.screenshot_downscale import effective_downscale_height
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
@@ -249,6 +250,14 @@ def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = 
         "enrich_tree_mode": context.enrich_tree_mode.value,
         "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
         "enriched_tree_enabled": context.enriched_tree_enabled(),
+    }
+
+
+def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) -> dict[str, Any]:
+    assigned = context.slim_output_variant_assigned if context else None
+    return {
+        "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
+        "prompt_schema_variant_assigned": assigned,
     }
 
 
@@ -1502,6 +1511,7 @@ class LLMAPIHandlerFactory:
                     image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
@@ -2055,6 +2065,7 @@ class LLMAPIHandlerFactory:
                     image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
@@ -2542,6 +2553,7 @@ class LLMCaller:
                 image_cost=image_cost if image_cost > 0 else None,
                 image_tokens_source=image_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
+                **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
                 **_screenshot_downscale_log_fields(context),
                 **_consume_prompt_breakdown(context),
