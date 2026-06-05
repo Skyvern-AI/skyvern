@@ -58,6 +58,8 @@ import {
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
+import { SpeechInputButton } from "@/components/SpeechInputButton";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -443,6 +445,17 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
+
+  const {
+    isSupported: isSpeechSupported,
+    isListening: isSpeechListening,
+    isHearingSpeech: isSpeechHearing,
+    toggle: toggleSpeech,
+  } = useSpeechToTextField({
+    value: inputValue,
+    onChange: setInputValue,
+    enabled: isOpen && !queuedPrompt,
+  });
 
   const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
     queuedPromptRef.current = next;
@@ -1541,6 +1554,11 @@ export function WorkflowCopilotChat({
       : isWaitingForLiveBrowser
         ? "Live browser is starting. Send now to queue your prompt."
         : null;
+  const inputStatusText = isSpeechListening
+    ? browserStatusText
+      ? `Listening… · ${browserStatusText}`
+      : "Listening…"
+    : browserStatusText;
 
   return (
     <div
@@ -1748,12 +1766,23 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
-        {browserStatusText ? (
-          <div className="mb-2 text-xs text-muted-foreground">
-            {browserStatusText}
+        {inputStatusText ? (
+          <div
+            className="mb-2 text-xs text-muted-foreground"
+            aria-live="polite"
+          >
+            {inputStatusText}
           </div>
         ) : null}
         <div className="flex items-end gap-2">
+          <SpeechInputButton
+            isSupported={isSpeechSupported}
+            isListening={isSpeechListening}
+            isHearingSpeech={isSpeechHearing}
+            disabled={inputDisabled}
+            onToggle={toggleSpeech}
+            className="h-9 w-9"
+          />
           <textarea
             ref={textareaRef}
             placeholder={
