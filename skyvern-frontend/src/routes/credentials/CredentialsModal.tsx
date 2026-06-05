@@ -248,16 +248,23 @@ function CredentialsModal({
     testUrl,
   ]);
 
-  const nameInitializedRef = useRef(false);
+  const formInitializedRef = useRef(false);
 
-  // Set default name when modal opens, or pre-populate fields in edit mode
+  // Initialize the form once per modal open — guarded by a ref so a background
+  // credentials refetch (e.g. the test-completion poll) can't re-run this and
+  // wipe typed values or in-progress test state.
   useEffect(() => {
     if (!isOpen) {
-      nameInitializedRef.current = false;
+      formInitializedRef.current = false;
+      return;
+    }
+
+    if (formInitializedRef.current) {
       return;
     }
 
     if (isEditMode) {
+      formInitializedRef.current = true;
       reset();
       const cred = editingCredential.credential;
       if (editingCredential.tested_url) {
@@ -300,8 +307,8 @@ function CredentialsModal({
       return;
     }
 
-    if (credentials && !nameInitializedRef.current) {
-      nameInitializedRef.current = true;
+    if (credentials) {
+      formInitializedRef.current = true;
       const existingNames = credentials.map((c) => c.name);
       const defaultName = generateDefaultCredentialName(existingNames);
 
