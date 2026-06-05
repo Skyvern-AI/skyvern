@@ -17,6 +17,7 @@ Use this context to understand variable values:
 {{ context_json }}
 {% endif %}
 
-For each condition, provide IN THIS ORDER:
-1. "reasoning": Explain your reasoning for evaluating the condition. Compare the actual values.
-2. "result": The boolean result (true/false) based on the condition.
+Return exactly {{ conditions|length }} evaluation object{{ '' if conditions|length == 1 else 's' }} — one per numbered condition, covering every condition_index from 1 to {{ conditions|length }} exactly once. Do not merge, skip, or add conditions. For each condition, provide IN THIS ORDER:
+1. "condition_index": The 1-based number of the condition this object evaluates (Condition 1 -> 1, Condition 2 -> 2, ...).
+2. "reasoning": Explain your reasoning for evaluating the condition. Compare the actual values.
+3. "result": The boolean result (true/false) based on the condition.
