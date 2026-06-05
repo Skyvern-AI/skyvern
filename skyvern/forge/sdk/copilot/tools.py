@@ -2765,6 +2765,109 @@ def _earliest_invalidated(requested_labels: list[str], invalidated: set[str]) ->
     return None
 
 
+def _clear_runtime_anchor_evidence(copilot_ctx: Any) -> None:
+    # Clears the runtime-anchor *trust* flags only. evidence.current_url /
+    # page_title / workflow_run_id are left intact: an edit does not move the
+    # browser, so they remain accurate observational context — the cleared flags
+    # are what mark that state as no longer verified.
+    evidence = copilot_ctx.workflow_verification_evidence
+    copilot_ctx.verified_prefix_current_url = None
+    evidence.live_page_state_verified = False
+    evidence.verified_from_current_browser_state = False
+    evidence.current_url_observed_after_workflow_run = False
+    evidence.current_url_may_encode_runtime_state = False
+
+
+def _reset_all_verified_trust(copilot_ctx: Any) -> None:
+    evidence = copilot_ctx.workflow_verification_evidence
+    copilot_ctx.verified_prefix_labels = []
+    copilot_ctx.verified_block_outputs = {}
+    copilot_ctx.last_full_workflow_test_ok = False
+    evidence.block_verified = []
+    evidence.full_workflow_verified = False
+    _clear_runtime_anchor_evidence(copilot_ctx)
+
+
+def _workflow_parameters_changed(prior_definition: object | None, new_definition: object | None) -> bool:
+    new_by_key = {getattr(p, "key", None): p for p in (getattr(new_definition, "parameters", None) or [])}
+    prior_by_key = {getattr(p, "key", None): p for p in (getattr(prior_definition, "parameters", None) or [])}
+    # Any added or removed parameter is a change: a block may reference a key by
+    # template without a config edit, so an added/removed key can alter behavior
+    # the block-diff alone won't catch. Pure reordering is ignored (keyed access).
+    if set(prior_by_key) != set(new_by_key):
+        return True
+    for key, prior_param in prior_by_key.items():
+        try:
+            if _stable_parameter_fingerprint(prior_param) != _stable_parameter_fingerprint(new_by_key[key]):
+                return True
+        except Exception:
+            LOG.debug("Parameter fingerprint comparison failed on edit", exc_info=True)
+            return True
+    return False
+
+
+def _invalidate_verified_state_on_edit(
+    copilot_ctx: Any,
+    prior_definition: object | None,
+    new_definition: object | None,
+) -> None:
+    evidence = copilot_ctx.workflow_verification_evidence
+    if new_definition is None:
+        # An unknown new definition can't be reconciled against; fail closed.
+        if copilot_ctx.verified_prefix_labels or evidence.block_verified:
+            _reset_all_verified_trust(copilot_ctx)
+        return
+    prior_labels = _workflow_definition_block_labels(prior_definition)
+    trusted = set(copilot_ctx.verified_prefix_labels or []) | set(evidence.block_verified or [])
+
+    invalidated: set[str] = set()
+    if trusted:
+        # No reconcilable prior, or a parameter change that could alter any
+        # block's behavior — fail closed rather than reuse unproven trust.
+        if prior_definition is None or _workflow_parameters_changed(prior_definition, new_definition):
+            _reset_all_verified_trust(copilot_ctx)
+            return
+        # Diff the full prior chain, not just trusted labels, so a change to an
+        # unverified upstream block still propagates to downstream trusted ones.
+        full_order = list(prior_labels)
+        for label in list(copilot_ctx.verified_prefix_labels or []) + list(evidence.block_verified or []):
+            if label not in full_order:
+                full_order.append(label)
+        try:
+            invalidated = _find_invalidated_labels(prior_definition, new_definition, full_order) & trusted
+        except Exception:
+            LOG.debug("Verified-state invalidation diff failed on edit", exc_info=True)
+            _reset_all_verified_trust(copilot_ctx)
+            return
+
+    if invalidated:
+        copilot_ctx.verified_prefix_labels = [
+            label for label in copilot_ctx.verified_prefix_labels if label not in invalidated
+        ]
+        for label in invalidated:
+            copilot_ctx.verified_block_outputs.pop(label, None)
+        evidence.block_verified = [label for label in evidence.block_verified if label not in invalidated]
+        # The recorded prefix-end URL came from a run that included a now-invalid
+        # block, so it is no longer a safe runtime anchor for a re-run.
+        _clear_runtime_anchor_evidence(copilot_ctx)
+
+    # The kept prefix must still be a contiguous leading run of the new workflow;
+    # a reorder or upstream insertion breaks that (set-membership trust is
+    # order-blind), so fail closed when it no longer is.
+    current_labels = _workflow_definition_block_labels(new_definition)
+    remaining = list(copilot_ctx.verified_prefix_labels or [])
+    if remaining and remaining != current_labels[: len(remaining)]:
+        _reset_all_verified_trust(copilot_ctx)
+        return
+
+    # The end-to-end claim survives only an identical block list whose every block
+    # is still verified, so append/removal/reorder/config edits all drop it.
+    verified = set(remaining) | set(evidence.block_verified or [])
+    if not (current_labels == prior_labels and all(label in verified for label in current_labels)):
+        evidence.full_workflow_verified = False
+        copilot_ctx.last_full_workflow_test_ok = False
+
+
 def _nearest_upstream_state_establisher(
     requested_labels: list[str], target_label: str, new_definition: object | None
 ) -> str | None:
@@ -5547,7 +5650,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
     }
 
 
-def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> None:
+def _record_workflow_update_result(
+    copilot_ctx: Any, result: dict[str, Any], prior_definition: object | None = None
+) -> None:
     if not (result.get("ok") and "_workflow" in result):
         return
 
@@ -5574,6 +5679,8 @@ def _record_workflow_update_result(copilot_ctx: Any, result: dict[str, Any]) -> 
     # workflow itself changes — without this clear, a user who fixes the bug
     # via update_workflow gets a LOOP DETECTED on the next legitimate run.
     clear_failed_step_tracker_for_tools_in_ctx(copilot_ctx, BLOCK_RUNNING_TOOLS)
+
+    _invalidate_verified_state_on_edit(copilot_ctx, prior_definition, getattr(wf, "workflow_definition", None))
 
 
 def _last_update_is_single_goto_bootstrap(copilot_ctx: CopilotContext) -> bool:
@@ -6483,13 +6590,14 @@ async def update_workflow_tool(
         sanitized = sanitize_tool_result_for_llm("update_workflow", result)
         return json.dumps(sanitized)
 
+    prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
             {**arguments, "raw_block_observation_refs": block_observation_refs},
             copilot_ctx,
             allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
         )
-        _record_workflow_update_result(copilot_ctx, result)
+        _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
@@ -6824,7 +6932,7 @@ async def update_and_run_blocks_tool(
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
         )
-        _record_workflow_update_result(copilot_ctx, update_result)
+        _record_workflow_update_result(copilot_ctx, update_result, prior_definition)
 
     if not update_result.get("ok"):
         record_tool_step_result_for_ctx(copilot_ctx, "update_and_run_blocks", arguments, update_result)
@@ -6889,29 +6997,10 @@ async def update_and_run_blocks_tool(
         )
         return json.dumps(skip_result)
 
-    # Step 2: Compute frontier and run the blocks
+    # Step 2: Compute frontier and run the blocks.
     new_definition = None
     if copilot_ctx.last_workflow is not None:
         new_definition = getattr(copilot_ctx.last_workflow, "workflow_definition", None)
-
-    # YAML-diff-based invalidation: drop any verified-prefix entries whose
-    # block config changed (or are downstream of a change) BEFORE the next
-    # run plans the frontier. This is the only point where we shrink verified
-    # state — failed runs leave it intact so subsequent edits can still use
-    # the optimization. On append-only diffs this is a no-op.
-    if prior_definition is not None and new_definition is not None and copilot_ctx.verified_prefix_labels:
-        try:
-            edit_invalidated = _find_invalidated_labels(
-                prior_definition, new_definition, list(copilot_ctx.verified_prefix_labels)
-            )
-        except Exception:
-            edit_invalidated = set()
-        if edit_invalidated:
-            for label in edit_invalidated:
-                copilot_ctx.verified_block_outputs.pop(label, None)
-            copilot_ctx.verified_prefix_labels = [
-                label for label in copilot_ctx.verified_prefix_labels if label not in edit_invalidated
-            ]
 
     labels_to_execute, block_outputs_to_seed, frontier_start_label = _plan_frontier(
         copilot_ctx, block_labels, prior_definition, new_definition
