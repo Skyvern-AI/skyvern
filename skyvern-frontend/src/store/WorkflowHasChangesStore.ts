@@ -4,10 +4,12 @@ import { create } from "zustand";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { stringify as convertToYAML } from "yaml";
 import { usePostHog } from "posthog-js/react";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 
 import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { isDraftWorkflowPermanentId } from "@/routes/workflows/draftWorkflow";
 import {
   type BlockYAML,
   type ParameterYAML,
@@ -86,6 +88,9 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
   const postHog = usePostHog();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
   const {
     getSaveData,
     saidOkToCodeCacheDeletion,
@@ -100,8 +105,12 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
 
       if (!saveData) {
         setHasChanges(false);
-        return;
+        return null;
       }
+
+      const isDraft = isDraftWorkflowPermanentId(
+        saveData.workflow.workflow_permanent_id,
+      );
 
       const client = await getClient(credentialGetter);
       const extraHttpHeaders: Record<string, string> = {};
@@ -207,11 +216,30 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
         status: opts?.status ?? saveData.workflow.status,
         run_sequentially: saveData.settings.runSequentially,
         sequential_key: saveData.settings.sequentialKey,
+        ...(isDraft && saveData.workflow.folder_id
+          ? { folder_id: saveData.workflow.folder_id }
+          : {}),
       };
 
       const yaml = convertToYAML(requestBody);
 
-      return client.put<string, WorkflowApiResponse>(
+      if (isDraft) {
+        const created = await client.post<
+          string,
+          { data: WorkflowApiResponse }
+        >("/workflows", yaml, {
+          headers: {
+            "Content-Type": "text/plain",
+          },
+        });
+        return {
+          saveData,
+          createdWorkflow: created.data,
+          isDraft: true as const,
+        };
+      }
+
+      const updated = await client.put<string, WorkflowApiResponse>(
         `/workflows/${saveData.workflow.workflow_permanent_id}`,
         yaml,
         {
@@ -225,37 +253,58 @@ const useWorkflowSave = (opts?: WorkflowSaveOpts) => {
           },
         },
       );
+      return { saveData, createdWorkflow: updated, isDraft: false as const };
     },
-    onSuccess: () => {
-      const saveData = getSaveData();
-
-      if (!saveData) {
+    onSuccess: (result) => {
+      if (!result) {
         return;
       }
 
+      const { saveData, createdWorkflow, isDraft } = result;
+      const workflowPermanentId = createdWorkflow.workflow_permanent_id;
+
       postHog.capture("builder.workflow.saved", {
-        org_id: saveData.workflow.organization_id,
-        workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+        org_id:
+          createdWorkflow.organization_id || saveData.workflow.organization_id,
+        workflow_permanent_id: workflowPermanentId,
         block_count: saveData.blocks.length,
         block_types: saveData.blocks.map((b) => b.block_type),
       });
 
       toast({
-        title: "Changes saved",
-        description: "Your changes have been saved",
+        title: isDraft ? "Agent created" : "Changes saved",
+        description: isDraft
+          ? "Your agent has been saved"
+          : "Your changes have been saved",
         variant: "success",
       });
 
-      queryClient.invalidateQueries({
-        queryKey: ["workflow", saveData.workflow.workflow_permanent_id],
-      });
+      if (isDraft) {
+        const via = searchParams.get("via");
+        const nextSearch = via ? `?via=${encodeURIComponent(via)}` : "";
+        navigate(`/workflows/${workflowPermanentId}/build${nextSearch}`, {
+          replace: true,
+          state: location.state,
+        });
+        queryClient.setQueryData(
+          ["workflow", workflowPermanentId],
+          createdWorkflow,
+        );
+      } else {
+        queryClient.invalidateQueries({
+          queryKey: ["workflow", workflowPermanentId],
+        });
+      }
 
       queryClient.invalidateQueries({
         queryKey: ["workflows"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["folders"],
+      });
 
       queryClient.invalidateQueries({
-        queryKey: ["block-scripts", saveData.workflow.workflow_permanent_id],
+        queryKey: ["block-scripts", workflowPermanentId],
       });
 
       setHasChanges(false);

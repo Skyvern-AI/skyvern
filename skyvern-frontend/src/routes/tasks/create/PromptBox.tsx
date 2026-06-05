@@ -1,7 +1,6 @@
 import { getClient } from "@/api/AxiosClient";
 import { Createv2TaskRequest, ProxyLocation } from "@/api/types";
-import { stringify as convertToYAML } from "yaml";
-import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
+import { buildBlankAgentBuildPath } from "@/routes/workflows/blankAgentNavigation";
 import img from "@/assets/promptBoxBg.png";
 import { AutoResizingTextarea } from "@/components/AutoResizingTextarea/AutoResizingTextarea";
 import { CartIcon } from "@/components/icons/CartIcon";
@@ -41,7 +40,9 @@ import {
 import { useAutoplayStore } from "@/store/useAutoplayStore";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import { ImprovePrompt } from "@/components/ImprovePrompt";
+import { SpeechInputButton } from "@/components/SpeechInputButton";
 import { cn } from "@/util/utils";
+import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 
 const exampleCases = [
   {
@@ -115,24 +116,6 @@ function deriveHandoffTitle(prompt: string): string {
   if (!collapsed) return "New Agent";
   if (collapsed.length <= HANDOFF_TITLE_MAX_LEN) return collapsed;
   return `${collapsed.slice(0, HANDOFF_TITLE_MAX_LEN - 1).trimEnd()}…`;
-}
-
-function buildBlankWorkflowRequest(
-  title: string,
-  runWith: "agent" | "code" = "agent",
-): WorkflowCreateYAMLRequest {
-  return {
-    title,
-    description: "",
-    ai_fallback: true,
-    code_version: 2,
-    run_with: runWith,
-    workflow_definition: {
-      version: 2,
-      blocks: [],
-      parameters: [],
-    },
-  };
 }
 
 function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
@@ -247,50 +230,18 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     },
   });
 
-  const handoffWorkflowMutation = useMutation({
-    mutationFn: async ({
-      prompt,
-      runWith,
-    }: {
-      prompt: string;
-      runWith: "agent" | "code";
-    }) => {
-      const client = await getClient(credentialGetter);
-      const yaml = convertToYAML(
-        buildBlankWorkflowRequest(deriveHandoffTitle(prompt), runWith),
-      );
-      const result = await client.post<string, { data: WorkflowApiResponse }>(
-        "/workflows",
-        yaml,
-        {
-          headers: {
-            "Content-Type": "text/plain",
-          },
-        },
-      );
-      return { data: result.data, prompt };
-    },
-    onSuccess: ({ data: workflow, prompt }) => {
-      queryClient.invalidateQueries({ queryKey: ["workflows"] });
-      queryClient.invalidateQueries({ queryKey: ["folders"] });
-      navigate(`/workflows/${workflow.workflow_permanent_id}/build`, {
-        state: { copilotMessage: prompt },
-      });
-    },
-    onError: (error: AxiosError) => {
-      toast({
-        variant: "destructive",
-        title: "Error creating agent",
-        description: error.message,
-      });
-    },
-    onSettled: () => {
-      submitInFlightRef.current = false;
-    },
-  });
+  const isSubmitting = generateWorkflowMutation.isPending;
 
-  const isSubmitting =
-    generateWorkflowMutation.isPending || handoffWorkflowMutation.isPending;
+  const {
+    isSupported: isSpeechSupported,
+    isListening: isSpeechListening,
+    isHearingSpeech: isSpeechHearing,
+    toggle: toggleSpeech,
+  } = useSpeechToTextField({
+    value: prompt,
+    onChange: setPrompt,
+    enabled: !promptImprovalIsPending && !isSubmitting,
+  });
 
   const submitPrompt = ({ prompt }: { prompt: string }) => {
     if (submitInFlightRef.current || isSubmitting) {
@@ -298,7 +249,14 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
     }
     submitInFlightRef.current = true;
     if (enableCopilotHandoff) {
-      handoffWorkflowMutation.mutate({ prompt, runWith: "agent" });
+      navigate(buildBlankAgentBuildPath({ via: "copilot" }), {
+        state: {
+          copilotMessage: prompt,
+          draftTitle: deriveHandoffTitle(prompt),
+          draftRunWith: "agent",
+        },
+      });
+      submitInFlightRef.current = false;
       return;
     }
     generateWorkflowMutation.mutate({ prompt });
@@ -325,6 +283,15 @@ function PromptBox({ enableCopilotHandoff = false }: PromptBoxProps) {
                 },
               )}
             >
+              <SpeechInputButton
+                isSupported={isSpeechSupported}
+                isListening={isSpeechListening}
+                isHearingSpeech={isSpeechHearing}
+                disabled={promptImprovalIsPending || isSubmitting}
+                onToggle={toggleSpeech}
+                className="ml-2 h-9 w-9 border-0 bg-transparent shadow-none hover:bg-muted"
+                iconClassName="h-5 w-5"
+              />
               <AutoResizingTextarea
                 className="min-h-0 resize-none border-0 bg-transparent px-4 py-0 leading-5 text-foreground shadow-none placeholder:text-muted-foreground hover:border-0 focus-visible:ring-0"
                 value={prompt}
