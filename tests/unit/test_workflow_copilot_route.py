@@ -225,6 +225,7 @@ def _setup_new_copilot_mocks(
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
 
     return restore_mock
 
@@ -364,6 +365,7 @@ async def test_flag_on_pre_agent_failure_persists_recoverable_reply(monkeypatch:
     )
     app.AGENT_FUNCTION.get_copilot_security_rules = MagicMock(return_value="")
     app.AGENT_FUNCTION.get_copilot_config = MagicMock(return_value=None)
+    app.AGENT_FUNCTION.get_copilot_config_for_request = AsyncMock(return_value=None)
     app.AGENT_FUNCTION.resolve_org_api_key = AsyncMock(return_value="sk-test-key")
 
     request = MagicMock()

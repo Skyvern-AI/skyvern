@@ -3,8 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from skyvern.config import settings
+
+
+class BlockAuthoringPolicy(StrEnum):
+    STANDARD = "standard"
+    CODE_ONLY_BROWSER = "code_only_browser"
+
+
+def normalize_block_authoring_policy(value: object) -> BlockAuthoringPolicy:
+    if isinstance(value, BlockAuthoringPolicy):
+        return value
+    if isinstance(value, str):
+        try:
+            return BlockAuthoringPolicy(value)
+        except ValueError:
+            return BlockAuthoringPolicy.STANDARD
+    return BlockAuthoringPolicy.STANDARD
+
+
+def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringPolicy:
+    return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
+
 
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 35
@@ -347,6 +369,7 @@ class CopilotConfig:
     security_rules: str = ""
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])
