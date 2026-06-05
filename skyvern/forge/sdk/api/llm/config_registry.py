@@ -475,6 +475,17 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.8_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-8",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
@@ -565,6 +576,17 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-7",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.8_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-4-8",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,
