@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import pathlib
+import re
 import typing as t
 import zlib
 
@@ -26,6 +27,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
     OutputBlock,
+    RecordingDraftStep,
 )
 
 
@@ -60,6 +62,21 @@ LOG = structlog.get_logger(__name__)
 
 # avoid decompression bombs
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
+DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
+
+
+def normalize_recording_block_label(label: str | None, *, fallback: str) -> str:
+    candidate = (label or "").strip()
+    candidate = re.sub(r"\W+", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+
+    if not candidate:
+        return fallback
+
+    if not re.match(r"^[A-Za-z_]", candidate):
+        candidate = f"{fallback}_{candidate}"
+
+    return candidate
 
 
 class Processor:
@@ -202,11 +219,12 @@ class Processor:
         self,
         events: list[ExfiltratedEvent],
         machines: list[sm.StateMachine] | None = None,
+        initial_actions: list[Action] | None = None,
     ) -> list[Action]:
         """
         Convert a list of `ExfiltratedEvent`s into `Action`s.
         """
-        actions: list[Action] = []
+        actions: list[Action] = list(initial_actions or [])
 
         machines = machines or [
             sm.Click(),
@@ -330,6 +348,57 @@ class Processor:
 
         return parameters
 
+    def drafts_to_blocks(self, draft_steps: list[RecordingDraftStep]) -> list[OutputBlock]:
+        """
+        Convert user-editable live recording drafts into workflow definition blocks.
+        """
+        blocks: list[OutputBlock] = []
+
+        for draft_step in draft_steps:
+            match draft_step.block_type:
+                case "action":
+                    block = WorkflowDefinitionYamlBlocksItem_Action(
+                        label=normalize_recording_block_label(draft_step.label, fallback="act"),
+                        title=draft_step.title or DEFAULT_DRAFT_ACTION_TITLE,
+                        navigation_goal=draft_step.navigation_goal or "",
+                        error_code_mapping=None,
+                        parameters=draft_step.parameters,
+                        parameter_keys=draft_step.parameter_keys,
+                    )
+                case "goto_url":
+                    url = (draft_step.url or "").strip()
+                    if not url:
+                        LOG.warning(
+                            "skipping draft goto_url block with empty URL",
+                            draft_step=draft_step.model_dump(mode="json"),
+                            **self.identity,
+                        )
+                        continue
+                    block = WorkflowDefinitionYamlBlocksItem_GotoUrl(
+                        label=normalize_recording_block_label(draft_step.label, fallback="goto_url"),
+                        url=url,
+                    )
+                case "wait":
+                    wait_sec = max(
+                        int(draft_step.wait_sec or 0),
+                        int(ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0),
+                    )
+                    block = WorkflowDefinitionYamlBlocksItem_Wait(
+                        label=normalize_recording_block_label(draft_step.label, fallback="wait"),
+                        wait_sec=wait_sec,
+                    )
+                case _:
+                    LOG.warning(
+                        "skipping unsupported draft block type",
+                        draft_step=draft_step.model_dump(mode="json"),
+                        **self.identity,
+                    )
+                    continue
+
+            blocks.append(block)
+
+        return self.dedupe_block_labels(blocks)
+
     async def create_action_block(self, action: ActionBlockable) -> WorkflowDefinitionYamlBlocksItem_Action:
         """
         Create a YAML action block from an `ActionBlockable`.
@@ -424,11 +493,22 @@ class Processor:
         return block
 
     async def process(
-        self, compressed_chunks: list[str]
+        self,
+        compressed_chunks: list[str],
+        draft_steps: list[RecordingDraftStep] | None = None,
     ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
+        if draft_steps:
+            LOG.info(
+                "record_browser.process_recording_drafts",
+                recording_draft_step_count=len(draft_steps),
+                **self.identity,
+            )
+            blocks = self.drafts_to_blocks(draft_steps)
+            parameters = self.blocks_to_parameters(blocks)
+            return blocks, parameters
 
         events = self.compressed_chunks_to_events(compressed_chunks)
         LOG.info(
@@ -451,6 +531,7 @@ class BrowserSessionRecordingService:
         organization_id: str,
         workflow_permanent_id: str,
         compressed_chunks: list[str],
+        draft_steps: list[RecordingDraftStep] | None = None,
     ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
@@ -461,7 +542,7 @@ class BrowserSessionRecordingService:
             workflow_permanent_id,
         )
 
-        return await processor.process(compressed_chunks)
+        return await processor.process(compressed_chunks, draft_steps=draft_steps)
 
 
 async def smoke() -> None:
