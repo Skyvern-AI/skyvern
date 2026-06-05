@@ -421,6 +421,12 @@ async def scrape_web_unsafe(
             _ss_span.set_attribute("max_screenshot_number", max_screenshot_number)
             _ss_span.set_attribute("draw_boxes", draw_boxes)
             _ss_span.set_attribute("scroll", scroll)
+            _scrape_ctx = skyvern_context.current()
+            if _scrape_ctx:
+                if _scrape_ctx.scrape_trigger:
+                    _ss_span.set_attribute("scrape_trigger", _scrape_ctx.scrape_trigger)
+                if _scrape_ctx.scrape_screenshots_consumed is not None:
+                    _ss_span.set_attribute("screenshots_consumed", _scrape_ctx.scrape_screenshots_consumed)
             try:
                 screenshots = await SkyvernFrame.take_split_screenshots(
                     page=page,

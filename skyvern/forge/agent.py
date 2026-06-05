@@ -2777,6 +2777,12 @@ class ForgeAgent:
             scroll = False
             llm_key_override = None
 
+        _ctx = skyvern_context.current()
+        if _ctx:
+            _ctx.scrape_trigger = "verification"
+            _ctx.scrape_screenshots_consumed = bool(
+                _ctx.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
+            )
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
         actions_and_results_str = ""
@@ -2974,6 +2980,10 @@ class ForgeAgent:
         engine: RunEngine,
         action: Action,
     ) -> None:
+        _span = otel_trace.get_current_span()
+        _span.set_attribute("action_type", str(action.action_type))
+        _span.set_attribute("step_order", step.order if step else -1)
+
         working_page = await browser_state.get_working_page()
         if not working_page:
             raise MissingBrowserStatePage()
@@ -3021,6 +3031,7 @@ class ForgeAgent:
                     apply_context_attrs(_ss_art_span)
                     _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
                     _ss_art_span.set_attribute("bundled", _bundled)
+                    _ss_art_span.set_attribute("action_type", str(action.action_type))
                     if _bundled:
                         ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
                             step=step,
@@ -3291,11 +3302,12 @@ class ForgeAgent:
             if engine not in CUA_ENGINES:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
 
-            # Scrape the web page and get the screenshot and the elements
-            # HACK: try scrape_website three time to handle screenshot timeout
-            # first time: normal scrape to take screenshot
-            # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
-            # third time: reload the page before scraping
+            if context:
+                context.scrape_trigger = "step_body"
+                context.scrape_screenshots_consumed = bool(
+                    context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
+                )
+
             extract_action_prompt = ""
             use_caching = False
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):

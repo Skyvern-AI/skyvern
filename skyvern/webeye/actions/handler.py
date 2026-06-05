@@ -5262,8 +5262,10 @@ async def extract_information_for_navigation_goal(
     identical to a previous call within the same workflow run, reuse the
     prior LLM result instead of paying for another extract-information call.
     """
-    scraped_page_refreshed = await scraped_page.refresh()
     context = ensure_context()
+    context.scrape_trigger = "extraction"
+    context.scrape_screenshots_consumed = True
+    scraped_page_refreshed = await scraped_page.refresh()
 
     # task.workflow_permanent_id is None on most fetch paths (tasks table has
     # no such column); fall back to context. SKY-8992.
