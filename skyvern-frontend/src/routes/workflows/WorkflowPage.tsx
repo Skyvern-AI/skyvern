@@ -44,7 +44,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import CloudContext from "@/store/CloudContext";
-import React, { useContext, useEffect, useState } from "react";
+import React, { useContext, useEffect, useMemo, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -53,6 +53,9 @@ import {
 } from "react-router-dom";
 import { useWorkflowQuery } from "./hooks/useWorkflowQuery";
 import { useWorkflowRunsQuery } from "./hooks/useWorkflowRunsQuery";
+import { useTagKeysQuery } from "./hooks/useTagKeysQuery";
+import { useWorkflowTagsBatchQuery } from "./hooks/useWorkflowTagsBatchQuery";
+import { TagChipList } from "./components/tagging/TagChipList";
 import { WorkflowActions } from "./WorkflowActions";
 import { useDebounce } from "use-debounce";
 import {
@@ -120,6 +123,24 @@ function WorkflowPage() {
     workflowPermanentId,
   });
 
+  const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(
+    workflowPermanentId ? [workflowPermanentId] : [],
+  );
+  const workflowTags = workflowPermanentId
+    ? workflowTagsMap[workflowPermanentId]
+    : undefined;
+  const { data: tagKeys = [] } = useTagKeysQuery();
+  const tagDescriptions = useMemo(
+    () =>
+      new Map(
+        tagKeys.map((tagKey): [string, string | null] => [
+          tagKey.key,
+          tagKey.description,
+        ]),
+      ),
+    [tagKeys],
+  );
+
   useEffect(() => {
     if (!isSearchActive) {
       setAutoExpandedRows([]);
@@ -141,18 +162,29 @@ function WorkflowPage() {
   return (
     <div className="space-y-8">
       <header className="flex justify-between">
-        <div className="flex flex-col gap-2">
-          {workflowIsLoading ? (
-            <>
-              <Skeleton className="h-7 w-56" />
-              <Skeleton className="h-7 w-56" />
-            </>
-          ) : (
-            <>
-              <h1 className="text-lg font-semibold">{workflow?.title}</h1>
-              <h2 className="text-sm">{workflowPermanentId}</h2>
-            </>
-          )}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <div className="flex flex-col gap-2">
+            {workflowIsLoading ? (
+              <>
+                <Skeleton className="h-7 w-56" />
+                <Skeleton className="h-7 w-56" />
+              </>
+            ) : (
+              <>
+                <h1 className="text-lg font-semibold">{workflow?.title}</h1>
+                <h2 className="text-sm">{workflowPermanentId}</h2>
+              </>
+            )}
+          </div>
+          {!workflowIsLoading &&
+          workflowTags &&
+          Object.keys(workflowTags).length > 0 ? (
+            <TagChipList
+              tags={workflowTags}
+              descriptions={tagDescriptions}
+              maxVisible={6}
+            />
+          ) : null}
         </div>
         <div className="flex gap-2">
           {workflow && (
