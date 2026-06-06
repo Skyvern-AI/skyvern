@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_testing,
     initial_build_phase,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 
 
@@ -25,6 +26,7 @@ class _Ctx:
         self.build_phase = phase
         self.discovery_started_monotonic: float | None = None
         self.workflow_permanent_id = "wpid_test"
+        self.block_authoring_policy = BlockAuthoringPolicy.STANDARD
 
 
 def _ti(mode: TurnIntentMode) -> TurnIntent:
