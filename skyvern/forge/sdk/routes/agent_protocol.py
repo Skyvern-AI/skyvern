@@ -2057,6 +2057,10 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+_VIDEO_CONTENT_TYPES_BY_EXTENSION = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+}
 
 
 def _sanitize_header_filename(name: str) -> str:
@@ -2133,9 +2137,16 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     so browsers never render user-supplied content inline (SKY-8862). All other
     types keep the historical ``inline`` behaviour.
     """
-    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    raw_name = _artifact_filename_from_uri(artifact.uri)
+    if artifact.artifact_type == ArtifactType.RECORDING:
+        _, dot, extension = raw_name.lower().rpartition(".")
+        media_type = _VIDEO_CONTENT_TYPES_BY_EXTENSION.get(
+            f"{dot}{extension}" if dot else "",
+            _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT),
+        )
+    else:
+        media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
     if artifact.artifact_type == ArtifactType.DOWNLOAD:
-        raw_name = _artifact_filename_from_uri(artifact.uri)
         return media_type, _build_attachment_disposition(raw_name)
     return media_type, "inline"
 
