@@ -12,7 +12,11 @@ import pytest
 from skyvern.cli.core import session_manager
 from skyvern.cli.core.result import BrowserContext as MCPBrowserContext
 from skyvern.cli.core.session_manager import SessionState, scoped_session
-from skyvern.forge.sdk.copilot.runtime import AgentContext, mcp_to_copilot
+from skyvern.forge.sdk.copilot.runtime import (
+    AgentContext,
+    _mcp_browser_context_for_copilot_session,
+    mcp_to_copilot,
+)
 from skyvern.forge.sdk.copilot.tools import _same_page_ignoring_fragment
 
 
@@ -147,6 +151,27 @@ def test_mcp_to_copilot_error() -> None:
 
 class TestMcpBrowserContextBridge:
     """Bridge-specific behavior of mcp_browser_context."""
+
+    def test_copilot_session_defaults_to_cloud_session_for_server_managed_browser(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+
+        monkeypatch.setattr(runtime.settings, "BROWSER_TYPE", "chromium-headful")
+
+        result = _mcp_browser_context_for_copilot_session("pbs_test")
+
+        assert result == MCPBrowserContext(mode="cloud_session", session_id="pbs_test")
+
+    def test_copilot_session_uses_cdp_for_loopback_cdp_connect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+
+        monkeypatch.setattr(runtime.settings, "BROWSER_TYPE", "cdp-connect")
+        monkeypatch.setattr(runtime.settings, "BROWSER_REMOTE_DEBUGGING_URL", "http://127.0.0.1:9222")
+
+        result = _mcp_browser_context_for_copilot_session("pbs_test")
+
+        assert result == MCPBrowserContext(mode="cdp", session_id="pbs_test", cdp_url="http://127.0.0.1:9222")
 
     def _install_happy_path_mocks(
         self, monkeypatch: pytest.MonkeyPatch

@@ -9,6 +9,7 @@ import pytest
 from jinja2.sandbox import SandboxedEnvironment
 
 from skyvern.forge.sdk.copilot import tools
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FAILED_TEST_NUDGES,
@@ -656,6 +657,103 @@ def test_plan_frontier_edit_read_only_block_still_walks_back_to_anchor() -> None
     labels, _seed, frontier = _plan_frontier(ctx, ["nav", "extract"], old, new)
     assert labels == ["nav", "extract"]
     assert frontier == "nav"
+
+
+def test_plan_frontier_code_only_edited_data_read_suffix_starts_at_edited_block() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_lookup_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_target_record", "code", {"code": "await page.fill('#q', 'sample target')"}),
+            _FakeBlock("expand_matching_results", "code", {"code": "return {'records': ['sample target']}"}),
+            _FakeBlock(
+                "extract_record_details",
+                "code",
+                {"code": "return {'source': {{ expand_matching_results_output }}, 'records': []}"},
+            ),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_lookup_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_target_record", "code", {"code": "await page.fill('#q', 'sample target')"}),
+            _FakeBlock("expand_matching_results", "code", {"code": "return {'records': ['sample target']}"}),
+            _FakeBlock(
+                "extract_record_details",
+                "code",
+                {"code": "return {'source': {{ expand_matching_results_output }}, 'records': [{'number': '1'}]}"},
+            ),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_lookup_page", "search_target_record", "expand_matching_results"]
+    ctx.verified_block_outputs = {"expand_matching_results": {"records": ["sample target"]}}
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open_lookup_page", "search_target_record", "expand_matching_results", "extract_record_details"],
+        old,
+        new,
+    )
+
+    assert labels == ["extract_record_details"]
+    assert seed == {"expand_matching_results": {"records": ["sample target"]}}
+    assert frontier == "extract_record_details"
+
+
+def test_plan_frontier_code_only_edited_page_action_code_walks_back_to_anchor() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("submit_search", "code", {"code": "await page.click('#search')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("submit_search", "code", {"code": "await page.click('#search-now')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_site", "submit_search", "extract_results"]
+    ctx.verified_block_outputs = {"open_site": {"current_url": "https://example.com"}}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["open_site", "submit_search", "extract_results"], old, new)
+
+    assert labels == ["open_site", "submit_search", "extract_results"]
+    assert seed == {}
+    assert frontier == "open_site"
+
+
+def test_code_only_verified_prefix_rewrite_rejects_downstream_repair_churn() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "code", {"code": "await page.goto('https://example.org')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': [{'title': 'sample'}]}"}),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_page", "search_results"]
+
+    error = tools._code_only_verified_prefix_rewrite_error(
+        ctx,
+        prior_definition=old,
+        new_definition=new,
+        requested_labels=["extract_results"],
+    )
+
+    assert error is not None
+    assert "already-verified upstream blocks: open_page" in error
+    assert "`extract_results`" in error
 
 
 def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() -> None:
@@ -1843,6 +1941,249 @@ def test_reorder_resets_verified_trust() -> None:
     assert ctx.verified_block_outputs == {}
     assert ctx.workflow_verification_evidence.full_workflow_verified is False
     assert ctx.last_full_workflow_test_ok is False
+
+
+# --------------------------------------------------------------------------- #
+# Code-only runtime rerun and output evidence                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_code_only_suffix_after_mutating_prefix_verifies_chain_without_replay() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_product", "code", {"code": "await page.fill('#q', 'part')"}),
+            _FakeBlock("add_to_cart", "code", {"code": "await page.click('#add')"}),
+            _FakeBlock("confirm_cart", "code", {"code": "return {'cart': 'ready'}"}),
+        ]
+    )
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.verified_prefix_labels = ["open_site", "search_product", "add_to_cart", "confirm_cart"]
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_suffix",
+                "executed_block_labels": ["confirm_cart"],
+                "blocks": [
+                    {
+                        "label": "confirm_cart",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"cart": "ready"},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.workflow_verification_evidence.full_workflow_verified is True
+
+
+def test_code_only_suffix_run_without_mutating_prefix_does_not_verify_full_workflow() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.verified_prefix_labels = ["open_site", "search_results", "extract_results"]
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_extract",
+                "executed_block_labels": ["extract_results"],
+                "blocks": [
+                    {
+                        "label": "extract_results",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [{"title": "sample result"}]},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert "suffix frontier" in str(ctx.last_test_failure_reason)
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+
+
+def test_code_only_run_result_rejects_non_json_serializable_code_output() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_locator",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": "Object '<class 'playwright.async_api._generated.Locator'>' is not JSON serializable",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "non-JSON-serializable runtime object" in str(ctx.last_test_failure_reason)
+
+
+def test_code_only_run_result_accepts_real_data_with_transient_non_json_locals() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_data",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {
+                            "records": [{"title": "sample result"}],
+                            "debug": (
+                                "Object '<class 'playwright.async_api._generated.Locator'>' is not JSON serializable"
+                            ),
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+
+
+def test_code_only_run_result_rejects_empty_data_read_output() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_empty",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [], "count": 0},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "no meaningful page data" in str(ctx.last_test_failure_reason)
+
+
+def test_code_only_run_result_rejects_missing_requested_structured_detail() -> None:
+    ctx = _make_ctx(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        user_message="Get the matching record number and expiration.",
+    )
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_details",
+                "blocks": [
+                    {
+                        "label": "extract_record_details",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [{"title": "sample result"}]},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "expiration" in str(ctx.last_test_failure_reason)
+    assert "number" in str(ctx.last_test_failure_reason)
+
+
+def test_observed_code_only_url_keeps_cert_failure_repairable() -> None:
+    reason = "Failed to navigate to url https://bad.example/search. Error message: net::ERR_CERT_DATE_INVALID"
+    ctx = _make_ctx(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        observed_browser_urls=["https://bad.example/search"],
+    )
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_cert",
+                "blocks": [{"label": "open_site", "status": "failed", "failure_reason": reason}],
+            },
+        },
+    )
+
+    assert ctx.last_test_non_retriable_nav_error is None
+    assert ctx.last_test_failure_reason == reason
+
+
+def test_observed_standard_url_still_treats_cert_failure_as_non_retriable() -> None:
+    reason = "Failed to navigate to url https://bad.example/search. Error message: net::ERR_CERT_DATE_INVALID"
+    ctx = _make_ctx(observed_browser_urls=["https://bad.example/search"])
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_cert",
+                "blocks": [{"label": "open_site", "status": "failed", "failure_reason": reason}],
+            },
+        },
+    )
+
+    assert ctx.last_test_non_retriable_nav_error == reason
+
+
+def test_code_only_failed_mutating_frontier_blocks_blind_rerun() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.code_only_failed_mutating_frontier_label = "add_exact_product_to_cart"
+
+    result = tools._tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["add_exact_product_to_cart"]})
+
+    assert result is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_code_only_failed_mutation_needs_inspection"
 
 
 if __name__ == "__main__":

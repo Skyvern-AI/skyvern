@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -228,6 +229,121 @@ class TestSchemaOverlay:
 
 
 class TestMCPFailedStepLoopDetection:
+    @pytest.mark.asyncio
+    async def test_code_only_mcp_tool_timeout_returns_structured_error(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class SlowClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> None:
+                del name, args, raise_on_error
+                await asyncio.sleep(10)
+
+        ctx = MagicMock()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"evaluate": SchemaOverlay(timeout=0.001)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = SlowClient()
+
+        result = await server.call_tool("evaluate", {"expression": "document.title"})
+        payload = json.loads(result.content[0].text)
+
+        assert result.isError is True
+        assert payload["ok"] is False
+        assert payload["error"] == "evaluate timed out after 0.001s"
+
+    @pytest.mark.asyncio
+    async def test_standard_mcp_tool_ignores_overlay_timeout(self) -> None:
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class SlowSuccessClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> Any:
+                del name, args, raise_on_error
+                await asyncio.sleep(0.01)
+                return SimpleNamespace(structured_content={"ok": True, "data": {"done": True}}, is_error=False)
+
+        ctx = MagicMock()
+        ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"evaluate": SchemaOverlay(timeout=0.001)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = SlowSuccessClient()
+
+        result = await server.call_tool("evaluate", {"expression": "document.title"})
+        payload = json.loads(result.content[0].text)
+
+        assert result.isError is False
+        assert payload == {"ok": True, "data": {"done": True}}
+
+    @pytest.mark.asyncio
+    async def test_code_only_hides_schema_after_target_evidence_and_schema_seen_but_keeps_browser_tools(
+        self,
+    ) -> None:
+        from mcp import Tool as MCPTool
+
+        from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class FakeClient:
+            async def list_tools(self) -> list[MCPTool]:
+                return [
+                    MCPTool(name="skyvern_evaluate", description="Evaluate", inputSchema={"type": "object"}),
+                    MCPTool(name="skyvern_block_schema", description="Schema", inputSchema={"type": "object"}),
+                    MCPTool(name="skyvern_block_validate", description="Validate", inputSchema={"type": "object"}),
+                ]
+
+        ctx = SimpleNamespace(
+            block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+            workflow_persisted=False,
+            update_workflow_called=False,
+            code_only_target_page_evidence_seen=True,
+            code_only_code_schema_seen=True,
+        )
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={
+                "evaluate": SchemaOverlay(),
+                "get_block_schema": SchemaOverlay(),
+                "validate_block": SchemaOverlay(),
+            },
+            alias_map={
+                "evaluate": "skyvern_evaluate",
+                "get_block_schema": "skyvern_block_schema",
+                "validate_block": "skyvern_block_validate",
+            },
+            allowlist=frozenset({"skyvern_evaluate", "skyvern_block_schema", "skyvern_block_validate"}),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        tools = await server.list_tools()
+
+        assert [tool.name for tool in tools] == ["evaluate"]
+
     @pytest.mark.asyncio
     async def test_browser_tool_call_is_created_inside_copilot_browser_context(
         self, monkeypatch: pytest.MonkeyPatch
