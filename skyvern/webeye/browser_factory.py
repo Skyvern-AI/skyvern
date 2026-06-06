@@ -360,6 +360,10 @@ class BrowserContextFactory:
             ],
             "record_har_path": har_dir,
             "record_video_dir": video_dir,
+            "record_video_size": {
+                "width": settings.BROWSER_WIDTH,
+                "height": settings.BROWSER_HEIGHT,
+            },
             "viewport": {
                 "width": settings.BROWSER_WIDTH,
                 "height": settings.BROWSER_HEIGHT,
@@ -925,6 +929,7 @@ async def _connect_to_cdp_browser(
         )
         browser_context = await browser.new_context(
             record_video_dir=browser_args["record_video_dir"],
+            record_video_size=browser_args["record_video_size"],
             viewport=browser_args["viewport"],
             extra_http_headers=browser_args["extra_http_headers"],
         )
