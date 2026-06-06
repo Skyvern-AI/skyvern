@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any, Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import structlog
 import yaml
@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_discovering,
     advance_to_testing,
 )
+from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
@@ -136,8 +137,8 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, CodeBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
     OutputParameter,
@@ -177,6 +178,16 @@ _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType
 # two in sync when adding a new task-backed type. ``TEXT_PROMPT`` is
 # deliberately excluded: its block.output is the raw LLM response dict (see
 # ``TextPromptBlock.execute``), no envelope to strip.
+_CODE_ONLY_PAGE_URL_PREFIX_GUARD_RE = re.compile(r"\bpage\.url\s*\.startswith\s*\(")
+_CODE_ONLY_URL_ASSIGNMENT_RE = re.compile(
+    r"""(?m)^\s*(?P<name>[A-Za-z_]\w*)\s*=\s*(?P<quote>['"])(?P<url>https?://[^'"]+)(?P=quote)"""
+)
+_CODE_ONLY_PAGE_GOTO_ARG_RE = re.compile(r"\bpage\.goto\s*\(\s*(?P<arg>[^,\)\n]+)")
+_CODE_ONLY_QUOTED_URL_ARG_RE = re.compile(r"""^(?P<quote>['"])(?P<url>https?://[^'"]+)(?P=quote)$""")
+_CODE_BLOCK_MIXED_TEXT_SELECTOR_GROUP_RE = re.compile(
+    r"""\b(?:page\.)?locator\s*\(\s*(?P<quote>['"])(?P<selector>[^'"]*,\s*text\s*=.*?)(?P=quote)""",
+    re.IGNORECASE | re.DOTALL,
+)
 _TASK_ENVELOPE_BLOCK_TYPES = frozenset({"EXTRACTION"})
 assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
     "_TASK_ENVELOPE_BLOCK_TYPES must be a subset of _DATA_PRODUCING_BLOCK_TYPES"
@@ -2220,11 +2231,27 @@ async def _update_workflow(
     if authority_error is not None:
         return {"ok": False, "error": authority_error}
 
-    workflow_yaml = params["workflow_yaml"]
+    workflow_yaml = _normalize_code_only_workflow_yaml_envelope(ctx, params["workflow_yaml"])
+    params["workflow_yaml"] = workflow_yaml
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
+    truncation_error = _workflow_yaml_truncation_placeholder_error(ctx, workflow_yaml)
+    if truncation_error is not None:
+        return {"ok": False, "error": truncation_error}
+    conflict_marker_error = _workflow_yaml_conflict_marker_error(ctx, workflow_yaml)
+    if conflict_marker_error is not None:
+        return {"ok": False, "error": conflict_marker_error}
+    code_security_error = _code_block_security_validation_error(ctx, workflow_yaml)
+    if code_security_error is not None:
+        return {"ok": False, "error": code_security_error}
+    runtime_navigation_guard_error = _code_only_runtime_navigation_guard_error(ctx, workflow_yaml)
+    if runtime_navigation_guard_error is not None:
+        return {"ok": False, "error": runtime_navigation_guard_error}
+    runtime_entrypoint_mismatch_error = _code_only_runtime_entrypoint_mismatch_error(ctx, workflow_yaml)
+    if runtime_entrypoint_mismatch_error is not None:
+        return {"ok": False, "error": runtime_entrypoint_mismatch_error}
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
@@ -2363,6 +2390,11 @@ async def _update_workflow(
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            return {
+                "ok": False,
+                "error": _code_only_yaml_validation_error_message(e),
+            }
         return {
             "ok": False,
             "error": f"Workflow validation failed: {e}",
@@ -4974,8 +5006,9 @@ _COPILOT_BANNED_BLOCK_ALTERNATIVES = (
     "`login` for authentication, or `goto_url` for pure URL navigation."
 )
 _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES = (
-    "Browser/page workflow block types are unavailable in code-only browser mode. Use focused `code` "
-    "blocks for durable page or browser-session work."
+    "Use focused `code` blocks for durable browser/page work. MCP browser tools are only for "
+    "build-time exploration; persist browser behavior as code blocks and test them with "
+    "`update_and_run_blocks`."
 )
 _CODE_ONLY_TARGET_EVIDENCE_KEYS = frozenset(
     {
@@ -5013,6 +5046,401 @@ def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
     return _COPILOT_BANNED_BLOCK_ALTERNATIVES
+
+
+_WORKFLOW_YAML_TRUNCATION_PLACEHOLDERS = (
+    "[... truncated",
+    "... [truncated",
+    "truncated due length",
+    "<truncated>",
+)
+_CODE_ONLY_UNAVAILABLE_LOCAL_HELPER_RE = re.compile(r"\b(?:globals|locals)\s*\(")
+
+
+_CODE_ONLY_ENVELOPE_BODY_KEYS = frozenset({"workflow_definition", "blocks"})
+_CODE_ONLY_ENVELOPE_PREFIX_KEYS = frozenset(
+    {
+        "title",
+        "description",
+        "proxy_location",
+        "persist_browser_session",
+        "browser_profile_id",
+        "model",
+        "max_screenshot_scrolls",
+        "max_elapsed_time_minutes",
+        "webhook_callback_url",
+        "totp_verification_url",
+        "totp_identifier",
+        "extra_http_headers",
+        "cdp_connect_headers",
+        "run_with",
+        "ai_fallback",
+        "cache_key",
+        "adaptive_caching",
+        "code_version",
+        "generate_script_on_terminal",
+        "run_sequentially",
+        "sequential_key",
+        "workflow_definition",
+        "parameters",
+        "blocks",
+    }
+)
+
+
+def _workflow_yaml_truncation_placeholder_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    lowered = workflow_yaml.lower()
+    if not any(placeholder in lowered for placeholder in _WORKFLOW_YAML_TRUNCATION_PLACEHOLDERS):
+        return None
+    return (
+        "Workflow validation failed: workflow_yaml contains a truncation placeholder instead of complete YAML. "
+        "Reconstruct and pass the complete workflow YAML with the full workflow_definition; do not include "
+        "`[... truncated ...]`, `... [truncated]`, or any placeholder text."
+    )
+
+
+def _workflow_yaml_conflict_marker_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if not re.search(r"(?m)^\s*(<<<<<<<|=======|>>>>>>>)", workflow_yaml):
+        return None
+    return (
+        "Workflow validation failed: workflow_yaml contains unresolved conflict markers such as "
+        "`<<<<<<<`, `=======`, or `>>>>>>>`. Reconstruct and pass one complete, valid workflow YAML document. "
+        "Do not include merge/conflict marker text, placeholders, or alternate draft fragments."
+    )
+
+
+def _repair_code_only_misindented_envelope_keys(workflow_yaml: str) -> str:
+    lines = workflow_yaml.splitlines(keepends=True)
+    repaired: list[str] = []
+    body_started = False
+    literal_block_indent: int | None = None
+    changed = False
+    key_pattern = re.compile(r"^(?P<indent>\s+)(?P<key>[A-Za-z_][A-Za-z0-9_]*):(?P<rest>.*)$")
+
+    for line in lines:
+        stripped_line = line.strip()
+        indent_len = len(line) - len(line.lstrip(" "))
+        if literal_block_indent is not None:
+            if stripped_line and indent_len <= literal_block_indent:
+                literal_block_indent = None
+            else:
+                repaired.append(line)
+                continue
+
+        if not body_started:
+            match = key_pattern.match(line)
+            if match and match.group("key") in _CODE_ONLY_ENVELOPE_PREFIX_KEYS:
+                line = line.lstrip(" ")
+                changed = True
+                if match.group("key") in _CODE_ONLY_ENVELOPE_BODY_KEYS:
+                    body_started = True
+
+            unindented = line.lstrip(" ")
+            if re.match(r"^(workflow_definition|blocks):", unindented):
+                body_started = True
+
+        if re.search(r":\s*[>|][+-]?\s*(?:#.*)?$", line.rstrip("\r\n")):
+            literal_block_indent = len(line) - len(line.lstrip(" "))
+
+        repaired.append(line)
+
+    return "".join(repaired) if changed else workflow_yaml
+
+
+def _normalize_code_only_workflow_yaml_envelope(ctx: AgentContext, workflow_yaml: str) -> str:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return workflow_yaml
+    try:
+        loaded = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        repaired_yaml = _repair_code_only_misindented_envelope_keys(workflow_yaml)
+        if repaired_yaml == workflow_yaml:
+            return workflow_yaml
+        try:
+            loaded = yaml.safe_load(repaired_yaml)
+        except yaml.YAMLError:
+            return workflow_yaml
+        workflow_yaml = repaired_yaml
+    if not isinstance(loaded, dict):
+        return workflow_yaml
+    if "workflow_definition" in loaded or not isinstance(loaded.get("blocks"), list):
+        return workflow_yaml
+
+    wrapped = dict(loaded)
+    blocks = wrapped.pop("blocks")
+    parameters = wrapped.pop("parameters", None)
+    workflow_definition: dict[str, Any] = {"blocks": blocks}
+    if parameters is not None:
+        workflow_definition["parameters"] = parameters
+    wrapped["workflow_definition"] = workflow_definition
+    return yaml.safe_dump(wrapped, sort_keys=False)
+
+
+def _code_only_yaml_validation_error_message(error: Exception) -> str:
+    return (
+        f"Workflow validation failed: {error}\n\n"
+        "CODE-ONLY YAML REPAIR: rebuild one complete workflow YAML document and call update_and_run_blocks "
+        "again. Use this top-level shape exactly: `title: ...` then `workflow_definition:` then `blocks:`. "
+        "Do not put `blocks:` at the top level. For every code block, write `code: |` and indent every Python "
+        "line under it; never inline Python control-flow lines such as `try:` or `except Exception:` as YAML "
+        "mapping text. Do not call MCP browser tools to repair YAML syntax."
+    )
+
+
+def _workflow_parameter_keys_from_dict(workflow_definition: Mapping[str, object]) -> set[str]:
+    parameters = workflow_definition.get("parameters")
+    keys: set[str] = set()
+    if not isinstance(parameters, list):
+        return keys
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        key = parameter.get("key")
+        if isinstance(key, str):
+            keys.add(key)
+    return keys
+
+
+def _code_block_security_validation_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    workflow_parameter_keys = _workflow_parameter_keys_from_dict(workflow_definition)
+
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) != "code":
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        try:
+            CodeBlock.is_safe_code(code)
+        except SyntaxError as exc:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` contains invalid Python syntax: {exc.msg} "
+                f"at line {exc.lineno or 'unknown'}. Repair the code before saving."
+            )
+        except InsecureCodeDetected as exc:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` contains sandbox-blocked Python: {exc}. "
+                "Remove unsafe code before saving. Do not write import statements; use the provided sandbox "
+                "helpers directly, for example `re.search(...)`, `json.loads(...)`, `sleep(...)`, or "
+                "`asyncio.sleep(...)` without importing modules."
+            )
+        if _CODE_ONLY_UNAVAILABLE_LOCAL_HELPER_RE.search(code):
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` calls `locals()` or `globals()`, which are "
+                "not available in the code-block sandbox. Build the output from explicitly named scalar, list, "
+                "or dict variables, and clear transient Playwright/runtime objects by assigning those variables "
+                "to `None` before the block ends."
+            )
+        mixed_selector = _CODE_BLOCK_MIXED_TEXT_SELECTOR_GROUP_RE.search(code)
+        if mixed_selector:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            selector = mixed_selector.group("selector")
+            return (
+                f"Workflow validation failed: code block `{label}` mixes CSS selector groups with Playwright "
+                f"text selectors in `{selector}`. Comma grouping only works for CSS selectors; use separate "
+                "locator waits, `page.get_by_text(...)`, `locator('text=...')`, or read body text and check "
+                "strings in Python."
+            )
+        parameter_keys = set(workflow_parameter_keys)
+        block_parameter_keys = block.get("parameter_keys")
+        if isinstance(block_parameter_keys, list):
+            parameter_keys.update(key for key in block_parameter_keys if isinstance(key, str))
+        diagnostics = preflight_code_block(code, parameter_keys=parameter_keys)
+        if diagnostics:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            diagnostic = diagnostics[0]
+            return (
+                f"Workflow validation failed: code block `{label}` failed static preflight "
+                f"({diagnostic.code}): {diagnostic.message}"
+            )
+    return None
+
+
+def _code_only_runtime_navigation_guard_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) != "code":
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        if not _CODE_ONLY_PAGE_URL_PREFIX_GUARD_RE.search(code):
+            continue
+        label = _block_label_from_yaml(block) or "<unlabeled>"
+        return (
+            f"Workflow validation failed: code block `{label}` uses `page.url.startswith(...)` as a runtime "
+            "navigation guard. That is unsafe for search/result pages because submitted/result URLs often share "
+            "the same prefix as the clean form URL, so the block can skip the required `page.goto(...)` from "
+            "stale browser state. Compare the normalized URL exactly, for example "
+            "`if page.url.split('#')[0] != target_url: await page.goto(target_url, ...)`, or always navigate "
+            "to the durable form/search URL at the start of the open block."
+        )
+    return None
+
+
+def _code_only_page_goto_urls(code: str) -> list[str]:
+    assignments: dict[str, str] = {}
+    for match in _CODE_ONLY_URL_ASSIGNMENT_RE.finditer(code):
+        url = _valid_runtime_anchor_url(match.group("url"))
+        if url is not None:
+            assignments[match.group("name")] = url
+
+    urls: list[str] = []
+    for match in _CODE_ONLY_PAGE_GOTO_ARG_RE.finditer(code):
+        arg = match.group("arg").strip()
+        direct_match = _CODE_ONLY_QUOTED_URL_ARG_RE.match(arg)
+        if direct_match:
+            url = _valid_runtime_anchor_url(direct_match.group("url"))
+        else:
+            url = assignments.get(arg)
+        if url is not None:
+            urls.append(url)
+    return urls
+
+
+def _code_only_runtime_entrypoint_mismatch_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+
+    normalized_observed_urls = [url for url in ctx.observed_browser_urls if _valid_runtime_anchor_url(url)]
+    hint = _code_only_runtime_entrypoint_url_hint(normalized_observed_urls)
+    if hint is None:
+        return None
+
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+
+    first_code_block: dict[str, Any] | None = None
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) == "code":
+            first_code_block = block
+            break
+    if first_code_block is None:
+        return None
+
+    code = first_code_block.get("code")
+    if not isinstance(code, str):
+        return None
+    goto_urls = _code_only_page_goto_urls(code)
+    if not goto_urls or any(_same_runtime_page(url, hint) for url in goto_urls):
+        return None
+
+    observed_mismatch = next(
+        (
+            url
+            for url in goto_urls
+            if any(_same_runtime_page(url, observed_url) for observed_url in normalized_observed_urls)
+        ),
+        None,
+    )
+    if observed_mismatch is None:
+        return None
+
+    label = _block_label_from_yaml(first_code_block) or "<unlabeled>"
+    return (
+        f"Workflow validation failed: first code block `{label}` starts runtime navigation from "
+        f"`{observed_mismatch}`, but MCP exploration already observed durable form/search entrypoint `{hint}`. "
+        "In code-only mode, the first open/navigation block must `page.goto(...)` the durable form/search URL "
+        "directly when it is known. Do not spend workflow runtime clicking through a homepage, marketing page, "
+        "submitted-results page, or record-detail page to rediscover the reusable entrypoint."
+    )
+
+
+def _record_observed_browser_url(ctx: AgentContext, url: str) -> None:
+    normalized = _valid_runtime_anchor_url(url)
+    if normalized is None:
+        return
+    observed = list(getattr(ctx, "observed_browser_urls", None) or [])
+    if normalized in observed:
+        observed.remove(normalized)
+    observed.append(normalized)
+    ctx.observed_browser_urls = observed[-20:]
+
+
+def _query_pair_set(url: str) -> frozenset[tuple[str, str]]:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return frozenset()
+    return frozenset((key.lower(), value.lower()) for key, value in parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def _url_without_query(url: str) -> tuple[str, str, str] | None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    return parsed.scheme.lower(), parsed.netloc.lower(), parsed.path
+
+
+def _code_only_runtime_entrypoint_url_hint(observed_urls: list[str]) -> str | None:
+    """Suggest a durable start URL for generated code blocks.
+
+    The observed URL list is recency-ordered, but the latest URL is often a
+    transient result/detail page reached during exploration. For reusable
+    workflows, prefer the earlier form/search URL on the same route.
+    """
+    valid_urls = [url for url in observed_urls if _valid_runtime_anchor_url(url)]
+    if len(valid_urls) < 2:
+        return None
+
+    for index, url in enumerate(valid_urls[:-1]):
+        route = _url_without_query(url)
+        if route is None:
+            continue
+        query_pairs = _query_pair_set(url)
+        for later_url in valid_urls[index + 1 :]:
+            if _url_without_query(later_url) != route:
+                continue
+            later_query_pairs = _query_pair_set(later_url)
+            if query_pairs < later_query_pairs:
+                return url
+    return None
 
 
 def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext | None = None) -> str:
@@ -5077,16 +5505,12 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
         pass
 
 
-def _collect_banned_block_items(
-    blocks: list[Any],
-    banned_types: frozenset[str] | None = None,
-) -> list[tuple[str, str]]:
+def _collect_banned_block_items(blocks: list[Any], banned_types: frozenset[str] | None = None) -> list[tuple[str, str]]:
     """Recursively walk ``blocks`` (mirroring
     :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`)
     and return ``(label, normalized_block_type)`` for every block whose type is
-    in :data:`_COPILOT_BANNED_BLOCK_TYPES`. Blocks missing ``label`` are
-    skipped — the downstream Pydantic validator surfaces those errors on its
-    own."""
+    in the active banned set. Blocks missing ``label`` are skipped — the
+    downstream Pydantic validator surfaces those errors on its own."""
     active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     items: list[tuple[str, str]] = []
     for block in blocks:
@@ -5094,12 +5518,12 @@ def _collect_banned_block_items(
             continue
         raw_type = block.get("block_type")
         if isinstance(raw_type, str):
-            normalized = raw_type.strip().lower()
-            raw_normalized = normalize_copilot_block_type_alias(normalized)
+            raw_normalized = raw_type.strip().lower()
+            normalized = normalize_copilot_block_type_alias(raw_type)
             if normalized in active_banned_types or raw_normalized in active_banned_types:
                 label = block.get("label")
                 if isinstance(label, str):
-                    items.append((label, raw_normalized))
+                    items.append((label, normalized))
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
             items.extend(_collect_banned_block_items(loop_blocks, active_banned_types))
@@ -5151,10 +5575,10 @@ def _detect_new_banned_blocks(
     ``_process_workflow_yaml`` surfaces the specific parse / shape error on
     its own path.
     """
+    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     submitted_blocks = _parse_workflow_blocks(submitted_yaml)
     if submitted_blocks is None:
         return []
-    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     submitted_items = _collect_banned_block_items(submitted_blocks, active_banned_types)
     if not submitted_items:
         return []
@@ -5286,6 +5710,20 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
+    if (
+        _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and normalized == "code"
+        and getattr(ctx, "code_only_code_schema_seen", False)
+        and not getattr(ctx, "workflow_persisted", False)
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "CODE-ONLY READY TO DRAFT: you already have the compact `code` block schema. "
+                "Do not call get_block_schema again before the first draft. Call update_and_run_blocks now "
+                "with the focused code-block chain for the known browser behavior."
+            ),
+        }
     if normalized not in _copilot_banned_block_types(ctx):
         return None
     return {
@@ -5294,10 +5732,7 @@ async def _get_block_schema_pre_hook(
     }
 
 
-async def _validate_block_pre_hook(
-    params: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any] | None:
+def _code_only_validate_block_error(ctx: AgentContext) -> dict[str, Any] | None:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     return {
@@ -5308,6 +5743,13 @@ async def _validate_block_pre_hook(
             "update_and_run_blocks with real focused code blocks that implement the workflow behavior."
         ),
     }
+
+
+async def _validate_block_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _code_only_validate_block_error(ctx)
 
 
 async def _get_block_schema_post_hook(
