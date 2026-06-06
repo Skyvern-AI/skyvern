@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
+    VIDEO_COMPRESSION_ENABLED: bool = True
+    VIDEO_COMPRESSION_CRF: int = 28
+    VIDEO_COMPRESSION_PRESET: str = "veryfast"
+    VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"

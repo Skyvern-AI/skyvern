@@ -482,6 +482,22 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                         organization_id=organization_id,
                     )
 
+            try:
+                await browser_session.browser_state.close()
+            except TargetClosedError:
+                LOG.info(
+                    "Browser context already closed",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.warning(
+                    "Error while closing browser session",
+                    organization_id=organization_id,
+                    session_id=browser_session_id,
+                    exc_info=True,
+                )
+
             if browser_artifacts and browser_artifacts.video_artifacts:
                 for video_artifact in browser_artifacts.video_artifacts:
                     if video_artifact.video_path:
@@ -508,22 +524,6 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             self._browser_sessions.pop(browser_session_id, None)
             if browser_session.cdp_port is not None:
                 _release_cdp_port(browser_session.cdp_port)
-
-            try:
-                await browser_session.browser_state.close()
-            except TargetClosedError:
-                LOG.info(
-                    "Browser context already closed",
-                    organization_id=organization_id,
-                    session_id=browser_session_id,
-                )
-            except Exception:
-                LOG.warning(
-                    "Error while closing browser session",
-                    organization_id=organization_id,
-                    session_id=browser_session_id,
-                    exc_info=True,
-                )
         else:
             LOG.info(
                 "Browser session not found in memory, marking as deleted in database",
