@@ -7,6 +7,7 @@ import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, cast
+from urllib.parse import urlparse
 
 import structlog
 
@@ -24,6 +25,7 @@ from skyvern.cli.core.session_manager import (
     scoped_session,
     unregister_copilot_session,
 )
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -47,6 +49,25 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _is_loopback_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        return (urlparse(url).hostname or "").lower() in _LOOPBACK_HOSTS
+    except Exception:
+        return False
+
+
+def _mcp_browser_context_for_copilot_session(session_id: str) -> MCPBrowserContext:
+    if settings.BROWSER_TYPE == "cdp-connect":
+        cdp_url = settings.BROWSER_REMOTE_DEBUGGING_URL
+        if _is_loopback_url(cdp_url):
+            return MCPBrowserContext(mode="cdp", session_id=session_id, cdp_url=cdp_url)
+
+    return MCPBrowserContext(mode="cloud_session", session_id=session_id)
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -131,6 +152,8 @@ class AgentContext:
     pending_action_sequence_fingerprint: str | None = None
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
+    verified_prefix_current_url: str | None = None
+    code_only_failed_mutating_frontier_label: str | None = None
     last_full_workflow_test_ok: bool = False
     last_unverified_block_labels: list[str] = field(default_factory=list)
     workflow_verification_evidence: WorkflowVerificationEvidence = field(default_factory=WorkflowVerificationEvidence)
@@ -208,6 +231,7 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
+    observed_browser_urls: list[str] = field(default_factory=list)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
@@ -293,7 +317,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser_state.browser_context,
             browser_session_id=ctx.browser_session_id,
         )
-        mcp_ctx = MCPBrowserContext(mode="cloud_session", session_id=ctx.browser_session_id)
+        mcp_ctx = _mcp_browser_context_for_copilot_session(ctx.browser_session_id)
         active_key = get_active_api_key()
         state = SessionState(
             browser=skyvern_browser,

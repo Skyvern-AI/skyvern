@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 import yaml
 
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.utils.yaml_loader import safe_load_no_dates
 
 if TYPE_CHECKING:
@@ -79,6 +80,10 @@ _DISCOVERY_TOOLS: frozenset[str] = frozenset({"discover_workflow_entrypoint"})
 _COMPOSITION_CONTEXT_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition"})
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)]+", re.IGNORECASE)
+
+
+def _is_code_only_browser_mode(ctx: CopilotContext) -> bool:
+    return normalize_block_authoring_policy(ctx.block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
 
 
 def _parse_workflow_blocks(workflow_yaml: str | None) -> list[dict[str, Any]]:
@@ -231,7 +236,7 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
             blocked_tool=tool_name,
         )
 
-    if tool_name in _BROWSER_PRIMITIVE_TOOLS and in_discovery:
+    if tool_name in _BROWSER_PRIMITIVE_TOOLS and in_discovery and not _is_code_only_browser_mode(ctx):
         return CopilotToolBlockerSignal(
             blocker_kind="phase_gated",
             agent_steering_text=(

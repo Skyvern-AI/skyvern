@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -66,15 +67,38 @@ LOG = structlog.get_logger()
 _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 
 
-def _hide_code_only_tool(ctx: CopilotContext, tool_name: str) -> bool:
-    return (
+def _is_code_only_pre_draft_after_target_evidence(ctx: CopilotContext) -> bool:
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return False
+    if ctx.workflow_persisted or ctx.update_workflow_called:
+        return False
+    if not ctx.code_only_target_page_evidence_seen:
+        return False
+    return True
+
+
+def _hide_code_only_tool_after_target_evidence(ctx: CopilotContext, tool_name: str) -> bool:
+    if (
         normalize_block_authoring_policy(ctx.block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
         and tool_name == "validate_block"
-    )
+    ):
+        return True
+    if not _is_code_only_pre_draft_after_target_evidence(ctx):
+        return False
+    # Once both target-page evidence and the compact code schema have been
+    # seen, leaving schema lookup visible gives the model a harmless but costly
+    # loop target. Hide it so the remaining productive action is authoring.
+    return tool_name == "get_block_schema" and ctx.code_only_code_schema_seen
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
+
+
+def _overlay_timeout_for_context(overlay: SchemaOverlay, ctx: CopilotContext) -> int | None:
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    return overlay.timeout
 
 
 def _apply_schema_overlay(
@@ -191,7 +215,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 continue
 
             copilot_name = self._reverse_alias.get(tool.name, tool.name)
-            if _hide_code_only_tool(copilot_ctx, copilot_name):
+            if _hide_code_only_tool_after_target_evidence(copilot_ctx, copilot_name):
                 continue
 
             overlay = self._overlays.get(copilot_name, SchemaOverlay())
@@ -270,11 +294,22 @@ class SkyvernOverlayMCPServer(MCPServer):
             mcp_args["session_id"] = copilot_ctx.browser_session_id
 
         try:
+            timeout = _overlay_timeout_for_context(overlay, copilot_ctx)
             if overlay.requires_browser:
                 async with mcp_browser_context(copilot_ctx):
-                    raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                    tool_call = self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                    raw_result = (
+                        await asyncio.wait_for(tool_call, timeout=timeout) if timeout is not None else await tool_call
+                    )
             else:
-                raw_result = await self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                tool_call = self._client.call_tool(mcp_name, mcp_args, raise_on_error=False)
+                raw_result = (
+                    await asyncio.wait_for(tool_call, timeout=timeout) if timeout is not None else await tool_call
+                )
+        except TimeoutError:
+            err = {"ok": False, "error": f"{tool_name} timed out after {timeout}s"}
+            record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
+            return _copilot_to_call_tool_result(err)
         except Exception as e:
             LOG.warning(
                 "MCP tool call failed",
