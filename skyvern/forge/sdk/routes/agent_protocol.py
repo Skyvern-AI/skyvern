@@ -33,9 +33,11 @@ from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
 from skyvern.exceptions import (
+    DisabledBlockExecutionError,
     MissingBrowserAddressError,
     SkyvernHTTPException,
     WorkflowNotFound,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -53,6 +55,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -174,6 +177,28 @@ FORCE_TASK_V1_MAX_STEPS = 25
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
 
+async def _validate_enterprise_gated_task_run_features(
+    *,
+    organization_id: str,
+    engine: RunEngine | None = None,
+    model: dict[str, Any] | None = None,
+) -> None:
+    feature_names = collect_enterprise_gated_run_features(engine=engine, model=model)
+    if not feature_names:
+        return
+
+    try:
+        await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+            organization_id=organization_id,
+            feature_names=feature_names,
+        )
+    except DisabledBlockExecutionError as e:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail=get_user_facing_exception_message(e),
+        ) from e
+
+
 class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
@@ -246,6 +271,12 @@ async def run_task(
         run_request.engine = RunEngine.skyvern_v1
         if not run_request.max_steps or run_request.max_steps > cap:
             run_request.max_steps = cap
+
+    await _validate_enterprise_gated_task_run_features(
+        organization_id=current_org.organization_id,
+        engine=run_request.engine,
+        model=run_request.model,
+    )
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -2680,6 +2711,11 @@ async def run_task_v1(
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+    # Legacy TaskRequest has no engine field; CUA engine selection goes through /run/tasks.
+    await _validate_enterprise_gated_task_run_features(
+        organization_id=current_org.organization_id,
+        model=task.model,
+    )
 
     created_task = await task_v1_service.run_task(
         task=task,

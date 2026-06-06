@@ -13,6 +13,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { ModelsResponse } from "@/api/types";
 import { WorkflowModel } from "@/routes/workflows/types/workflowTypes";
 import { useWorkflowScopeReadOnly } from "@/routes/workflows/editor/WorkflowScopeContext";
+import { BadgeLabel } from "@/components/BadgeLabel";
 
 type Props = {
   className?: string;
@@ -30,8 +31,19 @@ const deprecatedModelNames = new Set<string>([
   "gemini-2.5-flash-lite",
   "azure/gpt-4.1",
   "azure/gpt-5",
+  "azure/gpt-5.2",
   "azure/o3",
   "claude-haiku-4-5-20251001",
+  "claude-opus-4-5-20251101",
+  "mercury-2",
+]);
+
+const enterpriseModelNames = new Set<string>([
+  "us.anthropic.claude-opus-4-20250514-v1:0",
+  "claude-opus-4-5-20251101",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-opus-4-8",
 ]);
 
 function ModelSelector({
@@ -122,15 +134,26 @@ function ModelSelector({
             <SelectValue placeholder={constants.SkyvernOptimized} />
           </SelectTrigger>
           <SelectContent>
-            {choices.map((m) => (
-              <SelectItem key={m} value={m}>
-                {m === constants.SkyvernOptimized ? (
-                  <span>Skyvern Optimized ✨</span>
-                ) : (
-                  m
-                )}
-              </SelectItem>
-            ))}
+            {choices.map((m) => {
+              const modelName = reverseMap[m];
+              return (
+                <SelectItem key={m} value={m}>
+                  {m === constants.SkyvernOptimized ? (
+                    <span>Skyvern Optimized ✨</span>
+                  ) : (
+                    <BadgeLabel
+                      label={m}
+                      badge={
+                        modelName && enterpriseModelNames.has(modelName)
+                          ? "Enterprise"
+                          : undefined
+                      }
+                      badgeVariant="warning"
+                    />
+                  )}
+                </SelectItem>
+              );
+            })}
           </SelectContent>
         </Select>
         {value && clearable && (

@@ -141,6 +141,7 @@ async def test_execute_workflow_returns_after_elapsed_timeout_without_finally(mo
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -215,6 +216,7 @@ async def test_execute_workflow_times_out_slow_pre_block_script_lookup(monkeypat
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -285,6 +287,7 @@ async def test_execute_workflow_preserves_completed_status_after_post_run_timeou
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -373,6 +376,7 @@ async def test_execute_workflow_preserves_timed_out_status_after_non_terminal_po
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -467,6 +471,7 @@ async def test_execute_workflow_marks_timed_out_when_post_run_budget_is_exhauste
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -638,6 +643,7 @@ async def test_execute_workflow_refreshes_terminal_status_after_immediate_post_r
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -726,6 +732,7 @@ async def test_execute_workflow_returns_finalized_status_after_post_run_timeout(
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
@@ -820,6 +827,7 @@ async def test_execute_workflow_runs_finally_for_existing_timed_out_status(
         title="Timeout workflow",
         organization_id="org_1",
         generate_script_on_terminal=False,
+        model=None,
         workflow_definition=SimpleNamespace(
             parameters=[],
             finally_block_label="cleanup",
