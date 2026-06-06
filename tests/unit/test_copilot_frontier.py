@@ -7,8 +7,10 @@ from typing import Any
 
 import pytest
 from jinja2.sandbox import SandboxedEnvironment
+from playwright._impl._errors import TargetClosedError
 
 from skyvern.forge.sdk.copilot import tools
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     MAX_FAILED_TEST_NUDGES,
@@ -114,6 +116,72 @@ class _FakePersistentSessionsManager:
 class _FakeFailingPersistentSessionsManager:
     async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeBrowserState | None:
         raise RuntimeError("browser state unavailable")
+
+
+class _FakeStoragePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.closed = False
+        self.goto_calls: list[tuple[str, str | None, int | None]] = []
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def goto(self, url: str, wait_until: str | None = None, timeout: int | None = None) -> None:
+        self.goto_calls.append((url, wait_until, timeout))
+        self.url = url
+
+
+class _FakeStorageCDPSession:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict[str, object]]] = []
+        self.detached = False
+
+    async def send(self, method: str, params: dict[str, object]) -> None:
+        self.sent.append((method, params))
+
+    async def detach(self) -> None:
+        self.detached = True
+
+
+class _FakeStorageBrowserContext:
+    def __init__(self) -> None:
+        self.cookies_cleared = False
+        self.created_pages: list[_FakeStoragePage] = []
+        self.cdp_session = _FakeStorageCDPSession()
+
+    async def clear_cookies(self) -> None:
+        self.cookies_cleared = True
+
+    async def new_page(self) -> _FakeStoragePage:
+        page = _FakeStoragePage("about:blank")
+        self.created_pages.append(page)
+        return page
+
+    async def new_cdp_session(self, page: _FakeStoragePage) -> _FakeStorageCDPSession:
+        return self.cdp_session
+
+
+class _FakeClosedStorageBrowserContext(_FakeStorageBrowserContext):
+    async def clear_cookies(self) -> None:
+        raise TargetClosedError("Target page, context or browser has been closed")
+
+
+class _FakeStorageBrowserState:
+    def __init__(self, page: _FakeStoragePage | None, browser_context: _FakeStorageBrowserContext) -> None:
+        self._page = page
+        self.browser_context = browser_context
+
+    async def get_or_create_page(self) -> _FakeStoragePage | None:
+        return self._page
+
+
+class _FakeStoragePersistentSessionsManager:
+    def __init__(self, browser_state: _FakeStorageBrowserState | None) -> None:
+        self.browser_state = browser_state
+
+    async def get_browser_state(self, session_id: str, organization_id: str) -> _FakeStorageBrowserState | None:
+        return self.browser_state
 
 
 def _make_ctx(**kwargs: object) -> CopilotContext:
@@ -391,6 +459,330 @@ async def test_runtime_frontier_starter_url_seed_preserves_attached_live_page(
     assert workflow.workflow_definition.blocks[1].url is None
 
 
+def test_code_only_clean_session_reason_requires_full_chain_without_verified_prefix() -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open_product_page", "code"),
+            _FakeBlock("add_to_cart", "code"),
+            _FakeBlock("confirm_product_in_cart", "code"),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    ctx.last_workflow = _FakeWorkflow(definition)  # type: ignore[assignment]
+
+    reason = tools._code_only_clean_session_reason(
+        ctx,
+        block_labels=["open_product_page", "add_to_cart", "confirm_product_in_cart"],
+        labels_to_execute=["open_product_page", "add_to_cart", "confirm_product_in_cart"],
+        block_outputs_to_seed={},
+        frontier_start_label="open_product_page",
+    )
+
+    assert reason == "cleared_full_chain_browser_state"
+
+    ctx.verified_prefix_labels = ["open_product_page"]
+    assert (
+        tools._code_only_clean_session_reason(
+            ctx,
+            block_labels=["open_product_page", "add_to_cart", "confirm_product_in_cart"],
+            labels_to_execute=["open_product_page", "add_to_cart", "confirm_product_in_cart"],
+            block_outputs_to_seed={},
+            frontier_start_label="open_product_page",
+        )
+        is None
+    )
+
+
+def test_code_only_debug_storage_origins_collects_unique_http_origins() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.observed_browser_urls = [
+        "https://shop.example/products?id=1",
+        "https://shop.example/cart",
+        "http://cdn.example/assets",
+        "chrome-error://chromewebdata/",
+        "about:blank",
+    ]
+    ctx.composition_page_evidence = {
+        "current_url": "https://checkout.example/cart",
+        "inspected_url": "https://shop.example/products?id=2",
+    }
+
+    assert tools._code_only_debug_browser_storage_origins(ctx) == [
+        "https://shop.example",
+        "http://cdn.example",
+        "https://checkout.example",
+    ]
+
+
+def test_code_only_debug_storage_origins_include_runtime_code_goto_targets() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.observed_browser_urls = ["https://debugger.example/live-view"]
+    ctx.composition_page_evidence = {"current_url": "https://debugger.example/live-view?step=search"}
+    definition = _FakeDefinition(
+        [
+            _FakeBlock(
+                "search_sample_registry_entry",
+                "code",
+                {
+                    "code": (
+                        "target_url = 'https://registry.example/search?page=records'\n"
+                        "await page.goto(target_url, wait_until='domcontentloaded', timeout=10000)"
+                    )
+                },
+            ),
+            _FakeBlock(
+                "read_details",
+                "code",
+                {"code": "await page.goto('https://not-executed.example/details')"},
+            ),
+        ]
+    )
+
+    assert tools._code_only_debug_browser_storage_origins(
+        ctx,
+        workflow_definition=definition,
+        labels_to_execute=["search_sample_registry_entry"],
+    ) == [
+        "https://debugger.example",
+        "https://registry.example",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_code_only_debug_browser_storage_reuses_existing_browser_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    ctx.observed_browser_urls = ["https://shop.example/products?id=1"]
+    browser_context = _FakeStorageBrowserContext()
+    page = _FakeStoragePage("https://shop.example/cart")
+    browser_state = _FakeStorageBrowserState(
+        page,
+        browser_context,
+    )
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeStoragePersistentSessionsManager(browser_state),
+    )
+
+    result = await tools._clear_code_only_debug_browser_storage(ctx, reason="cleared_full_chain_browser_state")
+
+    assert result == {
+        "ok": True,
+        "data": {"cleared_origin_count": 1, "cookies_cleared": True, "page_reset_to_blank": True},
+    }
+    assert page.goto_calls == [("about:blank", "domcontentloaded", 5000)]
+    assert page.url == "about:blank"
+    assert browser_context.cookies_cleared is True
+    assert browser_context.created_pages == []
+    assert browser_context.cdp_session.detached is True
+    assert browser_context.cdp_session.sent == [
+        (
+            "Storage.clearDataForOrigin",
+            {
+                "origin": "https://shop.example",
+                "storageTypes": (
+                    "cookies,local_storage,session_storage,indexeddb,websql,service_workers,cache_storage"
+                ),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_code_only_debug_browser_storage_uses_active_page_origin_when_untracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    browser_context = _FakeStorageBrowserContext()
+    page = _FakeStoragePage("https://example.com/cart")
+    browser_state = _FakeStorageBrowserState(page, browser_context)
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeStoragePersistentSessionsManager(browser_state),
+    )
+
+    result = await tools._clear_code_only_debug_browser_storage(ctx, reason="cleared_first_frontier_browser_state")
+
+    assert result == {
+        "ok": True,
+        "data": {"cleared_origin_count": 1, "cookies_cleared": True, "page_reset_to_blank": True},
+    }
+    assert page.goto_calls == [("about:blank", "domcontentloaded", 5000)]
+    assert page.url == "about:blank"
+    assert browser_context.cookies_cleared is True
+    assert browser_context.created_pages == []
+    assert browser_context.cdp_session.detached is True
+    assert browser_context.cdp_session.sent == [
+        (
+            "Storage.clearDataForOrigin",
+            {
+                "origin": "https://example.com",
+                "storageTypes": (
+                    "cookies,local_storage,session_storage,indexeddb,websql,service_workers,cache_storage"
+                ),
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clear_code_only_debug_browser_storage_tolerates_closed_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    ctx.observed_browser_urls = ["https://shop.example/products?id=1"]
+    browser_context = _FakeClosedStorageBrowserContext()
+    browser_state = _FakeStorageBrowserState(_FakeStoragePage("https://shop.example/cart"), browser_context)
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeStoragePersistentSessionsManager(browser_state),
+    )
+
+    result = await tools._clear_code_only_debug_browser_storage(ctx, reason="cleared_full_chain_browser_state")
+
+    assert result == {
+        "ok": True,
+        "data": {
+            "cleared_origin_count": 0,
+            "cookies_cleared": False,
+            "skipped_target_closed": True,
+        },
+    }
+    assert browser_context.created_pages == []
+    assert browser_context.cdp_session.sent == []
+
+
+@pytest.mark.asyncio
+async def test_full_chain_storage_cleanup_clears_runtime_goto_origin_and_preserves_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = _FakeDefinition(
+        [
+            _FakeBlock(
+                "search_sample_registry_entry",
+                "code",
+                {
+                    "code": (
+                        "target_url = 'https://registry.example/search?page=records'\n"
+                        "await page.goto(target_url, wait_until='domcontentloaded', timeout=10000)"
+                    )
+                },
+            ),
+            _FakeBlock("confirm_record", "code", {"code": "output = {'found': True}"}),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    ctx.last_workflow = _FakeWorkflow(definition)  # type: ignore[assignment]
+    ctx.observed_browser_urls = ["https://debugger.example/live-view"]
+    browser_context = _FakeStorageBrowserContext()
+    page = _FakeStoragePage("https://debugger.example/live-view")
+    browser_state = _FakeStorageBrowserState(page, browser_context)
+    monkeypatch.setattr(
+        tools.app,
+        "PERSISTENT_SESSIONS_MANAGER",
+        _FakeStoragePersistentSessionsManager(browser_state),
+    )
+
+    reason = tools._code_only_clean_session_reason(
+        ctx,
+        block_labels=["search_sample_registry_entry", "confirm_record"],
+        labels_to_execute=["search_sample_registry_entry", "confirm_record"],
+        block_outputs_to_seed={},
+        frontier_start_label="search_sample_registry_entry",
+    )
+    assert reason == "cleared_full_chain_browser_state"
+
+    result = await tools._clear_code_only_debug_browser_storage(
+        ctx,
+        reason=reason,
+        workflow_definition=definition,
+        labels_to_execute=["search_sample_registry_entry", "confirm_record"],
+    )
+
+    assert result == {
+        "ok": True,
+        "data": {"cleared_origin_count": 2, "cookies_cleared": True, "page_reset_to_blank": True},
+    }
+    assert ctx.browser_session_id == "pbs_123"
+    assert page.goto_calls == [("about:blank", "domcontentloaded", 5000)]
+    assert page.url == "about:blank"
+    assert browser_context.cookies_cleared is True
+    assert browser_context.created_pages == []
+    assert browser_context.cdp_session.detached is True
+    assert browser_context.cdp_session.sent == [
+        (
+            "Storage.clearDataForOrigin",
+            {
+                "origin": "https://debugger.example",
+                "storageTypes": (
+                    "cookies,local_storage,session_storage,indexeddb,websql,service_workers,cache_storage"
+                ),
+            },
+        ),
+        (
+            "Storage.clearDataForOrigin",
+            {
+                "origin": "https://registry.example",
+                "storageTypes": (
+                    "cookies,local_storage,session_storage,indexeddb,websql,service_workers,cache_storage"
+                ),
+            },
+        ),
+    ]
+
+
+def test_record_run_blocks_ignores_code_only_storage_reset_marker_as_blocker() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER, browser_session_id="pbs_123")
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_clean",
+            "overall_status": "completed",
+            "debug_browser_storage_reset_reason": "cleared_full_chain_browser_state",
+            "storage_reset_browser_session_id": "pbs_123",
+            "debug_browser_session_reused_after_storage_reset": True,
+            "debug_browser_storage_reset": {
+                "cleared_origin_count": 1,
+                "cookies_cleared": True,
+            },
+            "blocks": [
+                {
+                    "label": "open_example_news",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "target_url": "https://news.example/latest",
+                        "current_url": "https://news.example/latest",
+                    },
+                },
+                {
+                    "label": "extract_top_post",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "top_post": {
+                            "rank": "1",
+                            "title": "Example Project Release Notes",
+                        },
+                        "extracted_at_url": "https://news.example/latest",
+                    },
+                },
+            ],
+        },
+    }
+
+    tools._record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+    assert "failure_reason" not in result["data"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_url", ["start_url", "{{ start_url }}", "example.com"])
 async def test_runtime_frontier_starter_url_seed_preserves_runtime_resolved_url(
@@ -656,6 +1048,103 @@ def test_plan_frontier_edit_read_only_block_still_walks_back_to_anchor() -> None
     labels, _seed, frontier = _plan_frontier(ctx, ["nav", "extract"], old, new)
     assert labels == ["nav", "extract"]
     assert frontier == "nav"
+
+
+def test_plan_frontier_code_only_edited_data_read_suffix_starts_at_edited_block() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_lookup_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_target_record", "code", {"code": "await page.fill('#q', 'sample target')"}),
+            _FakeBlock("expand_matching_results", "code", {"code": "return {'records': ['sample target']}"}),
+            _FakeBlock(
+                "extract_record_details",
+                "code",
+                {"code": "return {'source': {{ expand_matching_results_output }}, 'records': []}"},
+            ),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_lookup_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_target_record", "code", {"code": "await page.fill('#q', 'sample target')"}),
+            _FakeBlock("expand_matching_results", "code", {"code": "return {'records': ['sample target']}"}),
+            _FakeBlock(
+                "extract_record_details",
+                "code",
+                {"code": "return {'source': {{ expand_matching_results_output }}, 'records': [{'number': '1'}]}"},
+            ),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_lookup_page", "search_target_record", "expand_matching_results"]
+    ctx.verified_block_outputs = {"expand_matching_results": {"records": ["sample target"]}}
+
+    labels, seed, frontier = _plan_frontier(
+        ctx,
+        ["open_lookup_page", "search_target_record", "expand_matching_results", "extract_record_details"],
+        old,
+        new,
+    )
+
+    assert labels == ["extract_record_details"]
+    assert seed == {"expand_matching_results": {"records": ["sample target"]}}
+    assert frontier == "extract_record_details"
+
+
+def test_plan_frontier_code_only_edited_page_action_code_walks_back_to_anchor() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("submit_search", "code", {"code": "await page.click('#search')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "goto_url", {"url": "https://example.com"}),
+            _FakeBlock("submit_search", "code", {"code": "await page.click('#search-now')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_site", "submit_search", "extract_results"]
+    ctx.verified_block_outputs = {"open_site": {"current_url": "https://example.com"}}
+
+    labels, seed, frontier = _plan_frontier(ctx, ["open_site", "submit_search", "extract_results"], old, new)
+
+    assert labels == ["open_site", "submit_search", "extract_results"]
+    assert seed == {}
+    assert frontier == "open_site"
+
+
+def test_code_only_verified_prefix_rewrite_rejects_downstream_repair_churn() -> None:
+    old = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    new = _FakeDefinition(
+        [
+            _FakeBlock("open_page", "code", {"code": "await page.goto('https://example.org')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': [{'title': 'sample'}]}"}),
+        ]
+    )
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.verified_prefix_labels = ["open_page", "search_results"]
+
+    error = tools._code_only_verified_prefix_rewrite_error(
+        ctx,
+        prior_definition=old,
+        new_definition=new,
+        requested_labels=["extract_results"],
+    )
+
+    assert error is not None
+    assert "already-verified upstream blocks: open_page" in error
+    assert "`extract_results`" in error
 
 
 def test_plan_frontier_edit_with_no_upstream_anchor_falls_back_to_full_list() -> None:
@@ -1843,6 +2332,249 @@ def test_reorder_resets_verified_trust() -> None:
     assert ctx.verified_block_outputs == {}
     assert ctx.workflow_verification_evidence.full_workflow_verified is False
     assert ctx.last_full_workflow_test_ok is False
+
+
+# --------------------------------------------------------------------------- #
+# Code-only runtime rerun and output evidence                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_code_only_suffix_after_mutating_prefix_verifies_chain_without_replay() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_product", "code", {"code": "await page.fill('#q', 'part')"}),
+            _FakeBlock("add_to_cart", "code", {"code": "await page.click('#add')"}),
+            _FakeBlock("confirm_cart", "code", {"code": "return {'cart': 'ready'}"}),
+        ]
+    )
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.verified_prefix_labels = ["open_site", "search_product", "add_to_cart", "confirm_cart"]
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_suffix",
+                "executed_block_labels": ["confirm_cart"],
+                "blocks": [
+                    {
+                        "label": "confirm_cart",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"cart": "ready"},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.workflow_verification_evidence.full_workflow_verified is True
+
+
+def test_code_only_suffix_run_without_mutating_prefix_does_not_verify_full_workflow() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    definition = _FakeDefinition(
+        [
+            _FakeBlock("open_site", "code", {"code": "await page.goto('https://example.com')"}),
+            _FakeBlock("search_results", "code", {"code": "await page.fill('#q', 'sample')"}),
+            _FakeBlock("extract_results", "code", {"code": "return {'records': []}"}),
+        ]
+    )
+    ctx.last_workflow = _FakeWorkflow(definition)
+    ctx.verified_prefix_labels = ["open_site", "search_results", "extract_results"]
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_extract",
+                "executed_block_labels": ["extract_results"],
+                "blocks": [
+                    {
+                        "label": "extract_results",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [{"title": "sample result"}]},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert "suffix frontier" in str(ctx.last_test_failure_reason)
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+
+
+def test_code_only_run_result_rejects_non_json_serializable_code_output() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_locator",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": "Object '<class 'playwright.async_api._generated.Locator'>' is not JSON serializable",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "non-JSON-serializable runtime object" in str(ctx.last_test_failure_reason)
+
+
+def test_code_only_run_result_accepts_real_data_with_transient_non_json_locals() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_data",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {
+                            "records": [{"title": "sample result"}],
+                            "debug": (
+                                "Object '<class 'playwright.async_api._generated.Locator'>' is not JSON serializable"
+                            ),
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_test_failure_reason is None
+
+
+def test_code_only_run_result_rejects_empty_data_read_output() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_empty",
+                "blocks": [
+                    {
+                        "label": "extract_records",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [], "count": 0},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "no meaningful page data" in str(ctx.last_test_failure_reason)
+
+
+def test_code_only_run_result_rejects_missing_requested_structured_detail() -> None:
+    ctx = _make_ctx(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        user_message="Get the matching record number and expiration.",
+    )
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": True,
+            "data": {
+                "workflow_run_id": "wr_details",
+                "blocks": [
+                    {
+                        "label": "extract_record_details",
+                        "block_type": "code",
+                        "status": "completed",
+                        "output": {"records": [{"title": "sample result"}]},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert "expiration" in str(ctx.last_test_failure_reason)
+    assert "number" in str(ctx.last_test_failure_reason)
+
+
+def test_observed_code_only_url_keeps_cert_failure_repairable() -> None:
+    reason = "Failed to navigate to url https://bad.example/search. Error message: net::ERR_CERT_DATE_INVALID"
+    ctx = _make_ctx(
+        block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER,
+        observed_browser_urls=["https://bad.example/search"],
+    )
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_cert",
+                "blocks": [{"label": "open_site", "status": "failed", "failure_reason": reason}],
+            },
+        },
+    )
+
+    assert ctx.last_test_non_retriable_nav_error is None
+    assert ctx.last_test_failure_reason == reason
+
+
+def test_observed_standard_url_still_treats_cert_failure_as_non_retriable() -> None:
+    reason = "Failed to navigate to url https://bad.example/search. Error message: net::ERR_CERT_DATE_INVALID"
+    ctx = _make_ctx(observed_browser_urls=["https://bad.example/search"])
+
+    tools._record_run_blocks_result(
+        ctx,
+        {
+            "ok": False,
+            "data": {
+                "workflow_run_id": "wr_cert",
+                "blocks": [{"label": "open_site", "status": "failed", "failure_reason": reason}],
+            },
+        },
+    )
+
+    assert ctx.last_test_non_retriable_nav_error == reason
+
+
+def test_code_only_failed_mutating_frontier_blocks_blind_rerun() -> None:
+    ctx = _make_ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+    ctx.code_only_failed_mutating_frontier_label = "add_exact_product_to_cart"
+
+    result = tools._tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["add_exact_product_to_cart"]})
+
+    assert result is not None
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_code_only_failed_mutation_needs_inspection"
 
 
 if __name__ == "__main__":
