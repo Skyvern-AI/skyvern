@@ -33,6 +33,12 @@ def test_build_browser_args_invalid_custom_proxy_url_ignored() -> None:
     assert "proxy" not in args
 
 
+def test_build_browser_args_sets_record_video_size_to_viewport() -> None:
+    args = BrowserContextFactory.build_browser_args()
+
+    assert args["record_video_size"] == args["viewport"]
+
+
 def test_deserialize_proxy_location_custom_url_returns_dict() -> None:
     result = deserialize_proxy_location('{"url": "http://user:pass@proxy.example.com:8080"}')
     assert result == {"url": "http://user:pass@proxy.example.com:8080"}
