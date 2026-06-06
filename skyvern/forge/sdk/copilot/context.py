@@ -395,6 +395,7 @@ class CopilotContext(AgentContext):
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
+    observed_browser_urls: list[str] = field(default_factory=list)
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —
@@ -404,6 +405,7 @@ class CopilotContext(AgentContext):
     verified_block_outputs: dict[str, Any] = field(default_factory=dict)
     verified_prefix_labels: list[str] = field(default_factory=list)
     verified_prefix_current_url: str | None = None
+    code_only_failed_mutating_frontier_label: str | None = None
     last_requested_block_labels: list[str] = field(default_factory=list)
     last_executed_block_labels: list[str] = field(default_factory=list)
     last_full_workflow_test_ok: bool = False
