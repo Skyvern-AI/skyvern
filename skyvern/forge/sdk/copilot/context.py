@@ -395,6 +395,7 @@ class CopilotContext(AgentContext):
     post_budget_page_inspection_required: bool = False
     post_budget_page_inspection_url: str | None = None
     post_budget_page_inspection_run_id: str | None = None
+    observed_browser_urls: list[str] = field(default_factory=list)
 
     # Per-request frontier state. `verified_block_outputs` and
     # `verified_prefix_labels` are populated ONLY from fully-successful runs —

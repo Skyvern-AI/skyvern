@@ -11,8 +11,8 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Literal
-from urllib.parse import urljoin, urlparse
+from typing import Annotated, Any, Literal, cast
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import structlog
 import yaml
@@ -48,6 +48,7 @@ from skyvern.forge.sdk.copilot.build_phase import (
     advance_to_discovering,
     advance_to_testing,
 )
+from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
@@ -136,8 +137,8 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
-from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
+from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, CodeBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import (
     RESERVED_PARAMETER_KEYS,
     OutputParameter,
@@ -177,6 +178,16 @@ _OUTCOME_EVIDENCE_BLOCK_TYPES = frozenset({BlockType.EXTRACTION.value, BlockType
 # two in sync when adding a new task-backed type. ``TEXT_PROMPT`` is
 # deliberately excluded: its block.output is the raw LLM response dict (see
 # ``TextPromptBlock.execute``), no envelope to strip.
+_CODE_ONLY_PAGE_URL_PREFIX_GUARD_RE = re.compile(r"\bpage\.url\s*\.startswith\s*\(")
+_CODE_ONLY_URL_ASSIGNMENT_RE = re.compile(
+    r"""(?m)^\s*(?P<name>[A-Za-z_]\w*)\s*=\s*(?P<quote>['"])(?P<url>https?://[^'"]+)(?P=quote)"""
+)
+_CODE_ONLY_PAGE_GOTO_ARG_RE = re.compile(r"\bpage\.goto\s*\(\s*(?P<arg>[^,\)\n]+)")
+_CODE_ONLY_QUOTED_URL_ARG_RE = re.compile(r"""^(?P<quote>['"])(?P<url>https?://[^'"]+)(?P=quote)$""")
+_CODE_BLOCK_MIXED_TEXT_SELECTOR_GROUP_RE = re.compile(
+    r"""\b(?:page\.)?locator\s*\(\s*(?P<quote>['"])(?P<selector>[^'"]*,\s*text\s*=.*?)(?P=quote)""",
+    re.IGNORECASE | re.DOTALL,
+)
 _TASK_ENVELOPE_BLOCK_TYPES = frozenset({"EXTRACTION"})
 assert _TASK_ENVELOPE_BLOCK_TYPES <= _DATA_PRODUCING_BLOCK_TYPES, (
     "_TASK_ENVELOPE_BLOCK_TYPES must be a subset of _DATA_PRODUCING_BLOCK_TYPES"
@@ -2220,11 +2231,27 @@ async def _update_workflow(
     if authority_error is not None:
         return {"ok": False, "error": authority_error}
 
-    workflow_yaml = params["workflow_yaml"]
+    workflow_yaml = _normalize_code_only_workflow_yaml_envelope(ctx, params["workflow_yaml"])
+    params["workflow_yaml"] = workflow_yaml
     # Tool wrappers run authority/loop guards before calling here. The composition
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
+    truncation_error = _workflow_yaml_truncation_placeholder_error(ctx, workflow_yaml)
+    if truncation_error is not None:
+        return {"ok": False, "error": truncation_error}
+    conflict_marker_error = _workflow_yaml_conflict_marker_error(ctx, workflow_yaml)
+    if conflict_marker_error is not None:
+        return {"ok": False, "error": conflict_marker_error}
+    code_security_error = _code_block_security_validation_error(ctx, workflow_yaml)
+    if code_security_error is not None:
+        return {"ok": False, "error": code_security_error}
+    runtime_navigation_guard_error = _code_only_runtime_navigation_guard_error(ctx, workflow_yaml)
+    if runtime_navigation_guard_error is not None:
+        return {"ok": False, "error": runtime_navigation_guard_error}
+    runtime_entrypoint_mismatch_error = _code_only_runtime_entrypoint_mismatch_error(ctx, workflow_yaml)
+    if runtime_entrypoint_mismatch_error is not None:
+        return {"ok": False, "error": runtime_entrypoint_mismatch_error}
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
@@ -2363,6 +2390,11 @@ async def _update_workflow(
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            return {
+                "ok": False,
+                "error": _code_only_yaml_validation_error_message(e),
+            }
         return {
             "ok": False,
             "error": f"Workflow validation failed: {e}",
@@ -4974,8 +5006,30 @@ _COPILOT_BANNED_BLOCK_ALTERNATIVES = (
     "`login` for authentication, or `goto_url` for pure URL navigation."
 )
 _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES = (
-    "Browser/page workflow block types are unavailable in code-only browser mode. Use focused `code` "
-    "blocks for durable page or browser-session work."
+    "Use focused `code` blocks for durable browser/page work. MCP browser tools are only for "
+    "build-time exploration; persist browser behavior as code blocks and test them with "
+    "`update_and_run_blocks`."
+)
+_CODE_ONLY_EVALUATE_TEXT_LIMIT = 600
+_CODE_ONLY_EVALUATE_HTML_TEXT_LIMIT = 250
+_CODE_ONLY_EVALUATE_LIST_LIMIT = 40
+_CODE_ONLY_EVALUATE_OPTION_LIST_LIMIT = 12
+_CODE_ONLY_EVALUATE_LINK_LIST_LIMIT = 20
+_CODE_ONLY_EVALUATE_DICT_LIMIT = 80
+_CODE_ONLY_EVALUATE_LONG_TEXT_KEYS = frozenset(
+    {
+        "body",
+        "text",
+        "inner_text",
+        "innerText",
+        "content",
+        "raw_text",
+        "rawText",
+        "html",
+        "innerHTML",
+        "outerHTML",
+        "outer_html",
+    }
 )
 _CODE_ONLY_TARGET_EVIDENCE_KEYS = frozenset(
     {
@@ -5013,6 +5067,417 @@ def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
     if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
     return _COPILOT_BANNED_BLOCK_ALTERNATIVES
+
+
+def _code_only_composition_inspection_error(ctx: CopilotContext) -> dict[str, Any] | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if ctx.workflow_persisted or ctx.update_workflow_called:
+        return None
+    return {
+        "ok": False,
+        "error": (
+            "CODE-ONLY MCP EXPLORATION ONLY: do not use inspect_page_for_composition before the first draft. "
+            "Use MCP browser tools such as navigate_browser, evaluate, or get_browser_screenshot for build-time "
+            "page evidence, then get the `code` block schema and call update_and_run_blocks with focused code "
+            "blocks."
+        ),
+    }
+
+
+_WORKFLOW_YAML_TRUNCATION_PLACEHOLDERS = (
+    "[... truncated",
+    "... [truncated",
+    "truncated due length",
+    "<truncated>",
+)
+_CODE_ONLY_UNAVAILABLE_LOCAL_HELPER_RE = re.compile(r"\b(?:globals|locals)\s*\(")
+
+
+_CODE_ONLY_ENVELOPE_BODY_KEYS = frozenset({"workflow_definition", "blocks"})
+_CODE_ONLY_ENVELOPE_PREFIX_KEYS = frozenset(
+    {
+        "title",
+        "description",
+        "proxy_location",
+        "persist_browser_session",
+        "browser_profile_id",
+        "model",
+        "max_screenshot_scrolls",
+        "max_elapsed_time_minutes",
+        "webhook_callback_url",
+        "totp_verification_url",
+        "totp_identifier",
+        "extra_http_headers",
+        "cdp_connect_headers",
+        "run_with",
+        "ai_fallback",
+        "cache_key",
+        "adaptive_caching",
+        "code_version",
+        "generate_script_on_terminal",
+        "run_sequentially",
+        "sequential_key",
+        "workflow_definition",
+        "parameters",
+        "blocks",
+    }
+)
+
+
+def _workflow_yaml_truncation_placeholder_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    lowered = workflow_yaml.lower()
+    if not any(placeholder in lowered for placeholder in _WORKFLOW_YAML_TRUNCATION_PLACEHOLDERS):
+        return None
+    return (
+        "Workflow validation failed: workflow_yaml contains a truncation placeholder instead of complete YAML. "
+        "Reconstruct and pass the complete workflow YAML with the full workflow_definition; do not include "
+        "`[... truncated ...]`, `... [truncated]`, or any placeholder text."
+    )
+
+
+def _workflow_yaml_conflict_marker_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if not re.search(r"(?m)^\s*(<<<<<<<|=======|>>>>>>>)", workflow_yaml):
+        return None
+    return (
+        "Workflow validation failed: workflow_yaml contains unresolved conflict markers such as "
+        "`<<<<<<<`, `=======`, or `>>>>>>>`. Reconstruct and pass one complete, valid workflow YAML document. "
+        "Do not include merge/conflict marker text, placeholders, or alternate draft fragments."
+    )
+
+
+def _repair_code_only_misindented_envelope_keys(workflow_yaml: str) -> str:
+    lines = workflow_yaml.splitlines(keepends=True)
+    repaired: list[str] = []
+    body_started = False
+    literal_block_indent: int | None = None
+    changed = False
+    key_pattern = re.compile(r"^(?P<indent>\s+)(?P<key>[A-Za-z_][A-Za-z0-9_]*):(?P<rest>.*)$")
+
+    for line in lines:
+        stripped_line = line.strip()
+        indent_len = len(line) - len(line.lstrip(" "))
+        if literal_block_indent is not None:
+            if stripped_line and indent_len <= literal_block_indent:
+                literal_block_indent = None
+            else:
+                repaired.append(line)
+                continue
+
+        if not body_started:
+            match = key_pattern.match(line)
+            if match and match.group("key") in _CODE_ONLY_ENVELOPE_PREFIX_KEYS:
+                line = line.lstrip(" ")
+                changed = True
+                if match.group("key") in _CODE_ONLY_ENVELOPE_BODY_KEYS:
+                    body_started = True
+
+            unindented = line.lstrip(" ")
+            if re.match(r"^(workflow_definition|blocks):", unindented):
+                body_started = True
+
+        if re.search(r":\s*[>|][+-]?\s*(?:#.*)?$", line.rstrip("\r\n")):
+            literal_block_indent = len(line) - len(line.lstrip(" "))
+
+        repaired.append(line)
+
+    return "".join(repaired) if changed else workflow_yaml
+
+
+def _normalize_code_only_workflow_yaml_envelope(ctx: AgentContext, workflow_yaml: str) -> str:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return workflow_yaml
+    try:
+        loaded = yaml.safe_load(workflow_yaml)
+    except yaml.YAMLError:
+        repaired_yaml = _repair_code_only_misindented_envelope_keys(workflow_yaml)
+        if repaired_yaml == workflow_yaml:
+            return workflow_yaml
+        try:
+            loaded = yaml.safe_load(repaired_yaml)
+        except yaml.YAMLError:
+            return workflow_yaml
+        workflow_yaml = repaired_yaml
+    if not isinstance(loaded, dict):
+        return workflow_yaml
+    if "workflow_definition" in loaded or not isinstance(loaded.get("blocks"), list):
+        return workflow_yaml
+
+    wrapped = dict(loaded)
+    blocks = wrapped.pop("blocks")
+    parameters = wrapped.pop("parameters", None)
+    workflow_definition: dict[str, Any] = {"blocks": blocks}
+    if parameters is not None:
+        workflow_definition["parameters"] = parameters
+    wrapped["workflow_definition"] = workflow_definition
+    return yaml.safe_dump(wrapped, sort_keys=False)
+
+
+def _code_only_yaml_validation_error_message(error: Exception) -> str:
+    return (
+        f"Workflow validation failed: {error}\n\n"
+        "CODE-ONLY YAML REPAIR: rebuild one complete workflow YAML document and call update_and_run_blocks "
+        "again. Use this top-level shape exactly: `title: ...` then `workflow_definition:` then `blocks:`. "
+        "Do not put `blocks:` at the top level. For every code block, write `code: |` and indent every Python "
+        "line under it; never inline Python control-flow lines such as `try:` or `except Exception:` as YAML "
+        "mapping text. Do not call MCP browser tools to repair YAML syntax."
+    )
+
+
+def _workflow_parameter_keys_from_dict(workflow_definition: Mapping[str, object]) -> set[str]:
+    parameters = workflow_definition.get("parameters")
+    keys: set[str] = set()
+    if not isinstance(parameters, list):
+        return keys
+    for parameter in parameters:
+        if not isinstance(parameter, Mapping):
+            continue
+        key = parameter.get("key")
+        if isinstance(key, str):
+            keys.add(key)
+    return keys
+
+
+def _code_block_security_validation_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+    workflow_parameter_keys = _workflow_parameter_keys_from_dict(workflow_definition)
+
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) != "code":
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        try:
+            CodeBlock.is_safe_code(code)
+        except SyntaxError as exc:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` contains invalid Python syntax: {exc.msg} "
+                f"at line {exc.lineno or 'unknown'}. Repair the code before saving."
+            )
+        except InsecureCodeDetected as exc:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` contains sandbox-blocked Python: {exc}. "
+                "Remove unsafe code before saving. Do not write import statements; use the provided sandbox "
+                "helpers directly, for example `re.search(...)`, `json.loads(...)`, `sleep(...)`, or "
+                "`asyncio.sleep(...)` without importing modules."
+            )
+        if _CODE_ONLY_UNAVAILABLE_LOCAL_HELPER_RE.search(code):
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            return (
+                f"Workflow validation failed: code block `{label}` calls `locals()` or `globals()`, which are "
+                "not available in the code-block sandbox. Build the output from explicitly named scalar, list, "
+                "or dict variables, and clear transient Playwright/runtime objects by assigning those variables "
+                "to `None` before the block ends."
+            )
+        mixed_selector = _CODE_BLOCK_MIXED_TEXT_SELECTOR_GROUP_RE.search(code)
+        if mixed_selector:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            selector = mixed_selector.group("selector")
+            return (
+                f"Workflow validation failed: code block `{label}` mixes CSS selector groups with Playwright "
+                f"text selectors in `{selector}`. Comma grouping only works for CSS selectors; use separate "
+                "locator waits, `page.get_by_text(...)`, `locator('text=...')`, or read body text and check "
+                "strings in Python."
+            )
+        parameter_keys = set(workflow_parameter_keys)
+        block_parameter_keys = block.get("parameter_keys")
+        if isinstance(block_parameter_keys, list):
+            parameter_keys.update(key for key in block_parameter_keys if isinstance(key, str))
+        diagnostics = preflight_code_block(code, parameter_keys=parameter_keys)
+        if diagnostics:
+            label = _block_label_from_yaml(block) or "<unlabeled>"
+            diagnostic = diagnostics[0]
+            return (
+                f"Workflow validation failed: code block `{label}` failed static preflight "
+                f"({diagnostic.code}): {diagnostic.message}"
+            )
+    return None
+
+
+def _code_only_runtime_navigation_guard_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) != "code":
+            continue
+        code = block.get("code")
+        if not isinstance(code, str):
+            continue
+        if not _CODE_ONLY_PAGE_URL_PREFIX_GUARD_RE.search(code):
+            continue
+        label = _block_label_from_yaml(block) or "<unlabeled>"
+        return (
+            f"Workflow validation failed: code block `{label}` uses `page.url.startswith(...)` as a runtime "
+            "navigation guard. That is unsafe for search/result pages because submitted/result URLs often share "
+            "the same prefix as the clean form URL, so the block can skip the required `page.goto(...)` from "
+            "stale browser state. Compare the normalized URL exactly, for example "
+            "`if page.url.split('#')[0] != target_url: await page.goto(target_url, ...)`, or always navigate "
+            "to the durable form/search URL at the start of the open block."
+        )
+    return None
+
+
+def _code_only_page_goto_urls(code: str) -> list[str]:
+    assignments: dict[str, str] = {}
+    for match in _CODE_ONLY_URL_ASSIGNMENT_RE.finditer(code):
+        url = _valid_runtime_anchor_url(match.group("url"))
+        if url is not None:
+            assignments[match.group("name")] = url
+
+    urls: list[str] = []
+    for match in _CODE_ONLY_PAGE_GOTO_ARG_RE.finditer(code):
+        arg = match.group("arg").strip()
+        direct_match = _CODE_ONLY_QUOTED_URL_ARG_RE.match(arg)
+        if direct_match:
+            url = _valid_runtime_anchor_url(direct_match.group("url"))
+        else:
+            url = assignments.get(arg)
+        if url is not None:
+            urls.append(url)
+    return urls
+
+
+def _code_only_runtime_entrypoint_mismatch_error(ctx: AgentContext, workflow_yaml: str) -> str | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+
+    normalized_observed_urls = [url for url in ctx.observed_browser_urls if _valid_runtime_anchor_url(url)]
+    hint = _code_only_runtime_entrypoint_url_hint(normalized_observed_urls)
+    if hint is None:
+        return None
+
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return None
+    blocks = workflow_definition.get("blocks")
+    if not isinstance(blocks, list):
+        return None
+
+    first_code_block: dict[str, Any] | None = None
+    for block in _iter_yaml_blocks(blocks):
+        if normalize_copilot_block_type_alias(str(block.get("block_type") or "")) == "code":
+            first_code_block = block
+            break
+    if first_code_block is None:
+        return None
+
+    code = first_code_block.get("code")
+    if not isinstance(code, str):
+        return None
+    goto_urls = _code_only_page_goto_urls(code)
+    if not goto_urls or any(_same_runtime_page(url, hint) for url in goto_urls):
+        return None
+
+    observed_mismatch = next(
+        (
+            url
+            for url in goto_urls
+            if any(_same_runtime_page(url, observed_url) for observed_url in normalized_observed_urls)
+        ),
+        None,
+    )
+    if observed_mismatch is None:
+        return None
+
+    label = _block_label_from_yaml(first_code_block) or "<unlabeled>"
+    return (
+        f"Workflow validation failed: first code block `{label}` starts runtime navigation from "
+        f"`{observed_mismatch}`, but MCP exploration already observed durable form/search entrypoint `{hint}`. "
+        "In code-only mode, the first open/navigation block must `page.goto(...)` the durable form/search URL "
+        "directly when it is known. Do not spend workflow runtime clicking through a homepage, marketing page, "
+        "submitted-results page, or record-detail page to rediscover the reusable entrypoint."
+    )
+
+
+def _record_observed_browser_url(ctx: AgentContext, url: str) -> None:
+    normalized = _valid_runtime_anchor_url(url)
+    if normalized is None:
+        return
+    observed = list(getattr(ctx, "observed_browser_urls", None) or [])
+    if normalized in observed:
+        observed.remove(normalized)
+    observed.append(normalized)
+    ctx.observed_browser_urls = observed[-20:]
+
+
+def _query_pair_set(url: str) -> frozenset[tuple[str, str]]:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return frozenset()
+    return frozenset((key.lower(), value.lower()) for key, value in parse_qsl(parsed.query, keep_blank_values=True))
+
+
+def _url_without_query(url: str) -> tuple[str, str, str] | None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    return parsed.scheme.lower(), parsed.netloc.lower(), parsed.path
+
+
+def _code_only_runtime_entrypoint_url_hint(observed_urls: list[str]) -> str | None:
+    """Suggest a durable start URL for generated code blocks.
+
+    The observed URL list is recency-ordered, but the latest URL is often a
+    transient result/detail page reached during exploration. For reusable
+    workflows, prefer the earlier form/search URL on the same route.
+    """
+    valid_urls = [url for url in observed_urls if _valid_runtime_anchor_url(url)]
+    if len(valid_urls) < 2:
+        return None
+
+    for index, url in enumerate(valid_urls[:-1]):
+        route = _url_without_query(url)
+        if route is None:
+            continue
+        query_pairs = _query_pair_set(url)
+        for later_url in valid_urls[index + 1 :]:
+            if _url_without_query(later_url) != route:
+                continue
+            later_query_pairs = _query_pair_set(later_url)
+            if query_pairs < later_query_pairs:
+                return url
+    return None
 
 
 def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext | None = None) -> str:
@@ -5077,16 +5542,12 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
         pass
 
 
-def _collect_banned_block_items(
-    blocks: list[Any],
-    banned_types: frozenset[str] | None = None,
-) -> list[tuple[str, str]]:
+def _collect_banned_block_items(blocks: list[Any], banned_types: frozenset[str] | None = None) -> list[tuple[str, str]]:
     """Recursively walk ``blocks`` (mirroring
     :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`)
     and return ``(label, normalized_block_type)`` for every block whose type is
-    in :data:`_COPILOT_BANNED_BLOCK_TYPES`. Blocks missing ``label`` are
-    skipped — the downstream Pydantic validator surfaces those errors on its
-    own."""
+    in the active banned set. Blocks missing ``label`` are skipped — the
+    downstream Pydantic validator surfaces those errors on its own."""
     active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     items: list[tuple[str, str]] = []
     for block in blocks:
@@ -5094,12 +5555,12 @@ def _collect_banned_block_items(
             continue
         raw_type = block.get("block_type")
         if isinstance(raw_type, str):
-            normalized = raw_type.strip().lower()
-            raw_normalized = normalize_copilot_block_type_alias(normalized)
+            raw_normalized = raw_type.strip().lower()
+            normalized = normalize_copilot_block_type_alias(raw_type)
             if normalized in active_banned_types or raw_normalized in active_banned_types:
                 label = block.get("label")
                 if isinstance(label, str):
-                    items.append((label, raw_normalized))
+                    items.append((label, normalized))
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
             items.extend(_collect_banned_block_items(loop_blocks, active_banned_types))
@@ -5151,10 +5612,10 @@ def _detect_new_banned_blocks(
     ``_process_workflow_yaml`` surfaces the specific parse / shape error on
     its own path.
     """
+    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     submitted_blocks = _parse_workflow_blocks(submitted_yaml)
     if submitted_blocks is None:
         return []
-    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     submitted_items = _collect_banned_block_items(submitted_blocks, active_banned_types)
     if not submitted_items:
         return []
@@ -5286,6 +5747,20 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
+    if (
+        _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+        and normalized == "code"
+        and getattr(ctx, "code_only_code_schema_seen", False)
+        and not getattr(ctx, "workflow_persisted", False)
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "CODE-ONLY READY TO DRAFT: you already have the compact `code` block schema. "
+                "Do not call get_block_schema again before the first draft. Call update_and_run_blocks now "
+                "with the focused code-block chain for the known browser behavior."
+            ),
+        }
     if normalized not in _copilot_banned_block_types(ctx):
         return None
     return {
@@ -5294,10 +5769,7 @@ async def _get_block_schema_pre_hook(
     }
 
 
-async def _validate_block_pre_hook(
-    params: dict[str, Any],
-    ctx: AgentContext,
-) -> dict[str, Any] | None:
+def _code_only_validate_block_error(ctx: AgentContext) -> dict[str, Any] | None:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     return {
@@ -5308,6 +5780,13 @@ async def _validate_block_pre_hook(
             "update_and_run_blocks with real focused code blocks that implement the workflow behavior."
         ),
     }
+
+
+async def _validate_block_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _code_only_validate_block_error(ctx)
 
 
 async def _get_block_schema_post_hook(
@@ -5326,13 +5805,96 @@ async def _get_block_schema_post_hook(
         block_type = data.get("block_type")
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
-            data["code_only_note"] = _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
+            observed_urls = ctx.observed_browser_urls
+            code_only_observed_urls = (
+                [url for url in observed_urls[-5:] if isinstance(url, str) and url]
+                if isinstance(observed_urls, list)
+                else []
+            )
+            data["summary"] = (
+                "Run focused async Python against the browser page. In code-only browser mode, use this for "
+                "one durable browser goal at a time: navigation, form filling, submission, result expansion, "
+                "or extraction. Do not combine an entire browser workflow into one code block."
+            )
+            data["schema"] = {
+                "type": "object",
+                "required": ["block_type", "label", "code"],
+                "properties": {
+                    "block_type": {"const": "code"},
+                    "label": {
+                        "type": "string",
+                        "description": "Unique Python-identifier-like label such as open_registry or search_person.",
+                    },
+                    "title": {"type": "string", "description": "Short user-facing title."},
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Async Python body executed with Playwright `page`; use `code: |` in YAML. "
+                            "Keep browser operations deterministic and bounded."
+                        ),
+                    },
+                    "next_block_label": {"type": "string"},
+                    "parameter_keys": {"type": "array", "items": {"type": "string"}},
+                    "continue_on_failure": {"type": "boolean"},
+                },
+                "code_only_note": (
+                    "This compact schema intentionally replaces the generic full JSON schema in code-only mode. "
+                    "Do not spend tokens reproducing unused fields."
+                ),
+            }
+            if code_only_observed_urls:
+                data["code_only_observed_urls"] = code_only_observed_urls
+                runtime_entrypoint_hint = _code_only_runtime_entrypoint_url_hint(code_only_observed_urls)
+                if runtime_entrypoint_hint:
+                    data["code_only_runtime_entrypoint_url_hint"] = runtime_entrypoint_hint
+            data["example"] = {
+                "block_type": "code",
+                "label": "open_observed_target",
+                "title": "Open Observed Target",
+                "code": (
+                    "target_url = observed_target_url\n"
+                    "if page.url.split('#')[0] != target_url:\n"
+                    "    await page.goto(target_url, wait_until='domcontentloaded', timeout=10000)\n"
+                    "await page.locator('body').wait_for(timeout=5000)\n"
+                    "current_url = page.url\n"
+                    "try:\n"
+                    "    page_title = await page.title()\n"
+                    "except Exception:\n"
+                    "    page_title = ''"
+                ),
+                "parameter_keys": ["observed_target_url"],
+            }
             data["code_only_guidance"] = [
-                "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-                "Do not persist navigation/action/login/extraction/validation blocks for browser page work.",
-                "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
-                "Call update_and_run_blocks with a connected runnable set of real code blocks instead of validating dummy or probe blocks.",
-                "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
+                "Choose the durable runtime entrypoint from `code_only_observed_urls`: prefer the observed form/search/input URL where workflow parameters are entered, not the latest result, submitted-results, or record-detail URL reached during exploration.",
+                "If `code_only_runtime_entrypoint_url_hint` is present, the first open_* block should page.goto that URL directly unless the user explicitly asked the workflow to start from an already-open result/detail record.",
+                "Treat observed result/detail URLs as downstream evidence for waits, expansion, and extraction, not as the workflow's first runtime URL when a reusable search/form URL was also observed.",
+                "If MCP resolved a pretty or marketing URL to a different final lookup/search URL, code should use the final resolved form/search URL exactly.",
+                "If `code_only_observed_urls` includes the actual lookup/search URL, the first open_* block must page.goto that URL directly; do not click through a homepage or marketing navigation to rediscover it.",
+                "Do not invent alternate routes such as `/search/` or `/lookup/` after MCP evidence shows the actual target URL. If the page is already on the target URL, reuse the current page.",
+                "Use 2-5 focused code blocks for browser workflows; split open/search/expand/extract into separate blocks.",
+                "For multi-step forms or wizard flows, split blocks by visible step. Fill only the fields visible and editable on the current step, click the visible Next/Continue/Review control, then wait for the next step before filling later-step fields.",
+                "Workflow parameter keys that are valid Python identifiers are available as local variables; normalize user inputs into new locals such as name = str(person_name).strip() before filling fields.",
+                "Stop MCP exploration once the requested workflow's known URL, selectors, values, submit/expand action, and extraction signal are known; call update_and_run_blocks with that connected frontier instead of completing the task manually.",
+                "Do not make the first update only an open/navigation code block when the user asked for search, submit, expand, or extract behavior; include the currently known downstream code blocks too.",
+                "Once the open/search/expand/extract chain is known, skip single-block validation and run the full known chain with update_and_run_blocks; validating only the open block wastes a turn and does not prove the workflow.",
+                "When a code block confirms visible content, return the exact matched row/card/body text excerpt used as evidence, such as `matched_text_excerpt` or `evidence_text`; do not return only booleans for visible products, records, totals, confirmation messages, or identifiers.",
+                "Use `code: |` for multi-line code in workflow YAML; never include truncation placeholders.",
+                "Prefer direct stable URLs when known from the user or MCP evidence; do not click through a homepage at runtime solely to reach a known lookup page.",
+                "Do not guard navigation with `page.url.startswith(target_url)`: result/detail URLs often share the same prefix as the clean form URL. Use exact normalized equality or always navigate to the durable form/search URL in the first open_* block.",
+                "Avoid default-timeout `networkidle` waits; use domcontentloaded plus bounded waits for the selector, URL fragment, heading, or result container that proves the block succeeded.",
+                "Treat required fields, option controls, submit controls, expand controls, and the post-submit result-state transition as code-block preconditions. If a required control is missing, the action did not change state, or the page stays on the pre-submit form/challenge/validation state, raise an exception so the block fails and can be repaired.",
+                "Do not parse default empty-table placeholders or pre-submit page chrome as a truthful no-results state. Only return no results after a proven submit/search transition reaches a result container or explicit no-results message for the requested query.",
+                "After submit/expand actions that may navigate or redraw, wait for domcontentloaded, a URL/result selector, or a short bounded timeout before page.title/page.url/locator reads or a large page.evaluate; if the execution context is destroyed, wait and retry the read/evaluate once.",
+                "If browser exploration reached a page through a click, reproduce the robust click path or include a bounded fallback instead of relying only on a direct deep-link goto.",
+                "Keep generated code deterministic and bounded: use the current page or a known target frame, avoid scanning every frame or every generic div unless the page evidence requires it, and cap optional probes tightly.",
+                "For extraction blocks, prefer Playwright/Python text reads such as locator.inner_text() plus Python re parsing over large page.evaluate JavaScript snippets; avoid multi-line JS extraction functions with regex literals because escaping mistakes cause syntax-error repair loops.",
+                "For Playwright collection reads such as locator.all_inner_texts() or locator.all_text_contents(), wait for the locator first and then call the collection read without a timeout keyword.",
+                "Never let optional page.title() reads fail a code block after navigation or submit; wrap them in a simple try/except that falls back to an empty string, and use URL/body/result selectors as the durable success signal.",
+                "When visible result text contains repeated field/value lines, parse those lines into one structured object per record instead of returning only raw_text or empty detected arrays.",
+                "For result-list/detail workflows, extract only from actual result rows/cards near the searched entity; never infer records from global navigation, filter labels, headers, or footers. If the row shows a different type than requested, return the observed row plus a truthful no-match signal.",
+                "Treat workflow success as both a proven page-state transition and matching output evidence; if either is missing, raise so the block can be repaired.",
+                "All final local variables become block output; do not call locals() or globals(). Build outputs from explicitly named scalar/list/dict variables, and clear Playwright Locator/Page/ElementHandle objects, regex match objects, coroutine objects, exceptions, helper functions/classes, and transient loop locals before the block ends so outputs stay JSON-serializable.",
+                "Do not write import statements in code blocks; safe helpers such as any/all/max/min/sum/sorted, json, html.escape, sleep, and restricted re helpers (match/search/findall/finditer/fullmatch/sub/compile/split/escape plus I/S/IGNORECASE/MULTILINE/DOTALL flags) are already available and should be called directly.",
             ]
     return result
 
@@ -5409,18 +5971,88 @@ def _strip_intent_for_code_only_selector_action(
     return None
 
 
-def _code_only_has_target_page_evidence(data: object) -> bool:
-    if not isinstance(data, dict):
+def _code_only_has_target_page_evidence(data: dict[str, Any]) -> bool:
+    url = str(data.get("url") or "")
+    nested_result = data.get("result")
+    if isinstance(nested_result, dict):
+        nested_url = str(nested_result.get("url") or "")
+        if not url and nested_url:
+            url = nested_url
+        if _code_only_has_target_page_evidence(nested_result):
+            return True
+    if url.startswith("about:"):
         return False
-    for key, value in data.items():
-        normalized = str(key).strip().lower()
-        if normalized in _CODE_ONLY_TARGET_EVIDENCE_KEYS and bool(value):
+    parsed = urlparse(url) if url else None
+    non_root_path = bool(parsed and parsed.path and parsed.path not in {"", "/"})
+    result_evidence_keys = ("results", "rows", "tables")
+    for key in result_evidence_keys:
+        value = data.get(key)
+        if isinstance(value, (list, tuple, dict)) and bool(value):
             return True
-        if isinstance(value, dict) and _code_only_has_target_page_evidence(value):
+    page_structure_keys = (
+        "inputs",
+        "forms",
+        "fields",
+        "controls",
+        "buttons",
+        "selects",
+        "textareas",
+    )
+    for key in page_structure_keys:
+        value = data.get(key)
+        if non_root_path and isinstance(value, (list, tuple, dict)) and bool(value):
             return True
-        if isinstance(value, list) and any(_code_only_has_target_page_evidence(item) for item in value):
+    for key in ("body", "text", "inner_text", "content"):
+        value = data.get(key)
+        if non_root_path and isinstance(value, str) and len(value.strip()) >= 200:
             return True
     return False
+
+
+def _compact_code_only_evaluate_data(
+    value: object,
+    *,
+    key: str = "",
+    depth: int = 0,
+) -> object:
+    """Keep code-only browser evidence useful without sending full page dumps back to the LLM."""
+    if isinstance(value, str):
+        limit = (
+            _CODE_ONLY_EVALUATE_HTML_TEXT_LIMIT
+            if key in {"html", "innerHTML", "outerHTML", "outer_html"}
+            else _CODE_ONLY_EVALUATE_TEXT_LIMIT
+        )
+        if key in _CODE_ONLY_EVALUATE_LONG_TEXT_KEYS and len(value) > limit:
+            return f"{value[:limit]}\n[truncated {len(value) - limit} chars]"
+        return value
+    if isinstance(value, list):
+        limit = _CODE_ONLY_EVALUATE_LIST_LIMIT
+        if key == "options":
+            limit = _CODE_ONLY_EVALUATE_OPTION_LIST_LIMIT
+        elif key == "links":
+            limit = _CODE_ONLY_EVALUATE_LINK_LIST_LIMIT
+        compacted_list = [_compact_code_only_evaluate_data(item, key=key, depth=depth + 1) for item in value[:limit]]
+        if len(value) > limit:
+            compacted_list.append({"truncated_count": len(value) - limit})
+        return compacted_list
+    if isinstance(value, tuple):
+        return tuple(
+            _compact_code_only_evaluate_data(item, key=key, depth=depth + 1)
+            for item in value[:_CODE_ONLY_EVALUATE_LIST_LIMIT]
+        )
+    if isinstance(value, dict):
+        compacted: dict[str, Any] = {}
+        for index, (child_key, child_value) in enumerate(value.items()):
+            if index >= _CODE_ONLY_EVALUATE_DICT_LIMIT:
+                compacted["truncated_key_count"] = len(value) - _CODE_ONLY_EVALUATE_DICT_LIMIT
+                break
+            compacted[child_key] = _compact_code_only_evaluate_data(
+                child_value,
+                key=str(child_key),
+                depth=depth + 1,
+            )
+        return compacted
+    return value
 
 
 _JQUERY_SELECTOR_RE = re.compile(r":(?:contains|eq|first|last|gt|lt|nth|visible|hidden|checked)\s*\(", re.IGNORECASE)
@@ -5481,19 +6113,25 @@ async def _navigate_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     if result.get("ok"):
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and getattr(
+            ctx, "build_phase", None
+        ) in (BuildPhase.INITIAL, BuildPhase.DISCOVERING):
+            try:
+                advance_to_composing(cast(CopilotContext, ctx), reason="code_only_browser_navigation_succeeded")
+            except ValueError as exc:
+                LOG.warning(
+                    "code-only navigate phase transition to composing rejected",
+                    error=str(exc),
+                    build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
+                )
         data = result.pop("data", {})
         result["url"] = data.get("url", "")
+        _record_observed_browser_url(ctx, result["url"])
         result["next_step"] = (
             "Page loaded. You MUST now use evaluate, "
             "get_browser_screenshot, or click to inspect page content "
             "before responding."
         )
-        if (
-            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
-            and isinstance(ctx, CopilotContext)
-            and ctx.build_phase in {BuildPhase.INITIAL, BuildPhase.DISCOVERING}
-        ):
-            advance_to_composing(ctx, reason="code_only_browser_navigation_succeeded")
     return result
 
 
@@ -5525,6 +6163,7 @@ async def _click_post_hook(
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
+        _record_observed_browser_url(ctx, url)
         result["data"] = {
             "selector": data.get("selector", ""),
             "url": url,
@@ -5603,6 +6242,7 @@ async def _type_text_post_hook(
         selector = data.get("selector", "")
         typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
+        _record_observed_browser_url(ctx, url)
         result["data"] = {
             "selector": selector,
             "typed_length": typed_length,
@@ -5623,10 +6263,24 @@ async def _evaluate_post_hook(
     if result.get("ok") and result.get("data"):
         _mark_page_inspected(ctx)
         result["data"].pop("sdk_equivalent", None)
+        nested_result = result["data"].get("result")
+        if isinstance(nested_result, dict):
+            if "url" not in result["data"] and nested_result.get("url"):
+                result["data"]["url"] = nested_result["url"]
+            if "title" not in result["data"] and nested_result.get("title"):
+                result["data"]["title"] = nested_result["title"]
         if "url" not in result["data"]:
             url, _ = await _resolve_url_title(raw, ctx)
             if url:
                 result["data"]["url"] = url
+        if (
+            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+            and isinstance(result["data"], dict)
+            and _code_only_has_target_page_evidence(result["data"])
+        ):
+            ctx.code_only_target_page_evidence_seen = True
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+            result["data"] = _compact_code_only_evaluate_data(result["data"])
         url = str(result["data"].get("url") or "")
         title = str(result["data"].get("title") or "")
         if not title:
@@ -5643,10 +6297,6 @@ async def _evaluate_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
-        if _copilot_block_authoring_policy(
-            ctx
-        ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(result["data"]):
-            ctx.code_only_target_page_evidence_seen = True
         await _maybe_run_completion_verification_from_page_observation(
             ctx,
             url=url,
@@ -5664,6 +6314,7 @@ async def _scroll_post_hook(
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
+        _record_observed_browser_url(ctx, url)
         result["data"] = {
             "direction": data.get("direction", ""),
             "amount": data.get("pixels") or data.get("amount"),
@@ -5682,6 +6333,7 @@ async def _select_option_post_hook(
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
+        _record_observed_browser_url(ctx, url)
         result["data"] = {
             "selector": data.get("selector", ""),
             "value": data.get("value", ""),
@@ -5700,6 +6352,7 @@ async def _press_key_post_hook(
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
+        _record_observed_browser_url(ctx, url)
         result["data"] = {
             "key": data.get("key", ""),
             "selector": data.get("selector", ""),
@@ -5734,7 +6387,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
         "navigate_browser": SchemaOverlay(
             description=(
                 "Navigate the debug browser to a URL. "
-                "Use this to reset browser state or navigate to a starting page before running blocks."
+                "Use this to reset browser state or navigate to a starting page before running blocks. "
+                "In code-only browser mode, this is build-time exploration evidence only; persist browser "
+                "behavior as focused code blocks."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
@@ -5744,7 +6399,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             description=(
                 "Take a screenshot of the current debug browser session. "
                 "Returns a base64-encoded PNG image. "
-                "Use this to see what the browser looks like after running blocks."
+                "Use this to see what the browser looks like after running blocks. "
+                "In code-only browser mode, use screenshots to inform code-block authoring, not as persisted "
+                "workflow steps."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "selector"}),
             forced_args={"inline": True},
@@ -5754,7 +6411,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
         "evaluate": SchemaOverlay(
             description=(
                 "Execute JavaScript in the browser and return the result. "
-                "Use this to inspect DOM state, read values, or run arbitrary JS."
+                "Use this to inspect DOM state, read values, or run arbitrary JS. "
+                "In code-only browser mode, use this as temporary page evidence before writing focused "
+                "code blocks."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
@@ -5772,6 +6431,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
                 "matches many elements (e.g. one button per result row), scope the selector to "
                 "the specific item (its container, a unique attribute, or :nth-of-type) instead "
                 "of relying on `intent` to disambiguate. "
+                "In code-only browser mode, use this to explore or verify the page, then encode durable "
+                "click behavior in a code block. In code-only browser mode, intent-only clicks are rejected "
+                "and selector+intent clicks are downgraded to selector-only clicks to avoid AI fallback. "
                 "IMPORTANT: jQuery pseudo-selectors like :contains(), :eq(), :first, "
                 ":visible are NOT valid CSS. Use standard selectors: "
                 "'button.download', 'a[href*=\"pdf\"]', '#submit-btn', "
@@ -5792,6 +6454,9 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
                 "slower full-page AI scan, and if you pass both, the selector wins and the "
                 "`intent` is ignored. "
                 "Optionally clear the field first. Use this for form filling. "
+                "In code-only browser mode, use this to explore or verify fields, then encode durable "
+                "typing behavior in a code block. In code-only browser mode, intent-only typing is rejected "
+                "and selector+intent typing is downgraded to selector-only typing to avoid AI fallback. "
                 "NEVER type inline passwords, API keys, tokens, cookies, TOTP/OTP "
                 "codes, private keys, or other raw credentials/secrets received in "
                 "chat — stop and follow the CREDENTIAL HANDLING refusal rule in the "
@@ -5810,7 +6475,8 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             description=(
                 "Scroll the page in a direction (up/down/left/right) by pixel amount, "
                 "or scroll a specific element into view using intent or selector. "
-                "Use this to reveal content below the fold."
+                "Use this to reveal content below the fold. In code-only browser mode, use this only as "
+                "temporary page exploration evidence."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
@@ -5830,7 +6496,10 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
                 "Select an option from a <select> dropdown. Provide the value to select and a "
                 "selector to target the element precisely; use `intent` (alone) only when you "
                 "cannot derive a selector — passing both lets the selector win and ignores the "
-                "`intent`. For free-text inputs, use type_text instead."
+                "`intent`. For free-text inputs, use type_text instead. "
+                "In code-only browser mode, encode durable select behavior in a code block after "
+                "exploration. In code-only browser mode, intent-only selection is rejected and "
+                "selector+intent selection is downgraded to selector-only selection to avoid AI fallback."
             ),
             hide_params=frozenset({"session_id", "cdp_url", "timeout"}),
             forced_args={"selector_mode": "direct"},
@@ -5844,7 +6513,8 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             description=(
                 "Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.). "
                 "Optionally focus an element first via selector or intent. "
-                "Use for form submission, tab navigation, or closing dialogs."
+                "Use for form submission, tab navigation, or closing dialogs. In code-only browser mode, "
+                "encode durable key presses in a code block after exploration."
             ),
             hide_params=frozenset({"session_id", "cdp_url"}),
             required_overrides=["key"],
@@ -8167,6 +8837,11 @@ async def _inspect_page_for_composition_impl(
         result = {"ok": False, "error": authority_error}
         record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
         return result
+
+    composition_error = _code_only_composition_inspection_error(copilot_ctx)
+    if composition_error is not None:
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, composition_error)
+        return composition_error
 
     use_current_page = (target_url or "").strip().lower() in _CURRENT_PAGE_INSPECTION_TARGETS
     if not use_current_page:

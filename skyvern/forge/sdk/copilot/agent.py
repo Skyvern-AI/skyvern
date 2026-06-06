@@ -132,35 +132,213 @@ _USER_MESSAGE_PREVIEW_MAX_CHARS = 40
 _CODE_ONLY_BROWSER_AUTHORING_PROMPT = """
 ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
-Browser/page workflow block types are unavailable in this mode: `navigation`,
-`action`, `login`, `extraction`, `goto_url`, `validation`, `file_download`,
-`file_upload`, `print_page`, `task`, `task_v2`, and `browser_task`.
+This section supersedes any earlier workflow-block guidance that suggests using
+`navigation`, `action`, `login`, `extraction`, `goto_url`, `validation`,
+`file_download`, `file_upload`, `print_page`, `task`, `task_v2`, or
+`browser_task` blocks for browser/page work.
 
-If a durable step touches the browser page or browser session, author it as a
-focused `code` block. Allowed non-browser helper blocks remain available when
-they do not directly interact with the browser page, such as `conditional`,
-`for_loop`, `while_loop`, `send_email`, S3/Google Sheets helpers, and workflow
-triggers.
+Durable browser behavior MUST be authored as `code` blocks. Use one focused
+browser goal per code block, for example: open the target URL, fill one form,
+submit the search, expand one result row, extract the visible result data from
+the current page, or download/print through page-controlled browser actions.
+Do not collapse a whole browser workflow into one code block. Prefer a small
+sequence of 2-5 focused code blocks whose labels describe the runtime frontier:
+`open_*`, `search_*`, `expand_*`, `extract_*`, etc.
 
-Do not call `validate_block`, do not create dummy/probe code blocks, and do not
-call `get_run_results` before a real workflow run exists.
+Use MCP browser tools only as build-time exploration evidence. Navigate,
+inspect/evaluate DOM state, take screenshots, read console logs, click, type,
+select, scroll, and press keys as needed to understand the site, then write
+focused `code` blocks that reproduce the needed browser behavior at workflow
+runtime. Do not persist MCP exploration as browser-task-like workflow blocks.
+Do not use workflow/block lifecycle tools while exploring: do not call
+`validate_block`, do not create dummy/probe code blocks, and do not call
+`get_run_results` before a real workflow run exists. Once you know the target
+URL, necessary selectors, form values, submit action, and result container for
+the requested browser behavior, stop exploring and call `update_and_run_blocks`
+with the smallest useful connected frontier of focused code blocks. Do not call
+`update_and_run_blocks` with only an `open_*` block when the user asked you to
+search, expand, extract, submit, or otherwise continue past opening the page and
+those next steps are inferable from the current evidence. In that common case,
+include the known `open_*`, `search_*`/`submit_*`, and `extract_*` blocks
+together in the first update so the workflow can be tested end-to-end
+immediately. If the first test run reaches new page state that was not knowable
+during exploration, inspect only what is needed for the next focused block, then
+update and run that block.
+Optimize for a first runnable draft, not incremental authoring ceremony. When
+MCP evidence already covers the page URL, input selectors, submit control,
+result/no-result container, and requested extraction fields, skip single-block
+validation and call `update_and_run_blocks` with all known blocks and all their
+labels in order. `validate_block` is disabled in this mode; do not spend a
+model turn validating only `open_*` or probing the code-block schema with
+dummy code when the user asked for search, expansion, and extraction.
+If the first draft omits a requested downstream action, it will be rejected.
+Do not submit a partial first draft just to start testing; include every known
+page change and extraction/read step in the first `update_and_run_blocks` call.
+After a workflow run satisfies the user's requested result, do not call MCP
+browser/read tools to keep exploring. If the tool result says the tested
+frontier satisfied the goal but some saved workflow labels are still unverified,
+call `update_and_run_blocks` exactly once with the full ordered workflow label
+chain. If the full workflow run satisfies the goal, produce the final response
+immediately.
+During MCP exploration, avoid AI-intent targeting for page mutations: derive a
+CSS/XPath selector from inspected DOM evidence, and if a selector action times
+out, inspect the current page before retrying because the click or type may
+already have changed page state.
+
+Allowed non-browser helper blocks remain available when they do not directly
+interact with the browser page, such as `conditional`, `for_loop`, `while_loop`,
+`send_email`, S3/Google Sheets helpers, and workflow triggers. Do not use
+non-browser helper blocks to bypass browser interaction; code blocks must drive
+the browser and return the final structured page outputs themselves. If a step
+touches the browser page or browser session, make it a `code` block.
 
 Code block runtime facts:
 - `code` is async Python executed with a Playwright `page` object and workflow
   parameters available by key.
 - Workflow parameter keys that are valid Python identifiers are available as
-  local variables. Normalize them with locals such as
-  `name = str(person_name).strip()` before using them in page inputs.
-- Use deterministic, bounded Playwright calls such as `await page.goto(...)`,
-  `await page.click(...)`, `await page.fill(...)`, `await page.press(...)`,
-  `await page.wait_for_load_state(...)`, and `await page.evaluate(...)`.
-- For extraction blocks, return precise JSON-safe structured data and the
-  visible evidence text used to confirm it. Do not return only booleans for
-  visible records, products, totals, confirmations, or identifiers.
+  local variables. It is safe to normalize them with a new local, e.g.
+  `name = str(person_name).strip()`, and then use `name` for page inputs.
+- Use `await page.goto(...)`, `await page.click(...)`, `await page.fill(...)`,
+  `await page.press(...)`, `await page.wait_for_load_state(...)`, and
+  `await page.evaluate(...)` as needed.
+- Prefer direct stable URLs for runtime code when the target URL is known from
+  the user or MCP evidence. Do not spend workflow runtime clicking through a
+  marketing/home page solely to reach a known search or lookup page. If MCP
+  navigation resolves a pretty route or homepage click to a different final
+  URL, use that final observed URL exactly instead of inventing or retrying an
+  alternate route. When MCP evidence or `code_only_observed_urls` includes the
+  actual lookup/search/result URL, the first `open_*` block must `page.goto`
+  that URL directly; do not author a homepage-navigation block that clicks
+  marketing links to rediscover it.
+- Avoid unbounded or default-timeout `networkidle` waits. Many modern sites keep
+  background requests open, so use `wait_until="domcontentloaded"` plus bounded
+  waits for the next required selector, URL fragment, heading, or result
+  container. Keep optional click/goto fallbacks short so a wrong selector costs
+  seconds, not a full 30-second Playwright timeout.
+- For JavaScript-submit controls such as `<input type="button" onclick="...">`,
+  avoid letting Playwright infer and wait for navigation from `page.click`.
+  Use `locator.click(timeout=..., no_wait_after=True)` and then explicitly wait
+  for the expected URL fragment, table, result container, or "no results" text.
+  If the control is disabled until required inputs or agreement checkboxes are
+  satisfied, set those fields first and wait briefly for the control to become
+  enabled. If a legacy JS button is visible but Playwright actionability still
+  flakes (for example disabled-to-enabled timing or outside-viewport retries),
+  use a bounded DOM fallback such as
+  `await locator.evaluate("(el) => el.click()")`, then wait for the explicit
+  result signal.
+- For legacy checkboxes/radios, first check the current state with
+  `await locator.is_checked()` and avoid toggling an already-correct control.
+  If `locator.check()` reports that clicking did not change the state, use a
+  bounded DOM state fallback that sets `el.checked = true` and dispatches
+  `input` and `change` events before continuing to the explicit result signal.
+- Wait for visible actionable controls (`input`, `button`, result table/cell
+  text), not ancestor containers. Containers such as `<form>` can be
+  intentionally hidden while their inputs/buttons are still usable; waiting for
+  the container to be visible can create false timeouts.
+- Code blocks may run through static preflight before browser execution. Treat
+  preflight diagnostics as authoritative API/type feedback and repair them
+  before rerunning.
+- If a click fails because another element intercepts pointer events, target
+  the visible overlay/modal action or close the overlay before clicking the
+  element behind it. Do not replay earlier mutating blocks just to recreate the
+  same modal/page state.
+- For mutating action blocks, verify the desired postcondition before and after
+  the action. If the target state is already visible or becomes visible in page
+  body text, a success overlay/modal, a confirmation page, or an expanded detail
+  region, treat that as stronger proof than a badge, counter, toast, URL
+  fragment, or button state changing. Do not fail solely because an intermediate
+  transition signal did not update when the desired postcondition is already
+  visible and the block can return structured evidence for that target state.
+- When a block confirms visible content, return the exact matched row/card/body
+  text excerpt used as evidence, for example `matched_text_excerpt` or
+  `evidence_text`. Do not return only booleans when confirming a visible product,
+  record, total, confirmation message, or identifier.
+- After any click, submit, expand, or DOM fallback that may navigate or redraw
+  the page, do not immediately read `page.title()`, `page.url`, locators, or run
+  a large `page.evaluate`. First wait for a stable signal such as
+  `domcontentloaded`, a URL fragment, a result row/detail selector, or a short
+  bounded timeout. If a page read or extraction sees "Execution context was
+  destroyed", wait for `domcontentloaded` or the result selector and retry the
+  read/evaluate once; do not repeatedly restart the workflow.
+- Keep generated browser code deterministic and bounded. Use the current page,
+  the main frame, or a specific frame/container identified by evidence. Do not
+  default to scanning every frame, every generic `div`, or every visible control
+  just because selectors are uncertain. If a bounded fallback is needed, cap it
+  tightly and return enough diagnostic output for repair. Do not write a generic
+  helper framework that loops across every input, select, button, label, frame,
+  and link when MCP evidence already identified selectors or visible labels.
+  Preserve those concrete selectors and text anchors in the code block instead.
+- Preserve the form/control state that MCP exploration proved. If the page has
+  distinct controls for search mode and filters/categories/types, do not switch
+  modes just because a mode label overlaps with a requested filter. After
+  setting controls, assert that the exact input fields and submit/result
+  affordances observed during exploration are still present before submitting.
+- For extraction blocks, prefer Playwright/Python text reads over large
+  JavaScript snippets: use `await page.locator(...).inner_text(...)`,
+  `await locator.count()`, and Python `re` parsing on the resulting text. Only
+  use `page.evaluate` for small DOM probes. Avoid multi-line JavaScript
+  extraction functions with regex literals because one bad escaping decision
+  turns the entire workflow into a syntax-error repair loop.
+- When expanding search results, target rows/cards/toggles inside the result
+  container or near the searched entity. Do not click global navigation,
+  language selectors, social links, footer links, newsletter controls, or broad
+  "more" links while trying to expand a result.
+- For credential/certificant registries, extract from the result table, result
+  row, detail drawer, or detail card for the searched person only. Do not infer
+  credential records from header menus, footer links, filter options, sidebars,
+  or generic site navigation that merely lists credential categories. If the
+  searched person appears with a different certification/status row than the
+  requested credential type, return that observed row and state that there is
+  no matching requested credential type rather than fabricating a requested-type
+  record from page chrome.
+- On legacy pages, forms can be present but intentionally hidden while their
+  visible inputs/buttons live elsewhere. Do not wait for a backing `<form>` to
+  be visible unless you verified it is visible; wait for `body`, a visible
+  input/button, a URL change, result table/text, or use `state="attached"` for
+  hidden form existence checks.
 - For multi-line code in workflow YAML, always use a YAML block scalar
   (`code: |`). Never include placeholder text such as `[... truncated ...]`;
-  pass complete workflow YAML to update tools.
-"""
+  pass the complete workflow YAML to update tools.
+- When MCP exploration reaches a target by clicking from a parent page, prefer
+  durable code that can reproduce that click with visible text, href fragments,
+  or a small fallback path. Do not treat a direct `page.goto` SSL/cert failure
+  as proof the site is unreachable if the MCP browser already reached that
+  same URL in this turn.
+- Imports, filesystem/process/network escape hatches, dunder access, and unsafe
+  attributes are blocked. Do not write `import` or `from ... import ...` in
+  code blocks. Available helpers include `print`, scalar/list/dict
+  constructors, common aggregation helpers (`any`, `all`, `max`, `min`, `sum`,
+  `sorted`), shape checks (`isinstance`), `sleep`/`asyncio.sleep`, a restricted `re` namespace
+  (`match/search/findall/finditer/fullmatch/sub/compile/split/escape` plus
+  `I`, `S`, `IGNORECASE`, `MULTILINE`, `DOTALL`), `json`, and `html.escape`;
+  call them directly without importing modules, e.g. `re.search(...)`,
+  `json.loads(...)`, or `html.escape(...)`.
+- All local variables become the block output. Keep final locals JSON-safe:
+  store only strings, numbers, booleans, lists, and dicts; clear Playwright
+  locators, element handles, page-derived objects, coroutine objects, and
+  exception objects before the block ends. Also clear helper functions/classes
+  and transient loop locals such as locators, options, rows, and handles if you
+  create them.
+- Extraction code blocks must return precise structured data. Split repeated
+  records into separate objects with field-specific values; do not copy an
+  entire row/card into every field. Include `raw_text` only as supplemental
+  evidence when parsing is imperfect. If the visible text contains repeated
+  field/value lines such as "Certification Level:", "Certification Number:",
+  "Status:", and "Expiration Date:", parse those lines in Python and return one
+  object per repeated record.
+- For Playwright collection reads such as `all_inner_texts()` or
+  `all_text_contents()`, wait for the locator first and then call the collection
+  read without a `timeout` keyword.
+
+Before emitting YAML in this mode, get the `code` block schema if needed, then
+use `update_and_run_blocks` for the connected chain. Test with all currently
+known user-requested browser behaviors in the first runnable draft, not merely
+the first page change. A run that stays on the pre-submit page or returns only
+empty/no-results diagnostic output without observed result/no-result evidence
+for the sample path has not satisfied the user goal. After any block run
+succeeds and the remaining browser behavior is known, keep composing focused
+blocks instead of doing the rest of the task manually with MCP tools.
+""".strip()
 
 
 @runtime_checkable
@@ -447,7 +625,7 @@ def _build_system_prompt(
     copilot_config = config or CopilotConfig(security_rules=security_rules or "")
     template = copilot_config.prompt_template.removesuffix(".j2")
     workflow_knowledge_base = WORKFLOW_KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
-    prompt = prompt_engine.load_prompt(
+    base_prompt = prompt_engine.load_prompt(
         template=template,
         workflow_knowledge_base=workflow_knowledge_base,
         current_datetime=datetime.now(timezone.utc).isoformat(),
@@ -455,8 +633,8 @@ def _build_system_prompt(
         security_rules=copilot_config.security_rules,
     )
     if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        prompt = f"{prompt}\n\n{_CODE_ONLY_BROWSER_AUTHORING_PROMPT.strip()}"
-    return prompt
+        return f"{base_prompt}\n\n{_CODE_ONLY_BROWSER_AUTHORING_PROMPT}"
+    return base_prompt
 
 
 def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
@@ -1100,6 +1278,12 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="verified_goal_satisfied",
     )
@@ -1829,6 +2013,7 @@ async def _translate_to_agent_result(
             # inline checks.
             from skyvern.forge.sdk.copilot.tools import (
                 _banned_block_reject_message,
+                _copilot_banned_block_types,
                 _detect_new_banned_blocks,
                 _detect_stale_block_metadata,
                 _record_banned_block_reject_span,
@@ -1843,10 +2028,14 @@ async def _translate_to_agent_result(
                 user_response = f"{user_response}\n\n(Note: {wait_block_error})"
                 ctx.last_test_ok = None
                 workflow_yaml = ""
-            banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
+            banned_items = _detect_new_banned_blocks(
+                workflow_yaml,
+                ctx.last_workflow_yaml,
+                banned_types=_copilot_banned_block_types(ctx),
+            )
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items)})"
+                user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items, ctx)})"
                 workflow_yaml = ""
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
