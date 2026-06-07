@@ -695,7 +695,7 @@ request_options=RequestOptions(
 - Python `download_files` does not support `wait_for_completion` - poll manually or use webhooks.
 - `publish_workflow=True` is deprecated and routes through the legacy Skyvern 2.0 publish path for backwards compatibility. Prefer creating reusable workflows with the workflow APIs.
 - Only workflow runs with `persist_browser_session=True` produce archives for profile creation.
-- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`.
+- `engine` accepts `RunEngine` enum values: `skyvern_v1`, `skyvern_v2`, `openai_cua`, `anthropic_cua`, `ui_tars`, `yutori_navigator`. The `openai_cua` and `anthropic_cua` engines, as well as Anthropic Claude Opus 4.x models passed via `model`, are gated to enterprise organizations and return HTTP 403 for other callers.
 - `launch_local_browser` requires Python local mode (`Skyvern.local()`) and the `skyvern[local]` extra.
 - `page.agent` methods always wait for completion.
 - Python-only features: `launch_local_browser`, `get_page_for`, `locator`/`AILocator`, `type`, `hover`, `scroll`, `upload_file` (page-level), form automation (`fill_form`, `fill_multipage_form`, `fill_from_mapping`, `extract_form_fields`, `validate_mapping`, `fill_autocomplete`), iframe management (`frame_switch`, `frame_main`, `frame_list`).
