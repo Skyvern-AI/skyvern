@@ -7846,7 +7846,7 @@ async def _composition_evidence_after_navigation_failure(
     current_url = current_url or inspected_url
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
-    html, html_error, html_truncated = await _composition_get_html(ctx)
+    html, html_error, html_truncated, _ = await _composition_get_html(ctx)
     if html_error is None:
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
@@ -8085,7 +8085,7 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
-async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool]:
+async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> tuple[str, str | None, bool, bool]:
     """Return body HTML for composition parsing, surviving the MCP response size cap.
 
     `skyvern_get_html("body")` is the fast path, but the shared size cap DROPS the
@@ -8094,20 +8094,25 @@ async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool
     parse an empty string and report hollow evidence. On an empty/capped read, fall
     back to an `evaluate` that returns the body with script/style/svg/etc. stripped
     and length-bounded; that fits under the cap while preserving the form/link
-    structure. Returns (html, error, truncated): error is set only on a hard read
-    failure; truncated is True when the stripped fallback was sliced at the cap (the
-    raw path is never silently truncated — it is dropped over the cap and falls back).
+    structure. Returns (html, error, truncated, used_stripped): error is set only on
+    a hard read failure; truncated is True when the stripped fallback was sliced at
+    the cap; used_stripped is True when the bounded read was the source (raw skipped
+    or cap-dropped). `skip_raw` goes straight to the stripped read so a caller that
+    has already seen the raw serialization get cap-dropped for this page need not
+    re-issue it.
     """
-    html_result = await _discovery_get_html(copilot_ctx)
-    if html_result.get("ok"):
-        html = _discovery_extract_html_payload(html_result)
-        if html.strip():
-            return html, None, False
+    html_result: dict[str, Any] = {}
+    if not skip_raw:
+        html_result = await _discovery_get_html(copilot_ctx)
+        if html_result.get("ok"):
+            html = _discovery_extract_html_payload(html_result)
+            if html.strip():
+                return html, None, False, False
     stripped, truncated = await _composition_get_stripped_html(copilot_ctx)
     if stripped and stripped.strip():
-        return stripped, None, truncated
+        return stripped, None, truncated, True
     error = html_result.get("error")
-    return "", str(error) if error else None, False
+    return "", str(error) if error else None, False, True
 
 
 async def _capture_composition_evidence(
@@ -8129,10 +8134,16 @@ async def _capture_composition_evidence(
     """
     evidence: dict[str, Any] | None = None
     html_truncated = False
+    skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
-        html, html_error, html_truncated = await _composition_get_html(copilot_ctx)
+        html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
             return None, html_error
+        # On a heavy page the raw get_html serialization is dropped over the MCP size cap and
+        # falls back to the stripped read; once that happens, settle-and-recapture via the
+        # stripped path only so a slow page is still retried without re-serializing the full DOM.
+        if used_stripped:
+            skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         if has_bounded_page_schema(evidence):
             break
@@ -8149,6 +8160,39 @@ async def _capture_composition_evidence(
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
     return evidence, None
+
+
+def _normalized_inspect_url(url: str | None) -> str | None:
+    """Normalized full URL for strict same-page comparison, or None when not comparable.
+
+    Preserves scheme, the path's trailing slash, query, and fragment so distinct rendered
+    states (http vs https, /p vs /p/, ?q=a vs ?q=b, hash-routed SPA states) never collide;
+    only netloc case and an empty root path are normalized.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}{query}{fragment}"
+
+
+def _same_inspect_target(live_url: str | None, target_url: str | None) -> bool:
+    """True when the live page is the exact page a URL-target inspect would navigate to.
+
+    Strict full-URL equality, so a different scheme, trailing slash, query, or fragment
+    still navigates. Used to skip the re-navigation when the agent is already standing on
+    the requested page.
+    """
+    live_key = _normalized_inspect_url(live_url)
+    target_key = _normalized_inspect_url(target_url)
+    return live_key is not None and live_key == target_key
 
 
 async def _inspect_page_for_composition_impl(
@@ -8176,28 +8220,6 @@ async def _inspect_page_for_composition_impl(
         use_current_page=use_current_page,
     )
 
-    if (
-        not bypass_budget_for_post_run_current_page
-        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    ):
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
-    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
     entry_url: str
     kind: str
     if use_current_page:
@@ -8220,23 +8242,51 @@ async def _inspect_page_for_composition_impl(
             record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, regression_error)
             return regression_error
 
+    # Skip re-navigation when the inspect target is the page the browser is already on. A
+    # passive client-side redirect can move the browser without a tool, so for a URL target
+    # confirm against the live URL; for current_page the live URL is the target by definition.
+    if use_current_page:
+        inspect_target_url = current_url
+        on_target_page = True
+    else:
+        live_url, _ = await _fallback_page_info(copilot_ctx)
+        on_target_page = _same_inspect_target(live_url, entry_url)
+        inspect_target_url = live_url if on_target_page else entry_url
+
+    if (
+        not bypass_budget_for_post_run_current_page
+        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
+    ):
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
+    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    evidence = None
+    html_error: str | None = None
     with copilot_span(
         "inspect_page_for_composition",
         data={"target_url_kind": kind},
     ):
-        if use_current_page:
-            current_url = entry_url
+        if on_target_page:
+            # current_page, or a URL target the agent is already on — capture without navigating.
+            current_url = inspect_target_url or entry_url
             evidence, html_error = await _capture_composition_evidence(
                 copilot_ctx, inspected_url=entry_url, current_url=current_url
             )
-            if html_error is not None:
-                result = {
-                    "ok": False,
-                    "data": None,
-                    "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                }
-                record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                return result
         else:
             nav_result = await _discovery_navigate(
                 copilot_ctx,
@@ -8266,14 +8316,15 @@ async def _inspect_page_for_composition_impl(
                 evidence, html_error = await _capture_composition_evidence(
                     copilot_ctx, inspected_url=entry_url, current_url=current_url
                 )
-                if html_error is not None:
-                    result = {
-                        "ok": False,
-                        "data": None,
-                        "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                    }
-                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                    return result
+
+    if html_error is not None:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
 
     if evidence is None:
         result = {
@@ -8405,7 +8456,7 @@ async def _discovery_walk(
         # fall back to a stripped-body evaluate that keeps the links/forms the resolver needs
         # to identify a usable entrypoint. (Discovery only resolves the entrypoint, so a sliced
         # tail does not matter here.)
-        html, _, _ = await _composition_get_html(ctx)
+        html, _, _, _ = await _composition_get_html(ctx)
         page_title, anchors, form_fields = _discovery_parse_html(html)
 
         evidence_trail.append(

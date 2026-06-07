@@ -23,6 +23,7 @@ class _Ctx:
         self.composition_page_evidence = None
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
+        self.browser_session_id = None
 
 
 class _FailingNavigateServer:
@@ -608,12 +609,12 @@ async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap
     from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _composition_get_html
 
     at_cap = "<body>" + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
-    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
     assert error is None
     assert truncated is True
 
     under_cap = "<body><form><input name='x'></form></body>"
-    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
     assert error is None
     assert truncated is False
 
