@@ -646,6 +646,13 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def validate_enterprise_feature_access(
+        self,
+        organization_id: str | None = None,
+        feature_names: set[str] | None = None,
+    ) -> None:
+        return
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,
