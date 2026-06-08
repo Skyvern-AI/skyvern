@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, render, screen } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import type { ComponentType } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -22,6 +28,22 @@ vi.mock("../nodes/types", () => ({
   workflowBlockTitle: { task: "Task" },
 }));
 
+// The sidebar title delegates label edits to the same hook the canvas tile
+// uses. Stub it so this test pins the wiring (title → handler) without
+// pulling in React Flow node mutation, the parameters store, or the
+// collapse store the real hook depends on.
+const { mockLabelChangeHandler } = vi.hoisted(() => ({
+  mockLabelChangeHandler: vi.fn(),
+}));
+vi.mock("@/routes/workflows/hooks/useLabelChangeHandler", () => ({
+  useNodeLabelChangeHandler: ({
+    initialValue,
+  }: {
+    id: string;
+    initialValue: string;
+  }) => [initialValue, mockLabelChangeHandler] as const,
+}));
+
 // `useReactFlow` requires a `<ReactFlowProvider>` ancestor with mounted
 // nodes; spinning that up just to read `.getNode(id)` is overkill for a
 // structural mount test. Stub it to a deterministic node lookup so
@@ -32,8 +54,18 @@ vi.mock("@xyflow/react", async () => {
     await vi.importActual<typeof import("@xyflow/react")>("@xyflow/react");
   const nodeFor = (id: string) => ({
     id,
-    type: "task",
-    data: { label: id === "block-a" ? "Alpha" : "Beta" },
+    type: id === "start-block" ? "start" : "task",
+    data: {
+      label:
+        id === "block-a"
+          ? "Alpha"
+          : id === "start-block"
+            ? "__start_block__"
+            : id === "block-readonly"
+              ? "ReadOnly"
+              : "Beta",
+      editable: id !== "block-readonly",
+    },
   });
   return {
     ...actual,
@@ -49,6 +81,15 @@ import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 
 import { BLOCK_FORMS, type WorkflowBlockNodeType } from "./BlockConfigForm";
 import { BlockConfigSidebar } from "./BlockConfigSidebar";
+
+// EditableNodeTitle (used by the editable block title) measures truncation
+// via ResizeObserver, which jsdom does not implement. Stubbed per-test in
+// beforeEach/afterEach so the global does not leak across test files.
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
 
 // The structural invariants this file pins are about the sidebar shell,
 // not the body content. Stub each entry to a marker component so per-form
@@ -69,6 +110,7 @@ const StubFormForBlockType: (
   };
 
 beforeEach(() => {
+  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   useWorkflowPanelStore.getState().setSelectedBlockId(null);
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = StubFormForBlockType(key);
@@ -76,6 +118,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   cleanup();
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = ORIGINAL_BLOCK_FORMS[key];
@@ -216,5 +259,65 @@ describe("BlockConfigSidebar mode gating (SKY-9361)", () => {
     );
 
     expect(screen.getByTestId("block-config-sidebar")).toBeDefined();
+  });
+});
+
+describe("BlockConfigSidebar block title editing (SKY-10255)", () => {
+  beforeEach(() => {
+    mockLabelChangeHandler.mockClear();
+  });
+
+  test("clicking the block title reveals an input and committing a new value calls the label change handler", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-a");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const title = screen.getByText("Alpha");
+    fireEvent.click(title);
+
+    const input = screen.getByRole("textbox");
+    fireEvent.change(input, { target: { value: "renamed_block" } });
+    fireEvent.blur(input);
+
+    expect(mockLabelChangeHandler).toHaveBeenCalledWith("renamed_block");
+  });
+
+  test("keeps the start node title non-editable (no input on click)", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("start-block");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const title = screen.getByText("Agent Settings");
+    fireEvent.click(title);
+
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(mockLabelChangeHandler).not.toHaveBeenCalled();
+  });
+
+  test("keeps the title non-editable for a read-only block (no input on click)", () => {
+    act(() => {
+      useWorkflowPanelStore.getState().setSelectedBlockId("block-readonly");
+    });
+    render(
+      <MemoryRouter initialEntries={["/workflows/wpid_abc/edit"]}>
+        <BlockConfigSidebar />
+      </MemoryRouter>,
+    );
+
+    const title = screen.getByText("ReadOnly");
+    fireEvent.click(title);
+
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(mockLabelChangeHandler).not.toHaveBeenCalled();
   });
 });
