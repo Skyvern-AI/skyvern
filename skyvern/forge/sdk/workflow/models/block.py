@@ -6,7 +6,9 @@ import asyncio
 import codecs
 import copy
 import csv
+import html
 import json
+import keyword
 import os
 import re
 import smtplib
@@ -3460,20 +3462,34 @@ class CodeBlock(Block):
             "tuple": tuple,
             "set": set,
             "bool": bool,
+            "isinstance": isinstance,
+            "enumerate": enumerate,
+            "any": any,
+            "all": all,
+            "max": max,
+            "min": min,
+            "sum": sum,
+            "sorted": sorted,
             "sleep": asyncio.sleep,
             "asyncio": SimpleNamespace(sleep=asyncio.sleep),
             "re": SimpleNamespace(
                 match=re.match,
                 search=re.search,
                 findall=re.findall,
+                finditer=re.finditer,
+                fullmatch=re.fullmatch,
                 sub=re.sub,
                 compile=re.compile,
                 split=re.split,
+                escape=re.escape,
+                I=re.I,
+                S=re.S,
                 IGNORECASE=re.IGNORECASE,
                 MULTILINE=re.MULTILINE,
                 DOTALL=re.DOTALL,
             ),
             "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
+            "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
         }
 
@@ -3484,21 +3500,45 @@ class CodeBlock(Block):
         # user code so it can block dunder identifiers like __capture_locals.
         self.is_safe_code(code)
         code = textwrap.indent(textwrap.dedent(code), "    ")
-        full_code = f"""
-async def wrapper():
-{code}
-    return __capture_locals()
-"""
         runtime_variables: dict[str, Callable[[], Awaitable[dict[str, Any]]]] = {}
         safe_vars = self.build_safe_vars()
+        parameter_defaults: dict[str, Any] = {}
         if parameters:
             for key, value in parameters.items():
                 if key not in safe_vars:
                     safe_vars[key] = value
+                    if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
+                        parameter_defaults[key] = value
+        default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
+        full_code = f"""
+async def wrapper({default_args}):
+{code}
+    return __capture_locals()
+"""
         safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
+        safe_vars["__param_defaults"] = parameter_defaults
         exec(full_code, safe_vars, runtime_variables)
-        return runtime_variables["wrapper"]
+        user_function = runtime_variables["wrapper"]
+        if not parameter_defaults:
+            return user_function
+
+        excluded_parameter_keys = frozenset(parameter_defaults)
+
+        async def filtered_user_function() -> dict[str, Any]:
+            result = await user_function()
+            return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
+
+        return filtered_user_function
+
+    @staticmethod
+    async def execute_user_function_with_timeout(
+        user_function: Callable[[], Awaitable[dict[str, Any]]],
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        if timeout_seconds <= 0:
+            return await user_function()
+        return await asyncio.wait_for(user_function(), timeout=timeout_seconds)
 
     def get_all_parameters(
         self,
@@ -3603,11 +3643,26 @@ async def wrapper():
 
         try:
             user_function = self.generate_async_user_function(self.code, page, parameter_values)
-            result = await user_function()
+            result = await self.execute_user_function_with_timeout(
+                user_function,
+                settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
+            )
         except InsecureCodeDetected as e:
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except asyncio.TimeoutError:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=(
+                    "Failed to execute code block. Reason: TimeoutError: code block exceeded "
+                    f"{settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS} seconds"
+                ),
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,

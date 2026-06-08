@@ -38,6 +38,7 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    DisabledBlockExecutionError,
     InvalidCredentialId,
     MissingValueForParameter,
     ScriptTerminationException,
@@ -61,6 +62,7 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.screenshot_downscale import resolve_screenshot_downscale_for_context
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -75,13 +77,17 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    BaseTaskBlock,
     Block,
     BlockTypeVar,
     ConditionalBlock,
     ExtractionBlock,
+    FileParserBlock,
     ForLoopBlock,
     NavigationBlock,
+    PDFParserBlock,
     TaskV2Block,
+    TextPromptBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
@@ -179,6 +185,42 @@ def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> 
 def _format_workflow_run_elapsed_timeout_failure_reason(effective_minutes: int) -> str:
     minute_label = "minute" if effective_minutes == 1 else "minutes"
     return f"Workflow run exceeded max elapsed runtime limit of {effective_minutes} {minute_label}."
+
+
+def _collect_enterprise_gated_workflow_features(
+    workflow: Workflow,
+    *,
+    block_labels: list[str] | None = None,
+) -> set[str]:
+    # workflow.model is editor metadata today; executable blocks read their own model fields.
+    feature_names: set[str] = set()
+
+    all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+    if block_labels:
+        blocks_by_label = {block.label: block for block in all_blocks}
+        blocks_to_check = get_all_blocks([blocks_by_label[label] for label in block_labels if label in blocks_by_label])
+    else:
+        blocks_to_check = all_blocks
+
+    for block in blocks_to_check:
+        # TaskV2Block deliberately stays out of this set: its inherited model field is not consumed at runtime.
+        task_block_uses_engine_and_model = (
+            isinstance(block, BaseTaskBlock) and block.block_type != BlockType.HUMAN_INTERACTION
+        )
+        block_uses_model = task_block_uses_engine_and_model or isinstance(
+            block,
+            (TextPromptBlock, FileParserBlock, PDFParserBlock),
+        )
+        engine = block.engine if task_block_uses_engine_and_model else None
+        model = block.model if block_uses_model else None
+        feature_names.update(
+            collect_enterprise_gated_run_features(
+                engine=engine,
+                model=model,
+            )
+        )
+
+    return feature_names
 
 
 def _select_recording_urls_in_window(
@@ -1502,6 +1544,36 @@ class WorkflowService:
                 organization_id=organization_id,
             )
             return workflow_run
+
+        enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
+        if enterprise_gated_features:
+            try:
+                await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+                    organization_id=organization_id,
+                    feature_names=enterprise_gated_features,
+                )
+            except DisabledBlockExecutionError as e:
+                LOG.warning(
+                    "Workflow uses enterprise-gated features without access",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    enterprise_gated_features=sorted(enterprise_gated_features),
+                    exc_info=True,
+                )
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=get_user_facing_exception_message(e),
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                    need_call_webhook=need_call_webhook,
+                )
+                return workflow_run
 
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)

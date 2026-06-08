@@ -106,7 +106,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -2765,8 +2765,15 @@ class ForgeAgent:
 
     @traced(name="skyvern.agent.complete_verify")
     async def complete_verify(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteVerifyResult:
+        otel_trace.get_current_span().set_attribute("verification.trigger", verification_trigger)
         LOG.debug(
             "Checking if user goal is achieved after re-scraping the page",
             workflow_run_id=task.workflow_run_id,
@@ -2903,7 +2910,13 @@ class ForgeAgent:
         return result
 
     async def check_user_goal_complete(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2911,6 +2924,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger=verification_trigger,
             )
 
             # Check if we should terminate instead of complete
@@ -3730,7 +3744,7 @@ class ForgeAgent:
         cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
             EXTRACT_ACTION_TEMPLATE
         )
-        LOG.info(
+        LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
             cache_enabled=cache_enabled,
@@ -4812,18 +4826,13 @@ class ForgeAgent:
         Note: This should only be called when verification is needed (i.e., when
         the standard flow would have called check_user_goal_complete in agent_step).
         """
-        LOG.info(
-            "Starting parallel user goal verification with speculative extract-actions",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-
         verification_task = asyncio.create_task(
             self.check_user_goal_complete(
                 page=page,
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger="periodic_after_step",
             ),
             name=f"verify_goal_{step.step_id}",
         )

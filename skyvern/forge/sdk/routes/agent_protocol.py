@@ -33,9 +33,11 @@ from skyvern._version import __version__
 from skyvern.analytics import get_oss_version
 from skyvern.config import settings
 from skyvern.exceptions import (
+    DisabledBlockExecutionError,
     MissingBrowserAddressError,
     SkyvernHTTPException,
     WorkflowNotFound,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -53,6 +55,7 @@ from skyvern.forge.sdk.core.curl_converter import curl_to_http_request_block_par
 from skyvern.forge.sdk.core.permissions.permission_checker_factory import PermissionCheckerFactory
 from skyvern.forge.sdk.core.security import generate_skyvern_signature
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.routes.code_samples import (
@@ -174,6 +177,28 @@ FORCE_TASK_V1_MAX_STEPS = 25
 _create_from_prompt_adapter: TypeAdapter[CreateFromPromptRequest] = TypeAdapter(CreateFromPromptRequest)
 
 
+async def _validate_enterprise_gated_task_run_features(
+    *,
+    organization_id: str,
+    engine: RunEngine | None = None,
+    model: dict[str, Any] | None = None,
+) -> None:
+    feature_names = collect_enterprise_gated_run_features(engine=engine, model=model)
+    if not feature_names:
+        return
+
+    try:
+        await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+            organization_id=organization_id,
+            feature_names=feature_names,
+        )
+    except DisabledBlockExecutionError as e:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail=get_user_facing_exception_message(e),
+        ) from e
+
+
 class AISuggestionType(str, Enum):
     DATA_SCHEMA = "data_schema"
 
@@ -246,6 +271,12 @@ async def run_task(
         run_request.engine = RunEngine.skyvern_v1
         if not run_request.max_steps or run_request.max_steps > cap:
             run_request.max_steps = cap
+
+    await _validate_enterprise_gated_task_run_features(
+        organization_id=current_org.organization_id,
+        engine=run_request.engine,
+        model=run_request.model,
+    )
 
     if run_request.engine in CUA_ENGINES or run_request.engine == RunEngine.skyvern_v1:
         # create task v1
@@ -1224,7 +1255,7 @@ async def delete_workflow(
 @base_router.post(
     "/folders",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "create_folder",
     },
@@ -1266,7 +1297,7 @@ async def create_folder(
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folder",
     },
@@ -1310,7 +1341,7 @@ async def get_folder(
 @base_router.get(
     "/folders",
     response_model=list[Folder],
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folders",
     },
@@ -1367,7 +1398,7 @@ async def get_folders(
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_folder",
     },
@@ -1413,7 +1444,7 @@ async def update_folder(
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_folder",
     },
@@ -1449,7 +1480,7 @@ async def delete_folder(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow_folder",
     },
@@ -1559,7 +1590,7 @@ async def _apply_tag_changes_with_retry(
 @base_router.post(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
@@ -1609,7 +1640,7 @@ async def apply_workflow_tags(
 @base_router.delete(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
     summary="Delete agent tag",
@@ -1658,7 +1689,7 @@ async def delete_workflow_tag(
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
     summary="Get agent tags",
@@ -1705,7 +1736,7 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
     summary="Get agent tag history",
@@ -1746,7 +1777,7 @@ async def get_workflow_tag_history(
 @base_router.get(
     "/tag-keys",
     response_model=list[TagKey],
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
@@ -1767,7 +1798,7 @@ async def list_tag_keys(
 @base_router.patch(
     "/tag-keys/{key}",
     response_model=TagKey,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
@@ -1895,7 +1926,7 @@ async def _resolve_active_batch_wpids(requested_wpids: list[str], organization_i
 @base_router.get(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags"},
     description="Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
     summary="Batch get agent tags",
@@ -1930,7 +1961,7 @@ async def batch_get_workflow_tags(
 @base_router.post(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags_post"},
     description="Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
     summary="Batch get agent tags (POST)",
@@ -2054,9 +2085,14 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
     ArtifactType.RECORDING: "video/webm",
+    ArtifactType.SESSION_REPLAY: "video/mp4",
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
+_VIDEO_CONTENT_TYPES_BY_EXTENSION = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+}
 
 
 def _sanitize_header_filename(name: str) -> str:
@@ -2133,9 +2169,16 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     so browsers never render user-supplied content inline (SKY-8862). All other
     types keep the historical ``inline`` behaviour.
     """
-    media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
+    raw_name = _artifact_filename_from_uri(artifact.uri)
+    if artifact.artifact_type in {ArtifactType.RECORDING, ArtifactType.SESSION_REPLAY}:
+        _, dot, extension = raw_name.lower().rpartition(".")
+        media_type = _VIDEO_CONTENT_TYPES_BY_EXTENSION.get(
+            f"{dot}{extension}" if dot else "",
+            _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT),
+        )
+    else:
+        media_type = _ARTIFACT_CONTENT_TYPES.get(artifact.artifact_type, _ARTIFACT_CONTENT_TYPE_DEFAULT)
     if artifact.artifact_type == ArtifactType.DOWNLOAD:
-        raw_name = _artifact_filename_from_uri(artifact.uri)
         return media_type, _build_attachment_disposition(raw_name)
     return media_type, "inline"
 
@@ -2615,10 +2658,11 @@ async def heartbeat() -> Response:
 @legacy_base_router.get("/version/", include_in_schema=False)
 @base_router.get(
     "/version",
-    tags=["server"],
+    tags=["Server"],
     summary="Get server version",
     description="Returns the current Skyvern server version (git SHA for official builds).",
     responses={200: {"description": "Current server version"}},
+    openapi_extra={"x-fern-sdk-method-name": "get_version"},
 )
 @base_router.get("/version/", include_in_schema=False)
 async def get_version() -> dict[str, str]:
@@ -2669,6 +2713,11 @@ async def run_task_v1(
     analytics.capture("skyvern-oss-agent-task-create", data={"url": task.url})
     await PermissionCheckerFactory.get_instance().check(current_org, browser_session_id=task.browser_session_id)
     await app.RATE_LIMITER.rate_limit_submit_run(current_org.organization_id)
+    # Legacy TaskRequest has no engine field; CUA engine selection goes through /run/tasks.
+    await _validate_enterprise_gated_task_run_features(
+        organization_id=current_org.organization_id,
+        model=task.model,
+    )
 
     created_task = await task_v1_service.run_task(
         task=task,

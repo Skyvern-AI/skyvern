@@ -73,6 +73,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     parse_composition_html,
     workflow_target_url,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
@@ -2278,10 +2279,14 @@ async def _update_workflow(
     # block type. The schema pre_hook only fires when the LLM consults the
     # schema; this safety net fires regardless of emission path. Label-based
     # diff preserves legacy workflows — only NEW banned labels trip the reject.
-    banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.workflow_yaml)
+    banned_items = _detect_new_banned_blocks(
+        workflow_yaml,
+        ctx.workflow_yaml,
+        banned_types=_copilot_banned_block_types(ctx),
+    )
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
-        return {"ok": False, "error": _banned_block_reject_message(banned_items)}
+        return {"ok": False, "error": _banned_block_reject_message(banned_items, ctx)}
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
     if composition_evidence_error:
@@ -4942,6 +4947,23 @@ async def _maybe_run_completion_verification_from_page_observation(
 # a separate agent, which bypasses copilot-level block decomposition and
 # obfuscates issues the copilot should surface/handle directly.
 _COPILOT_BANNED_BLOCK_TYPES: frozenset[str] = frozenset({"task", "task_v2"})
+# Code-only browser mode uses this temporary hard ban to force iteration on
+# code-first Copilot behavior. The GA policy is not settled: it may allow some
+# of these block types again, or make the allow/ban list configurable.
+_COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES: frozenset[str] = _COPILOT_BANNED_BLOCK_TYPES | frozenset(
+    {
+        "action",
+        "browser_task",
+        "extraction",
+        "file_download",
+        "file_upload",
+        "goto_url",
+        "login",
+        "navigation",
+        "print_page",
+        "validation",
+    }
+)
 
 # Shared suffix across every LLM-facing rejection message for banned
 # block emission — the pre-hook (schema-lookup reject) and the post-
@@ -4951,9 +4973,49 @@ _COPILOT_BANNED_BLOCK_ALTERNATIVES = (
     "`extraction` for data extraction, `validation` for completion checks, "
     "`login` for authentication, or `goto_url` for pure URL navigation."
 )
+_COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES = (
+    "Browser/page workflow block types are unavailable in code-only browser mode. Use focused `code` "
+    "blocks for durable page or browser-session work."
+)
+_CODE_ONLY_TARGET_EVIDENCE_KEYS = frozenset(
+    {
+        "buttons",
+        "fields",
+        "forms",
+        "inputs",
+        "links",
+        "options",
+        "result",
+        "results",
+        "rows",
+        "selects",
+        "tables",
+        "textareas",
+        "url",
+    }
+)
+_CODE_ONLY_SELECTOR_ACTION_TOOLS = frozenset({"click", "type_text", "select_option", "press_key"})
 
 
-def _banned_block_reject_message(items: list[tuple[str, str]]) -> str:
+def _copilot_block_authoring_policy(ctx: AgentContext | None) -> BlockAuthoringPolicy:
+    if ctx is None:
+        return BlockAuthoringPolicy.STANDARD
+    return normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None))
+
+
+def _copilot_banned_block_types(ctx: AgentContext | None) -> frozenset[str]:
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES
+    return _COPILOT_BANNED_BLOCK_TYPES
+
+
+def _copilot_banned_block_alternatives(ctx: AgentContext | None) -> str:
+    if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
+    return _COPILOT_BANNED_BLOCK_ALTERNATIVES
+
+
+def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext | None = None) -> str:
     """Uniform error text for the post-emission reject, sharing the
     alternatives suffix with the schema pre-hook."""
     labels = ", ".join(sorted({label for label, _ in items}))
@@ -4962,7 +5024,7 @@ def _banned_block_reject_message(items: list[tuple[str, str]]) -> str:
     return (
         f"Block type {types_part} is not available in the workflow copilot. "
         f"Offending labels: [{labels}]. "
-        f"{_COPILOT_BANNED_BLOCK_ALTERNATIVES}"
+        f"{_copilot_banned_block_alternatives(ctx)}"
     )
 
 
@@ -5015,13 +5077,17 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
         pass
 
 
-def _collect_banned_block_items(blocks: list[Any]) -> list[tuple[str, str]]:
+def _collect_banned_block_items(
+    blocks: list[Any],
+    banned_types: frozenset[str] | None = None,
+) -> list[tuple[str, str]]:
     """Recursively walk ``blocks`` (mirroring
     :func:`skyvern.forge.sdk.copilot.block_goal_wrapping._wrap_blocks_in_place`)
     and return ``(label, normalized_block_type)`` for every block whose type is
     in :data:`_COPILOT_BANNED_BLOCK_TYPES`. Blocks missing ``label`` are
     skipped — the downstream Pydantic validator surfaces those errors on its
     own."""
+    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
     items: list[tuple[str, str]] = []
     for block in blocks:
         if not isinstance(block, dict):
@@ -5029,13 +5095,14 @@ def _collect_banned_block_items(blocks: list[Any]) -> list[tuple[str, str]]:
         raw_type = block.get("block_type")
         if isinstance(raw_type, str):
             normalized = raw_type.strip().lower()
-            if normalized in _COPILOT_BANNED_BLOCK_TYPES:
+            raw_normalized = normalize_copilot_block_type_alias(normalized)
+            if normalized in active_banned_types or raw_normalized in active_banned_types:
                 label = block.get("label")
                 if isinstance(label, str):
-                    items.append((label, normalized))
+                    items.append((label, raw_normalized))
         loop_blocks = block.get("loop_blocks")
         if isinstance(loop_blocks, list):
-            items.extend(_collect_banned_block_items(loop_blocks))
+            items.extend(_collect_banned_block_items(loop_blocks, active_banned_types))
     return items
 
 
@@ -5067,6 +5134,8 @@ def _block_label_from_yaml(block: dict[str, Any]) -> str | None:
 def _detect_new_banned_blocks(
     submitted_yaml: str,
     prior_workflow_yaml: str | None,
+    *,
+    banned_types: frozenset[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Return ``[(label, block_type), ...]`` for every banned-type block in
     ``submitted_yaml`` whose label is NOT present as a banned-type block in
@@ -5085,11 +5154,12 @@ def _detect_new_banned_blocks(
     submitted_blocks = _parse_workflow_blocks(submitted_yaml)
     if submitted_blocks is None:
         return []
-    submitted_items = _collect_banned_block_items(submitted_blocks)
+    active_banned_types = banned_types or _COPILOT_BANNED_BLOCK_TYPES
+    submitted_items = _collect_banned_block_items(submitted_blocks, active_banned_types)
     if not submitted_items:
         return []
     prior_blocks = _parse_workflow_blocks(prior_workflow_yaml)
-    prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [])}
+    prior_labels = {label for label, _ in _collect_banned_block_items(prior_blocks or [], active_banned_types)}
     return [(label, block_type) for label, block_type in submitted_items if label not in prior_labels]
 
 
@@ -5216,11 +5286,27 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
-    if normalized not in _COPILOT_BANNED_BLOCK_TYPES:
+    if normalized not in _copilot_banned_block_types(ctx):
         return None
     return {
         "ok": False,
-        "error": f"Block type {block_type!r} is not available in the workflow copilot. {_COPILOT_BANNED_BLOCK_ALTERNATIVES}",
+        "error": f"Block type {block_type!r} is not available in the workflow copilot. {_copilot_banned_block_alternatives(ctx)}",
+    }
+
+
+async def _validate_block_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    return {
+        "ok": False,
+        "error": (
+            "CODE-ONLY BLOCK VALIDATION DISABLED: do not use validate_block, dummy code blocks, or probe code "
+            "blocks in code-only browser mode. Use MCP browser tools to explore the page, then call "
+            "update_and_run_blocks with real focused code blocks that implement the workflow behavior."
+        ),
     }
 
 
@@ -5235,9 +5321,43 @@ async def _get_block_schema_post_hook(
     if isinstance(data, dict):
         block_types = data.get("block_types")
         if isinstance(block_types, dict):
-            for banned in _COPILOT_BANNED_BLOCK_TYPES:
+            for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
+        block_type = data.get("block_type")
+        if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
+            ctx.code_only_code_schema_seen = True
+            data["code_only_note"] = _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
+            data["code_only_guidance"] = [
+                "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
+                "Do not persist navigation/action/login/extraction/validation blocks for browser page work.",
+                "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
+                "Call update_and_run_blocks with a connected runnable set of real code blocks instead of validating dummy or probe blocks.",
+                "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
+            ]
     return result
+
+
+def _code_only_pre_run_results_error(ctx: CopilotContext) -> dict[str, Any] | None:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if ctx.workflow_persisted or ctx.update_workflow_called:
+        return None
+    for value in (
+        ctx.pending_reconciliation_run_id,
+        ctx.last_run_blocks_workflow_run_id,
+        ctx.last_successful_run_blocks_workflow_run_id,
+    ):
+        if isinstance(value, str) and value:
+            return None
+    return {
+        "ok": False,
+        "error": (
+            "CODE-ONLY EXPLORATION PHASE: get_run_results is unavailable before a real workflow run exists. "
+            "Use MCP browser tools such as navigate_browser, evaluate, click, type_text, get_browser_screenshot, "
+            "console_messages, scroll, select_option, or press_key to understand the page, then call "
+            "update_and_run_blocks with real focused code blocks."
+        ),
+    }
 
 
 async def _evaluate_pre_hook(
@@ -5253,15 +5373,66 @@ async def _evaluate_pre_hook(
     return None
 
 
-_JQUERY_SELECTOR_RE = re.compile(
-    r":(?:contains|eq|first|last|gt|lt|nth|has|visible|hidden|checked)\s*\(", re.IGNORECASE
-)
+def _code_only_deterministic_targeting_error(tool_name: str) -> str:
+    return (
+        f"In code-only browser mode, {tool_name} requires a CSS/XPath selector for page mutations "
+        "after the reusable workflow has been verified. Use evaluate, screenshots, or page inspection "
+        "to derive a selector, then retry with selector only."
+    )
+
+
+def _code_only_selector_action_requires_deterministic_target(ctx: AgentContext) -> bool:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return False
+    if not getattr(ctx, "workflow_persisted", False):
+        return False
+    return bool(getattr(ctx, "last_full_workflow_test_ok", False))
+
+
+def _strip_intent_for_code_only_selector_action(
+    params: dict[str, Any],
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    if not _code_only_selector_action_requires_deterministic_target(ctx):
+        return None
+    if tool_name not in _CODE_ONLY_SELECTOR_ACTION_TOOLS:
+        return None
+    selector = params.get("selector")
+    if isinstance(selector, str) and selector.strip():
+        if "intent" in params:
+            params["intent"] = None
+        return None
+    if params.get("intent"):
+        return {"ok": False, "error": _code_only_deterministic_targeting_error(tool_name)}
+    return None
+
+
+def _code_only_has_target_page_evidence(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    for key, value in data.items():
+        normalized = str(key).strip().lower()
+        if normalized in _CODE_ONLY_TARGET_EVIDENCE_KEYS and bool(value):
+            return True
+        if isinstance(value, dict) and _code_only_has_target_page_evidence(value):
+            return True
+        if isinstance(value, list) and any(_code_only_has_target_page_evidence(item) for item in value):
+            return True
+    return False
+
+
+_JQUERY_SELECTOR_RE = re.compile(r":(?:contains|eq|first|last|gt|lt|nth|visible|hidden|checked)\s*\(", re.IGNORECASE)
 
 
 async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
+    if deterministic_result is not None:
+        return deterministic_result
     selector = params.get("selector", "")
     if not selector:
         return None
@@ -5282,6 +5453,27 @@ async def _click_pre_hook(
     return None
 
 
+async def _type_text_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
+
+
+async def _select_option_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
+
+
+async def _press_key_pre_hook(
+    params: dict[str, Any],
+    ctx: AgentContext,
+) -> dict[str, Any] | None:
+    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="press_key")
+
+
 async def _navigate_post_hook(
     result: dict[str, Any],
     raw: dict[str, Any],
@@ -5296,6 +5488,12 @@ async def _navigate_post_hook(
             "get_browser_screenshot, or click to inspect page content "
             "before responding."
         )
+        if (
+            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+            and isinstance(ctx, CopilotContext)
+            and ctx.build_phase in {BuildPhase.INITIAL, BuildPhase.DISCOVERING}
+        ):
+            advance_to_composing(ctx, reason="code_only_browser_navigation_succeeded")
     return result
 
 
@@ -5445,6 +5643,10 @@ async def _evaluate_post_hook(
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if _copilot_block_authoring_policy(
+            ctx
+        ) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and _code_only_has_target_page_evidence(result["data"]):
+            ctx.code_only_target_page_evidence_seen = True
         await _maybe_run_completion_verification_from_page_observation(
             ctx,
             url=url,
@@ -5528,7 +5730,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             pre_hook=_get_block_schema_pre_hook,
             post_hook=_get_block_schema_post_hook,
         ),
-        "validate_block": SchemaOverlay(),
+        "validate_block": SchemaOverlay(pre_hook=_validate_block_pre_hook),
         "navigate_browser": SchemaOverlay(
             description=(
                 "Navigate the debug browser to a URL. "
@@ -5601,6 +5803,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             arg_transforms={"clear_first": "clear"},
             requires_browser=True,
             timeout=15,
+            pre_hook=_type_text_pre_hook,
             post_hook=_type_text_post_hook,
         ),
         "scroll": SchemaOverlay(
@@ -5634,6 +5837,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             required_overrides=["value"],
             requires_browser=True,
             timeout=15,
+            pre_hook=_select_option_pre_hook,
             post_hook=_select_option_post_hook,
         ),
         "press_key": SchemaOverlay(
@@ -5645,6 +5849,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             hide_params=frozenset({"session_id", "cdp_url"}),
             required_overrides=["key"],
             requires_browser=True,
+            pre_hook=_press_key_pre_hook,
             post_hook=_press_key_post_hook,
         ),
     }
@@ -6807,6 +7012,11 @@ async def get_run_results_tool(
     authority_error = _authority_tool_error(copilot_ctx, "get_run_results")
     if authority_error:
         return json.dumps({"ok": False, "error": authority_error})
+    if isinstance(copilot_ctx, CopilotContext):
+        code_only_pre_run_error = _code_only_pre_run_results_error(copilot_ctx)
+        if code_only_pre_run_error is not None:
+            record_tool_step_result_for_ctx(copilot_ctx, "get_run_results", params, code_only_pre_run_error)
+            return json.dumps(code_only_pre_run_error)
 
     result = await _get_run_results(params, copilot_ctx)
     _record_per_tool_budget_problem_blocks_from_results(copilot_ctx, result)
@@ -7636,7 +7846,7 @@ async def _composition_evidence_after_navigation_failure(
     current_url = current_url or inspected_url
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
-    html, html_error, html_truncated = await _composition_get_html(ctx)
+    html, html_error, html_truncated, _ = await _composition_get_html(ctx)
     if html_error is None:
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
@@ -7875,7 +8085,7 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
-async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool]:
+async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> tuple[str, str | None, bool, bool]:
     """Return body HTML for composition parsing, surviving the MCP response size cap.
 
     `skyvern_get_html("body")` is the fast path, but the shared size cap DROPS the
@@ -7884,20 +8094,25 @@ async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool
     parse an empty string and report hollow evidence. On an empty/capped read, fall
     back to an `evaluate` that returns the body with script/style/svg/etc. stripped
     and length-bounded; that fits under the cap while preserving the form/link
-    structure. Returns (html, error, truncated): error is set only on a hard read
-    failure; truncated is True when the stripped fallback was sliced at the cap (the
-    raw path is never silently truncated — it is dropped over the cap and falls back).
+    structure. Returns (html, error, truncated, used_stripped): error is set only on
+    a hard read failure; truncated is True when the stripped fallback was sliced at
+    the cap; used_stripped is True when the bounded read was the source (raw skipped
+    or cap-dropped). `skip_raw` goes straight to the stripped read so a caller that
+    has already seen the raw serialization get cap-dropped for this page need not
+    re-issue it.
     """
-    html_result = await _discovery_get_html(copilot_ctx)
-    if html_result.get("ok"):
-        html = _discovery_extract_html_payload(html_result)
-        if html.strip():
-            return html, None, False
+    html_result: dict[str, Any] = {}
+    if not skip_raw:
+        html_result = await _discovery_get_html(copilot_ctx)
+        if html_result.get("ok"):
+            html = _discovery_extract_html_payload(html_result)
+            if html.strip():
+                return html, None, False, False
     stripped, truncated = await _composition_get_stripped_html(copilot_ctx)
     if stripped and stripped.strip():
-        return stripped, None, truncated
+        return stripped, None, truncated, True
     error = html_result.get("error")
-    return "", str(error) if error else None, False
+    return "", str(error) if error else None, False, True
 
 
 async def _capture_composition_evidence(
@@ -7919,10 +8134,16 @@ async def _capture_composition_evidence(
     """
     evidence: dict[str, Any] | None = None
     html_truncated = False
+    skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
-        html, html_error, html_truncated = await _composition_get_html(copilot_ctx)
+        html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
             return None, html_error
+        # On a heavy page the raw get_html serialization is dropped over the MCP size cap and
+        # falls back to the stripped read; once that happens, settle-and-recapture via the
+        # stripped path only so a slow page is still retried without re-serializing the full DOM.
+        if used_stripped:
+            skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         if has_bounded_page_schema(evidence):
             break
@@ -7939,6 +8160,39 @@ async def _capture_composition_evidence(
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
     return evidence, None
+
+
+def _normalized_inspect_url(url: str | None) -> str | None:
+    """Normalized full URL for strict same-page comparison, or None when not comparable.
+
+    Preserves scheme, the path's trailing slash, query, and fragment so distinct rendered
+    states (http vs https, /p vs /p/, ?q=a vs ?q=b, hash-routed SPA states) never collide;
+    only netloc case and an empty root path are normalized.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}{query}{fragment}"
+
+
+def _same_inspect_target(live_url: str | None, target_url: str | None) -> bool:
+    """True when the live page is the exact page a URL-target inspect would navigate to.
+
+    Strict full-URL equality, so a different scheme, trailing slash, query, or fragment
+    still navigates. Used to skip the re-navigation when the agent is already standing on
+    the requested page.
+    """
+    live_key = _normalized_inspect_url(live_url)
+    target_key = _normalized_inspect_url(target_url)
+    return live_key is not None and live_key == target_key
 
 
 async def _inspect_page_for_composition_impl(
@@ -7966,28 +8220,6 @@ async def _inspect_page_for_composition_impl(
         use_current_page=use_current_page,
     )
 
-    if (
-        not bypass_budget_for_post_run_current_page
-        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    ):
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
-    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
     entry_url: str
     kind: str
     if use_current_page:
@@ -8010,23 +8242,51 @@ async def _inspect_page_for_composition_impl(
             record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, regression_error)
             return regression_error
 
+    # Skip re-navigation when the inspect target is the page the browser is already on. A
+    # passive client-side redirect can move the browser without a tool, so for a URL target
+    # confirm against the live URL; for current_page the live URL is the target by definition.
+    if use_current_page:
+        inspect_target_url = current_url
+        on_target_page = True
+    else:
+        live_url, _ = await _fallback_page_info(copilot_ctx)
+        on_target_page = _same_inspect_target(live_url, entry_url)
+        inspect_target_url = live_url if on_target_page else entry_url
+
+    if (
+        not bypass_budget_for_post_run_current_page
+        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
+    ):
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
+    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    evidence = None
+    html_error: str | None = None
     with copilot_span(
         "inspect_page_for_composition",
         data={"target_url_kind": kind},
     ):
-        if use_current_page:
-            current_url = entry_url
+        if on_target_page:
+            # current_page, or a URL target the agent is already on — capture without navigating.
+            current_url = inspect_target_url or entry_url
             evidence, html_error = await _capture_composition_evidence(
                 copilot_ctx, inspected_url=entry_url, current_url=current_url
             )
-            if html_error is not None:
-                result = {
-                    "ok": False,
-                    "data": None,
-                    "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                }
-                record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                return result
         else:
             nav_result = await _discovery_navigate(
                 copilot_ctx,
@@ -8056,14 +8316,15 @@ async def _inspect_page_for_composition_impl(
                 evidence, html_error = await _capture_composition_evidence(
                     copilot_ctx, inspected_url=entry_url, current_url=current_url
                 )
-                if html_error is not None:
-                    result = {
-                        "ok": False,
-                        "data": None,
-                        "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                    }
-                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                    return result
+
+    if html_error is not None:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
 
     if evidence is None:
         result = {
@@ -8195,7 +8456,7 @@ async def _discovery_walk(
         # fall back to a stripped-body evaluate that keeps the links/forms the resolver needs
         # to identify a usable entrypoint. (Discovery only resolves the entrypoint, so a sliced
         # tail does not matter here.)
-        html, _, _ = await _composition_get_html(ctx)
+        html, _, _, _ = await _composition_get_html(ctx)
         page_title, anchors, form_fields = _discovery_parse_html(html)
 
         evidence_trail.append(

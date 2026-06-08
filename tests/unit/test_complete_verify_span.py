@@ -14,6 +14,7 @@ verified — just the observability plumbing.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import get_args
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from skyvern.forge.agent import ForgeAgent
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.models import StepStatus
+from skyvern.forge.sdk.trace import VerificationTrigger
 from tests.unit.helpers import make_browser_state, make_organization, make_step, make_task
 
 COMPLETE_VERIFY_SPAN_NAME = "skyvern.agent.complete_verify"
@@ -38,6 +40,7 @@ async def _call_complete_verify(
     *,
     llm_response: dict,
     use_termination_prompt: bool,
+    verification_trigger: VerificationTrigger = "periodic_after_step",
 ) -> None:
     agent = ForgeAgent()
     now = datetime.now(UTC)
@@ -92,7 +95,13 @@ async def _call_complete_verify(
     )
     skyvern_context.set(context)
     try:
-        await agent.complete_verify(page=page, scraped_page=scraped_page, task=task, step=step)
+        await agent.complete_verify(
+            page=page,
+            scraped_page=scraped_page,
+            task=task,
+            step=step,
+            verification_trigger=verification_trigger,
+        )
     finally:
         skyvern_context.reset()
 
@@ -169,3 +178,22 @@ async def test_span_attrs_for_complete_status_termination_aware_prompt(
     attrs = span.attributes or {}
     assert attrs.get("verification.status") == "complete"
     assert attrs.get("verification.template") == "check-user-goal-with-termination"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verification_trigger", list(get_args(VerificationTrigger)))
+async def test_span_carries_verification_trigger_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+    span_exporter: InMemorySpanExporter,
+    verification_trigger: VerificationTrigger,
+) -> None:
+    await _call_complete_verify(
+        monkeypatch,
+        llm_response={"user_goal_achieved": True, "thoughts": "done", "page_info": "ok"},
+        use_termination_prompt=False,
+        verification_trigger=verification_trigger,
+    )
+    span = _span_by_name(span_exporter.get_finished_spans(), COMPLETE_VERIFY_SPAN_NAME)
+    assert span is not None
+    attrs = span.attributes or {}
+    assert attrs.get("verification.trigger") == verification_trigger

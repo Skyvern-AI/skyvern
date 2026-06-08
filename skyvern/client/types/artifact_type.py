@@ -5,6 +5,7 @@ import typing
 ArtifactType = typing.Union[
     typing.Literal[
         "recording",
+        "session_replay",
         "browser_console_log",
         "skyvern_log",
         "skyvern_log_raw",

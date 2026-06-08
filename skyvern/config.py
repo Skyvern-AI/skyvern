@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     CHROME_EXECUTABLE_PATH: str | None = None
     MAX_SCRAPING_RETRIES: int = 0
     VIDEO_PATH: str | None = "./video"
+    VIDEO_COMPRESSION_ENABLED: bool = True
+    VIDEO_COMPRESSION_CRF: int = 28
+    VIDEO_COMPRESSION_PRESET: str = "veryfast"
+    VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
@@ -107,6 +111,7 @@ class Settings(BaseSettings):
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
+    CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25

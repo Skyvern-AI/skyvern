@@ -311,26 +311,30 @@ For each test, record:
 
 ## Step 7: Report Results
 
-The report must include embedded screenshots. Upload screenshot files to GitHub
-and reference them as markdown images.
+The report must include embedded screenshots. Host them at a **PR-accessible URL** and reference
+them as markdown images. **Do not upload evidence to a GitHub release, and do not commit
+screenshots into the repository.**
 
-### Upload screenshots to GitHub
+### Host the screenshots
 
-Look up the PR number and short SHA first so filenames are stable:
+Embed each screenshot from somewhere the PR can render it:
+
+- An image host or your issue tracker's attachment upload that returns a public URL, or
+- Drag-and-drop the file into the PR or comment composer on github.com, which uploads it to
+  `user-attachments` and yields a ready markdown embed.
+
+**Privacy gate:** the embedded URL is public and the PR may be public, so before uploading scrub
+each capture of names, PII, secrets, tokens, and internal URLs — otherwise re-capture against
+non-sensitive data, crop/mask the sensitive regions, or describe the result instead of embedding it.
+
+Look up the PR number (Step 8 reuses it):
 
 ```bash
 PR_NUMBER=$(gh pr view --json number -q '.number' 2>/dev/null || echo "draft")
-SHORT_SHA=$(git rev-parse --short HEAD)
-
-# Create a release for screenshot assets (once per repo)
-gh release create qa-screenshots --repo OWNER/REPO --title "QA Screenshots" --notes "Asset store for smoke test screenshots" 2>/dev/null || true
-
-# Upload each screenshot (namespaced to avoid clobbering prior runs)
-gh release upload qa-screenshots "/path/to/screenshot.png#pr${PR_NUMBER}-${SHORT_SHA}-screenshot.png" --repo OWNER/REPO --clobber
 ```
 
-The download URL follows the pattern:
-`https://github.com/OWNER/REPO/releases/download/qa-screenshots/pr123-abc1234-screenshot.png`
+If you have no PR-accessible host, save the captures under `.qa/screenshots/` and tell the user
+where they are and that a host is needed — do not post unreachable local paths as evidence.
 
 ### Report format
 
@@ -343,9 +347,9 @@ The download URL follows the pattern:
 ### Results
 | Flow | Result | Screenshot |
 |------|--------|------------|
-| Workflows page | PASS | ![workflows](https://github.com/OWNER/REPO/releases/download/qa-screenshots/pr123-abc1234-workflows.png) |
-| Task detail | PASS | ![task-detail](https://github.com/OWNER/REPO/releases/download/qa-screenshots/pr123-abc1234-task-detail.png) |
-| Settings save | FAIL | ![settings-error](https://github.com/OWNER/REPO/releases/download/qa-screenshots/pr123-abc1234-settings.png) |
+| Workflows page | PASS | ![workflows](https://<image-host>/workflows.png) |
+| Task detail | PASS | ![task-detail](https://<image-host>/task-detail.png) |
+| Settings save | FAIL | ![settings-error](https://<image-host>/settings.png) |
 
 ### Verdict
 2/3 tests passed. 1 issue found.
@@ -416,7 +420,7 @@ rm -f "$COMMENT_FILE"
 | Auth redirect detected | Tell user to authenticate in the Chrome DevTools browser, wait for confirmation |
 | Skyvern browser tools also unavailable | Use Playwright directly (`npx playwright`) as last resort |
 | Health gate fails on navigation | Mark the test as FAIL, take a screenshot anyway for evidence, continue |
-| Screenshot upload fails | Save locally to `.qa/screenshots/`, list paths in the PR comment, and tell the user to upload manually |
+| Screenshot upload fails | Save the captures under `.qa/screenshots/` for the record, then stop and ask the user for a PR-accessible host — do not post unreachable local paths as evidence |
 | No testable changes (docs-only, config-only) | Report "Changes are non-behavioral - no smoke tests generated." |
 
 ## CI Setup

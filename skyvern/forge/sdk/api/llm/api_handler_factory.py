@@ -85,6 +85,17 @@ EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
 
 
+def _set_llm_context_attrs(
+    span: otel_trace.Span,
+    *,
+    screenshots: list[bytes] | None,
+    is_speculative_step: bool,
+) -> None:
+    span.set_attribute("screenshots_included", bool(screenshots))
+    span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
+    span.set_attribute("speculative", bool(is_speculative_step))
+
+
 def _enrich_llm_span(
     span: otel_trace.Span,
     *,
@@ -512,6 +523,26 @@ class LLMAPIHandlerFactory:
                 cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
+
+    @staticmethod
+    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """Return provider-reported cost from response.usage.cost when present."""
+        if not hasattr(response, "usage") or not response.usage:
+            return None
+
+        usage = response.usage
+        cost = getattr(usage, "cost", None)
+        if cost is None and isinstance(usage, dict):
+            cost = usage.get("cost")
+        if cost is None:
+            return None
+
+        try:
+            cost_value = float(cost)
+        except (TypeError, ValueError):
+            return None
+
+        return cost_value if cost_value >= 0 else None
 
     @staticmethod
     def _apply_thinking_budget_optimization(
@@ -1052,6 +1083,7 @@ class LLMAPIHandlerFactory:
                             )
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1730,6 +1762,7 @@ class LLMAPIHandlerFactory:
 
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 model_name = llm_config.model_name
 
@@ -2380,6 +2413,7 @@ class LLMCaller:
 
             screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
             llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
+            _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2875,8 +2909,6 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-        if self.original_llm_key.startswith("openrouter/"):
-            return empty_call_stats
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot
         if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
@@ -2917,14 +2949,30 @@ class LLMCaller:
                 reasoning_tokens=0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
-            try:
-                llm_cost = litellm.completion_cost(completion_response=response)
-            except Exception as e:
-                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                llm_cost = 0
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
+            llm_cost = 0.0
+            if self.original_llm_key.startswith("openrouter/"):
+                reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
+                if reported_cost is not None:
+                    llm_cost = reported_cost
+                else:
+                    LOG.warning(
+                        "OpenRouter response missing usage.cost; cost will be reported as 0",
+                        llm_key=self.original_llm_key,
+                        response_id=getattr(response, "id", None),
+                    )
+            else:
+                try:
+                    llm_cost = litellm.completion_cost(completion_response=response)
+                except Exception as e:
+                    LOG.debug(
+                        "Failed to calculate LLM cost",
+                        error=str(e),
+                        exc_info=True,
+                    )
+                    llm_cost = 0
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,

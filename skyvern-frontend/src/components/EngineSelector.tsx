@@ -6,13 +6,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "./ui/select";
-import { cn } from "@/util/utils";
+import { BadgeLabel, type BadgeVariant } from "./BadgeLabel";
 
 type EngineOption = {
   value: RunEngine;
   label: string;
   badge?: string;
-  badgeVariant?: "default" | "success" | "warning";
+  badgeVariant?: BadgeVariant;
 };
 
 type Props = {
@@ -38,14 +38,20 @@ const allEngineOptions: Array<EngineOption> = [
   {
     value: RunEngine.OpenaiCua,
     label: "OpenAI CUA",
+    badge: "Enterprise",
+    badgeVariant: "warning",
   },
   {
     value: RunEngine.AnthropicCua,
     label: "Anthropic CUA",
+    badge: "Enterprise",
+    badgeVariant: "warning",
   },
   {
     value: RunEngine.YutoriNavigator,
     label: "Yutori Navigator",
+    badge: "Deprecated",
+    badgeVariant: "default",
   },
 ];
 
@@ -54,28 +60,7 @@ const defaultEngines: Array<RunEngine> = [
   RunEngine.SkyvernV1,
   RunEngine.OpenaiCua,
   RunEngine.AnthropicCua,
-  RunEngine.YutoriNavigator,
 ];
-
-function BadgeLabel({ option }: { option: EngineOption }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span>{option.label}</span>
-      {option.badge && (
-        <span
-          className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium", {
-            "bg-green-500/20 text-green-400": option.badgeVariant === "success",
-            "bg-amber-500/20 text-amber-400": option.badgeVariant === "warning",
-            "bg-slate-500/20 text-slate-400":
-              option.badgeVariant === "default" || !option.badgeVariant,
-          })}
-        >
-          {option.badge}
-        </span>
-      )}
-    </div>
-  );
-}
 
 function RunEngineSelector({
   value,
@@ -84,8 +69,10 @@ function RunEngineSelector({
   availableEngines,
 }: Props) {
   const engines = availableEngines ?? defaultEngines;
+  const visibleEngines =
+    value && !engines.includes(value) ? [...engines, value] : engines;
   const engineOptions = allEngineOptions.filter((opt) =>
-    engines.includes(opt.value),
+    visibleEngines.includes(opt.value),
   );
 
   const selectedOption = engineOptions.find(
@@ -96,13 +83,23 @@ function RunEngineSelector({
     <Select value={value ?? RunEngine.SkyvernV1} onValueChange={onChange}>
       <SelectTrigger className={className}>
         <SelectValue>
-          {selectedOption && <BadgeLabel option={selectedOption} />}
+          {selectedOption && (
+            <BadgeLabel
+              label={selectedOption.label}
+              badge={selectedOption.badge}
+              badgeVariant={selectedOption.badgeVariant}
+            />
+          )}
         </SelectValue>
       </SelectTrigger>
       <SelectContent>
         {engineOptions.map((option) => (
           <SelectItem key={option.value} value={option.value}>
-            <BadgeLabel option={option} />
+            <BadgeLabel
+              label={option.label}
+              badge={option.badge}
+              badgeVariant={option.badgeVariant}
+            />
           </SelectItem>
         ))}
       </SelectContent>

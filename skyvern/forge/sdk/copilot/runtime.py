@@ -25,6 +25,7 @@ from skyvern.cli.core.session_manager import (
     unregister_copilot_session,
 )
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -156,6 +157,8 @@ class AgentContext:
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None
+    code_only_code_schema_seen: bool = False
+    code_only_target_page_evidence_seen: bool = False
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
     challenge_gated_proxy_retry_count: int = 0
@@ -170,6 +173,7 @@ class AgentContext:
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
