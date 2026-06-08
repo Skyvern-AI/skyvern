@@ -1,7 +1,29 @@
 import { type ReactNode } from "react";
 
+import {
+  CheckCircledIcon,
+  CircleBackslashIcon,
+  CircleIcon,
+  ClockIcon,
+  CrossCircledIcon,
+  MinusCircledIcon,
+  PauseIcon,
+  StopIcon,
+  StopwatchIcon,
+  UpdateIcon,
+} from "@radix-ui/react-icons";
+
 import { Status } from "@/api/types";
 import { cn } from "@/util/utils";
+
+import { Badge } from "./ui/badge";
+
+type StatusVariant =
+  | "success"
+  | "warning"
+  | "destructive"
+  | "terminated"
+  | "secondary";
 
 type PillTone =
   | "success"
@@ -11,13 +33,13 @@ type PillTone =
   | "queued"
   | "neutral";
 
-const toneStyles: Record<PillTone, string> = {
-  success: "bg-emerald-600 text-white",
-  danger: "bg-rose-600 text-white",
-  terminated: "bg-orange-600 text-white",
-  running: "bg-blue-600 text-white",
-  queued: "bg-amber-500 text-amber-950",
-  neutral: "bg-slate-600 text-white",
+const toneToVariant: Record<PillTone, StatusVariant> = {
+  success: "success",
+  danger: "destructive",
+  terminated: "terminated",
+  running: "warning",
+  queued: "warning",
+  neutral: "secondary",
 };
 
 type PillProps = {
@@ -28,15 +50,9 @@ type PillProps = {
 
 function Pill({ tone, className, children }: PillProps) {
   return (
-    <span
-      className={cn(
-        "inline-flex items-center whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-medium",
-        toneStyles[tone],
-        className,
-      )}
-    >
+    <Badge variant={toneToVariant[tone]} className={className}>
       {children}
-    </span>
+    </Badge>
   );
 }
 
@@ -45,35 +61,65 @@ type Props = {
   status: Status | "pending";
 };
 
-function toneForStatus(status: Status | "pending"): PillTone {
+function variantForStatus(status: Status | "pending"): StatusVariant {
   switch (status) {
     case Status.Completed:
       return "success";
     case Status.Failed:
     case Status.Canceled:
     case Status.TimedOut:
-      return "danger";
+      return "destructive";
     case Status.Terminated:
       return "terminated";
     case Status.Running:
-      return "running";
     case Status.Queued:
     case "pending":
-      return "queued";
+      return "warning";
     case Status.Created:
     default:
-      return "neutral";
+      return "secondary";
+  }
+}
+
+function iconForStatus(status: Status | "pending") {
+  const cls = "h-3.5 w-3.5 shrink-0";
+  switch (status) {
+    case Status.Completed:
+      return <CheckCircledIcon className={cls} />;
+    case Status.Running:
+      return <UpdateIcon className={cls} />;
+    case Status.Queued:
+    case "pending":
+      return <ClockIcon className={cls} />;
+    case Status.Failed:
+      return <CrossCircledIcon className={cls} />;
+    case Status.Canceled:
+      return <CircleBackslashIcon className={cls} />;
+    case Status.TimedOut:
+      return <StopwatchIcon className={cls} />;
+    case Status.Terminated:
+      return <StopIcon className={cls} />;
+    case Status.Skipped:
+      return <MinusCircledIcon className={cls} />;
+    case Status.Paused:
+      return <PauseIcon className={cls} />;
+    case Status.Created:
+    default:
+      return <CircleIcon className={cls} />;
   }
 }
 
 function StatusBadge({ className, status }: Props) {
   const statusText = status === "timed_out" ? "timed out" : status;
-  const tone = toneForStatus(status);
 
   return (
-    <Pill tone={tone} className={cn("capitalize", className)}>
+    <Badge
+      variant={variantForStatus(status)}
+      className={cn("w-28 justify-start gap-1.5 capitalize", className)}
+    >
+      {iconForStatus(status)}
       {statusText}
-    </Pill>
+    </Badge>
   );
 }
 

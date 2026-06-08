@@ -21,6 +21,26 @@ vi.mock("@xyflow/react", async () => {
   };
 });
 
+// The sidebar header now renders an editable title for block nodes, which
+// pulls in the label-change hook (needs a ReactFlow store). Stub it so these
+// commit-orchestration tests stay scoped to the body, not the title. The
+// title also needs ResizeObserver (absent in jsdom); that is stubbed per-test
+// in beforeEach/afterEach below to avoid leaking the global across files.
+vi.mock("@/routes/workflows/hooks/useLabelChangeHandler", () => ({
+  useNodeLabelChangeHandler: ({
+    initialValue,
+  }: {
+    id: string;
+    initialValue: string;
+  }) => [initialValue, () => {}] as const,
+}));
+
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { usePendingCommitsStore } from "@/store/PendingCommitsStore";
 
@@ -36,12 +56,14 @@ const BLOCK_FORM_KEYS = Object.keys(BLOCK_FORMS) as WorkflowBlockNodeType[];
 const ORIGINAL_BLOCK_FORMS = { ...BLOCK_FORMS };
 
 beforeEach(() => {
+  vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   mockNodeFixtures.clear();
   usePendingCommitsStore.setState({ commits: {} });
   useWorkflowPanelStore.getState().setSelectedBlockId(null);
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   cleanup();
   for (const key of BLOCK_FORM_KEYS) {
     BLOCK_FORMS[key] = ORIGINAL_BLOCK_FORMS[key];
