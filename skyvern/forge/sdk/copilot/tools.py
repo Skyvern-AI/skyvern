@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
     BeautifulSoup = None  # type: ignore[assignment, misc]
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -2210,6 +2210,284 @@ class BlockObservationRef(BaseModel):
     observation_step: Annotated[int, Field(ge=0)]
 
 
+ArtifactEvidenceStatus = Literal["satisfied", "missing", "diagnostic_only", "observed_not_verified"]
+
+
+class CodeArtifactClaimedOutcome(BaseModel):
+    id: str
+    scope: str
+    text: str
+    status: ArtifactEvidenceStatus
+    depends_on: list[str] = Field(default_factory=list)
+    covered_criteria: list[str] = Field(default_factory=list)
+    criteria_ids: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    observation_refs: list[str] = Field(default_factory=list)
+    required_tokens: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+
+
+class CodeArtifactPageDependency(BaseModel):
+    id: str
+    scope: str
+    status: ArtifactEvidenceStatus
+    url_hint: str | None = None
+    page_state_hint: str | None = None
+    required_affordances: list[str] = Field(default_factory=list)
+    required_outcomes: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list, description="Dependency-scoped evidence_ref ids.")
+    observation_refs: list[str] = Field(default_factory=list, description="Dependency-scoped observation_ref ids.")
+
+
+class CodeArtifactCompletionCriterion(BaseModel):
+    id: str
+    text: str
+    level: Literal["terminal", "outcome", "prefix", "method"]
+    outcome: str | None = None
+    terminal: bool | None = None
+
+
+class CodeArtifactScopedRef(BaseModel):
+    claim_id: str | None = None
+    dependency_id: str | None = None
+    criterion_id: str | None = None
+    evidence_ref: str | None = None
+    observation_ref: str | None = None
+    status: ArtifactEvidenceStatus = Field(validation_alias=AliasChoices("status", "evidence_status"))
+    source_tool: str | None = None
+    observation_step: Annotated[int, Field(ge=0)] | None = None
+    run_sample_id: str | None = None
+    current_url: str | None = None
+    source_label: str | None = None
+    checkpoint_next_mode: Literal["advance", "stop"] | None = None
+
+
+class CodeArtifactTerminalVerifierExpectation(BaseModel):
+    id: str
+    text: str
+    criteria_ids: list[str] = Field(default_factory=list)
+    claimed_outcome_ids: list[str] = Field(default_factory=list)
+
+
+class CodeArtifactExplorationObservation(BaseModel):
+    id: str
+    text: str
+    status: Literal["observed_not_verified"] = Field(
+        default="observed_not_verified",
+        validation_alias=AliasChoices("status", "evidence_status"),
+    )
+    observation_ref: str | None = None
+    source_tool: str | None = None
+    observation_step: Annotated[int, Field(ge=0)] | None = None
+    current_url: str | None = None
+    source_label: str | None = None
+    checkpoint_next_mode: Literal["stop"] | None = None
+
+
+class CodeArtifactMetadata(BaseModel):
+    artifact_id: str | None = None
+    block_label: str | None = None
+    block_id: str | None = None
+    declared_goal: str
+    claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(default_factory=list)
+    page_dependencies: list[CodeArtifactPageDependency] = Field(default_factory=list)
+    completion_criteria: list[CodeArtifactCompletionCriterion] = Field(default_factory=list)
+    evidence_refs: list[CodeArtifactScopedRef] = Field(default_factory=list)
+    observation_refs: list[CodeArtifactScopedRef] = Field(default_factory=list)
+    terminal_verifier_expectations: list[CodeArtifactTerminalVerifierExpectation] = Field(default_factory=list)
+    exploration_observations: list[CodeArtifactExplorationObservation] = Field(default_factory=list)
+
+
+_CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
+    "claimed_outcomes",
+    "page_dependencies",
+    "completion_criteria",
+    "terminal_verifier_expectations",
+)
+
+
+def _code_artifact_metadata_as_tool_argument(
+    metadata: list[CodeArtifactMetadata] | None,
+) -> list[dict[str, Any]]:
+    if not metadata:
+        return []
+    return [item.model_dump(mode="json", exclude_none=True) for item in metadata]
+
+
+def _normalize_code_artifact_metadata(
+    raw_metadata: Any,
+    workflow_yaml: str,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    if raw_metadata in (None, [], {}):
+        return {}, None
+    items = _code_artifact_metadata_items(raw_metadata)
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_item in items:
+        try:
+            metadata = (
+                raw_item
+                if isinstance(raw_item, CodeArtifactMetadata)
+                else CodeArtifactMetadata.model_validate(raw_item)
+            )
+        except ValidationError as exc:
+            return {}, f"Artifact metadata is malformed: {exc}"
+        dumped = metadata.model_dump(mode="json", exclude_none=True)
+        label = str(dumped.get("block_label") or "").strip()
+        if not label:
+            return {}, "Artifact metadata requires a non-empty `block_label` for each artifact."
+        if label not in code_blocks:
+            return {}, (
+                f"Artifact metadata for `{label}` does not reference an existing code block label. "
+                "Attach metadata only to authored code blocks."
+            )
+        if label in normalized:
+            return {}, f"Artifact metadata contains duplicate entries for `{label}`."
+        dumped["block_label"] = label
+        artifact_id = str(dumped.get("artifact_id") or "").strip()
+        if artifact_id and not artifact_id.startswith("code_artifact:"):
+            return {}, f"Artifact metadata for `{label}` requires `artifact_id` to start with `code_artifact:`."
+        dumped["artifact_id"] = artifact_id or _artifact_id_for_block_label(label)
+        block_id = str(
+            dumped.get("block_id") or code_blocks[label].get("block_id") or code_blocks[label].get("id") or ""
+        ).strip()
+        if block_id:
+            dumped["block_id"] = block_id
+        declared_goal = str(dumped.get("declared_goal") or "").strip()
+        if not declared_goal:
+            return {}, f"Artifact metadata for `{label}` requires a non-empty `declared_goal`."
+        for field_name in _CODE_ARTIFACT_REQUIRED_LIST_FIELDS:
+            value = dumped.get(field_name)
+            if not isinstance(value, list) or not value:
+                return {}, f"Artifact metadata for `{label}` requires non-empty `{field_name}`."
+        if not dumped.get("evidence_refs") and not dumped.get("observation_refs"):
+            return {}, f"Artifact metadata for `{label}` requires `evidence_refs` or `observation_refs`."
+        validation_error = _code_artifact_metadata_shape_error(label, dumped)
+        if validation_error is not None:
+            return {}, validation_error
+        normalized[label] = dumped
+    return normalized, None
+
+
+def _code_artifact_metadata_items(raw_metadata: Any) -> list[Any]:
+    if isinstance(raw_metadata, Mapping):
+        items: list[Any] = []
+        for block_label, value in raw_metadata.items():
+            if isinstance(value, Mapping) and "block_label" not in value:
+                items.append({"block_label": block_label, **value})
+            else:
+                items.append(value)
+        return items
+    if isinstance(raw_metadata, list):
+        return raw_metadata
+    return [raw_metadata]
+
+
+def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, Mapping[str, Any]]:
+    blocks: dict[str, Mapping[str, Any]] = {}
+    for label, block in _workflow_yaml_blocks_by_label(workflow_yaml).items():
+        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
+            blocks[label] = block
+    return blocks
+
+
+def _artifact_id_for_block_label(label: str) -> str:
+    fragment = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "artifact"
+    return f"code_artifact:{fragment}"
+
+
+def _code_artifact_metadata_shape_error(label: str, artifact: Mapping[str, Any]) -> str | None:
+    for field_name, ref_key in (("evidence_refs", "evidence_ref"), ("observation_refs", "observation_ref")):
+        for index, ref in enumerate(_artifact_rows(artifact.get(field_name))):
+            if not str(ref.get(ref_key) or "").strip():
+                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `{ref_key}`."
+            if not any(str(ref.get(key) or "").strip() for key in ("claim_id", "dependency_id", "criterion_id")):
+                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires a scoped id."
+            status = str(ref.get("status") or "").strip()
+            if ref.get("checkpoint_next_mode") == "advance" and status != "diagnostic_only":
+                return (
+                    f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
+                    "`checkpoint_next_mode=advance`; it must stay `diagnostic_only`."
+                )
+            if ref.get("checkpoint_next_mode") == "stop" and status not in {"observed_not_verified", "diagnostic_only"}:
+                return (
+                    f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
+                    "`checkpoint_next_mode=stop`; it must remain `observed_not_verified` or `diagnostic_only`."
+                )
+            if status != "missing" and not str(ref.get("source_tool") or "").strip():
+                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `source_tool`."
+
+    for index, claim in enumerate(_artifact_rows(artifact.get("claimed_outcomes"))):
+        claim_id = str(claim.get("id") or "").strip()
+        if not _artifact_string_list(claim.get("depends_on")):
+            return f"Artifact metadata claim `{claim_id or index}` for `{label}` requires `depends_on`."
+        claim_criteria = _artifact_string_list(claim.get("covered_criteria")) or _artifact_string_list(
+            claim.get("criteria_ids")
+        )
+        if not claim_criteria:
+            return f"Artifact metadata claim `{claim_id}` for `{label}` requires covered criterion ids."
+        claim_evidence_refs = _artifact_string_list(claim.get("evidence_refs"))
+        claim_observation_refs = _artifact_string_list(claim.get("observation_refs"))
+        if claim.get("status") == "satisfied" and not claim_evidence_refs:
+            return (
+                f"Artifact metadata claim `{claim_id}` for `{label}` is `satisfied` but has no "
+                "claim-scoped `evidence_refs`."
+            )
+        if claim.get("status") != "missing" and not claim_evidence_refs and not claim_observation_refs:
+            return (
+                f"Artifact metadata claim `{claim_id}` for `{label}` requires claim-scoped "
+                "`evidence_refs` or `observation_refs` unless status is `missing`."
+            )
+
+    for dependency in _artifact_rows(artifact.get("page_dependencies")):
+        dependency_id = str(dependency.get("id") or "").strip()
+        dependency_evidence_refs = _artifact_string_list(dependency.get("evidence_refs"))
+        dependency_observation_refs = _artifact_string_list(dependency.get("observation_refs"))
+        if dependency.get("status") == "satisfied" and not dependency_evidence_refs:
+            return (
+                f"Artifact metadata dependency `{dependency_id}` for `{label}` is `satisfied` but has no "
+                "dependency-scoped `evidence_refs`."
+            )
+        if dependency.get("status") != "missing" and not dependency_evidence_refs and not dependency_observation_refs:
+            return (
+                f"Artifact metadata dependency `{dependency_id}` for `{label}` requires scoped "
+                "`evidence_refs` or `observation_refs` unless status is `missing`."
+            )
+
+    for index, expectation in enumerate(_artifact_rows(artifact.get("terminal_verifier_expectations"))):
+        expectation_id = str(expectation.get("id") or "").strip()
+        if not _artifact_string_list(expectation.get("criteria_ids")) and not _artifact_string_list(
+            expectation.get("claimed_outcome_ids")
+        ):
+            return (
+                f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
+                "requires `criteria_ids` or `claimed_outcome_ids`."
+            )
+
+    for index, observation in enumerate(_artifact_rows(artifact.get("exploration_observations"))):
+        if observation.get("status") != "observed_not_verified":
+            return (
+                f"Artifact metadata for `{label}` exploration observation {index} must be marked "
+                "`observed_not_verified` until authored execution and terminal verification pass."
+            )
+        if observation.get("checkpoint_next_mode") == "advance":
+            return (
+                f"Artifact metadata for `{label}` exploration observation {index} cannot carry "
+                "`checkpoint_next_mode=advance`; record that as `diagnostic_only` evidence instead."
+            )
+    return None
+
+
+def _artifact_rows(value: Any) -> list[Mapping[str, Any]]:
+    return [row for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
+
+
+def _artifact_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -2225,6 +2503,17 @@ async def _update_workflow(
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
+    ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
+    code_artifact_metadata, code_artifact_metadata_error = _normalize_code_artifact_metadata(
+        params.get("code_artifact_metadata"),
+        workflow_yaml,
+    )
+    if code_artifact_metadata_error is not None:
+        return {"ok": False, "error": code_artifact_metadata_error}
+    if code_artifact_metadata:
+        ctx.code_artifact_metadata = code_artifact_metadata
+        ctx.workflow_verification_evidence.code_artifact_metadata = code_artifact_metadata
+        params["code_artifact_metadata"] = code_artifact_metadata
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
@@ -6722,6 +7011,7 @@ async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
     block_observation_refs: list[BlockObservationRef] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
 ) -> str:
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
@@ -6740,10 +7030,18 @@ async def update_workflow_tool(
     `block_observation_refs` entries with each block label and the
     `observation_step` returned by inspect_page_for_composition for the page
     that block acts on.
+    For authored code blocks, include `code_artifact_metadata` rows describing
+    declared goals, claimed outcomes, page dependencies, criteria, evidence
+    refs, observation refs, and terminal verifier expectations.
     """
     copilot_ctx = ctx.context
+    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
-    arguments = {"workflow_yaml": workflow_yaml, "block_observation_refs": normalized_block_observation_refs}
+    arguments = {
+        "workflow_yaml": workflow_yaml,
+        "block_observation_refs": normalized_block_observation_refs,
+        "code_artifact_metadata": serialized_code_artifact_metadata,
+    }
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -6798,7 +7096,11 @@ async def update_workflow_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
-            {**arguments, "raw_block_observation_refs": block_observation_refs},
+            {
+                **arguments,
+                "raw_block_observation_refs": block_observation_refs,
+                "raw_code_artifact_metadata": code_artifact_metadata,
+            },
             copilot_ctx,
             allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
         )
@@ -7038,6 +7340,7 @@ async def update_and_run_blocks_tool(
     workflow_yaml: str,
     block_labels: list[str],
     block_observation_refs: list[BlockObservationRef] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     parameters: dict[str, Any] | None = None,
 ) -> Any:
     """Update the workflow YAML and immediately run the specified blocks in one step.
@@ -7080,6 +7383,9 @@ async def update_and_run_blocks_tool(
     `block_observation_refs` entries with each block label and the
     `observation_step` returned by inspect_page_for_composition or evaluate for
     the page that block acts on.
+    For authored code blocks, include `code_artifact_metadata` rows describing
+    declared goals, claimed outcomes, page dependencies, criteria, evidence
+    refs, observation refs, and terminal verifier expectations.
     When inspected evidence shows an anti-bot challenge gating a disabled
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
@@ -7087,11 +7393,13 @@ async def update_and_run_blocks_tool(
     copilot_ctx = ctx.context
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
+    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
         "workflow_yaml": workflow_yaml,
         "block_labels": block_labels,
         "block_observation_refs": normalized_block_observation_refs,
+        "code_artifact_metadata": serialized_code_artifact_metadata,
         "parameters": parameters or {},
     }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
@@ -7138,6 +7446,8 @@ async def update_and_run_blocks_tool(
                 "workflow_yaml": workflow_yaml,
                 "block_observation_refs": normalized_block_observation_refs,
                 "raw_block_observation_refs": block_observation_refs,
+                "code_artifact_metadata": serialized_code_artifact_metadata,
+                "raw_code_artifact_metadata": code_artifact_metadata,
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
