@@ -459,8 +459,8 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             # Export session profile before closing (so it can be used to create browser profiles)
             browser_artifacts = browser_session.browser_state.browser_artifacts
             if browser_artifacts and browser_artifacts.browser_session_dir:
-                # Load-bearing: write the sidecar before store_browser_profile copies the dir; close()
-                # also persists but runs after the export, too late for this path.
+                # Snapshot session cookies before store_browser_profile copies the dir; the later
+                # close() persist runs after this export, too late to land in the archive.
                 await persist_session_cookies(
                     browser_session.browser_state.browser_context, browser_artifacts.browser_session_dir
                 )

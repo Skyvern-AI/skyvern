@@ -5877,6 +5877,10 @@ class LoginBlock(BaseTaskBlock):
     # Parameter 1 of Literal[...] cannot be of type "Any"
     block_type: Literal[BlockType.LOGIN] = BlockType.LOGIN  # type: ignore
 
+    # Opt out of reusing the credential's saved browser profile so the run logs in fresh and
+    # the captured session persists via the normal path (a reused profile is loaded read-only).
+    skip_saved_profile: bool = False
+
 
 class FileDownloadBlock(BaseTaskBlock):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
