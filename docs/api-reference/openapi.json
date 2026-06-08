@@ -860,6 +860,534 @@
         }
       }
     },
+    "/v1/workflows/{workflow_permanent_id}/tags": {
+      "post": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Apply workflow tags",
+        "description": "Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
+        "operationId": "apply_workflow_tags_v1_workflows__workflow_permanent_id__tags_post",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully applied tag changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Invalid tag key or value"
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Get workflow tags",
+        "description": "Get the current tag state for a workflow.",
+        "operationId": "get_workflow_tags_v1_workflows__workflow_permanent_id__tags_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/tags/{key}": {
+      "delete": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Delete workflow tag",
+        "description": "Soft-delete a single tag from a workflow. Writes a DELETE event row.",
+        "operationId": "delete_workflow_tag_v1_workflows__workflow_permanent_id__tags__key__delete",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "example": "env",
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag (or no-op if absent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/workflows/{workflow_permanent_id}/tags/history": {
+      "get": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Get workflow tag history",
+        "description": "Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
+        "operationId": "get_workflow_tag_history_v1_workflows__workflow_permanent_id__tags_history_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "example": "wpid_123",
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Max events to return",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Max events to return"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true,
+              "description": "Only return events at or after this timestamp",
+              "title": "Since"
+            },
+            "description": "Only return events at or after this timestamp"
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Filter to events for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to events for a single tag key"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagHistoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tag-keys": {
+      "get": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "List tag keys",
+        "description": "List all tag keys registered for the organization with their descriptions.",
+        "operationId": "list_tag_keys_v1_tag_keys_get",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TagKey"
+                  },
+                  "title": "Response List Tag Keys V1 Tag Keys Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tag-keys/{key}": {
+      "patch": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Update tag key",
+        "description": "Update the description for a tag key.",
+        "operationId": "update_tag_key_v1_tag_keys__key__patch",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to update",
+              "title": "Key"
+            },
+            "description": "Tag key to update"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagKeyUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated tag key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagKey"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag key not found"
+          },
+          "422": {
+            "description": "Description too long"
+          }
+        }
+      }
+    },
+    "/v1/workflow-tags": {
+      "get": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Batch get workflow tags",
+        "description": "Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
+        "operationId": "batch_get_workflow_tags_v1_workflow_tags_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_ids",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Comma-separated workflow permanent IDs",
+              "example": "wpid_123,wpid_456",
+              "title": "Workflow Permanent Ids"
+            },
+            "description": "Comma-separated workflow permanent IDs"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Batch get workflow tags (POST)",
+        "description": "Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
+        "operationId": "batch_get_workflow_tags_post_v1_workflow_tags_post",
+        "parameters": [
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true,
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkflowTagsBatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowTagsBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Too many workflow IDs requested"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/artifacts/{artifact_id}": {
       "get": {
         "tags": [
@@ -2525,6 +3053,15 @@
   },
   "components": {
     "schemas": {
+      "AIFallbackMode": {
+        "type": "string",
+        "enum": [
+          "fallback",
+          "proactive"
+        ],
+        "title": "AIFallbackMode",
+        "description": "Controls how an action block uses a CSS/XPath selector relative to AI.\n\n- `fallback`: attempt the selector first; fall back to AI on failure.\n- `proactive`: always use AI; the selector (if any) is a hint only.\n\nWhen `selector` is None, both modes degrade to AI-only — the difference is purely semantic (whether the author expected to have a selector here)."
+      },
       "AWSSecretParameter": {
         "properties": {
           "parameter_type": {
@@ -3074,6 +3611,16 @@
             "type": "number",
             "nullable": true,
             "title": "Download Timeout"
+          },
+          "selector": {
+            "type": "string",
+            "nullable": true,
+            "title": "Selector",
+            "description": "Optional CSS or XPath selector for the action target. Used in combination with `ai_fallback`."
+          },
+          "ai_fallback": {
+            "$ref": "#/components/schemas/AIFallbackMode",
+            "default": "fallback"
           }
         },
         "type": "object",
@@ -3138,6 +3685,16 @@
             "type": "string",
             "nullable": true,
             "title": "Navigation Goal"
+          },
+          "selector": {
+            "type": "string",
+            "nullable": true,
+            "title": "Selector",
+            "description": "Optional CSS or XPath selector for the action target. Used in combination with `ai_fallback`."
+          },
+          "ai_fallback": {
+            "$ref": "#/components/schemas/AIFallbackMode",
+            "default": "fallback"
           },
           "error_code_mapping": {
             "additionalProperties": {
@@ -10179,6 +10736,186 @@
         ],
         "title": "TOTPCodeCreate"
       },
+      "TagApplyRequest": {
+        "properties": {
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Tags",
+            "description": "Tags to set (overwrite). Map of key to value."
+          },
+          "tags_to_delete": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tags To Delete",
+            "description": "Tag keys to soft-delete."
+          }
+        },
+        "type": "object",
+        "title": "TagApplyRequest",
+        "description": "Body for `POST /v1/workflows/{wpid}/tags`. Either field may be empty; both empty is a valid no-op. Same-key collisions: set wins over delete."
+      },
+      "TagHistoryItem": {
+        "properties": {
+          "tag_event_id": {
+            "type": "string",
+            "title": "Tag Event Id"
+          },
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "nullable": true,
+            "title": "Value"
+          },
+          "event_type": {
+            "type": "string",
+            "title": "Event Type"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "set_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Set At"
+          },
+          "set_by": {
+            "type": "string",
+            "title": "Set By"
+          },
+          "superseded_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "title": "Superseded At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tag_event_id",
+          "key",
+          "value",
+          "event_type",
+          "source",
+          "set_at",
+          "set_by"
+        ],
+        "title": "TagHistoryItem",
+        "description": "One row from `GET /v1/workflows/{wpid}/tags/history`."
+      },
+      "TagHistoryResponse": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/TagHistoryItem"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "events"
+        ],
+        "title": "TagHistoryResponse"
+      },
+      "TagKey": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "title": "TagKey",
+        "description": "Tag-key registry entry."
+      },
+      "TagKeyUpdate": {
+        "properties": {
+          "description": {
+            "type": "string",
+            "nullable": true,
+            "title": "Description",
+            "description": "Free-form description (max 500 chars). Pass null to clear."
+          }
+        },
+        "type": "object",
+        "title": "TagKeyUpdate",
+        "description": "Body for `PATCH /v1/tag-keys/{key}`."
+      },
+      "TagResponse": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "set_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Set At"
+          },
+          "set_by": {
+            "type": "string",
+            "title": "Set By"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "source",
+          "set_at",
+          "set_by"
+        ],
+        "title": "TagResponse",
+        "description": "Current state of one tag (`GET /v1/workflows/{wpid}/tags` row)."
+      },
+      "TagsResponse": {
+        "properties": {
+          "workflow_permanent_id": {
+            "type": "string",
+            "title": "Workflow Permanent Id"
+          },
+          "tags": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TagResponse"
+            },
+            "type": "object",
+            "title": "Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_permanent_id",
+          "tags"
+        ],
+        "title": "TagsResponse",
+        "description": "Current tag map for a workflow."
+      },
       "TaskBlock": {
         "properties": {
           "label": {
@@ -14178,6 +14915,41 @@
           "import_failed"
         ],
         "title": "WorkflowStatus"
+      },
+      "WorkflowTagsBatchRequest": {
+        "properties": {
+          "workflow_permanent_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Workflow Permanent Ids",
+            "description": "Workflow permanent IDs to fetch tags for."
+          }
+        },
+        "type": "object",
+        "title": "WorkflowTagsBatchRequest",
+        "description": "Body for `POST /v1/workflow-tags` (used when the wpid list would exceed the URL length cap)."
+      },
+      "WorkflowTagsBatchResponse": {
+        "properties": {
+          "workflow_tags": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Workflow Tags"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workflow_tags"
+        ],
+        "title": "WorkflowTagsBatchResponse",
+        "description": "Response for batch workflow tag fetches. Maps workflow permanent ID to a flat key→value map of current tags."
       },
       "skyvern__forge__sdk__schemas__credentials__CredentialType": {
         "type": "string",
