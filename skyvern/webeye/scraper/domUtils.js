@@ -464,7 +464,22 @@ function isElementVisible(element) {
     !element.disabled
   ) {
     if (tagLower !== "input" || element.type !== "hidden") {
-      return true;
+      // Skip force-visible when the dropdown host/trigger is closed.
+      const host = element.getRootNode().host;
+      const hostClosed = host && host.getAttribute("aria-expanded") === "false";
+      if (!hostClosed) {
+        // Only suppress combobox/filter inputs whose sibling trigger is closed —
+        // regular text inputs next to an unrelated closed element stay visible.
+        const isFilter = element.getAttribute("role") === "combobox";
+        const prevSibling = element.previousElementSibling;
+        const siblingClosed =
+          isFilter &&
+          prevSibling &&
+          prevSibling.getAttribute("aria-expanded") === "false";
+        if (!siblingClosed) {
+          return true;
+        }
+      }
     }
   }
 
