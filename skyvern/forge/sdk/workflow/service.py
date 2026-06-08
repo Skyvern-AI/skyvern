@@ -159,6 +159,7 @@ from skyvern.utils.css_selector import build_action_summaries_with_timing  # sha
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -5697,6 +5698,13 @@ class WorkflowService:
                 and not workflow_run.browser_profile_id
             ):
                 if workflow_run.status == WorkflowRunStatus.completed:
+                    if not close_browser_on_completion:
+                        # Browser stays alive here, so close()'s cookie snapshot never ran; capture
+                        # session cookies now or they're missing from the archived profile on reuse.
+                        await persist_session_cookies(
+                            browser_state.browser_context,
+                            browser_state.browser_artifacts.browser_session_dir,
+                        )
                     await app.STORAGE.store_browser_session(
                         workflow_run.organization_id,
                         workflow.workflow_permanent_id,
