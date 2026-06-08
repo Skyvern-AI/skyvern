@@ -475,6 +475,22 @@
             }
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "nullable": true,
+              "title": "Tags"
+            },
+            "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`.",
+            "example": "env:prod"
+          },
+          {
             "name": "template",
             "in": "query",
             "required": false,
