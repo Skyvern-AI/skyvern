@@ -325,6 +325,37 @@ MINIMAX_API_BASE=https://api.minimax.io/v1
 
 ---
 
+## Baidu Qianfan / ERNIE
+
+[Baidu Qianfan](https://intl.cloud.baidu.com/product/qianfan) provides access to ERNIE models through an OpenAI-compatible chat completions API.
+
+```bash .env
+ENABLE_QIANFAN=true
+QIANFAN_API_KEY=your-qianfan-api-key
+LLM_KEY=QIANFAN_ERNIE_5_0
+```
+
+### Available models
+
+| LLM_KEY | Model | Notes |
+|---------|-------|-------|
+| `QIANFAN_ERNIE_5_1` | `ernie-5.1` | |
+| `QIANFAN_ERNIE_5_0` | `ernie-5.0` | Vision support |
+| `QIANFAN_ERNIE_4_5_TURBO_128K` | `ernie-4.5-turbo-128k` | Long-context model |
+| `QIANFAN_ERNIE_4_5_TURBO_VL` | `ernie-4.5-turbo-vl` | Vision support |
+
+### Optional settings
+
+```bash .env
+# Default OpenAI-compatible endpoint from Baidu's international docs
+QIANFAN_API_BASE=https://api.baiduqianfan.ai/v1
+
+# China region alternative
+QIANFAN_API_BASE=https://qianfan.baidubce.com/v2
+```
+
+---
+
 ## VolcEngine (ByteDance Doubao)
 
 [VolcEngine](https://www.volcengine.com/) provides access to ByteDance's Doubao models with vision support.

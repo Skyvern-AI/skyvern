@@ -307,6 +307,11 @@ class Settings(BaseSettings):
     VOLCENGINE_API_BASE: str = "https://ark.cn-beijing.volces.com/api/v3"
     VOLCENGINE_CUA_LLM_KEY: str = "VOLCENGINE_DOUBAO_1_5_THINKING_VISION_PRO"
 
+    # BAIDU QIANFAN / ERNIE
+    ENABLE_QIANFAN: bool = False
+    QIANFAN_API_KEY: str | None = None
+    QIANFAN_API_BASE: str = "https://api.baiduqianfan.ai/v1"
+
     # Yutori Navigator
     ENABLE_YUTORI: bool = False
     YUTORI_API_KEY: str | None = None

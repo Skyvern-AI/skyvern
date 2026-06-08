@@ -493,6 +493,7 @@ def _check_llm_config() -> CheckResult:
         "OLLAMA": {"enable": "ENABLE_OLLAMA", "key": None},
         "OPENROUTER": {"enable": "ENABLE_OPENROUTER", "key": "OPENROUTER_API_KEY"},
         "GROQ": {"enable": "ENABLE_GROQ", "key": "GROQ_API_KEY"},
+        "QIANFAN": {"enable": "ENABLE_QIANFAN", "key": "QIANFAN_API_KEY"},
     }
 
     enabled = []
