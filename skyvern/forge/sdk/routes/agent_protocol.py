@@ -1255,7 +1255,7 @@ async def delete_workflow(
 @base_router.post(
     "/folders",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "create_folder",
     },
@@ -1297,7 +1297,7 @@ async def create_folder(
 @base_router.get(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folder",
     },
@@ -1341,7 +1341,7 @@ async def get_folder(
 @base_router.get(
     "/folders",
     response_model=list[Folder],
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "get_folders",
     },
@@ -1398,7 +1398,7 @@ async def get_folders(
 @base_router.put(
     "/folders/{folder_id}",
     response_model=Folder,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_folder",
     },
@@ -1444,7 +1444,7 @@ async def update_folder(
 @legacy_base_router.delete("/folders/{folder_id}/", include_in_schema=False)
 @base_router.delete(
     "/folders/{folder_id}",
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "delete_folder",
     },
@@ -1480,7 +1480,7 @@ async def delete_folder(
 @base_router.put(
     "/workflows/{workflow_permanent_id}/folder",
     response_model=Workflow,
-    tags=["Agent Folders"],
+    tags=["Folders"],
     openapi_extra={
         "x-fern-sdk-method-name": "update_workflow_folder",
     },
@@ -1590,7 +1590,7 @@ async def _apply_tag_changes_with_retry(
 @base_router.post(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "apply_workflow_tags"},
     description="Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; "
     "same-key collisions resolve set-wins.",
@@ -1640,7 +1640,7 @@ async def apply_workflow_tags(
 @base_router.delete(
     "/workflows/{workflow_permanent_id}/tags/{key}",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "delete_workflow_tag"},
     description="Soft-delete a single tag from a workflow. Writes a DELETE event row.",
     summary="Delete agent tag",
@@ -1689,7 +1689,7 @@ async def delete_workflow_tag(
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags",
     response_model=TagsResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tags"},
     description="Get the current tag state for a workflow.",
     summary="Get agent tags",
@@ -1736,7 +1736,7 @@ async def _build_tags_response(workflow_permanent_id: str, organization_id: str)
 @base_router.get(
     "/workflows/{workflow_permanent_id}/tags/history",
     response_model=TagHistoryResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "get_workflow_tag_history"},
     description="Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
     summary="Get agent tag history",
@@ -1777,7 +1777,7 @@ async def get_workflow_tag_history(
 @base_router.get(
     "/tag-keys",
     response_model=list[TagKey],
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "list_tag_keys"},
     description="List all tag keys registered for the organization with their descriptions.",
     summary="List tag keys",
@@ -1798,7 +1798,7 @@ async def list_tag_keys(
 @base_router.patch(
     "/tag-keys/{key}",
     response_model=TagKey,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "update_tag_key"},
     description="Update the description for a tag key.",
     summary="Update tag key",
@@ -1926,7 +1926,7 @@ async def _resolve_active_batch_wpids(requested_wpids: list[str], organization_i
 @base_router.get(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags"},
     description="Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
     summary="Batch get agent tags",
@@ -1961,7 +1961,7 @@ async def batch_get_workflow_tags(
 @base_router.post(
     "/workflow-tags",
     response_model=WorkflowTagsBatchResponse,
-    tags=["Agent Tags"],
+    tags=["Tags"],
     openapi_extra={"x-hidden": True, "x-fern-sdk-method-name": "batch_get_workflow_tags_post"},
     description="Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
     summary="Batch get agent tags (POST)",
@@ -2657,10 +2657,11 @@ async def heartbeat() -> Response:
 @legacy_base_router.get("/version/", include_in_schema=False)
 @base_router.get(
     "/version",
-    tags=["server"],
+    tags=["Server"],
     summary="Get server version",
     description="Returns the current Skyvern server version (git SHA for official builds).",
     responses={200: {"description": "Current server version"}},
+    openapi_extra={"x-fern-sdk-method-name": "get_version"},
 )
 @base_router.get("/version/", include_in_schema=False)
 async def get_version() -> dict[str, str]:
