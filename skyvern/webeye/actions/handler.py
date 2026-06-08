@@ -2833,8 +2833,10 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    # verification_path separates the three distinct runtime paths that
-    # roll up to this span — explains the 175x p95/p50 ratio.
+    # verification_path labels the handler-internal outcome of this span
+    # (already_verified / needs_llm_* / terminate_requested). Caller-side
+    # attribution (periodic vs handler-forced) lives on the child
+    # complete_verify span as `verification.trigger`.
     _span = otel_trace.get_current_span()
     if action.verified or not task.navigation_goal:
         _span.set_attribute("verification_path", "already_verified")
@@ -2845,7 +2847,9 @@ async def handle_complete_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+        verification_result = await app.agent.complete_verify(
+            page, scraped_page, task, step, verification_trigger="complete_action_forced"
+        )
     except Exception as e:
         _span.set_attribute("verification_path", "needs_llm_error")
         LOG.exception(
