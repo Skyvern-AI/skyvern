@@ -6248,6 +6248,12 @@
             "title": "Filename",
             "description": "Original filename"
           },
+          "file_size": {
+            "type": "integer",
+            "nullable": true,
+            "title": "File Size",
+            "description": "Size of the file in bytes"
+          },
           "modified_at": {
             "type": "string",
             "format": "date-time",
