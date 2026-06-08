@@ -189,14 +189,11 @@ class LocalStorage(BaseStorage):
             return None
 
     def _drop_stale_session_sidecar(self, source_directory: Path, stored_folder_path: Path) -> None:
-        # These stores overlay onto an existing dir. persist_session_cookies removes the sidecar at the
-        # source when a session ends with no session cookies; without this the old sidecar survives in the
-        # destination and a dead session gets re-injected on the next reuse.
+        # These stores overlay onto an existing dir, so a sidecar dropped at the source (session ended
+        # with no session cookies) must also be cleared in the destination, else a dead session reinjects.
         if (source_directory / SESSION_COOKIES_FILENAME).exists():
             return
-        stale_sidecar = stored_folder_path / SESSION_COOKIES_FILENAME
-        if stale_sidecar.exists():
-            stale_sidecar.unlink(missing_ok=True)
+        (stored_folder_path / SESSION_COOKIES_FILENAME).unlink(missing_ok=True)
 
     def _copy_directory_best_effort(self, source_directory: Path, stored_folder_path: Path) -> None:
         # Source may be a live browser profile. Skip only transient runtime files: ones that vanish
@@ -294,6 +291,11 @@ class LocalStorage(BaseStorage):
         source_directory = Path(directory).resolve()
         if source_directory == stored_folder_path:
             return
+        # True overwrite: drop any prior contents so a re-save can't leave stale cookies or
+        # localStorage from the old session mixed into the refreshed profile. Let errors surface
+        # rather than silently merging onto a half-deleted directory.
+        if stored_folder_path.exists():
+            shutil.rmtree(stored_folder_path)
         self._create_directories_if_not_exists(stored_folder_path)
         LOG.info(
             "Storing browser profile locally",
