@@ -27,7 +27,6 @@ exact threat the vault architecture is designed to prevent.
 
 import asyncio
 import json
-from datetime import datetime
 from typing import Annotated
 
 import structlog
@@ -38,6 +37,7 @@ from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
@@ -105,7 +105,10 @@ from skyvern.schemas.credential_folders import (
     UpdateCredentialFolderRequest,
 )
 from skyvern.schemas.workflows import (
+    BLOCK_YAML_TYPES,
     LoginBlockYAML,
+    UrlBlockYAML,
+    ValidationBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowParameterYAML,
@@ -426,6 +429,50 @@ def _build_navigation_goal(base_prompt: str, user_context: str | None) -> str:
     )
 
 
+SESSION_VALIDATION_COMPLETE_CRITERION = (
+    "The user is logged in: the page shows authenticated content such as a dashboard, "
+    "account/profile menu, or user-specific data, and there is NO sign-in page or "
+    "username/password login form visible."
+)
+
+SESSION_VALIDATION_TERMINATE_CRITERION = (
+    "Terminate if a sign-in/login page or a username/password login form is visible, "
+    "or the page indicates the user is logged out or the session has expired. This means "
+    "the browser session is not authenticated and must not be saved."
+)
+
+
+def _build_login_test_blocks(
+    *,
+    url: str,
+    navigation_goal: str,
+    parameter_key: str,
+    totp_identifier: str | None,
+) -> list[BLOCK_YAML_TYPES]:
+    # Re-navigate after login so validation runs on a freshly fetched page, not a stale cached one.
+    blocks: list[BLOCK_YAML_TYPES] = [
+        LoginBlockYAML(
+            label="login",
+            title="login",
+            url=url,
+            navigation_goal=navigation_goal,
+            terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
+            max_steps_per_run=None,
+            parameter_keys=[parameter_key],
+            totp_verification_url=None,
+            totp_identifier=totp_identifier,
+            skip_saved_profile=True,
+        ),
+        UrlBlockYAML(label="verify_navigate", url=url),
+        ValidationBlockYAML(
+            label="verify_session",
+            complete_criterion=SESSION_VALIDATION_COMPLETE_CRITERION,
+            terminate_criterion=SESSION_VALIDATION_TERMINATE_CRITERION,
+        ),
+    ]
+    return blocks
+
+
 @base_router.patch(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -728,7 +775,6 @@ async def test_credential(
     navigation_goal = _build_navigation_goal(base_prompt, data.user_context)
 
     parameter_key = "credential"
-    label = "login"
 
     yaml_parameters = [
         WorkflowParameterYAML(
@@ -739,21 +785,14 @@ async def test_credential(
         )
     ]
 
-    login_block_yaml = LoginBlockYAML(
-        label=label,
-        title=label,
-        url=data.url,
-        navigation_goal=navigation_goal,
-        terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
-        max_steps_per_run=None,
-        parameter_keys=[parameter_key],
-        totp_verification_url=None,
-        totp_identifier=credential.totp_identifier,
-    )
-
     workflow_definition_yaml = WorkflowDefinitionYAML(
         parameters=yaml_parameters,
-        blocks=[login_block_yaml],
+        blocks=_build_login_test_blocks(
+            url=data.url,
+            navigation_goal=navigation_goal,
+            parameter_key=parameter_key,
+            totp_identifier=credential.totp_identifier,
+        ),
     )
 
     workflow_create_request = WorkflowCreateYAMLRequest(
@@ -770,9 +809,10 @@ async def test_credential(
             request=workflow_create_request,
         )
 
-        run_request = WorkflowRequestBody(
-            browser_profile_id=existing_browser_profile_id,
-        )
+        # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
+        # refreshed session would never persist. A fresh login persists via the normal session path,
+        # which the saver then writes onto existing_browser_profile_id.
+        run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -814,6 +854,7 @@ async def test_credential(
                 organization_id=organization_id,
                 credential_name=credential.name,
                 test_url=data.url,
+                existing_browser_profile_id=existing_browser_profile_id,
             )
         )
         _background_tasks.add(task)
@@ -963,18 +1004,29 @@ async def get_test_credential_status(
     elif status == WorkflowRunStatus.canceled:
         failure_reason = "The login test was canceled."
 
-    # Only a real failure once the background task has had time to finish; grace must
-    # exceed its session-persist wait plus headroom, else mid-polls misread.
+    # The saver runs after the run reaches `completed`, and on a re-save it overwrites an
+    # already-linked profile in place — so a present id is not by itself proof this run's
+    # session was stored. Confirm via the profile's modified_at; until then withhold the id so
+    # the client keeps polling, and only surface failure once the saver's retry budget is spent.
     _PROFILE_GRACE_PERIOD_SECONDS = _SESSION_PERSIST_MAX_WAIT_SECONDS + _PROFILE_GRACE_PERIOD_HEADROOM_SECONDS
-    if (
-        status == WorkflowRunStatus.completed
-        and not browser_profile_id
-        and workflow_run.finished_at
-        and (datetime.utcnow() - workflow_run.finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS
-    ):
-        browser_profile_failure_reason = (
-            "Login succeeded but the browser profile could not be saved. Please try testing again."
-        )
+    if status == WorkflowRunStatus.completed and workflow_run.finished_at:
+        workflow = await app.DATABASE.workflows.get_workflow(workflow_run.workflow_id, organization_id)
+        # Only a save-enabled test has a saver; a plain login test must not report a save failure.
+        if workflow and workflow.persist_browser_session:
+            save_persisted = False
+            if browser_profile_id:
+                profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=browser_profile_id, organization_id=organization_id
+                )
+                saved_at = to_naive_utc(profile.modified_at) if profile else None
+                run_finished_at = to_naive_utc(workflow_run.finished_at)
+                save_persisted = bool(saved_at and run_finished_at and saved_at >= run_finished_at)
+            if not save_persisted:
+                browser_profile_id = None
+                if (naive_utc_now() - workflow_run.finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS:
+                    browser_profile_failure_reason = (
+                        "Login succeeded but the browser profile could not be saved. Please try testing again."
+                    )
 
     return TestCredentialStatusResponse(
         credential_id=credential_id,
@@ -1070,9 +1122,10 @@ async def _create_browser_profile_after_workflow(
     organization_id: str,
     credential_name: str,
     test_url: str,
+    existing_browser_profile_id: str | None = None,
 ) -> None:
-    """Background task that polls the workflow run status and creates a browser
-    profile from the persisted session when the run completes successfully."""
+    """Poll the run and persist the captured session on success: a re-save overwrites
+    ``existing_browser_profile_id`` in place, otherwise a new profile is created and linked."""
     max_polls = 120  # ~10 minutes at 5s intervals
     poll_interval = 5
 
@@ -1153,34 +1206,54 @@ async def _create_browser_profile_after_workflow(
                 )
                 return
 
-            # Create the browser profile in DB
-            profile_name = f"Profile - {credential_name} ({credential_id})"
-            profile = await app.DATABASE.browser_sessions.create_browser_profile(
-                organization_id=organization_id,
-                name=profile_name,
-                description=f"Browser profile from credential test for {credential_name}",
-            )
+            # Re-save overwrites the existing profile in place so references to its id keep
+            # working; a first-time save (or a since-deleted profile) creates a new one.
+            target_profile_id = existing_browser_profile_id
+            reused_existing = False
+            if target_profile_id:
+                existing_profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=target_profile_id,
+                    organization_id=organization_id,
+                )
+                reused_existing = existing_profile is not None
+                if not reused_existing:
+                    target_profile_id = None
 
-            # Copy session data to the browser profile storage location
+            if not target_profile_id:
+                profile = await app.DATABASE.browser_sessions.create_browser_profile(
+                    organization_id=organization_id,
+                    name=f"Profile - {credential_name} ({credential_id})",
+                    description=f"Browser profile from credential test for {credential_name}",
+                )
+                target_profile_id = profile.browser_profile_id
+
+            # Overwrites in place when reusing an existing id.
             await app.STORAGE.store_browser_profile(
                 organization_id=organization_id,
-                profile_id=profile.browser_profile_id,
+                profile_id=target_profile_id,
                 directory=session_dir,
             )
+            if reused_existing:
+                # Bump modified_at so the status poll can tell this run's re-save actually landed.
+                await app.DATABASE.browser_sessions.touch_browser_profile(
+                    profile_id=target_profile_id,
+                    organization_id=organization_id,
+                )
 
-            # Link browser profile to credential
+            # Link browser profile to credential (refreshes tested_url; id unchanged on re-save).
             await app.DATABASE.credentials.update_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
+                browser_profile_id=target_profile_id,
                 tested_url=test_url,
             )
 
             LOG.info(
-                "Browser profile created from credential test",
+                "Browser profile saved from credential test",
                 credential_id=credential_id,
-                browser_profile_id=profile.browser_profile_id,
+                browser_profile_id=target_profile_id,
                 workflow_run_id=workflow_run_id,
+                overwrote_existing=target_profile_id == existing_browser_profile_id,
             )
             return
 

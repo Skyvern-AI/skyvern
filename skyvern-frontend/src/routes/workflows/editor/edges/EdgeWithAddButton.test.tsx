@@ -102,7 +102,9 @@ describe("EdgeWithAddButton", () => {
     cleanup();
   });
 
-  it("keeps the loop as parent and inherits branch context for nested-loop edge inserts", () => {
+  it("keeps the loop as parent without branch context for nested-loop edge inserts", () => {
+    // SKY-10719: a block inside a loop is a plain loop child even when the loop
+    // lives in a conditional; keep the loop as parent with no branch context.
     useNodesMock.mockReturnValue([
       {
         id: "conditional",
@@ -138,19 +140,17 @@ describe("EdgeWithAddButton", () => {
 
     fireEvent.click(screen.getByRole("button"));
 
-    expect(useWorkflowPanelStore.getState().workflowPanelState).toMatchObject({
+    const state = useWorkflowPanelStore.getState().workflowPanelState;
+    expect(state).toMatchObject({
       active: true,
       content: "nodeLibrary",
       data: {
-        branchContext: {
-          branchId: "branch-a",
-          conditionalNodeId: "conditional",
-        },
         next: "target",
         parent: "loop",
         previous: "source",
       },
     });
+    expect(state.data?.branchContext).toBeUndefined();
   });
 
   it("does not branch-scope the post-merge edge after a top-level conditional", () => {
