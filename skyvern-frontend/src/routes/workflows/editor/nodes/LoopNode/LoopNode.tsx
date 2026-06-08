@@ -16,6 +16,7 @@ import { cn } from "@/util/utils";
 
 import { AppNode } from "..";
 import { applyDescendantCollapseVisibility } from "../../collapse/applyDescendantCollapseVisibility";
+import { scheduleCollapseRelayout } from "../../collapse/scheduleCollapseRelayout";
 import { useCollapseContext } from "../../collapse/CollapseContext";
 import {
   isBlockCollapsedAt,
@@ -92,7 +93,7 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
       prevIsCollapsed.current = false;
       return;
     }
-    const wasCollapsed = prevIsCollapsed.current === true;
+    const previousIsCollapsed = prevIsCollapsed.current;
     prevIsCollapsed.current = isCollapsed;
     setNodes((prev) => {
       const collapsedSet = useNodeCollapseStore.getState().collapsed;
@@ -105,10 +106,13 @@ function LoopNode({ id, data }: NodeProps<LoopNode>) {
     // marginy even if debouncedLayoutForDimensions already ran with stale
     // data before the header's ResizeObserver had a chance to update
     // _headerHeight. The handler has a built-in 10ms delay that lets the
-    // ResizeObserver win the race.
-    if (wasCollapsed && !isCollapsed) {
-      window.dispatchEvent(new Event("loop-header-resized"));
-    }
+    // ResizeObserver win the race. Collapsing fires the same re-layout, but
+    // deferred two frames so React Flow has re-measured the shorter card.
+    return scheduleCollapseRelayout(
+      "loop-header-resized",
+      previousIsCollapsed,
+      isCollapsed,
+    );
   }, [id, isCollapsed, setNodes, workflowPermanentId]);
 
   const furthestDownChild: Node | null = children.reduce(
