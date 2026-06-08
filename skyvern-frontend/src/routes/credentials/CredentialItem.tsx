@@ -6,6 +6,7 @@ import {
 } from "@/api/types";
 import { useState } from "react";
 import {
+  ExclamationTriangleIcon,
   ExternalLinkIcon,
   Pencil1Icon,
   ReloadIcon,
@@ -43,6 +44,23 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
   );
   const credentialData = credential.credential;
   const modalType = credentialTypeToModalType(credential.credential_type);
+  // Offer re-save for any credential that already has a saved profile, not only ones
+  // flagged with the save-session intent.
+  const canResaveSession = Boolean(
+    credential.save_browser_session_intent || credential.browser_profile_id,
+  );
+  const handleResaveSession = () => {
+    if (credential.tested_url && onStartBackgroundTest) {
+      onStartBackgroundTest(
+        credential.credential_id,
+        credential.tested_url,
+        credential.user_context ?? undefined,
+      );
+    } else {
+      // No URL on record to test against — fall back to the editor where it's entered.
+      setEditModalOpen(true);
+    }
+  };
   const getTotpTypeDisplay = (totpType: string) => {
     switch (totpType) {
       case "authenticator":
@@ -174,6 +192,21 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
             )}
           </div>
         )}
+        {canResaveSession && !credential.browser_profile_id && !activeTest && (
+          <div className="flex items-center gap-1 text-xs">
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex items-center text-red-400">
+                    <ExclamationTriangleIcon className="size-4" />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>Browser session was not saved</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            <span className="text-red-400">Not saved</span>
+          </div>
+        )}
       </div>
       {credentialDetails}
       <div className="ml-auto flex gap-1">
@@ -190,6 +223,33 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
             <TooltipContent>Assign to Folder</TooltipContent>
           </Tooltip>
         </TooltipProvider>
+        {canResaveSession && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  size="icon"
+                  variant="tertiary"
+                  className="h-8 w-9"
+                  disabled={Boolean(activeTest)}
+                  onClick={handleResaveSession}
+                  aria-label={
+                    credential.browser_profile_id
+                      ? "Refresh saved session"
+                      : "Retry saving session"
+                  }
+                >
+                  <ReloadIcon className="size-5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {credential.browser_profile_id
+                  ? "Refresh saved session"
+                  : "Retry saving session"}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
