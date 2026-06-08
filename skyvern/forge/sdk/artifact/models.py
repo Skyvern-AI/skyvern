@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_serializer
 
 class ArtifactType(StrEnum):
     RECORDING = "recording"
+    SESSION_REPLAY = "session_replay"
     BROWSER_CONSOLE_LOG = "browser_console_log"
 
     SKYVERN_LOG = "skyvern_log"
