@@ -428,6 +428,26 @@ class ArtifactManager:
             file_size=file_size,
         )
 
+    async def create_browser_session_replay_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+        file_size: int | None = None,
+    ) -> str:
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.SESSION_REPLAY,
+            checksum=checksum,
+            file_size=file_size,
+        )
+
     async def _create_browser_session_artifact(
         self,
         *,

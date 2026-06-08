@@ -2085,6 +2085,7 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
     ArtifactType.RECORDING: "video/webm",
+    ArtifactType.SESSION_REPLAY: "video/mp4",
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
 _ARTIFACT_CONTENT_TYPE_DEFAULT = "application/json"
@@ -2169,7 +2170,7 @@ def _artifact_response_config(artifact: Artifact) -> tuple[str, str]:
     types keep the historical ``inline`` behaviour.
     """
     raw_name = _artifact_filename_from_uri(artifact.uri)
-    if artifact.artifact_type == ArtifactType.RECORDING:
+    if artifact.artifact_type in {ArtifactType.RECORDING, ArtifactType.SESSION_REPLAY}:
         _, dot, extension = raw_name.lower().rpartition(".")
         media_type = _VIDEO_CONTENT_TYPES_BY_EXTENSION.get(
             f"{dot}{extension}" if dot else "",
