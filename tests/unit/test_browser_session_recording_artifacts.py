@@ -56,6 +56,28 @@ def _make_recording_artifact(
     )
 
 
+def _make_session_replay_artifact(
+    artifact_id: str,
+    uri: str,
+    *,
+    browser_session_id: str = "pbs_1",
+    checksum: str | None = "sha-replay",
+    file_size: int | None = 1024,
+    created_at: str = "2026-04-26T00:00:00Z",
+) -> Artifact:
+    return Artifact(
+        artifact_id=artifact_id,
+        artifact_type=ArtifactType.SESSION_REPLAY,
+        uri=uri,
+        organization_id="o_1",
+        browser_session_id=browser_session_id,
+        checksum=checksum,
+        file_size=file_size,
+        created_at=created_at,
+        modified_at=created_at,
+    )
+
+
 @pytest.fixture
 def keyring_configured():
     from skyvern.config import settings
@@ -133,6 +155,74 @@ async def test_create_browser_session_recording_artifact_is_idempotent():
             uri=existing.uri,
             filename="recording.webm",
             checksum="sha-r",
+        )
+
+    assert artifact_id == "a_existing"
+    mock_db_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_replay_artifact_inserts_session_replay_row():
+    manager = ArtifactManager()
+    find_existing = AsyncMock(return_value=None)
+    mock_db_create = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
+            mock_db_create,
+        ),
+    ):
+        artifact_id = await manager.create_browser_session_replay_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri="s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/session_replays/2026-04-26/replay.mp4",
+            filename="replay.mp4",
+            checksum="sha-replay",
+            file_size=8192,
+        )
+
+    assert artifact_id.startswith("a_")
+    mock_db_create.assert_awaited_once()
+    _, kwargs = mock_db_create.call_args
+    assert kwargs["artifact_type"] == ArtifactType.SESSION_REPLAY
+    assert kwargs["browser_session_id"] == "pbs_1"
+    assert kwargs["organization_id"] == "o_1"
+    assert kwargs["checksum"] == "sha-replay"
+    assert kwargs["file_size"] == 8192
+    assert kwargs.get("run_id") is None
+
+
+@pytest.mark.asyncio
+async def test_create_browser_session_replay_artifact_is_idempotent():
+    manager = ArtifactManager()
+    existing = _make_session_replay_artifact(
+        "a_existing",
+        "s3://skyvern-artifacts/v1/local/o_1/browser_sessions/pbs_1/session_replays/2026-04-26/replay.mp4",
+    )
+    find_existing = AsyncMock(return_value=existing)
+    mock_db_create = AsyncMock()
+
+    with (
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.find_artifact_for_browser_session",
+            find_existing,
+        ),
+        patch(
+            "skyvern.forge.sdk.artifact.manager.app.DATABASE.artifacts.create_artifact",
+            mock_db_create,
+        ),
+    ):
+        artifact_id = await manager.create_browser_session_replay_artifact(
+            organization_id="o_1",
+            browser_session_id="pbs_1",
+            uri=existing.uri,
+            filename="replay.mp4",
+            checksum="sha-replay",
         )
 
     assert artifact_id == "a_existing"
