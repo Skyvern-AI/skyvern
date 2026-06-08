@@ -148,6 +148,21 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
 
+    @db_operation("touch_browser_profile")
+    async def touch_browser_profile(self, profile_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            browser_profile.modified_at = naive_utc_now()
+            await session.commit()
+
     @db_operation("get_active_persistent_browser_sessions")
     async def get_active_persistent_browser_sessions(
         self,

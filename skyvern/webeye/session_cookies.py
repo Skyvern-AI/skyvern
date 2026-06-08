@@ -62,9 +62,10 @@ async def restore_session_cookies(browser_context: BrowserContext | None, user_d
             return
         with open(path) as f:
             cookies = json.load(f)
-        # Re-filter so a sidecar written before this filter existed (full cookie set) still narrows.
+        # Re-filter (old sidecars hold the full cookie set) and pin expires to -1: patchright reports
+        # session cookies as expires 0, which add_cookies reads as the Unix epoch (expired) and drops.
         sanitized = [
-            {k: v for k, v in cookie.items() if k in _ALLOWED_COOKIE_KEYS}
+            {**{k: v for k, v in cookie.items() if k in _ALLOWED_COOKIE_KEYS}, "expires": -1}
             for cookie in cookies
             if cookie.get("expires", -1) in _SESSION_COOKIE_EXPIRES
         ]
