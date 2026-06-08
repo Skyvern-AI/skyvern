@@ -42,8 +42,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf 
 
 WORKDIR /app
 
-# Copy built assets and server files from builder
-COPY --from=builder /app/dist ./dist
+# dist is a pristine template; the entrypoint re-creates /app/dist from it
+# on every start so env-var changes apply on `docker restart`.
+COPY --from=builder /app/dist ./dist.template
 COPY --from=builder /app/localServer.js ./
 COPY --from=builder /app/artifactServer.js ./
 COPY --from=builder /app/package.json ./
