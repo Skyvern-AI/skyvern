@@ -14,6 +14,7 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.services.otp_service import (
     OTPValue,
+    _get_otp_value_from_db,
     _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
     extract_totp_from_navigation_inputs,
@@ -928,3 +929,22 @@ class TestPostTotpVerificationUrlSeam:
         assert parsed["task_id"] == "t_123123123"
         assert parsed["verification_code"] == email
         assert "123456" in parsed["verification_code"]
+
+
+@pytest.mark.asyncio
+async def test_get_otp_value_from_db_forwards_created_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_get_otp_value_from_db forwards created_after so the DB query can disqualify pre-run codes."""
+    started_at = datetime(2026, 6, 8, 20, 3, 0)
+    get_otp_codes = AsyncMock(return_value=[])
+    with patch("skyvern.services.otp_service.app") as mock_app:
+        mock_app.DATABASE.otp.get_otp_codes = get_otp_codes
+        result = await _get_otp_value_from_db(
+            "o_test",
+            "otp@example.com",
+            workflow_run_id="wr_test",
+            created_after=started_at,
+        )
+
+    assert result is None
+    get_otp_codes.assert_awaited_once()
+    assert get_otp_codes.await_args.kwargs["created_after"] == started_at
