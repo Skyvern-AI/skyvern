@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 import structlog
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import Select, exists, func, or_, select, update
 
 from skyvern.constants import DEFAULT_SCRIPT_RUN_ID
 from skyvern.forge.sdk.db._error_handling import db_operation
@@ -413,7 +413,7 @@ class WorkflowsRepository(BaseRepository):
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        workflow_tags: list[tuple[str, str]] | None = None,
+        workflow_tags: list[tuple[str | None, str | None]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -426,10 +426,15 @@ class WorkflowsRepository(BaseRepository):
         - Parameter metadata search excludes soft-deleted parameter rows across parameter tables.
 
         Tag filtering (`workflow_tags`):
-        - A list of (key, value) pairs. Pairs are grouped by key; the filter is AND
-          across distinct keys and OR within a key's values. One semi-join subquery is
-          emitted per distinct key — normalized event rows can't satisfy two `key=`
-          predicates at once, so a single conjunctive subquery would match nothing.
+        - A list of (key, value) terms in three shapes: exact ``(key, value)``,
+          group/key-only ``(key, None)``, and label/value-only ``(None, value)``.
+        - The filter is AND across distinct terms, with OR within a key for exact
+          terms sharing that key (so ``env:prod`` + ``env:staging`` is ``env IN
+          (prod, staging)``). One semi-join subquery is emitted per term group —
+          a normalized event row can't satisfy two different ``key=`` predicates
+          at once, so a single conjunctive subquery would match nothing.
+        - A value-only term matches that label across any/no group; a key-only
+          term matches any value within the group.
         - Matches only the current value of each tag: superseded and soft-deleted
           event rows are excluded, mirroring the active-tag read path.
         """
@@ -481,19 +486,45 @@ class WorkflowsRepository(BaseRepository):
             if folder_id:
                 main_query = main_query.where(WorkflowModel.folder_id == folder_id)
             if workflow_tags:
-                values_by_key: dict[str, list[str]] = {}
+                exact_values_by_key: dict[str, list[str]] = {}
+                key_only_terms: list[str] = []
+                value_only_terms: list[str] = []
                 for key, value in workflow_tags:
-                    values_by_key.setdefault(key, []).append(value)
-                for key, values in values_by_key.items():
+                    if key is not None and value is not None:
+                        exact_values_by_key.setdefault(key, []).append(value)
+                    elif key is not None:
+                        key_only_terms.append(key)
+                    elif value is not None:
+                        value_only_terms.append(value)
+
+                def _active_set_subquery() -> Select:
+                    return (
+                        select(WorkflowTagEventModel.workflow_permanent_id)
+                        .where(WorkflowTagEventModel.organization_id == organization_id)
+                        .where(WorkflowTagEventModel.deleted_at.is_(None))
+                        .where(WorkflowTagEventModel.superseded_at.is_(None))
+                        .where(WorkflowTagEventModel.event_type == TagEventType.SET.value)
+                    )
+
+                # AND across distinct terms; OR within a key for exact terms.
+                for key, values in exact_values_by_key.items():
                     main_query = main_query.where(
                         WorkflowModel.workflow_permanent_id.in_(
-                            select(WorkflowTagEventModel.workflow_permanent_id)
-                            .where(WorkflowTagEventModel.organization_id == organization_id)
-                            .where(WorkflowTagEventModel.deleted_at.is_(None))
-                            .where(WorkflowTagEventModel.superseded_at.is_(None))
-                            .where(WorkflowTagEventModel.event_type == TagEventType.SET.value)
+                            _active_set_subquery()
                             .where(WorkflowTagEventModel.key == key)
                             .where(WorkflowTagEventModel.value.in_(values))
+                        )
+                    )
+                for key in key_only_terms:
+                    main_query = main_query.where(
+                        WorkflowModel.workflow_permanent_id.in_(
+                            _active_set_subquery().where(WorkflowTagEventModel.key == key)
+                        )
+                    )
+                for value in value_only_terms:
+                    main_query = main_query.where(
+                        WorkflowModel.workflow_permanent_id.in_(
+                            _active_set_subquery().where(WorkflowTagEventModel.value == value)
                         )
                     )
             if search_key:

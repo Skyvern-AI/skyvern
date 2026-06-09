@@ -3351,8 +3351,15 @@ async def chain_click(
     action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
-            await EventStrategyFactory.move_to_element(page, locator)
-            await _locator_click(locator, click_count, timeout=timeout)
+            if click_count == 1:
+                # Route through the active cursor strategy so alternate profiles can
+                # dispatch their own click sequence (explicit mouse.down/up).
+                # Multi-click variants (dblclick / triple-click) still go through
+                # _locator_click because they rely on Playwright's click_count arg.
+                await EventStrategyFactory.click_element(page, locator, timeout=timeout)
+            else:
+                await EventStrategyFactory.move_to_element(page, locator)
+                await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         action_results = [ActionSuccess()]
         return action_results
