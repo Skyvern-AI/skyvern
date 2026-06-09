@@ -469,7 +469,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
 
 @base_router.post(
     "/run/agents",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
@@ -569,7 +569,7 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
     summary="Get run info by id",
@@ -611,7 +611,7 @@ async def get_run(
 
 @base_router.post(
     "/runs/{run_id}/cancel",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
@@ -639,7 +639,7 @@ async def cancel_run(
 
 @base_router.post(
     "/runs/cancel",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "bulk_cancel_runs",
         "x-fern-examples": [
@@ -1834,7 +1834,7 @@ async def update_tag_key(
 @base_router.delete(
     "/tag-keys/{key}",
     response_model=TagKeyDeleteResponse,
-    tags=["Workflow Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
     description="Delete a tag key from the organization registry and remove that tag from every workflow that "
     "currently has it (cascade). Returns how many workflows the tag was removed from.",
@@ -2400,7 +2400,7 @@ async def get_run_artifacts(
 
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
@@ -2434,7 +2434,7 @@ async def retry_run_webhook(
 
 @base_router.get(
     "/runs/{run_id}/timeline",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
@@ -2876,7 +2876,7 @@ def _workflow_run_request_from_workflow_request(
 
 @base_router.post(
     "/workflows/runs/{workflow_run_id}/retry",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=WorkflowRunResponse,
     openapi_extra={
         "x-fern-sdk-method-name": "retry_workflow_run",
@@ -3450,7 +3450,7 @@ async def run_workflow_legacy(
 @base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
-    tags=["Agents"],
+    tags=["Runs"],
     description=(
         "List workflow runs across all workflows for the current organization.\n\n"
         "Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. "
@@ -3600,7 +3600,7 @@ async def _get_workflow_runs_by_id(
 @base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
-    tags=["Agents"],
+    tags=["Runs"],
     description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
     summary="Get all runs by agent",
     openapi_extra={

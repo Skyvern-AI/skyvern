@@ -9,6 +9,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.schemas.tasks import Task
     from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 
 from skyvern.config import settings
@@ -274,6 +275,35 @@ def _try_generate_totp_for_credential(
         return None
 
 
+def has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
+    """Return True when try_generate_totp_from_credential would have a credential to consult.
+
+    Mirrors try_generate_totp_from_credential's selection: active-with-TOTP if an
+    active credential is recorded, else exactly one TOTP-bearing candidate.
+    Used to drive prompt gating and classifier branches without actually
+    generating a code.
+    """
+    if not workflow_run_id:
+        return False
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if not workflow_run_context:
+        return False
+
+    current_context = skyvern_context.current()
+    active_credential_key = current_context.active_credential_parameter_key if current_context else None
+    if active_credential_key:
+        value = workflow_run_context.values.get(active_credential_key)
+        return isinstance(value, dict) and isinstance(value.get("totp"), str)
+
+    candidate_keys = [
+        key
+        for key, value in workflow_run_context.values.items()
+        if isinstance(value, dict) and isinstance(value.get("totp"), str)
+    ]
+    return len(candidate_keys) == 1
+
+
 def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue | None:
     """Generate a TOTP only for the credential the agent is currently typing into.
 
@@ -306,6 +336,45 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
             )
         return None
     return _try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
+
+
+async def resolve_otp_value(task: "Task") -> OTPValue | None:
+    """Resolve the OTP value to use for a verification step.
+
+    Priority is payload -> credential-backed TOTP -> webhook polling. The
+    workflow-run metadata lookup needed by polling is performed lazily so
+    payload/credential resolutions do not touch the database. Polling raises
+    NoTOTPVerificationCodeFound or FailedToGetTOTPVerificationCode on timeout;
+    those propagate so callers can build the right terminate action. Returns
+    None when no source is configured.
+    """
+    otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
+    if otp_value:
+        return otp_value
+
+    otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+    if otp_value:
+        return otp_value
+
+    if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
+        workflow_id: str | None = None
+        workflow_permanent_id: str | None = None
+        if task.workflow_run_id:
+            workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
+            if workflow_run:
+                workflow_id = workflow_run.workflow_id
+                workflow_permanent_id = workflow_run.workflow_permanent_id
+        return await poll_otp_value(
+            organization_id=task.organization_id,
+            task_id=task.task_id,
+            workflow_id=workflow_id,
+            workflow_run_id=task.workflow_run_id,
+            workflow_permanent_id=workflow_permanent_id,
+            totp_verification_url=task.totp_verification_url,
+            totp_identifier=task.totp_identifier,
+        )
+
+    return None
 
 
 async def poll_otp_value(
