@@ -51,7 +51,8 @@ def test_cache_hit_same_flag_combo_returns_same_tree_object() -> None:
 
     # First call populates the cache.
     page.build_lean_elements_tree(strip_url_query_strings=True)
-    cache_key = (False, False, True)
+    # key order: (compress_long_href, compress_image_src, strip_url_query_strings, compress_nonnavigable_href)
+    cache_key = (False, False, True, False)
     assert cache_key in page.lean_element_tree_cache
     cached_tree = page.lean_element_tree_cache[cache_key]
 
@@ -77,7 +78,7 @@ def test_cache_isolation_across_flag_combos() -> None:
     page.build_lean_elements_tree(compress_image_src=True, strip_url_query_strings=True)
 
     keys = set(page.lean_element_tree_cache.keys())
-    assert keys == {(False, True, False), (False, False, True), (False, True, True)}
+    assert keys == {(False, True, False, False), (False, False, True, False), (False, True, True, False)}
 
     # Different combos produce different rendered output.
     only_img = page.build_lean_elements_tree(compress_image_src=True)
@@ -92,7 +93,24 @@ def test_cache_isolation_default_flags_off_is_its_own_slot() -> None:
     """No-op call (all flags False) is a valid combo with its own cache key."""
     page = _make_scraped_page([_node("a", attributes={"href": "/x?utm=1"})])
     page.build_lean_elements_tree()
-    assert (False, False, False) in page.lean_element_tree_cache
+    assert (False, False, False, False) in page.lean_element_tree_cache
+
+
+def test_nonnavigable_href_flag_has_its_own_cache_slot_and_drops_href() -> None:
+    """The 4th transform (compress_nonnavigable_href) must participate in the cache key
+    (so it can't return a stale 3-flag tree) and must drop a labeled javascript: href."""
+    labeled_postback = _node("a", id="AA", attributes={"href": "javascript:__doPostBack('x','')"})
+    labeled_postback["text"] = "Detail"
+    page = _make_scraped_page([labeled_postback])
+
+    plain = page.build_lean_elements_tree()
+    slim = page.build_lean_elements_tree(compress_nonnavigable_href=True)
+
+    assert (False, False, False, False) in page.lean_element_tree_cache
+    assert (False, False, False, True) in page.lean_element_tree_cache
+    assert "__doPostBack" in plain  # untouched without the flag
+    assert "__doPostBack" not in slim  # dropped with the flag
+    assert "href" not in slim
 
 
 # --- JSON vs HTML dispatch -----------------------------------------------
