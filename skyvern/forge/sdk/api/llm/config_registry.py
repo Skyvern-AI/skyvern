@@ -1883,6 +1883,23 @@ if settings.ENABLE_OPENROUTER:
                 ),
             ),
         )
+
+    LLMConfigRegistry.register_config(
+        "OPENROUTER_DEEPSEEK_V4_FLASH",
+        LLMConfig(
+            "openrouter/deepseek/deepseek-v4-flash",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
+            ),
+        ),
+    )
 if settings.ENABLE_GROQ:
     # Register Groq model configured in settings
     if settings.GROQ_MODEL:
