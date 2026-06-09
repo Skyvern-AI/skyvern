@@ -7,6 +7,7 @@ polling. Polling exceptions surface unchanged so callers can react.
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -86,10 +87,16 @@ async def test_credential_returns_value_skipping_poll_even_when_url_configured()
 
 
 def _stub_workflow_run_lookup(
-    monkeypatch_target, *, workflow_id: str | None, workflow_permanent_id: str | None
+    monkeypatch_target,
+    *,
+    workflow_id: str | None,
+    workflow_permanent_id: str | None,
+    started_at: datetime | None = None,
 ) -> MagicMock:
     """Patch app.DATABASE.workflow_runs.get_workflow_run with a recording mock."""
-    workflow_run = SimpleNamespace(workflow_id=workflow_id, workflow_permanent_id=workflow_permanent_id)
+    workflow_run = SimpleNamespace(
+        workflow_id=workflow_id, workflow_permanent_id=workflow_permanent_id, started_at=started_at
+    )
     get = AsyncMock(return_value=workflow_run)
     monkeypatch_target.setattr(
         "skyvern.services.otp_service.app.DATABASE.workflow_runs.get_workflow_run",
@@ -124,6 +131,43 @@ async def test_falls_through_to_poll_when_no_payload_or_credential(monkeypatch: 
     assert kwargs["workflow_permanent_id"] == "wpid_test"
     assert kwargs["totp_verification_url"] == "https://example.com/webhook"
     assert kwargs["totp_identifier"] == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_forwards_run_started_at_as_created_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run's started_at is forwarded as created_after so prior-run codes are disqualified."""
+    poll_value = _otp_value("303030")
+    started_at = datetime(2026, 6, 8, 20, 3, 0)
+    task = _make_task(totp_identifier="otp@example.com")
+    _stub_workflow_run_lookup(
+        monkeypatch, workflow_id="w_test", workflow_permanent_id="wpid_test", started_at=started_at
+    )
+    with (
+        patch("skyvern.services.otp_service.extract_totp_from_navigation_inputs", return_value=None),
+        patch("skyvern.services.otp_service.try_generate_totp_from_credential", return_value=None),
+        patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock(return_value=poll_value)) as poll,
+    ):
+        result = await resolve_otp_value(task)
+
+    assert result is poll_value
+    assert poll.await_args.kwargs["created_after"] == started_at
+
+
+@pytest.mark.asyncio
+async def test_created_after_is_none_when_run_started_at_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Null-fallback: a run with no started_at must not gain a watermark filter."""
+    poll_value = _otp_value("404040")
+    task = _make_task(totp_identifier="user@example.com")
+    _stub_workflow_run_lookup(monkeypatch, workflow_id="w_test", workflow_permanent_id="wpid_test", started_at=None)
+    with (
+        patch("skyvern.services.otp_service.extract_totp_from_navigation_inputs", return_value=None),
+        patch("skyvern.services.otp_service.try_generate_totp_from_credential", return_value=None),
+        patch("skyvern.services.otp_service.poll_otp_value", new=AsyncMock(return_value=poll_value)) as poll,
+    ):
+        result = await resolve_otp_value(task)
+
+    assert result is poll_value
+    assert poll.await_args.kwargs["created_after"] is None
 
 
 @pytest.mark.asyncio
