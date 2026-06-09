@@ -22,6 +22,7 @@ class OTPRepository(BaseRepository):
         valid_lifespan_minutes: int = settings.TOTP_LIFESPAN_MINUTES,
         otp_type: OTPType | None = None,
         workflow_run_id: str | None = None,
+        created_after: datetime | None = None,
         limit: int | None = None,
     ) -> list[TOTPCode]:
         """
@@ -29,6 +30,7 @@ class OTPRepository(BaseRepository):
         - organization_id
         - totp_identifier
         - workflow_run_id (optional)
+        - created_after (optional): only codes created at/after this instant
         2. make sure created_at is within the valid lifespan
         3. sort by task_id/workflow_id/workflow_run_id nullslast and created_at desc
         4. apply an optional limit at the DB layer
@@ -51,6 +53,8 @@ class OTPRepository(BaseRepository):
                 query = query.filter(TOTPCodeModel.otp_type == otp_type)
             if workflow_run_id is not None:
                 query = query.filter(TOTPCodeModel.workflow_run_id == workflow_run_id)
+            if created_after is not None:
+                query = query.filter(TOTPCodeModel.created_at >= created_after)
             query = query.order_by(asc(all_null), TOTPCodeModel.created_at.desc())
             if limit is not None:
                 query = query.limit(limit)

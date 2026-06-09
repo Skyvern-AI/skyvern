@@ -44,7 +44,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 
 LOG = structlog.get_logger()
 
@@ -1333,6 +1333,7 @@ class AgentFunction:
         self,
         organization_id: str,
         workflow_id: str,
+        status: "WorkflowRunStatus | None" = None,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None
