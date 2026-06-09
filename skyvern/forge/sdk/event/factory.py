@@ -136,6 +136,34 @@ class EventStrategyFactory:
         """Update cursor position without generating movement."""
         EventStrategyFactory.get_cursor_strategy().sync_position(page, x, y)
 
+    @staticmethod
+    async def warmup_cursor(page: Page) -> None:
+        """Run the active cursor strategy's per-page warmup hook (idempotent, no-op by default)."""
+        start = time.perf_counter()
+        try:
+            await EventStrategyFactory.get_cursor_strategy().warmup(page)
+        except Exception:
+            LOG.debug("Cursor warmup failed, proceeding with action", exc_info=True)
+        finally:
+            EventStrategyFactory.__metrics.record("warmup_cursor", time.perf_counter() - start)
+
+    @staticmethod
+    async def click_element(page: Page, locator: Locator, timeout: float | None = None) -> None:
+        """Click an element through the active cursor strategy.
+
+        The default strategy delegates to ``locator.click(timeout=...)`` so
+        Playwright's actionability checks remain in force. An alternate strategy
+        dispatches explicit ``page.mouse.down``/``page.mouse.up`` events with a
+        press dwell at the resolved destination coordinates, avoiding the implicit
+        mousemove that ``page.mouse.click``/``locator.click`` inserts before
+        mousedown.
+        """
+        start = time.perf_counter()
+        try:
+            await EventStrategyFactory.get_cursor_strategy().click(page, locator, timeout=timeout)
+        finally:
+            EventStrategyFactory.__metrics.record("click_element", time.perf_counter() - start)
+
     # -- input convenience methods ----------------------------------------------
 
     @staticmethod
