@@ -144,6 +144,9 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
+    # Approves persisting a bound credential, not running it: run authority stays
+    # scoped to resolved_credentials (ADR 0002).
+    discovered_credentials: list[Credential] = field(default_factory=list)
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
     raw_secret_detected: bool = False
@@ -777,6 +780,30 @@ def _previous_credential_clarification_was_asked(global_llm_context: str) -> boo
     )
 
 
+def _discovered_credential_ids_from_context(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        check.credential_id
+        for check in structured.credentials_checked
+        if check.found and isinstance(check.credential_id, str) and check.credential_id.startswith("cred_")
+    }
+
+
+async def _seed_discovered_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    discovered_ids = _discovered_credential_ids_from_context(global_llm_context)
+    if not discovered_ids:
+        return
+    policy.discovered_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        sorted(discovered_ids),
+        organization_id=organization_id,
+    )
+
+
 def _last_assistant_message_was_saved_credential_question(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
 ) -> bool:
@@ -1035,6 +1062,18 @@ async def build_request_policy(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
+    try:
+        await _seed_discovered_credentials(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy discovered-credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
     _prioritize_credential_clarification(policy)
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":

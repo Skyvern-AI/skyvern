@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urljoin, urlparse
 
 import structlog
@@ -69,6 +69,9 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -144,6 +147,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
@@ -1530,6 +1534,83 @@ def _consume_scout_source_url(ctx: AgentContext) -> str | None:
     return source_url
 
 
+_ROLE_NAME_SELECTOR_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
+
+
+def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
+    """Parse the ``role=<role>[name="<name>"]`` form (ref_to_selector) — TIER 1, no browser read.
+
+    Returns (role, accessible_name) when the selector is a plain role/name locator;
+    None for bare CSS/xpath or when an engine chain (`>> nth=`) trails the role/name.
+    """
+    selector = selector.strip()
+    match = _ROLE_NAME_SELECTOR_RE.match(selector)
+    if not match:
+        return None
+    role, raw_name, suffix = match.group(1), match.group(2), match.group(3)
+    if suffix.strip():
+        return None
+    name = raw_name.replace('\\"', '"') if raw_name is not None else ""
+    return role, name
+
+
+async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tuple[str, str] | None:
+    """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
+
+    A failed read degrades gracefully to None so the selector-only auto-credit
+    path (SKY-10712) stays intact.
+    """
+    selector = selector.strip()
+    if not selector:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _scout_accessible_role_name_expression(selector)},
+            ),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, dict):
+        return None
+    role = str(value.get("role") or "").strip()
+    name = str(value.get("accessible_name") or "").strip()
+    if not role and not name:
+        return None
+    return role, name
+
+
+async def _resolve_scout_role_name(
+    ctx: AgentContext, selector: str, *, allow_browser_read: bool = True
+) -> tuple[str, str]:
+    """Resolve (role, accessible_name) for a scouted selector. TIER 1 parse first;
+    TIER 2 browser read only for bare CSS/xpath. Always degrades to ("", "").
+
+    ``allow_browser_read=False`` skips TIER 2 when the action navigated: a post-action
+    read against the landing page would capture the wrong element's name, so the bare
+    selector is kept verbatim (the synthesizer prefers it anyway)."""
+    selector = selector.strip()
+    if not selector:
+        return "", ""
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        return parsed
+    if not allow_browser_read:
+        return "", ""
+    captured = await _capture_accessible_role_name(ctx, selector)
+    if captured is not None:
+        return captured
+    return "", ""
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -1539,6 +1620,8 @@ def _record_scouted_interaction(
     value: str = "",
     key: str = "",
     typed_length: int = 0,
+    role: str = "",
+    accessible_name: str = "",
 ) -> None:
     selector = selector.strip()
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -1555,6 +1638,10 @@ def _record_scouted_interaction(
         artifact["key"] = key
     if typed_length:
         artifact["typed_length"] = typed_length
+    if role:
+        artifact["role"] = role
+    if accessible_name:
+        artifact["accessible_name"] = accessible_name
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -1566,12 +1653,21 @@ def _record_scouted_interaction(
     ]
     interactions.append(artifact)
     ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+
+    trajectory = list(ctx.scout_trajectory)
+    trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
+    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory.append(trajectory_artifact)
+    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+
     LOG.info(
         "copilot_scout_interaction_captured",
         tool_name=tool_name,
         selector=selector or None,
         source_url=artifact.get("source_url"),
+        role=role or None,
         total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
     )
 
 
@@ -2420,6 +2516,15 @@ def _code_artifact_metadata_as_tool_argument(
     return [item.model_dump(mode="json", exclude_none=True) for item in metadata]
 
 
+def _format_code_artifact_violations(violations: list[str]) -> str:
+    # Surface every contract violation at once so the agent fixes them in a single
+    # update instead of round-tripping one error per `update_and_run_blocks` call.
+    if len(violations) == 1:
+        return violations[0]
+    numbered = "\n".join(f"{index}. {message}" for index, message in enumerate(violations, start=1))
+    return f"Artifact metadata has {len(violations)} contract violations; fix all of them in one update:\n{numbered}"
+
+
 def _normalize_code_artifact_metadata(
     raw_metadata: Any,
     workflow_yaml: str,
@@ -2429,6 +2534,8 @@ def _normalize_code_artifact_metadata(
     items = _code_artifact_metadata_items(raw_metadata)
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     normalized: dict[str, dict[str, Any]] = {}
+    violations: list[str] = []
+    seen_labels: set[str] = set()
     for raw_item in items:
         try:
             metadata = (
@@ -2437,22 +2544,30 @@ def _normalize_code_artifact_metadata(
                 else CodeArtifactMetadata.model_validate(raw_item)
             )
         except ValidationError as exc:
-            return {}, f"Artifact metadata is malformed: {exc}"
+            violations.append(f"Artifact metadata is malformed: {exc}")
+            continue
         dumped = metadata.model_dump(mode="json", exclude_none=True)
         label = str(dumped.get("block_label") or "").strip()
         if not label:
-            return {}, "Artifact metadata requires a non-empty `block_label` for each artifact."
+            violations.append("Artifact metadata requires a non-empty `block_label` for each artifact.")
+            continue
         if label not in code_blocks:
-            return {}, (
+            violations.append(
                 f"Artifact metadata for `{label}` does not reference an existing code block label. "
                 "Attach metadata only to authored code blocks."
             )
-        if label in normalized:
-            return {}, f"Artifact metadata contains duplicate entries for `{label}`."
+            continue
+        if label in seen_labels:
+            violations.append(f"Artifact metadata contains duplicate entries for `{label}`.")
+            continue
+        seen_labels.add(label)
         dumped["block_label"] = label
+        item_violations: list[str] = []
         artifact_id = str(dumped.get("artifact_id") or "").strip()
         if artifact_id and not artifact_id.startswith("code_artifact:"):
-            return {}, f"Artifact metadata for `{label}` requires `artifact_id` to start with `code_artifact:`."
+            item_violations.append(
+                f"Artifact metadata for `{label}` requires `artifact_id` to start with `code_artifact:`."
+            )
         dumped["artifact_id"] = artifact_id or _artifact_id_for_block_label(label)
         block_id = str(
             dumped.get("block_id") or code_blocks[label].get("block_id") or code_blocks[label].get("id") or ""
@@ -2461,17 +2576,20 @@ def _normalize_code_artifact_metadata(
             dumped["block_id"] = block_id
         declared_goal = str(dumped.get("declared_goal") or "").strip()
         if not declared_goal:
-            return {}, f"Artifact metadata for `{label}` requires a non-empty `declared_goal`."
+            item_violations.append(f"Artifact metadata for `{label}` requires a non-empty `declared_goal`.")
         for field_name in _CODE_ARTIFACT_REQUIRED_LIST_FIELDS:
             value = dumped.get(field_name)
             if not isinstance(value, list) or not value:
-                return {}, f"Artifact metadata for `{label}` requires non-empty `{field_name}`."
+                item_violations.append(f"Artifact metadata for `{label}` requires non-empty `{field_name}`.")
         if not dumped.get("evidence_refs") and not dumped.get("observation_refs"):
-            return {}, f"Artifact metadata for `{label}` requires `evidence_refs` or `observation_refs`."
-        validation_error = _code_artifact_metadata_shape_error(label, dumped)
-        if validation_error is not None:
-            return {}, validation_error
+            item_violations.append(f"Artifact metadata for `{label}` requires `evidence_refs` or `observation_refs`.")
+        item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
+        if item_violations:
+            violations.extend(item_violations)
+            continue
         normalized[label] = dumped
+    if violations:
+        return {}, _format_code_artifact_violations(violations)
     return normalized, None
 
 
@@ -2502,45 +2620,47 @@ def _artifact_id_for_block_label(label: str) -> str:
     return f"code_artifact:{fragment}"
 
 
-def _code_artifact_metadata_shape_error(label: str, artifact: Mapping[str, Any]) -> str | None:
+def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]) -> list[str]:
+    """Return every shape violation for one artifact; the caller aggregates them."""
+    errors: list[str] = []
     for field_name, ref_key in (("evidence_refs", "evidence_ref"), ("observation_refs", "observation_ref")):
         for index, ref in enumerate(_artifact_rows(artifact.get(field_name))):
             if not str(ref.get(ref_key) or "").strip():
-                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `{ref_key}`."
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `{ref_key}`.")
             if not any(str(ref.get(key) or "").strip() for key in ("claim_id", "dependency_id", "criterion_id")):
-                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires a scoped id."
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires a scoped id.")
             status = str(ref.get("status") or "").strip()
             if ref.get("checkpoint_next_mode") == "advance" and status != "diagnostic_only":
-                return (
+                errors.append(
                     f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
                     "`checkpoint_next_mode=advance`; it must stay `diagnostic_only`."
                 )
             if ref.get("checkpoint_next_mode") == "stop" and status not in {"observed_not_verified", "diagnostic_only"}:
-                return (
+                errors.append(
                     f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
                     "`checkpoint_next_mode=stop`; it must remain `observed_not_verified` or `diagnostic_only`."
                 )
             if status != "missing" and not str(ref.get("source_tool") or "").strip():
-                return f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `source_tool`."
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `source_tool`.")
 
     for index, claim in enumerate(_artifact_rows(artifact.get("claimed_outcomes"))):
         claim_id = str(claim.get("id") or "").strip()
         if not _artifact_string_list(claim.get("depends_on")):
-            return f"Artifact metadata claim `{claim_id or index}` for `{label}` requires `depends_on`."
+            errors.append(f"Artifact metadata claim `{claim_id or index}` for `{label}` requires `depends_on`.")
         claim_criteria = _artifact_string_list(claim.get("covered_criteria")) or _artifact_string_list(
             claim.get("criteria_ids")
         )
         if not claim_criteria:
-            return f"Artifact metadata claim `{claim_id}` for `{label}` requires covered criterion ids."
+            errors.append(f"Artifact metadata claim `{claim_id}` for `{label}` requires covered criterion ids.")
         claim_evidence_refs = _artifact_string_list(claim.get("evidence_refs"))
         claim_observation_refs = _artifact_string_list(claim.get("observation_refs"))
         if claim.get("status") == "satisfied" and not claim_evidence_refs:
-            return (
+            errors.append(
                 f"Artifact metadata claim `{claim_id}` for `{label}` is `satisfied` but has no "
                 "claim-scoped `evidence_refs`."
             )
         if claim.get("status") != "missing" and not claim_evidence_refs and not claim_observation_refs:
-            return (
+            errors.append(
                 f"Artifact metadata claim `{claim_id}` for `{label}` requires claim-scoped "
                 "`evidence_refs` or `observation_refs` unless status is `missing`."
             )
@@ -2550,12 +2670,12 @@ def _code_artifact_metadata_shape_error(label: str, artifact: Mapping[str, Any])
         dependency_evidence_refs = _artifact_string_list(dependency.get("evidence_refs"))
         dependency_observation_refs = _artifact_string_list(dependency.get("observation_refs"))
         if dependency.get("status") == "satisfied" and not dependency_evidence_refs:
-            return (
+            errors.append(
                 f"Artifact metadata dependency `{dependency_id}` for `{label}` is `satisfied` but has no "
                 "dependency-scoped `evidence_refs`."
             )
         if dependency.get("status") != "missing" and not dependency_evidence_refs and not dependency_observation_refs:
-            return (
+            errors.append(
                 f"Artifact metadata dependency `{dependency_id}` for `{label}` requires scoped "
                 "`evidence_refs` or `observation_refs` unless status is `missing`."
             )
@@ -2565,23 +2685,23 @@ def _code_artifact_metadata_shape_error(label: str, artifact: Mapping[str, Any])
         if not _artifact_string_list(expectation.get("criteria_ids")) and not _artifact_string_list(
             expectation.get("claimed_outcome_ids")
         ):
-            return (
+            errors.append(
                 f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
                 "requires `criteria_ids` or `claimed_outcome_ids`."
             )
 
     for index, observation in enumerate(_artifact_rows(artifact.get("exploration_observations"))):
         if observation.get("status") != "observed_not_verified":
-            return (
+            errors.append(
                 f"Artifact metadata for `{label}` exploration observation {index} must be marked "
                 "`observed_not_verified` until authored execution and terminal verification pass."
             )
         if observation.get("checkpoint_next_mode") == "advance":
-            return (
+            errors.append(
                 f"Artifact metadata for `{label}` exploration observation {index} cannot carry "
                 "`checkpoint_next_mode=advance`; record that as `diagnostic_only` evidence instead."
             )
-    return None
+    return errors
 
 
 def _artifact_rows(value: Any) -> list[Mapping[str, Any]]:
@@ -2788,6 +2908,7 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
         elif cred.secret_label:
             entry["secret_label"] = cred.secret_label
         serialized.append(entry)
+    _record_discovered_credentials_on_policy(ctx, credentials)
     return {
         "ok": True,
         "data": {
@@ -2798,6 +2919,16 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             "has_more": len(serialized) == page_size,
         },
     }
+
+
+def _record_discovered_credentials_on_policy(ctx: AgentContext, credentials: list[Credential]) -> None:
+    request_policy = ctx.request_policy
+    if not isinstance(request_policy, RequestPolicy):
+        return
+    known_ids = {credential.credential_id for credential in request_policy.discovered_credentials}
+    for credential in credentials:
+        if credential.credential_id not in known_ids:
+            request_policy.discovered_credentials.append(credential)
 
 
 # Block types that establish browser state (loaded page / authenticated
@@ -5930,7 +6061,18 @@ async def _click_post_hook(
             "url": url,
             "title": title,
         }
-        _record_scouted_interaction(ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url)
+        navigated = bool(source_url) and bool(url) and source_url != url
+        role, accessible_name = await _resolve_scout_role_name(
+            ctx, data.get("selector", ""), allow_browser_read=not navigated
+        )
+        _record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector=data.get("selector", ""),
+            source_url=source_url,
+            role=role,
+            accessible_name=accessible_name,
+        )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
         )
@@ -6020,8 +6162,15 @@ async def _type_text_post_hook(
         if landing_failure is not None:
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
         _record_scouted_interaction(
-            ctx, tool_name="type_text", selector=selector, source_url=source_url, typed_length=typed_length
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            source_url=source_url,
+            typed_length=typed_length,
+            role=role,
+            accessible_name=accessible_name,
         )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
@@ -6105,12 +6254,15 @@ async def _select_option_post_hook(
             "value": data.get("value", ""),
             "url": url,
         }
+        role, accessible_name = await _resolve_scout_role_name(ctx, data.get("selector", ""))
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
             selector=data.get("selector", ""),
             source_url=source_url,
             value=data.get("value", ""),
+            role=role,
+            accessible_name=accessible_name,
         )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url

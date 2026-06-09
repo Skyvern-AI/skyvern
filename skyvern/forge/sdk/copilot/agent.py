@@ -38,7 +38,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
+from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
     AgentResult,
@@ -160,6 +161,12 @@ Code block runtime facts:
 - For multi-line code in workflow YAML, always use a YAML block scalar
   (`code: |`). Never include placeholder text such as `[... truncated ...]`;
   pass complete workflow YAML to update tools.
+
+When a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page
+interactions you scouted as deterministic Playwright. Persist that block VERBATIM
+via update_workflow / update_and_run_blocks — do not rewrite, reorder, or
+re-derive its locators. Only hand-author the steps it does not cover, such as the
+extraction or report block that returns the structured result.
 """
 
 
@@ -475,6 +482,43 @@ def _runtime_verification_evidence_prompt(ctx: CopilotContext | None) -> str:
     )
 
 
+def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
+    """Pre-authoring offer of the synthesized code block.
+
+    Trips the ``synthesized_block_offered`` latch (shared with the post-turn enforcement offer)
+    only when a non-None offer is actually rendered, so an empty trajectory leaves it open.
+    """
+    if ctx is None:
+        return ""
+    if normalize_block_authoring_policy(ctx.block_authoring_policy) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="policy_not_code_only_browser")
+        return ""
+    if ctx.update_workflow_called:
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_authored")
+        return ""
+    if ctx.synthesized_block_offered:
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="already_offered")
+        return ""
+    if not ctx.scout_trajectory:
+        LOG.debug("copilot_synthesized_block_offer_skipped", reason="empty_trajectory")
+        return ""
+    synthesized = synthesize_code_block(ctx.scout_trajectory)
+    if synthesized is None:
+        LOG.debug(
+            "copilot_synthesized_block_offer_skipped",
+            reason="synthesis_returned_none",
+            trajectory_len=len(ctx.scout_trajectory),
+        )
+        return ""
+    ctx.synthesized_block_offered = True
+    LOG.info(
+        "copilot_synthesized_block_offer_rendered",
+        trajectory_len=len(ctx.scout_trajectory),
+        code_len=len(synthesized.code),
+    )
+    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory)
+
+
 def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
     base_system_prompt = _build_system_prompt(tool_usage_guide=tool_usage_guide, config=config)
 
@@ -501,7 +545,12 @@ def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -
             + "and tell the user to store the redacted secret as a saved credential before testing. "
             + "If `resolved_credentials` are present, use those `credential_id` values."
         )
-        return prompt + _runtime_verification_evidence_prompt(ctx) + _docs_answer_turn_directive(ctx.turn_intent)
+        return (
+            prompt
+            + _runtime_verification_evidence_prompt(ctx)
+            + _synthesized_block_offer_prompt(ctx)
+            + _docs_answer_turn_directive(ctx.turn_intent)
+        )
 
     return instructions
 

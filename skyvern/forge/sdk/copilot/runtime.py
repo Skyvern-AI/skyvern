@@ -113,6 +113,9 @@ class ScoutedInteraction(TypedDict):
     value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
+    role: NotRequired[str]
+    accessible_name: NotRequired[str]
+    trajectory_index: NotRequired[int]
 
 
 @dataclass
@@ -228,6 +231,12 @@ class AgentContext:
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
     scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
+    # Append-only, non-deduped record of the scout's interaction sequence in
+    # acted order. Unlike scouted_interactions (deduped for auto-credit), this
+    # preserves repeats and ordering so code_block_synthesis can emit a faithful
+    # linear Playwright trajectory.
+    scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    synthesized_block_offered: bool = False
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
 

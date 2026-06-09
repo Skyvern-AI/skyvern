@@ -40,6 +40,66 @@ COMPOSITION_STRIPPED_HTML_EXPRESSION = (
     "})()"
 )
 
+
+# Given a CSS selector, return the element's ARIA role and accessible name so the code-block
+# synthesizer has a get_by_role fallback anchor for a positional/unstable captured selector. The
+# name is read only from true label sources, never the element's own textContent/value.
+def scout_accessible_role_name_expression(css_selector: str) -> str:
+    sel = json.dumps(css_selector)
+    return (
+        "(() => {"
+        f"  const el = document.querySelector({sel});"
+        "  if (!el) return null;"
+        "  const text = (v) => String(v == null ? '' : v).replace(/\\s+/g, ' ').trim();"
+        "  const implicitRole = (node) => {"
+        "    const tag = (node.tagName || '').toLowerCase();"
+        "    const type = (node.getAttribute('type') || '').toLowerCase();"
+        "    if (tag === 'a' && node.hasAttribute('href')) return 'link';"
+        "    if (tag === 'button') return 'button';"
+        "    if (tag === 'select') return 'combobox';"
+        "    if (tag === 'textarea') return 'textbox';"
+        "    if (tag === 'input') {"
+        "      if (['button', 'submit', 'reset'].includes(type)) return 'button';"
+        "      if (type === 'checkbox') return 'checkbox';"
+        "      if (type === 'radio') return 'radio';"
+        "      if (['text', 'search', 'email', 'tel', 'url', 'password', ''].includes(type)) return 'textbox';"
+        "    }"
+        "    if (/^h[1-6]$/.test(tag)) return 'heading';"
+        "    return '';"
+        "  };"
+        "  const accessibleName = (node) => {"
+        "    const aria = text(node.getAttribute('aria-label'));"
+        "    if (aria) return aria;"
+        "    const labelledby = node.getAttribute('aria-labelledby');"
+        "    if (labelledby) {"
+        "      const parts = labelledby.split(/\\s+/).map((id) => {"
+        "        const ref = document.getElementById(id);"
+        "        return ref ? text(ref.textContent) : '';"
+        "      }).filter(Boolean);"
+        "      if (parts.length) return text(parts.join(' '));"
+        "    }"
+        "    const id = node.getAttribute('id');"
+        "    if (id) {"
+        "      let lab = null;"
+        "      try { lab = document.querySelector('label[for=\"' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '\"]'); } catch (e) { lab = null; }"
+        "      if (lab) { const t = text(lab.textContent); if (t) return t; }"
+        "    }"
+        "    const parentLabel = node.closest ? node.closest('label') : null;"
+        "    if (parentLabel) { const t = text(parentLabel.textContent); if (t) return t; }"
+        # textContent/value are never name sources: for a typed-into textbox/contenteditable
+        # they would leak the raw typed value as accessible_name.
+        "    const title = text(node.getAttribute('title'));"
+        "    if (title) return title;"
+        "    const placeholder = text(node.getAttribute('placeholder'));"
+        "    if (placeholder) return placeholder;"
+        "    return '';"
+        "  };"
+        "  const role = text(el.getAttribute('role')) || implicitRole(el);"
+        "  return { role: role, accessible_name: accessibleName(el) };"
+        "})()"
+    )
+
+
 COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION = (
     "(() => {"
     "  const body = document.body; if (!body) return [];"
