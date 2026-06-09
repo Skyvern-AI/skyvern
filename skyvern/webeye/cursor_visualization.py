@@ -42,7 +42,7 @@ class VisualizingCursorStrategy(CursorEventStrategy):
             await self._show(page, x, y)
         return x, y
 
-    async def click(self, page: Page, locator: Locator) -> None:
+    async def click(self, page: Page, locator: Locator, *, timeout: float | None = None) -> None:
         cx: float | None = None
         cy: float | None = None
 
@@ -55,7 +55,7 @@ class VisualizingCursorStrategy(CursorEventStrategy):
         except Exception:
             LOG.debug("cursor_vis: pre-click positioning failed", exc_info=True)
 
-        await self._inner.click(page, locator)
+        await self._inner.click(page, locator, timeout=timeout)
 
         if cx is not None and cy is not None:
             try:
