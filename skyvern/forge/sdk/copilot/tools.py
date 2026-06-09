@@ -62,6 +62,12 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -71,6 +77,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
+    parse_composition_structured,
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
@@ -8154,6 +8161,15 @@ async def _composition_evidence_after_navigation_failure(
 ) -> dict[str, Any] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
+    structured = await _composition_get_structured_evidence(ctx, inspected_url=inspected_url, current_url=current_url)
+    if structured is not None and has_bounded_page_schema(structured):
+        evidence = _composition_add_inspection_warning(
+            structured,
+            f"navigation_error_before_html_capture: {navigation_error}",
+        )
+        if page_evidence_needs_visual_fallback(evidence):
+            evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
+        return evidence
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
     html, html_error, html_truncated, _ = await _composition_get_html(ctx)
@@ -8425,6 +8441,43 @@ async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> 
     return "", str(error) if error else None, False, True
 
 
+async def _composition_get_structured_evidence(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+) -> dict[str, Any] | None:
+    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    with copilot_span("composition_structured_extract"):
+        try:
+            result = await asyncio.wait_for(
+                server.call_internal_tool(
+                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
+                ),
+                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    raw = (result.get("data") or {}).get("result")
+    if isinstance(raw, str):
+        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
+
+
 async def _capture_composition_evidence(
     copilot_ctx: Any,
     *,
@@ -8432,22 +8485,27 @@ async def _capture_composition_evidence(
     current_url: str,
     active_run_terminal_sample: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Read page HTML and parse composition evidence, recapturing on a hollow read.
-
-    The capture (`_composition_get_html`) survives the MCP size cap; this loop adds a
-    short settle and re-read for the separate case where the page had not finished
-    rendering at capture time (a cold cloud session's first navigate to a heavy page
-    can hand back a shell). Returns (evidence, html_error); html_error is set only
-    when the HTML read itself failed. Stops early once the parse yields a bounded
-    schema (forms/links/result containers/challenge), so a genuine challenge page is
-    not retried.
-    """
+    """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
     evidence: dict[str, Any] | None = None
     html_truncated = False
+    used_structured = False
     skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
+        structured = await _composition_get_structured_evidence(
+            copilot_ctx, inspected_url=inspected_url, current_url=current_url
+        )
+        if structured is not None:
+            evidence = structured
+            used_structured = True
+            if has_bounded_page_schema(evidence):
+                break
+            if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
+                await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
+                continue
         html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
+            if evidence is not None:
+                break
             return None, html_error
         # On a heavy page the raw get_html serialization is dropped over the MCP size cap and
         # falls back to the stripped read; once that happens, settle-and-recapture via the
@@ -8455,13 +8513,15 @@ async def _capture_composition_evidence(
         if used_stripped:
             skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        used_structured = False
         if has_bounded_page_schema(evidence):
             break
         if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
-    if evidence is not None and html_truncated:
+    if evidence is not None and html_truncated and not used_structured:
         evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
-    if evidence is not None:
+    # Structured evidence already carries computed obstruction candidates; only the get_html path augments.
+    if evidence is not None and not used_structured:
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
