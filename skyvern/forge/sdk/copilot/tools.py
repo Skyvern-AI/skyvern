@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urljoin, urlparse
 
 import structlog
@@ -69,6 +69,9 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
@@ -144,6 +147,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
@@ -1530,6 +1534,83 @@ def _consume_scout_source_url(ctx: AgentContext) -> str | None:
     return source_url
 
 
+_ROLE_NAME_SELECTOR_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
+
+
+def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
+    """Parse the ``role=<role>[name="<name>"]`` form (ref_to_selector) — TIER 1, no browser read.
+
+    Returns (role, accessible_name) when the selector is a plain role/name locator;
+    None for bare CSS/xpath or when an engine chain (`>> nth=`) trails the role/name.
+    """
+    selector = selector.strip()
+    match = _ROLE_NAME_SELECTOR_RE.match(selector)
+    if not match:
+        return None
+    role, raw_name, suffix = match.group(1), match.group(2), match.group(3)
+    if suffix.strip():
+        return None
+    name = raw_name.replace('\\"', '"') if raw_name is not None else ""
+    return role, name
+
+
+async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tuple[str, str] | None:
+    """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
+
+    A failed read degrades gracefully to None so the selector-only auto-credit
+    path (SKY-10712) stays intact.
+    """
+    selector = selector.strip()
+    if not selector:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _scout_accessible_role_name_expression(selector)},
+            ),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, dict):
+        return None
+    role = str(value.get("role") or "").strip()
+    name = str(value.get("accessible_name") or "").strip()
+    if not role and not name:
+        return None
+    return role, name
+
+
+async def _resolve_scout_role_name(
+    ctx: AgentContext, selector: str, *, allow_browser_read: bool = True
+) -> tuple[str, str]:
+    """Resolve (role, accessible_name) for a scouted selector. TIER 1 parse first;
+    TIER 2 browser read only for bare CSS/xpath. Always degrades to ("", "").
+
+    ``allow_browser_read=False`` skips TIER 2 when the action navigated: a post-action
+    read against the landing page would capture the wrong element's name, so the bare
+    selector is kept verbatim (the synthesizer prefers it anyway)."""
+    selector = selector.strip()
+    if not selector:
+        return "", ""
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        return parsed
+    if not allow_browser_read:
+        return "", ""
+    captured = await _capture_accessible_role_name(ctx, selector)
+    if captured is not None:
+        return captured
+    return "", ""
+
+
 def _record_scouted_interaction(
     ctx: AgentContext,
     *,
@@ -1539,6 +1620,8 @@ def _record_scouted_interaction(
     value: str = "",
     key: str = "",
     typed_length: int = 0,
+    role: str = "",
+    accessible_name: str = "",
 ) -> None:
     selector = selector.strip()
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -1555,6 +1638,10 @@ def _record_scouted_interaction(
         artifact["key"] = key
     if typed_length:
         artifact["typed_length"] = typed_length
+    if role:
+        artifact["role"] = role
+    if accessible_name:
+        artifact["accessible_name"] = accessible_name
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -1566,12 +1653,21 @@ def _record_scouted_interaction(
     ]
     interactions.append(artifact)
     ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+
+    trajectory = list(ctx.scout_trajectory)
+    trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
+    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory.append(trajectory_artifact)
+    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+
     LOG.info(
         "copilot_scout_interaction_captured",
         tool_name=tool_name,
         selector=selector or None,
         source_url=artifact.get("source_url"),
+        role=role or None,
         total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
     )
 
 
@@ -2788,6 +2884,7 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
         elif cred.secret_label:
             entry["secret_label"] = cred.secret_label
         serialized.append(entry)
+    _record_discovered_credentials_on_policy(ctx, credentials)
     return {
         "ok": True,
         "data": {
@@ -2798,6 +2895,16 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             "has_more": len(serialized) == page_size,
         },
     }
+
+
+def _record_discovered_credentials_on_policy(ctx: AgentContext, credentials: list[Credential]) -> None:
+    request_policy = ctx.request_policy
+    if not isinstance(request_policy, RequestPolicy):
+        return
+    known_ids = {credential.credential_id for credential in request_policy.discovered_credentials}
+    for credential in credentials:
+        if credential.credential_id not in known_ids:
+            request_policy.discovered_credentials.append(credential)
 
 
 # Block types that establish browser state (loaded page / authenticated
@@ -5930,7 +6037,18 @@ async def _click_post_hook(
             "url": url,
             "title": title,
         }
-        _record_scouted_interaction(ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url)
+        navigated = bool(source_url) and bool(url) and source_url != url
+        role, accessible_name = await _resolve_scout_role_name(
+            ctx, data.get("selector", ""), allow_browser_read=not navigated
+        )
+        _record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector=data.get("selector", ""),
+            source_url=source_url,
+            role=role,
+            accessible_name=accessible_name,
+        )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
         )
@@ -6020,8 +6138,15 @@ async def _type_text_post_hook(
         if landing_failure is not None:
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
         _record_scouted_interaction(
-            ctx, tool_name="type_text", selector=selector, source_url=source_url, typed_length=typed_length
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            source_url=source_url,
+            typed_length=typed_length,
+            role=role,
+            accessible_name=accessible_name,
         )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
@@ -6105,12 +6230,15 @@ async def _select_option_post_hook(
             "value": data.get("value", ""),
             "url": url,
         }
+        role, accessible_name = await _resolve_scout_role_name(ctx, data.get("selector", ""))
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
             selector=data.get("selector", ""),
             source_url=source_url,
             value=data.get("value", ""),
+            role=role,
+            accessible_name=accessible_name,
         )
         observation_step = _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url

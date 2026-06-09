@@ -784,6 +784,7 @@ class IncrementalScrapePage(ElementTreeBuilder):
         compress_long_href: bool = False,
         compress_image_src: bool = False,
         strip_url_query_strings: bool = False,
+        compress_nonnavigable_href: bool = False,
     ) -> str:
         raise NotImplementedError("Not implemented")
 

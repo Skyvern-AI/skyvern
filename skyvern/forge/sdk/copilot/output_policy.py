@@ -17,6 +17,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     parse_workflow_yaml,
     url_origin,
     workflow_blocks,
+    workflow_credential_ids_from_parsed,
     workflow_credential_origins_from_parsed,
 )
 
@@ -481,7 +482,10 @@ def _apply_credential_policy(
 
     approved_ids = _approved_credential_ids(request_policy)
     allowed_unresolved_ids = _allowed_unresolved_credential_ids(request_policy)
-    allowed_ids = approved_ids | allowed_unresolved_ids | _existing_workflow_credential_ids(request_policy)
+    bound_approved_ids = _bound_approved_credential_ids(request_policy, workflow_yaml)
+    allowed_ids = (
+        approved_ids | allowed_unresolved_ids | bound_approved_ids | _existing_workflow_credential_ids(request_policy)
+    )
     if any(credential_id not in allowed_ids for credential_id in found_ids):
         verdict.add(OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE)
 
@@ -501,6 +505,19 @@ def _approved_credential_ids(request_policy: RequestPolicy) -> set[str]:
         for credential in request_policy.resolved_credentials
         if isinstance(getattr(credential, "credential_id", None), str)
     }
+
+
+def _bound_approved_credential_ids(request_policy: RequestPolicy, workflow_yaml: str | None) -> set[str]:
+    # Requiring binding keeps a discovered ID leaked into a non-credential field
+    # caught by misbinding rather than approved here.
+    discovered = {credential.credential_id for credential in request_policy.discovered_credentials}
+    discovered = {cid for cid in discovered if cid.startswith("cred_")}
+    if not discovered or not workflow_yaml:
+        return set()
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return set()
+    return discovered & workflow_credential_ids_from_parsed(parsed)
 
 
 def _allowed_unresolved_credential_ids(request_policy: RequestPolicy) -> set[str]:
@@ -583,7 +600,7 @@ def _workflow_broadens_credential_scope(parsed_workflow: dict[str, Any], request
 
 def _approved_origins_by_id(request_policy: RequestPolicy) -> dict[str, set[str]]:
     origins: dict[str, set[str]] = {}
-    for credential in request_policy.resolved_credentials:
+    for credential in [*request_policy.resolved_credentials, *request_policy.discovered_credentials]:
         credential_id = getattr(credential, "credential_id", None)
         tested_url = getattr(credential, "tested_url", None)
         if isinstance(credential_id, str) and isinstance(tested_url, str):
