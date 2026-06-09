@@ -1,5 +1,6 @@
 """Tests for the summarize-output endpoint and helpers."""
 
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
@@ -60,10 +61,16 @@ class TestSummarizeOutputRequest:
             SummarizeOutputRequest(output_json="{}", workflow_title="x" * 501)
 
     def test_deeply_nested_json_rejected(self) -> None:
-        # 10k levels of nesting exceeds Python's recursion limit inside json.loads.
+        # Rejection relies on json.loads overflowing the recursion limit; pin it so the test does not
+        # depend on the suite-global limit another test may have raised (e.g. via networkx).
         deep = "[" * 10_000 + "]" * 10_000
-        with pytest.raises(ValidationError):
-            SummarizeOutputRequest(output_json=deep)
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(1000)
+        try:
+            with pytest.raises(ValidationError):
+                SummarizeOutputRequest(output_json=deep)
+        finally:
+            sys.setrecursionlimit(old_limit)
 
 
 def _fake_org() -> Organization:

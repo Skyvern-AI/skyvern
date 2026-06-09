@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import textwrap
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound
+import pytest
+
+from skyvern.forge.sdk.copilot.context import CredentialCheck, StructuredContext
+from skyvern.forge.sdk.copilot.request_policy import _workflow_credential_inputs_unbound, build_request_policy
 
 
 def _yaml(body: str) -> str:
@@ -212,3 +217,70 @@ def test_malformed_or_empty_yaml_is_inert() -> None:
     assert _workflow_credential_inputs_unbound("") == []
     assert _workflow_credential_inputs_unbound("- not a workflow yaml\n") == []
     assert _workflow_credential_inputs_unbound(":: broken yaml ::") == []
+
+
+def _discovered_context(*credential_ids: str) -> str:
+    structured = StructuredContext(
+        credentials_checked=[
+            CredentialCheck(credential_name=cid, credential_id=cid, found=True) for cid in credential_ids
+        ]
+    )
+    return structured.to_json_str()
+
+
+@pytest.mark.asyncio
+async def test_discovered_credentials_seed_approved_set_on_none_turn() -> None:
+    org_credentials = [
+        SimpleNamespace(credential_id="cred_amazon"),
+        SimpleNamespace(credential_id="cred_quicken"),
+    ]
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
+        new=AsyncMock(return_value=org_credentials),
+    ):
+        policy = await build_request_policy(
+            user_message="yes, use both of those",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=_discovered_context("cred_amazon", "cred_quicken"),
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.credential_input_kind == "none"
+    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon", "cred_quicken"]
+
+
+@pytest.mark.asyncio
+async def test_discovered_credential_absent_from_org_is_not_approved() -> None:
+    with patch(
+        "skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids",
+        new=AsyncMock(return_value=[SimpleNamespace(credential_id="cred_amazon")]),
+    ):
+        policy = await build_request_policy(
+            user_message="yes",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context=_discovered_context("cred_amazon", "cred_ghost"),
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert [c.credential_id for c in policy.discovered_credentials] == ["cred_amazon"]
+
+
+@pytest.mark.asyncio
+async def test_no_discovered_credentials_leaves_approved_set_empty() -> None:
+    get_by_ids = AsyncMock(return_value=[])
+    with patch("skyvern.forge.app.DATABASE.credentials.get_credentials_by_ids", new=get_by_ids):
+        policy = await build_request_policy(
+            user_message="add a step to download the report",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="o_test",
+            handler=None,
+        )
+
+    assert policy.discovered_credentials == []
+    get_by_ids.assert_not_awaited()

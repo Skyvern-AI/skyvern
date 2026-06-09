@@ -68,8 +68,16 @@ def preflight_code_block(
 def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     try:
         tree = ast.parse(_build_typed_module(code, parameter_keys=()))
-    except SyntaxError:
-        return []
+    except SyntaxError as exc:
+        # The wrapper scaffolding is static and valid, so any SyntaxError is in the supplied code —
+        # e.g. an attacker-page string with a raw line-boundary codepoint that splits a literal. Surface
+        # it at authoring time instead of letting the block fail silently at run time.
+        return [
+            CodeBlockPreflightDiagnostic(
+                code="SYNTAX_ERROR",
+                message=f"Code block does not parse as Python: {exc.msg}. Fix the snippet before persisting it.",
+            )
+        ]
 
     diagnostics: list[CodeBlockPreflightDiagnostic] = []
     for node in ast.walk(tree):
