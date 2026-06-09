@@ -1,7 +1,6 @@
 import * as React from "react";
 import {
-  ArrowLeftIcon,
-  CheckIcon,
+  Cross2Icon,
   PlusIcon,
   ReloadIcon,
   TokensIcon,
@@ -29,92 +28,97 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
 import { copyText } from "@/util/copyText";
 import { toast } from "@/components/ui/use-toast";
-import type { TagFilterPair, TagKey } from "../../types/tagTypes";
+import {
+  MAX_AUTOCOMPLETE_SUGGESTIONS,
+  parseTagFilterTerm,
+  parseTypedTagQuery,
+  termDedupeKey,
+  type TagFilterTerm,
+  type TagKey,
+} from "../../types/tagTypes";
 import { useDeleteTagKeyMutation } from "../../hooks/useWorkflowTagMutations";
-import { TagChip } from "./TagChip";
 
 type Props = {
   tagKeys: Array<TagKey>;
-  value: Array<TagFilterPair>;
-  onChange: (pairs: Array<TagFilterPair>) => void;
-  // key -> distinct values observed on the current page; used to suggest values
-  // since the backend has no "list values for key" endpoint. Free-text entry
-  // always works regardless. A Map (not a plain object) so a tag key like
-  // "constructor" can't resolve to an inherited Object prototype member.
-  valueSuggestions?: Map<string, Array<string>>;
+  value: Array<TagFilterTerm>;
+  onChange: (terms: Array<TagFilterTerm>) => void;
+  // Standalone label values observed on the page (for value-only suggestions).
+  labelSuggestions?: Array<string>;
+  // Grouped values observed per key (for exact suggestions after `group:`).
+  valueSuggestionsByKey?: Map<string, Array<string>>;
 };
 
-// Tag filter pill for the workflows-list page. Collects `key:value` pairs; the
-// backend (GET /workflows?tags=) ANDs across distinct keys and ORs within a
-// key, so adding several values for one key is the OR-within-key path.
+// Group identity used for display + dedupe: exact terms sharing a key OR
+// together (shown adjacent), everything else is its own AND conjunct.
+function termGroupId(term: TagFilterTerm): string {
+  if (term.key === null) {
+    return `l:${term.value}`; // label
+  }
+  if (term.value === null) {
+    return `k:${term.key}`; // group-only
+  }
+  return `e:${term.key}`; // exact (OR within key)
+}
+
+function sameTerm(a: TagFilterTerm, b: TagFilterTerm): boolean {
+  return a.key === b.key && a.value === b.value;
+}
+
+// Tag filter pill for the workflows list. Collects terms in three shapes — label
+// (value-only), group (`key:*`), and exact (group:label). Backend ANDs, ORs per key.
 function WorkflowTagFilter({
   tagKeys,
   value,
   onChange,
-  valueSuggestions,
+  labelSuggestions = [],
+  valueSuggestionsByKey,
 }: Props) {
   const [open, setOpen] = React.useState(false);
-  const [selectedKey, setSelectedKey] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
   const [keyToDelete, setKeyToDelete] = React.useState<TagKey | null>(null);
   const deleteKeyMutation = useDeleteTagKeyMutation();
 
   React.useEffect(() => {
     if (!open) {
-      setSelectedKey(null);
       setQuery("");
     }
   }, [open]);
 
-  function addPair(key: string, rawValue: string) {
-    const trimmedKey = key.trim();
-    const trimmedValue = rawValue.trim();
-    // Comma is the pair separator in the serialized `tags` param, so a value
-    // containing one cannot round-trip (it would split into a different
-    // filter). Backend filter values can't contain commas, so reject here.
-    if (!trimmedKey || !trimmedValue || trimmedValue.includes(",")) {
+  function addTerm(term: TagFilterTerm) {
+    if (value.some((existing) => sameTerm(existing, term))) {
+      setQuery("");
       return;
     }
-    const exists = value.some(
-      (pair) => pair.key === trimmedKey && pair.value === trimmedValue,
-    );
-    if (exists) {
-      return;
-    }
-    onChange([...value, { key: trimmedKey, value: trimmedValue }]);
+    onChange([...value, term]);
+    setQuery("");
   }
 
-  function removePair(target: TagFilterPair) {
-    onChange(
-      value.filter(
-        (pair) => !(pair.key === target.key && pair.value === target.value),
-      ),
-    );
+  function removeTerm(target: TagFilterTerm) {
+    onChange(value.filter((term) => !sameTerm(term, target)));
   }
 
-  // Registered keys, to flag active filters whose key isn't in the org's
-  // registry (e.g. a typo'd / hand-edited URL).
   const knownKeys = React.useMemo(
     () => new Set(tagKeys.map((tagKey) => tagKey.key)),
     [tagKeys],
   );
 
-  // Stable key-then-value order so same-key pairs sit together and the "AND"
-  // separators land between distinct keys.
-  const sortedValue = React.useMemo(
+  // Sort by group id then value so OR'd exact terms sit together and AND
+  // separators land between distinct conjuncts.
+  const sortedTerms = React.useMemo(
     () =>
       [...value].sort(
-        (a, b) => a.key.localeCompare(b.key) || a.value.localeCompare(b.value),
+        (a, b) =>
+          termGroupId(a).localeCompare(termGroupId(b)) ||
+          (a.value ?? "").localeCompare(b.value ?? ""),
       ),
     [value],
   );
 
   function copyFilterUrl() {
-    // copyText handles the secure-context navigator.clipboard path plus an
-    // execCommand fallback, and resolves false on failure (no silent no-op).
     copyText(window.location.href).then((ok) => {
       toast(
         ok
@@ -124,27 +128,68 @@ function WorkflowTagFilter({
     });
   }
 
-  const normalizedQuery = query.trim().toLowerCase();
-
-  const filteredKeys = tagKeys.filter((tagKey) =>
-    tagKey.key.toLowerCase().includes(normalizedQuery),
-  );
-
-  const suggestionsForKey = selectedKey
-    ? (valueSuggestions?.get(selectedKey) ?? [])
-    : [];
-  // Drop unselectable comma-containing values (they can't be applied as a
-  // filter) so the suggestion list never dangles a no-op item.
-  const filteredValues = suggestionsForKey.filter(
-    (suggestion) =>
-      !suggestion.includes(",") &&
-      suggestion.toLowerCase().includes(normalizedQuery),
-  );
   const trimmedQuery = query.trim();
-  const showAddOption =
-    trimmedQuery.length > 0 &&
-    !trimmedQuery.includes(",") &&
-    !suggestionsForKey.includes(trimmedQuery);
+  const normalizedQuery = trimmedQuery.toLowerCase();
+  const candidate = parseTagFilterTerm(query);
+  const candidateExists =
+    candidate !== null && value.some((term) => sameTerm(term, candidate));
+  const showAdd = candidate !== null && !candidateExists;
+
+  const { typedKey, typedValuePartial } = parseTypedTagQuery(trimmedQuery);
+
+  const groupSuggestions =
+    typedKey === null
+      ? tagKeys
+          .filter((tk) => tk.key.toLowerCase().includes(normalizedQuery))
+          .filter(
+            (tk) =>
+              !value.some((term) => term.key === tk.key && term.value === null),
+          )
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
+  const labelMatches =
+    typedKey === null
+      ? labelSuggestions
+          .filter((label) => label.toLowerCase().includes(normalizedQuery))
+          .filter(
+            (label) =>
+              !value.some((term) => term.key === null && term.value === label),
+          )
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
+  const groupedValueMatches =
+    typedKey !== null
+      ? (valueSuggestionsByKey?.get(typedKey) ?? [])
+          .filter((v) => v.toLowerCase().includes(typedValuePartial))
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
+
+  function termLabel(term: TagFilterTerm): React.ReactNode {
+    if (term.key === null) {
+      return term.value;
+    }
+    return (
+      <>
+        <span className="font-medium">{term.key}</span>
+        <span className="text-muted-foreground">: </span>
+        {term.value === null ? (
+          <span className="italic text-muted-foreground">any</span>
+        ) : (
+          term.value
+        )}
+      </>
+    );
+  }
+
+  function candidateLabel(term: TagFilterTerm): string {
+    if (term.key === null) {
+      return `label “${term.value}”`;
+    }
+    if (term.value === null) {
+      return `group “${term.key}”`;
+    }
+    return `${term.key}: ${term.value}`;
+  }
 
   return (
     <>
@@ -185,32 +230,43 @@ function WorkflowTagFilter({
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-1">
-                {sortedValue.map((pair, index) => {
+                {sortedTerms.map((term, index) => {
                   const previous =
-                    index > 0 ? sortedValue[index - 1] : undefined;
-                  // Different key from the previous chip → AND; same key →
-                  // adjacent (OR within a key).
-                  const startsNewKey =
-                    previous !== undefined && previous.key !== pair.key;
-                  const unknownKey = !knownKeys.has(pair.key);
+                    index > 0 ? sortedTerms[index - 1] : undefined;
+                  const startsNewConjunct =
+                    previous !== undefined &&
+                    termGroupId(previous) !== termGroupId(term);
+                  const unknownKey =
+                    term.key !== null && !knownKeys.has(term.key);
                   return (
-                    <React.Fragment key={`${pair.key}:${pair.value}`}>
-                      {startsNewKey ? (
+                    <React.Fragment key={termDedupeKey(term)}>
+                      {startsNewConjunct ? (
                         <span className="px-0.5 text-[10px] font-semibold uppercase text-muted-foreground">
                           and
                         </span>
                       ) : null}
-                      <TagChip
-                        tagKey={pair.key}
-                        value={pair.value}
-                        description={
+                      <span
+                        className={cn(
+                          badgeVariants({ variant: "secondary" }),
+                          "max-w-full gap-1 font-normal",
+                          unknownKey ? "border-warning" : undefined,
+                        )}
+                        title={
                           unknownKey
-                            ? `"${pair.key}" isn't a registered tag key in this org.`
+                            ? `"${term.key}" isn't a registered group in this org.`
                             : undefined
                         }
-                        className={unknownKey ? "border-warning" : undefined}
-                        onRemove={() => removePair(pair)}
-                      />
+                      >
+                        <span className="truncate">{termLabel(term)}</span>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${candidateLabel(term)}`}
+                          className="ml-0.5 shrink-0 rounded-sm opacity-70 hover:opacity-100"
+                          onClick={() => removeTerm(term)}
+                        >
+                          <Cross2Icon className="h-3 w-3" />
+                        </button>
+                      </span>
                     </React.Fragment>
                   );
                 })}
@@ -218,145 +274,106 @@ function WorkflowTagFilter({
             </div>
           ) : null}
           <Command shouldFilter={false}>
-            {selectedKey === null ? (
-              <>
-                <CommandInput
-                  placeholder="Filter by tag key…"
-                  value={query}
-                  onValueChange={setQuery}
-                />
-                <CommandList>
-                  <CommandEmpty>No tag keys found.</CommandEmpty>
-                  <CommandGroup>
-                    {filteredKeys.map((tagKey) => (
-                      <CommandItem
-                        key={tagKey.key}
-                        value={tagKey.key}
-                        className="justify-between gap-2"
-                        onSelect={() => {
-                          setSelectedKey(tagKey.key);
-                          setQuery("");
-                        }}
-                      >
-                        <div className="flex min-w-0 flex-col">
-                          <span className="truncate">{tagKey.key}</span>
-                          {tagKey.description ? (
-                            <span className="truncate text-xs text-muted-foreground">
-                              {tagKey.description}
-                            </span>
-                          ) : null}
-                        </div>
-                        <div className="flex shrink-0 items-center gap-1.5">
-                          {tagKey.workflow_count > 0 ? (
-                            <span className="text-xs text-muted-foreground">
-                              {tagKey.workflow_count}
-                            </span>
-                          ) : null}
-                          <button
-                            type="button"
-                            aria-label={`Delete tag key ${tagKey.key}`}
-                            className="rounded-sm p-1 text-muted-foreground hover:text-destructive"
-                            onClick={(event) => {
-                              // Stop cmdk from treating this as selecting the key.
-                              event.preventDefault();
-                              event.stopPropagation();
-                              setKeyToDelete(tagKey);
-                            }}
-                          >
-                            <TrashIcon className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </CommandItem>
-                    ))}
-                  </CommandGroup>
-                </CommandList>
-              </>
-            ) : (
-              <>
-                <div className="flex items-center gap-1 border-b px-2 py-1.5">
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 shrink-0"
-                    onClick={() => {
-                      setSelectedKey(null);
-                      setQuery("");
-                    }}
+            <CommandInput
+              placeholder="Filter by label or group:label…"
+              value={query}
+              onValueChange={setQuery}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && candidate && showAdd) {
+                  event.preventDefault();
+                  addTerm(candidate);
+                }
+              }}
+            />
+            <CommandList>
+              <CommandEmpty>
+                Type a label, group:*, or group:label.
+              </CommandEmpty>
+              {showAdd && candidate ? (
+                <CommandGroup>
+                  <CommandItem
+                    value={`__add__,${trimmedQuery}`}
+                    onSelect={() => addTerm(candidate)}
                   >
-                    <ArrowLeftIcon className="h-4 w-4" />
-                  </Button>
-                  <span className="truncate text-sm font-medium">
-                    {selectedKey}
-                  </span>
-                </div>
-                <CommandInput
-                  placeholder="Add a value…"
-                  value={query}
-                  onValueChange={setQuery}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && trimmedQuery.length > 0) {
-                      event.preventDefault();
-                      addPair(selectedKey, trimmedQuery);
-                      setQuery("");
-                    }
-                  }}
-                />
-                <CommandList>
-                  {filteredValues.length === 0 && !showAddOption ? (
-                    <CommandEmpty>Type a value to filter.</CommandEmpty>
-                  ) : null}
-                  {showAddOption ? (
-                    <CommandGroup>
-                      <CommandItem
-                        value={`__add__:${trimmedQuery}`}
-                        onSelect={() => {
-                          addPair(selectedKey, trimmedQuery);
-                          setQuery("");
-                        }}
-                      >
-                        <PlusIcon className="mr-2 h-4 w-4" />
-                        Add “{trimmedQuery}”
-                      </CommandItem>
-                    </CommandGroup>
-                  ) : null}
-                  {filteredValues.length > 0 ? (
-                    <CommandGroup heading="Suggestions">
-                      {filteredValues.map((suggestion) => {
-                        const checked = value.some(
-                          (pair) =>
-                            pair.key === selectedKey &&
-                            pair.value === suggestion,
-                        );
-                        return (
-                          <CommandItem
-                            key={suggestion}
-                            value={suggestion}
-                            onSelect={() => {
-                              if (checked) {
-                                removePair({
-                                  key: selectedKey,
-                                  value: suggestion,
-                                });
-                              } else {
-                                addPair(selectedKey, suggestion);
-                              }
-                            }}
-                          >
-                            <CheckIcon
-                              className={cn(
-                                "mr-2 h-4 w-4",
-                                checked ? "opacity-100" : "opacity-0",
-                              )}
-                            />
-                            {suggestion}
-                          </CommandItem>
-                        );
-                      })}
-                    </CommandGroup>
-                  ) : null}
-                </CommandList>
-              </>
-            )}
+                    <PlusIcon className="mr-2 h-4 w-4" />
+                    Filter by {candidateLabel(candidate)}
+                  </CommandItem>
+                </CommandGroup>
+              ) : null}
+              {groupSuggestions.length > 0 ? (
+                <CommandGroup heading="Groups">
+                  {groupSuggestions.map((tagKey) => (
+                    <CommandItem
+                      key={tagKey.key}
+                      value={`__group__,${tagKey.key}`}
+                      className="justify-between gap-2"
+                      // Filter by group (any value in it). Type `group:value`
+                      // for an exact match instead.
+                      onSelect={() => addTerm({ key: tagKey.key, value: null })}
+                    >
+                      <div className="flex min-w-0 flex-col">
+                        <span className="truncate">
+                          <span className="font-medium">{tagKey.key}</span>
+                          <span className="text-muted-foreground">: any</span>
+                        </span>
+                        {tagKey.description ? (
+                          <span className="truncate text-xs text-muted-foreground">
+                            {tagKey.description}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        {tagKey.workflow_count > 0 ? (
+                          <span className="text-xs text-muted-foreground">
+                            {tagKey.workflow_count}
+                          </span>
+                        ) : null}
+                        <button
+                          type="button"
+                          aria-label={`Delete group ${tagKey.key}`}
+                          className="rounded-sm p-1 text-muted-foreground hover:text-destructive"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setKeyToDelete(tagKey);
+                          }}
+                        >
+                          <TrashIcon className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              ) : null}
+              {labelMatches.length > 0 ? (
+                <CommandGroup heading="Labels">
+                  {labelMatches.map((label) => (
+                    <CommandItem
+                      key={`label:${label}`}
+                      value={`__label__,${label}`}
+                      onSelect={() => addTerm({ key: null, value: label })}
+                    >
+                      {label}
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              ) : null}
+              {groupedValueMatches.length > 0 && typedKey !== null ? (
+                <CommandGroup heading={`${typedKey} values`}>
+                  {groupedValueMatches.map((v) => (
+                    <CommandItem
+                      key={`gv:${v}`}
+                      value={`__gv__,${v}`}
+                      onSelect={() => addTerm({ key: typedKey, value: v })}
+                    >
+                      <span className="font-medium">{typedKey}</span>
+                      <span className="text-muted-foreground">: </span>
+                      {v}
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              ) : null}
+            </CommandList>
           </Command>
         </PopoverContent>
       </Popover>
@@ -370,10 +387,10 @@ function WorkflowTagFilter({
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Delete tag “{keyToDelete?.key}”?</DialogTitle>
+            <DialogTitle>Delete group “{keyToDelete?.key}”?</DialogTitle>
             <DialogDescription>
               This removes it from {keyToDelete?.workflow_count ?? 0} workflow
-              {keyToDelete?.workflow_count === 1 ? "" : "s"} and from the tag
+              {keyToDelete?.workflow_count === 1 ? "" : "s"} and from the group
               list. This can’t be undone.
             </DialogDescription>
           </DialogHeader>
@@ -396,9 +413,9 @@ function WorkflowTagFilter({
                 const deletedKey = keyToDelete.key;
                 deleteKeyMutation.mutate(deletedKey, {
                   onSuccess: () => {
-                    // Drop any active filter on the now-deleted key, else the
-                    // list refetches with a stale ?tags= and shows empty.
-                    onChange(value.filter((pair) => pair.key !== deletedKey));
+                    // Drop any active filter term on the now-deleted group, else
+                    // the list refetches with a stale ?tags= and shows empty.
+                    onChange(value.filter((term) => term.key !== deletedKey));
                     setKeyToDelete(null);
                   },
                 });

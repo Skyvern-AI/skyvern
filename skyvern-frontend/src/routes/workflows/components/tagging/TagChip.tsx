@@ -9,18 +9,18 @@ import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
 
 type Props = {
-  tagKey: string;
+  // null = a standalone label (no group); rendered as just the value.
+  tagKey: string | null;
   value: string;
   description?: string | null;
   onRemove?: () => void;
   className?: string;
 };
 
-// Generic single-tag chip. Rendered as a styled span (not the Badge div) so it
-// can be a Radix TooltipTrigger `asChild` target without a ref/nesting warning.
-// Reusable wherever a `key: value` tag is shown (workflow cards today, run-tag
-// UI later).
+// Generic single-tag chip: a styled span (not Badge div) so it can be a Radix
+// TooltipTrigger `asChild` target. Grouped shows `key: value`, standalone the value.
 function TagChip({ tagKey, value, description, onRemove, className }: Props) {
+  const label = tagKey === null ? value : `${tagKey}: ${value}`;
   const chip = (
     <span
       className={cn(
@@ -30,14 +30,18 @@ function TagChip({ tagKey, value, description, onRemove, className }: Props) {
       )}
     >
       <span className="truncate">
-        <span className="font-medium">{tagKey}</span>
-        <span className="text-muted-foreground">: </span>
+        {tagKey !== null ? (
+          <>
+            <span className="font-medium">{tagKey}</span>
+            <span className="text-muted-foreground">: </span>
+          </>
+        ) : null}
         {value}
       </span>
       {onRemove ? (
         <button
           type="button"
-          aria-label={`Remove ${tagKey}: ${value}`}
+          aria-label={`Remove ${label}`}
           className="ml-0.5 shrink-0 rounded-sm opacity-70 hover:opacity-100"
           onClick={(event) => {
             event.stopPropagation();
