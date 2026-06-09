@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -26,6 +27,7 @@ class WorkflowVerificationEvidence:
     unverified_block_labels: list[str] = field(default_factory=list)
     failed_block_labels: list[str] = field(default_factory=list)
     failure_reason: str | None = None
+    code_artifact_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def merge_verified_blocks(self, labels: list[str]) -> None:
         self.block_verified = _dedupe([*self.block_verified, *labels])
@@ -51,6 +53,7 @@ class WorkflowVerificationEvidence:
             or self.unverified_block_labels
             or self.failed_block_labels
             or self.failure_reason
+            or self.code_artifact_metadata
         )
 
     def to_trace_data(self) -> dict[str, bool | int]:
@@ -70,6 +73,7 @@ class WorkflowVerificationEvidence:
             "unverified_block_count": len(self.unverified_block_labels),
             "failed_block_count": len(self.failed_block_labels),
             "has_failure_reason": bool(self.failure_reason),
+            "code_artifact_metadata_count": len(self.code_artifact_metadata),
         }
 
     def render_prompt_block(self) -> str:
