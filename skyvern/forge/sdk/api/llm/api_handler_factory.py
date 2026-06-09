@@ -65,6 +65,12 @@ configure_litellm_transport()
 
 LOG = structlog.get_logger()
 
+# Vertex returns this trafficType for flex-tier calls. litellm (through 1.88.1 and
+# main) neither maps it nor applies tier pricing in completion_cost, so flex bills at
+# standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
+_VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
+_VERTEX_FLEX_COST_MULTIPLIER = 0.5
+
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
 # router / non-router / LLMCaller paths with a single filter.
@@ -543,6 +549,24 @@ class LLMAPIHandlerFactory:
             return None
 
         return cost_value if cost_value >= 0 else None
+
+    @staticmethod
+    def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
+        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
+
+        Flex is 50% of standard, but litellm reports both at the standard rate, so the
+        discount is applied here. Internal cost tracking only — never customer-facing.
+        """
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception as e:
+            LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
+            return 0.0
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
+        if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
+            return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        return cost
 
     @staticmethod
     def _apply_thinking_budget_optimization(
@@ -1409,12 +1433,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1972,12 +1992,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2964,15 +2980,7 @@ class LLMCaller:
                         response_id=getattr(response, "id", None),
                     )
             else:
-                try:
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug(
-                        "Failed to calculate LLM cost",
-                        error=str(e),
-                        exc_info=True,
-                    )
-                    llm_cost = 0
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,
