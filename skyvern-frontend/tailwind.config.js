@@ -61,6 +61,13 @@ export default {
           DEFAULT: "hsl(var(--success))",
           foreground: "hsl(var(--success-foreground))",
         },
+        badge: {
+          success: "hsl(var(--badge-success))",
+          warning: "hsl(var(--badge-warning))",
+          destructive: "hsl(var(--badge-destructive))",
+          terminated: "hsl(var(--badge-terminated))",
+          neutral: "hsl(var(--badge-neutral))",
+        },
         muted: {
           DEFAULT: "hsl(var(--muted))",
           foreground: "hsl(var(--muted-foreground))",
