@@ -150,7 +150,7 @@ async function renderChat() {
   const view = render(<WorkflowCopilotChat />);
   // Let the mount-time chat-history fetch settle.
   await waitFor(() =>
-    expect(screen.getByPlaceholderText(/Type your message/)).toBeTruthy(),
+    expect(screen.getByPlaceholderText(/Message Skyvern Copilot/)).toBeTruthy(),
   );
   return view;
 }

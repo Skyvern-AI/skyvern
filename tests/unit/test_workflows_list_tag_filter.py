@@ -202,6 +202,82 @@ async def test_tag_filter_composes_with_search_key(repo: WorkflowsRepository) ->
     assert result == {"wpid_a"}
 
 
+# ---------------------- Phase 6.1: value-only / group-only / standalone ----------------------
+
+
+async def _set_label(
+    repo: WorkflowsRepository,
+    *,
+    wpid: str,
+    value: str,
+    organization_id: str = ORG_ID,
+) -> None:
+    """Insert an active standalone-label SET event (no group / key)."""
+    async with repo.Session() as session:
+        session.add(
+            WorkflowTagEventModel(
+                workflow_permanent_id=wpid,
+                organization_id=organization_id,
+                key=None,
+                value=value,
+                event_type=TagEventType.SET.value,
+                set_at=datetime.now(timezone.utc),
+                set_by="user_test",
+                source=TagSource.MANUAL.value,
+            )
+        )
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_value_only_matches_grouped_and_standalone(repo: WorkflowsRepository) -> None:
+    """A value-only (label) term matches the value across any group and on
+    standalone labels."""
+    await _create_workflow(repo, wpid="wpid_grouped", title="G")
+    await _create_workflow(repo, wpid="wpid_standalone", title="S")
+    await _create_workflow(repo, wpid="wpid_other", title="O")
+    await _set_tag(repo, wpid="wpid_grouped", key="env", value="prod")
+    await _set_label(repo, wpid="wpid_standalone", value="prod")
+    await _set_tag(repo, wpid="wpid_other", key="env", value="dev")
+
+    assert await _wpids(repo, workflow_tags=[(None, "prod")]) == {"wpid_grouped", "wpid_standalone"}
+
+
+@pytest.mark.asyncio
+async def test_group_only_matches_any_value_in_group(repo: WorkflowsRepository) -> None:
+    await _create_workflow(repo, wpid="wpid_a", title="A")
+    await _create_workflow(repo, wpid="wpid_b", title="B")
+    await _create_workflow(repo, wpid="wpid_c", title="C")
+    await _set_tag(repo, wpid="wpid_a", key="env", value="prod")
+    await _set_tag(repo, wpid="wpid_b", key="env", value="staging")
+    await _set_tag(repo, wpid="wpid_c", key="team", value="growth")
+
+    assert await _wpids(repo, workflow_tags=[("env", None)]) == {"wpid_a", "wpid_b"}
+
+
+@pytest.mark.asyncio
+async def test_group_only_excludes_deleted(repo: WorkflowsRepository) -> None:
+    await _create_workflow(repo, wpid="wpid_a", title="A")
+    await _set_tag(repo, wpid="wpid_a", key="env", value="prod", deleted_at=datetime.now(timezone.utc))
+
+    assert await _wpids(repo, workflow_tags=[("env", None)]) == set()
+
+
+@pytest.mark.asyncio
+async def test_and_across_mixed_term_shapes(repo: WorkflowsRepository) -> None:
+    await _create_workflow(repo, wpid="wpid_both", title="Both")
+    await _create_workflow(repo, wpid="wpid_env_only", title="EnvOnly")
+    await _create_workflow(repo, wpid="wpid_label_only", title="LabelOnly")
+    await _set_tag(repo, wpid="wpid_both", key="env", value="prod")
+    await _set_label(repo, wpid="wpid_both", value="urgent")
+    await _set_tag(repo, wpid="wpid_env_only", key="env", value="prod")
+    await _set_label(repo, wpid="wpid_label_only", value="urgent")
+
+    # exact env:prod AND label urgent -> only the workflow carrying both.
+    result = await _wpids(repo, workflow_tags=[("env", "prod"), (None, "urgent")])
+    assert result == {"wpid_both"}
+
+
 def _make_org(org_id: str = ORG_ID) -> Organization:
     now = datetime.now(timezone.utc)
     return Organization(
@@ -282,9 +358,9 @@ def test_route_value_keeps_later_colons(route_client: TestClient) -> None:
 @pytest.mark.parametrize(
     "tags_params",
     [
-        [("tags", "envprod")],  # no colon
         [("tags", ":prod")],  # empty key
-        [("tags", "env:")],  # empty value
+        [("tags", "env:")],  # empty value (not the `key:*` group form)
+        [("tags", ":*")],  # group wildcard with empty key
         [("tags", "env:prod,")],  # trailing blank segment (comma form)
         [("tags", "env:prod,,customer:acme")],  # interior blank segment
         [("tags", "env:prod"), ("tags", "")],  # blank repeated param (must match comma form -> CORR-3)
@@ -293,6 +369,38 @@ def test_route_value_keeps_later_colons(route_client: TestClient) -> None:
 def test_route_malformed_tags_400(route_client: TestClient, tags_params: list[tuple[str, str]]) -> None:
     resp = route_client.get("/v1/workflows", params=tags_params)
     assert resp.status_code == 400, resp.text
+
+
+def test_route_value_only_term_parses_as_label(route_client: TestClient) -> None:
+    # A bare token (no colon) is a label / value-only term -> (None, value).
+    resp = route_client.get("/v1/workflows", params=[("tags", "production")])
+    assert resp.status_code == 200, resp.text
+    assert route_client.captured["workflow_tags"] == [(None, "production")]  # type: ignore[attr-defined]
+
+
+def test_route_group_wildcard_parses_as_key_only(route_client: TestClient) -> None:
+    # `key:*` is the group-only (any value) term -> (key, None).
+    resp = route_client.get("/v1/workflows", params=[("tags", "env:*")])
+    assert resp.status_code == 200, resp.text
+    assert route_client.captured["workflow_tags"] == [("env", None)]  # type: ignore[attr-defined]
+
+
+def test_route_exact_value_ending_in_wildcard_stays_exact(route_client: TestClient) -> None:
+    # Splitting on the first colon keeps an exact value that itself ends in `:*`
+    # (or contains colons) as an exact term, not a group-only wildcard.
+    resp = route_client.get("/v1/workflows", params=[("tags", "url:http://x:*")])
+    assert resp.status_code == 200, resp.text
+    assert route_client.captured["workflow_tags"] == [("url", "http://x:*")]  # type: ignore[attr-defined]
+
+
+def test_route_mixed_term_shapes_parse(route_client: TestClient) -> None:
+    resp = route_client.get("/v1/workflows", params=[("tags", "urgent,env:*,team:growth")])
+    assert resp.status_code == 200, resp.text
+    assert route_client.captured["workflow_tags"] == [  # type: ignore[attr-defined]
+        (None, "urgent"),
+        ("env", None),
+        ("team", "growth"),
+    ]
 
 
 def test_route_tags_with_template_rejected(route_client: TestClient) -> None:

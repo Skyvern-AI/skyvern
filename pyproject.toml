@@ -26,6 +26,7 @@ dependencies = [
 # browser-only runtime until local stops importing Forge internals.
 local = [
     "azure-storage-blob>=12.26.0",
+    "google-cloud-storage>=2.18,<4",
     "openai>=1.68.2",
     "yutori>=0.5.0",
     "sqlalchemy>=2.0.29,<3",
@@ -87,6 +88,7 @@ local = [
 # with local until the embedded runtime is separated from Forge/server internals.
 server = [
     "azure-storage-blob>=12.26.0",
+    "google-cloud-storage>=2.18,<4",
     "openai>=1.68.2",
     "yutori>=0.5.0",
     # Plain pip sees LiteLLM's exact openai pin and therefore resolves this

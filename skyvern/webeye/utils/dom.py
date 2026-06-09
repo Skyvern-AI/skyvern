@@ -841,9 +841,13 @@ class SkyvernElement:
         if await self.is_disabled(dynamic=True):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
-        await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
-            await self.get_locator().click(timeout=timeout)
+            # Route through the active cursor strategy so alternate profiles can
+            # dispatch their own click sequence (explicit mouse.down/up).
+            # The strategy is responsible for moving to the element first; the
+            # DEFAULT path still ends up calling locator.click(timeout=timeout)
+            # so Playwright actionability is preserved.
+            await EventStrategyFactory.click_element(page, self.get_locator(), timeout=timeout)
             return
         except Exception:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())

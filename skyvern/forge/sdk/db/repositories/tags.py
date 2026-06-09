@@ -32,9 +32,10 @@ register_passthrough_exception(TagCountLimitExceeded)
 
 @dataclass(frozen=True)
 class TagChange:
-    """One concrete state change derived from a caller's set/delete request."""
+    """One concrete state change derived from a caller's set/delete request.
+    ``key`` is None for a standalone label (identified by its value)."""
 
-    key: str
+    key: str | None
     new_value: str | None
     event_type: TagEventType
     superseded_event_id: str | None
@@ -51,53 +52,66 @@ class TagsRepository(BaseRepository):
         sets: dict[str, str],
         deletes: set[str],
         context: TagWriteContext,
+        label_sets: list[str] | None = None,
+        label_deletes: list[str] | None = None,
     ) -> list[TagChange]:
-        """Atomically apply SET/DELETE events for a workflow's tags. Sets win
-        over deletes on same-key collision; same-value SETs are no-ops. Same-key
-        concurrent writers race the partial UNIQUE — the loser's IntegrityError
-        is not caught here, so it surfaces to the caller as a 5xx."""
+        """Atomically apply SET/DELETE tag events. Grouped tags via ``sets``/``deletes``
+        (keys), standalone labels via ``label_sets``/``label_deletes``; set wins over delete."""
+        label_sets = label_sets or []
+        label_deletes = label_deletes or []
+        label_set_values = set(label_sets)
         effective_deletes = {k for k in deletes if k not in sets}
-        if not sets and not effective_deletes:
+        effective_label_deletes = {v for v in label_deletes if v not in label_set_values}
+        if not sets and not effective_deletes and not label_set_values and not effective_label_deletes:
             return []
 
         now = datetime.now(timezone.utc)
 
         async with self.Session() as session:
-            current = await self._get_current_active_set_events(
+            active_rows = await self._get_active_set_rows(
                 session,
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )
+            # Grouped tags keyed by their group; standalone labels keyed by value.
+            grouped_current = {row.key: row for row in active_rows if row.key is not None}
+            label_current = {row.value: row for row in active_rows if row.key is None}
 
-            # Soft cap: concurrent distinct-key writers can each pass; partial
-            # UNIQUE catches only same-key races. Cap is a UX rule, acceptable.
-            projected_keys = (set(current.keys()) | set(sets.keys())) - effective_deletes
-            if len(projected_keys) > MAX_TAGS_PER_WORKFLOW:
+            # Soft cap: concurrent distinct-identity writers can each pass; the
+            # partial UNIQUEs catch only same-identity races. Cap is a UX rule.
+            projected_grouped = (set(grouped_current.keys()) | set(sets.keys())) - effective_deletes
+            projected_labels = (set(label_current.keys()) | label_set_values) - effective_label_deletes
+            projected_total = len(projected_grouped) + len(projected_labels)
+            if projected_total > MAX_TAGS_PER_WORKFLOW:
                 raise TagCountLimitExceeded(
-                    f"workflow {workflow_permanent_id} would have {len(projected_keys)} tags; "
+                    f"workflow {workflow_permanent_id} would have {projected_total} tags; "
                     f"max is {MAX_TAGS_PER_WORKFLOW}"
                 )
 
             changes: list[TagChange] = []
 
+            def _add_event(*, key: str | None, value: str | None, event_type: TagEventType) -> None:
+                session.add(
+                    WorkflowTagEventModel(
+                        workflow_permanent_id=workflow_permanent_id,
+                        organization_id=organization_id,
+                        key=key,
+                        value=value,
+                        event_type=event_type.value,
+                        set_at=now,
+                        set_by=context.caller_id,
+                        source=context.source.value,
+                        caller_type=context.caller_type.value if context.caller_type else None,
+                    )
+                )
+
             for key, new_value in sets.items():
-                existing = current.get(key)
+                existing = grouped_current.get(key)
                 if existing is not None and existing.value == new_value:
                     continue
                 if existing is not None:
                     existing.superseded_at = now
-                event = WorkflowTagEventModel(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    key=key,
-                    value=new_value,
-                    event_type=TagEventType.SET.value,
-                    set_at=now,
-                    set_by=context.caller_id,
-                    source=context.source.value,
-                    caller_type=context.caller_type.value if context.caller_type else None,
-                )
-                session.add(event)
+                _add_event(key=key, value=new_value, event_type=TagEventType.SET)
                 changes.append(
                     TagChange(
                         key=key,
@@ -107,26 +121,42 @@ class TagsRepository(BaseRepository):
                     )
                 )
 
+            # A standalone label's value IS its identity, so an already-present
+            # label is a no-op; otherwise it's a fresh insert (never an overwrite).
+            for value in label_set_values:
+                if value in label_current:
+                    continue
+                _add_event(key=None, value=value, event_type=TagEventType.SET)
+                changes.append(
+                    TagChange(key=None, new_value=value, event_type=TagEventType.SET, superseded_event_id=None)
+                )
+
             for key in effective_deletes:
-                existing = current.get(key)
+                existing = grouped_current.get(key)
                 if existing is None:
                     continue
                 existing.superseded_at = now
-                event = WorkflowTagEventModel(
-                    workflow_permanent_id=workflow_permanent_id,
-                    organization_id=organization_id,
-                    key=key,
-                    value=None,
-                    event_type=TagEventType.DELETE.value,
-                    set_at=now,
-                    set_by=context.caller_id,
-                    source=context.source.value,
-                    caller_type=context.caller_type.value if context.caller_type else None,
-                )
-                session.add(event)
+                _add_event(key=key, value=None, event_type=TagEventType.DELETE)
                 changes.append(
                     TagChange(
                         key=key,
+                        new_value=None,
+                        event_type=TagEventType.DELETE,
+                        superseded_event_id=existing.tag_event_id,
+                    )
+                )
+
+            # Standalone-label DELETE rows carry the value so history records
+            # which label was removed (a group-less delete has no key to identify it).
+            for value in effective_label_deletes:
+                existing = label_current.get(value)
+                if existing is None:
+                    continue
+                existing.superseded_at = now
+                _add_event(key=None, value=value, event_type=TagEventType.DELETE)
+                changes.append(
+                    TagChange(
+                        key=None,
                         new_value=None,
                         event_type=TagEventType.DELETE,
                         superseded_event_id=existing.tag_event_id,
@@ -137,18 +167,14 @@ class TagsRepository(BaseRepository):
             # consistent state when the new SET row hits it.
             await session.flush()
 
-            # Auto-register TagKeyModel rows only for keys whose SET actually
-            # wrote a new event. The partial UNIQUE on (org, key) WHERE
-            # deleted_at IS NULL races concurrent first-use writers, so we use
-            # an INSERT ... ON CONFLICT DO NOTHING to swallow the race instead
-            # of letting it surface as a 5xx. postgresql and sqlite need their
-            # own insert() construct to compile ON CONFLICT, but share the
-            # on_conflict_do_nothing signature. Both require index_where to
-            # match the partial unique index or ON CONFLICT inference fails.
-            changed_set_keys = {c.key for c in changes if c.event_type == TagEventType.SET}
+            # Register a TagKeyModel only for grouped keys with a new SET (standalone
+            # labels have no key). ON CONFLICT DO NOTHING swallows the first-use race.
+            changed_set_keys = {c.key for c in changes if c.event_type == TagEventType.SET and c.key is not None}
             if changed_set_keys:
                 rows = [{"organization_id": organization_id, "key": key} for key in changed_set_keys]
                 dialect_name = session.bind.dialect.name if session.bind is not None else "postgresql"
+                # postgres/sqlite each need their own insert() for ON CONFLICT; index_where
+                # must match the partial unique index or ON CONFLICT inference fails.
                 insert = sqlite.insert if dialect_name == "sqlite" else postgresql.insert
                 insert_stmt = (
                     insert(TagKeyModel.__table__)
@@ -163,13 +189,15 @@ class TagsRepository(BaseRepository):
             await session.commit()
             return changes
 
-    async def _get_current_active_set_events(
+    async def _get_active_set_rows(
         self,
         session: AsyncSession,
         *,
         workflow_permanent_id: str,
         organization_id: str,
-    ) -> dict[str, WorkflowTagEventModel]:
+    ) -> list[WorkflowTagEventModel]:
+        """Active (non-superseded, non-deleted) SET event rows for a workflow —
+        both grouped tags and standalone labels."""
         stmt = select(WorkflowTagEventModel).where(
             and_(
                 WorkflowTagEventModel.organization_id == organization_id,
@@ -180,17 +208,18 @@ class TagsRepository(BaseRepository):
             )
         )
         result = await session.execute(stmt)
-        return {row.key: row for row in result.scalars().all()}
+        return list(result.scalars().all())
 
-    @db_operation("get_active_tags_for_workflow")
-    async def get_active_tags_for_workflow(
+    @db_operation("get_active_grouped_tags_for_workflow")
+    async def get_active_grouped_tags_for_workflow(
         self,
         workflow_permanent_id: str,
         organization_id: str,
     ) -> dict[str, str]:
-        """Return the current {key: value} map for a workflow."""
+        """Current {key: value} map of a workflow's grouped tags. Standalone labels
+        (no key) are excluded; use ``get_active_tag_events_for_workflow`` for all tags."""
         async with self.Session() as session:
-            rows = await self._get_current_active_set_events(
+            rows = await self._get_active_set_rows(
                 session,
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
@@ -198,17 +227,19 @@ class TagsRepository(BaseRepository):
             # SET events always carry a non-null value, but defend against
             # data drift: skip-and-log instead of crashing the request.
             result: dict[str, str] = {}
-            for key, row in rows.items():
+            for row in rows:
+                if row.key is None:
+                    continue
                 if row.value is None:
                     LOG.warning(
                         "active SET tag row has null value; skipping",
                         tag_event_id=row.tag_event_id,
                         organization_id=organization_id,
                         workflow_permanent_id=workflow_permanent_id,
-                        key=key,
+                        key=row.key,
                     )
                     continue
-                result[key] = row.value
+                result[row.key] = row.value
             return result
 
     @db_operation("get_active_tag_events_for_workflow")
@@ -217,16 +248,14 @@ class TagsRepository(BaseRepository):
         workflow_permanent_id: str,
         organization_id: str,
     ) -> list[WorkflowTagEventModel]:
-        """Active SET event rows for a workflow. Carries full attribution
-        (source/set_at/set_by) so callers can surface per-tag provenance —
-        ``get_active_tags_for_workflow`` returns just key→value."""
+        """Active SET rows (grouped + standalone) with full attribution
+        (source/set_at/set_by) for per-tag provenance."""
         async with self.Session() as session:
-            rows = await self._get_current_active_set_events(
+            return await self._get_active_set_rows(
                 session,
                 workflow_permanent_id=workflow_permanent_id,
                 organization_id=organization_id,
             )
-            return list(rows.values())
 
     @db_operation("get_tag_event_history")
     async def get_tag_event_history(
@@ -260,10 +289,9 @@ class TagsRepository(BaseRepository):
         self,
         workflow_permanent_ids: list[str],
         organization_id: str,
-    ) -> dict[str, dict[str, str]]:
-        """Batch read of current SET tags for many workflows. Cross-org isolation
-        is enforced by the organization_id filter — wpids that don't belong to
-        the org are silently absent from the result (no rows match)."""
+    ) -> dict[str, list[tuple[str | None, str]]]:
+        """Batch read of current SET tags (grouped + standalone) as a list of
+        (key, value) per workflow. The org filter silently drops foreign wpids."""
         if not workflow_permanent_ids:
             return {}
 
@@ -279,7 +307,7 @@ class TagsRepository(BaseRepository):
             )
             rows = (await session.execute(stmt)).scalars().all()
 
-        result: dict[str, dict[str, str]] = {}
+        result: dict[str, list[tuple[str | None, str]]] = {}
         for row in rows:
             if row.value is None:
                 LOG.warning(
@@ -290,7 +318,7 @@ class TagsRepository(BaseRepository):
                     key=row.key,
                 )
                 continue
-            result.setdefault(row.workflow_permanent_id, {})[row.key] = row.value
+            result.setdefault(row.workflow_permanent_id, []).append((row.key, row.value))
         return result
 
     @db_operation("list_tag_keys")
@@ -344,9 +372,8 @@ class TagsRepository(BaseRepository):
 
     @db_operation("count_active_workflows_per_key")
     async def count_active_workflows_per_key(self, organization_id: str) -> dict[str, int]:
-        """Map of tag key -> number of workflows currently carrying it. The
-        partial UNIQUE guarantees one active SET per (workflow, key), so a plain
-        row count per key already equals the distinct-workflow count."""
+        """Map of tag key -> number of workflows carrying it (one active SET per
+        (workflow, key), so a row count suffices). Standalone labels are excluded."""
         async with self.Session() as session:
             stmt = (
                 select(WorkflowTagEventModel.key, func.count(WorkflowTagEventModel.tag_event_id))
@@ -356,6 +383,7 @@ class TagsRepository(BaseRepository):
                         WorkflowTagEventModel.superseded_at.is_(None),
                         WorkflowTagEventModel.event_type == TagEventType.SET.value,
                         WorkflowTagEventModel.deleted_at.is_(None),
+                        WorkflowTagEventModel.key.isnot(None),
                     )
                 )
                 .group_by(WorkflowTagEventModel.key)
