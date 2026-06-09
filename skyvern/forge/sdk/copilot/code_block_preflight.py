@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import keyword
 import re
+import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass
@@ -45,20 +46,26 @@ def preflight_code_block(
         return []
 
     source = _build_typed_module(code, parameter_keys=parameter_keys)
+    # mypy's API raises the interpreter recursion limit and never restores it,
+    # which leaks into the rest of the process; snapshot and restore it ourselves.
+    recursion_limit = sys.getrecursionlimit()
     with tempfile.TemporaryDirectory(prefix="skyvern-code-block-preflight-") as tmpdir:
         path = Path(tmpdir) / "code_block.py"
         path.write_text(source, encoding="utf-8")
-        stdout, stderr, status = mypy_api.run(
-            [
-                str(path),
-                "--config-file=/dev/null",
-                "--no-error-summary",
-                "--show-error-codes",
-                "--ignore-missing-imports",
-                "--no-incremental",
-                "--cache-dir=/dev/null",
-            ]
-        )
+        try:
+            stdout, stderr, status = mypy_api.run(
+                [
+                    str(path),
+                    "--config-file=/dev/null",
+                    "--no-error-summary",
+                    "--show-error-codes",
+                    "--ignore-missing-imports",
+                    "--no-incremental",
+                    "--cache-dir=/dev/null",
+                ]
+            )
+        finally:
+            sys.setrecursionlimit(recursion_limit)
     if status == 0:
         return []
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import keyword
+import sys
 from typing import Any
 
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
@@ -645,3 +646,10 @@ class TestSynthesizedArtifactMetadata:
         text = render_synthesized_offer_text(synthesized)
         assert "code_artifact_metadata" not in text
         assert "```json" not in text
+
+
+def test_code_block_preflight_restores_recursion_limit() -> None:
+    before = sys.getrecursionlimit()
+    preflight_code_block("await page.locator('button[type=submit]').first.click(timeout=5000)\n")
+
+    assert sys.getrecursionlimit() == before
