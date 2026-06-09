@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -68,6 +68,12 @@ class WorkflowCopilotChatRequest(BaseModel):
     )
     message: str = Field(..., description="The message that user sends")
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
+    mode: Literal["ask", "build"] | None = Field(
+        None, description="Per-request copilot path selector; None falls back to feature flags."
+    )
+    code_block: bool | None = Field(
+        None, description="Per-request code-block authoring; honored only on the build/v2 path."
+    )
     cancel_token: str | None = Field(
         None,
         description=(

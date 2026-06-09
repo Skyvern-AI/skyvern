@@ -148,6 +148,7 @@ from skyvern.schemas.tags import (
     TagApplyRequest,
     TagHistoryItem,
     TagHistoryResponse,
+    TagItem,
     TagKey,
     TagKeyDeleteResponse,
     TagKeyUpdate,
@@ -469,7 +470,7 @@ def _workflow_run_request_to_legacy_request(workflow_run_request: WorkflowRunReq
 
 @base_router.post(
     "/run/agents",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "run_workflow",
         "x-fern-examples": [
@@ -569,7 +570,7 @@ async def run_workflow(
 
 @base_router.get(
     "/runs/{run_id}",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=RunResponse,
     description="Get run information (task run, workflow run)",
     summary="Get run info by id",
@@ -611,7 +612,7 @@ async def get_run(
 
 @base_router.post(
     "/runs/{run_id}/cancel",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "cancel_run",
         "x-fern-examples": [
@@ -639,7 +640,7 @@ async def cancel_run(
 
 @base_router.post(
     "/runs/cancel",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "bulk_cancel_runs",
         "x-fern-examples": [
@@ -1529,7 +1530,7 @@ async def _assert_workflow_in_org(workflow_permanent_id: str, organization_id: s
 
 
 def _tag_event_to_response(row: Any) -> TagResponse:
-    return TagResponse(value=row.value, source=row.source, set_at=row.set_at, set_by=row.set_by)
+    return TagResponse(key=row.key, value=row.value, source=row.source, set_at=row.set_at, set_by=row.set_by)
 
 
 def _validate_path_key(key: str) -> None:
@@ -1550,14 +1551,11 @@ async def _apply_tag_changes_with_retry(
     sets: dict[str, str],
     deletes: set[str],
     context: TagWriteContext,
+    label_sets: list[str] | None = None,
+    label_deletes: list[str] | None = None,
 ) -> None:
-    """Wrap ``apply_tag_changes`` with a single IntegrityError retry. The
-    Phase 2 repo documents that same-workflow/same-key concurrent SET writers
-    race the partial UNIQUE on ``workflow_tag_events_active_set_unique`` and
-    the loser surfaces an IntegrityError. Last-write-wins is the right
-    semantics here — the retry re-reads current state and either no-ops (same
-    value) or supersedes the winner. If the second attempt also conflicts,
-    surface as 409 Conflict instead of an unstructured 5xx."""
+    """Wrap ``apply_tag_changes`` with one IntegrityError retry: concurrent
+    same-identity SETs race the partial UNIQUE; last-write-wins, else 409."""
     for attempt in range(2):
         try:
             await app.DATABASE.tags.apply_tag_changes(
@@ -1566,6 +1564,8 @@ async def _apply_tag_changes_with_retry(
                 sets=sets,
                 deletes=deletes,
                 context=context,
+                label_sets=label_sets,
+                label_deletes=label_deletes,
             )
             return
         except IntegrityError:
@@ -1616,13 +1616,21 @@ async def apply_workflow_tags(
         source=TagSource.MANUAL,
         caller_type=caller.caller_type,
     )
+    # A tag's key is its group; grouped tags are keyed (last-wins per group),
+    # standalone labels (no key) are addressed by value.
+    grouped_sets: dict[str, str] = {tag.key: tag.value for tag in data.tags if tag.key is not None}
+    label_sets: list[str] = [tag.value for tag in data.tags if tag.key is None]
+    grouped_deletes: set[str] = {d.key for d in data.tags_to_delete if d.key is not None}
+    label_deletes: list[str] = [d.value for d in data.tags_to_delete if d.key is None and d.value is not None]
     try:
         await _apply_tag_changes_with_retry(
             workflow_permanent_id=workflow_permanent_id,
             organization_id=organization_id,
-            sets=data.tags,
-            deletes=set(data.tags_to_delete),
+            sets=grouped_sets,
+            deletes=grouped_deletes,
             context=write_ctx,
+            label_sets=label_sets,
+            label_deletes=label_deletes,
         )
     except ValueError as e:
         # Cap-breach is the only ValueError surfaced; treat as 422 (user input).
@@ -1709,16 +1717,15 @@ async def get_workflow_tags(
 
 
 async def _build_tags_response(workflow_permanent_id: str, organization_id: str) -> TagsResponse:
-    """Read active SET event rows and project them into the response shape."""
+    """Read active SET event rows and project them into the response shape.
+    Sorted by (key, value) — standalone labels (null key) first — for stable output."""
     rows = await app.DATABASE.tags.get_active_tag_events_for_workflow(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=organization_id,
     )
-    tags: dict[str, TagResponse] = {}
-    for row in rows:
-        if row.value is None:
-            continue
-        tags[row.key] = _tag_event_to_response(row)
+    tags = [_tag_event_to_response(row) for row in rows if row.value is not None]
+    # Sort standalone labels (null key) first, then grouped by key, then value.
+    tags.sort(key=lambda t: (t.key is not None, t.key or "", t.value))
     return TagsResponse(workflow_permanent_id=workflow_permanent_id, tags=tags)
 
 
@@ -1834,7 +1841,7 @@ async def update_tag_key(
 @base_router.delete(
     "/tag-keys/{key}",
     response_model=TagKeyDeleteResponse,
-    tags=["Workflow Tags"],
+    tags=["Tags"],
     openapi_extra={"x-fern-sdk-method-name": "delete_tag_key"},
     description="Delete a tag key from the organization registry and remove that tag from every workflow that "
     "currently has it (cascade). Returns how many workflows the tag was removed from.",
@@ -1878,15 +1885,23 @@ def _parse_batch_wpids(raw: str | None) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
-def _build_batch_response(requested_wpids: list[str], tag_map: dict[str, dict[str, str]]) -> WorkflowTagsBatchResponse:
-    """Echo every requested wpid in the response (empty dict if no tags). Tag
-    values themselves are already org-filtered by the repo query, so this only
-    surfaces wpids the caller already supplied."""
-    workflow_tags: dict[str, dict[str, str]] = {wpid: tag_map.get(wpid, {}) for wpid in requested_wpids}
+def _build_batch_response(
+    requested_wpids: list[str], tag_map: dict[str, list[tuple[str | None, str]]]
+) -> WorkflowTagsBatchResponse:
+    """Echo every requested wpid (empty list if no tags). Each list is sorted
+    standalone-first, then by key, then value — the repo SELECT has no ORDER BY."""
+
+    def _sorted(pairs: list[tuple[str | None, str]]) -> list[TagItem]:
+        ordered = sorted(pairs, key=lambda kv: (kv[0] is not None, kv[0] or "", kv[1]))
+        return [TagItem(key=key, value=value) for key, value in ordered]
+
+    workflow_tags: dict[str, list[TagItem]] = {wpid: _sorted(tag_map.get(wpid, [])) for wpid in requested_wpids}
     return WorkflowTagsBatchResponse(workflow_tags=workflow_tags)
 
 
-async def _resolve_active_batch_wpids(requested_wpids: list[str], organization_id: str) -> dict[str, dict[str, str]]:
+async def _resolve_active_batch_wpids(
+    requested_wpids: list[str], organization_id: str
+) -> dict[str, list[tuple[str | None, str]]]:
     """Return the org-filtered, soft-delete-filtered tag map for the requested
     wpids. Two existence checks bracket the tag read so a workflow soft-deleted
     *between* the lookup and the tag query doesn't leak stale tag values: the
@@ -2400,7 +2415,7 @@ async def get_run_artifacts(
 
 @base_router.post(
     "/runs/{run_id}/retry_webhook",
-    tags=["Agents"],
+    tags=["Runs"],
     openapi_extra={
         "x-fern-sdk-method-name": "retry_run_webhook",
         "x-fern-examples": [
@@ -2434,7 +2449,7 @@ async def retry_run_webhook(
 
 @base_router.get(
     "/runs/{run_id}/timeline",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=list[WorkflowRunTimeline],
     openapi_extra={
         "x-fern-sdk-method-name": "get_run_timeline",
@@ -2876,7 +2891,7 @@ def _workflow_run_request_from_workflow_request(
 
 @base_router.post(
     "/workflows/runs/{workflow_run_id}/retry",
-    tags=["Agents"],
+    tags=["Runs"],
     response_model=WorkflowRunResponse,
     openapi_extra={
         "x-fern-sdk-method-name": "retry_workflow_run",
@@ -3450,7 +3465,7 @@ async def run_workflow_legacy(
 @base_router.get(
     "/workflows/runs",
     response_model=list[WorkflowRun],
-    tags=["Agents"],
+    tags=["Runs"],
     description=(
         "List workflow runs across all workflows for the current organization.\n\n"
         "Results are paginated and can be filtered by **status**, **search_key**, and **error_code**. "
@@ -3600,7 +3615,7 @@ async def _get_workflow_runs_by_id(
 @base_router.get(
     "/workflows/{workflow_id}/runs",
     response_model=list[WorkflowRun],
-    tags=["Agents"],
+    tags=["Runs"],
     description=_WORKFLOW_RUNS_BY_ID_DESCRIPTION,
     summary="Get all runs by agent",
     openapi_extra={
@@ -3903,12 +3918,14 @@ async def get_workflows(
         Query(
             max_length=20,
             description=(
-                "Filter by tags as `key:value` pairs. Repeat the param or comma-separate "
-                "(`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key "
-                "(`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). "
+                "Filter by tags. Each term is a label (`production`), a group (`env:*`), "
+                "or a group:label (`env:prod`). Repeat the param or comma-separate "
+                "(`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's "
+                "labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in "
+                "(prod, staging)). A label term matches the value across any/no group. "
                 "Matches current tag values only. Not supported with `template=true`."
             ),
-            examples=["env:prod", "customer:acme,env:prod"],
+            examples=["env:prod", "production", "env:*", "customer:acme,env:prod"],
         ),
     ] = None,
     current_org: Organization = Depends(org_auth_service.get_current_org),
@@ -3938,18 +3955,37 @@ async def get_workflows(
     tag_groups = tags or []
     if tag_groups == [""]:
         tag_groups = []
-    workflow_tags: list[tuple[str, str]] = []
+    # Split on the FIRST colon: no colon -> value-only (None, value); value `*` ->
+    # group-only (key, None); else exact (key, value), whose value may contain colons.
+    invalid_term_detail = "expected 'label', 'key:*', or 'key:value'"
+    workflow_tags: list[tuple[str | None, str | None]] = []
     for raw_group in tag_groups:
-        for raw_pair in raw_group.split(","):
-            pair = raw_pair.strip()
-            tag_key, sep, tag_value = pair.partition(":")
-            tag_key, tag_value = tag_key.strip(), tag_value.strip()
-            if not sep or not tag_key or not tag_value:
+        for raw_term in raw_group.split(","):
+            term = raw_term.strip()
+            if not term:
                 raise HTTPException(
                     status_code=http_status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid tag filter '{pair}'; expected 'key:value'.",
+                    detail="Invalid tag filter; empty term.",
                 )
-            workflow_tags.append((tag_key, tag_value))
+            tag_key, sep, tag_value = term.partition(":")
+            if not sep:
+                workflow_tags.append((None, term))
+                continue
+            tag_key, tag_value = tag_key.strip(), tag_value.strip()
+            if not tag_key:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            if tag_value == "*":
+                workflow_tags.append((tag_key, None))
+            elif not tag_value:
+                raise HTTPException(
+                    status_code=http_status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid tag filter '{term}'; {invalid_term_detail}.",
+                )
+            else:
+                workflow_tags.append((tag_key, tag_value))
 
     if template and workflow_tags:
         # Templates are global; tags are org-scoped, so the two can't combine.
