@@ -6,36 +6,38 @@ import {
 } from "@/components/ui/tooltip";
 import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
+import { sortTags, tagElementKey, type Tag } from "../../types/tagTypes";
 import { TagChip } from "./TagChip";
 
 type Props = {
-  tags: Record<string, string>;
-  // Map (not a plain object) so lookups by user-controlled tag keys can't hit
-  // inherited Object prototype members (e.g. a key named "constructor").
+  tags: Array<Tag>;
+  // Group (key) -> description. A Map (not a plain object) so user-controlled keys
+  // can't hit Object prototype members (e.g. a key named "constructor").
   descriptions?: Map<string, string | null>;
   maxVisible?: number;
   className?: string;
 };
 
-// Generic list of tag chips with a "+N" overflow affordance. Sorts by key for
-// stable ordering across renders. Reusable for any key->value tag map.
+// Generic list of tag chips with a "+N" overflow affordance. Standalone labels
+// sort first, then grouped by key, for stable ordering across renders.
 function TagChipList({ tags, descriptions, maxVisible = 3, className }: Props) {
-  const entries = Object.entries(tags).sort(([a], [b]) => a.localeCompare(b));
-  if (entries.length === 0) {
+  if (tags.length === 0) {
     return null;
   }
-
-  const visible = entries.slice(0, maxVisible);
-  const hidden = entries.slice(maxVisible);
+  const sorted = sortTags(tags);
+  const visible = sorted.slice(0, maxVisible);
+  const hidden = sorted.slice(maxVisible);
 
   return (
     <div className={cn("flex flex-wrap items-center gap-1", className)}>
-      {visible.map(([key, value]) => (
+      {visible.map((tag) => (
         <TagChip
-          key={key}
-          tagKey={key}
-          value={value}
-          description={descriptions?.get(key)}
+          key={tagElementKey(tag)}
+          tagKey={tag.key}
+          value={tag.value}
+          description={
+            tag.key !== null ? descriptions?.get(tag.key) : undefined
+          }
         />
       ))}
       {hidden.length > 0 ? (
@@ -53,9 +55,14 @@ function TagChipList({ tags, descriptions, maxVisible = 3, className }: Props) {
             </TooltipTrigger>
             <TooltipContent className="max-w-xs">
               <div className="flex flex-col gap-1">
-                {hidden.map(([key, value]) => (
-                  <span key={key} className="break-words">
-                    <span className="font-medium">{key}</span>: {value}
+                {hidden.map((tag) => (
+                  <span key={tagElementKey(tag)} className="break-words">
+                    {tag.key !== null ? (
+                      <>
+                        <span className="font-medium">{tag.key}</span>:{" "}
+                      </>
+                    ) : null}
+                    {tag.value}
                   </span>
                 ))}
               </div>
