@@ -36,6 +36,8 @@ mode: custom
 - **Filter Workflows by Tags** — The `GET /workflows` API now accepts a `?tags=` query parameter to filter results by tag. ([#6334](https://github.com/Skyvern-AI/skyvern/pull/6334))
 - **Workflow Schedules in Open Source** — Self-hosted Skyvern deployments now support workflow schedules, previously a cloud-only feature. ([#6344](https://github.com/Skyvern-AI/skyvern/pull/6344))
 - **Claude Opus 4.8 Support** — Added Claude Opus 4.8 as a selectable model for both direct Anthropic and AWS Bedrock inference paths. ([#6409](https://github.com/Skyvern-AI/skyvern/pull/6409))
+- **Automatic Re-save of Expired Credential Sessions** — Saved credential sessions that have expired or encountered an error are now automatically re-saved, keeping browser profiles available without manual intervention. ([#6435](https://github.com/Skyvern-AI/skyvern/pull/6435))
+- **GPT-5-mini Support** — Added GPT-5-mini as a selectable LLM for customers using their own OpenAI API keys, providing a faster, lower-cost inference option.
 
 ## Improvements
 
@@ -43,6 +45,9 @@ mode: custom
 - **Undo/Redo Moved to Canvas Toolbar** — Undo and redo controls are back on the workflow canvas toolbar for easier access. ([#6310](https://github.com/Skyvern-AI/skyvern/pull/6310))
 - **Better Loading and Error States in Browser Streams** — Improved copy and animations for loading and error states across all browser stream views. ([#6332](https://github.com/Skyvern-AI/skyvern/pull/6332))
 - **Extended Credential Test Timeout** — The browser profile credential test now polls for up to 10 minutes, accommodating slower authentication flows that previously timed out. ([#6359](https://github.com/Skyvern-AI/skyvern/pull/6359))
+- **Code-First Copilot Validation Gates** — The code-first Copilot now runs preflight checks, MCP evidence gates, and validation steps before executing generated code blocks, reducing silent failures. ([#6410](https://github.com/Skyvern-AI/skyvern/pull/6410))
+- **OpenRouter Cost Tracking** — LLM token counts and costs are now tracked for runs using OpenRouter models, making per-run spending visible alongside other LLM providers. ([#6427](https://github.com/Skyvern-AI/skyvern/pull/6427))
+- **CUA and Claude Opus Models Now Enterprise-Only** — The CUA browser-control mode and Claude Opus model family are now reserved for enterprise accounts. ([#6420](https://github.com/Skyvern-AI/skyvern/pull/6420))
 
 ## Bug fixes
 
@@ -53,6 +58,10 @@ mode: custom
 - Fixed block prompts not rendering in the workflow version comparison view. ([#6331](https://github.com/Skyvern-AI/skyvern/pull/6331))
 - Fixed agent navigation buttons rendered via CSS `::before`/`::after` pseudo-content icons being missed when the icon element's bounding rect was zero due to out-of-flow positioning. ([#6385](https://github.com/Skyvern-AI/skyvern/pull/6385))
 - Fixed credential edit form values and in-progress test state being cleared when the credentials list refreshed in the background during a browser profile test. ([#6404](https://github.com/Skyvern-AI/skyvern/pull/6404))
+- Fixed workflow canvas layout not updating correctly when a container block is collapsed. ([#6436](https://github.com/Skyvern-AI/skyvern/pull/6436))
+- Fixed session cookie capture not persisting correctly when saving browser credential sessions. ([#6434](https://github.com/Skyvern-AI/skyvern/pull/6434))
+- Fixed persistent browser session final status not being reconciled when a session close races a timeout cleanup.
+- Fixed shadow DOM inputs inside closed dropdown components incorrectly being forced visible. ([#6433](https://github.com/Skyvern-AI/skyvern/pull/6433))
 
 </Update>
 
