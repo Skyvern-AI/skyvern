@@ -359,11 +359,16 @@ async def resolve_otp_value(task: "Task") -> OTPValue | None:
     if (task.totp_verification_url or task.totp_identifier) and task.organization_id:
         workflow_id: str | None = None
         workflow_permanent_id: str | None = None
+        # Codes forwarded into the DB share a single totp_identifier across runs with no
+        # run_id, so a stale code from a prior run can be handed to this one. Anchoring to
+        # the run's start time disqualifies any code that predates this run.
+        run_started_at: datetime | None = None
         if task.workflow_run_id:
             workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
             if workflow_run:
                 workflow_id = workflow_run.workflow_id
                 workflow_permanent_id = workflow_run.workflow_permanent_id
+                run_started_at = workflow_run.started_at
         return await poll_otp_value(
             organization_id=task.organization_id,
             task_id=task.task_id,
@@ -372,6 +377,7 @@ async def resolve_otp_value(task: "Task") -> OTPValue | None:
             workflow_permanent_id=workflow_permanent_id,
             totp_verification_url=task.totp_verification_url,
             totp_identifier=task.totp_identifier,
+            created_after=run_started_at,
         )
 
     return None
@@ -385,6 +391,7 @@ async def poll_otp_value(
     workflow_permanent_id: str | None = None,
     totp_verification_url: str | None = None,
     totp_identifier: str | None = None,
+    created_after: datetime | None = None,
 ) -> OTPValue | None:
     timeout = timedelta(minutes=settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS)
     start_datetime = datetime.utcnow()
@@ -448,6 +455,7 @@ async def poll_otp_value(
                     task_id=task_id,
                     workflow_id=workflow_permanent_id,
                     workflow_run_id=workflow_run_id,
+                    created_after=created_after,
                 )
         except FailedToGetTOTPVerificationCode as e:
             consecutive_failures += 1
@@ -584,8 +592,11 @@ async def _get_otp_value_from_db(
     task_id: str | None = None,
     workflow_id: str | None = None,
     workflow_run_id: str | None = None,
+    created_after: datetime | None = None,
 ) -> OTPValue | None:
-    totp_codes = await app.DATABASE.otp.get_otp_codes(organization_id=organization_id, totp_identifier=totp_identifier)
+    totp_codes = await app.DATABASE.otp.get_otp_codes(
+        organization_id=organization_id, totp_identifier=totp_identifier, created_after=created_after
+    )
     for totp_code in totp_codes:
         if totp_code.workflow_run_id and workflow_run_id and totp_code.workflow_run_id != workflow_run_id:
             continue

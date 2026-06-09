@@ -228,15 +228,20 @@ def _collect_enterprise_gated_workflow_features(
 def _select_recording_urls_in_window(
     recordings: Sequence[FileInfo],
     lower_bound: datetime,
-    upper_bound: datetime,
+    upper_bound: datetime | None = None,
 ) -> list[str]:
-    """Filter recordings to [lower_bound, upper_bound] by modified_at (UTC), sort oldest-first."""
+    """Filter recordings to [lower_bound, upper_bound] by modified_at (UTC), sort oldest-first.
+
+    ``upper_bound=None`` keeps every recording from ``lower_bound`` on. A persistent browser
+    session finalizes its single continuous recording at session close — possibly hours after
+    a run ends — so the bounded window misses it; the unbounded form is the fallback.
+    """
     in_window: list[tuple[datetime, str]] = []
     for r in recordings:
         if r.modified_at is None:
             continue
         modified_utc = _as_utc(r.modified_at)
-        if lower_bound <= modified_utc <= upper_bound:
+        if modified_utc >= lower_bound and (upper_bound is None or modified_utc <= upper_bound):
             in_window.append((modified_utc, r.url))
     in_window.sort(key=lambda pair: pair[0])
     return [url for _, url in in_window]
@@ -4183,7 +4188,7 @@ class WorkflowService:
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        workflow_tags: list[tuple[str, str]] | None = None,
+        workflow_tags: list[tuple[str | None, str | None]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -4191,7 +4196,8 @@ class WorkflowService:
         Args:
             search_key: Unified search term for title, folder name, and parameter metadata.
             folder_id: Filter workflows by folder ID.
-            workflow_tags: (key, value) tag filters; AND across keys, OR within a key.
+            workflow_tags: tag filter terms — exact (key, value), group-only (key, None),
+                or label-only (None, value). AND across distinct terms; OR within a key.
         """
         return await app.DATABASE.workflows.get_workflows_by_organization_id(
             organization_id=organization_id,
@@ -4748,6 +4754,7 @@ class WorkflowService:
                 app.AGENT_FUNCTION.on_workflow_run_completed(
                     organization_id=workflow_run.organization_id,
                     workflow_id=workflow_run.workflow_id,
+                    status=status,
                 ),
             )
             self._background_tasks.add(run_completed_task)
@@ -5439,6 +5446,11 @@ class WorkflowService:
                         run_end = _as_utc(workflow_run.finished_at) if workflow_run.finished_at else datetime.now(UTC)
                         upper_bound = run_end + RECORDING_WINDOW_END_BUFFER
                         recording_urls = _select_recording_urls_in_window(recordings, lower_bound, upper_bound)
+                        if not recording_urls and recordings:
+                            # Persistent sessions upload one continuous recording at session
+                            # close, often long after run_end, so it never lands in the bounded
+                            # window. Drop the upper bound rather than show "no recording".
+                            recording_urls = _select_recording_urls_in_window(recordings, lower_bound)
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
