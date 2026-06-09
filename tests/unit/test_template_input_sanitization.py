@@ -256,6 +256,7 @@ class _FakeBuilderWithLastHtml:
         compress_long_href: bool = False,
         compress_image_src: bool = False,
         strip_url_query_strings: bool = False,
+        compress_nonnavigable_href: bool = False,
     ) -> str:
         self.last_used_element_tree_html = self._html
         return self._html
@@ -285,6 +286,7 @@ class _FakeBuilderNoneLastHtml:
         compress_long_href: bool = False,
         compress_image_src: bool = False,
         strip_url_query_strings: bool = False,
+        compress_nonnavigable_href: bool = False,
     ) -> str:
         return self._html
 
