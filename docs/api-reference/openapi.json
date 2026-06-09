@@ -106,7 +106,7 @@
     "/v1/run/agents": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Run an agent",
         "description": "Run an agent",
@@ -228,7 +228,7 @@
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get run info by id",
         "description": "Get run information (task run, workflow run)",
@@ -334,7 +334,7 @@
     "/v1/runs/{run_id}/cancel": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Cancel a run by id",
         "description": "Cancel a run (task or workflow)",
@@ -410,7 +410,7 @@
     "/v1/runs/cancel": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Bulk cancel runs",
         "description": "Cancel multiple runs (tasks or workflows) in a single request",
@@ -1495,6 +1495,56 @@
           }
         },
         "x-fern-sdk-method-name": "update_tag_key"
+      },
+      "delete": {
+        "tags": [
+          "Tags"
+        ],
+        "summary": "Delete tag key",
+        "description": "Delete a tag key from the organization registry and remove that tag from every workflow that currently has it (cascade). Returns how many workflows the tag was removed from.",
+        "operationId": "delete_tag_key_v1_tag_keys__key__delete",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagKeyDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag key not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
     "/v1/workflow-tags": {
@@ -1783,7 +1833,7 @@
     "/v1/runs/{run_id}/retry_webhook": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Replay a run webhook",
         "description": "Retry sending the webhook for a run",
@@ -1882,7 +1932,7 @@
     "/v1/runs/{run_id}/timeline": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get run timeline",
         "description": "Get timeline for a run (workflow run or task_v2 run)",
@@ -4717,7 +4767,7 @@
     "/v1/agents/runs/{workflow_run_id}/retry": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Retry a run",
         "description": "Retry a workflow run using the original run parameters.",
@@ -4822,7 +4872,7 @@
     "/v1/agents/runs": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get all runs",
         "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
@@ -4974,7 +5024,7 @@
     "/v1/agents/{workflow_id}/runs": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get all runs by agent",
         "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
@@ -17616,6 +17666,11 @@
               }
             ],
             "title": "Description"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "default": 0
           }
         },
         "type": "object",
@@ -17624,6 +17679,25 @@
         ],
         "title": "TagKey",
         "description": "Tag-key registry entry."
+      },
+      "TagKeyDeleteResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "removed_from_workflow_count": {
+            "type": "integer",
+            "title": "Removed From Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "removed_from_workflow_count"
+        ],
+        "title": "TagKeyDeleteResponse",
+        "description": "Response for ``DELETE /v1/tag-keys/{key}``."
       },
       "TagKeyUpdate": {
         "properties": {
