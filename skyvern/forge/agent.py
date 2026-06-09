@@ -2846,6 +2846,7 @@ class ForgeAgent:
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
             lean_strip_url_query_strings=lean_enabled,
+            lean_compress_nonnavigable_href=lean_enabled,
         )
 
         # This prompt is critical for our agent, we probably should use the primary LLM handler
@@ -3761,6 +3762,9 @@ class ForgeAgent:
                 compress_long_href=False,
                 compress_image_src=True,
                 strip_url_query_strings=True,
+                # non-navigable hrefs (javascript:/empty/'#') carry no
+                # destination signal, so they're safe to drop for the planner.
+                compress_nonnavigable_href=True,
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
@@ -3900,6 +3904,7 @@ class ForgeAgent:
             lean_compress_long_href=False,
             lean_compress_image_src=context.enable_lean_element_tree,
             lean_strip_url_query_strings=context.enable_lean_element_tree,
+            lean_compress_nonnavigable_href=context.enable_lean_element_tree,
         )
 
         # Map template to prompt_name for logging/caching guards
