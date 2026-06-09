@@ -155,6 +155,7 @@ class TestWorkflowRunCompleteHookFires:
         mock_agent_fn.on_workflow_run_completed.assert_awaited_once_with(
             organization_id="o_789",
             workflow_id="wf_1",
+            status=mock_status,
         )
 
     @pytest.mark.asyncio

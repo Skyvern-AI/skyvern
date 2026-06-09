@@ -83,7 +83,7 @@ async def test_no_op_when_sets_and_deletes_empty(repo: TagsRepository) -> None:
 async def test_initial_set_creates_event_and_registers_key(repo: TagsRepository) -> None:
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
     assert await _registered_keys(repo) == ["env"]
 
 
@@ -92,7 +92,7 @@ async def test_set_existing_key_supersedes_prior_row(repo: TagsRepository) -> No
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {"env": "stg"}
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "stg"}
 
     rows = await _all_events(repo)
     assert len(rows) == 2
@@ -116,7 +116,7 @@ async def test_delete_writes_delete_event_with_null_value(repo: TagsRepository) 
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes={"env"}, context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {}
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {}
 
     rows = await _all_events(repo)
     assert len(rows) == 2
@@ -137,7 +137,7 @@ async def test_sets_win_on_same_key_collision(repo: TagsRepository) -> None:
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "stg"}, deletes={"env"}, context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {"env": "stg"}
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "stg"}
     rows = await _all_events(repo)
     # No DELETE event got emitted for the colliding key.
     assert [r.event_type for r in rows] == [TagEventType.SET.value, TagEventType.SET.value]
@@ -159,7 +159,7 @@ async def test_cap_allows_replace_at_limit(repo: TagsRepository) -> None:
 
     await repo.apply_tag_changes(WPID, ORG_ID, sets={"k0": "new"}, deletes=set(), context=_ctx())
 
-    current = await repo.get_active_tags_for_workflow(WPID, ORG_ID)
+    current = await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID)
     assert current["k0"] == "new"
     assert len(current) == MAX_TAGS_PER_WORKFLOW
 
@@ -230,8 +230,8 @@ async def test_isolation_between_workflows_in_same_org(repo: TagsRepository) -> 
     await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx())
     await repo.apply_tag_changes("wpid_b", ORG_ID, sets={"env": "stg"}, deletes=set(), context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow("wpid_a", ORG_ID) == {"env": "prod"}
-    assert await repo.get_active_tags_for_workflow("wpid_b", ORG_ID) == {"env": "stg"}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "prod"}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_b", ORG_ID) == {"env": "stg"}
 
 
 def test_tag_count_limit_is_registered_as_passthrough_exception() -> None:
@@ -301,7 +301,7 @@ async def test_realistic_tag_examples(repo: TagsRepository, tags: dict[str, str]
     what shapes the system supports.
     """
     await repo.apply_tag_changes(WPID, ORG_ID, sets=tags, deletes=set(), context=_ctx())
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == tags
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == tags
 
 
 @pytest.mark.asyncio
@@ -324,7 +324,7 @@ async def test_dotted_key_hierarchy_works_without_schema_change(repo: TagsReposi
         deletes=set(),
         context=_ctx(),
     )
-    active = await repo.get_active_tags_for_workflow(WPID, ORG_ID)
+    active = await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID)
     assert active == {
         "team": "payments",
         "team.subteam": "billing",
@@ -352,15 +352,15 @@ async def test_same_key_value_across_many_workflows_n_to_m(repo: TagsRepository)
         context=_ctx(),
     )
 
-    assert await repo.get_active_tags_for_workflow("wpid_invoice_processor", ORG_ID) == {
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_invoice_processor", ORG_ID) == {
         "team": "payments",
         "environment": "prod",
         "priority": "p0",
     }
-    assert await repo.get_active_tags_for_workflow("wpid_refund_handler", ORG_ID) == {
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_refund_handler", ORG_ID) == {
         "team": "payments",
     }
-    assert await repo.get_active_tags_for_workflow("wpid_billing_sync", ORG_ID) == {
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_billing_sync", ORG_ID) == {
         "team": "payments",
     }
 
@@ -383,7 +383,7 @@ async def test_value_can_contain_colons(repo: TagsRepository) -> None:
         deletes=set(),
         context=_ctx(),
     )
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {
         "jira_ticket": "PROJ-1234:bugfix",
         "captured_at": "2026-05-25T18:30:00Z",
     }
@@ -401,7 +401,7 @@ async def test_get_active_tags_for_workflows_batch(repo: TagsRepository) -> None
     await repo.apply_tag_changes(WPID, "o_other", sets={"secret": "leak"}, deletes=set(), context=_ctx("other"))
 
     result = await repo.get_active_tags_for_workflows([WPID, "wpid_beta", "wpid_missing"], ORG_ID)
-    assert result == {WPID: {"env": "prod"}, "wpid_beta": {"team": "growth"}}
+    assert result == {WPID: [("env", "prod")], "wpid_beta": [("team", "growth")]}
 
 
 @pytest.mark.asyncio
@@ -497,7 +497,7 @@ async def test_apply_tag_changes_idempotent_when_tag_key_already_exists(repo: Ta
             .all()
         )
     assert len(keys) == 1
-    assert await repo.get_active_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
 
 
 @pytest.mark.asyncio
@@ -534,8 +534,8 @@ async def test_delete_tag_key_cascades_across_workflows(repo: TagsRepository) ->
 
     assert removed == 2
     # Tag gone from both workflows...
-    assert await repo.get_active_tags_for_workflow("wpid_a", ORG_ID) == {}
-    assert await repo.get_active_tags_for_workflow("wpid_b", ORG_ID) == {"team": "core"}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_b", ORG_ID) == {"team": "core"}
     # ...and the key no longer appears in the active registry.
     assert [row.key for row in await repo.list_tag_keys(ORG_ID)] == ["team"]
 
@@ -561,5 +561,104 @@ async def test_delete_tag_key_then_reapply_reregisters(repo: TagsRepository) -> 
 
     await repo.apply_tag_changes("wpid_a", ORG_ID, sets={"env": "dev"}, deletes=set(), context=_ctx())
 
-    assert await repo.get_active_tags_for_workflow("wpid_a", ORG_ID) == {"env": "dev"}
+    assert await repo.get_active_grouped_tags_for_workflow("wpid_a", ORG_ID) == {"env": "dev"}
     assert [row.key for row in await repo.list_tag_keys(ORG_ID)] == ["env"]
+
+
+# ---------------------- Phase 6.1: key-optional (standalone) labels ----------------------
+
+
+async def _active_labels(repo: TagsRepository, wpid: str = WPID, org_id: str = ORG_ID) -> set[str]:
+    """Standalone labels (no group) currently active on a workflow."""
+    rows = await repo.get_active_tag_events_for_workflow(wpid, org_id)
+    return {row.value for row in rows if row.key is None}
+
+
+@pytest.mark.asyncio
+async def test_standalone_label_set_and_read(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["production"])
+
+    # Standalone labels carry no key, so they don't show in the grouped map...
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {}
+    # ...and they don't register a tag key.
+    assert await _registered_keys(repo) == []
+    # But the label is active.
+    assert await _active_labels(repo) == {"production"}
+
+
+@pytest.mark.asyncio
+async def test_standalone_label_re_add_is_no_op(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["urgent"])
+    changes = await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["urgent"])
+    assert changes == []
+    assert await _event_count(repo) == 1
+
+
+@pytest.mark.asyncio
+async def test_standalone_and_grouped_coexist(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), label_sets=["urgent"]
+    )
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
+    assert await _active_labels(repo) == {"urgent"}
+
+
+@pytest.mark.asyncio
+async def test_same_value_grouped_and_standalone_are_independent(repo: TagsRepository) -> None:
+    """A grouped tag `env:prod` and a standalone label `prod` are different
+    identities (key vs value) and coexist on one workflow."""
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), label_sets=["prod"])
+    assert await repo.get_active_grouped_tags_for_workflow(WPID, ORG_ID) == {"env": "prod"}
+    assert await _active_labels(repo) == {"prod"}
+
+
+@pytest.mark.asyncio
+async def test_standalone_label_delete_records_value(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["production"])
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_deletes=["production"])
+
+    assert await _active_labels(repo) == set()
+    rows = await _all_events(repo)
+    assert len(rows) == 2
+    assert rows[1].event_type == TagEventType.DELETE.value
+    # The standalone-label delete records which label was removed (no key to identify it).
+    assert rows[1].key is None
+    assert rows[1].value == "production"
+
+
+@pytest.mark.asyncio
+async def test_standalone_label_set_wins_over_delete(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["keep"])
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["keep"], label_deletes=["keep"]
+    )
+    # Set wins: the label survives and no DELETE event was written.
+    assert await _active_labels(repo) == {"keep"}
+    assert [r.event_type for r in await _all_events(repo)] == [TagEventType.SET.value]
+
+
+@pytest.mark.asyncio
+async def test_cap_counts_grouped_and_labels_together(repo: TagsRepository) -> None:
+    grouped = {f"k{i}": "v" for i in range(MAX_TAGS_PER_WORKFLOW - 1)}
+    await repo.apply_tag_changes(WPID, ORG_ID, sets=grouped, deletes=set(), context=_ctx(), label_sets=["one_label"])
+    # At the cap (19 grouped + 1 label = 20); one more label trips it.
+    with pytest.raises(TagCountLimitExceeded):
+        await repo.apply_tag_changes(WPID, ORG_ID, sets={}, deletes=set(), context=_ctx(), label_sets=["over"])
+
+
+@pytest.mark.asyncio
+async def test_count_active_workflows_per_key_ignores_standalone(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), label_sets=["urgent"]
+    )
+    # Standalone labels have no key and must not appear in the per-key counts.
+    assert await repo.count_active_workflows_per_key(ORG_ID) == {"env": 1}
+
+
+@pytest.mark.asyncio
+async def test_batch_includes_standalone_labels(repo: TagsRepository) -> None:
+    await repo.apply_tag_changes(
+        WPID, ORG_ID, sets={"env": "prod"}, deletes=set(), context=_ctx(), label_sets=["urgent"]
+    )
+    result = await repo.get_active_tags_for_workflows([WPID], ORG_ID)
+    assert set(result[WPID]) == {("env", "prod"), (None, "urgent")}
