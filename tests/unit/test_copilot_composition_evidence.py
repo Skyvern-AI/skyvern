@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
+import pytest
 import yaml
 
+from skyvern.forge.sdk.copilot import tools as tools_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+    COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     has_bounded_page_schema,
@@ -15,6 +25,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
+    parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -59,6 +70,22 @@ def _flow_entry(
         "evidence": evidence,
         "reached_via": reached_via,
         "had_bounded_schema": with_form or observed_empty_page,
+        "step": step,
+    }
+
+
+def _scout_interaction_entry(url: str, *, step: int, selector: str = "#x") -> dict:
+    # A scout-interaction observation carries the proven selector but no page schema.
+    return {
+        "evidence": {
+            "inspected_url": url,
+            "current_url": url,
+            "source_tool": "scout_interaction",
+            "interaction_tool": "click",
+            "interaction_selector": selector,
+        },
+        "reached_via": "interaction",
+        "had_bounded_schema": False,
         "step": step,
     }
 
@@ -1512,6 +1539,110 @@ def test_composition_gate_allows_current_page_read_after_matching_interaction_re
     assert composition_page_evidence_error(ctx, workflow_yaml) is None
 
 
+def test_composition_gate_accepts_scout_interaction_observation_for_click_reached_block() -> None:
+    # SKY-10712: a successful scout interaction reaches the page, so a click-reached
+    # block authors against it without a separate inspect_page_for_composition.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Add the first result to the cart."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            _scout_interaction_entry("https://example.com/cart", step=2),
+        ],
+        block_observation_refs={"search_product": 1, "add_to_cart": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_hollow_interaction_observation_without_schema() -> None:
+    # Guard: a hollow inspect (interaction-reached but no schema and not a scout
+    # interaction) must still be rejected — the relaxation is scoped to scout proof.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Add the first result to the cart."},
+    )
+    hollow = _flow_entry("https://example.com/cart", reached_via="interaction", with_form=False, step=2)
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/results", step=1),
+            hollow,
+        ],
+        block_observation_refs={"search_product": 1, "add_to_cart": 2},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is not None
+
+
+def test_composition_gate_auto_credits_interaction_observation_without_a_ref() -> None:
+    # SKY-10712 option 1: a click-reached action block with NO block_observation_refs entry is
+    # auto-credited from the most-recent interaction-reached observation; the agent need not thread it.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Click the Add to Cart button."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[
+            _flow_entry("https://example.com/", reached_via="navigate", step=0),
+            _scout_interaction_entry("https://example.com/", step=1),
+        ],
+        block_observation_refs={},
+    )
+
+    assert composition_page_evidence_error(ctx, workflow_yaml) is None
+
+
+def test_composition_gate_rejects_click_reached_block_with_no_interaction_observation() -> None:
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Click the Add to Cart button."},
+    )
+    ctx = _Ctx(
+        flow_evidence=[_flow_entry("https://example.com/", reached_via="navigate", step=0)],
+        block_observation_refs={},
+    )
+
+    error = composition_page_evidence_error(ctx, workflow_yaml)
+
+    assert error is not None
+    assert "add_to_cart (action)" in error
+
+
+def test_composition_gate_auto_credit_consumes_each_interaction_once() -> None:
+    # Two click-reached blocks need two distinct interaction observations (consume-once); the
+    # SPA URL is identical across both, so binding is by trajectory order, never by url.
+    workflow_yaml = _yaml(
+        {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
+        {"block_type": "action", "label": "search_product", "navigation_goal": "Search for the product."},
+        {"block_type": "action", "label": "add_to_cart", "navigation_goal": "Click the Add to Cart button."},
+        {"block_type": "action", "label": "open_cart", "navigation_goal": "Click the cart icon."},
+    )
+    base = [_flow_entry("https://example.com/", reached_via="navigate", step=0)]
+
+    one = _Ctx(
+        flow_evidence=base + [_scout_interaction_entry("https://example.com/", step=1)], block_observation_refs={}
+    )
+    assert composition_page_evidence_error(one, workflow_yaml) is not None
+
+    two = _Ctx(
+        flow_evidence=base
+        + [
+            _scout_interaction_entry("https://example.com/", step=1),
+            _scout_interaction_entry("https://example.com/", step=2),
+        ],
+        block_observation_refs={},
+    )
+    assert composition_page_evidence_error(two, workflow_yaml) is None
+
+
 def test_composition_gate_reports_missing_referenced_observation_step() -> None:
     workflow_yaml = _yaml(
         {"block_type": "goto_url", "label": "open_home", "url": "https://example.com/"},
@@ -1581,9 +1712,10 @@ def test_composition_gate_reports_string_typed_observation_step_from_raw_refs() 
         {"block_type": "action", "label": "add_first_result", "navigation_goal": "Add the first result to the cart."},
     )
     ctx = _Ctx(
+        # No interaction-reached observation exists, so auto-credit cannot ground the block and the
+        # string-typed-ref diagnostic fires instead.
         flow_evidence=[
             _flow_entry("https://example.com/", reached_via="navigate", step=0),
-            _flow_entry("https://example.com/results", reached_via="interaction", step=1),
         ],
         block_observation_refs={
             "search_product": 0,
@@ -1762,3 +1894,552 @@ def test_composition_gate_matches_url_blocks_against_target_when_observation_ref
 
     assert error is not None
     assert "open_cart (goto_url)" in error
+
+
+# Bounded structured-evidence extractor
+
+
+def _structured_form_payload() -> dict[str, Any]:
+    return {
+        "page_title": "Lookup",
+        "forms": [
+            {
+                "id": "searchForm",
+                "name": "",
+                "action": "/results",
+                "method": "get",
+                "fields": [
+                    {
+                        "name": "q",
+                        "id": "q",
+                        "label": "Full name",
+                        "type": "text",
+                        "value": "",
+                        "class": [],
+                        "placeholder": "name",
+                        "required": True,
+                        "disabled": False,
+                        "checked": False,
+                        "options": [],
+                        "selector": "#q",
+                    },
+                    {
+                        "name": "state",
+                        "id": "state",
+                        "label": "State",
+                        "type": "select",
+                        "value": "",
+                        "class": [],
+                        "placeholder": "",
+                        "required": False,
+                        "disabled": False,
+                        "checked": False,
+                        "options": [
+                            {"text": "CA", "value": "ca", "selected": True},
+                            {"text": "NY", "value": "ny", "selected": False},
+                        ],
+                        "selector": "#state",
+                    },
+                ],
+                "submit_controls": [
+                    {
+                        "text": "Search",
+                        "name": "",
+                        "id": "",
+                        "value": "",
+                        "class": [],
+                        "type": "submit",
+                        "disabled": False,
+                        "selector": "button",
+                    }
+                ],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Full name State Search",
+        "anti_bot_indicators": [],
+    }
+
+
+def test_structured_parses_forms_labels_options_and_submit() -> None:
+    parsed = parse_composition_structured(
+        _structured_form_payload(),
+        inspected_url="https://example.com/lookup",
+        current_url="https://example.com/lookup",
+    )
+
+    assert parsed is not None
+    assert parsed["source_tool"] == "inspect_page_for_composition"
+    form = parsed["forms"][0]
+    assert [field["label"] for field in form["fields"]] == ["Full name", "State"]
+    assert form["fields"][0]["required"] is True
+    assert form["fields"][1]["options"][0] == {"text": "CA", "value": "ca", "selected": True}
+    assert form["submit_controls"][0]["text"] == "Search"
+    assert parsed["evidence_confidence"] == 0.85
+    assert has_bounded_page_schema(parsed) is True
+
+
+def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
+    payload = {
+        "page_title": "",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [
+            {
+                "role": "dialog",
+                "aria_modal": True,
+                "id": "",
+                "class": ["modal"],
+                "selector": "div.modal",
+                "text": "Subscribe",
+                "dismiss_controls": [
+                    {
+                        "tag": "button",
+                        "text": "Close",
+                        "aria_label": "",
+                        "title": "",
+                        "selector": "button.x",
+                        "type": "",
+                    }
+                ],
+            }
+        ],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Subscribe Close",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/r", current_url="https://example.com/r"
+    )
+
+    assert parsed is not None
+    overlay = parsed["modal_overlays"][0]
+    assert overlay["selector"] == "div.modal"
+    assert overlay["dismiss_controls"][0]["text"] == "Close"
+    assert "aria_modal" in overlay and overlay["aria_modal"] is True
+    assert parsed["page_obstructions"]
+    assert has_bounded_page_schema(parsed) is True
+
+
+def test_structured_detects_anti_bot_and_challenge_controls() -> None:
+    payload = {
+        "page_title": "",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [
+            {
+                "tag": "iframe",
+                "id": "",
+                "name": "",
+                "class": [],
+                "type": "",
+                "selector": "iframe",
+                "text": "",
+                "src": "https://challenges.cloudflare.com/turnstile/v0/api.js",
+                "title": "Cloudflare security challenge",
+            }
+        ],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "",
+        "anti_bot_indicators": ["captcha", "turnstile"],
+    }
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/x", current_url="https://example.com/x"
+    )
+
+    assert parsed is not None
+    assert parsed["anti_bot_indicators"] == ["captcha", "turnstile"]
+    assert parsed["challenge_state"]["detected"] is True
+    assert parsed["challenge_state"]["kind"] == "captcha"
+    assert "data_sitekey" not in parsed["challenge_controls"][0]
+    assert parsed["challenge_controls"][0]["src"] == "https://challenges.cloudflare.com/turnstile/v0/api.js"
+    assert has_bounded_page_schema(parsed) is True
+    assert page_evidence_needs_visual_fallback(parsed) is True
+
+
+def test_structured_rejects_unusable_payloads() -> None:
+    for bad in (None, "not a dict", ["a"], 123, 4.5, True):
+        assert parse_composition_structured(bad, inspected_url="u", current_url="u") is None
+
+
+def test_structured_intersects_reported_anti_bot_indicators_with_known_patterns() -> None:
+    payload = _structured_form_payload()
+    payload["anti_bot_indicators"] = ["captcha", "totally-made-up", "challenge"]
+
+    parsed = parse_composition_structured(payload, inspected_url="u", current_url="u")
+
+    assert parsed is not None
+    # Bogus indicators are dropped; survivors are returned in canonical pattern order.
+    assert parsed["anti_bot_indicators"] == ["captcha", "challenge"]
+
+
+def test_structured_navigation_drops_cross_origin_links() -> None:
+    payload = _structured_form_payload()
+    payload["navigation_targets"] = [
+        {"text": "Same", "href": "https://example.com/page2", "selector": 'a[href="/page2"]'},
+        {"text": "Cross", "href": "https://other.example.org/x", "selector": 'a[href="x"]'},
+        {"text": "Scheme", "href": "http://example.com/page3", "selector": 'a[href="/page3"]'},
+    ]
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert parsed is not None
+    hrefs = [target["href"] for target in parsed["navigation_targets"]]
+    # netloc match keeps the http<->https same-host link and drops the cross-host one.
+    assert "https://example.com/page2" in hrefs
+    assert "http://example.com/page3" in hrefs
+    assert "https://other.example.org/x" not in hrefs
+
+
+def test_structured_body_with_markup_but_no_structure_is_schema_empty() -> None:
+    # body markup but no bounded structure and no visible text -> schema-empty.
+    payload = {
+        "page_title": "",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "",
+        "body_has_markup": True,
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url="u", current_url="u")
+
+    assert parsed is not None
+    assert parsed["schema_empty_page"] is True
+    assert has_bounded_page_schema(parsed) is False
+
+
+def test_structured_blank_payload_is_not_schema_empty() -> None:
+    payload = {
+        "page_title": "",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "",
+        "body_has_markup": False,
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(payload, inspected_url="u", current_url="u")
+
+    assert parsed is not None
+    assert parsed["schema_empty_page"] is False
+
+
+# JS-DOM fidelity: run the real extractor against a live DOM and compare to the HTML parser
+
+
+def _has_playwright_browser() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+
+        with sync_playwright() as p:
+            return Path(p.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+_skip_no_browser = pytest.mark.skipif(
+    not _has_playwright_browser(),
+    reason="Requires Playwright browsers installed (run: playwright install chromium)",
+)
+
+_FIDELITY_URL = "https://test.example.com/lookup"
+_FIDELITY_HTML = """<!DOCTYPE html>
+<html>
+<head><title>Lookup</title></head>
+<body>
+  <form id="searchForm" action="/results" method="get">
+    <label for="q">Full name</label>
+    <input id="q" name="q" required placeholder="name" />
+    <label>Email <input name="email" type="email" /></label>
+    <span>Phone</span><input name="phone" />
+    <select id="state" name="state"><option value="ca" selected>CA</option><option value="ny">NY</option></select>
+    <input type="hidden" name="csrf" value="xyz" />
+    <button type="submit">Search</button>
+  </form>
+  <a href="/results">Results</a>
+  <a href="https://test.example.com/page2">Page2</a>
+  <a href="https://other.example.org/x">External</a>
+  <a href="#frag">Frag</a>
+  <table id="results"><tbody><tr><td>row</td></tr></tbody></table>
+  <div role="dialog" aria-modal="true" class="modal" id="signup">Sign up<button aria-label="Close">x</button></div>
+  <iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js" title="Widget containing a Cloudflare security challenge"></iframe>
+  <div class="cf-turnstile" data-sitekey="abc123">Verify</div>
+  <script>var marker = "captcha widget loaded";</script>
+  <noscript>access denied</noscript>
+</body>
+</html>
+"""
+
+
+def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
+    """Project the acceptance-criteria fields (forms/labels/modal/anti-bot/nav/challenge) for parity."""
+    forms = [
+        {
+            "fields": [(field["name"], field["label"], field["type"], field["required"]) for field in form["fields"]],
+            "submit": [control["text"] for control in form["submit_controls"]],
+        }
+        for form in evidence["forms"]
+    ]
+    challenge_state = evidence["challenge_state"]
+    return {
+        "page_title": evidence["page_title"],
+        "forms": forms,
+        "navigation_targets": sorted(target["href"] for target in evidence["navigation_targets"]),
+        "result_containers": sorted((rc["tag"], rc["selector"]) for rc in evidence["result_containers"]),
+        "modal_selectors": sorted(
+            (overlay["selector"], bool(overlay.get("dismiss_controls"))) for overlay in evidence["modal_overlays"]
+        ),
+        "challenge_selectors": sorted(control["selector"] for control in evidence["challenge_controls"]),
+        "anti_bot_indicators": evidence["anti_bot_indicators"],
+        "challenge_detected": challenge_state["detected"],
+        "challenge_kind": challenge_state["kind"],
+        "bounded": has_bounded_page_schema(evidence),
+    }
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_matches_html_parser_on_live_dom() -> None:
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+
+        async def _handle(route: Any) -> None:
+            if route.request.url == _FIDELITY_URL:
+                await route.fulfill(status=200, content_type="text/html", body=_FIDELITY_HTML)
+            else:
+                await route.abort()
+
+        await context.route("**/*", _handle)
+        page = await context.new_page()
+        await page.goto(_FIDELITY_URL, wait_until="domcontentloaded")
+        await page.wait_for_selector("#searchForm")
+        raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
+        content = await page.content()
+        await context.close()
+        await browser.close()
+
+    structured = parse_composition_structured(json.loads(raw), inspected_url=_FIDELITY_URL, current_url=_FIDELITY_URL)
+    html_parsed = parse_composition_html(content, inspected_url=_FIDELITY_URL, current_url=_FIDELITY_URL)
+
+    assert structured is not None
+    assert _ac_projection(structured) == _ac_projection(html_parsed)
+    # Sanity: the fixture really exercised the detectors.
+    assert structured["forms"] and structured["challenge_controls"]
+    assert structured["anti_bot_indicators"] and structured["challenge_state"]["detected"] is True
+    assert any(overlay["selector"] == "#signup" for overlay in structured["modal_overlays"])
+
+
+_HEAVY_URL = "https://test.example.com/cart"
+
+
+def _heavy_results_cart_html() -> str:
+    """A heavy results+cart page: many rows, multiple forms/containers, lots of nav.
+
+    Exercises extractor/parser parity at the scale where their `_MAX_*` caps must
+    agree — the case SKY-10714 ships for, where get_html cap-overflows in prod.
+    """
+    product_rows = "".join(
+        f"<tr><td>Item {i}</td><td>${i}.99</td>"
+        f'<td><button name="add" value="{i}" type="button">Add to cart</button></td></tr>'
+        for i in range(1, 41)
+    )
+    cart_rows = "".join(
+        f"<tr><td>Line {i}</td>"
+        f'<td><label for="qty{i}">Qty {i}</label><input id="qty{i}" name="qty{i}" value="1" /></td></tr>'
+        for i in range(1, 16)
+    )
+    filter_fields = "".join(
+        f'<label for="f{i}">Filter {i}</label><input id="f{i}" name="f{i}" />' for i in range(1, 13)
+    )
+    nav_links = "".join(f'<a href="/category/{i}">Category {i}</a>' for i in range(1, 26))
+    return f"""<!DOCTYPE html>
+<html><head><title>Cart</title></head>
+<body>
+  <form id="filterForm" action="/results" method="get">
+    {filter_fields}
+    <button type="submit">Apply filters</button>
+  </form>
+  <table id="products"><tbody>{product_rows}</tbody></table>
+  <form id="cartForm" action="/cart" method="post">
+    <table id="cart"><tbody>{cart_rows}</tbody></table>
+    <button type="submit">Checkout</button>
+  </form>
+  <nav>{nav_links}<a href="https://other.example.org/x">External</a><a href="#top">Top</a></nav>
+  <div role="dialog" aria-modal="true" class="modal" id="promo">Promo<button aria-label="Close">x</button></div>
+</body></html>"""
+
+
+@_skip_no_browser
+@pytest.mark.asyncio
+async def test_structured_extractor_matches_html_parser_on_heavy_results_cart_dom() -> None:
+    from playwright.async_api import async_playwright
+
+    html = _heavy_results_cart_html()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+
+        async def _handle(route: Any) -> None:
+            if route.request.url == _HEAVY_URL:
+                await route.fulfill(status=200, content_type="text/html", body=html)
+            else:
+                await route.abort()
+
+        await context.route("**/*", _handle)
+        page = await context.new_page()
+        await page.goto(_HEAVY_URL, wait_until="domcontentloaded")
+        await page.wait_for_selector("#products")
+        raw = await page.evaluate(COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION)
+        content = await page.content()
+        await context.close()
+        await browser.close()
+
+    structured = parse_composition_structured(json.loads(raw), inspected_url=_HEAVY_URL, current_url=_HEAVY_URL)
+    html_parsed = parse_composition_html(content, inspected_url=_HEAVY_URL, current_url=_HEAVY_URL)
+
+    assert structured is not None
+    assert _ac_projection(structured) == _ac_projection(html_parsed)
+    # Sanity: the heavy fixture really exercised results + multi-form at scale.
+    assert structured["result_containers"]
+    assert structured["forms"]
+
+
+# Tools-layer invariant: cheap path skips get_html; failure falls back
+
+
+class _RecordingCompositionServer:
+    """Records call_internal_tool tool names and evaluate expressions for invariant assertions."""
+
+    def __init__(self, *, structured_json: str | None, html: str = "") -> None:
+        self.calls: list[str] = []
+        self.evaluate_expressions: list[str] = []
+        self._structured_json = structured_json
+        self._html = html
+
+    async def call_internal_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(tool_name)
+        if tool_name == "skyvern_evaluate":
+            expression = arguments.get("expression", "")
+            self.evaluate_expressions.append(expression)
+            if expression == COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION:
+                if self._structured_json is None:
+                    return {"ok": False, "error": "structured extract failed"}
+                return {"ok": True, "data": {"result": self._structured_json}}
+            if expression == COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION:
+                return {"ok": True, "data": {"result": []}}
+            return {"ok": False, "error": "unexpected expression"}
+        if tool_name == "skyvern_get_html":
+            return {"ok": True, "data": {"html": self._html}}
+        return {"ok": False, "error": f"unexpected tool {tool_name}"}
+
+
+_HTML_FORM_PAGE = (
+    "<html><head><title>T</title></head><body>"
+    "<form id='f'><input name='x'><button type='submit'>Go</button></form>"
+    "</body></html>"
+)
+
+
+@pytest.mark.asyncio
+async def test_capture_uses_structured_extractor_and_skips_get_html() -> None:
+    server = _RecordingCompositionServer(structured_json=json.dumps(_structured_form_payload()))
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert evidence["forms"][0]["fields"][0]["label"] == "Full name"
+    assert evidence["source_tool"] == "inspect_page_for_composition"
+    # AC1: the cheap path never serializes the full DOM, and a bounded page needs only one evaluate.
+    assert server.calls.count("skyvern_get_html") == 0
+    assert server.calls.count("skyvern_evaluate") == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_falls_back_to_get_html_when_structured_unusable() -> None:
+    server = _RecordingCompositionServer(structured_json=None, html=_HTML_FORM_PAGE)
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert evidence["forms"]
+    assert server.calls.count("skyvern_get_html") >= 1
+
+
+@pytest.mark.asyncio
+async def test_navigation_failure_uses_structured_evidence_when_bounded() -> None:
+    server = _RecordingCompositionServer(structured_json=json.dumps(_structured_form_payload()))
+    ctx = SimpleNamespace(discovery_mcp_server=server, browser_session_id=None, organization_id="o_test")
+
+    evidence = await tools_module._composition_evidence_after_navigation_failure(
+        ctx, inspected_url="https://example.com/lookup", navigation_error="boom"
+    )
+
+    assert evidence is not None
+    assert evidence["forms"]
+    assert server.calls.count("skyvern_get_html") == 0
+    assert any("navigation_error_before_html_capture" in warning for warning in evidence["inspection_warnings"])
+
+
+@pytest.mark.asyncio
+async def test_capture_prefers_html_parse_over_hollow_structured_on_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When both extractor and get_html are unbounded, the get_html parse wins (carries the fallback signals).
+    monkeypatch.setattr(tools_module, "_COMPOSITION_HOLLOW_RECAPTURE_RETRIES", 0)
+    hollow = json.dumps(
+        {
+            "page_title": "",
+            "forms": [],
+            "navigation_targets": [],
+            "result_containers": [],
+            "challenge_controls": [],
+            "modal_overlays": [],
+            "visual_obstruction_candidates": [],
+            "visible_text_excerpt": "",
+            "body_has_markup": False,
+            "anti_bot_indicators": [],
+        }
+    )
+    html = "<html><head><title>Notice</title></head><body><p>Welcome notice text</p></body></html>"
+    server = _RecordingCompositionServer(structured_json=hollow, html=html)
+    ctx = SimpleNamespace(discovery_mcp_server=server)
+
+    evidence, error = await tools_module._capture_composition_evidence(
+        ctx, inspected_url="https://example.com/p", current_url="https://example.com/p"
+    )
+
+    assert error is None
+    assert evidence is not None
+    assert "Welcome notice text" in evidence["visible_text_excerpt"]
+    assert evidence["schema_empty_page"] is True
+    assert server.calls.count("skyvern_get_html") == 1
