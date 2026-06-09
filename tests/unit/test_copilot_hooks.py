@@ -118,6 +118,43 @@ async def test_on_tool_end_failed_whitelisted_tool_skips_preview() -> None:
 
 
 @pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_records_resolved_ids() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "credentials": [
+                    {"credential_id": "cred_amazon", "name": "Amazon", "username": "shopper@example.test"},
+                    {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+                ],
+                "count": 2,
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+
+    entry = ctx.tool_activity[0]
+    assert entry["credentials"] == [
+        {"credential_id": "cred_amazon", "name": "Amazon"},
+        {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"credentials": [], "count": 0}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+
+    assert "credentials" not in ctx.tool_activity[0]
+
+
+@pytest.mark.asyncio
 async def test_on_tool_end_swallows_unserializable_output() -> None:
     # json.dumps(default=str) can still raise if str() on the value raises --
     # on_tool_end must never propagate that into the agent loop.
@@ -725,6 +762,7 @@ class TestBrowserInteractionObservationHooks:
             pending_browser_interaction_observation=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
+            scout_trajectory=[],
             pending_scout_source_url=None,
         )
         result = await _click_post_hook(
@@ -754,6 +792,7 @@ class TestBrowserInteractionObservationHooks:
             ),
             discovery_mcp_server=None,
             scouted_interactions=[],
+            scout_trajectory=[],
             pending_scout_source_url=None,
         )
 
@@ -781,6 +820,7 @@ class TestBrowserInteractionObservationHooks:
             pending_browser_interaction_observation=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
+            scout_trajectory=[],
             pending_scout_source_url=None,
         )
 
@@ -803,6 +843,7 @@ class TestScoutedInteractionCapture:
             pending_browser_interaction_observation=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
+            scout_trajectory=[],
             observed_browser_urls=[],
             pending_scout_source_url=source_url,
         )
@@ -1047,3 +1088,51 @@ class TestScoutedInteractionCapture:
         assert entry["reached_via"] == "interaction"
         assert entry["evidence"]["interaction_selector"] == "#sort"
         assert result["data"]["observation_step"] == entry["step"]
+
+
+class TestAssembleEnforcementMessages:
+    @staticmethod
+    def _screenshot_msg() -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "screenshot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }
+
+    @staticmethod
+    def _offer_msg() -> dict[str, Any]:
+        return {"role": "user", "content": "Here is a code block you can add."}
+
+    def test_screenshot_nudge_and_offer_ordering(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        offer_msg = self._offer_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, "please finish the workflow", offer_msg)
+
+        screenshot_indices = [i for i, m in enumerate(msgs) if m is screenshot_msg]
+        assert screenshot_indices == [msgs.index(screenshot_msg)]
+        assert len(screenshot_indices) == 1
+
+        nudge_index = next(
+            i
+            for i, m in enumerate(msgs)
+            if isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL)
+        )
+        assert nudge_index == len(msgs) - 1
+
+        offer_index = msgs.index(offer_msg)
+        assert offer_index < nudge_index
+
+    def test_offer_and_screenshot_without_nudge(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        offer_msg = self._offer_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, None, offer_msg)
+
+        assert offer_msg in msgs
+        assert msgs.count(screenshot_msg) == 1
+        assert not any(isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL) for m in msgs)

@@ -34,6 +34,52 @@ def test_merge_turn_summary_caps_credentials_checked() -> None:
     assert len(ctx.credentials_checked) == 40
 
 
+def test_merge_turn_summary_records_resolved_credential_ids() -> None:
+    ctx = StructuredContext()
+    activity = [
+        {
+            "tool": "list_credentials",
+            "summary": "Found 2 credential(s)",
+            "credentials": [
+                {"credential_id": "cred_amazon", "name": "Amazon"},
+                {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+            ],
+        }
+    ]
+    ctx.merge_turn_summary(activity)
+
+    by_id = {check.credential_id: check for check in ctx.credentials_checked}
+    assert set(by_id) == {"cred_amazon", "cred_quicken"}
+    assert all(check.found for check in ctx.credentials_checked)
+    assert by_id["cred_amazon"].credential_name == "Amazon"
+
+
+def test_resolved_credential_ids_survive_context_roundtrip() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary(
+        [
+            {
+                "tool": "list_credentials",
+                "summary": "Found 1 credential(s)",
+                "credentials": [{"credential_id": "cred_amazon", "name": "Amazon"}],
+            }
+        ]
+    )
+
+    rehydrated = StructuredContext.from_json_str(ctx.to_json_str())
+
+    assert [check.credential_id for check in rehydrated.credentials_checked] == ["cred_amazon"]
+
+
+def test_merge_turn_summary_falls_back_to_summary_without_structured_credentials() -> None:
+    ctx = StructuredContext()
+    ctx.merge_turn_summary([{"tool": "list_credentials", "summary": "Found 0 credential(s)"}])
+
+    assert len(ctx.credentials_checked) == 1
+    assert ctx.credentials_checked[0].credential_id is None
+    assert ctx.credentials_checked[0].found is False
+
+
 def test_merge_observed_acted_pages_uses_nested_evidence_url() -> None:
     pages = _merge_observed_acted_pages(
         [ObservedPage(url="https://example.com/old", had_bounded_schema=True, reached_via="navigate")],
