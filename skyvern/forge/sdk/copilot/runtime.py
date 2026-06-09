@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, TypeAlias, cast
 
 import structlog
 
@@ -104,15 +104,6 @@ async def _get_persistent_browser_session(session_id: str, organization_id: str)
 class PendingBrowserInteractionObservation:
     tool_name: str
     url: str = ""
-
-
-class ScoutedInteraction(TypedDict):
-    tool_name: str
-    selector: NotRequired[str]
-    source_url: NotRequired[str]
-    value: NotRequired[str]
-    key: NotRequired[str]
-    typed_length: NotRequired[int]
 
 
 @dataclass
@@ -225,11 +216,6 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
-    observed_browser_urls: list[str] = field(default_factory=list)
-    # Ephemeral within-turn scout captures; not persisted across turns.
-    scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
-    # Source page of an in-flight scout action, captured before it may navigate away.
-    pending_scout_source_url: str | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at

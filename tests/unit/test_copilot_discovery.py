@@ -375,8 +375,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    # structured extractor probe (None on the [] mock) -> get_html fallback -> obstruction-candidates probe
-    assert server.calls == ["skyvern_evaluate", "skyvern_get_html", "skyvern_evaluate"]
+    assert server.calls == ["skyvern_get_html", "skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True

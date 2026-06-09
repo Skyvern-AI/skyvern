@@ -62,23 +62,15 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
-    SCOUT_INTERACTION_EVIDENCE_TOOL,
     composition_page_evidence_error,
     has_bounded_page_schema,
     merge_visual_composition_evidence,
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
-    parse_composition_structured,
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
@@ -129,7 +121,6 @@ from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_R
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
-    ScoutedInteraction,
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
@@ -1497,103 +1488,6 @@ def _consume_pending_browser_interaction_observation(
         )
         return False
     return True
-
-
-_MAX_SCOUTED_INTERACTIONS = 20
-
-
-async def _live_working_page_url(ctx: AgentContext) -> str | None:
-    if not ctx.browser_session_id:
-        return None
-    try:
-        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-            session_id=ctx.browser_session_id,
-            organization_id=ctx.organization_id,
-        )
-        if not browser_state:
-            return None
-        page = await browser_state.get_or_create_page()
-        return page.url if page else None
-    except Exception:
-        return None
-
-
-async def _capture_scout_source_url(ctx: AgentContext) -> None:
-    # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
-    ctx.pending_scout_source_url = await _live_working_page_url(ctx)
-
-
-def _consume_scout_source_url(ctx: AgentContext) -> str | None:
-    source_url = ctx.pending_scout_source_url
-    # Cleared unconditionally so a non-recording action can't bleed its source page into a later interaction.
-    ctx.pending_scout_source_url = None
-    return source_url
-
-
-def _record_scouted_interaction(
-    ctx: AgentContext,
-    *,
-    tool_name: str,
-    selector: str = "",
-    source_url: str | None = None,
-    value: str = "",
-    key: str = "",
-    typed_length: int = 0,
-) -> None:
-    selector = selector.strip()
-    # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
-    if tool_name != "press_key" and not selector:
-        return
-    artifact: ScoutedInteraction = {"tool_name": tool_name}
-    if selector:
-        artifact["selector"] = selector
-    if source_url and source_url.strip():
-        artifact["source_url"] = source_url.strip()
-    if value:
-        artifact["value"] = value
-    if key:
-        artifact["key"] = key
-    if typed_length:
-        artifact["typed_length"] = typed_length
-    interactions = [
-        item
-        for item in ctx.scouted_interactions
-        if not (
-            item.get("tool_name") == artifact["tool_name"]
-            and item.get("selector") == artifact.get("selector")
-            and item.get("source_url") == artifact.get("source_url")
-        )
-    ]
-    interactions.append(artifact)
-    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
-    LOG.info(
-        "copilot_scout_interaction_captured",
-        tool_name=tool_name,
-        selector=selector or None,
-        source_url=artifact.get("source_url"),
-        total_scouted_interactions=len(ctx.scouted_interactions),
-    )
-
-
-def _register_scout_interaction_observation(
-    ctx: AgentContext, *, tool_name: str, selector: str, source_url: str | None, url: str
-) -> int | None:
-    # A successful scout interaction reaches the post-action page; record it as an
-    # interaction-reached observation so a click-reached block can be authored
-    # against it without a separate inspect_page_for_composition.
-    selector = selector.strip()
-    if not selector or not url:
-        return None
-    evidence: dict[str, Any] = {
-        "inspected_url": url,
-        "current_url": url,
-        "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
-        "interaction_tool": tool_name,
-        "interaction_selector": selector,
-    }
-    if source_url and source_url.strip():
-        evidence["interaction_source_url"] = source_url.strip()
-    return _append_flow_evidence(ctx, evidence, reached_via="interaction")
 
 
 def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
@@ -5825,7 +5719,6 @@ async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
         return deterministic_result
@@ -5853,7 +5746,6 @@ async def _type_text_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
 
 
@@ -5861,7 +5753,6 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
 
 
@@ -5869,7 +5760,6 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
-    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="press_key")
 
 
@@ -5920,7 +5810,6 @@ async def _click_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
@@ -5930,13 +5819,6 @@ async def _click_post_hook(
             "url": url,
             "title": title,
         }
-        _record_scouted_interaction(ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url)
-        observation_step = _register_scout_interaction_observation(
-            ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
-        )
-        if observation_step is not None:
-            result["observation_step"] = observation_step
-            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -6005,7 +5887,6 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = data.get("selector", "")
@@ -6020,15 +5901,6 @@ async def _type_text_post_hook(
         if landing_failure is not None:
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
-        _record_scouted_interaction(
-            ctx, tool_name="type_text", selector=selector, source_url=source_url, typed_length=typed_length
-        )
-        observation_step = _register_scout_interaction_observation(
-            ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
-        )
-        if observation_step is not None:
-            result["observation_step"] = observation_step
-            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -6095,7 +5967,6 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -6105,19 +5976,6 @@ async def _select_option_post_hook(
             "value": data.get("value", ""),
             "url": url,
         }
-        _record_scouted_interaction(
-            ctx,
-            tool_name="select_option",
-            selector=data.get("selector", ""),
-            source_url=source_url,
-            value=data.get("value", ""),
-        )
-        observation_step = _register_scout_interaction_observation(
-            ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
-        )
-        if observation_step is not None:
-            result["observation_step"] = observation_step
-            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -6127,7 +5985,6 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
-    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -6137,13 +5994,6 @@ async def _press_key_post_hook(
             "selector": data.get("selector", ""),
             "url": url,
         }
-        _record_scouted_interaction(
-            ctx,
-            tool_name="press_key",
-            selector=data.get("selector", ""),
-            source_url=source_url,
-            key=data.get("key", ""),
-        )
     return result
 
 
@@ -8304,15 +8154,6 @@ async def _composition_evidence_after_navigation_failure(
 ) -> dict[str, Any] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
-    structured = await _composition_get_structured_evidence(ctx, inspected_url=inspected_url, current_url=current_url)
-    if structured is not None and has_bounded_page_schema(structured):
-        evidence = _composition_add_inspection_warning(
-            structured,
-            f"navigation_error_before_html_capture: {navigation_error}",
-        )
-        if page_evidence_needs_visual_fallback(evidence):
-            evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
-        return evidence
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
     html, html_error, html_truncated, _ = await _composition_get_html(ctx)
@@ -8584,43 +8425,6 @@ async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> 
     return "", str(error) if error else None, False, True
 
 
-async def _composition_get_structured_evidence(
-    copilot_ctx: Any,
-    *,
-    inspected_url: str,
-    current_url: str,
-) -> dict[str, Any] | None:
-    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
-    server = getattr(copilot_ctx, "discovery_mcp_server", None)
-    if server is None:
-        return None
-    with copilot_span("composition_structured_extract"):
-        try:
-            result = await asyncio.wait_for(
-                server.call_internal_tool(
-                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
-                ),
-                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    raw = (result.get("data") or {}).get("result")
-    if isinstance(raw, str):
-        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
-            return None
-        try:
-            payload = json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-    elif isinstance(raw, dict):
-        payload = raw
-    else:
-        return None
-    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
-
-
 async def _capture_composition_evidence(
     copilot_ctx: Any,
     *,
@@ -8628,27 +8432,22 @@ async def _capture_composition_evidence(
     current_url: str,
     active_run_terminal_sample: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
+    """Read page HTML and parse composition evidence, recapturing on a hollow read.
+
+    The capture (`_composition_get_html`) survives the MCP size cap; this loop adds a
+    short settle and re-read for the separate case where the page had not finished
+    rendering at capture time (a cold cloud session's first navigate to a heavy page
+    can hand back a shell). Returns (evidence, html_error); html_error is set only
+    when the HTML read itself failed. Stops early once the parse yields a bounded
+    schema (forms/links/result containers/challenge), so a genuine challenge page is
+    not retried.
+    """
     evidence: dict[str, Any] | None = None
     html_truncated = False
-    used_structured = False
     skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
-        structured = await _composition_get_structured_evidence(
-            copilot_ctx, inspected_url=inspected_url, current_url=current_url
-        )
-        if structured is not None:
-            evidence = structured
-            used_structured = True
-            if has_bounded_page_schema(evidence):
-                break
-            if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
-                await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
-                continue
         html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
-            if evidence is not None:
-                break
             return None, html_error
         # On a heavy page the raw get_html serialization is dropped over the MCP size cap and
         # falls back to the stripped read; once that happens, settle-and-recapture via the
@@ -8656,15 +8455,13 @@ async def _capture_composition_evidence(
         if used_stripped:
             skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
-        used_structured = False
         if has_bounded_page_schema(evidence):
             break
         if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
-    if evidence is not None and html_truncated and not used_structured:
+    if evidence is not None and html_truncated:
         evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
-    # Structured evidence already carries computed obstruction candidates; only the get_html path augments.
-    if evidence is not None and not used_structured:
+    if evidence is not None:
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)

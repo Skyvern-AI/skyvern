@@ -1013,17 +1013,22 @@ async def get_test_credential_status(
         workflow = await app.DATABASE.workflows.get_workflow(workflow_run.workflow_id, organization_id)
         # Only a save-enabled test has a saver; a plain login test must not report a save failure.
         if workflow and workflow.persist_browser_session:
+            # finished_at may come back tz-aware from the ORM; normalize once so every comparison /
+            # subtraction below stays naive-vs-naive and never raises TypeError.
+            run_finished_at = to_naive_utc(workflow_run.finished_at)
             save_persisted = False
             if browser_profile_id:
                 profile = await app.DATABASE.browser_sessions.get_browser_profile(
                     profile_id=browser_profile_id, organization_id=organization_id
                 )
                 saved_at = to_naive_utc(profile.modified_at) if profile else None
-                run_finished_at = to_naive_utc(workflow_run.finished_at)
                 save_persisted = bool(saved_at and run_finished_at and saved_at >= run_finished_at)
             if not save_persisted:
                 browser_profile_id = None
-                if (naive_utc_now() - workflow_run.finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS:
+                if (
+                    run_finished_at
+                    and (naive_utc_now() - run_finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS
+                ):
                     browser_profile_failure_reason = (
                         "Login succeeded but the browser profile could not be saved. Please try testing again."
                     )
