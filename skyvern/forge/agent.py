@@ -119,11 +119,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
-    poll_otp_value,
-    try_generate_totp_from_credential,
-)
+from skyvern.services.otp_service import poll_otp_value, resolve_otp_value
 from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
@@ -5895,25 +5891,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-            workflow_id = workflow_permanent_id = None
-            if task.workflow_run_id:
-                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
-                if workflow_run:
-                    workflow_id = workflow_run.workflow_id
-                    workflow_permanent_id = workflow_run.workflow_permanent_id
-            otp_value = await poll_otp_value(
-                organization_id=task.organization_id,
-                task_id=task.task_id,
-                workflow_id=workflow_id,
-                workflow_run_id=task.workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                totp_verification_url=task.totp_verification_url,
-                totp_identifier=task.totp_identifier,
-            )
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        otp_value = await resolve_otp_value(task)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response
