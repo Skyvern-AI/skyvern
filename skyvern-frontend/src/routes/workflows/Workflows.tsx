@@ -65,7 +65,7 @@ import { WorkflowTagEditor } from "./components/tagging/WorkflowTagEditor";
 import {
   parseTagFilter,
   serializeTagFilter,
-  type TagFilterPair,
+  type TagFilterTerm,
 } from "./types/tagTypes";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
 import { convert } from "./editor/workflowEditorUtils";
@@ -146,9 +146,9 @@ function Workflows() {
   const serializedTagFilter = serializeTagFilter(tagFilters);
 
   const setTagFilters = useCallback(
-    (pairs: TagFilterPair[]) => {
+    (terms: TagFilterTerm[]) => {
       const params = new URLSearchParams(searchParams);
-      const serialized = serializeTagFilter(pairs);
+      const serialized = serializeTagFilter(terms);
       if (serialized) {
         params.set("tags", serialized);
       } else {
@@ -342,25 +342,33 @@ function Workflows() {
   );
   const { data: workflowTagsMap = {} } = useWorkflowTagsBatchQuery(workflowIds);
 
-  // Distinct values per key observed on the page, used as filter suggestions.
-  // Maps avoid prototype-key collisions from user-controlled tag keys.
-  const tagValueSuggestions = useMemo(() => {
+  // Tags observed on the page for editor/filter suggestions: grouped values per
+  // key plus standalone labels. Maps avoid prototype-key collisions.
+  const { valueSuggestionsByKey, labelSuggestions } = useMemo(() => {
     const collected = new Map<string, Set<string>>();
+    const labels = new Set<string>();
     for (const tags of Object.values(workflowTagsMap)) {
-      for (const [key, value] of Object.entries(tags)) {
-        let values = collected.get(key);
+      for (const tag of tags) {
+        if (tag.key === null) {
+          labels.add(tag.value);
+          continue;
+        }
+        let values = collected.get(tag.key);
         if (!values) {
           values = new Set<string>();
-          collected.set(key, values);
+          collected.set(tag.key, values);
         }
-        values.add(value);
+        values.add(tag.value);
       }
     }
-    const suggestions = new Map<string, string[]>();
+    const byKey = new Map<string, string[]>();
     for (const [key, values] of collected) {
-      suggestions.set(key, [...values].sort());
+      byKey.set(key, [...values].sort());
     }
-    return suggestions;
+    return {
+      valueSuggestionsByKey: byKey,
+      labelSuggestions: [...labels].sort(),
+    };
   }, [workflowTagsMap]);
 
   const { matchesParameter, isSearchActive } =
@@ -587,7 +595,8 @@ function Workflows() {
               tagKeys={tagKeys}
               value={tagFilters}
               onChange={setTagFilters}
-              valueSuggestions={tagValueSuggestions}
+              labelSuggestions={labelSuggestions}
+              valueSuggestionsByKey={valueSuggestionsByKey}
             />
           </div>
           <div className="flex items-center gap-4">
@@ -785,8 +794,7 @@ function Workflows() {
                                   </TooltipProvider>
                                 )}
                               </div>
-                              {workflowTags &&
-                              Object.keys(workflowTags).length > 0 ? (
+                              {workflowTags && workflowTags.length > 0 ? (
                                 <TagChipList
                                   tags={workflowTags}
                                   descriptions={tagDescriptions}
@@ -860,9 +868,10 @@ function Workflows() {
                                 workflowPermanentId={
                                   workflow.workflow_permanent_id
                                 }
-                                tags={workflowTags ?? {}}
+                                tags={workflowTags ?? []}
                                 tagKeys={tagKeys}
-                                valueSuggestions={tagValueSuggestions}
+                                labelSuggestions={labelSuggestions}
+                                valueSuggestionsByKey={valueSuggestionsByKey}
                               />
                               <TooltipProvider>
                                 <Tooltip>
