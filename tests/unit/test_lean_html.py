@@ -26,6 +26,7 @@ ALL_LEAN_FLAGS = dict(
     compress_long_href=True,
     compress_image_src=True,
     strip_url_query_strings=True,
+    compress_nonnavigable_href=True,
 )
 
 
@@ -135,6 +136,171 @@ def test_strip_url_query_strings_off_keeps_query() -> None:
     tree = [_node("a", attributes={"href": "/x?utm=1"}, children=[])]
     out = apply_lean_to_tree(tree, strip_url_query_strings=False)
     assert out[0]["attributes"]["href"] == "/x?utm=1"
+
+
+# --- flag #4: compress_nonnavigable_href ---------------------------------
+
+
+def test_nonnavigable_drops_javascript_href() -> None:
+    tree = [_node("a", id="AABm", attributes={"href": "javascript:void(0)"}, text="More", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert "href" not in out[0]["attributes"]
+    # tag identity, id, and text survive — element stays clickable-by-id.
+    assert out[0]["id"] == "AABm"
+    assert out[0]["text"] == "More"
+
+
+def test_nonnavigable_drops_labeled_webforms_postback_href() -> None:
+    """A labeled __doPostBack anchor (visible text present) drops the opaque token."""
+    href = "javascript:__doPostBack('DataListResultats$ctl02$lnkDetail','')"
+    tree = [_node("a", id="AABm", attributes={"href": href}, text="+ Details", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert "href" not in out[0]["attributes"]
+
+
+def test_nonnavigable_keeps_textless_postback_href_stripped() -> None:
+    """A textless icon link's only naming signal is the postback control name, so
+    it survives — but with the noisy `javascript:` wrapper stripped (semantic
+    payload preserved, token cost reduced)."""
+    href = "javascript:__doPostBack('ctl00$grid$lnkDownloadPDF','')"
+    tree = [_node("a", id="AA", attributes={"href": href}, text="", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == "__doPostBack('ctl00$grid$lnkDownloadPDF','')"
+
+
+def test_nonnavigable_keeps_icon_marker_only_postback_href_stripped() -> None:
+    """`[icon]` is not a human label, so an icon-only postback link keeps its
+    semantic payload (with the `javascript:` wrapper stripped)."""
+    href = "javascript:__doPostBack('ctl00$grid$lnkExport','')"
+    tree = [_node("a", id="AA", attributes={"href": href}, text="[icon]", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == "__doPostBack('ctl00$grid$lnkExport','')"
+
+
+def test_nonnavigable_keeps_textless_void_wrapped_call_stripped() -> None:
+    """A `javascript:void(downloadFn(...))` href on a textless control keeps the
+    inner function-name signal — Codex/Lawy regression."""
+    tree = [_node("a", id="AA", attributes={"href": "javascript:void(downloadPdf('123'))"}, text="", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == "downloadPdf('123')"
+
+
+def test_nonnavigable_keeps_textless_bare_javascript_expression_stripped() -> None:
+    """A bare `javascript:fn(...)` href (no void wrapper) on a textless control
+    keeps the function call after the scheme is stripped."""
+    tree = [_node("a", id="AA", attributes={"href": "javascript:openModal('confirm')"}, text="", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == "openModal('confirm')"
+
+
+def test_nonnavigable_drops_textless_javascript_no_op_payloads() -> None:
+    """`javascript:void(0)`, `javascript:`, `javascript:void(undefined)` etc.
+    carry no signal — drop the href entirely even on textless controls."""
+    for noop in (
+        "javascript:",
+        "javascript:void(0)",
+        "javascript:void(0);",
+        "javascript:void(undefined)",
+        "javascript:void(null)",
+        "javascript:;",
+    ):
+        tree = [_node("a", id="AA", attributes={"href": noop}, text="", children=[])]
+        out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+        assert "href" not in out[0]["attributes"], f"{noop!r} should drop"
+
+
+def test_nonnavigable_drops_postback_href_labeled_by_aria() -> None:
+    href = "javascript:__doPostBack('ctl00$grid$lnkExport','')"
+    tree = [_node("a", id="AA", attributes={"href": href, "aria-label": "Export"}, text="", children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert "href" not in out[0]["attributes"]
+
+
+def test_nonnavigable_drops_postback_href_labeled_by_child() -> None:
+    """A wrapper anchor with the label in a child span still drops the postback href."""
+    href = "javascript:__doPostBack('ctl00$grid$lnkDetail','')"
+    tree = [_node("a", id="AA", attributes={"href": href}, children=[_node("span", id="AB", text="Details")])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert "href" not in out[0]["attributes"]
+
+
+def test_nonnavigable_keeps_href_when_label_is_below_recursion_depth_cap() -> None:
+    """Depth guard: a label nested deeper than _TEXT_SIGNAL_MAX_DEPTH isn't detected,
+    so the anchor is treated as textless and the semantic payload is conservatively
+    KEPT (no spurious drop, no RecursionError on deep DOMs). The `javascript:`
+    wrapper is still stripped on the textless path."""
+    from skyvern.utils.lean_html import _TEXT_SIGNAL_MAX_DEPTH
+
+    href = "javascript:__doPostBack('ctl00$grid$lnkDeep','')"
+    node: dict = _node("span", id="ZZ", text="Details")
+    for _ in range(_TEXT_SIGNAL_MAX_DEPTH + 5):
+        node = _node("div", id="WR", children=[node])
+    anchor = _node("a", id="AA", attributes={"href": href}, text="", children=[node])
+    out = apply_lean_to_tree([anchor], compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == "__doPostBack('ctl00$grid$lnkDeep','')"
+
+
+def test_nonnavigable_drops_pure_idiom_even_when_textless() -> None:
+    """Pure idioms (#/empty/javascript:;/void(0)) are content-free, so they drop
+    regardless of whether the element has a label."""
+    for idiom in ("#", "", "javascript:;", "javascript:void(0)", "javascript:void(0);"):
+        tree = [_node("a", id="AA", attributes={"href": idiom}, text="", children=[])]
+        out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+        assert "href" not in out[0]["attributes"], f"{idiom!r} should drop even on a textless element"
+
+
+def test_nonnavigable_drops_empty_and_bare_hash() -> None:
+    for noop in ("", "#", "  "):
+        tree = [_node("a", id="AA", attributes={"href": noop}, children=[])]
+        out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+        assert "href" not in out[0]["attributes"], f"{noop!r} should be dropped"
+
+
+def test_nonnavigable_preserves_hash_routes_and_anchors() -> None:
+    """SPA hash routes (#/...) and same-page anchors (#name) are real destinations — keep them."""
+    for navigable in ("#/checkout", "#/orders/123", "#section", "#" + "x"):
+        tree = [_node("a", id="AA", attributes={"href": navigable}, children=[])]
+        out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+        assert out[0]["attributes"]["href"] == navigable, f"{navigable!r} must be preserved"
+
+
+def test_nonnavigable_preserves_real_urls_even_when_long() -> None:
+    long_url = "https://www.example.com/very/long/destination/" + "x" * 200
+    tree = [_node("a", id="AA", attributes={"href": long_url}, children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == long_url
+
+
+def test_nonnavigable_substring_in_navigable_url_is_not_dropped() -> None:
+    """RISK-4 regression: the rule is scheme-anchored, not a bare substring match.
+    A real http(s) URL whose path merely contains '__doPostBack' must survive."""
+    url = "https://docs.example.com/help/__doPostBack-explained"
+    tree = [_node("a", id="AA", attributes={"href": url}, children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=True)
+    assert out[0]["attributes"]["href"] == url
+
+
+def test_nonnavigable_off_keeps_href() -> None:
+    tree = [_node("a", id="AA", attributes={"href": "javascript:void(0)"}, children=[])]
+    out = apply_lean_to_tree(tree, compress_nonnavigable_href=False)
+    assert out[0]["attributes"]["href"] == "javascript:void(0)"
+
+
+def test_nonnavigable_is_token_monotonic_never_adds_bytes() -> None:
+    """The transform only ever removes the attribute — it must never replace a short
+    href with a longer marker (that would inflate tokens, the inverse of the goal)."""
+    from skyvern.forge.sdk.core import skyvern_context
+    from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+    from skyvern.webeye.scraper.scraped_page import json_to_html
+
+    with skyvern_context.scoped(SkyvernContext(organization_id="o_test", workflow_run_id="wr_test")):
+        for noop in ("#", "", "javascript:__doPostBack('x','')"):
+            node = _node("a", id="AA", attributes={"href": noop}, text="t", children=[])
+            before = json_to_html(copy.deepcopy(node), need_skyvern_attrs=False)
+            after = json_to_html(
+                apply_lean_to_tree([node], compress_nonnavigable_href=True)[0], need_skyvern_attrs=False
+            )
+            assert len(after) <= len(before), f"href={noop!r}: rendered HTML grew ({before!r} -> {after!r})"
 
 
 # --- defaults / no-ops ---------------------------------------------------

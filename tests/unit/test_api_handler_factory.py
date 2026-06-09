@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -746,3 +747,26 @@ def test_router_fallback_chain_no_duplicate_keys_or_overlapping_chains(monkeypat
             f"each chain must drop one head from the previous (strict suffix); got chains={chains}. "
             "Non-suffix expansion could re-list already-tried hops and amplify retries."
         )
+
+
+def test_completion_cost_halves_vertex_flex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vertex flex responses (trafficType ON_DEMAND_FLEX) bill at 50%: litellm reports
+    them at the standard rate, so the helper applies the flex discount itself."""
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.10)
+
+    flex = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
+    standard = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND"}})
+    no_meta = SimpleNamespace(_hidden_params={})
+
+    assert LLMAPIHandlerFactory._completion_cost(flex) == pytest.approx(0.05)
+    assert LLMAPIHandlerFactory._completion_cost(standard) == pytest.approx(0.10)
+    assert LLMAPIHandlerFactory._completion_cost(no_meta) == pytest.approx(0.10)
+
+
+def test_completion_cost_returns_zero_when_litellm_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(completion_response: Any) -> float:
+        raise RuntimeError("provider unsupported")
+
+    monkeypatch.setattr(litellm, "completion_cost", _raise)
+    resp = SimpleNamespace(_hidden_params={"provider_specific_fields": {"traffic_type": "ON_DEMAND_FLEX"}})
+    assert LLMAPIHandlerFactory._completion_cost(resp) == 0.0

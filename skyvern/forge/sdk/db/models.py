@@ -309,10 +309,13 @@ class WorkflowTagEventModel(Base):
     """Append-only event log for workflow tags.
 
     Every state change writes a new row. SET events carry value; DELETE
-    events have value=NULL and carry their own attribution. Supersession
-    sets superseded_at on the previously-current row so the partial unique
-    index keeps exactly one active SET per (org, wpid, key). superseded_at
-    means "no longer current but still historical fact"; deleted_at follows
+    events carry their own attribution (and a value only for standalone-label
+    deletes, which are identified by value). A tag is a label (value, always
+    present) with an optional group (key): grouped labels are identified by
+    key, standalone labels by value. Two partial unique indexes keep exactly
+    one active SET per (org, wpid, key) for grouped labels and per
+    (org, wpid, value) for standalone labels. superseded_at means "no longer
+    current but still historical fact"; deleted_at follows
     the same soft-delete convention as SoftDeleteMixin (via a manual column)
     and is separate.
 
@@ -343,15 +346,36 @@ class WorkflowTagEventModel(Base):
             postgresql_include=["workflow_permanent_id"],
             postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
         ),
-        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # Powers the value-only ("filter by label") term, which matches a value
+        # across any/no group.
         Index(
-            "workflow_tag_events_active_set_unique",
+            "workflow_tag_events_org_value_active_idx",
+            "organization_id",
+            "value",
+            postgresql_include=["workflow_permanent_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # One active SET per group (key) on a workflow = one-label-per-group.
+        Index(
+            "workflow_tag_events_active_grouped_unique",
             "organization_id",
             "workflow_permanent_id",
             "key",
             unique=True,
-            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
-            sqlite_where=text("superseded_at IS NULL AND event_type = 'set'"),
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+        ),
+        # A standalone label (no group) is identified by its value, so it gets
+        # its own one-active-SET-per-value uniqueness.
+        Index(
+            "workflow_tag_events_active_label_unique",
+            "organization_id",
+            "workflow_permanent_id",
+            "value",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
@@ -362,13 +386,16 @@ class WorkflowTagEventModel(Base):
             "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
             name="ck_workflow_tag_events_caller_type",
         ),
-        CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
+        # SET rows require a value; DELETE rows carry a value (standalone-label
+        # delete) or null (grouped delete, identified by key).
+        CheckConstraint("event_type != 'set' OR value IS NOT NULL", name="ck_workflow_tag_events_set_has_value"),
     )
 
     tag_event_id = Column(String, primary_key=True, default=generate_tag_event_id)
     workflow_permanent_id = Column(String, nullable=False)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
-    key = Column(String, nullable=False)
+    # Nullable: null = standalone label (group-less); non-null = grouped label.
+    key = Column(String, nullable=True)
     value = Column(String, nullable=True)
     event_type = Column(String, nullable=False)
     set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)

@@ -83,6 +83,7 @@ def load_prompt_with_elements_tracked(
     lean_compress_long_href: bool = False,
     lean_compress_image_src: bool = False,
     lean_strip_url_query_strings: bool = False,
+    lean_compress_nonnavigable_href: bool = False,
     **kwargs: Any,
 ) -> tuple[str, dict[str, Any]]:
     """Same as load_prompt_with_elements but also returns post-ceiling kwargs.
@@ -92,7 +93,12 @@ def load_prompt_with_elements_tracked(
     inputs for caching should use these values instead of the pre-drop kwargs
     so two requests that render to the same final prompt share a cache key.
     """
-    lean_any = lean_compress_long_href or lean_compress_image_src or lean_strip_url_query_strings
+    lean_any = (
+        lean_compress_long_href
+        or lean_compress_image_src
+        or lean_strip_url_query_strings
+        or lean_compress_nonnavigable_href
+    )
     if lean_any and element_tree_builder.support_lean_elements_tree():
         elements = _sanitize_elements_for_prompt(
             element_tree_builder,
@@ -101,6 +107,7 @@ def load_prompt_with_elements_tracked(
                 compress_long_href=lean_compress_long_href,
                 compress_image_src=lean_compress_image_src,
                 strip_url_query_strings=lean_strip_url_query_strings,
+                compress_nonnavigable_href=lean_compress_nonnavigable_href,
             ),
         )
     else:
@@ -189,6 +196,7 @@ def load_prompt_with_elements(
     lean_compress_long_href: bool = False,
     lean_compress_image_src: bool = False,
     lean_strip_url_query_strings: bool = False,
+    lean_compress_nonnavigable_href: bool = False,
     **kwargs: Any,
 ) -> str:
     prompt, _ = load_prompt_with_elements_tracked(
@@ -199,6 +207,7 @@ def load_prompt_with_elements(
         lean_compress_long_href=lean_compress_long_href,
         lean_compress_image_src=lean_compress_image_src,
         lean_strip_url_query_strings=lean_strip_url_query_strings,
+        lean_compress_nonnavigable_href=lean_compress_nonnavigable_href,
         **kwargs,
     )
     return prompt

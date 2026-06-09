@@ -18,9 +18,9 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.forge.sdk.trace import traced
 from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
+    has_credential_totp_candidate,
     poll_otp_value,
-    try_generate_totp_from_credential,
+    resolve_otp_value,
 )
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.utils.url_validators import strip_query_params
@@ -55,29 +55,6 @@ from skyvern.webeye.actions.actions import (
 from skyvern.webeye.scraper.scraped_page import ScrapedPage
 
 LOG = structlog.get_logger()
-
-
-def _has_credential_totp_candidate(workflow_run_id: str | None) -> bool:
-    # Mirrors try_generate_totp_from_credential selection: active-with-TOTP, or
-    # exactly one TOTP-bearing candidate when no active is set (multi-no-active -> False).
-    if not workflow_run_id:
-        return False
-    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
-    if not workflow_run_context:
-        return False
-
-    current_context = skyvern_context.current()
-    active_credential_key = current_context.active_credential_parameter_key if current_context else None
-    if active_credential_key:
-        value = workflow_run_context.values.get(active_credential_key)
-        return isinstance(value, dict) and isinstance(value.get("totp"), str)
-
-    candidate_keys = [
-        key
-        for key, value in workflow_run_context.values.items()
-        if isinstance(value, dict) and isinstance(value.get("totp"), str)
-    ]
-    return len(candidate_keys) == 1
 
 
 def parse_action(
@@ -976,37 +953,16 @@ async def generate_cua_fallback_actions(
             )
 
     elif skyvern_action_type == "get_verification_code":
-        # 1. Check navigation payload first for inline OTP.
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        # 2. Then try to generate TOTP from credential if payload has no OTP.
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
-        # 3. Lastly, poll for OTP if organization has config and no OTP was found yet.
-        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-            LOG.info(
-                "Getting verification code for CUA",
-                task_id=task.task_id,
-                organization_id=task.organization_id,
-                workflow_run_id=task.workflow_run_id,
-                totp_verification_url=strip_query_params(task.totp_verification_url)
-                if task.totp_verification_url
-                else None,
-                totp_identifier=task.totp_identifier,
-            )
-            try:
-                otp_value = await poll_otp_value(
-                    organization_id=task.organization_id,
-                    task_id=task.task_id,
-                    workflow_run_id=task.workflow_run_id,
-                    totp_verification_url=task.totp_verification_url,
-                    totp_identifier=task.totp_identifier,
-                )
-            except NoTOTPVerificationCodeFound:
-                reasoning_suffix = "No verification code found"
-                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
-            except FailedToGetTOTPVerificationCode as e:
-                reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
-                reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+        try:
+            otp_value = await resolve_otp_value(task)
+        except NoTOTPVerificationCodeFound:
+            otp_value = None
+            reasoning_suffix = "No verification code found"
+            reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
+        except FailedToGetTOTPVerificationCode as e:
+            otp_value = None
+            reasoning_suffix = f"Failed to get verification code. Reason: {e.reason}"
+            reasoning = f"{reasoning}. {reasoning_suffix}" if reasoning else reasoning_suffix
 
         # OTP value obtained - use it as verification code
         if otp_value and otp_value.get_otp_type() == OTPType.TOTP:
@@ -1021,7 +977,7 @@ async def generate_cua_fallback_actions(
             # Three-way classification: missing config, configured-but-empty (any of
             # URL / identifier / credential), or wrong-type otp_value. Each gets a
             # distinct customer-visible signal so webhook consumers can branch.
-            has_credential = _has_credential_totp_candidate(task.workflow_run_id)
+            has_credential = has_credential_totp_candidate(task.workflow_run_id)
             no_source_configured = (
                 otp_value is None and not task.totp_verification_url and not task.totp_identifier and not has_credential
             )

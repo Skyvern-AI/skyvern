@@ -50,11 +50,11 @@ def _patch_cua_fallback_common(monkeypatch: pytest.MonkeyPatch, action_type: str
 
     monkeypatch.setattr("skyvern.webeye.actions.parse_actions.app.LLM_API_HANDLER", AsyncMock(side_effect=_fake_llm))
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions.extract_totp_from_navigation_inputs",
+        "skyvern.services.otp_service.extract_totp_from_navigation_inputs",
         lambda *_: None,
     )
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions.try_generate_totp_from_credential",
+        "skyvern.services.otp_service.try_generate_totp_from_credential",
         lambda *_: None,
     )
 
@@ -68,7 +68,7 @@ async def test_get_verification_code_with_no_source_emits_missing_totp_source(mo
     step = _make_step()
     _patch_cua_fallback_common(monkeypatch, "get_verification_code")
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions._has_credential_totp_candidate",
+        "skyvern.webeye.actions.parse_actions.has_credential_totp_candidate",
         lambda *_: False,
     )
 
@@ -93,14 +93,14 @@ async def test_get_verification_code_with_url_configured_emits_configured_but_em
     step = _make_step()
     _patch_cua_fallback_common(monkeypatch, "get_verification_code")
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions._has_credential_totp_candidate",
+        "skyvern.webeye.actions.parse_actions.has_credential_totp_candidate",
         lambda *_: False,
     )
 
     async def _no_poll(*args, **kwargs):  # type: ignore[no-untyped-def]
         return None
 
-    monkeypatch.setattr("skyvern.webeye.actions.parse_actions.poll_otp_value", _no_poll)
+    monkeypatch.setattr("skyvern.services.otp_service.poll_otp_value", _no_poll)
 
     actions = await generate_cua_fallback_actions(task, step, assistant_message=None, reasoning=None)
 
@@ -127,7 +127,7 @@ async def test_get_verification_code_with_only_credential_configured_but_failing
     step = _make_step()
     _patch_cua_fallback_common(monkeypatch, "get_verification_code")
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions._has_credential_totp_candidate",
+        "skyvern.webeye.actions.parse_actions.has_credential_totp_candidate",
         lambda *_: True,
     )
 
@@ -155,7 +155,7 @@ async def test_get_verification_code_with_credential_totp_returns_verification(
     fake_otp_value.get_otp_type.return_value = OTPType.TOTP
 
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions.try_generate_totp_from_credential",
+        "skyvern.services.otp_service.try_generate_totp_from_credential",
         lambda *_: fake_otp_value,
     )
 
@@ -179,7 +179,7 @@ async def test_get_verification_code_with_multiple_unselected_credentials_emits_
     step = _make_step()
     _patch_cua_fallback_common(monkeypatch, "get_verification_code")
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions._has_credential_totp_candidate",
+        "skyvern.webeye.actions.parse_actions.has_credential_totp_candidate",
         lambda *_: False,  # mirroring multi-no-active selection result
     )
 
@@ -223,7 +223,7 @@ async def test_get_magic_link_with_credential_candidate_still_emits_missing_sour
     # Even if _has_credential_totp_candidate would return True, the magic-link
     # branch must NOT consult it. Patch to True to prove the branch ignores it.
     monkeypatch.setattr(
-        "skyvern.webeye.actions.parse_actions._has_credential_totp_candidate",
+        "skyvern.webeye.actions.parse_actions.has_credential_totp_candidate",
         lambda *_: True,
     )
 

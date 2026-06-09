@@ -34,7 +34,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
 )
 
 
-def _make_chat_request() -> WorkflowCopilotChatRequest:
+def _make_chat_request(mode: str | None = None, code_block: bool | None = None) -> WorkflowCopilotChatRequest:
     return WorkflowCopilotChatRequest(
         workflow_permanent_id="wpid-1",
         workflow_id="wf-request",
@@ -42,6 +42,8 @@ def _make_chat_request() -> WorkflowCopilotChatRequest:
         workflow_run_id=None,
         message="Please update it",
         workflow_yaml="title: Example",
+        mode=mode,
+        code_block=code_block,
     )
 
 
@@ -159,6 +161,78 @@ async def test_flag_on_dispatches_to_new_copilot(monkeypatch: pytest.MonkeyPatch
     response = await workflow_copilot_chat_post(request, _make_chat_request(), organization)
 
     assert response is sentinel
+    new_copilot_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_mode_ask_forces_v1_over_flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode='ask' must take the v1 path even when the settings flag is on."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+
+    new_copilot_mock = AsyncMock(side_effect=AssertionError("mode='ask' must not reach the v2 path"))
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="ask"), organization)
+
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_mode_build_forces_v2_over_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode='build' must take the v2 path even when the settings flag is off."""
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, return_value=False)
+
+    sentinel = object()
+    new_copilot_mock = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode="build"), organization)
+
+    assert response is sentinel
+    new_copilot_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_request_mode_absent_follows_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    """mode absent (None) keeps following the settings flag in both directions."""
+    new_copilot_mock = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.routes.workflow_copilot._new_copilot_chat_post",
+        new_copilot_mock,
+    )
+    captured = _install_fake_create(monkeypatch)
+
+    request = MagicMock()
+    request.headers = {}
+    organization = SimpleNamespace(organization_id="org-1")
+
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", False)
+    _install_mock_provider(monkeypatch, return_value=False)
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    assert response is captured["sentinel"]
+    new_copilot_mock.assert_not_awaited()
+
+    monkeypatch.setattr(settings, "ENABLE_WORKFLOW_COPILOT_V2", True)
+    response = await workflow_copilot_chat_post(request, _make_chat_request(mode=None), organization)
+    assert response is new_copilot_mock.return_value
     new_copilot_mock.assert_awaited_once()
 
 
