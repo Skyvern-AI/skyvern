@@ -83,6 +83,62 @@ workflow_definition:
 """
 
 
+def _code_artifact_metadata(label: str = "open_results") -> list[dict[str, object]]:
+    return [
+        {
+            "block_label": label,
+            "declared_goal": "Open the result page.",
+            "claimed_outcomes": [
+                {
+                    "id": "claim:open_results",
+                    "scope": "sufficient_for_prefix_validation",
+                    "text": "The result page is reachable.",
+                    "status": "satisfied",
+                    "depends_on": ["dep:result_link"],
+                    "criteria_ids": ["criterion:result_page_reached"],
+                    "evidence_refs": ["evidence:result_link"],
+                }
+            ],
+            "page_dependencies": [
+                {
+                    "id": "dep:result_link",
+                    "scope": "current_page_state",
+                    "status": "satisfied",
+                    "evidence_refs": ["evidence:result_link"],
+                }
+            ],
+            "completion_criteria": [
+                {
+                    "id": "criterion:result_page_reached",
+                    "text": "The result page is visible after authored execution.",
+                    "level": "terminal",
+                }
+            ],
+            "evidence_refs": [
+                {
+                    "evidence_ref": "evidence:result_link",
+                    "claim_id": "claim:open_results",
+                    "dependency_id": "dep:result_link",
+                    "criterion_id": "criterion:result_page_reached",
+                    "status": "satisfied",
+                    "source_tool": "inspect_page_for_composition",
+                    "observation_step": 1,
+                }
+            ],
+            "observation_refs": [],
+            "terminal_verifier_expectations": [
+                {
+                    "id": "verify:result_page_reached",
+                    "text": "Verify the result page is visible.",
+                    "criteria_ids": ["criterion:result_page_reached"],
+                    "claimed_outcome_ids": ["claim:open_results"],
+                }
+            ],
+            "exploration_observations": [],
+        }
+    ]
+
+
 def _inline_conditional_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
     return f"""
 workflow_definition:
@@ -1345,6 +1401,7 @@ workflow_definition:
                     {"label": "open_results", "observation_step": 0},
                     {"label": "read_results", "observation_step": 1},
                 ],
+                "code_artifact_metadata": _code_artifact_metadata(),
                 "parameters": {},
             }
         ),
@@ -1360,6 +1417,14 @@ workflow_definition:
         {"label": "open_results", "observation_step": 0},
         {"label": "read_results", "observation_step": 1},
     ]
+    assert captured["payload"]["code_artifact_metadata"][0]["block_label"] == "open_results"
+    assert captured["payload"]["code_artifact_metadata"][0]["claimed_outcomes"][0]["id"] == "claim:open_results"
+    assert (
+        captured["payload"]["code_artifact_metadata"][0]["evidence_refs"][0]["evidence_ref"] == "evidence:result_link"
+    )
+    assert [
+        item.model_dump(mode="json", exclude_none=True) for item in captured["payload"]["raw_code_artifact_metadata"]
+    ] == captured["payload"]["code_artifact_metadata"]
     assert ctx.block_observation_refs == {}
 
 

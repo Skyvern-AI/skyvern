@@ -97,7 +97,9 @@ describe("NodeAdderNode", () => {
     cleanup();
   });
 
-  it("keeps the loop as parent and inherits branch context when adding the first block in a nested loop", () => {
+  it("keeps the loop as parent without branch context when adding the first block in a nested loop", () => {
+    // SKY-10719: adding a block into a loop nested in a conditional keeps the
+    // loop as parent with no branch context (loop children are not branch members).
     const edges: Array<Edge> = [
       {
         id: "edge",
@@ -142,18 +144,16 @@ describe("NodeAdderNode", () => {
 
     fireEvent.click(screen.getByTestId("node-adder-button"));
 
-    expect(useWorkflowPanelStore.getState().workflowPanelState).toMatchObject({
+    const state = useWorkflowPanelStore.getState().workflowPanelState;
+    expect(state).toMatchObject({
       active: true,
       content: "nodeLibrary",
       data: {
-        branchContext: {
-          branchId: "branch-a",
-          conditionalNodeId: "conditional",
-        },
         next: "adder",
         parent: "loop",
         previous: "start",
       },
     });
+    expect(state.data?.branchContext).toBeUndefined();
   });
 });

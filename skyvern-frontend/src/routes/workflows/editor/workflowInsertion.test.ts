@@ -101,7 +101,9 @@ describe("findBranchContextForInsertion", () => {
     ).toEqual(branch);
   });
 
-  it("climbs to a parent loop when an empty nested loop inserts from its start node", () => {
+  it("does not inherit branch context when inserting into a loop nested in a conditional (from its start node)", () => {
+    // SKY-10719: a loop is a container boundary; an insert inside it must not
+    // inherit the loop's own membership in the outer conditional.
     expect(
       findBranchContextForInsertion(
         [
@@ -126,6 +128,78 @@ describe("findBranchContextForInsertion", () => {
         ],
         "start",
         "loop",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("does not inherit branch context when inserting between two blocks inside a loop nested in a conditional", () => {
+    // SKY-10719: walking up from a loop child reaches the loop, whose branch
+    // membership belongs to the loop, not to blocks inside it.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "conditional-node",
+            type: "conditional",
+            data: {
+              activeBranchId: "branch-a",
+              branches: [{ id: "branch-a" }, { id: "branch-b" }],
+              label: "conditional",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "loop",
+            parentId: "conditional-node",
+            type: "loop",
+            data: {
+              conditionalBranchId: "branch-a",
+              conditionalLabel: "conditional",
+              conditionalMergeLabel: null,
+              conditionalNodeId: "conditional-node",
+              label: "block_loop",
+            },
+          },
+          { id: "block-8", parentId: "loop", type: "codeBlock", data: {} },
+          { id: "block-14", parentId: "loop", type: "codeBlock", data: {} },
+        ],
+        "block-8",
+        "loop",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("still inherits branch context when inserting a sibling after a loop inside a conditional", () => {
+    // The loop's own membership is correct when the loop itself is the insertion
+    // point; the boundary only applies when stepping INTO the loop from a child.
+    expect(
+      findBranchContextForInsertion(
+        [
+          {
+            id: "conditional-node",
+            type: "conditional",
+            data: {
+              activeBranchId: "branch-a",
+              branches: [{ id: "branch-a" }],
+              label: "conditional",
+              mergeLabel: null,
+            },
+          },
+          {
+            id: "loop",
+            parentId: "conditional-node",
+            type: "loop",
+            data: {
+              conditionalBranchId: "branch-a",
+              conditionalLabel: "conditional",
+              conditionalMergeLabel: null,
+              conditionalNodeId: "conditional-node",
+              label: "block_loop",
+            },
+          },
+        ],
+        "loop",
+        "conditional-node",
       ),
     ).toEqual(branch);
   });

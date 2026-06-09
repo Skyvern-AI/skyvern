@@ -507,8 +507,12 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
 
     persist_mock = AsyncMock()
     monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", persist_mock)
-    monkeypatch.setattr("skyvern.forge.sdk.routes.streaming.registries.stream_ref_active", lambda wrid: True)
-    monkeypatch.setattr("skyvern.forge.sdk.routes.streaming.registries.set_deferred_close_params", lambda *a, **k: None)
+    # streaming is a namespace package; patch the module object so resolution does not depend on the
+    # parent binding the submodule, which varies with import order across the suite.
+    from skyvern.forge.sdk.routes.streaming import registries as streaming_registries
+
+    monkeypatch.setattr(streaming_registries, "stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr(streaming_registries, "set_deferred_close_params", lambda *a, **k: None)
 
     await manager.cleanup_for_workflow_run("wfr_streamed", task_ids=[], close_browser_on_completion=True)
 
