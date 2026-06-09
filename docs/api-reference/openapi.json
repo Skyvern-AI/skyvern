@@ -14337,6 +14337,12 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "description": "When true, the login block does not reuse the credential's saved browser profile. The run logs in from a clean state and the freshly captured session persists via the normal session path. Use this when re-saving a credential's browser session (a reused profile is loaded read-only and would not persist updates).",
+            "default": false
           }
         },
         "type": "object",
@@ -14526,6 +14532,12 @@
             "type": "boolean",
             "title": "Complete Verification",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "description": "When true, the login block does not reuse the credential's saved browser profile. The run logs in from a clean state and the freshly captured session persists via the normal session path. Use this when re-saving a credential's browser session (a reused profile is loaded read-only and would not persist updates).",
+            "default": false
           }
         },
         "type": "object",
