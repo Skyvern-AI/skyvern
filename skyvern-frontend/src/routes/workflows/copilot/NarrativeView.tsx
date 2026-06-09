@@ -425,6 +425,14 @@ interface TurnSummary {
   isStoppedWithDraft: boolean;
 }
 
+function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
+  const latest = new Map<string, BlockState>();
+  for (const block of blocks) {
+    latest.set(block.label, block);
+  }
+  return Array.from(latest.values());
+}
+
 function asksUserForInput(turn: TurnNarrativeState): boolean {
   if (turn.responseType === "ASK_QUESTION") {
     return true;
@@ -442,8 +450,9 @@ function asksUserForInput(turn: TurnNarrativeState): boolean {
 }
 
 function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
+  const rollupBlocks = latestBlocksByLabel(turn.blocks);
   const isFail =
-    turn.terminal === "error" || turn.blocks.some((b) => b.state === "failed");
+    turn.terminal === "error" || rollupBlocks.some((b) => b.state === "failed");
   const mode = effectiveMode(turn);
   const needsInput = asksUserForInput(turn);
   const isQA =
@@ -490,8 +499,8 @@ function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
   const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
   if (turnElapsed) stats.push(turnElapsed);
   if (!isQA) {
-    const ok = turn.blocks.filter((b) => b.state === "completed").length;
-    const failed = turn.blocks.filter((b) => b.state === "failed").length;
+    const ok = rollupBlocks.filter((b) => b.state === "completed").length;
+    const failed = rollupBlocks.filter((b) => b.state === "failed").length;
     const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
     if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
     if (newBlocks) stats.push(`${newBlocks} new`);
@@ -592,8 +601,9 @@ interface RollupCardProps {
 function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
   const closing =
     turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
-  const completed = turn.blocks.filter((b) => b.state === "completed");
-  const failed = turn.blocks.filter((b) => b.state === "failed");
+  const rollupBlocks = latestBlocksByLabel(turn.blocks);
+  const completed = rollupBlocks.filter((b) => b.state === "completed");
+  const failed = rollupBlocks.filter((b) => b.state === "failed");
   const showCommit = !summary.isQA && completed.length > 0;
 
   return (

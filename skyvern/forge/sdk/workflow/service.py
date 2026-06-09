@@ -84,6 +84,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ExtractionBlock,
     FileParserBlock,
     ForLoopBlock,
+    LoginBlock,
     NavigationBlock,
     PDFParserBlock,
     TaskV2Block,
@@ -3316,6 +3317,10 @@ class WorkflowService:
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
+        # A credential re-save logs in fresh so the new session persists via the normal path,
+        # so it must not reuse (and boot read-only from) the credential's saved profile.
+        if isinstance(block, LoginBlock) and block.skip_saved_profile:
+            return None
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).

@@ -291,6 +291,11 @@ class LocalStorage(BaseStorage):
         source_directory = Path(directory).resolve()
         if source_directory == stored_folder_path:
             return
+        # True overwrite: drop any prior contents so a re-save can't leave stale cookies or
+        # localStorage from the old session mixed into the refreshed profile. Let errors surface
+        # rather than silently merging onto a half-deleted directory.
+        if stored_folder_path.exists():
+            shutil.rmtree(stored_folder_path)
         self._create_directories_if_not_exists(stored_folder_path)
         LOG.info(
             "Storing browser profile locally",

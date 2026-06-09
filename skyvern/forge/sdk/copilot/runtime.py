@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, TypeAlias, cast
 
 import structlog
 
@@ -47,6 +47,10 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+CodeArtifactMetadataValue: TypeAlias = (
+    str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
+)
+CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -194,7 +198,11 @@ class AgentContext:
     block_observation_refs: dict[str, int] = field(default_factory=dict)
     # Raw tool input for block_observation_refs, retained only for diagnostics
     # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: Any | None = None
+    raw_block_observation_refs: object | None = None
+    # Block-label keyed metadata describing authored code artifacts. This layer
+    # only normalizes and carries the metadata; sufficiency checks live elsewhere.
+    code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
+    raw_code_artifact_metadata: object | None = None
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
