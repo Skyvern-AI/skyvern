@@ -10,7 +10,12 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { ReloadIcon, Cross2Icon, ChevronDownIcon } from "@radix-ui/react-icons";
+import {
+  ReloadIcon,
+  Cross2Icon,
+  ChevronDownIcon,
+  CheckIcon,
+} from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -56,6 +61,20 @@ import {
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
+import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { cn } from "@/util/utils";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
@@ -66,6 +85,44 @@ function formatElapsedSeconds(ms: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Ask's mark is a text dingbat; Build's is a color emoji that ModeGlyph flattens
+// to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
+const ASK_GLYPH = "\u275D\uFE0E";
+const BUILD_GLYPH = "\uD83D\uDC09";
+
+function isPictographic(glyph: string): boolean {
+  try {
+    return /\p{Extended_Pictographic}/u.test(glyph);
+  } catch {
+    return false;
+  }
+}
+
+function ModeGlyph({
+  mode,
+  tone = "light",
+}: {
+  mode: "ask" | "build";
+  tone?: "light" | "dark";
+}) {
+  const glyph = mode === "build" ? BUILD_GLYPH : ASK_GLYPH;
+  const filter = isPictographic(glyph)
+    ? tone === "dark"
+      ? "grayscale(1) brightness(0)"
+      : "grayscale(1) brightness(0) invert(1)"
+    : undefined;
+  return (
+    <span className="inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+      <span
+        className={cn(mode === "build" ? "text-[16px]" : "text-[15px]")}
+        style={{ lineHeight: 1, filter }}
+      >
+        {glyph}
+      </span>
+    </span>
+  );
 }
 
 function ConvoAggregatePill({
@@ -293,6 +350,15 @@ export function WorkflowCopilotChat({
   initialMessage,
   onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
+  const copilotV2Enabled =
+    useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2") === true;
+  const codeBlockModeEnabled =
+    useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE") === true;
+  const [composerMode, setComposerMode] = useState<"ask" | "build">("build");
+  const [codeWorkflow, setCodeWorkflow] = useState(true);
+  // Build can never be active unless the V2 flag is on.
+  const isBuild = copilotV2Enabled && composerMode === "build";
+  const showCodeToggle = isBuild && codeBlockModeEnabled;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -433,8 +499,16 @@ export function WorkflowCopilotChat({
     const textarea = textareaRef.current;
     if (!textarea) return;
 
+    if (!textarea.value) {
+      textarea.style.height = "40px";
+      textarea.style.overflowY = "hidden";
+      return;
+    }
+
     textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
+    const newHeight = Math.min(textarea.scrollHeight, 150);
+    textarea.style.height = `${newHeight}px`;
+    textarea.style.overflowY = newHeight >= 150 ? "auto" : "hidden";
   }, []);
 
   useEffect(() => {
@@ -1135,6 +1209,8 @@ export function WorkflowCopilotChat({
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
             workflow_yaml: workflowYaml,
+            mode: copilotV2Enabled ? composerMode : null,
+            code_block: showCodeToggle ? codeWorkflow : null,
             cancel_token: cancelToken,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -1242,12 +1318,16 @@ export function WorkflowCopilotChat({
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
+      codeWorkflow,
+      composerMode,
+      copilotV2Enabled,
       credentialGetter,
       getSaveData,
       inputValue,
       isLiveBrowserReady,
       liveBrowserSessionId,
       requiresLiveBrowser,
+      showCodeToggle,
       updateQueuedPrompt,
       workflowCopilotChatId,
       workflowPermanentId,
@@ -1757,7 +1837,7 @@ export function WorkflowCopilotChat({
             isHearingSpeech={isSpeechHearing}
             disabled={inputDisabled}
             onToggle={toggleSpeech}
-            className="h-9 w-9"
+            className="h-10 w-10 rounded-lg"
           />
           <textarea
             ref={textareaRef}
@@ -1768,18 +1848,18 @@ export function WorkflowCopilotChat({
                   ? "Type a message to queue for the next turn…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to queue..."
-                    : "Type your message... (Shift+Enter for new line)"
+                    : "Message Skyvern Copilot…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-input bg-slate-elevation2 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
-              minHeight: "38px",
+              minHeight: "40px",
               maxHeight: "150px",
-              overflow: "auto",
+              overflowY: "hidden",
             }}
           />
           {isLoading && queuedPrompt ? (
@@ -1787,14 +1867,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={cancelQueuedPrompt}
                 title="Edit queued message"
-                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Edit queued
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1804,14 +1884,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={() => handleSend()}
                 title="Queue for the next turn"
-                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Queue
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1820,17 +1900,108 @@ export function WorkflowCopilotChat({
             <button
               onClick={cancelQueuedPrompt}
               title="Edit queued prompt"
-              className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              className="flex h-10 items-center justify-center rounded-lg bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
               Cancel
             </button>
-          ) : (
+          ) : !copilotV2Enabled ? (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-cta px-4 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
+              className="flex h-10 items-center justify-center rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
             >
               Send
             </button>
+          ) : (
+            <div className="flex items-end gap-2">
+              {showCodeToggle ? (
+                <TooltipProvider>
+                  <Tooltip delayDuration={300}>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-pressed={codeWorkflow}
+                        onClick={() => setCodeWorkflow((v) => !v)}
+                        className={cn(
+                          "flex h-10 w-10 items-center justify-center rounded-lg border transition-colors hover:brightness-[1.18] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                          codeWorkflow
+                            ? "border-sky-300 bg-sky-300/15 text-sky-300"
+                            : "border-slate-600 bg-transparent text-slate-400",
+                        )}
+                      >
+                        <span
+                          className="text-[13px] font-semibold"
+                          style={{ lineHeight: 1 }}
+                        >
+                          {"</>"}
+                        </span>
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-[260px]">
+                      Build the workflow as code. Faster and more flexible, but
+                      may need extra detail to handle every edge case.
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : null}
+              <div className="flex items-stretch">
+                <button
+                  onClick={() => handleSend()}
+                  className="flex h-10 items-center gap-1.5 rounded-l-lg bg-cta px-3 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ModeGlyph mode={isBuild ? "build" : "ask"} tone="dark" />
+                  {isBuild ? "Build" : "Ask"}
+                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      title="Switch mode"
+                      aria-label="Switch mode"
+                      className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <ChevronDownIcon className="h-3.5 w-3.5" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    side="top"
+                    align="end"
+                    className="w-[272px] p-1.5"
+                  >
+                    <DropdownMenuItem
+                      onSelect={() => setComposerMode("ask")}
+                      className="flex items-start gap-2.5"
+                    >
+                      <ModeGlyph mode="ask" />
+                      <span className="flex flex-1 flex-col">
+                        <span className="text-sm font-medium">Ask</span>
+                        <span className="text-xs leading-snug text-muted-foreground">
+                          Answer questions and make quick workflow edits.
+                        </span>
+                      </span>
+                      {!isBuild ? (
+                        <CheckIcon className="h-4 w-4 text-sky-400" />
+                      ) : null}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => setComposerMode("build")}
+                      className="flex items-start gap-2.5"
+                    >
+                      <ModeGlyph mode="build" />
+                      <span className="flex flex-1 flex-col">
+                        <span className="text-sm font-medium">Build</span>
+                        <span className="text-xs leading-snug text-muted-foreground">
+                          Navigates the site to design your workflow, then tests
+                          that it works.
+                        </span>
+                      </span>
+                      {isBuild ? (
+                        <CheckIcon className="h-4 w-4 text-sky-400" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </div>
           )}
         </div>
       </div>

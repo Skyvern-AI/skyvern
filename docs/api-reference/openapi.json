@@ -726,14 +726,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`.",
+              "description": "Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`.",
               "examples": [
                 "env:prod",
+                "production",
+                "env:*",
                 "customer:acme,env:prod"
               ],
               "title": "Tags"
             },
-            "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`."
+            "description": "Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`."
           },
           {
             "name": "template",
@@ -14387,6 +14389,11 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "default": false
           }
         },
         "type": "object",
@@ -14576,6 +14583,11 @@
             "type": "boolean",
             "title": "Complete Verification",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "default": false
           }
         },
         "type": "object",
@@ -17545,25 +17557,56 @@
       "TagApplyRequest": {
         "properties": {
           "tags": {
-            "additionalProperties": {
-              "type": "string"
+            "items": {
+              "$ref": "#/components/schemas/TagInput"
             },
-            "type": "object",
+            "type": "array",
             "title": "Tags",
-            "description": "Tags to set (overwrite). Map of key to value."
+            "description": "Tags to set (overwrite). List of {key?, value} objects."
           },
           "tags_to_delete": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/TagDeleteInput"
             },
             "type": "array",
             "title": "Tags To Delete",
-            "description": "Tag keys to soft-delete."
+            "description": "Tags to soft-delete. List of {key?, value?} targets."
           }
         },
         "type": "object",
         "title": "TagApplyRequest",
-        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty;\nboth empty is a valid no-op. Same-key collisions: set wins over delete."
+        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty (both\nempty is a no-op). On a same-identity collision, set wins over delete."
+      },
+      "TagDeleteInput": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key",
+            "description": "Group (key) to delete. Use for grouped tags."
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Label (value) to delete. Use for standalone labels."
+          }
+        },
+        "type": "object",
+        "title": "TagDeleteInput",
+        "description": "One tag to soft-delete: a grouped tag by its ``key``, or a standalone label\nby its ``value`` (omit the key)."
       },
       "TagHistoryItem": {
         "properties": {
@@ -17572,7 +17615,14 @@
             "title": "Tag Event Id"
           },
           "key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Key"
           },
           "value": {
@@ -17650,6 +17700,58 @@
         ],
         "title": "TagHistoryResponse"
       },
+      "TagInput": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key",
+            "description": "Optional group (key). Omit for a standalone label."
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Label (value). Always required."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagInput",
+        "description": "One tag to set. ``value`` is the required label; ``key`` is the optional\ngroup — null for a standalone label, set for a grouped label (e.g. env:prod)."
+      },
+      "TagItem": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagItem",
+        "description": "A single tag (key + label) without per-tag attribution. ``key`` is null\nfor a standalone label."
+      },
       "TagKey": {
         "properties": {
           "key": {
@@ -17720,6 +17822,17 @@
       },
       "TagResponse": {
         "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
           "value": {
             "type": "string",
             "title": "Value"
@@ -17746,7 +17859,7 @@
           "set_by"
         ],
         "title": "TagResponse",
-        "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row)."
+        "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row).\n``key`` is null for a standalone label."
       },
       "TagsResponse": {
         "properties": {
@@ -17755,10 +17868,10 @@
             "title": "Workflow Permanent Id"
           },
           "tags": {
-            "additionalProperties": {
+            "items": {
               "$ref": "#/components/schemas/TagResponse"
             },
-            "type": "object",
+            "type": "array",
             "title": "Tags"
           }
         },
@@ -17768,7 +17881,7 @@
           "tags"
         ],
         "title": "TagsResponse",
-        "description": "Current tag map for a workflow."
+        "description": "Current tags for a workflow. A list (not a key-map) so standalone labels,\nwhich have no key, are representable."
       },
       "TaskBlock": {
         "properties": {
@@ -25006,10 +25119,10 @@
         "properties": {
           "workflow_tags": {
             "additionalProperties": {
-              "additionalProperties": {
-                "type": "string"
+              "items": {
+                "$ref": "#/components/schemas/TagItem"
               },
-              "type": "object"
+              "type": "array"
             },
             "type": "object",
             "title": "Workflow Tags"
@@ -25020,7 +25133,7 @@
           "workflow_tags"
         ],
         "title": "WorkflowTagsBatchResponse",
-        "description": "Response for the batch endpoint.\n\nWorkflows with no tags are present with an empty dict so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nWorkflows outside the caller's org are silently absent (no leakage)."
+        "description": "Response for the batch endpoint.\n\nWorkflows with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nWorkflows outside the caller's org are silently absent (no leakage)."
       },
       "WorkflowTriggerBlock": {
         "properties": {

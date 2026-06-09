@@ -4188,7 +4188,7 @@ class WorkflowService:
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        workflow_tags: list[tuple[str, str]] | None = None,
+        workflow_tags: list[tuple[str | None, str | None]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -4196,7 +4196,8 @@ class WorkflowService:
         Args:
             search_key: Unified search term for title, folder name, and parameter metadata.
             folder_id: Filter workflows by folder ID.
-            workflow_tags: (key, value) tag filters; AND across keys, OR within a key.
+            workflow_tags: tag filter terms — exact (key, value), group-only (key, None),
+                or label-only (None, value). AND across distinct terms; OR within a key.
         """
         return await app.DATABASE.workflows.get_workflows_by_organization_id(
             organization_id=organization_id,

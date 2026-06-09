@@ -1197,16 +1197,17 @@ class AgentFunction:
         """
         return ""
 
-    def get_copilot_config(self) -> CopilotConfig | None:
+    def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
-        return CopilotConfig(
-            block_authoring_policy=block_authoring_policy_from_code_only_mode(settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE)
-        )
+        resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
+        return CopilotConfig(block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved))
 
-    async def get_copilot_config_for_request(self, organization_id: str | None = None) -> CopilotConfig | None:
+    async def get_copilot_config_for_request(
+        self, organization_id: str | None = None, code_block_mode: bool | None = None
+    ) -> CopilotConfig | None:
         """Return a request-scoped workflow copilot config override."""
         del organization_id
-        return self.get_copilot_config()
+        return self.get_copilot_config(code_block_mode)
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.

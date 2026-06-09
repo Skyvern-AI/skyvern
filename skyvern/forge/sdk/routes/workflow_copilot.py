@@ -1630,7 +1630,9 @@ async def _new_copilot_chat_post(
                 return
 
             copilot_config = (
-                await app.AGENT_FUNCTION.get_copilot_config_for_request(organization.organization_id)
+                await app.AGENT_FUNCTION.get_copilot_config_for_request(
+                    organization.organization_id, code_block_mode=chat_request.code_block
+                )
             ) or CopilotConfig()
 
             # Spawn the cancel watcher only after the chat row exists; cancels
@@ -1905,7 +1907,11 @@ async def _new_copilot_chat_post(
 COPILOT_V2_FLAG_KEY = "ENABLE_WORKFLOW_COPILOT_V2"
 
 
-async def _should_use_copilot_v2(organization: Organization, workflow_permanent_id: str) -> bool:
+async def _should_use_copilot_v2(
+    organization: Organization, workflow_permanent_id: str, mode: str | None = None
+) -> bool:
+    if mode is not None:
+        return mode == "build"
     if settings.ENABLE_WORKFLOW_COPILOT_V2:
         return True
     try:
@@ -1933,7 +1939,7 @@ async def workflow_copilot_chat_post(
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
-    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id):
+    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
         return await _new_copilot_chat_post(request, chat_request, organization)
 
     async def stream_handler(stream: EventSourceStream) -> None:
