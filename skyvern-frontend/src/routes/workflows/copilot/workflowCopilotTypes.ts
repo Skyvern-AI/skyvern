@@ -37,6 +37,8 @@ export interface WorkflowCopilotChatRequest {
   browser_session_id?: string | null;
   message: string;
   workflow_yaml: string;
+  mode?: "ask" | "build" | null;
+  code_block?: boolean | null;
   cancel_token?: string;
 }
 

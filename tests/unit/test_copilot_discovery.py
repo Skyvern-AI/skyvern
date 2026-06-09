@@ -23,6 +23,7 @@ class _Ctx:
         self.composition_page_evidence = None
         self.pending_browser_interaction_observation = None
         self.workflow_verification_evidence = WorkflowVerificationEvidence()
+        self.browser_session_id = None
 
 
 class _FailingNavigateServer:
@@ -374,7 +375,8 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
     assert result["ok"] is True
-    assert server.calls == ["skyvern_get_html", "skyvern_evaluate"]
+    # structured extractor probe (None on the [] mock) -> get_html fallback -> obstruction-candidates probe
+    assert server.calls == ["skyvern_evaluate", "skyvern_get_html", "skyvern_evaluate"]
     assert result["data"]["current_url"] == "https://www.example.com/results"
     assert result["data"]["workflow_run_id"] == "wr_123"
     assert result["data"]["observed_after_workflow_run"] is True
@@ -608,12 +610,12 @@ async def test_composition_get_html_flags_truncation_when_stripped_body_hits_cap
     from skyvern.forge.sdk.copilot.tools import _COMPOSITION_STRIPPED_HTML_MAX_CHARS, _composition_get_html
 
     at_cap = "<body>" + "x" * _COMPOSITION_STRIPPED_HTML_MAX_CHARS
-    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(at_cap)))
     assert error is None
     assert truncated is True
 
     under_cap = "<body><form><input name='x'></form></body>"
-    _, error, truncated = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
+    _, error, truncated, _ = await _composition_get_html(_Ctx(_StrippedHtmlServer(under_cap)))
     assert error is None
     assert truncated is False
 

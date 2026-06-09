@@ -261,8 +261,12 @@ def test_family_lookups() -> None:
 
 def test_effective_prompt_schema_variant() -> None:
     assert effective_prompt_schema_variant(SLIM_VARIANT_SAFE, "extract-actions") == SLIM_VARIANT_SAFE
-    assert effective_prompt_schema_variant(SLIM_VARIANT_TERSE, "check-user-goal-after-click") == SLIM_VARIANT_TERSE
-    # Families outside the allowlist render control, so their calls must be labeled control.
+    assert effective_prompt_schema_variant(SLIM_VARIANT_TERSE, "extract-actions") == SLIM_VARIANT_TERSE
+    # check-user-goal is intentionally excluded from the allowlist — its calls must
+    # label control even under a treatment run.
+    assert effective_prompt_schema_variant(SLIM_VARIANT_SAFE, "check-user-goal") is None
+    assert effective_prompt_schema_variant(SLIM_VARIANT_TERSE, "check-user-goal-after-click") is None
+    # Other families outside the allowlist render control, so their calls must be labeled control.
     assert effective_prompt_schema_variant(SLIM_VARIANT_SAFE, "auto-completion-choose-option") is None
     assert effective_prompt_schema_variant(SLIM_VARIANT_SAFE, "parse-input-or-select-context") is None
     # Unknown prompt_names and non-slim assignments fail safe to control.
@@ -298,8 +302,8 @@ async def test_resolver_maps_flag_variant_to_template_value(
 async def test_resolver_resolves_once_per_run(monkeypatch: pytest.MonkeyPatch, run_context: SkyvernContext) -> None:
     provider = _mock_provider(monkeypatch, SLIM_VARIANT_SAFE)
     assert await get_slim_output_template_value("extract-action") == "safe"
-    assert await get_slim_output_template_value("check-user-goal") == "safe"
-    assert await get_slim_output_template_value("check-user-goal-with-termination") == "safe"
+    assert await get_slim_output_template_value("extract-action-static") == "safe"
+    assert await get_slim_output_template_value("extract-action-dynamic") == "safe"
     assert provider.get_value_cached.await_count == 1
     assert run_context.slim_output_variant_assigned == SLIM_VARIANT_SAFE
     assert run_context.slim_output_variant_resolved is True
@@ -312,6 +316,10 @@ async def test_resolver_excludes_families_outside_allowlist(
     _mock_provider(monkeypatch, SLIM_VARIANT_SAFE)
     assert await get_slim_output_template_value("auto-completion-choose-option") is None
     assert await get_slim_output_template_value("parse-input-or-select-context") is None
+    # check-user-goal is intentionally excluded — its templates must render control
+    # even under a treatment run.
+    assert await get_slim_output_template_value("check-user-goal") is None
+    assert await get_slim_output_template_value("check-user-goal-with-termination") is None
     # The assignment is still recorded for telemetry even though these render control.
     assert run_context.slim_output_variant_assigned == SLIM_VARIANT_SAFE
 
@@ -367,7 +375,7 @@ async def test_concurrent_first_use_resolves_exactly_once(
 
     results = await asyncio.gather(
         get_slim_output_template_value("extract-action"),
-        get_slim_output_template_value("check-user-goal"),
+        get_slim_output_template_value("extract-action-static"),
         get_slim_output_template_value("extract-action"),
     )
     assert results == ["safe", "safe", "safe"]
@@ -394,7 +402,7 @@ async def test_concurrent_first_use_with_flag_error_pins_all_callers_to_control(
 
     results = await asyncio.gather(
         get_slim_output_template_value("extract-action"),
-        get_slim_output_template_value("check-user-goal"),
+        get_slim_output_template_value("extract-action-static"),
     )
     assert results == [None, None]
     assert provider.get_value_cached.await_count == 1

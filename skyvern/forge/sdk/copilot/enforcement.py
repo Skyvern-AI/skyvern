@@ -15,6 +15,7 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -37,7 +38,9 @@ from skyvern.forge.sdk.copilot.config import (
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
     SCREENSHOT_DROPPED_NUDGE,
+    BlockAuthoringPolicy,
     CopilotConfig,
+    normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
@@ -1446,6 +1449,52 @@ async def _run_streamed_with_deadline(
     return result
 
 
+def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
+    """Post-turn fallback offer of a deterministically synthesized code block, in code-only mode.
+
+    Returns a single user message wrapping the synthesized Playwright block, or
+    None when the policy/latch/empty-trajectory guards do not hold. Shares the
+    one-shot latch with the pre-authoring prompt-side offer, so whichever fires
+    first wins and the model sees the offer at most once.
+    """
+    if getattr(ctx, "synthesized_block_offered", False):
+        return None
+    if getattr(ctx, "update_workflow_called", False):
+        return None
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return None
+    trajectory = getattr(ctx, "scout_trajectory", None) or []
+    if not trajectory:
+        return None
+    synthesized = synthesize_code_block(trajectory)
+    if synthesized is None:
+        return None
+
+    ctx.synthesized_block_offered = True
+    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory)}
+
+
+def _assemble_enforcement_messages(
+    screenshot_msg: dict[str, Any] | None,
+    nudge_content: str | None,
+    synthesized_msg: dict[str, Any] | None,
+) -> list[Any]:
+    """Build the extra messages for an enforcement retry, ordered so a nudge, when present, stays last.
+
+    The screenshot rides as its own user-role message because OpenAI rejects image parts inside a tool message.
+    """
+    extra_msgs: list[Any] = []
+    if screenshot_msg is not None:
+        extra_msgs.append(screenshot_msg)
+    if nudge_content is not None:
+        extra_msgs.append({"role": "user", "content": NUDGE_SENTINEL + nudge_content})
+    if synthesized_msg is not None:
+        extra_msgs.insert(0, synthesized_msg)
+    return extra_msgs
+
+
 async def run_with_enforcement(
     agent: Agent,
     initial_input: str | list,
@@ -1573,12 +1622,19 @@ async def run_with_enforcement(
             pending_recovery_nudge = None
         else:
             nudge = _check_enforcement(ctx, result, copilot_config)
-        if nudge is None:
+
+        # The offer is independent of the nudge: a clean scout-then-author turn
+        # finalizes with nudge=None, so injecting it only inside the nudge branch
+        # would never reach the model. Compute it once here so it rides both the
+        # nudge path and the finalize path.
+        synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
+
+        if nudge is None and synthesized_msg is None:
             _consume_pending_screenshots(ctx)
             _maybe_raise_non_retriable_nav(ctx)
             return result
 
-        if nudge == _nudge(copilot_config, "post_update"):
+        if nudge is not None and nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
                 LOG.warning(
                     "Enforcement exhausted post-update nudges, allowing response",
@@ -1589,7 +1645,7 @@ async def run_with_enforcement(
                 return result
             ctx.post_update_nudge_count += 1
 
-        nudge_type = _nudge_type_for_log(nudge, copilot_config)
+        nudge_type = _nudge_type_for_log(nudge, copilot_config) if nudge is not None else "synthesized_block_offer"
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run
@@ -1599,8 +1655,7 @@ async def run_with_enforcement(
             LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
-            nudge_msg = {"role": "user", "content": NUDGE_SENTINEL + nudge}
-            extra_msgs = [nudge_msg] if screenshot_msg is None else [screenshot_msg, nudge_msg]
+            extra_msgs = _assemble_enforcement_messages(screenshot_msg, nudge, synthesized_msg)
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )

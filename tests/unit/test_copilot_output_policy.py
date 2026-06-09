@@ -83,6 +83,62 @@ workflow_definition:
 """
 
 
+def _code_artifact_metadata(label: str = "open_results") -> list[dict[str, object]]:
+    return [
+        {
+            "block_label": label,
+            "declared_goal": "Open the result page.",
+            "claimed_outcomes": [
+                {
+                    "id": "claim:open_results",
+                    "scope": "sufficient_for_prefix_validation",
+                    "text": "The result page is reachable.",
+                    "status": "satisfied",
+                    "depends_on": ["dep:result_link"],
+                    "criteria_ids": ["criterion:result_page_reached"],
+                    "evidence_refs": ["evidence:result_link"],
+                }
+            ],
+            "page_dependencies": [
+                {
+                    "id": "dep:result_link",
+                    "scope": "current_page_state",
+                    "status": "satisfied",
+                    "evidence_refs": ["evidence:result_link"],
+                }
+            ],
+            "completion_criteria": [
+                {
+                    "id": "criterion:result_page_reached",
+                    "text": "The result page is visible after authored execution.",
+                    "level": "terminal",
+                }
+            ],
+            "evidence_refs": [
+                {
+                    "evidence_ref": "evidence:result_link",
+                    "claim_id": "claim:open_results",
+                    "dependency_id": "dep:result_link",
+                    "criterion_id": "criterion:result_page_reached",
+                    "status": "satisfied",
+                    "source_tool": "inspect_page_for_composition",
+                    "observation_step": 1,
+                }
+            ],
+            "observation_refs": [],
+            "terminal_verifier_expectations": [
+                {
+                    "id": "verify:result_page_reached",
+                    "text": "Verify the result page is visible.",
+                    "criteria_ids": ["criterion:result_page_reached"],
+                    "claimed_outcome_ids": ["claim:open_results"],
+                }
+            ],
+            "exploration_observations": [],
+        }
+    ]
+
+
 def _inline_conditional_workflow_yaml(*, url: str = "https://login.example.test/login") -> str:
     return f"""
 workflow_definition:
@@ -1345,6 +1401,7 @@ workflow_definition:
                     {"label": "open_results", "observation_step": 0},
                     {"label": "read_results", "observation_step": 1},
                 ],
+                "code_artifact_metadata": _code_artifact_metadata(),
                 "parameters": {},
             }
         ),
@@ -1360,6 +1417,14 @@ workflow_definition:
         {"label": "open_results", "observation_step": 0},
         {"label": "read_results", "observation_step": 1},
     ]
+    assert captured["payload"]["code_artifact_metadata"][0]["block_label"] == "open_results"
+    assert captured["payload"]["code_artifact_metadata"][0]["claimed_outcomes"][0]["id"] == "claim:open_results"
+    assert (
+        captured["payload"]["code_artifact_metadata"][0]["evidence_refs"][0]["evidence_ref"] == "evidence:result_link"
+    )
+    assert [
+        item.model_dump(mode="json", exclude_none=True) for item in captured["payload"]["raw_code_artifact_metadata"]
+    ] == captured["payload"]["code_artifact_metadata"]
     assert ctx.block_observation_refs == {}
 
 
@@ -1712,3 +1777,136 @@ def test_translate_to_agent_result_adds_unvalidated_affordance() -> None:
     assert agent_result.updated_workflow is workflow
     assert "Accept to save" in agent_result.user_response
     assert "Reject to discard" in agent_result.user_response
+
+
+def _two_credential_workflow_yaml() -> str:
+    return """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: site_a_credentials
+      default_value: cred_amazon
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: site_b_credentials
+      default_value: cred_quicken
+  blocks:
+    - block_type: login
+      label: login_a
+      url: https://login-a.authenticationtest.test/login
+      navigation_goal: Log in to site A.
+      parameter_keys:
+        - site_a_credentials
+    - block_type: login
+      label: login_b
+      url: https://login-b.authenticationtest.test/login
+      navigation_goal: Log in to site B.
+      parameter_keys:
+        - site_b_credentials
+"""
+
+
+def _discovered(credential_id: str, tested_url: str | None) -> object:
+    return SimpleNamespace(credential_id=credential_id, name=credential_id, tested_url=tested_url)
+
+
+def test_allows_discovered_bound_credential_with_no_resolved_credentials() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[_discovered("cred_safe", "https://login.example.test/login")],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(navigation_goal="Log in."),
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+
+
+def test_allows_two_discovered_bound_credentials_in_one_save() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[
+                _discovered("cred_amazon", "https://login-a.authenticationtest.test/login"),
+                _discovered("cred_quicken", "https://login-b.authenticationtest.test/login"),
+            ],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_two_credential_workflow_yaml(),
+    )
+
+    assert verdict.allowed
+
+
+def test_allows_resolved_and_discovered_credentials_together_in_one_save() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[_credential("cred_amazon", "https://login-a.authenticationtest.test/login")],
+            discovered_credentials=[_discovered("cred_quicken", "https://login-b.authenticationtest.test/login")],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_two_credential_workflow_yaml(),
+    )
+
+    assert verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE not in verdict.reason_codes
+
+
+def test_rejects_when_only_one_of_two_bound_credentials_is_discovered() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[_discovered("cred_amazon", "https://login-a.authenticationtest.test/login")],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_two_credential_workflow_yaml(),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+
+def test_rejects_discovered_credential_id_that_is_not_bound_in_workflow() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[_discovered("cred_safe", "https://login.example.test/login")],
+            credential_input_kind="none",
+        ),
+        user_response="I used cred_safe for the login.",
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+
+def test_rejects_fabricated_credential_id_not_in_discovered_set() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[_discovered("cred_amazon", "https://login.example.test/login")],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(navigation_goal="Log in."),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.UNAPPROVED_CREDENTIAL_REFERENCE in verdict.reason_codes
+
+
+def test_rejects_discovered_credential_bound_to_new_origin() -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(
+            resolved_credentials=[],
+            discovered_credentials=[_discovered("cred_safe", "https://login.example.test/login")],
+            credential_input_kind="none",
+        ),
+        workflow_yaml=_workflow_yaml(url="https://evil.example.test/login"),
+    )
+
+    assert not verdict.allowed
+    assert OutputPolicyReason.CREDENTIAL_SCOPE_BROADENED in verdict.reason_codes

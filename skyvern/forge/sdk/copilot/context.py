@@ -152,9 +152,26 @@ class StructuredContext(BaseModel):
                     self.urls_visited.append(UrlVisit(url=url, summary=""))
 
             elif tool == "list_credentials":
-                match = re.search(r"Found (\d+)", summary)
-                found = int(match.group(1)) > 0 if match else False
-                self.credentials_checked.append(CredentialCheck(credential_name=summary, found=found))
+                resolved = entry.get("credentials")
+                if isinstance(resolved, list) and resolved:
+                    for credential in resolved:
+                        if not isinstance(credential, dict):
+                            continue
+                        credential_id = credential.get("credential_id")
+                        if not isinstance(credential_id, str):
+                            continue
+                        name = credential.get("name")
+                        self.credentials_checked.append(
+                            CredentialCheck(
+                                credential_name=name if isinstance(name, str) else "",
+                                credential_id=credential_id,
+                                found=True,
+                            )
+                        )
+                else:
+                    match = re.search(r"Found (\d+)", summary)
+                    found = int(match.group(1)) > 0 if match else False
+                    self.credentials_checked.append(CredentialCheck(credential_name=summary, found=found))
 
             elif tool == "type_text":
                 parts = summary.split("into ")

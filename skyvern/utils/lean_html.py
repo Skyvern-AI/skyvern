@@ -10,6 +10,10 @@ per template:
     1. compress_long_href                  7.2%  — long hrefs → `"#templated"`
     2. compress_image_src                  4.3%  — drops `<img src="…">`
     3. strip_url_query_strings             0.9%  — strips `?…` from href/src
+    4. compress_nonnavigable_href          —     — drops non-navigable hrefs;
+                                                   strips `javascript:` wrappers
+                                                   on textless controls so the
+                                                   semantic payload survives
 
 Combined potential ~12% planner savings. The largest single source of bloat
 in offline analysis was Skyvern internal IDs (~24% of the verifier prompt),
@@ -36,6 +40,70 @@ from typing import Any
 _HASHED_HREF_PLACEHOLDER = "#templated"
 _HASHED_HREF_LEN_THRESHOLD = 150
 
+# Bounds the _has_text_signal descent on adversarially deep DOMs (well above any
+# real label nesting; hitting it returns no-signal, which keeps the href).
+_TEXT_SIGNAL_MAX_DEPTH = 50
+
+
+def _is_pure_idiom_href(href: Any) -> bool:
+    """A content-free href — empty, bare '#', or a javascript no-op. Carries no
+    signal at all, so it is always safe to drop.
+
+    Excludes hash routes (`#/checkout`) and same-page anchors (`#section`),
+    which are real destinations. Broader `javascript:` payloads (e.g.
+    `javascript:void(downloadPdf('123'))`) are NOT pure idioms — their inner
+    expression names the control's action and is preserved via
+    `_strip_javascript_wrapper` when no other label survives.
+    """
+    if not isinstance(href, str):
+        return False
+    stripped = href.strip()
+    if stripped in ("", "#"):
+        return True
+    return stripped.lower() in ("javascript:", "javascript:;", "javascript:void(0)", "javascript:void(0);")
+
+
+_JS_NOOP_PAYLOADS = ("", "0", "null", "undefined")
+
+
+def _strip_javascript_wrapper(href: str) -> str:
+    """Return the semantic payload of a `javascript:` href, stripping the scheme
+    and an optional `void(...)` wrapper. Returns `""` when nothing meaningful
+    remains (pure no-ops like `javascript:`, `javascript:void(undefined)`).
+
+    Non-`javascript:` hrefs are returned unchanged (after a trim). Keeping the
+    inner expression preserves the only naming signal on textless icon controls
+    (`javascript:__doPostBack('lnkDownloadPDF','')` → `__doPostBack('lnkDownloadPDF','')`),
+    while dropping the noisy wrapper for tokens.
+    """
+    s = href.strip()
+    if not s.lower().startswith("javascript:"):
+        return s
+    payload = s[len("javascript:") :].strip().rstrip(";").strip()
+    if payload.lower().startswith("void(") and payload.endswith(")"):
+        payload = payload[len("void(") : -1].strip()
+    return "" if payload.lower() in _JS_NOOP_PAYLOADS else payload
+
+
+def _has_text_signal(node: dict, _depth: int = 0) -> bool:
+    """Whether the element keeps a human-readable label after slimming — its own
+    visible text, an alt/aria-label/title, or a labeled descendant.
+
+    The icon marker and machine-only ids do not count, so a truly textless
+    control reads as no-signal and we preserve its (otherwise sole) href hint.
+    """
+    text = (node.get("text") or "").strip()
+    if text and text != "[icon]":
+        return True
+    attributes = node.get("attributes") or {}
+    for key in ("aria-label", "title", "alt"):
+        value = attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    if _depth >= _TEXT_SIGNAL_MAX_DEPTH:
+        return False
+    return any(_has_text_signal(child, _depth + 1) for child in node.get("children") or [])
+
 
 def _transform_node(
     node: dict,
@@ -43,6 +111,7 @@ def _transform_node(
     compress_long_href: bool,
     compress_image_src: bool,
     strip_url_query_strings: bool,
+    compress_nonnavigable_href: bool,
 ) -> dict | None:
     """Apply the selected lean transforms to a single node and recurse into children.
 
@@ -79,6 +148,26 @@ def _transform_node(
         if isinstance(href, str) and len(href) > _HASHED_HREF_LEN_THRESHOLD:
             attributes["href"] = _HASHED_HREF_PLACEHOLDER
 
+    # 4. Drop non-navigable hrefs (the agent acts on the element id, not the
+    # href). A javascript:/postback href can still carry a control-name hint, so
+    # when a human-readable label survives, the wrapped expression is redundant
+    # and we drop it; on a textless control we keep the inner expression as the
+    # only naming signal and strip the noisy `javascript:`/`void(...)` wrapper.
+    if compress_nonnavigable_href:
+        href = attributes.get("href")
+        if isinstance(href, str):
+            if _is_pure_idiom_href(href):
+                attributes.pop("href", None)
+            elif href.strip().lower().startswith("javascript:"):
+                if _has_text_signal(node):
+                    attributes.pop("href", None)
+                else:
+                    payload = _strip_javascript_wrapper(href)
+                    if payload:
+                        attributes["href"] = payload
+                    else:
+                        attributes.pop("href", None)
+
     node["attributes"] = attributes
 
     children = node.get("children")
@@ -90,6 +179,7 @@ def _transform_node(
                 compress_long_href=compress_long_href,
                 compress_image_src=compress_image_src,
                 strip_url_query_strings=strip_url_query_strings,
+                compress_nonnavigable_href=compress_nonnavigable_href,
             )
             if transformed is not None:
                 new_children.append(transformed)
@@ -104,6 +194,7 @@ def apply_lean_to_tree(
     compress_long_href: bool = False,
     compress_image_src: bool = False,
     strip_url_query_strings: bool = False,
+    compress_nonnavigable_href: bool = False,
 ) -> list[dict]:
     """Apply the deterministic lean-tree recipe to a list of element dicts.
 
@@ -119,6 +210,7 @@ def apply_lean_to_tree(
             compress_long_href=compress_long_href,
             compress_image_src=compress_image_src,
             strip_url_query_strings=strip_url_query_strings,
+            compress_nonnavigable_href=compress_nonnavigable_href,
         )
         if transformed is not None:
             out.append(transformed)

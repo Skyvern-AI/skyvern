@@ -176,9 +176,7 @@ function WorkflowPage() {
               </>
             )}
           </div>
-          {!workflowIsLoading &&
-          workflowTags &&
-          Object.keys(workflowTags).length > 0 ? (
+          {!workflowIsLoading && workflowTags && workflowTags.length > 0 ? (
             <TagChipList
               tags={workflowTags}
               descriptions={tagDescriptions}

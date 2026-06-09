@@ -1,5 +1,5 @@
 import { Cross2Icon, GearIcon, PlusIcon } from "@radix-ui/react-icons";
-import { useReactFlow } from "@xyflow/react";
+import { useNodesData, useReactFlow } from "@xyflow/react";
 import { Resizable } from "re-resizable";
 import { useEffect, useRef, useState } from "react";
 
@@ -13,8 +13,11 @@ import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowPanelStore } from "@/store/WorkflowPanelStore";
 import { cn } from "@/util/utils";
 
+import { useNodeLabelChangeHandler } from "@/routes/workflows/hooks/useLabelChangeHandler";
+
 import { useWorkflowEditorMode } from "../hooks/useWorkflowEditorMode";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "../nodes";
+import { EditableNodeTitle } from "../nodes/components/EditableNodeTitle";
 import { isStartNode } from "../nodes/StartNode/types";
 import { WorkflowBlockIcon } from "../nodes/WorkflowBlockIcon";
 import { workflowBlockTitle } from "../nodes/types";
@@ -129,6 +132,47 @@ function SubLabel() {
   );
 }
 
+// Inline-editable block title, mirroring the canvas tile's NodeHeader. Reads
+// the live label/editable slice reactively so the heading reflects an edit
+// immediately, and routes commits through the same handler the canvas uses
+// (sanitize, dedupe, propagate the rename to parameter keys + collapse state).
+// Keyed on blockId by the caller so it re-initializes when the selection moves
+// to another block without remounting the surrounding sidebar shell. On
+// read-only (global) workflows it renders a plain heading: EditableNodeTitle
+// still enters its click-to-edit affordance when disabled, which would read
+// as misleadingly interactive.
+function EditableBlockTitle({
+  blockId,
+  fallbackLabel,
+}: Readonly<{ blockId: string; fallbackLabel: string }>) {
+  const data = useNodesData<WorkflowBlockNode>(blockId)?.data;
+  const label =
+    typeof data?.label === "string" && data.label.length > 0
+      ? data.label
+      : fallbackLabel;
+  const editable = Boolean(data?.editable);
+  const [, handleLabelChange] = useNodeLabelChangeHandler({
+    id: blockId,
+    initialValue: label,
+  });
+
+  if (!editable) {
+    return (
+      <h2 className="truncate text-sm font-medium text-slate-100">{label}</h2>
+    );
+  }
+
+  return (
+    <EditableNodeTitle
+      value={label}
+      editable
+      onChange={handleLabelChange}
+      titleClassName="text-sm font-medium text-slate-100"
+      inputClassName="text-sm font-medium text-slate-100"
+    />
+  );
+}
+
 function BlockConfigSidebarBody({
   selectedBlockId,
   onClose,
@@ -163,9 +207,17 @@ function BlockConfigSidebarBody({
             </div>
           ) : null}
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-medium text-slate-100">
-              {label}
-            </h2>
+            {isStart ? (
+              <h2 className="truncate text-sm font-medium text-slate-100">
+                {label}
+              </h2>
+            ) : (
+              <EditableBlockTitle
+                key={selectedBlockId}
+                blockId={selectedBlockId}
+                fallbackLabel={label}
+              />
+            )}
             <SubLabel />
           </div>
         </div>

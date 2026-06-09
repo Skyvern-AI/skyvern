@@ -11,6 +11,7 @@ export type DownloadedFileInfo = {
 
 export const ArtifactType = {
   Recording: "recording",
+  SessionReplay: "session_replay",
   ActionScreenshot: "screenshot_action",
   LLMScreenshot: "screenshot_llm",
   LLMResponseRaw: "llm_response",

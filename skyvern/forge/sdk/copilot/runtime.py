@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
 
@@ -47,6 +47,10 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+CodeArtifactMetadataValue: TypeAlias = (
+    str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
+)
+CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -100,6 +104,18 @@ async def _get_persistent_browser_session(session_id: str, organization_id: str)
 class PendingBrowserInteractionObservation:
     tool_name: str
     url: str = ""
+
+
+class ScoutedInteraction(TypedDict):
+    tool_name: str
+    selector: NotRequired[str]
+    source_url: NotRequired[str]
+    value: NotRequired[str]
+    key: NotRequired[str]
+    typed_length: NotRequired[int]
+    role: NotRequired[str]
+    accessible_name: NotRequired[str]
+    trajectory_index: NotRequired[int]
 
 
 @dataclass
@@ -194,7 +210,11 @@ class AgentContext:
     block_observation_refs: dict[str, int] = field(default_factory=dict)
     # Raw tool input for block_observation_refs, retained only for diagnostics
     # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: Any | None = None
+    raw_block_observation_refs: object | None = None
+    # Block-label keyed metadata describing authored code artifacts. This layer
+    # only normalizes and carries the metadata; sufficiency checks live elsewhere.
+    code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
+    raw_code_artifact_metadata: object | None = None
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
@@ -208,6 +228,17 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
+    observed_browser_urls: list[str] = field(default_factory=list)
+    # Ephemeral within-turn scout captures; not persisted across turns.
+    scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
+    # Append-only, non-deduped record of the scout's interaction sequence in
+    # acted order. Unlike scouted_interactions (deduped for auto-credit), this
+    # preserves repeats and ordering so code_block_synthesis can emit a faithful
+    # linear Playwright trajectory.
+    scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    synthesized_block_offered: bool = False
+    # Source page of an in-flight scout action, captured before it may navigate away.
+    pending_scout_source_url: str | None = None
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at

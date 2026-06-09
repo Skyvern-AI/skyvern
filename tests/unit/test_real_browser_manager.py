@@ -490,3 +490,31 @@ async def test_popup_video_listener_timeout_url_error_safe() -> None:
 
     await handler(page)
     assert len(artifacts.video_artifacts) == 0
+
+
+@pytest.mark.asyncio
+async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Active CDP streams defer the browser close, so cleanup must snapshot session cookies before
+    store_browser_session archives the dir — the deferred close runs too late."""
+    manager = RealBrowserManager()
+    browser_state = MagicMock()
+    browser_state.browser_artifacts.traces_dir = None
+    browser_state.browser_artifacts.browser_session_dir = "/tmp/fake_profile"
+    browser_state.close = AsyncMock()
+    manager.pages["wfr_streamed"] = browser_state
+
+    persist_mock = AsyncMock()
+    monkeypatch.setattr("skyvern.webeye.real_browser_manager.persist_session_cookies", persist_mock)
+    # streaming is a namespace package; patch the module object so resolution does not depend on the
+    # parent binding the submodule, which varies with import order across the suite.
+    from skyvern.forge.sdk.routes.streaming import registries as streaming_registries
+
+    monkeypatch.setattr(streaming_registries, "stream_ref_active", lambda wrid: True)
+    monkeypatch.setattr(streaming_registries, "set_deferred_close_params", lambda *a, **k: None)
+
+    await manager.cleanup_for_workflow_run("wfr_streamed", task_ids=[], close_browser_on_completion=True)
+
+    persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
+    browser_state.close.assert_not_awaited()

@@ -88,6 +88,17 @@ class CopilotRunHooks(RunHooksBase):
                 total_tokens=getattr(self._ctx, "total_tokens_used", None),
             )
 
+            if tool_name == "list_credentials" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                listed = data.get("credentials", []) if isinstance(data, dict) else []
+                resolved = [
+                    {"credential_id": c.get("credential_id"), "name": c.get("name")}
+                    for c in listed
+                    if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
+                ]
+                if resolved:
+                    activity_entry["credentials"] = resolved
+
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 blocks = data.get("blocks", []) if isinstance(data, dict) else []

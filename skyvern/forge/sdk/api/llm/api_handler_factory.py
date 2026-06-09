@@ -65,6 +65,12 @@ configure_litellm_transport()
 
 LOG = structlog.get_logger()
 
+# Vertex returns this trafficType for flex-tier calls. litellm (through 1.88.1 and
+# main) neither maps it nor applies tier pricing in completion_cost, so flex bills at
+# standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
+_VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
+_VERTEX_FLEX_COST_MULTIPLIER = 0.5
+
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
 # router / non-router / LLMCaller paths with a single filter.
@@ -83,6 +89,17 @@ VISION_FALLBACK_PROMPT_NAMES = {
 # Default thinking budgets (configurable via env vars, can be overridden by THINKING_BUDGET_OPTIMIZATION experiment)
 EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
+
+
+def _set_llm_context_attrs(
+    span: otel_trace.Span,
+    *,
+    screenshots: list[bytes] | None,
+    is_speculative_step: bool,
+) -> None:
+    span.set_attribute("screenshots_included", bool(screenshots))
+    span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
+    span.set_attribute("speculative", bool(is_speculative_step))
 
 
 def _enrich_llm_span(
@@ -512,6 +529,44 @@ class LLMAPIHandlerFactory:
                 cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0
 
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
+
+    @staticmethod
+    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """Return provider-reported cost from response.usage.cost when present."""
+        if not hasattr(response, "usage") or not response.usage:
+            return None
+
+        usage = response.usage
+        cost = getattr(usage, "cost", None)
+        if cost is None and isinstance(usage, dict):
+            cost = usage.get("cost")
+        if cost is None:
+            return None
+
+        try:
+            cost_value = float(cost)
+        except (TypeError, ValueError):
+            return None
+
+        return cost_value if cost_value >= 0 else None
+
+    @staticmethod
+    def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
+        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
+
+        Flex is 50% of standard, but litellm reports both at the standard rate, so the
+        discount is applied here. Internal cost tracking only — never customer-facing.
+        """
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception as e:
+            LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
+            return 0.0
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
+        if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
+            return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        return cost
 
     @staticmethod
     def _apply_thinking_budget_optimization(
@@ -1052,6 +1107,7 @@ class LLMAPIHandlerFactory:
                             )
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1377,12 +1433,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1730,6 +1782,7 @@ class LLMAPIHandlerFactory:
 
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 model_name = llm_config.model_name
 
@@ -1939,12 +1992,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -2380,6 +2429,7 @@ class LLMCaller:
 
             screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
             llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
+            _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2875,8 +2925,6 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-        if self.original_llm_key.startswith("openrouter/"):
-            return empty_call_stats
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot
         if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
@@ -2917,14 +2965,22 @@ class LLMCaller:
                 reasoning_tokens=0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
-            try:
-                llm_cost = litellm.completion_cost(completion_response=response)
-            except Exception as e:
-                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                llm_cost = 0
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
+            llm_cost = 0.0
+            if self.original_llm_key.startswith("openrouter/"):
+                reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
+                if reported_cost is not None:
+                    llm_cost = reported_cost
+                else:
+                    LOG.warning(
+                        "OpenRouter response missing usage.cost; cost will be reported as 0",
+                        llm_key=self.original_llm_key,
+                        response_id=getattr(response, "id", None),
+                    )
+            else:
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,

@@ -106,7 +106,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -119,11 +119,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
-    poll_otp_value,
-    try_generate_totp_from_credential,
-)
+from skyvern.services.otp_service import poll_otp_value, resolve_otp_value
 from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
@@ -2765,8 +2761,15 @@ class ForgeAgent:
 
     @traced(name="skyvern.agent.complete_verify")
     async def complete_verify(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteVerifyResult:
+        otel_trace.get_current_span().set_attribute("verification.trigger", verification_trigger)
         LOG.debug(
             "Checking if user goal is achieved after re-scraping the page",
             workflow_run_id=task.workflow_run_id,
@@ -2843,6 +2846,7 @@ class ForgeAgent:
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
             lean_strip_url_query_strings=lean_enabled,
+            lean_compress_nonnavigable_href=lean_enabled,
         )
 
         # This prompt is critical for our agent, we probably should use the primary LLM handler
@@ -2903,7 +2907,13 @@ class ForgeAgent:
         return result
 
     async def check_user_goal_complete(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2911,6 +2921,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger=verification_trigger,
             )
 
             # Check if we should terminate instead of complete
@@ -3751,6 +3762,9 @@ class ForgeAgent:
                 compress_long_href=False,
                 compress_image_src=True,
                 strip_url_query_strings=True,
+                # non-navigable hrefs (javascript:/empty/'#') carry no
+                # destination signal, so they're safe to drop for the planner.
+                compress_nonnavigable_href=True,
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
@@ -3890,6 +3904,7 @@ class ForgeAgent:
             lean_compress_long_href=False,
             lean_compress_image_src=context.enable_lean_element_tree,
             lean_strip_url_query_strings=context.enable_lean_element_tree,
+            lean_compress_nonnavigable_href=context.enable_lean_element_tree,
         )
 
         # Map template to prompt_name for logging/caching guards
@@ -4818,6 +4833,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger="periodic_after_step",
             ),
             name=f"verify_goal_{step.step_id}",
         )
@@ -5880,25 +5896,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-            workflow_id = workflow_permanent_id = None
-            if task.workflow_run_id:
-                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
-                if workflow_run:
-                    workflow_id = workflow_run.workflow_id
-                    workflow_permanent_id = workflow_run.workflow_permanent_id
-            otp_value = await poll_otp_value(
-                organization_id=task.organization_id,
-                task_id=task.task_id,
-                workflow_id=workflow_id,
-                workflow_run_id=task.workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                totp_verification_url=task.totp_verification_url,
-                totp_identifier=task.totp_identifier,
-            )
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        otp_value = await resolve_otp_value(task)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

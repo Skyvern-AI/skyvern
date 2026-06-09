@@ -41,6 +41,13 @@
     --success: 142.1 76.2% 36.3%; /* green-600 */
     --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
 
+    /* status badge chips: light tint / deep fill; text always uses --foreground (dark in light, light in dark) */
+    --badge-success: 141 78.9% 85.1%;
+    --badge-warning: 48 96.6% 76.7%;
+    --badge-destructive: 352.7 96.1% 90%;
+    --badge-terminated: 32.1 97.7% 83.1%;
+    --badge-neutral: 214.3 31.8% 91.4%;
+
     --border: 0 0% 88%;
     --input: 0 0% 88%;
     --ring: 0 0% 9%;
@@ -91,6 +98,12 @@
 
     --success: 142.1 76.2% 36.3%; /* green-600 */
     --success-foreground: 138.5 76.5% 96.7%; /* green-50 */
+
+    --badge-success: 143.8 61.2% 20.2%;
+    --badge-warning: 42 85% 30%;
+    --badge-destructive: 0 62.8% 30.6%;
+    --badge-terminated: 15 79.1% 33.7%;
+    --badge-neutral: 215.3 25% 26.7%;
 
     --border: 215.3 25% 26.7%;
     --input: 215.3 25% 26.7%;

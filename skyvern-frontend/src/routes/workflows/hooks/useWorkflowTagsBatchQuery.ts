@@ -1,17 +1,14 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import type { WorkflowTagsBatchResponse } from "../types/tagTypes";
+import type { Tag, WorkflowTagsBatchResponse } from "../types/tagTypes";
 
-// The backend batch endpoint rejects more than this many IDs per request
-// (_BATCH_TAGS_MAX_WPIDS). The workflows list page size is unbounded via the
-// URL, so chunk rather than slice to avoid silently dropping tags for rows
-// beyond the limit. The common case (page size <= 50) is a single request.
+// Backend rejects more than this many IDs per request (_BATCH_TAGS_MAX_WPIDS); the
+// list page size is unbounded, so chunk rather than slice to avoid dropping tags.
 const BATCH_TAGS_MAX_WPIDS = 200;
 
-// One batch fetch for all visible workflows, avoiding an N+1 of per-row tag
-// fetches on the workflows-list page. Ids are sorted so the query key is
-// order-independent and two renders with the same set share a cache entry.
+// One batch fetch for all visible workflows (avoids per-row N+1). Ids are sorted so
+// the query key is order-independent and identical sets share a cache entry.
 function useWorkflowTagsBatchQuery(workflowPermanentIds: Array<string>) {
   const credentialGetter = useCredentialGetter();
   const sortedIds = [...workflowPermanentIds].sort();
@@ -35,7 +32,7 @@ function useWorkflowTagsBatchQuery(workflowPermanentIds: Array<string>) {
         }),
       );
       // Chunks are disjoint slices, so wpid keys never collide on merge.
-      const merged: Record<string, Record<string, string>> = {};
+      const merged: Record<string, Array<Tag>> = {};
       for (const response of responses) {
         Object.assign(merged, response);
       }

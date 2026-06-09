@@ -201,6 +201,15 @@ class Settings(BaseSettings):
     AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
     AZURE_STORAGE_CONTAINER_UPLOADS: str = "skyvern-uploads"
 
+    # Google Cloud Storage settings (bucket names are globally unique — override per deployment)
+    GCS_PROJECT_ID: str | None = None
+    GCS_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
+    GCS_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
+    GCS_BUCKET_BROWSER_SESSIONS: str = "skyvern-browser-sessions"
+    GCS_BUCKET_UPLOADS: str = "skyvern-uploads"
+    # GSA email used to sign V4 URLs when running under Workload Identity (no local private key).
+    GCS_SIGNER_SA_EMAIL: str | None = None
+
     SKYVERN_TELEMETRY: bool = True
     ANALYTICS_ID: str = "anonymous"
     ANALYTICS_TEST_ID: str | None = None

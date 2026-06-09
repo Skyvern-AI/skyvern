@@ -52,7 +52,6 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
-import { useSidebarStore } from "@/store/SidebarStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
@@ -101,6 +100,7 @@ import { cn } from "@/util/utils";
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
 import { useCacheKeyValueUrlSync } from "./hooks/useCacheKeyValueUrlSync";
 import { useSaveWorkflow } from "./hooks/useSaveWorkflow";
+import { useWorkspaceMountInitialization } from "./hooks/useWorkspaceMountInitialization";
 import { useWorkflowHistory } from "./hooks/useWorkflowHistory";
 import { AppNode, isWorkflowBlockNode, WorkflowBlockNode } from "./nodes";
 import { blockTypeFromNode } from "./nodes/blockTypeFromNode";
@@ -622,10 +622,6 @@ function Workspace({
 
   const activeDebugSession = debugSession ?? null;
 
-  const setCollapsed = useSidebarStore((state) => {
-    return state.setCollapsed;
-  });
-
   const workflowChangesStore = useWorkflowHasChangesStore();
 
   const showBreakoutButton =
@@ -793,15 +789,12 @@ function Workspace({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workflowPermanentId]);
 
-  useMountEffect(() => {
-    setCollapsed(true);
-    workflowChangesStore.setHasChanges(false);
-    if (workflowPermanentId) {
-      queryClient.invalidateQueries({
-        queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
-      });
-    }
-    closeWorkflowPanel();
+  useWorkspaceMountInitialization({
+    cacheKey,
+    closeWorkflowPanel,
+    queryClient,
+    workflowChangesStore,
+    workflowPermanentId,
   });
 
   useCacheKeyValueUrlSync(cacheKeyInitWpidRef.current === workflowPermanentId);

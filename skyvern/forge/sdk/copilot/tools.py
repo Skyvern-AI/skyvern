@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urljoin, urlparse
 
 import structlog
@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover — bs4 is a transitive dep but discover
     BeautifulSoup = None  # type: ignore[assignment, misc]
 from agents.run_context import RunContextWrapper
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.config import settings
 from skyvern.forge import app
@@ -62,15 +62,26 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    scout_accessible_role_name_expression as _scout_accessible_role_name_expression,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    SCOUT_INTERACTION_EVIDENCE_TOOL,
     composition_page_evidence_error,
     has_bounded_page_schema,
     merge_visual_composition_evidence,
     normalize_block_observation_refs,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
+    parse_composition_structured,
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, normalize_block_authoring_policy
@@ -121,6 +132,7 @@ from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_R
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
+    ScoutedInteraction,
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
@@ -135,6 +147,7 @@ from skyvern.forge.sdk.copilot.turn_intent import (
 )
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
+from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, get_all_blocks
@@ -1490,6 +1503,195 @@ def _consume_pending_browser_interaction_observation(
     return True
 
 
+_MAX_SCOUTED_INTERACTIONS = 20
+
+
+async def _live_working_page_url(ctx: AgentContext) -> str | None:
+    if not ctx.browser_session_id:
+        return None
+    try:
+        browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
+            session_id=ctx.browser_session_id,
+            organization_id=ctx.organization_id,
+        )
+        if not browser_state:
+            return None
+        page = await browser_state.get_or_create_page()
+        return page.url if page else None
+    except Exception:
+        return None
+
+
+async def _capture_scout_source_url(ctx: AgentContext) -> None:
+    # Pre-action: a navigating click/Enter would leave only the destination URL, not the page the selector acted on.
+    ctx.pending_scout_source_url = await _live_working_page_url(ctx)
+
+
+def _consume_scout_source_url(ctx: AgentContext) -> str | None:
+    source_url = ctx.pending_scout_source_url
+    # Cleared unconditionally so a non-recording action can't bleed its source page into a later interaction.
+    ctx.pending_scout_source_url = None
+    return source_url
+
+
+_ROLE_NAME_SELECTOR_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
+
+
+def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
+    """Parse the ``role=<role>[name="<name>"]`` form (ref_to_selector) — TIER 1, no browser read.
+
+    Returns (role, accessible_name) when the selector is a plain role/name locator;
+    None for bare CSS/xpath or when an engine chain (`>> nth=`) trails the role/name.
+    """
+    selector = selector.strip()
+    match = _ROLE_NAME_SELECTOR_RE.match(selector)
+    if not match:
+        return None
+    role, raw_name, suffix = match.group(1), match.group(2), match.group(3)
+    if suffix.strip():
+        return None
+    name = raw_name.replace('\\"', '"') if raw_name is not None else ""
+    return role, name
+
+
+async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tuple[str, str] | None:
+    """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
+
+    A failed read degrades gracefully to None so the selector-only auto-credit
+    path (SKY-10712) stays intact.
+    """
+    selector = selector.strip()
+    if not selector:
+        return None
+    server = getattr(ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    try:
+        result = await asyncio.wait_for(
+            server.call_internal_tool(
+                "skyvern_evaluate",
+                {"expression": _scout_accessible_role_name_expression(selector)},
+            ),
+            timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    value = (result.get("data") or {}).get("result")
+    if not isinstance(value, dict):
+        return None
+    role = str(value.get("role") or "").strip()
+    name = str(value.get("accessible_name") or "").strip()
+    if not role and not name:
+        return None
+    return role, name
+
+
+async def _resolve_scout_role_name(
+    ctx: AgentContext, selector: str, *, allow_browser_read: bool = True
+) -> tuple[str, str]:
+    """Resolve (role, accessible_name) for a scouted selector. TIER 1 parse first;
+    TIER 2 browser read only for bare CSS/xpath. Always degrades to ("", "").
+
+    ``allow_browser_read=False`` skips TIER 2 when the action navigated: a post-action
+    read against the landing page would capture the wrong element's name, so the bare
+    selector is kept verbatim (the synthesizer prefers it anyway)."""
+    selector = selector.strip()
+    if not selector:
+        return "", ""
+    parsed = _role_name_from_selector(selector)
+    if parsed is not None:
+        return parsed
+    if not allow_browser_read:
+        return "", ""
+    captured = await _capture_accessible_role_name(ctx, selector)
+    if captured is not None:
+        return captured
+    return "", ""
+
+
+def _record_scouted_interaction(
+    ctx: AgentContext,
+    *,
+    tool_name: str,
+    selector: str = "",
+    source_url: str | None = None,
+    value: str = "",
+    key: str = "",
+    typed_length: int = 0,
+    role: str = "",
+    accessible_name: str = "",
+) -> None:
+    selector = selector.strip()
+    # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
+    if tool_name != "press_key" and not selector:
+        return
+    artifact: ScoutedInteraction = {"tool_name": tool_name}
+    if selector:
+        artifact["selector"] = selector
+    if source_url and source_url.strip():
+        artifact["source_url"] = source_url.strip()
+    if value:
+        artifact["value"] = value
+    if key:
+        artifact["key"] = key
+    if typed_length:
+        artifact["typed_length"] = typed_length
+    if role:
+        artifact["role"] = role
+    if accessible_name:
+        artifact["accessible_name"] = accessible_name
+    interactions = [
+        item
+        for item in ctx.scouted_interactions
+        if not (
+            item.get("tool_name") == artifact["tool_name"]
+            and item.get("selector") == artifact.get("selector")
+            and item.get("source_url") == artifact.get("source_url")
+        )
+    ]
+    interactions.append(artifact)
+    ctx.scouted_interactions = interactions[-_MAX_SCOUTED_INTERACTIONS:]
+
+    trajectory = list(ctx.scout_trajectory)
+    trajectory_artifact = cast(ScoutedInteraction, artifact.copy())
+    trajectory_artifact["trajectory_index"] = len(trajectory)
+    trajectory.append(trajectory_artifact)
+    ctx.scout_trajectory = trajectory[-_MAX_SCOUTED_INTERACTIONS:]
+
+    LOG.info(
+        "copilot_scout_interaction_captured",
+        tool_name=tool_name,
+        selector=selector or None,
+        source_url=artifact.get("source_url"),
+        role=role or None,
+        total_scouted_interactions=len(ctx.scouted_interactions),
+        total_scout_trajectory=len(ctx.scout_trajectory),
+    )
+
+
+def _register_scout_interaction_observation(
+    ctx: AgentContext, *, tool_name: str, selector: str, source_url: str | None, url: str
+) -> int | None:
+    # A successful scout interaction reaches the post-action page; record it as an
+    # interaction-reached observation so a click-reached block can be authored
+    # against it without a separate inspect_page_for_composition.
+    selector = selector.strip()
+    if not selector or not url:
+        return None
+    evidence: dict[str, Any] = {
+        "inspected_url": url,
+        "current_url": url,
+        "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
+        "interaction_tool": tool_name,
+        "interaction_selector": selector,
+    }
+    if source_url and source_url.strip():
+        evidence["interaction_source_url"] = source_url.strip()
+    return _append_flow_evidence(ctx, evidence, reached_via="interaction")
+
+
 def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:
     run_id = getattr(ctx, "last_run_blocks_workflow_run_id", None)
     if not isinstance(run_id, str) or not run_id:
@@ -2210,6 +2412,308 @@ class BlockObservationRef(BaseModel):
     observation_step: Annotated[int, Field(ge=0)]
 
 
+ArtifactEvidenceStatus = Literal["satisfied", "missing", "diagnostic_only", "observed_not_verified"]
+
+
+class CodeArtifactClaimedOutcome(BaseModel):
+    id: str
+    scope: str
+    text: str
+    status: ArtifactEvidenceStatus
+    depends_on: list[str] = Field(default_factory=list)
+    covered_criteria: list[str] = Field(default_factory=list)
+    criteria_ids: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    observation_refs: list[str] = Field(default_factory=list)
+    required_tokens: list[str] = Field(default_factory=list)
+    entities: list[str] = Field(default_factory=list)
+
+
+class CodeArtifactPageDependency(BaseModel):
+    id: str
+    scope: str
+    status: ArtifactEvidenceStatus
+    url_hint: str | None = None
+    page_state_hint: str | None = None
+    required_affordances: list[str] = Field(default_factory=list)
+    required_outcomes: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list, description="Dependency-scoped evidence_ref ids.")
+    observation_refs: list[str] = Field(default_factory=list, description="Dependency-scoped observation_ref ids.")
+
+
+class CodeArtifactCompletionCriterion(BaseModel):
+    id: str
+    text: str
+    level: Literal["terminal", "outcome", "prefix", "method"]
+    outcome: str | None = None
+    terminal: bool | None = None
+
+
+class CodeArtifactScopedRef(BaseModel):
+    claim_id: str | None = None
+    dependency_id: str | None = None
+    criterion_id: str | None = None
+    evidence_ref: str | None = None
+    observation_ref: str | None = None
+    status: ArtifactEvidenceStatus = Field(validation_alias=AliasChoices("status", "evidence_status"))
+    source_tool: str | None = None
+    observation_step: Annotated[int, Field(ge=0)] | None = None
+    run_sample_id: str | None = None
+    current_url: str | None = None
+    source_label: str | None = None
+    checkpoint_next_mode: Literal["advance", "stop"] | None = None
+
+
+class CodeArtifactTerminalVerifierExpectation(BaseModel):
+    id: str
+    text: str
+    criteria_ids: list[str] = Field(default_factory=list)
+    claimed_outcome_ids: list[str] = Field(default_factory=list)
+
+
+class CodeArtifactExplorationObservation(BaseModel):
+    id: str
+    text: str
+    status: Literal["observed_not_verified"] = Field(
+        default="observed_not_verified",
+        validation_alias=AliasChoices("status", "evidence_status"),
+    )
+    observation_ref: str | None = None
+    source_tool: str | None = None
+    observation_step: Annotated[int, Field(ge=0)] | None = None
+    current_url: str | None = None
+    source_label: str | None = None
+    checkpoint_next_mode: Literal["stop"] | None = None
+
+
+class CodeArtifactMetadata(BaseModel):
+    artifact_id: str | None = None
+    block_label: str | None = None
+    block_id: str | None = None
+    declared_goal: str
+    claimed_outcomes: list[CodeArtifactClaimedOutcome] = Field(default_factory=list)
+    page_dependencies: list[CodeArtifactPageDependency] = Field(default_factory=list)
+    completion_criteria: list[CodeArtifactCompletionCriterion] = Field(default_factory=list)
+    evidence_refs: list[CodeArtifactScopedRef] = Field(default_factory=list)
+    observation_refs: list[CodeArtifactScopedRef] = Field(default_factory=list)
+    terminal_verifier_expectations: list[CodeArtifactTerminalVerifierExpectation] = Field(default_factory=list)
+    exploration_observations: list[CodeArtifactExplorationObservation] = Field(default_factory=list)
+
+
+_CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
+    "claimed_outcomes",
+    "page_dependencies",
+    "completion_criteria",
+    "terminal_verifier_expectations",
+)
+
+
+def _code_artifact_metadata_as_tool_argument(
+    metadata: list[CodeArtifactMetadata] | None,
+) -> list[dict[str, Any]]:
+    if not metadata:
+        return []
+    return [item.model_dump(mode="json", exclude_none=True) for item in metadata]
+
+
+def _format_code_artifact_violations(violations: list[str]) -> str:
+    # Surface every contract violation at once so the agent fixes them in a single
+    # update instead of round-tripping one error per `update_and_run_blocks` call.
+    if len(violations) == 1:
+        return violations[0]
+    numbered = "\n".join(f"{index}. {message}" for index, message in enumerate(violations, start=1))
+    return f"Artifact metadata has {len(violations)} contract violations; fix all of them in one update:\n{numbered}"
+
+
+def _normalize_code_artifact_metadata(
+    raw_metadata: Any,
+    workflow_yaml: str,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    if raw_metadata in (None, [], {}):
+        return {}, None
+    items = _code_artifact_metadata_items(raw_metadata)
+    code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
+    normalized: dict[str, dict[str, Any]] = {}
+    violations: list[str] = []
+    seen_labels: set[str] = set()
+    for raw_item in items:
+        try:
+            metadata = (
+                raw_item
+                if isinstance(raw_item, CodeArtifactMetadata)
+                else CodeArtifactMetadata.model_validate(raw_item)
+            )
+        except ValidationError as exc:
+            violations.append(f"Artifact metadata is malformed: {exc}")
+            continue
+        dumped = metadata.model_dump(mode="json", exclude_none=True)
+        label = str(dumped.get("block_label") or "").strip()
+        if not label:
+            violations.append("Artifact metadata requires a non-empty `block_label` for each artifact.")
+            continue
+        if label not in code_blocks:
+            violations.append(
+                f"Artifact metadata for `{label}` does not reference an existing code block label. "
+                "Attach metadata only to authored code blocks."
+            )
+            continue
+        if label in seen_labels:
+            violations.append(f"Artifact metadata contains duplicate entries for `{label}`.")
+            continue
+        seen_labels.add(label)
+        dumped["block_label"] = label
+        item_violations: list[str] = []
+        artifact_id = str(dumped.get("artifact_id") or "").strip()
+        if artifact_id and not artifact_id.startswith("code_artifact:"):
+            item_violations.append(
+                f"Artifact metadata for `{label}` requires `artifact_id` to start with `code_artifact:`."
+            )
+        dumped["artifact_id"] = artifact_id or _artifact_id_for_block_label(label)
+        block_id = str(
+            dumped.get("block_id") or code_blocks[label].get("block_id") or code_blocks[label].get("id") or ""
+        ).strip()
+        if block_id:
+            dumped["block_id"] = block_id
+        declared_goal = str(dumped.get("declared_goal") or "").strip()
+        if not declared_goal:
+            item_violations.append(f"Artifact metadata for `{label}` requires a non-empty `declared_goal`.")
+        for field_name in _CODE_ARTIFACT_REQUIRED_LIST_FIELDS:
+            value = dumped.get(field_name)
+            if not isinstance(value, list) or not value:
+                item_violations.append(f"Artifact metadata for `{label}` requires non-empty `{field_name}`.")
+        if not dumped.get("evidence_refs") and not dumped.get("observation_refs"):
+            item_violations.append(f"Artifact metadata for `{label}` requires `evidence_refs` or `observation_refs`.")
+        item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
+        if item_violations:
+            violations.extend(item_violations)
+            continue
+        normalized[label] = dumped
+    if violations:
+        return {}, _format_code_artifact_violations(violations)
+    return normalized, None
+
+
+def _code_artifact_metadata_items(raw_metadata: Any) -> list[Any]:
+    if isinstance(raw_metadata, Mapping):
+        items: list[Any] = []
+        for block_label, value in raw_metadata.items():
+            if isinstance(value, Mapping) and "block_label" not in value:
+                items.append({"block_label": block_label, **value})
+            else:
+                items.append(value)
+        return items
+    if isinstance(raw_metadata, list):
+        return raw_metadata
+    return [raw_metadata]
+
+
+def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, Mapping[str, Any]]:
+    blocks: dict[str, Mapping[str, Any]] = {}
+    for label, block in _workflow_yaml_blocks_by_label(workflow_yaml).items():
+        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
+            blocks[label] = block
+    return blocks
+
+
+def _artifact_id_for_block_label(label: str) -> str:
+    fragment = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("_") or "artifact"
+    return f"code_artifact:{fragment}"
+
+
+def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]) -> list[str]:
+    """Return every shape violation for one artifact; the caller aggregates them."""
+    errors: list[str] = []
+    for field_name, ref_key in (("evidence_refs", "evidence_ref"), ("observation_refs", "observation_ref")):
+        for index, ref in enumerate(_artifact_rows(artifact.get(field_name))):
+            if not str(ref.get(ref_key) or "").strip():
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `{ref_key}`.")
+            if not any(str(ref.get(key) or "").strip() for key in ("claim_id", "dependency_id", "criterion_id")):
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires a scoped id.")
+            status = str(ref.get("status") or "").strip()
+            if ref.get("checkpoint_next_mode") == "advance" and status != "diagnostic_only":
+                errors.append(
+                    f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
+                    "`checkpoint_next_mode=advance`; it must stay `diagnostic_only`."
+                )
+            if ref.get("checkpoint_next_mode") == "stop" and status not in {"observed_not_verified", "diagnostic_only"}:
+                errors.append(
+                    f"Artifact metadata for `{label}` `{field_name}` entry {index} has "
+                    "`checkpoint_next_mode=stop`; it must remain `observed_not_verified` or `diagnostic_only`."
+                )
+            if status != "missing" and not str(ref.get("source_tool") or "").strip():
+                errors.append(f"Artifact metadata for `{label}` `{field_name}` entry {index} requires `source_tool`.")
+
+    for index, claim in enumerate(_artifact_rows(artifact.get("claimed_outcomes"))):
+        claim_id = str(claim.get("id") or "").strip()
+        if not _artifact_string_list(claim.get("depends_on")):
+            errors.append(f"Artifact metadata claim `{claim_id or index}` for `{label}` requires `depends_on`.")
+        claim_criteria = _artifact_string_list(claim.get("covered_criteria")) or _artifact_string_list(
+            claim.get("criteria_ids")
+        )
+        if not claim_criteria:
+            errors.append(f"Artifact metadata claim `{claim_id}` for `{label}` requires covered criterion ids.")
+        claim_evidence_refs = _artifact_string_list(claim.get("evidence_refs"))
+        claim_observation_refs = _artifact_string_list(claim.get("observation_refs"))
+        if claim.get("status") == "satisfied" and not claim_evidence_refs:
+            errors.append(
+                f"Artifact metadata claim `{claim_id}` for `{label}` is `satisfied` but has no "
+                "claim-scoped `evidence_refs`."
+            )
+        if claim.get("status") != "missing" and not claim_evidence_refs and not claim_observation_refs:
+            errors.append(
+                f"Artifact metadata claim `{claim_id}` for `{label}` requires claim-scoped "
+                "`evidence_refs` or `observation_refs` unless status is `missing`."
+            )
+
+    for dependency in _artifact_rows(artifact.get("page_dependencies")):
+        dependency_id = str(dependency.get("id") or "").strip()
+        dependency_evidence_refs = _artifact_string_list(dependency.get("evidence_refs"))
+        dependency_observation_refs = _artifact_string_list(dependency.get("observation_refs"))
+        if dependency.get("status") == "satisfied" and not dependency_evidence_refs:
+            errors.append(
+                f"Artifact metadata dependency `{dependency_id}` for `{label}` is `satisfied` but has no "
+                "dependency-scoped `evidence_refs`."
+            )
+        if dependency.get("status") != "missing" and not dependency_evidence_refs and not dependency_observation_refs:
+            errors.append(
+                f"Artifact metadata dependency `{dependency_id}` for `{label}` requires scoped "
+                "`evidence_refs` or `observation_refs` unless status is `missing`."
+            )
+
+    for index, expectation in enumerate(_artifact_rows(artifact.get("terminal_verifier_expectations"))):
+        expectation_id = str(expectation.get("id") or "").strip()
+        if not _artifact_string_list(expectation.get("criteria_ids")) and not _artifact_string_list(
+            expectation.get("claimed_outcome_ids")
+        ):
+            errors.append(
+                f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
+                "requires `criteria_ids` or `claimed_outcome_ids`."
+            )
+
+    for index, observation in enumerate(_artifact_rows(artifact.get("exploration_observations"))):
+        if observation.get("status") != "observed_not_verified":
+            errors.append(
+                f"Artifact metadata for `{label}` exploration observation {index} must be marked "
+                "`observed_not_verified` until authored execution and terminal verification pass."
+            )
+        if observation.get("checkpoint_next_mode") == "advance":
+            errors.append(
+                f"Artifact metadata for `{label}` exploration observation {index} cannot carry "
+                "`checkpoint_next_mode=advance`; record that as `diagnostic_only` evidence instead."
+            )
+    return errors
+
+
+def _artifact_rows(value: Any) -> list[Mapping[str, Any]]:
+    return [row for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
+
+
+def _artifact_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -2225,6 +2729,17 @@ async def _update_workflow(
     # gate below consumes these refs, so they must be visible before validation.
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
+    ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
+    code_artifact_metadata, code_artifact_metadata_error = _normalize_code_artifact_metadata(
+        params.get("code_artifact_metadata"),
+        workflow_yaml,
+    )
+    if code_artifact_metadata_error is not None:
+        return {"ok": False, "error": code_artifact_metadata_error}
+    if code_artifact_metadata:
+        ctx.code_artifact_metadata = code_artifact_metadata
+        ctx.workflow_verification_evidence.code_artifact_metadata = code_artifact_metadata
+        params["code_artifact_metadata"] = code_artifact_metadata
     if allow_missing_credentials is None:
         allow_missing_credentials = getattr(ctx, "allow_untested_workflow_draft", False) is True
     if not allow_missing_credentials:
@@ -2393,6 +2908,7 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
         elif cred.secret_label:
             entry["secret_label"] = cred.secret_label
         serialized.append(entry)
+    _record_discovered_credentials_on_policy(ctx, credentials)
     return {
         "ok": True,
         "data": {
@@ -2403,6 +2919,16 @@ async def _list_credentials(params: dict[str, Any], ctx: AgentContext) -> dict[s
             "has_more": len(serialized) == page_size,
         },
     }
+
+
+def _record_discovered_credentials_on_policy(ctx: AgentContext, credentials: list[Credential]) -> None:
+    request_policy = ctx.request_policy
+    if not isinstance(request_policy, RequestPolicy):
+        return
+    known_ids = {credential.credential_id for credential in request_policy.discovered_credentials}
+    for credential in credentials:
+        if credential.credential_id not in known_ids:
+            request_policy.discovered_credentials.append(credential)
 
 
 # Block types that establish browser state (loaded page / authenticated
@@ -5430,6 +5956,7 @@ async def _click_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
     deterministic_result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="click")
     if deterministic_result is not None:
         return deterministic_result
@@ -5457,6 +5984,7 @@ async def _type_text_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
 
 
@@ -5464,6 +5992,7 @@ async def _select_option_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="select_option")
 
 
@@ -5471,6 +6000,7 @@ async def _press_key_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
+    await _capture_scout_source_url(ctx)
     return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="press_key")
 
 
@@ -5521,6 +6051,7 @@ async def _click_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, title = await _resolve_url_title(raw, ctx)
@@ -5530,6 +6061,24 @@ async def _click_post_hook(
             "url": url,
             "title": title,
         }
+        navigated = bool(source_url) and bool(url) and source_url != url
+        role, accessible_name = await _resolve_scout_role_name(
+            ctx, data.get("selector", ""), allow_browser_read=not navigated
+        )
+        _record_scouted_interaction(
+            ctx,
+            tool_name="click",
+            selector=data.get("selector", ""),
+            source_url=source_url,
+            role=role,
+            accessible_name=accessible_name,
+        )
+        observation_step = _register_scout_interaction_observation(
+            ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
+        )
+        if observation_step is not None:
+            result["observation_step"] = observation_step
+            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -5598,6 +6147,7 @@ async def _type_text_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = data.get("selector", "")
@@ -5612,6 +6162,22 @@ async def _type_text_post_hook(
         if landing_failure is not None:
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        _record_scouted_interaction(
+            ctx,
+            tool_name="type_text",
+            selector=selector,
+            source_url=source_url,
+            typed_length=typed_length,
+            role=role,
+            accessible_name=accessible_name,
+        )
+        observation_step = _register_scout_interaction_observation(
+            ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
+        )
+        if observation_step is not None:
+            result["observation_step"] = observation_step
+            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -5678,6 +6244,7 @@ async def _select_option_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -5687,6 +6254,22 @@ async def _select_option_post_hook(
             "value": data.get("value", ""),
             "url": url,
         }
+        role, accessible_name = await _resolve_scout_role_name(ctx, data.get("selector", ""))
+        _record_scouted_interaction(
+            ctx,
+            tool_name="select_option",
+            selector=data.get("selector", ""),
+            source_url=source_url,
+            value=data.get("value", ""),
+            role=role,
+            accessible_name=accessible_name,
+        )
+        observation_step = _register_scout_interaction_observation(
+            ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
+        )
+        if observation_step is not None:
+            result["observation_step"] = observation_step
+            result["data"]["observation_step"] = observation_step
     return result
 
 
@@ -5696,6 +6279,7 @@ async def _press_key_post_hook(
     ctx: AgentContext,
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
+    source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
         url, _ = await _resolve_url_title(raw, ctx)
@@ -5705,6 +6289,13 @@ async def _press_key_post_hook(
             "selector": data.get("selector", ""),
             "url": url,
         }
+        _record_scouted_interaction(
+            ctx,
+            tool_name="press_key",
+            selector=data.get("selector", ""),
+            source_url=source_url,
+            key=data.get("key", ""),
+        )
     return result
 
 
@@ -6722,6 +7313,7 @@ async def update_workflow_tool(
     ctx: RunContextWrapper,
     workflow_yaml: str,
     block_observation_refs: list[BlockObservationRef] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
 ) -> str:
     """Validate and update the workflow YAML definition.
     Provide the complete workflow YAML as a string.
@@ -6740,10 +7332,18 @@ async def update_workflow_tool(
     `block_observation_refs` entries with each block label and the
     `observation_step` returned by inspect_page_for_composition for the page
     that block acts on.
+    For authored code blocks, include `code_artifact_metadata` rows describing
+    declared goals, claimed outcomes, page dependencies, criteria, evidence
+    refs, observation refs, and terminal verifier expectations.
     """
     copilot_ctx = ctx.context
+    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
-    arguments = {"workflow_yaml": workflow_yaml, "block_observation_refs": normalized_block_observation_refs}
+    arguments = {
+        "workflow_yaml": workflow_yaml,
+        "block_observation_refs": normalized_block_observation_refs,
+        "code_artifact_metadata": serialized_code_artifact_metadata,
+    }
     loop_error = _tool_loop_error(copilot_ctx, "update_workflow", arguments)
     if loop_error:
         return json.dumps({"ok": False, "error": loop_error})
@@ -6798,7 +7398,11 @@ async def update_workflow_tool(
     prior_definition = await _get_prior_workflow_definition(copilot_ctx)
     with copilot_span("update_workflow", data={"yaml_length": len(workflow_yaml)}):
         result = await _update_workflow(
-            {**arguments, "raw_block_observation_refs": block_observation_refs},
+            {
+                **arguments,
+                "raw_block_observation_refs": block_observation_refs,
+                "raw_code_artifact_metadata": code_artifact_metadata,
+            },
             copilot_ctx,
             allow_missing_credentials=getattr(copilot_ctx, "allow_untested_workflow_draft", False) is True,
         )
@@ -7038,6 +7642,7 @@ async def update_and_run_blocks_tool(
     workflow_yaml: str,
     block_labels: list[str],
     block_observation_refs: list[BlockObservationRef] | None = None,
+    code_artifact_metadata: list[CodeArtifactMetadata] | None = None,
     parameters: dict[str, Any] | None = None,
 ) -> Any:
     """Update the workflow YAML and immediately run the specified blocks in one step.
@@ -7080,6 +7685,9 @@ async def update_and_run_blocks_tool(
     `block_observation_refs` entries with each block label and the
     `observation_step` returned by inspect_page_for_composition or evaluate for
     the page that block acts on.
+    For authored code blocks, include `code_artifact_metadata` rows describing
+    declared goals, claimed outcomes, page dependencies, criteria, evidence
+    refs, observation refs, and terminal verifier expectations.
     When inspected evidence shows an anti-bot challenge gating a disabled
     submit/search control, account for challenge resolution before submit;
     do not compose a click against a control observed as disabled.
@@ -7087,11 +7695,13 @@ async def update_and_run_blocks_tool(
     copilot_ctx = ctx.context
     copilot_ctx.completion_verification_result = None
     handler_start = time.monotonic()
+    serialized_code_artifact_metadata = _code_artifact_metadata_as_tool_argument(code_artifact_metadata)
     normalized_block_observation_refs = normalize_block_observation_refs(block_observation_refs)
     arguments = {
         "workflow_yaml": workflow_yaml,
         "block_labels": block_labels,
         "block_observation_refs": normalized_block_observation_refs,
+        "code_artifact_metadata": serialized_code_artifact_metadata,
         "parameters": parameters or {},
     }
     skip_run_after_update = _request_policy_allows_update_and_skip_run(copilot_ctx, "update_and_run_blocks")
@@ -7138,6 +7748,8 @@ async def update_and_run_blocks_tool(
                 "workflow_yaml": workflow_yaml,
                 "block_observation_refs": normalized_block_observation_refs,
                 "raw_block_observation_refs": block_observation_refs,
+                "code_artifact_metadata": serialized_code_artifact_metadata,
+                "raw_code_artifact_metadata": code_artifact_metadata,
             },
             copilot_ctx,
             allow_missing_credentials=skip_run_after_update,
@@ -7844,9 +8456,18 @@ async def _composition_evidence_after_navigation_failure(
 ) -> dict[str, Any] | None:
     current_url, _ = await _fallback_page_info(ctx)
     current_url = current_url or inspected_url
+    structured = await _composition_get_structured_evidence(ctx, inspected_url=inspected_url, current_url=current_url)
+    if structured is not None and has_bounded_page_schema(structured):
+        evidence = _composition_add_inspection_warning(
+            structured,
+            f"navigation_error_before_html_capture: {navigation_error}",
+        )
+        if page_evidence_needs_visual_fallback(evidence):
+            evidence = await _augment_composition_evidence_with_visual_fallback(ctx, evidence)
+        return evidence
     # Same size-cap survival as the success path: a heavy page that rendered before the nav
     # error still parses via the stripped-body evaluate instead of yielding hollow evidence.
-    html, html_error, html_truncated = await _composition_get_html(ctx)
+    html, html_error, html_truncated, _ = await _composition_get_html(ctx)
     if html_error is None:
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
         evidence = _composition_add_inspection_warning(
@@ -8085,7 +8706,7 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
     return _merge_visual_obstruction_candidates(evidence, candidates)
 
 
-async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool]:
+async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> tuple[str, str | None, bool, bool]:
     """Return body HTML for composition parsing, surviving the MCP response size cap.
 
     `skyvern_get_html("body")` is the fast path, but the shared size cap DROPS the
@@ -8094,20 +8715,62 @@ async def _composition_get_html(copilot_ctx: Any) -> tuple[str, str | None, bool
     parse an empty string and report hollow evidence. On an empty/capped read, fall
     back to an `evaluate` that returns the body with script/style/svg/etc. stripped
     and length-bounded; that fits under the cap while preserving the form/link
-    structure. Returns (html, error, truncated): error is set only on a hard read
-    failure; truncated is True when the stripped fallback was sliced at the cap (the
-    raw path is never silently truncated — it is dropped over the cap and falls back).
+    structure. Returns (html, error, truncated, used_stripped): error is set only on
+    a hard read failure; truncated is True when the stripped fallback was sliced at
+    the cap; used_stripped is True when the bounded read was the source (raw skipped
+    or cap-dropped). `skip_raw` goes straight to the stripped read so a caller that
+    has already seen the raw serialization get cap-dropped for this page need not
+    re-issue it.
     """
-    html_result = await _discovery_get_html(copilot_ctx)
-    if html_result.get("ok"):
-        html = _discovery_extract_html_payload(html_result)
-        if html.strip():
-            return html, None, False
+    html_result: dict[str, Any] = {}
+    if not skip_raw:
+        html_result = await _discovery_get_html(copilot_ctx)
+        if html_result.get("ok"):
+            html = _discovery_extract_html_payload(html_result)
+            if html.strip():
+                return html, None, False, False
     stripped, truncated = await _composition_get_stripped_html(copilot_ctx)
     if stripped and stripped.strip():
-        return stripped, None, truncated
+        return stripped, None, truncated, True
     error = html_result.get("error")
-    return "", str(error) if error else None, False
+    return "", str(error) if error else None, False, True
+
+
+async def _composition_get_structured_evidence(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+) -> dict[str, Any] | None:
+    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    with copilot_span("composition_structured_extract"):
+        try:
+            result = await asyncio.wait_for(
+                server.call_internal_tool(
+                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
+                ),
+                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    raw = (result.get("data") or {}).get("result")
+    if isinstance(raw, str):
+        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
 
 
 async def _capture_composition_evidence(
@@ -8117,30 +8780,43 @@ async def _capture_composition_evidence(
     current_url: str,
     active_run_terminal_sample: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Read page HTML and parse composition evidence, recapturing on a hollow read.
-
-    The capture (`_composition_get_html`) survives the MCP size cap; this loop adds a
-    short settle and re-read for the separate case where the page had not finished
-    rendering at capture time (a cold cloud session's first navigate to a heavy page
-    can hand back a shell). Returns (evidence, html_error); html_error is set only
-    when the HTML read itself failed. Stops early once the parse yields a bounded
-    schema (forms/links/result containers/challenge), so a genuine challenge page is
-    not retried.
-    """
+    """Parse composition evidence (cheap extractor first, get_html fallback); html_error is set only on a failed HTML read."""
     evidence: dict[str, Any] | None = None
     html_truncated = False
+    used_structured = False
+    skip_raw = False
     for attempt in range(_COMPOSITION_HOLLOW_RECAPTURE_RETRIES + 1):
-        html, html_error, html_truncated = await _composition_get_html(copilot_ctx)
+        structured = await _composition_get_structured_evidence(
+            copilot_ctx, inspected_url=inspected_url, current_url=current_url
+        )
+        if structured is not None:
+            evidence = structured
+            used_structured = True
+            if has_bounded_page_schema(evidence):
+                break
+            if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
+                await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
+                continue
+        html, html_error, html_truncated, used_stripped = await _composition_get_html(copilot_ctx, skip_raw=skip_raw)
         if html_error is not None:
+            if evidence is not None:
+                break
             return None, html_error
+        # On a heavy page the raw get_html serialization is dropped over the MCP size cap and
+        # falls back to the stripped read; once that happens, settle-and-recapture via the
+        # stripped path only so a slow page is still retried without re-serializing the full DOM.
+        if used_stripped:
+            skip_raw = True
         evidence = parse_composition_html(html, inspected_url=inspected_url, current_url=current_url)
+        used_structured = False
         if has_bounded_page_schema(evidence):
             break
         if attempt < _COMPOSITION_HOLLOW_RECAPTURE_RETRIES:
             await asyncio.sleep(_COMPOSITION_HOLLOW_RECAPTURE_DELAY_SECONDS)
-    if evidence is not None and html_truncated:
+    if evidence is not None and html_truncated and not used_structured:
         evidence = _composition_add_inspection_warning(evidence, "html_sliced_at_cap")
-    if evidence is not None:
+    # Structured evidence already carries computed obstruction candidates; only the get_html path augments.
+    if evidence is not None and not used_structured:
         evidence = await _augment_composition_evidence_with_computed_obstruction_candidates(copilot_ctx, evidence)
     if evidence is not None and (
         page_evidence_needs_visual_fallback(evidence)
@@ -8149,6 +8825,39 @@ async def _capture_composition_evidence(
     ):
         evidence = await _augment_composition_evidence_with_visual_fallback(copilot_ctx, evidence)
     return evidence, None
+
+
+def _normalized_inspect_url(url: str | None) -> str | None:
+    """Normalized full URL for strict same-page comparison, or None when not comparable.
+
+    Preserves scheme, the path's trailing slash, query, and fragment so distinct rendered
+    states (http vs https, /p vs /p/, ?q=a vs ?q=b, hash-routed SPA states) never collide;
+    only netloc case and an empty root path are normalized.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}{query}{fragment}"
+
+
+def _same_inspect_target(live_url: str | None, target_url: str | None) -> bool:
+    """True when the live page is the exact page a URL-target inspect would navigate to.
+
+    Strict full-URL equality, so a different scheme, trailing slash, query, or fragment
+    still navigates. Used to skip the re-navigation when the agent is already standing on
+    the requested page.
+    """
+    live_key = _normalized_inspect_url(live_url)
+    target_key = _normalized_inspect_url(target_url)
+    return live_key is not None and live_key == target_key
 
 
 async def _inspect_page_for_composition_impl(
@@ -8176,28 +8885,6 @@ async def _inspect_page_for_composition_impl(
         use_current_page=use_current_page,
     )
 
-    if (
-        not bypass_budget_for_post_run_current_page
-        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
-    ):
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
-    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
-    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
-        result = {
-            "ok": False,
-            "data": None,
-            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
-        }
-        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-        return result
-
     entry_url: str
     kind: str
     if use_current_page:
@@ -8220,23 +8907,51 @@ async def _inspect_page_for_composition_impl(
             record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, regression_error)
             return regression_error
 
+    # Skip re-navigation when the inspect target is the page the browser is already on. A
+    # passive client-side redirect can move the browser without a tool, so for a URL target
+    # confirm against the live URL; for current_page the live URL is the target by definition.
+    if use_current_page:
+        inspect_target_url = current_url
+        on_target_page = True
+    else:
+        live_url, _ = await _fallback_page_info(copilot_ctx)
+        on_target_page = _same_inspect_target(live_url, entry_url)
+        inspect_target_url = live_url if on_target_page else entry_url
+
+    if (
+        not bypass_budget_for_post_run_current_page
+        and copilot_ctx.page_inspection_calls_this_turn >= _COMPOSITION_INSPECTION_PER_TURN_BUDGET
+    ):
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="turn"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    cumulative = copilot_ctx.prior_page_inspection_calls_made + copilot_ctx.page_inspection_calls_this_turn
+    if not bypass_budget_for_post_run_current_page and cumulative >= _COMPOSITION_INSPECTION_PER_CHAT_BUDGET:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": _page_inspection_budget_error(copilot_ctx, scope="chat"),
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
+
+    evidence = None
+    html_error: str | None = None
     with copilot_span(
         "inspect_page_for_composition",
         data={"target_url_kind": kind},
     ):
-        if use_current_page:
-            current_url = entry_url
+        if on_target_page:
+            # current_page, or a URL target the agent is already on — capture without navigating.
+            current_url = inspect_target_url or entry_url
             evidence, html_error = await _capture_composition_evidence(
                 copilot_ctx, inspected_url=entry_url, current_url=current_url
             )
-            if html_error is not None:
-                result = {
-                    "ok": False,
-                    "data": None,
-                    "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                }
-                record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                return result
         else:
             nav_result = await _discovery_navigate(
                 copilot_ctx,
@@ -8266,14 +8981,15 @@ async def _inspect_page_for_composition_impl(
                 evidence, html_error = await _capture_composition_evidence(
                     copilot_ctx, inspected_url=entry_url, current_url=current_url
                 )
-                if html_error is not None:
-                    result = {
-                        "ok": False,
-                        "data": None,
-                        "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
-                    }
-                    record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
-                    return result
+
+    if html_error is not None:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": f"inspect_page_for_composition could not read page HTML: {html_error}",
+        }
+        record_tool_step_result_for_ctx(copilot_ctx, "inspect_page_for_composition", arguments, result)
+        return result
 
     if evidence is None:
         result = {
@@ -8405,7 +9121,7 @@ async def _discovery_walk(
         # fall back to a stripped-body evaluate that keeps the links/forms the resolver needs
         # to identify a usable entrypoint. (Discovery only resolves the entrypoint, so a sliced
         # tail does not matter here.)
-        html, _, _ = await _composition_get_html(ctx)
+        html, _, _, _ = await _composition_get_html(ctx)
         page_title, anchors, form_fields = _discovery_parse_html(html)
 
         evidence_trail.append(

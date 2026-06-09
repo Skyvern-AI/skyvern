@@ -1467,6 +1467,7 @@ async def handle_sequential_click_for_dropdown(
         lean_compress_long_href=lean_enabled,
         lean_compress_image_src=lean_enabled,
         lean_strip_url_query_strings=lean_enabled,
+        lean_compress_nonnavigable_href=lean_enabled,
     )
     distinct_id_for_override = task.workflow_run_id if task.workflow_run_id else task.task_id
     check_user_goal_handler = await resolve_check_user_goal_handler(
@@ -2833,8 +2834,10 @@ async def handle_complete_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    # verification_path separates the three distinct runtime paths that
-    # roll up to this span — explains the 175x p95/p50 ratio.
+    # verification_path labels the handler-internal outcome of this span
+    # (already_verified / needs_llm_* / terminate_requested). Caller-side
+    # attribution (periodic vs handler-forced) lives on the child
+    # complete_verify span as `verification.trigger`.
     _span = otel_trace.get_current_span()
     if action.verified or not task.navigation_goal:
         _span.set_attribute("verification_path", "already_verified")
@@ -2845,7 +2848,9 @@ async def handle_complete_action(
         workflow_run_id=task.workflow_run_id,
     )
     try:
-        verification_result = await app.agent.complete_verify(page, scraped_page, task, step)
+        verification_result = await app.agent.complete_verify(
+            page, scraped_page, task, step, verification_trigger="complete_action_forced"
+        )
     except Exception as e:
         _span.set_attribute("verification_path", "needs_llm_error")
         LOG.exception(
@@ -3347,8 +3352,15 @@ async def chain_click(
     action_results: list[ActionResult] = []
     try:
         if not await skyvern_element.navigate_to_a_href(page=page):
-            await EventStrategyFactory.move_to_element(page, locator)
-            await _locator_click(locator, click_count, timeout=timeout)
+            if click_count == 1:
+                # Route through the active cursor strategy so alternate profiles can
+                # dispatch their own click sequence (explicit mouse.down/up).
+                # Multi-click variants (dblclick / triple-click) still go through
+                # _locator_click because they rely on Playwright's click_count arg.
+                await EventStrategyFactory.click_element(page, locator, timeout=timeout)
+            else:
+                await EventStrategyFactory.move_to_element(page, locator)
+                await _locator_click(locator, click_count, timeout=timeout)
             LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
         action_results = [ActionSuccess()]
         return action_results
@@ -4411,13 +4423,15 @@ async def select_from_emerging_elements(
     # Extract minimal subtrees rooted at new elements — avoids sending the full page DOM
     # which gets truncated on large pages, losing portal-rendered dropdown items.
     new_element_subtrees = _extract_new_subtrees(scraped_page_after_open.element_tree_trimmed, new_element_ids)
+    _ctx = skyvern_context.current()
+    lean_enabled = bool(_ctx and _ctx.enable_lean_element_tree)
     if new_element_subtrees:
-        _ctx = skyvern_context.current()
-        if _ctx and _ctx.enable_lean_element_tree:
+        if lean_enabled:
             new_element_subtrees = apply_lean_to_tree(
                 new_element_subtrees,
                 compress_image_src=True,
                 strip_url_query_strings=True,
+                compress_nonnavigable_href=True,
             )
         incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in new_element_subtrees)
     else:
@@ -4426,7 +4440,17 @@ async def select_from_emerging_elements(
             current_element_id=current_element_id,
             new_element_id_count=len(new_element_ids),
         )
-        incremental_html = scraped_page_after_open.build_element_tree(html_need_skyvern_attrs=True)
+        # Keep the recipe consistent under the one flag (SKY-10076): apply lean to
+        # the full trimmed tree on the fallback path too, mirroring the branch above.
+        fallback_tree = scraped_page_after_open.element_tree_trimmed
+        if lean_enabled:
+            fallback_tree = apply_lean_to_tree(
+                fallback_tree,
+                compress_image_src=True,
+                strip_url_query_strings=True,
+                compress_nonnavigable_href=True,
+            )
+        incremental_html = "".join(json_to_html(element, need_skyvern_attrs=True) for element in fallback_tree)
     LOG.debug(
         "Built HTML for emerging-element custom-select",
         current_element_id=current_element_id,
