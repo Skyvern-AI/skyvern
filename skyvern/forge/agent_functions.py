@@ -1322,6 +1322,15 @@ class AgentFunction:
         """
         return None
 
+    async def validate_user_organization_membership(
+        self,
+        user_id: str,
+        organization_id: str,
+        bearer_token: str | None = None,
+    ) -> bool | None:
+        """Return whether the user belongs to the organization, or None when membership cannot be determined."""
+        return None
+
     async def on_workflow_saved(
         self,
         organization_id: str,

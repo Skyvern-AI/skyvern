@@ -353,7 +353,10 @@ async def test_completion_verification_handler_uses_main_copilot_lane(
         assert organization_id == "org_1"
         return main_handler
 
-    monkeypatch.setattr(copilot_tools, "resolve_main_copilot_handler", _main_lookup)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion.resolve_main_copilot_handler",
+        _main_lookup,
+    )
     ctx: Any = SimpleNamespace(workflow_permanent_id="wpid_1", organization_id="org_1")
 
     handler = await copilot_tools._completion_verification_handler(ctx)
@@ -371,7 +374,7 @@ async def test_composition_visual_handler_uses_fast_copilot_lane(
         assert organization_id == "org_1"
         return fast_handler
 
-    monkeypatch.setattr(copilot_tools, "resolve_fast_copilot_handler", _fast_lookup)
+    monkeypatch.setattr(copilot_tools.composition_capture, "resolve_fast_copilot_handler", _fast_lookup)
     ctx: Any = SimpleNamespace(workflow_permanent_id="wpid_1", organization_id="org_1")
 
     handler = await copilot_tools._composition_visual_handler(ctx)

@@ -1,5 +1,7 @@
 import { Skeleton } from "@/components/ui/skeleton";
+import { useRowSelection } from "@/hooks/useRowSelection";
 import { CredentialItem } from "./CredentialItem";
+import { CredentialsBulkBar } from "./CredentialsBulkBar";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import {
   Pagination,
@@ -65,6 +67,20 @@ function CredentialsList({
     enabled: !isResolvingFolder,
   });
 
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
+  const {
+    selected,
+    selectedItems: selectedCredentials,
+    isSelected,
+    handleSelect,
+    clearSelection,
+    replaceSelection,
+  } = useRowSelection({
+    items: credentials ?? [],
+    getId: (credential) => credential.credential_id,
+    resetKey: JSON.stringify([page, trimmedSearch, folderId ?? null]),
+  });
+
   if (isResolvingFolder || isLoading) {
     return (
       <div className="space-y-5">
@@ -96,11 +112,15 @@ function CredentialsList({
   return (
     <div className="space-y-5">
       <div className="space-y-5">
-        {credentials.map((credential) => (
+        {credentials.map((credential, index) => (
           <CredentialItem
             key={credential.credential_id}
             credential={credential}
             onStartBackgroundTest={onStartBackgroundTest}
+            index={index}
+            selected={isSelected(credential.credential_id)}
+            hasSelection={selected.size > 0}
+            onSelect={handleSelect}
           />
         ))}
       </div>
@@ -132,6 +152,15 @@ function CredentialsList({
             </PaginationItem>
           </PaginationContent>
         </Pagination>
+      )}
+      {selectedCredentials.length > 0 && (
+        <CredentialsBulkBar
+          selectedCredentials={selectedCredentials}
+          isOperating={isBulkOperating}
+          onOperatingChange={setIsBulkOperating}
+          onClear={clearSelection}
+          onReplaceSelection={replaceSelection}
+        />
       )}
     </div>
   );

@@ -29,13 +29,14 @@ mode: custom
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
-<Update label="Week of June 8, 2026" description="Copilot modes, GCS storage, API docs split, OTP fixes">
+<Update label="Week of June 8, 2026" description="Editor onboarding, Copilot modes, GCS storage, API docs split, OTP fixes">
 
 ## New features
 
 - **Copilot Ask/Build/Code Mode Routing** — The Copilot now routes each request based on the active mode: Ask returns answers without modifying the workflow, Build creates or updates workflows, and Code generates executable code blocks. ([#6459](https://github.com/Skyvern-AI/skyvern/pull/6459))
 - **GCS Storage Backend** — Added Google Cloud Storage as an artifact storage backend for self-hosted deployments. ([#6442](https://github.com/Skyvern-AI/skyvern/pull/6442))
 - **Key-Optional Labels and Flexible Tag Filters** — Tags now support key-optional labels, and tag filter queries accept more flexible formats for richer agent organization. ([#6458](https://github.com/Skyvern-AI/skyvern/pull/6458))
+- **Self-Serve Editor Onboarding** — New users in the workflow editor now see a get-started modal with intent routing and template cards, a 4-stop guided product tour, and smart empty states on the dashboard and runs pages to accelerate time-to-first-automation. ([#6475](https://github.com/Skyvern-AI/skyvern/pull/6475))
 
 ## Improvements
 
@@ -47,12 +48,15 @@ mode: custom
 - **Accessible Status Badges** — Status badges across the product have been updated with improved contrast and consistent pill styling for better accessibility. ([#6444](https://github.com/Skyvern-AI/skyvern/pull/6444))
 - **Block Title Editable from Settings Sidebar** — Workflow block titles can now be edited from the right-hand settings sidebar, without needing to use the inline editor on the canvas. ([#6443](https://github.com/Skyvern-AI/skyvern/pull/6443))
 - **API Reference Split into Agents and Runs Sections** — The public API reference is now organized into separate Agents and Runs sections for easier navigation. ([#6448](https://github.com/Skyvern-AI/skyvern/pull/6448))
+- **Label-First Tag Editor and Flexible Tag Filter UI** — The tag editor now accepts standalone labels or `group:label` format in a single input, and the filter bar supports filtering by label, group, or group:label for richer agent organization. ([#6470](https://github.com/Skyvern-AI/skyvern/pull/6470))
 
 ## Bug fixes
 
 - Fixed org-verified discovered credentials not being credited in the Copilot credential gate, which could prevent runs from starting. ([#6462](https://github.com/Skyvern-AI/skyvern/pull/6462))
 - Fixed OTP codes from previous workflow runs being picked up and incorrectly used in new runs. ([#6455](https://github.com/Skyvern-AI/skyvern/pull/6455))
 - Fixed persistent-session screen recordings not appearing in the run view when the recording timestamp fell outside the run's time window. ([#6454](https://github.com/Skyvern-AI/skyvern/pull/6454))
+- Fixed Copilot inconsistently asking for a URL before running discovery when the user had only named a site without providing one. ([#6473](https://github.com/Skyvern-AI/skyvern/pull/6473))
+- Fixed Copilot asking for a URL after already successfully navigating to the requested site during discovery. ([#6472](https://github.com/Skyvern-AI/skyvern/pull/6472))
 
 </Update>
 

@@ -136,7 +136,7 @@ async def test_target_url_inspection_does_not_navigate_away_from_interaction_evi
     async def unexpected_navigate(*_: object, **__: object) -> dict[str, object]:
         raise AssertionError("target_url inspection should not navigate away from reached evidence")
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._discovery_navigate", unexpected_navigate)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.composition_capture._discovery_navigate", unexpected_navigate)
 
     result = await _inspect_page_for_composition_impl(ctx, "https://example.test/")
 

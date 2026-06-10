@@ -695,6 +695,7 @@ async def create_workflow_legacy(
     request: Request,
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create-legacy")
     raw_yaml = await request.body()
@@ -712,7 +713,10 @@ async def create_workflow_legacy(
         if folder_id is not None:
             workflow_create_request.folder_id = folder_id
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
-            organization=current_org, request=workflow_create_request
+            organization=current_org,
+            request=workflow_create_request,
+            created_by=user_id,
+            edited_by=user_id,
         )
     except WorkflowDefinitionValidationException as e:
         raise e
@@ -754,6 +758,7 @@ async def create_workflow(
     data: WorkflowRequest,
     folder_id: str | None = Query(None, description="Optional folder ID to assign the workflow to"),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-create")
     try:
@@ -775,6 +780,8 @@ async def create_workflow(
         return await app.WORKFLOW_SERVICE.create_workflow_from_request(
             organization=current_org,
             request=workflow_definition,
+            created_by=user_id,
+            edited_by=user_id,
         )
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))
@@ -1100,6 +1107,7 @@ async def update_workflow_legacy(
         ..., description="The ID of the workflow to update. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     # validate the workflow
@@ -1115,6 +1123,8 @@ async def update_workflow_legacy(
             organization=current_org,
             request=workflow_create_request,
             workflow_permanent_id=workflow_id,
+            created_by=user_id,
+            edited_by=user_id,
         )
     except WorkflowDefinitionValidationException as e:
         raise e
@@ -1173,6 +1183,7 @@ async def update_workflow(
         ..., description="The ID of the agent to update. Starts with `wpid_`.", examples=["wpid_123"]
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    user_id: str | None = Depends(org_auth_service.get_current_user_id_or_none),
 ) -> Workflow:
     analytics.capture("skyvern-oss-agent-workflow-update")
     try:
@@ -1192,6 +1203,8 @@ async def update_workflow(
             organization=current_org,
             request=workflow_definition,
             workflow_permanent_id=workflow_id,
+            created_by=user_id,
+            edited_by=user_id,
         )
     except yaml.YAMLError as exc:
         raise HTTPException(status_code=422, detail=format_yaml_error(exc))

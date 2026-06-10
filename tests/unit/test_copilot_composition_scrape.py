@@ -56,9 +56,11 @@ async def test_recapture_skips_raw_get_html_after_cap_drop(monkeypatch: pytest.M
     async def identity(ctx: object, evidence: dict) -> dict:
         return evidence
 
-    monkeypatch.setattr(tools, "_discovery_get_html", fake_raw)
-    monkeypatch.setattr(tools, "_composition_get_stripped_html", fake_stripped)
-    monkeypatch.setattr(tools, "_augment_composition_evidence_with_computed_obstruction_candidates", identity)
+    monkeypatch.setattr(tools._shared, "_discovery_get_html", fake_raw)
+    monkeypatch.setattr(tools._shared, "_composition_get_stripped_html", fake_stripped)
+    monkeypatch.setattr(
+        tools.composition_capture, "_augment_composition_evidence_with_computed_obstruction_candidates", identity
+    )
 
     evidence, html_error = await tools._capture_composition_evidence(
         SimpleNamespace(), inspected_url="https://example.com/s", current_url="https://example.com/s"

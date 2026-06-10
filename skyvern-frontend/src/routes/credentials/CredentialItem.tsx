@@ -4,6 +4,7 @@ import {
   isPasswordCredential,
   isSecretCredential,
 } from "@/api/types";
+import { SelectionCheckbox } from "@/components/SelectionCheckbox";
 import { useState } from "react";
 import {
   ExclamationTriangleIcon,
@@ -33,9 +34,20 @@ type Props = {
     url: string,
     userContext?: string,
   ) => void;
+  index?: number;
+  selected?: boolean;
+  hasSelection?: boolean;
+  onSelect?: (index: number, shiftKey: boolean) => void;
 };
 
-function CredentialItem({ credential, onStartBackgroundTest }: Props) {
+function CredentialItem({
+  credential,
+  onStartBackgroundTest,
+  index = -1,
+  selected = false,
+  hasSelection = false,
+  onSelect,
+}: Props) {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const activeTest = useCredentialTestStore((s) =>
     s.activeTest?.credentialId === credential.credential_id
@@ -151,7 +163,21 @@ function CredentialItem({ credential, onStartBackgroundTest }: Props) {
   }
 
   return (
-    <div className="flex gap-5 rounded-lg bg-slate-elevation2 p-4">
+    <div
+      className="group/row flex gap-5 rounded-lg bg-slate-elevation2 p-4 data-[state=selected]:ring-1 data-[state=selected]:ring-primary"
+      data-state={selected ? "selected" : undefined}
+    >
+      {onSelect && (
+        <div className="self-start pt-1">
+          <SelectionCheckbox
+            index={index}
+            checked={selected}
+            hasSelection={hasSelection}
+            onSelect={onSelect}
+            ariaLabel={`Select ${credential.name}`}
+          />
+        </div>
+      )}
       <div className="w-48 space-y-2">
         <p className="w-full truncate" title={credential.name}>
           {credential.name}

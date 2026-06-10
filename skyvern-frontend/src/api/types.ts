@@ -164,6 +164,8 @@ export type FailureCategory = {
   reasoning: string;
 };
 
+export type WebhookDeliveryStatus = "pending" | "failed";
+
 export type TaskApiResponse = {
   request: CreateTaskRequest;
   task_id: string;
@@ -253,6 +255,10 @@ export type CreateOnePasswordTokenRequest = {
 
 export type CreateOnePasswordTokenResponse = {
   token: OnePasswordTokenApiResponse;
+};
+
+export type ClearOrganizationAuthTokenResponse = {
+  success: boolean;
 };
 
 export interface AzureClientSecretCredential {
@@ -601,6 +607,7 @@ export type WorkflowRunStatusApiResponse = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
+  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;
@@ -638,6 +645,7 @@ export type WorkflowRunStatusApiResponseWithWorkflow = {
   outputs: Record<string, unknown> | null;
   failure_reason: string | null;
   failure_category: Array<FailureCategory> | null;
+  webhook_delivery_status?: WebhookDeliveryStatus | null;
   webhook_failure_reason: string | null;
   downloaded_file_urls: Array<string> | null;
   downloaded_files: Array<DownloadedFileInfo> | null;

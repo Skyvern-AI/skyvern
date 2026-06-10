@@ -2415,7 +2415,7 @@ async def test_navigation_failure_uses_structured_evidence_when_bounded() -> Non
 @pytest.mark.asyncio
 async def test_capture_prefers_html_parse_over_hollow_structured_on_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     # When both extractor and get_html are unbounded, the get_html parse wins (carries the fallback signals).
-    monkeypatch.setattr(tools_module, "_COMPOSITION_HOLLOW_RECAPTURE_RETRIES", 0)
+    monkeypatch.setattr(tools_module.composition_capture, "_COMPOSITION_HOLLOW_RECAPTURE_RETRIES", 0)
     hollow = json.dumps(
         {
             "page_title": "",

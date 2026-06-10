@@ -17,12 +17,14 @@ from skyvern.forge.sdk.routes.code_samples import (
 )
 from skyvern.forge.sdk.routes.routers import base_router
 from skyvern.forge.sdk.schemas.organizations import Organization
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import is_final_status
 from skyvern.forge.sdk.services import org_auth_service
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.browser_sessions import (
     CreateBrowserSessionRequest,
     ProcessBrowserSessionRecordingRequest,
     ProcessBrowserSessionRecordingResponse,
+    UpdateBrowserSessionRequest,
 )
 from skyvern.webeye.schemas import BrowserSessionResponse
 
@@ -109,6 +111,7 @@ async def create_browser_session(
         extensions=browser_session_request.extensions,
         browser_type=browser_session_request.browser_type,
         browser_profile_id=browser_session_request.browser_profile_id,
+        generate_browser_profile=browser_session_request.generate_browser_profile,
     )
     return await BrowserSessionResponse.from_browser_session(browser_session)
 
@@ -152,6 +155,54 @@ async def close_browser_session(
         status_code=200,
         media_type="application/json",
     )
+
+
+@base_router.patch(
+    "/browser_sessions/{browser_session_id}",
+    response_model=BrowserSessionResponse,
+    tags=["Browser Sessions"],
+    openapi_extra={
+        "x-fern-sdk-method-name": "update_browser_session",
+    },
+    description=(
+        "Update a live browser session. Currently supports toggling generate_browser_profile, which is read "
+        "when the session ends to decide whether to save its browser profile."
+    ),
+    summary="Update a session",
+    responses={
+        200: {"description": "Successfully updated browser session"},
+        404: {"description": "Browser session not found"},
+        403: {"description": "Unauthorized - Invalid or missing authentication"},
+    },
+)
+@base_router.patch(
+    "/browser_sessions/{browser_session_id}/",
+    response_model=BrowserSessionResponse,
+    include_in_schema=False,
+)
+async def update_browser_session(
+    request: UpdateBrowserSessionRequest,
+    browser_session_id: str = Path(
+        ..., description="The ID of the browser session. browser_session_id starts with `pbs_`", examples=["pbs_123456"]
+    ),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> BrowserSessionResponse:
+    existing = await app.PERSISTENT_SESSIONS_MANAGER.get_session(browser_session_id, current_org.organization_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Browser session {browser_session_id} not found")
+    # The flag is read at teardown, so toggling it after the session has ended has no effect and
+    # would make a later profile-creation attempt treat the missing archive as a transient upload.
+    if is_final_status(existing.status):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Browser session {browser_session_id} has already ended and can no longer be updated.",
+        )
+    updated = await app.DATABASE.browser_sessions.update_persistent_browser_session(
+        browser_session_id,
+        organization_id=current_org.organization_id,
+        generate_browser_profile=request.generate_browser_profile,
+    )
+    return await BrowserSessionResponse.from_browser_session(updated, app.STORAGE)
 
 
 @base_router.get(

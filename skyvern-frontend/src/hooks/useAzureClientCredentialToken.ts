@@ -7,6 +7,7 @@ import {
   CreateAzureClientSecretCredentialRequest,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useAzureClientCredentialToken() {
   const credentialGetter = useCredentialGetter();
@@ -14,7 +15,7 @@ export function useAzureClientCredentialToken() {
   const { toast } = useToast();
 
   const { data: azureOrganizationAuthToken, isLoading } =
-    useQuery<AzureOrganizationAuthToken>({
+    useQuery<AzureOrganizationAuthToken | null>({
       queryKey: ["azureOrganizationAuthToken"],
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -57,10 +58,19 @@ export function useAzureClientCredentialToken() {
     },
   });
 
+  const clearCredentialMutation = useClearOrganizationAuthToken({
+    providerPath: "azure_credential",
+    queryKey: "azureOrganizationAuthToken",
+    successDescription: "Azure Client Secret Credential cleared successfully",
+    errorDescription: "Failed to clear Azure Client Secret Credential",
+  });
+
   return {
     azureOrganizationAuthToken,
     isLoading,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
+    clearCredential: clearCredentialMutation.mutate,
+    isClearing: clearCredentialMutation.isPending,
   };
 }

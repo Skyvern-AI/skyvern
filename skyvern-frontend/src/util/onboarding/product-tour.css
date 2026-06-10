@@ -1,0 +1,122 @@
+.driver-popover.skyvern-onboarding {
+  background-color: hsl(231 26% 14%);
+  border: 1px solid hsl(215 25% 27%);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px -8px hsl(222 84% 5% / 0.6);
+  color: hsl(210 40% 98%);
+  padding: 16px;
+  max-width: 320px;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-arrow-side-left,
+.driver-popover.skyvern-onboarding .driver-popover-arrow-side-right,
+.driver-popover.skyvern-onboarding .driver-popover-arrow-side-top,
+.driver-popover.skyvern-onboarding .driver-popover-arrow-side-bottom {
+  border: none;
+}
+
+.driver-popover.skyvern-onboarding
+  .driver-popover-arrow-side-left
+  .driver-popover-arrow,
+.driver-popover.skyvern-onboarding
+  .driver-popover-arrow-side-right
+  .driver-popover-arrow,
+.driver-popover.skyvern-onboarding
+  .driver-popover-arrow-side-top
+  .driver-popover-arrow,
+.driver-popover.skyvern-onboarding
+  .driver-popover-arrow-side-bottom
+  .driver-popover-arrow {
+  background-color: hsl(231 26% 14%);
+  border: 1px solid hsl(215 25% 27%);
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: hsl(210 40% 98%);
+  font-family: inherit;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-description {
+  margin: 4px 0 0;
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 20px;
+  color: hsl(215 20% 65%);
+  font-family: inherit;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-close-btn {
+  color: hsl(215 20% 65%);
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-close-btn:hover {
+  color: hsl(210 40% 98%);
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-footer {
+  margin-top: 16px;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-progress-text {
+  font-size: 12px;
+  font-weight: 500;
+  color: hsl(215 20% 65%);
+  font-variant-numeric: tabular-nums;
+  font-family: inherit;
+}
+
+.driver-popover.skyvern-onboarding
+  .driver-popover-navigation-btns
+  button
+  + button {
+  margin-left: 8px;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-prev-btn {
+  padding: 8px 16px;
+  border: 1px solid hsl(215 25% 27%);
+  border-radius: 6px;
+  background-color: transparent;
+  color: hsl(210 40% 98%);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-shadow: none;
+  font-family: inherit;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-prev-btn:hover {
+  background-color: hsl(217 33% 18%);
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-next-btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  background-color: hsl(210 40% 98%);
+  color: hsl(222 47% 11%);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.25;
+  text-shadow: none;
+  font-family: inherit;
+}
+
+.driver-popover.skyvern-onboarding .driver-popover-next-btn:hover {
+  background-color: hsl(210 40% 92%);
+}
+
+/* Exit dialog opens over the active tour; driver.js kills page pointer-events and overlays everything. */
+.tour-paused .driver-overlay,
+.tour-paused .driver-popover {
+  display: none !important;
+}
+
+.driver-active .skyvern-tour-exit,
+.driver-active .skyvern-tour-exit * {
+  pointer-events: auto;
+}

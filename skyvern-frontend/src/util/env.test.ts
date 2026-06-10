@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-async function loadEnv(apiKey: string | null = null) {
+async function loadEnv(apiKey: string | null = null, streamingMode = "") {
   vi.resetModules();
   vi.stubEnv("VITE_API_BASE_URL", "http://localhost:8000/api/v1");
   vi.stubEnv("VITE_ARTIFACT_API_BASE_URL", "http://localhost:9090");
   vi.stubEnv("VITE_ENVIRONMENT", "test");
   vi.stubEnv("VITE_WSS_BASE_URL", "ws://localhost:8000/api/v1");
+  vi.stubEnv("VITE_BROWSER_STREAMING_MODE", streamingMode);
   if (apiKey) {
     vi.stubEnv("VITE_SKYVERN_API_KEY", apiKey);
   } else {
@@ -56,9 +57,7 @@ describe("browserStreamingMode", () => {
   });
 
   it("uses the configured streaming mode when present", async () => {
-    vi.stubEnv("VITE_BROWSER_STREAMING_MODE", "CDP");
-
-    const { browserStreamingMode } = await loadEnv();
+    const { browserStreamingMode } = await loadEnv(null, "CDP");
 
     expect(browserStreamingMode).toBe("cdp");
   });

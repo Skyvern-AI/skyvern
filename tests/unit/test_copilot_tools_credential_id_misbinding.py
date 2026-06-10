@@ -365,10 +365,10 @@ async def test_update_workflow_rejects_credential_id_in_navigation_goal() -> Non
 
     with (
         patch(
-            "skyvern.forge.sdk.copilot.tools._credential_reference_validation_error",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._credential_reference_validation_error",
             new=AsyncMock(return_value=None),
         ),
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": submitted}, _ctx())
@@ -402,11 +402,11 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
 
     with (
         patch(
-            "skyvern.forge.sdk.copilot.tools._credential_reference_validation_error",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._credential_reference_validation_error",
             new=AsyncMock(return_value=None),
         ),
         patch(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             return_value=MagicMock(
                 title="Sign in",
                 description=None,
@@ -426,10 +426,11 @@ async def test_update_workflow_allows_credential_id_in_credential_parameter_slot
             ),
         ),
         patch(
-            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp", new=AsyncMock(return_value="copilot")
+            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
+            new=AsyncMock(return_value="copilot"),
         ),
-        patch("skyvern.forge.sdk.copilot.tools._record_workflow_proxy_location_span"),
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         mock_app.DATABASE = MagicMock()

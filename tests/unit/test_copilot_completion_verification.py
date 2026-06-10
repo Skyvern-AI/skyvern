@@ -563,7 +563,7 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -584,7 +584,7 @@ async def test_maybe_run_completion_verification_skips_active_terminal_evidence(
         return handler
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         fake_completion_verification_handler,
     )
     ctx = _run_ctx()
@@ -632,12 +632,14 @@ async def test_active_run_terminal_evidence_sample_matches_current_page(
         return handler
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
         fake_completion_verification_handler,
     )
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._fallback_page_info", fake_fallback_page_info)
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._capture_composition_evidence",
+        "skyvern.forge.sdk.copilot.tools.composition_capture._fallback_page_info", fake_fallback_page_info
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
         fake_capture_composition_evidence,
     )
     ctx = _run_ctx()
@@ -664,7 +666,9 @@ async def test_active_run_terminal_evidence_sample_skips_method_only_criteria(
     async def handler(**_: object) -> dict:
         raise AssertionError("method-mandated criteria cannot be verified from page state")
 
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", lambda: handler)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler", lambda: handler
+    )
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
         completion_criteria=[_criterion("c0", "must use website search", method_mandated=True)]
@@ -815,7 +819,7 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -861,7 +865,7 @@ async def test_page_observation_verification_does_not_overwrite_satisfied_verdic
         raise AssertionError("handler should not be called once the outcome is verified")
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -898,7 +902,7 @@ async def test_page_observation_verification_preserves_existing_unsatisfied_verd
         return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -932,7 +936,7 @@ async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -1038,7 +1042,7 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _ctx_unverified_prefix()
@@ -1068,7 +1072,7 @@ async def test_method_mandated_criteria_excluded_from_verification(monkeypatch: 
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -1201,7 +1205,7 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         }
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", True)
@@ -1271,7 +1275,7 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -1285,7 +1289,7 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
 
     # A missing judge handler stays a soft fallback (None), not a hard block.
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(None),
     )
     assert await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic()) is None

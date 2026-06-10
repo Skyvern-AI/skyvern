@@ -20,6 +20,7 @@ const CREATE_RETRY_INTERVAL_MS = 10000;
 const MAX_CONSECUTIVE_ERRORS = 10;
 
 const ARCHIVE_NOT_READY_HINT = "persisted profile archive";
+const NOT_OPTED_IN_HINT = "was not configured to generate a browser profile";
 
 type ActiveRefState = ActiveBrowserProfileCreate & {
   timeoutId: ReturnType<typeof setTimeout> | null;
@@ -132,6 +133,21 @@ function useBackgroundBrowserProfileCreate() {
     } catch (error) {
       const axiosError = error as AxiosError;
       const detail = getErrorDetail(axiosError);
+
+      // An opted-out session never uploads an archive, so retrying can't help — fail fast.
+      if (
+        axiosError.response?.status === 400 &&
+        typeof detail === "string" &&
+        detail.includes(NOT_OPTED_IN_HINT)
+      ) {
+        cleanup();
+        toast({
+          title: "Profile generation not enabled for this session",
+          description: detail,
+          variant: "destructive",
+        });
+        return;
+      }
 
       if (
         axiosError.response?.status === 400 &&
@@ -315,6 +331,11 @@ function useBackgroundBrowserProfileCreate() {
 
       try {
         const client = await getClient(credentialGetter, "sans-api-v1");
+        // Opt the running session into profile generation before closing so teardown uploads its
+        // profile — sessions default to not persisting one.
+        await client.patch(`/browser_sessions/${browserSessionId}`, {
+          generate_browser_profile: true,
+        });
         await client.post(`/browser_sessions/${browserSessionId}/close`);
         queryClient.invalidateQueries({
           queryKey: ["browserSession", browserSessionId],

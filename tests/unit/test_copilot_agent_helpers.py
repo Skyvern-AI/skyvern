@@ -3052,11 +3052,11 @@ workflow_definition:
         workflow.sequential_key = None
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: workflow,
         )
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp",
+            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
             AsyncMock(return_value="copilot"),
         )
         workflow_service = MagicMock()
