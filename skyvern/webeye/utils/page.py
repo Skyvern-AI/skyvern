@@ -16,10 +16,8 @@ from playwright.async_api import ElementHandle, Frame, Page
 from skyvern.constants import PAGE_CONTENT_TIMEOUT, SKYVERN_DIR
 from skyvern.exceptions import FailedToTakeScreenshot
 from skyvern.forge.sdk.core import skyvern_context
-from skyvern.forge.sdk.experimentation.screenshot_downscale import effective_downscale_height
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import apply_context_attrs, traced
-from skyvern.utils.image_resizer import downscale_screenshots_to_height
 
 LOG = structlog.get_logger()
 
@@ -513,19 +511,15 @@ class SkyvernFrame:
         scroll: bool = True,
     ) -> list[bytes]:
         if not scroll:
-            screenshots = [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
-        else:
-            screenshots, _ = await _scrolling_screenshots_helper(
-                page=page,
-                url=url,
-                max_number=max_number,
-                draw_boxes=draw_boxes,
-                mode=ScreenshotMode.DETAILED,
-            )
+            return [await _current_viewpoint_screenshot_helper(page=page, mode=ScreenshotMode.DETAILED)]
 
-        max_height = effective_downscale_height(skyvern_context.current())
-        if max_height:
-            screenshots = downscale_screenshots_to_height(screenshots, max_height)
+        screenshots, _ = await _scrolling_screenshots_helper(
+            page=page,
+            url=url,
+            max_number=max_number,
+            draw_boxes=draw_boxes,
+            mode=ScreenshotMode.DETAILED,
+        )
         return screenshots
 
     @classmethod
