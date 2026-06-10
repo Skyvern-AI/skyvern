@@ -115,10 +115,14 @@ function StatusBadge({ className, status }: Props) {
   return (
     <Badge
       variant={variantForStatus(status)}
-      className={cn("w-28 justify-start gap-1.5 capitalize", className)}
+      className={cn(
+        "justify-center gap-1.5 px-1.5 capitalize md:w-28 md:justify-start md:px-2.5",
+        className,
+      )}
+      title={statusText}
     >
       {iconForStatus(status)}
-      {statusText}
+      <span className="sr-only md:not-sr-only">{statusText}</span>
     </Badge>
   );
 }
