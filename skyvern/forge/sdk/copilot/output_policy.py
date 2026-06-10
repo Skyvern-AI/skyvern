@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, cast
 
+from skyvern.forge.sdk.copilot.blocker_signal import contains_internal_machinery_leak
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES, ResponseType
 from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
@@ -376,6 +377,8 @@ def _contains_raw_secret(value: Any) -> bool:
 def _contains_internal_tool_instruction(user_response: str | None) -> bool:
     if not isinstance(user_response, str):
         return False
+    if contains_internal_machinery_leak(user_response):
+        return True
     normalized = " ".join(user_response.lower().translate(_INTERNAL_TOOL_INSTRUCTION_TRANSLATION).split())
     if any(marker in normalized for marker in _INTERNAL_TOOL_INSTRUCTION_MARKERS):
         return True

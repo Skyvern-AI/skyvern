@@ -35,6 +35,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+    contains_internal_machinery_leak,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
@@ -53,6 +54,7 @@ from skyvern.forge.sdk.copilot.context import (
     finalize_discovery_counter_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
+from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_gate_decision,
@@ -1194,6 +1196,11 @@ _UNBACKED_WORKFLOW_DELIVERY_REPLY = (
     "from this turn. Please retry with the target site, page, or workflow requirement."
 )
 _UNBACKED_WORKFLOW_DELIVERY_PREFIX = "I wasn't able to produce a workflow proposal in this turn."
+
+_INLINE_REJECT_NOTE_FALLBACK = (
+    "This draft didn't pass validation against the live page, so I haven't saved it. "
+    "I'll revise it before proposing again."
+)
 _GENERIC_MISSING_CONTEXT_PHRASES = (
     "missing details",
     "one more detail",
@@ -1396,6 +1403,36 @@ def _workflow_block_count(ctx: CopilotContext) -> int | None:
     return len(blocks) if isinstance(blocks, list) and blocks else None
 
 
+def _observed_page_sentence(ctx: CopilotContext) -> str:
+    evidence = getattr(ctx, "workflow_verification_evidence", None)
+    url = getattr(evidence, "current_url", None)
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    sentence = f" The last page I observed was {url.strip()[:140]}."
+    return "" if contains_internal_machinery_leak(sentence) else sentence
+
+
+def _observed_facts_halt_reply(ctx: CopilotContext) -> str:
+    block_count = _workflow_block_count(ctx)
+    block_phrase = f"a {block_count}-block draft" if block_count else "a draft"
+    observed = _observed_page_sentence(ctx)
+    if getattr(ctx, "last_workflow", None) is not None:
+        return (
+            f"I built {block_phrase} and was still testing it when the turn ran out of time."
+            f"{observed} I haven't verified the results, so I'm not claiming them."
+        )
+    return (
+        f"The turn ran out of time before I could finish.{observed}"
+        " I haven't verified any results, so I'm not claiming them."
+    )
+
+
+def _halted_mid_progress(ctx: CopilotContext, internal_tool_instruction_failure: bool) -> bool:
+    if internal_tool_instruction_failure:
+        return True
+    return getattr(ctx, "last_failure_category_top", None) == PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+
 def _clean_recorded_failure_text(value: Any, max_chars: int = 240) -> str:
     # Caller-owned sentence templates add punctuation around these fragments.
     text = clean_recorded_failure_text(value, max_chars=max_chars).rstrip(".")
@@ -1438,10 +1475,13 @@ def _recorded_failure_is_internal_tool_instruction(ctx: CopilotContext) -> bool:
     for value in candidates:
         if not isinstance(value, str) or not value.strip():
             continue
+        # Evaluate the redacted form at the same truncation the reply embeds:
+        # standard redaction already neutralizes browser-session references,
+        # so flag only what would still leak.
         verdict = evaluate_output_policy(
             request_policy=None,
             response_type="REPLY",
-            user_response=value,
+            user_response=clean_recorded_failure_text(value, max_chars=240),
             output_kind=CopilotOutputKind.INFORMATIONAL_ANSWER,
         )
         if OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes:
@@ -1561,6 +1601,12 @@ def _recorded_failure_reply(
     reason, status_sentence = _recorded_failure_summary(ctx)
     if not reason:
         return None
+    if internal_tool_instruction_failure is None:
+        internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
+    # A guard-halted or budget-paced run was interrupted, not disproven; render
+    # observed facts instead of a failure verdict built from internal text.
+    if _halted_mid_progress(ctx, internal_tool_instruction_failure):
+        return _observed_facts_halt_reply(ctx)
 
     run_status = _clean_recorded_failure_text(getattr(verification, "run_status", None), max_chars=80).lower()
     block_count = _workflow_block_count(ctx)
@@ -1570,9 +1616,7 @@ def _recorded_failure_reply(
         or getattr(ctx, "last_test_ok", None) is not None
         or getattr(diagnosis_input, "workflow_run_id", None)
     )
-    if internal_tool_instruction_failure is None:
-        internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
-    test_failed = (ctx.last_test_ok is False or run_status == "failed") and not internal_tool_instruction_failure
+    test_failed = ctx.last_test_ok is False or run_status == "failed"
     unrecoverable_stop = next_action == "stop" or failure_type == "unrecoverable_tool_error"
 
     if getattr(ctx, "last_workflow", None) is not None:
@@ -1609,12 +1653,19 @@ def _build_wip_exit_result(
 ) -> AgentResult:
     """Selected non-success exits surface the most recent successfully parsed workflow."""
     internal_tool_instruction_failure = _recorded_failure_is_internal_tool_instruction(ctx)
+    halted_mid_progress = _halted_mid_progress(ctx, internal_tool_instruction_failure)
     recorded_failure_reply = _recorded_failure_reply(
         ctx, cancelled=cancelled, internal_tool_instruction_failure=internal_tool_instruction_failure
     )
     effective_terminal = terminal_reason or ("cancel" if cancelled else None)
 
     def _guard(text: str) -> tuple[str, TurnOutcome]:
+        if contains_internal_machinery_leak(text):
+            LOG.warning(
+                "copilot terminal output invariant replaced leaked text",
+                terminal_reason=effective_terminal,
+            )
+            text = _observed_facts_halt_reply(ctx)
         return apply_repeated_reply_guard(
             final_text=text,
             attempted_kind=ResponseKind.CLARIFY,
@@ -1663,14 +1714,14 @@ def _build_wip_exit_result(
     if (
         ctx.last_workflow is not None
         and ctx.last_workflow_yaml
-        and (ctx.last_test_ok is not False or internal_tool_instruction_failure)
+        and (ctx.last_test_ok is not False or halted_mid_progress)
         and not ctx.last_test_suspicious_success
     ):
         full_test_ok = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
         unvalidated = not full_test_ok
         if unvalidated and recorded_failure_reply:
             reply = recorded_failure_reply
-            if internal_tool_instruction_failure:
+            if halted_mid_progress:
                 reply = _ensure_unvalidated_proposal_affordance(reply)
         else:
             reply = unvalidated_reply if unvalidated else tested_reply
@@ -1849,6 +1900,10 @@ async def _translate_to_agent_result(
     last_workflow = ctx.last_workflow
     last_workflow_yaml = ctx.last_workflow_yaml
 
+    def _with_inline_reject_note(response: Any, detail: str) -> str:
+        note = detail if not contains_internal_machinery_leak(detail) else _INLINE_REJECT_NOTE_FALLBACK
+        return f"{response}\n\n(Note: {note})"
+
     if resp_type == "REPLACE_WORKFLOW":
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
@@ -1889,17 +1944,17 @@ async def _translate_to_agent_result(
 
             wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
             if wait_block_error:
-                user_response = f"{user_response}\n\n(Note: {wait_block_error})"
+                user_response = _with_inline_reject_note(user_response, wait_block_error)
                 ctx.last_test_ok = None
                 workflow_yaml = ""
             banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = f"{user_response}\n\n(Note: {_banned_block_reject_message(banned_items)})"
+                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items))
                 workflow_yaml = ""
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
-                user_response = f"{user_response}\n\n(Note: {_stale_block_metadata_message(stale_metadata)})"
+                user_response = _with_inline_reject_note(user_response, _stale_block_metadata_message(stale_metadata))
                 ctx.last_test_ok = None
                 workflow_yaml = ""
             composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
@@ -1909,7 +1964,7 @@ async def _translate_to_agent_result(
                     workflow_permanent_id=ctx.workflow_permanent_id,
                     target_url=workflow_target_url(workflow_yaml),
                 )
-                user_response = f"{user_response}\n\n(Note: {composition_evidence_error})"
+                user_response = _with_inline_reject_note(user_response, composition_evidence_error)
                 ctx.last_test_ok = None
                 workflow_yaml = ""
         if workflow_yaml:

@@ -70,6 +70,8 @@ from .blockers import _analyze_run_blocks as _analyze_run_blocks
 from .blockers import _build_loop_blocker_signal as _build_loop_blocker_signal
 from .blockers import _last_run_has_terminal_anti_bot_blocker as _last_run_has_terminal_anti_bot_blocker
 from .blockers import _per_tool_budget_problem_rerun_signal as _per_tool_budget_problem_rerun_signal
+from .blockers import _post_budget_terminal_challenge_signal as _post_budget_terminal_challenge_signal
+from .blockers import _post_run_terminal_challenge_reason as _post_run_terminal_challenge_reason
 from .blockers import (
     _record_per_tool_budget_problem_blocks_from_results,
     _tool_loop_error,
@@ -226,6 +228,7 @@ from .scouting import _role_name_from_selector as _role_name_from_selector
 from .workflow_update import BlockObservationRef as BlockObservationRef
 from .workflow_update import CodeArtifactMetadata as CodeArtifactMetadata
 from .workflow_update import _code_artifact_metadata_as_tool_argument as _code_artifact_metadata_as_tool_argument
+from .workflow_update import _code_block_safety_errors as _code_block_safety_errors
 from .workflow_update import _normalize_code_artifact_metadata as _normalize_code_artifact_metadata
 from .workflow_update import _pre_run_workflow_coverage_error as _pre_run_workflow_coverage_error
 from .workflow_update import _record_workflow_proxy_location_span as _record_workflow_proxy_location_span
