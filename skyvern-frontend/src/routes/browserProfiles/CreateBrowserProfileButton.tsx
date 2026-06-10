@@ -34,6 +34,7 @@ function CreateBrowserProfileButton({
         createBrowserSessionMutation.mutate({
           proxyLocation: null,
           timeout: null,
+          generateBrowserProfile: true,
         });
       }}
     >

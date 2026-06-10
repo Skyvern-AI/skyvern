@@ -55,8 +55,9 @@ vi.mock("@/components/HelpTooltip", () => ({
   HelpTooltip: () => <span data-testid="help-tooltip" />,
 }));
 
+const mockCredentialTotp = vi.hoisted(() => ({ value: null as string | null }));
 vi.mock("../../hooks/useSelectedCredentialTotpIdentifier", () => ({
-  useSelectedCredentialTotpIdentifier: () => null,
+  useSelectedCredentialTotpIdentifier: () => mockCredentialTotp.value,
 }));
 
 vi.mock("../../nodes/LoginNode/LoginBlockCredentialSelector", () => ({
@@ -200,6 +201,7 @@ function makeLoginFixture(
 
 beforeEach(() => {
   mockNodeFixtures.clear();
+  mockCredentialTotp.value = null;
   usePendingCommitsStore.setState({ commits: {} });
   updateNodeDataMock.mockReset();
   useDebouncedSidebarSaveMock.mockReset();
@@ -225,19 +227,90 @@ describe("LoginBlockForm (SKY-9374)", () => {
     expect(useDebouncedSidebarSaveMock).not.toHaveBeenCalled();
   });
 
-  test("renders the basic fields and the advanced-settings accordion trigger", () => {
+  test("renders the basic fields and collapses 2FA behind an add button", () => {
     mockNodeFixtures.set("b1", makeLoginFixture("b1"));
     render(<LoginBlockForm blockId="b1" />);
 
-    // Outside the (collapsed) Advanced Settings accordion: URL + Login
-    // Goal textareas, plus the Authentication group (Credential selector +
-    // 2FA Identifier + 2FA Verification URL textareas). Radix
-    // AccordionContent does not render its children while closed, so
-    // these are the only basic-section assertions we can make without
-    // expanding it.
-    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(4);
+    // Basic section: URL + Login Goal textareas (2). The Credential
+    // selector is always present, but the two 2FA textareas now sit behind
+    // the "Add two-factor authentication" affordance until the user opts in.
+    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(2);
     expect(screen.getByTestId("login-credential-selector")).toBeDefined();
+    expect(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    ).toBeDefined();
+    expect(screen.queryByText("2FA Identifier")).toBeNull();
+    expect(screen.queryByText("2FA Verification URL")).toBeNull();
     expect(screen.getByText("Advanced Settings")).toBeDefined();
+  });
+
+  test("clicking add reveals the two 2FA fields", () => {
+    mockNodeFixtures.set("b1", makeLoginFixture("b1"));
+    render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    );
+
+    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(4);
+    expect(screen.getByText("2FA Identifier")).toBeDefined();
+    expect(screen.getByText("2FA Verification URL")).toBeDefined();
+  });
+
+  test("auto-expands 2FA when the block already has a totp value", () => {
+    mockNodeFixtures.set(
+      "b1",
+      makeLoginFixture("b1", { totpIdentifier: "my-identifier" }),
+    );
+    render(<LoginBlockForm blockId="b1" />);
+
+    // Saved 2FA config is never hidden: the fields render without clicking
+    // add, and the add affordance is gone.
+    expect(screen.getByText("2FA Identifier")).toBeDefined();
+    expect(screen.getByText("2FA Verification URL")).toBeDefined();
+    expect(
+      screen.queryByRole("button", { name: "Add two-factor authentication" }),
+    ).toBeNull();
+  });
+
+  test("summarizes credential-provided 2FA, showing the identifier, with override", () => {
+    mockCredentialTotp.value = "credential-identifier";
+    mockNodeFixtures.set("b1", makeLoginFixture("b1"));
+    render(<LoginBlockForm blockId="b1" />);
+
+    // A credential that carries TOTP is summarized (not force-expanded) as a
+    // link to the 2FA page, surfacing its identifier — a routing label, not a
+    // secret — so the user can confirm which one is in effect.
+    const summaryLink = screen.getByRole("link", {
+      name: /waiting for 2FA codes/i,
+    });
+    expect(summaryLink.getAttribute("href")).toBe("/credentials?tab=twoFactor");
+    expect(screen.getByText("credential-identifier")).toBeDefined();
+    expect(screen.queryByText("2FA Identifier")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Override" }));
+    expect(screen.getByText("2FA Identifier")).toBeDefined();
+    expect(screen.getByText("2FA Verification URL")).toBeDefined();
+  });
+
+  test("does not leak the 2FA expand toggle across block switches", () => {
+    // Same-type block forms are reused without remounting, so the editor is
+    // keyed by blockId. Open 2FA on b1, switch to b2, and b2 must start
+    // collapsed instead of inheriting b1's expanded section.
+    mockNodeFixtures.set("b1", makeLoginFixture("b1"));
+    mockNodeFixtures.set("b2", makeLoginFixture("b2"));
+    const { rerender } = render(<LoginBlockForm blockId="b1" />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    );
+    expect(screen.getByText("2FA Identifier")).toBeDefined();
+
+    rerender(<LoginBlockForm blockId="b2" />);
+    expect(screen.queryByText("2FA Identifier")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Add two-factor authentication" }),
+    ).toBeDefined();
   });
 
   test("expanding Advanced Settings reveals every inline-form field", () => {
@@ -245,13 +318,13 @@ describe("LoginBlockForm (SKY-9374)", () => {
     render(<LoginBlockForm blockId="b1" />);
 
     // Radix AccordionContent unmounts while collapsed, so reach the
-    // advanced-settings widgets by clicking the trigger first. After
-    // expansion every field the inline LoginNode form owns must be
-    // present — pin the count so additions/removals force this test to
-    // be updated explicitly instead of silently drifting parity.
+    // advanced-settings widgets by clicking the trigger first. With 2FA
+    // collapsed by default, the visible textareas are URL + Login Goal +
+    // Complete-if (3) — pin the count so additions/removals force this
+    // test to be updated explicitly instead of silently drifting parity.
     fireEvent.click(screen.getByText("Advanced Settings"));
 
-    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(5);
+    expect(screen.getAllByTestId("wbi-textarea")).toHaveLength(3);
     expect(screen.getByTestId("parameters-multi-select")).toBeDefined();
     expect(screen.getByTestId("model-selector")).toBeDefined();
     expect(screen.getByTestId("engine-selector")).toBeDefined();
