@@ -109,6 +109,21 @@ def test_click() -> None:
     assert actions[0].target.sky_id == "sky-123"
 
 
+def test_identical_click_events_are_deduped() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    event = make_click_event(
+        target=target,
+        timestamp=1000.0,
+    )
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions([event, event])
+
+    assert len(actions) == 1
+    assert actions[0].kind == "click"
+
+
 def test_hover() -> None:
     target = dict(id="button-1", skyId="sky-123", text=["Click me"])
 
