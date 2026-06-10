@@ -387,6 +387,7 @@ def convert_to_workflow_copilot_chat_message(
         workflow_copilot_chat_id=message_model.workflow_copilot_chat_id,
         sender=message_model.sender,
         content=message_model.content,
+        audio_artifact_id=message_model.audio_artifact_id,
         global_llm_context=message_model.global_llm_context,
         turn_outcome=parsed_outcome,
         narrative_payload=parsed_narrative,
