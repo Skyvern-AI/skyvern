@@ -40,6 +40,7 @@ from skyvern.schemas.runs import (
 )
 from skyvern.schemas.webhooks import RunWebhookPreviewResponse, RunWebhookReplayResponse
 from skyvern.services import run_service, task_v2_service
+from skyvern.services.webhook_delivery import scrub_internal_webhook_delivery_state
 from skyvern.utils.url_validators import validate_url
 
 LOG = structlog.get_logger()
@@ -439,14 +440,16 @@ async def _build_workflow_payload(
         errors=status_response.errors,
     )
 
-    payload_dict = json.loads(
-        status_response.model_dump_json(
-            exclude={
-                "webhook_callback_url",
-                "totp_verification_url",
-                "totp_identifier",
-                "extra_http_headers",
-            }
+    payload_dict = scrub_internal_webhook_delivery_state(
+        json.loads(
+            status_response.model_dump_json(
+                exclude={
+                    "webhook_callback_url",
+                    "totp_verification_url",
+                    "totp_identifier",
+                    "extra_http_headers",
+                }
+            )
         )
     )
     payload_dict.update(json.loads(run_response.model_dump_json(exclude={"run_request"})))
