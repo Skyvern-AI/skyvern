@@ -65,6 +65,34 @@ MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
 DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
 
 
+def _action_identity(action: Action) -> tuple[str, str, str, str]:
+    """Stable identity fields used for duplicate-action suppression."""
+    return (
+        str(action.kind),
+        action.url,
+        action.target.sky_id or "",
+        action.target.id or "",
+    )
+
+
+def _is_duplicate_action(candidate: Action, existing_actions: list[Action]) -> bool:
+    """
+    Suppress duplicate actions emitted from duplicate transport events.
+
+    We only dedupe when the latest action has the exact same identity and
+    timestamps, which keeps intentional repeated clicks intact.
+    """
+    if not existing_actions:
+        return False
+
+    previous = existing_actions[-1]
+    return (
+        _action_identity(previous) == _action_identity(candidate)
+        and previous.timestamp_start == candidate.timestamp_start
+        and previous.timestamp_end == candidate.timestamp_end
+    )
+
+
 def normalize_recording_block_label(label: str | None, *, fallback: str) -> str:
     candidate = (label or "").strip()
     candidate = re.sub(r"\W+", "_", candidate)
@@ -253,6 +281,14 @@ class Processor:
                         )
 
                 if allow_action:
+                    if _is_duplicate_action(action, actions):
+                        LOG.debug(
+                            f"{self.class_name} duplicate action suppressed",
+                            action=action,
+                            **self.identity,
+                        )
+                        continue
+
                     actions.append(action)
                 else:
                     # if an action was vetoed, we do not allow further processing
@@ -500,7 +536,9 @@ class Processor:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
-        if draft_steps:
+        # `is not None` (not truthiness): an empty list means the user deleted every
+        # live-interpreted step, which must not fall back to re-processing raw events.
+        if draft_steps is not None:
             LOG.info(
                 "record_browser.process_recording_drafts",
                 recording_draft_step_count=len(draft_steps),

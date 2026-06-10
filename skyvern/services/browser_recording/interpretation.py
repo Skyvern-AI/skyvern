@@ -122,6 +122,8 @@ def _draft_step_from_block(
             ],
             parameters=_extra_field(block, "parameters", []),
             parameter_keys=block.parameter_keys or [],
+            timestamp_start=action.timestamp_start,
+            timestamp_end=action.timestamp_end,
         )
 
     if isinstance(block, WorkflowDefinitionYamlBlocksItem_GotoUrl):
@@ -136,6 +138,8 @@ def _draft_step_from_block(
                 RecordingDraftStepEditableField.LABEL,
                 RecordingDraftStepEditableField.URL,
             ],
+            timestamp_start=action.timestamp_start,
+            timestamp_end=action.timestamp_end,
         )
 
     if isinstance(block, WorkflowDefinitionYamlBlocksItem_Wait):
@@ -150,6 +154,8 @@ def _draft_step_from_block(
                 RecordingDraftStepEditableField.LABEL,
                 RecordingDraftStepEditableField.WAIT_SEC,
             ],
+            timestamp_start=action.timestamp_start,
+            timestamp_end=action.timestamp_end,
         )
 
     return None
