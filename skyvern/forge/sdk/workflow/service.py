@@ -130,6 +130,7 @@ from skyvern.schemas.runs import (
     ProxyLocationInput,
     RunStatus,
     RunType,
+    RunUsageResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
 )
@@ -163,6 +164,21 @@ from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
+
+
+def build_workflow_usage_response(
+    credits_used: int | None,
+    cached_credits_used: int | None,
+) -> RunUsageResponse:
+    billable_credits = credits_used or 0
+    cached_credits = cached_credits_used or 0
+    return RunUsageResponse(
+        source="workflow_run",
+        billable_credits_used=billable_credits,
+        cached_credits_used=cached_credits,
+        total_credits_used=billable_credits + cached_credits,
+    )
+
 
 DEFAULT_FIRST_BLOCK_LABEL = "block_1"
 DEFAULT_WORKFLOW_TITLE = "New Workflow"
@@ -5646,6 +5662,7 @@ class WorkflowService:
             total_cost=None,
             credits_used=workflow_run.credits_used,
             cached_credits_used=workflow_run.cached_credits_used,
+            usage=build_workflow_usage_response(workflow_run.credits_used, workflow_run.cached_credits_used),
             workflow_title=workflow.title,
             browser_session_id=workflow_run.browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,

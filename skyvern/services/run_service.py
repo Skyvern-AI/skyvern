@@ -12,6 +12,7 @@ from skyvern.schemas.runs import (
     BulkCancelRunsResponse,
     RunEngine,
     RunResponse,
+    RunUsageResponse,
     RunType,
     TaskRunRequest,
     TaskRunResponse,
@@ -20,6 +21,45 @@ from skyvern.schemas.webhooks import RunWebhookReplayResponse
 from skyvern.services import task_v1_service, task_v2_service, webhook_service, workflow_service
 
 LOG = structlog.get_logger()
+
+
+def _as_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _build_task_run_usage(run: object) -> RunUsageResponse | None:
+    compute_cost = _as_float(getattr(run, "compute_cost", None))
+    llm_cost = _as_float(getattr(run, "llm_cost", None))
+    proxy_cost = _as_float(getattr(run, "proxy_cost", None))
+    captcha_cost = _as_float(getattr(run, "captcha_cost", None))
+    duration_ms = getattr(run, "duration_ms", None)
+
+    costs = [cost for cost in [compute_cost, llm_cost, proxy_cost, captcha_cost] if cost is not None]
+    if not costs and duration_ms is None:
+        return None
+
+    return RunUsageResponse(
+        source="task_run",
+        duration_ms=duration_ms,
+        total_cost_usd=sum(costs) if costs else None,
+        compute_cost_usd=compute_cost,
+        llm_cost_usd=llm_cost,
+        proxy_cost_usd=proxy_cost,
+        captcha_cost_usd=captcha_cost,
+    )
+
+
+def _with_task_run_usage(response: RunResponse | None, run: object) -> RunResponse | None:
+    if response is None:
+        return None
+
+    usage = _build_task_run_usage(run)
+    if usage is None:
+        return response
+
+    return response.model_copy(update={"usage": usage})
 
 
 async def get_run_response(run_id: str, organization_id: str | None = None) -> RunResponse | None:
@@ -57,7 +97,7 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
         elif run.task_run_type == RunType.yutori_navigator:
             run_engine = RunEngine.yutori_navigator
 
-        return TaskRunResponse(
+        response = TaskRunResponse(
             run_id=run.run_id,
             run_type=run.task_run_type,
             status=str(task_v1_response.status),
@@ -89,11 +129,13 @@ async def get_run_response(run_id: str, organization_id: str | None = None) -> R
             errors=task_v1_response.errors,
             step_count=task_v1_response.step_count,
         )
+        return _with_task_run_usage(response, run)
     elif run.task_run_type == RunType.task_v2:
         task_v2 = await app.DATABASE.observer.get_task_v2(run.run_id, organization_id=organization_id)
         if not task_v2:
             return None
-        return await task_v2_service.build_task_v2_run_response(task_v2)
+        response = await task_v2_service.build_task_v2_run_response(task_v2)
+        return _with_task_run_usage(response, run)
     elif run.task_run_type == RunType.workflow_run:
         return await workflow_service.get_workflow_run_response(run.run_id, organization_id=organization_id)
     raise ValueError(f"Invalid task run type: {run.task_run_type}")

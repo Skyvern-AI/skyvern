@@ -10,9 +10,23 @@ from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.workflow.exceptions import InvalidTemplateWorkflowPermanentId
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRun
-from skyvern.schemas.runs import RunStatus, RunType, WorkflowRunRequest, WorkflowRunResponse
+from skyvern.schemas.runs import RunStatus, RunType, RunUsageResponse, WorkflowRunRequest, WorkflowRunResponse
 
 LOG = structlog.get_logger(__name__)
+
+
+def build_workflow_run_usage(
+    credits_used: int | None,
+    cached_credits_used: int | None,
+) -> RunUsageResponse:
+    billable_credits = credits_used or 0
+    cached_credits = cached_credits_used or 0
+    return RunUsageResponse(
+        source="workflow_run",
+        billable_credits_used=billable_credits,
+        cached_credits_used=cached_credits,
+        total_credits_used=billable_credits + cached_credits,
+    )
 
 
 async def prepare_workflow(
@@ -141,6 +155,7 @@ async def get_workflow_run_response(
         include_step_count=True,
     )
     app_url = f"{settings.SKYVERN_APP_URL.rstrip('/')}/runs/{workflow_run.workflow_run_id}"
+    status_usage = getattr(workflow_run_resp, "usage", None)
     return WorkflowRunResponse(
         run_id=workflow_run_id,
         run_type=RunType.workflow_run,
@@ -179,4 +194,7 @@ async def get_workflow_run_response(
         ),
         errors=workflow_run_resp.errors,
         step_count=workflow_run_resp.total_steps,
+        usage=status_usage
+        if isinstance(status_usage, RunUsageResponse)
+        else build_workflow_run_usage(workflow_run.credits_used, workflow_run.cached_credits_used),
     )
