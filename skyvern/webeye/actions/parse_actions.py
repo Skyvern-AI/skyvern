@@ -1,6 +1,7 @@
 import ast
 import re
 from typing import Any, Dict, Match
+from urllib.parse import urlparse
 
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
@@ -9,7 +10,12 @@ from pydantic import ValidationError
 
 from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
 from skyvern.errors.errors import GetTOTPVerificationCodeError, MissingTOTPSourceError
-from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
+from skyvern.exceptions import (
+    FailedToGetTOTPVerificationCode,
+    InvalidUrl,
+    NoTOTPVerificationCodeFound,
+    UnsupportedActionType,
+)
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.core import skyvern_context
@@ -23,7 +29,7 @@ from skyvern.services.otp_service import (
     resolve_otp_value,
 )
 from skyvern.utils.image_resizer import Resolution, scale_coordinates
-from skyvern.utils.url_validators import strip_query_params
+from skyvern.utils.url_validators import is_blocked_host, prepend_scheme_and_validate_url, strip_query_params
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
@@ -42,11 +48,13 @@ from skyvern.webeye.actions.actions import (
     KeypressAction,
     LeftMouseAction,
     MoveAction,
+    NewTabAction,
     NullAction,
     ScrollAction,
     SelectOption,
     SelectOptionAction,
     SolveCaptchaAction,
+    SwitchTabAction,
     TerminateAction,
     UploadFileAction,
     VerificationCodeAction,
@@ -247,6 +255,34 @@ def parse_action(
 
     if action_type == ActionType.CLOSE_PAGE:
         return ClosePageAction(**base_action_dict)
+
+    if action_type == ActionType.NEW_TAB:
+        url = action.get("url")
+        if not url or not isinstance(url, str):
+            LOG.warning("NEW_TAB action returned without a url, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            validated_url = prepend_scheme_and_validate_url(url.strip())
+        except InvalidUrl:
+            LOG.warning("NEW_TAB action returned with an invalid url, skipping action", url=url)
+            return NullAction(**base_action_dict)
+        host = urlparse(validated_url).hostname
+        if not host or is_blocked_host(host):
+            LOG.warning("NEW_TAB action targets a blocked host, skipping action", url=validated_url)
+            return NullAction(**base_action_dict)
+        return NewTabAction(**base_action_dict, url=validated_url)
+
+    if action_type == ActionType.SWITCH_TAB:
+        raw_index = action.get("tab_index")
+        if raw_index is None:
+            LOG.warning("SWITCH_TAB action returned without a tab_index, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        try:
+            tab_index = int(raw_index)
+        except (TypeError, ValueError):
+            LOG.warning("SWITCH_TAB action returned with a non-integer tab_index, skipping action", raw_action=action)
+            return NullAction(**base_action_dict)
+        return SwitchTabAction(**base_action_dict, tab_index=tab_index)
 
     raise UnsupportedActionType(action_type=action_type)
 

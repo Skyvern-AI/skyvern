@@ -36,7 +36,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
-from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification, record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import (
     _INTERNAL_RUN_CANCELLED_BY_WATCHDOG_KEY,
     build_run_blocks_response,
@@ -1414,6 +1414,13 @@ def _record_run_blocks_result(
 
     structured_blocker = _run_blocks_structured_blocker_message(result)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
+    record_gate_decision(
+        copilot_ctx,
+        {
+            "run_output_blocker_detected": bool(structured_blocker),
+            "run_output_empty_data_blocks": bool(empty_data_blocks),
+        },
+    )
     if not anti_bot_match:
         anti_bot_match = _composition_anti_bot_reason(copilot_ctx)
     if anti_bot_match:
@@ -1479,7 +1486,7 @@ def _record_run_blocks_result(
             copilot_ctx.null_data_streak_count = getattr(copilot_ctx, "null_data_streak_count", 0) + 1
             copilot_ctx.last_test_failure_reason = (
                 "All blocks completed but data-producing blocks "
-                "(extraction/text_prompt) produced no meaningful output "
+                "produced no meaningful output "
                 "(missing, empty, or all-null fields). "
                 "The workflow may not be working correctly."
             )

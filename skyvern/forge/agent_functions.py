@@ -1076,8 +1076,11 @@ class AgentFunction:
 
         return cleanup_element_tree_func
 
+    async def has_code_block_access(self, organization_id: str | None = None) -> bool:
+        return settings.ENABLE_CODE_BLOCK
+
     async def validate_code_block(self, organization_id: str | None = None) -> None:
-        if not settings.ENABLE_CODE_BLOCK:
+        if not await self.has_code_block_access(organization_id):
             raise DisabledBlockExecutionError("CodeBlock is disabled")
 
     # TODO: Remove these methods if nothing calls them after verifying in production
