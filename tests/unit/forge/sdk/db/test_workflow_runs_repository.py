@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -201,6 +202,97 @@ async def test_get_all_runs_v2_search_key_matches_run_id_and_workflow_permanent_
     assert "coalesce(task_runs.workflow_permanent_id, workflow_runs.workflow_permanent_id)" in where_clause
     # autoescape rewrites '_' to e.g. '/_' so check the distinctive suffix.
     assert "abc123" in where_clause
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_runs_with_pending_webhook_delivery_filters_finalized_null_webhook_state() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _scalars(query):
+        captured["query"] = query
+        return _EmptyExecuteResult()
+
+    session = MagicMock()
+    session.scalars = AsyncMock(side_effect=_scalars)
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    await repo.get_workflow_runs_with_pending_webhook_delivery(
+        older_than=datetime(2026, 6, 1, 13, 20, tzinfo=timezone.utc),
+        limit=17,
+        in_progress_reason="Webhook delivery is in progress",
+    )
+
+    rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
+    where_clause = _where_clause_sql(captured["query"])
+    assert "workflow_runs.status IN ('failed', 'terminated', 'canceled', 'timed_out', 'completed')" in where_clause
+    for expected in [
+        "workflow_runs.webhook_callback_url IS NOT NULL",
+        "length(trim(workflow_runs.webhook_callback_url)) > 0",
+        # SQLAlchemy omits parentheses in the rendered string; SQL operator
+        # precedence keeps the modified_at cutoff bound to only the sentinel branch.
+        "workflow_runs.webhook_failure_reason IS NULL OR workflow_runs.webhook_failure_reason = 'Webhook delivery is in progress' AND workflow_runs.modified_at <= '2026-06-01 13:20:00'",
+        "workflow_runs.finished_at <= '2026-06-01 13:20:00' OR workflow_runs.finished_at IS NULL AND workflow_runs.modified_at <= '2026-06-01 13:20:00'",
+    ]:
+        assert expected in where_clause
+    assert "ORDER BY coalesce(workflow_runs.finished_at, workflow_runs.modified_at) ASC" in rendered
+    assert "LIMIT 17" in rendered
+
+
+@pytest.mark.asyncio
+async def test_claim_workflow_run_webhook_delivery_only_claims_null_state() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return SimpleNamespace(rowcount=1)
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    session.commit = AsyncMock()
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    claimed = await repo.claim_workflow_run_webhook_delivery(
+        workflow_run_id="wr_abc",
+        in_progress_reason="Webhook delivery is in progress",
+    )
+
+    rendered = str(captured["query"].compile(compile_kwargs={"literal_binds": True}))
+    assert claimed is True
+    assert "UPDATE workflow_runs SET" in rendered
+    assert "webhook_failure_reason='Webhook delivery is in progress'" in rendered
+    assert "modified_at=" in rendered
+    assert "workflow_runs.workflow_run_id = 'wr_abc'" in rendered
+    assert "workflow_runs.webhook_failure_reason IS NULL" in rendered
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_claim_workflow_run_webhook_delivery_can_reclaim_stale_in_progress_state() -> None:
+    captured: dict[str, Any] = {}
+
+    async def _execute(query):
+        captured["query"] = query
+        return SimpleNamespace(rowcount=1)
+
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=_execute)
+    session.commit = AsyncMock()
+    repo = WorkflowRunsRepository(session_factory=lambda: _SessionContext(session), debug_enabled=False)
+
+    claimed = await repo.claim_workflow_run_webhook_delivery(
+        workflow_run_id="wr_abc",
+        in_progress_reason="Webhook delivery is in progress",
+        claim_older_than=datetime(2026, 6, 1, 13, 20, tzinfo=timezone.utc),
+    )
+
+    where_clause = _where_clause_sql(captured["query"])
+    assert claimed is True
+    assert "workflow_runs.workflow_run_id = 'wr_abc'" in where_clause
+    assert (
+        "workflow_runs.webhook_failure_reason IS NULL OR workflow_runs.webhook_failure_reason = "
+        "'Webhook delivery is in progress' AND workflow_runs.modified_at <= '2026-06-01 13:20:00'"
+    ) in where_clause
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

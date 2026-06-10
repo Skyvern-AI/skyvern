@@ -170,10 +170,12 @@ async def test_print_page_block_filters_downloads_to_current_loop_iteration(
         artifact_id="a_new",
     )
 
+    # Baseline capture (block start) sees only the earlier iteration's file; the
+    # post-PDF read sees both. The block must scope its output to just the new one.
     fake_app = SimpleNamespace(
         STORAGE=SimpleNamespace(
             save_downloaded_files=AsyncMock(),
-            get_downloaded_files=AsyncMock(return_value=[prev_file, new_file]),
+            get_downloaded_files=AsyncMock(side_effect=[[prev_file], [prev_file, new_file]]),
         ),
     )
     monkeypatch.setattr(block_module, "app", fake_app)
