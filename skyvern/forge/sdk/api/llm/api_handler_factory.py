@@ -46,7 +46,6 @@ from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
 from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
-from skyvern.forge.sdk.experimentation.screenshot_downscale import effective_downscale_height
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -275,15 +274,6 @@ def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) ->
     return {
         "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
         "prompt_schema_variant_assigned": assigned,
-    }
-
-
-def _screenshot_downscale_log_fields(context: SkyvernContext | None) -> dict[str, Any]:
-    # variant is the raw A/B arm ("control"/"treatment"/None); max_height is the effective applied
-    # height (also non-null when the static kill-switch downscales outside the flag).
-    return {
-        "screenshot_downscale_variant": context.screenshot_downscale_variant if context else None,
-        "screenshot_downscale_max_height": effective_downscale_height(context),
     }
 
 
@@ -1565,7 +1555,6 @@ class LLMAPIHandlerFactory:
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
-                    **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2116,7 +2105,6 @@ class LLMAPIHandlerFactory:
                     llm_screenshots_enabled=llm_screenshots_enabled,
                     **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
-                    **_screenshot_downscale_log_fields(context),
                     **_consume_prompt_breakdown(context),
                 )
 
@@ -2605,7 +2593,6 @@ class LLMCaller:
                 llm_screenshots_enabled=llm_screenshots_enabled,
                 **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
-                **_screenshot_downscale_log_fields(context),
                 **_consume_prompt_breakdown(context),
             )
 

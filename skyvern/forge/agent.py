@@ -98,7 +98,6 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
-from skyvern.forge.sdk.experimentation.screenshot_downscale import resolve_screenshot_downscale_for_context
 from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
@@ -1358,13 +1357,6 @@ class ForgeAgent:
                 context.step_retry_index = step.retry_index
                 if not task.workflow_run_id and step.order == 0 and step.retry_index == 0:
                     await resolve_enrich_tree_for_context(
-                        context,
-                        task.task_id,
-                        task.organization_id,
-                        task_url=task.url,
-                        log_context={"task_id": task.task_id},
-                    )
-                    await resolve_screenshot_downscale_for_context(
                         context,
                         task.task_id,
                         task.organization_id,
