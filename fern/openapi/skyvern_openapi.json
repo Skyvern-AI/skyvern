@@ -106,7 +106,7 @@
     "/v1/run/agents": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Run an agent",
         "description": "Run an agent",
@@ -228,7 +228,7 @@
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get run info by id",
         "description": "Get run information (task run, workflow run)",
@@ -334,7 +334,7 @@
     "/v1/runs/{run_id}/cancel": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Cancel a run by id",
         "description": "Cancel a run (task or workflow)",
@@ -410,7 +410,7 @@
     "/v1/runs/cancel": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Bulk cancel runs",
         "description": "Cancel multiple runs (tasks or workflows) in a single request",
@@ -726,14 +726,16 @@
                   "type": "null"
                 }
               ],
-              "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`.",
+              "description": "Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`.",
               "examples": [
                 "env:prod",
+                "production",
+                "env:*",
                 "customer:acme,env:prod"
               ],
               "title": "Tags"
             },
-            "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`."
+            "description": "Filter by tags. Each term is a label (`production`), a group (`env:*`), or a group:label (`env:prod`). Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct terms, OR within a group's labels (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). A label term matches the value across any/no group. Matches current tag values only. Not supported with `template=true`."
           },
           {
             "name": "template",
@@ -977,7 +979,7 @@
     "/v1/folders": {
       "post": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Create folder",
         "description": "Create a new folder to organize workflows",
@@ -1041,7 +1043,7 @@
       },
       "get": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Get folders",
         "description": "Get all folders for the organization",
@@ -1143,7 +1145,7 @@
     "/v1/folders/{folder_id}": {
       "get": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Get folder",
         "description": "Get a specific folder by ID",
@@ -1211,7 +1213,7 @@
       },
       "put": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Update folder",
         "description": "Update a folder's title or description",
@@ -1289,7 +1291,7 @@
       },
       "delete": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Delete folder",
         "description": "Delete a folder. Optionally delete all workflows in the folder.",
@@ -1373,7 +1375,7 @@
     "/v1/tag-keys": {
       "get": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "List tag keys",
         "description": "List all tag keys registered for the organization with their descriptions.",
@@ -1430,7 +1432,7 @@
     "/v1/tag-keys/{key}": {
       "patch": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Update tag key",
         "description": "Update the description for a tag key.",
@@ -1498,7 +1500,7 @@
       },
       "delete": {
         "tags": [
-          "Workflow Tags"
+          "Tags"
         ],
         "summary": "Delete tag key",
         "description": "Delete a tag key from the organization registry and remove that tag from every workflow that currently has it (cascade). Returns how many workflows the tag was removed from.",
@@ -1550,7 +1552,7 @@
     "/v1/workflow-tags": {
       "get": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Batch get agent tags",
         "description": "Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
@@ -1626,7 +1628,7 @@
       },
       "post": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Batch get agent tags (POST)",
         "description": "Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
@@ -1833,7 +1835,7 @@
     "/v1/runs/{run_id}/retry_webhook": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Replay a run webhook",
         "description": "Retry sending the webhook for a run",
@@ -1932,7 +1934,7 @@
     "/v1/runs/{run_id}/timeline": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get run timeline",
         "description": "Get timeline for a run (workflow run or task_v2 run)",
@@ -2024,7 +2026,7 @@
     "/v1/version": {
       "get": {
         "tags": [
-          "server"
+          "Server"
         ],
         "summary": "Get server version",
         "description": "Returns the current Skyvern server version (git SHA for official builds).",
@@ -2044,7 +2046,8 @@
               }
             }
           }
-        }
+        },
+        "x-fern-sdk-method-name": "get_version"
       }
     },
     "/v1/runs": {
@@ -4373,7 +4376,7 @@
     "/v1/agents/{workflow_permanent_id}/folder": {
       "put": {
         "tags": [
-          "Agent Folders"
+          "Folders"
         ],
         "summary": "Update agent folder",
         "description": "Update a workflow's folder assignment for the latest version",
@@ -4456,7 +4459,7 @@
     "/v1/agents/{workflow_permanent_id}/tags": {
       "post": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Apply agent tags",
         "description": "Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
@@ -4509,7 +4512,7 @@
       },
       "get": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Get agent tags",
         "description": "Get the current tag state for a workflow.",
@@ -4579,7 +4582,7 @@
     "/v1/agents/{workflow_permanent_id}/tags/{key}": {
       "delete": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Delete agent tag",
         "description": "Soft-delete a single tag from a workflow. Writes a DELETE event row.",
@@ -4645,7 +4648,7 @@
     "/v1/agents/{workflow_permanent_id}/tags/history": {
       "get": {
         "tags": [
-          "Agent Tags"
+          "Tags"
         ],
         "summary": "Get agent tag history",
         "description": "Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
@@ -4766,7 +4769,7 @@
     "/v1/agents/runs/{workflow_run_id}/retry": {
       "post": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Retry a run",
         "description": "Retry a workflow run using the original run parameters.",
@@ -4871,7 +4874,7 @@
     "/v1/agents/runs": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get all runs",
         "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
@@ -5023,7 +5026,7 @@
     "/v1/agents/{workflow_id}/runs": {
       "get": {
         "tags": [
-          "Agents"
+          "Runs"
         ],
         "summary": "Get all runs by agent",
         "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
@@ -14386,6 +14389,11 @@
             "type": "boolean",
             "title": "Include Extracted Text",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "default": false
           }
         },
         "type": "object",
@@ -14575,6 +14583,11 @@
             "type": "boolean",
             "title": "Complete Verification",
             "default": true
+          },
+          "skip_saved_profile": {
+            "type": "boolean",
+            "title": "Skip Saved Profile",
+            "default": false
           }
         },
         "type": "object",
@@ -17544,25 +17557,56 @@
       "TagApplyRequest": {
         "properties": {
           "tags": {
-            "additionalProperties": {
-              "type": "string"
+            "items": {
+              "$ref": "#/components/schemas/TagInput"
             },
-            "type": "object",
+            "type": "array",
             "title": "Tags",
-            "description": "Tags to set (overwrite). Map of key to value."
+            "description": "Tags to set (overwrite). List of {key?, value} objects."
           },
           "tags_to_delete": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/TagDeleteInput"
             },
             "type": "array",
             "title": "Tags To Delete",
-            "description": "Tag keys to soft-delete."
+            "description": "Tags to soft-delete. List of {key?, value?} targets."
           }
         },
         "type": "object",
         "title": "TagApplyRequest",
-        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty;\nboth empty is a valid no-op. Same-key collisions: set wins over delete."
+        "description": "Body for ``POST /v1/workflows/{wpid}/tags``. Either field may be empty (both\nempty is a no-op). On a same-identity collision, set wins over delete."
+      },
+      "TagDeleteInput": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key",
+            "description": "Group (key) to delete. Use for grouped tags."
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value",
+            "description": "Label (value) to delete. Use for standalone labels."
+          }
+        },
+        "type": "object",
+        "title": "TagDeleteInput",
+        "description": "One tag to soft-delete: a grouped tag by its ``key``, or a standalone label\nby its ``value`` (omit the key)."
       },
       "TagHistoryItem": {
         "properties": {
@@ -17571,7 +17615,14 @@
             "title": "Tag Event Id"
           },
           "key": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Key"
           },
           "value": {
@@ -17649,6 +17700,58 @@
         ],
         "title": "TagHistoryResponse"
       },
+      "TagInput": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key",
+            "description": "Optional group (key). Omit for a standalone label."
+          },
+          "value": {
+            "type": "string",
+            "title": "Value",
+            "description": "Label (value). Always required."
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagInput",
+        "description": "One tag to set. ``value`` is the required label; ``key`` is the optional\ngroup — null for a standalone label, set for a grouped label (e.g. env:prod)."
+      },
+      "TagItem": {
+        "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value"
+        ],
+        "title": "TagItem",
+        "description": "A single tag (key + label) without per-tag attribution. ``key`` is null\nfor a standalone label."
+      },
       "TagKey": {
         "properties": {
           "key": {
@@ -17719,6 +17822,17 @@
       },
       "TagResponse": {
         "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key"
+          },
           "value": {
             "type": "string",
             "title": "Value"
@@ -17745,7 +17859,7 @@
           "set_by"
         ],
         "title": "TagResponse",
-        "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row)."
+        "description": "Current state of one tag (``GET /v1/workflows/{wpid}/tags`` row).\n``key`` is null for a standalone label."
       },
       "TagsResponse": {
         "properties": {
@@ -17754,10 +17868,10 @@
             "title": "Workflow Permanent Id"
           },
           "tags": {
-            "additionalProperties": {
+            "items": {
               "$ref": "#/components/schemas/TagResponse"
             },
-            "type": "object",
+            "type": "array",
             "title": "Tags"
           }
         },
@@ -17767,7 +17881,7 @@
           "tags"
         ],
         "title": "TagsResponse",
-        "description": "Current tag map for a workflow."
+        "description": "Current tags for a workflow. A list (not a key-map) so standalone labels,\nwhich have no key, are representable."
       },
       "TaskBlock": {
         "properties": {
@@ -25005,10 +25119,10 @@
         "properties": {
           "workflow_tags": {
             "additionalProperties": {
-              "additionalProperties": {
-                "type": "string"
+              "items": {
+                "$ref": "#/components/schemas/TagItem"
               },
-              "type": "object"
+              "type": "array"
             },
             "type": "object",
             "title": "Workflow Tags"
@@ -25019,7 +25133,7 @@
           "workflow_tags"
         ],
         "title": "WorkflowTagsBatchResponse",
-        "description": "Response for the batch endpoint.\n\nWorkflows with no tags are present with an empty dict so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nWorkflows outside the caller's org are silently absent (no leakage)."
+        "description": "Response for the batch endpoint.\n\nWorkflows with no tags are present with an empty list so the frontend can\ndistinguish \"fetched, none set\" from \"not fetched\" without a second call.\nWorkflows outside the caller's org are silently absent (no leakage)."
       },
       "WorkflowTriggerBlock": {
         "properties": {
