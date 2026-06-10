@@ -12,6 +12,7 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import { ClearCredentialDialog } from "@/components/ClearCredentialDialog";
 import { useBitwardenCredential } from "@/hooks/useBitwardenCredential";
 import { EyeOpenIcon, EyeClosedIcon } from "@radix-ui/react-icons";
 
@@ -44,6 +45,8 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
     isLoading,
     createOrUpdateToken,
     isUpdating,
+    clearCredential,
+    isClearing,
   } = useBitwardenCredential();
 
   const form = useForm<FormData>({
@@ -55,6 +58,7 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
       },
     },
   });
+  const isMutating = isUpdating || isClearing;
 
   const onSubmit = (data: FormData) => {
     createOrUpdateToken(data, {
@@ -63,15 +67,13 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
   };
 
   useEffect(() => {
-    if (bitwardenOrganizationAuthToken?.credential) {
-      form.reset({
-        credential: {
-          email: bitwardenOrganizationAuthToken.credential.email,
-          master_password: "",
-        },
-      });
-    }
-  }, [bitwardenOrganizationAuthToken, form]);
+    form.reset({
+      credential: {
+        email: bitwardenOrganizationAuthToken?.credential?.email || "",
+        master_password: "",
+      },
+    });
+  }, [bitwardenOrganizationAuthToken?.credential?.email, form]);
 
   return (
     <div className="space-y-4">
@@ -109,7 +111,7 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
                       {...field}
                       type="email"
                       placeholder="user@example.com"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                 </div>
@@ -129,7 +131,7 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
                       {...field}
                       type={showMasterPassword ? "text" : "password"}
                       placeholder="master_password"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                   <Button
@@ -138,7 +140,7 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
                     size="sm"
                     className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
                     onClick={() => setShowMasterPassword((v) => !v)}
-                    disabled={isLoading || isUpdating}
+                    disabled={isLoading || isMutating}
                   >
                     {showMasterPassword ? (
                       <EyeClosedIcon className="h-4 w-4" />
@@ -159,9 +161,19 @@ export function BitwardenCredentialForm({ onSuccess }: Props = {}) {
           />
 
           <div className="flex items-center gap-4">
-            <Button type="submit" disabled={isLoading || isUpdating}>
+            <Button type="submit" disabled={isLoading || isMutating}>
               {isUpdating ? "Updating..." : "Update Credential"}
             </Button>
+            {bitwardenOrganizationAuthToken && (
+              <ClearCredentialDialog
+                label="Clear Credential"
+                title="Clear Bitwarden credential?"
+                description="Workflows that use Bitwarden-backed credentials will no longer be able to resolve them until new Bitwarden credentials are added."
+                disabled={isLoading || isMutating}
+                isPending={isClearing}
+                onConfirm={() => clearCredential()}
+              />
+            )}
             {bitwardenOrganizationAuthToken && (
               <div className="text-sm text-muted-foreground">
                 Last updated:{" "}
