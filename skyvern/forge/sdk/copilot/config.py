@@ -271,6 +271,14 @@ POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE = (
     "and only when a separate required non-URL input is still missing."
 )
 
+PRE_DISCOVERY_URL_QUESTION_NUDGE = (
+    "STOP — you are asking the user for an entry-point URL before resolving it yourself. "
+    "discover_workflow_entrypoint has not run this turn. Call "
+    "discover_workflow_entrypoint(site_or_url, intent_hint) to resolve the entrypoint from the "
+    "site the user named, then compose from the resolved page. Only ask for a URL if discovery "
+    "runs and cannot resolve a site."
+)
+
 PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX = (
     "STOP — the target site has failed to scrape on every attempt across "
     "multiple workflow shapes. Every run navigated successfully but the "
@@ -346,6 +354,7 @@ DEFAULT_ENFORCEMENT_NUDGES: dict[str, str] = {
     "post_per_tool_budget_stop": POST_PER_TOOL_BUDGET_STOP_NUDGE,
     "post_no_workflow_delivery": POST_NO_WORKFLOW_DELIVERY_NUDGE,
     "post_discovery_entrypoint_url_question": POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE,
+    "pre_discovery_url_question": PRE_DISCOVERY_URL_QUESTION_NUDGE,
     "post_probable_site_block_stop_prefix": PROBABLE_SITE_BLOCK_STOP_NUDGE_PREFIX,
     "post_probable_site_block_stop": POST_PROBABLE_SITE_BLOCK_STOP_NUDGE,
     "post_anti_bot_failed_test": POST_ANTI_BOT_FAILED_TEST_NUDGE,
