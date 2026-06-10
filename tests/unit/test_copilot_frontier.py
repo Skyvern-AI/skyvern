@@ -32,6 +32,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_workflow_update_result,
     _referenced_output_labels,
 )
+from skyvern.forge.sdk.copilot.tools import frontier as frontier_module
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS
 
 
@@ -688,12 +689,10 @@ def test_plan_frontier_cold_start_no_old_definition_uses_first_requested() -> No
 
 
 def test_plan_frontier_ambiguous_diff_falls_back_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
-    from skyvern.forge.sdk.copilot import tools
-
     def _blow_up(*args: object, **kwargs: object) -> set[str]:
         raise RuntimeError("parse failure in diff")
 
-    monkeypatch.setattr(tools, "_find_invalidated_labels", _blow_up)
+    monkeypatch.setattr(frontier_module, "_find_invalidated_labels", _blow_up)
 
     old = _FakeDefinition([_FakeBlock("a", "navigation")])
     new = _FakeDefinition([_FakeBlock("a", "navigation")])
@@ -1685,7 +1684,7 @@ def test_differ_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*_args: object, **_kwargs: object) -> set[str]:
         raise RuntimeError("differ blew up")
 
-    monkeypatch.setattr(tools, "_find_invalidated_labels", _boom)
+    monkeypatch.setattr(frontier_module, "_find_invalidated_labels", _boom)
 
     _invalidate_verified_state_on_edit(ctx, prior, new)
 

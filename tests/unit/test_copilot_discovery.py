@@ -370,7 +370,7 @@ async def test_inspect_current_page_uses_existing_browser_page(monkeypatch: pyte
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
-    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
@@ -397,7 +397,7 @@ async def test_post_run_current_page_inspection_budget_bypass_does_not_consume_c
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
-    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
@@ -418,7 +418,7 @@ async def test_current_page_inspection_without_earned_interaction_is_not_click_r
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
-    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
@@ -441,7 +441,7 @@ async def test_current_page_inspection_after_browser_action_is_click_reached_onc
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
-    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
 
     result = await _inspect_page_for_composition_impl(ctx, "current_page")
 
@@ -499,7 +499,7 @@ async def test_target_url_inspection_uses_visual_summary_for_generic_obstruction
             "omissions": [],
         }, None
 
-    monkeypatch.setattr(tools_module, "_composition_summarize_screenshot", fake_visual_summary)
+    monkeypatch.setattr(tools_module.composition_capture, "_composition_summarize_screenshot", fake_visual_summary)
 
     result = await _inspect_page_for_composition_impl(ctx, "https://www.example.com/search")
 
@@ -538,7 +538,7 @@ async def test_target_url_inspection_clears_pending_interaction_credit(
     async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
         return "https://www.example.com/results", "Results"
 
-    monkeypatch.setattr(tools_module, "_fallback_page_info", fake_fallback_page_info)
+    monkeypatch.setattr(tools_module.composition_capture, "_fallback_page_info", fake_fallback_page_info)
 
     current_result = await _inspect_page_for_composition_impl(ctx, "current_page")
 

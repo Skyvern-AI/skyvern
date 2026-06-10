@@ -815,7 +815,7 @@ class TestBrowserInteractionObservationHooks:
         async def fake_verify(*_args: object, **_kwargs: object) -> dict[str, object]:
             return {"ok": False, "error": "field is still empty"}
 
-        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", fake_verify)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fake_verify)
         ctx = SimpleNamespace(
             pending_browser_interaction_observation=None,
             discovery_mcp_server=None,
@@ -983,7 +983,7 @@ class TestScoutedInteractionCapture:
         async def passes(*_a: object, **_k: object) -> None:
             return None
 
-        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", passes)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
         ctx = self._ctx()
         await tools_module._type_text_post_hook(
             {"ok": True, "data": {"selector": "#q", "text_length": 8}},
@@ -1001,7 +1001,7 @@ class TestScoutedInteractionCapture:
         async def fails(*_a: object, **_k: object) -> dict[str, object]:
             return {"ok": False, "error": "field is still empty"}
 
-        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", fails)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fails)
         ctx = self._ctx()
         await tools_module._type_text_post_hook(
             {"ok": True, "data": {"selector": "#q", "text_length": 8}},
@@ -1037,7 +1037,7 @@ class TestScoutedInteractionCapture:
         async def passes(*_a: object, **_k: object) -> None:
             return None
 
-        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", passes)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
         ctx = self._ctx()
         await tools_module._type_text_post_hook(
             {"ok": True, "data": {"selector": "#q", "text_length": 8}},
@@ -1064,11 +1064,12 @@ class TestScoutedInteractionCapture:
     @pytest.mark.asyncio
     async def test_capture_scout_source_url_reads_live_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.copilot import tools as tools_module
+        from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
 
         async def fake_url(_ctx: object) -> str:
             return "https://example.com/product"
 
-        monkeypatch.setattr(tools_module, "_live_working_page_url", fake_url)
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
         ctx = self._ctx()
         await tools_module._capture_scout_source_url(ctx)
         assert ctx.pending_scout_source_url == "https://example.com/product"

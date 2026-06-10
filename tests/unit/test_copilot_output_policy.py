@@ -1433,7 +1433,7 @@ async def test_update_workflow_rejects_raw_secret_before_processing(monkeypatch)
     from skyvern.forge.sdk.copilot.tools import _update_workflow
 
     process_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
 
     result = await _update_workflow(
         {
@@ -1456,7 +1456,7 @@ workflow_definition:
 
 def test_inline_replace_workflow_rejects_raw_secret_before_processing(monkeypatch) -> None:
     process_mock = MagicMock()
-    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+    monkeypatch.setattr("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", process_mock)
     result = _fake_run_result(
         {
             "type": "REPLACE_WORKFLOW",

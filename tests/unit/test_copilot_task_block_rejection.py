@@ -276,7 +276,7 @@ async def test_update_workflow_rejects_new_task_block_and_emits_span() -> None:
     submitted = _yaml({"block_type": "task", "label": "fill_contact_form", "navigation_goal": "do"})
     ctx = _ctx(prior_yaml=None)
 
-    with patch("skyvern.forge.sdk.copilot.tools._record_banned_block_reject_span") as mock_span:
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_banned_block_reject_span") as mock_span:
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is False
@@ -319,9 +319,11 @@ async def test_update_workflow_preserves_legacy_task_block_under_unchanged_label
     fake_workflow.sequential_key = None
 
     with (
-        patch("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", return_value=fake_workflow),
-        patch("skyvern.forge.sdk.copilot.tools._record_workflow_proxy_location_span") as mock_proxy_span,
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", return_value=fake_workflow),
+        patch(
+            "skyvern.forge.sdk.copilot.tools.workflow_update._record_workflow_proxy_location_span"
+        ) as mock_proxy_span,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
@@ -362,8 +364,8 @@ async def test_update_workflow_allows_all_allowed_block_types() -> None:
         setattr(fake_workflow, attr, None)
 
     with (
-        patch("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", return_value=fake_workflow),
-        patch("skyvern.forge.sdk.copilot.tools.app") as mock_app,
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml", return_value=fake_workflow),
+        patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app,
     ):
         mock_app.WORKFLOW_SERVICE.get_workflow = AsyncMock(return_value=None)
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
