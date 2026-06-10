@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
@@ -51,11 +51,21 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { SelectionBar } from "@/components/SelectionBar";
+import {
+  SelectionCheckboxCell,
+  SelectionHeaderCheckboxCell,
+} from "@/components/SelectionCheckbox";
+import { useRowSelection } from "@/hooks/useRowSelection";
+import { bulkResultToast } from "@/util/bulkResultToast";
+import {
+  BULK_CONCURRENCY_LIMIT,
+  runWithConcurrency,
+} from "@/util/runWithConcurrency";
 import { TableSearchInput } from "@/components/TableSearchInput";
 import { Pill } from "@/components/StatusBadge";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
-import { toast } from "@/components/ui/use-toast";
 import { useOrganizationSchedulesQuery } from "./useOrganizationSchedulesQuery";
 import {
   useDeleteOrgScheduleMutation,
@@ -67,32 +77,6 @@ import { cronToHumanReadable } from "@/routes/workflows/editor/panels/schedulePa
 import { basicLocalTimeFormat, basicTimeFormat } from "@/util/timeFormat";
 import type { OrganizationScheduleItem } from "@/routes/workflows/types/scheduleTypes";
 import { CreateOrgScheduleDialog } from "./CreateOrgScheduleDialog";
-
-const BULK_CONCURRENCY_LIMIT = 5;
-
-async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  limit: number,
-): Promise<PromiseSettledResult<T>[]> {
-  const results: Array<PromiseSettledResult<T>> = new Array(tasks.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < tasks.length) {
-      const index = nextIndex++;
-      try {
-        results[index] = { status: "fulfilled", value: await tasks[index]!() };
-      } catch (reason) {
-        results[index] = { status: "rejected", reason };
-      }
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(limit, tasks.length) }, () => worker()),
-  );
-  return results;
-}
 
 type ScheduleStatus = "active" | "paused";
 
@@ -119,8 +103,6 @@ function SchedulesPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [statusFilters, setStatusFilters] = useState<ScheduleStatus[]>([]);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const lastSelectedIndex = useRef<number | null>(null);
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [deleteDialog, setDeleteDialog] = useState<{
     open: boolean;
@@ -154,49 +136,26 @@ function SchedulesPage() {
   const totalCount = data?.total_count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  const allSelected =
-    schedules.length > 0 &&
-    schedules.every((s) => selected.has(s.workflow_schedule_id));
-
-  function toggleSelectAll() {
-    if (allSelected) {
-      setSelected(new Set());
-    } else {
-      setSelected(new Set(schedules.map((s) => s.workflow_schedule_id)));
-    }
-  }
-
-  function handleSelect(index: number, shiftKey: boolean) {
-    const id = schedules[index]!.workflow_schedule_id;
-    if (shiftKey && lastSelectedIndex.current !== null) {
-      const start = Math.min(lastSelectedIndex.current, index);
-      const end = Math.max(lastSelectedIndex.current, index);
-      setSelected((prev) => {
-        const next = new Set(prev);
-        for (let i = start; i <= end; i++) {
-          next.add(schedules[i]!.workflow_schedule_id);
-        }
-        return next;
-      });
-    } else {
-      setSelected((prev) => {
-        const next = new Set(prev);
-        if (next.has(id)) {
-          next.delete(id);
-        } else {
-          next.add(id);
-        }
-        return next;
-      });
-    }
-    lastSelectedIndex.current = index;
-  }
+  const {
+    selected,
+    selectedItems: selectedSchedules,
+    isSelected,
+    allSelected,
+    someSelected,
+    handleSelect,
+    toggleSelectAll,
+    clearSelection,
+    replaceSelection,
+  } = useRowSelection({
+    items: schedules,
+    getId: (s) => s.workflow_schedule_id,
+    resetKey: JSON.stringify([page, pageSize, statusFilters, debouncedSearch]),
+  });
 
   function setPage(p: number) {
     const params = new URLSearchParams(searchParams);
     params.set("page", String(p));
     setSearchParams(params);
-    setSelected(new Set());
   }
 
   function setPageSize(size: string) {
@@ -204,7 +163,6 @@ function SchedulesPage() {
     params.set("page_size", size);
     params.set("page", "1");
     setSearchParams(params);
-    setSelected(new Set());
   }
 
   function handleDeleteConfirm() {
@@ -212,18 +170,9 @@ function SchedulesPage() {
     deleteMutation.mutate(deleteDialog.schedule, {
       onSettled: () => {
         setDeleteDialog({ open: false, schedule: null });
-        setSelected((prev) => {
-          const next = new Set(prev);
-          next.delete(deleteDialog.schedule!.workflow_schedule_id);
-          return next;
-        });
       },
     });
   }
-
-  const selectedSchedules = schedules.filter((s) =>
-    selected.has(s.workflow_schedule_id),
-  );
 
   async function runBulkOperation(
     items: OrganizationScheduleItem[],
@@ -243,23 +192,20 @@ function SchedulesPage() {
         BULK_CONCURRENCY_LIMIT,
       );
       const succeeded = results.filter((r) => r.status === "fulfilled").length;
-      const failed = results.filter((r) => r.status === "rejected").length;
-      if (failed === 0) {
-        toast({
-          title: `${succeeded} schedule${succeeded !== 1 ? "s" : ""} ${successLabel} successfully.`,
-          variant: "success",
-        });
-        setSelected(new Set());
-      } else if (succeeded === 0) {
-        toast({
-          title: `Failed to ${failureLabel} ${failed} schedule${failed !== 1 ? "s" : ""}.`,
-          variant: "destructive",
-        });
-      } else {
-        toast({
-          title: `${succeeded}/${items.length} schedules ${successLabel} successfully. ${failed} failed.`,
-          variant: "destructive",
-        });
+      bulkResultToast({
+        succeeded,
+        total: items.length,
+        results,
+        successTitle: (n) =>
+          `${n} schedule${n !== 1 ? "s" : ""} ${successLabel} successfully.`,
+        failureTitle: (n) =>
+          `Failed to ${failureLabel} ${n} schedule${n !== 1 ? "s" : ""}.`,
+        partialTitle: (successCount, failedCount) =>
+          `${successCount} schedule${successCount !== 1 ? "s" : ""} ${successLabel} successfully. ${failedCount} failed.`,
+      });
+      if (succeeded === items.length) {
+        clearSelection();
+      } else if (succeeded > 0) {
         // Keep only failed items selected so the user can retry
         const failedIds = new Set<string>();
         results.forEach((result, i) => {
@@ -267,7 +213,7 @@ function SchedulesPage() {
             failedIds.add(items[i]!.workflow_schedule_id);
           }
         });
-        setSelected(failedIds);
+        replaceSelection(failedIds);
       }
       queryClient.invalidateQueries({ queryKey: ["organizationSchedules"] });
       queryClient.invalidateQueries({ queryKey: ["scheduleDetail"] });
@@ -336,7 +282,7 @@ function SchedulesPage() {
     setBulkDeleteDialog({ open: false, count: 0 });
   }
 
-  const showCheckbox = schedules.length > 1;
+  const showCheckbox = schedules.length > 0;
   const columnCount = showCheckbox ? 7 : 6;
 
   return (
@@ -411,14 +357,16 @@ function SchedulesPage() {
         <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
             <TableHeader>
-              <TableRow>
+              <TableRow className="group/header">
                 {showCheckbox && (
-                  <TableHead className="w-[3%]">
-                    <Checkbox
-                      checked={allSelected}
-                      onCheckedChange={toggleSelectAll}
-                    />
-                  </TableHead>
+                  <SelectionHeaderCheckboxCell
+                    className="w-[3%]"
+                    allSelected={allSelected}
+                    someSelected={someSelected}
+                    hasSelection={selected.size > 0}
+                    onToggleAll={toggleSelectAll}
+                    ariaLabel="Select all schedules"
+                  />
                 )}
                 <TableHead className={showCheckbox ? "w-[28%]" : "w-[31%]"}>
                   Agent
@@ -468,7 +416,12 @@ function SchedulesPage() {
                   key={schedule.workflow_schedule_id}
                   tabIndex={0}
                   aria-label={`Open schedule ${schedule.name ?? schedule.workflow_title}`}
-                  className="cursor-pointer select-none hover:bg-muted/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary"
+                  data-state={
+                    isSelected(schedule.workflow_schedule_id)
+                      ? "selected"
+                      : undefined
+                  }
+                  className="group/row cursor-pointer select-none hover:bg-muted/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary"
                   onClick={() =>
                     navigate(
                       `/schedules/${schedule.workflow_permanent_id}/${schedule.workflow_schedule_id}`,
@@ -487,17 +440,13 @@ function SchedulesPage() {
                   }}
                 >
                   {showCheckbox && (
-                    <TableCell
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleSelect(index, e.shiftKey);
-                      }}
-                    >
-                      <Checkbox
-                        checked={selected.has(schedule.workflow_schedule_id)}
-                        className="pointer-events-none"
-                      />
-                    </TableCell>
+                    <SelectionCheckboxCell
+                      index={index}
+                      checked={isSelected(schedule.workflow_schedule_id)}
+                      hasSelection={selected.size > 0}
+                      onSelect={handleSelect}
+                      ariaLabel={`Select schedule ${schedule.name ?? schedule.workflow_title}`}
+                    />
                   )}
                   <TableCell className="truncate font-medium">
                     {schedule.workflow_title}
@@ -521,49 +470,52 @@ function SchedulesPage() {
                     <StatusDisplay enabled={schedule.enabled} />
                   </TableCell>
                   <TableCell onClick={(e) => e.stopPropagation()}>
-                    <DropdownMenu modal={false}>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-8 text-muted-foreground hover:text-foreground"
-                        >
-                          <DotsHorizontalIcon className="size-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        {schedule.enabled ? (
-                          <DropdownMenuItem
-                            onSelect={() => disableMutation.mutate(schedule)}
+                    {/* Row menus yield to the bulk bar while any selection is active. */}
+                    {selected.size === 0 && (
+                      <DropdownMenu modal={false}>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-8 text-muted-foreground hover:text-foreground"
                           >
-                            <PauseIcon className="mr-2 size-4" />
-                            Pause
-                          </DropdownMenuItem>
-                        ) : (
+                            <DotsHorizontalIcon className="size-4" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          {schedule.enabled ? (
+                            <DropdownMenuItem
+                              onSelect={() => disableMutation.mutate(schedule)}
+                            >
+                              <PauseIcon className="mr-2 size-4" />
+                              Pause
+                            </DropdownMenuItem>
+                          ) : (
+                            <DropdownMenuItem
+                              onSelect={() => enableMutation.mutate(schedule)}
+                            >
+                              <PlayIcon className="mr-2 size-4" />
+                              Activate
+                            </DropdownMenuItem>
+                          )}
                           <DropdownMenuItem
-                            onSelect={() => enableMutation.mutate(schedule)}
+                            onSelect={() => duplicateMutation.mutate(schedule)}
                           >
-                            <PlayIcon className="mr-2 size-4" />
-                            Activate
+                            <CopyIcon className="mr-2 size-4" />
+                            Duplicate
                           </DropdownMenuItem>
-                        )}
-                        <DropdownMenuItem
-                          onSelect={() => duplicateMutation.mutate(schedule)}
-                        >
-                          <CopyIcon className="mr-2 size-4" />
-                          Duplicate
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onSelect={() =>
-                            setDeleteDialog({ open: true, schedule })
-                          }
-                          className="text-destructive"
-                        >
-                          <TrashIcon className="mr-2 size-4" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              setDeleteDialog({ open: true, schedule })
+                            }
+                            className="text-destructive"
+                          >
+                            <TrashIcon className="mr-2 size-4" />
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -634,15 +586,15 @@ function SchedulesPage() {
       </div>
 
       {/* Multi-select bulk action bar */}
-      {selected.size > 0 && (
-        <div className="fixed inset-x-0 bottom-6 mx-auto flex w-fit items-center gap-3 rounded-lg border border-slate-700 bg-slate-900 px-6 py-3 shadow-xl">
-          <span className="text-sm text-slate-300">
-            {isBulkOperating ? "Processing…" : `${selected.size} selected`}
-          </span>
-          <div className="h-6 w-px bg-slate-700" />
+      {selectedSchedules.length > 0 && (
+        <SelectionBar
+          count={selectedSchedules.length}
+          isOperating={isBulkOperating}
+          onClear={clearSelection}
+        >
           <Button
             size="sm"
-            className="bg-green-900 text-green-50 hover:bg-green-800"
+            variant="ghost"
             onClick={handleBulkActivate}
             disabled={isBulkOperating}
           >
@@ -651,7 +603,7 @@ function SchedulesPage() {
           </Button>
           <Button
             size="sm"
-            className="bg-amber-800 text-amber-50 hover:bg-amber-700"
+            variant="ghost"
             onClick={handleBulkPause}
             disabled={isBulkOperating}
           >
@@ -660,7 +612,7 @@ function SchedulesPage() {
           </Button>
           <Button
             size="sm"
-            className="bg-blue-800 text-blue-50 hover:bg-blue-700"
+            variant="ghost"
             onClick={handleBulkDuplicate}
             disabled={isBulkOperating}
           >
@@ -669,14 +621,15 @@ function SchedulesPage() {
           </Button>
           <Button
             size="sm"
-            className="bg-red-900 text-red-50 hover:bg-red-800"
+            variant="ghost"
+            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
             onClick={handleBulkDelete}
             disabled={isBulkOperating}
           >
             <TrashIcon className="mr-1.5 size-3.5" />
             Delete
           </Button>
-        </div>
+        </SelectionBar>
       )}
 
       {/* Bulk delete confirmation dialog */}

@@ -20,18 +20,29 @@ import { useDebounce } from "use-debounce";
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface CredentialFolderSelectorProps {
-  credentialId: string;
+  credentialId?: string;
   currentFolderId: string | null;
+  bulkCount?: number;
+  onBulkFolderSelect?: (folderId: string | null) => Promise<void>;
+  bulkHasFolders?: boolean;
+  disabled?: boolean;
+  trigger?: React.ReactNode;
 }
 
 function CredentialFolderSelector({
   credentialId,
   currentFolderId,
+  bulkCount,
+  onBulkFolderSelect,
+  bulkHasFolders = true,
+  disabled = false,
+  trigger,
 }: CredentialFolderSelectorProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const isTyping = search !== debouncedSearch;
+  const isBulkMode = (bulkCount ?? 0) > 0 && Boolean(onBulkFolderSelect);
 
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isFetching } =
     useInfiniteCredentialFoldersQuery({
@@ -46,32 +57,49 @@ function CredentialFolderSelector({
   const updateFolderMutation = useUpdateCredentialFolderAssignmentMutation();
 
   const handleFolderSelect = async (folderId: string | null) => {
-    try {
-      await updateFolderMutation.mutateAsync({
-        credentialId,
-        data: { folder_id: folderId },
-      });
-      setOpen(false);
-      setSearch("");
-    } catch {
-      // onError toast already surfaces the failure
+    // Close before the request; progress feedback lives in the caller's toast
+    // or the bulk bar's Processing label, not in a hanging popover.
+    setOpen(false);
+    setSearch("");
+    if (isBulkMode && onBulkFolderSelect) {
+      await onBulkFolderSelect(folderId);
+      return;
+    }
+    if (credentialId) {
+      try {
+        await updateFolderMutation.mutateAsync({
+          credentialId,
+          data: { folder_id: folderId },
+        });
+      } catch {
+        // onError toast already surfaces the failure
+      }
+      return;
+    }
+    if (import.meta.env.DEV) {
+      console.warn(
+        "CredentialFolderSelector needs credentialId (single mode) or onBulkFolderSelect (bulk mode).",
+      );
     }
   };
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Assign to folder"
-          className={cn(
-            "h-8 w-8",
-            currentFolderId ? "text-blue-400" : "text-slate-400",
-          )}
-        >
-          <FolderIcon className="h-4 w-4" />
-        </Button>
+        {trigger ?? (
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Assign to folder"
+            disabled={disabled}
+            className={cn(
+              "h-8 w-8",
+              currentFolderId ? "text-blue-400" : "text-slate-400",
+            )}
+          >
+            <FolderIcon className="h-4 w-4" />
+          </Button>
+        )}
       </PopoverTrigger>
       <PopoverContent
         className="w-80 p-0"
@@ -79,7 +107,11 @@ function CredentialFolderSelector({
         onCloseAutoFocus={(e) => e.preventDefault()}
       >
         <div className="border-b p-3">
-          <h4 className="mb-2 text-sm font-medium">Move to folder</h4>
+          <h4 className="mb-2 text-sm font-medium">
+            {isBulkMode
+              ? `Move ${bulkCount} credential${bulkCount === 1 ? "" : "s"} to folder`
+              : "Move to folder"}
+          </h4>
           <div className="relative">
             <MagnifyingGlassIcon className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
             <Input
@@ -102,10 +134,10 @@ function CredentialFolderSelector({
             )
           }
         >
-          {currentFolderId && (
+          {(isBulkMode ? bulkHasFolders : Boolean(currentFolderId)) && (
             <button
               onClick={() => handleFolderSelect(null)}
-              disabled={updateFolderMutation.isPending}
+              disabled={disabled || updateFolderMutation.isPending}
               className="flex w-full items-center justify-between border-b px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
             >
               <div className="flex items-center gap-2">
@@ -137,12 +169,17 @@ function CredentialFolderSelector({
           ) : (
             <>
               {folders.map((folder) => {
-                const isCurrentFolder = currentFolderId === folder.folder_id;
+                const isCurrentFolder =
+                  !isBulkMode && currentFolderId === folder.folder_id;
                 return (
                   <button
                     key={folder.folder_id}
                     onClick={() => handleFolderSelect(folder.folder_id)}
-                    disabled={isCurrentFolder || updateFolderMutation.isPending}
+                    disabled={
+                      disabled ||
+                      isCurrentFolder ||
+                      updateFolderMutation.isPending
+                    }
                     className="flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors hover:bg-slate-50 disabled:opacity-50 dark:hover:bg-slate-800"
                   >
                     <div className="flex items-center gap-2">

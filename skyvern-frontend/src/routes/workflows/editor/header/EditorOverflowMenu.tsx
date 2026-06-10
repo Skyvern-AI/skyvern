@@ -26,6 +26,7 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { statusIsRunningOrQueued } from "@/routes/tasks/types";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
 import { useWorkflowRunQuery } from "@/routes/workflows/hooks/useWorkflowRunQuery";
+import { useProductTourStore } from "@/store/ProductTourStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 
@@ -40,6 +41,7 @@ export function EditorOverflowMenu() {
   const isTemplate = workflow?.is_template ?? false;
   const saving = useWorkflowHasChangesStore((s) => s.saveIsPending);
   const isRecording = useRecordingStore((s) => s.isRecording);
+  const requestTour = useProductTourStore((s) => s.requestTour);
   const onSave = useSaveWorkflow();
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -130,6 +132,11 @@ export function EditorOverflowMenu() {
           }}
         >
           {isTemplate ? "Remove from Templates" : "Save as Template"}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={requestTour}>
+          <span className="flex-1">Take a tour</span>
+          <kbd className="ml-4 text-xs text-slate-400">Shift+?</kbd>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
