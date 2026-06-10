@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  normalizeWorkflowTags,
   parseTagFilter,
   parseTagFilterTerm,
   parseTagInput,
@@ -140,6 +141,52 @@ describe("sortTags", () => {
       { key: "env", value: "dev" },
       { key: "env", value: "prod" },
     ]);
+  });
+});
+
+describe("normalizeWorkflowTags", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("passes a well-formed tag list through unchanged", () => {
+    const tags: Array<Tag> = [
+      { key: null, value: "prod" },
+      { key: "env", value: "dev" },
+    ];
+    expect(normalizeWorkflowTags(tags)).toEqual(tags);
+  });
+
+  it("drops malformed list entries and warns instead of throwing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const skewed = [
+      { key: "env", value: "prod" },
+      { key: "bad", value: { key: "nested", value: "object" } },
+      { value: 42 },
+      null,
+      "loose-string",
+    ];
+    expect(normalizeWorkflowTags(skewed)).toEqual([
+      { key: "env", value: "prod" },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("converts a legacy key-to-value record and warns", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(normalizeWorkflowTags({ env: "prod", team: "growth" })).toEqual([
+      { key: "env", value: "prod" },
+      { key: "team", value: "growth" },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("degrades null, undefined, and junk to an empty list without throwing", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(normalizeWorkflowTags(null)).toEqual([]);
+    expect(normalizeWorkflowTags(undefined)).toEqual([]);
+    expect(normalizeWorkflowTags("env:prod")).toEqual([]);
+    expect(normalizeWorkflowTags(7)).toEqual([]);
   });
 });
 

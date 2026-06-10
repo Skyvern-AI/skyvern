@@ -291,7 +291,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
   );
 
   return (
-    <div>
+    <div data-tour="node-adder">
       <input
         ref={fileInputRef}
         type="file"

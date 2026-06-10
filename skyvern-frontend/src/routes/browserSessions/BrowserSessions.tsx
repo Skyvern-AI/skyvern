@@ -76,6 +76,7 @@ const EXTENSION_OPTIONS: Array<{
   value: BrowserSessionExtension;
   label: string;
   description: string;
+  enterprise?: boolean;
 }> = [
   {
     value: "ad-blocker",
@@ -86,6 +87,7 @@ const EXTENSION_OPTIONS: Array<{
     value: "captcha-solver",
     label: "Captcha Solver",
     description: "Enables automated captcha solving when available.",
+    enterprise: true,
   },
 ];
 
@@ -466,7 +468,14 @@ function BrowserSessions() {
                             htmlFor={`extension-${extension.value}`}
                             className="font-medium"
                           >
-                            {extension.label}
+                            <span className="inline-flex items-center gap-2">
+                              <span>{extension.label}</span>
+                              {extension.enterprise ? (
+                                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                                  Enterprise
+                                </span>
+                              ) : null}
+                            </span>
                           </Label>
                           <p className="text-xs text-muted-foreground">
                             {extension.description}
