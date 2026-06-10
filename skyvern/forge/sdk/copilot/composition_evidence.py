@@ -111,22 +111,41 @@ def _challenge_kind(indicators: list[str]) -> str:
     return "unknown" if indicators else "none"
 
 
+# Tags that carry challenge-vendor markup without rendering a widget. A passive
+# script/meta tag ships on every page behind some CDNs, so it can trigger the
+# visual fallback but never assert human verification by itself.
+_PASSIVE_CHALLENGE_TAGS: frozenset[str] = frozenset({"script", "noscript", "style", "link", "meta"})
+
+
+def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+        control
+        for control in challenge_controls or []
+        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
+    ]
+
+
 def _challenge_state(
     indicators: list[str],
     *,
     source: str = DOM_EVIDENCE_SOURCE,
     gated_submit_controls: list[dict[str, Any]] | None = None,
+    challenge_controls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     detected = bool(indicators)
     gated_controls = gated_submit_controls or []
+    # Raw-HTML token hits only mark `detected` (triggering the visual fallback);
+    # asserting human verification requires a rendered challenge control or a
+    # later vision confirmation.
+    semantic_challenge = bool(interactive_challenge_controls(challenge_controls))
     return {
         "detected": detected,
         "kind": _challenge_kind(indicators),
         "source": source if detected else "",
         "indicators": indicators[:8],
-        "requires_human_verification": detected,
+        "requires_human_verification": semantic_challenge,
         "visual_location": "",
-        "gates_submit_controls": bool(detected and gated_controls),
+        "gates_submit_controls": bool(semantic_challenge and gated_controls),
         "gated_submit_controls": gated_controls[:5] if detected else [],
     }
 
@@ -165,6 +184,7 @@ def _evidence_metadata(
     indicators: list[str] | None = None,
     *,
     forms: list[dict[str, Any]] | None = None,
+    challenge_controls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
     return {
@@ -176,6 +196,7 @@ def _evidence_metadata(
         "challenge_state": _challenge_state(
             indicators or [],
             gated_submit_controls=gated_controls,
+            challenge_controls=challenge_controls,
         ),
     }
 
@@ -223,6 +244,20 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
 
 
+# The vision classifier's typed non-challenge obstruction kind: a consent dialog
+# is dismissed, not solved, so it must never promote challenge state.
+CONSENT_OBSTRUCTION_KIND = "cookie_consent"
+
+
+def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
+    if visual_summary.get("challenge_detected") is not True:
+        return False
+    if interactive_challenge_controls(evidence.get("challenge_controls")):
+        return True
+    obstruction_kind = str(visual_summary.get("obstruction_kind") or "").strip().lower()
+    return obstruction_kind != CONSENT_OBSTRUCTION_KIND
+
+
 def merge_visual_composition_evidence(
     evidence: dict[str, Any],
     *,
@@ -261,28 +296,34 @@ def merge_visual_composition_evidence(
             if bounded:
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
-        if visual_summary.get("challenge_detected") is True:
+        challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
+        if challenge_confirmed:
             challenge_state["detected"] = True
             challenge_state["requires_human_verification"] = True
             challenge_state["source"] = (
                 "dom+screenshot" if challenge_state.get("source") else SCREENSHOT_EVIDENCE_SOURCE
             )
-        challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
-        if challenge_kind:
-            challenge_state["kind"] = challenge_kind
-        challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
-        if challenge_location:
-            challenge_state["visual_location"] = challenge_location
-        if visual_summary.get("submit_blocked") is True:
+        if challenge_confirmed or challenge_state.get("detected") is True:
+            challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
+            if challenge_kind:
+                challenge_state["kind"] = challenge_kind
+            challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
+            if challenge_location:
+                challenge_state["visual_location"] = challenge_location
+        if visual_summary.get("submit_blocked") is True and challenge_confirmed:
             challenge_state["gates_submit_controls"] = True
-        visual_blocked_controls = [
-            {
-                "text": _bounded_string(item, 120),
-                "disabled": True,
-            }
-            for item in visual_summary.get("blocked_submit_controls") or []
-            if _bounded_string(item, 120)
-        ]
+        visual_blocked_controls = (
+            [
+                {
+                    "text": _bounded_string(item, 120),
+                    "disabled": True,
+                }
+                for item in visual_summary.get("blocked_submit_controls") or []
+                if _bounded_string(item, 120)
+            ]
+            if challenge_confirmed
+            else []
+        )
         if visual_blocked_controls:
             existing_controls = [
                 item for item in challenge_state.get("gated_submit_controls") or [] if isinstance(item, dict)
@@ -1664,7 +1705,7 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms),
+        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
     }
 
 
@@ -1940,5 +1981,5 @@ def parse_composition_structured(data: Any, *, inspected_url: str, current_url: 
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms),
+        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
     }

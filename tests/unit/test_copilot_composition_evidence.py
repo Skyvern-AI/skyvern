@@ -2443,3 +2443,109 @@ async def test_capture_prefers_html_parse_over_hollow_structured_on_fallback(mon
     assert "Welcome notice text" in evidence["visible_text_excerpt"]
     assert evidence["schema_empty_page"] is True
     assert server.calls.count("skyvern_get_html") == 1
+
+
+class TestSemanticChallengeSplit:
+    def test_passive_vendor_markup_does_not_assert_human_verification(self) -> None:
+        html = """
+        <html><head><title>Registry search results</title>
+          <script src="https://cdn.example/challenge-platform/api.js"></script>
+        </head><body>
+          <form><input name="q" /><button type="submit" disabled>Search</button></form>
+          <table id="results"><tbody><tr><td>SAMPLE, PERSON</td></tr></tbody></table>
+        </body></html>
+        """
+        parsed = parse_composition_html(
+            html, inspected_url="https://example.com/search", current_url="https://example.com/search"
+        )
+        state = parsed["challenge_state"]
+        assert state["detected"] is True
+        assert state["requires_human_verification"] is False
+        assert state["gates_submit_controls"] is False
+        # Substring detection still arms the visual fallback for confirmation.
+        assert page_evidence_needs_visual_fallback(parsed) is True
+
+    def test_rendered_challenge_widget_asserts_human_verification(self) -> None:
+        html = """
+        <html><head><title>Verify you are human</title></head><body>
+          <form>
+            <input name="q" />
+            <div id="cf-turnstile-widget" data-sitekey="abc"></div>
+            <button type="submit" disabled>Search</button>
+          </form>
+        </body></html>
+        """
+        parsed = parse_composition_html(
+            html, inspected_url="https://example.com/search", current_url="https://example.com/search"
+        )
+        state = parsed["challenge_state"]
+        assert state["detected"] is True
+        assert state["requires_human_verification"] is True
+        assert state["gates_submit_controls"] is True
+
+    def test_consent_typed_visual_obstruction_does_not_promote_challenge(self) -> None:
+        html = """
+        <html><head><title>Search</title>
+          <script src="https://cdn.example/challenge-platform/api.js"></script>
+        </head><body>
+          <form><input name="q" /><button type="submit" disabled>Search</button></form>
+        </body></html>
+        """
+        parsed = parse_composition_html(
+            html, inspected_url="https://example.com/search", current_url="https://example.com/search"
+        )
+        merged = merge_visual_composition_evidence(
+            parsed,
+            visual_summary={
+                "summary": "A privacy settings dialog covers the page.",
+                "challenge_detected": True,
+                "challenge_kind": "",
+                "challenge_location": "",
+                "submit_blocked": True,
+                "blocked_submit_controls": ["Search"],
+                "page_obstruction_detected": True,
+                "obstruction_kind": "cookie_consent",
+                "obstruction_location": "center",
+                "underlying_page_blocked": True,
+                "visible_dismiss_controls": ["Accept all"],
+                "omissions": [],
+            },
+        )
+        state = merged["challenge_state"]
+        assert state["requires_human_verification"] is False
+        assert state["gates_submit_controls"] is False
+        kinds = [obstruction.get("kind") for obstruction in merged["page_obstructions"]]
+        assert "cookie_consent" in kinds
+
+    def test_vision_confirmation_still_promotes_challenge(self) -> None:
+        html = """
+        <html><head><title>Search</title>
+          <script src="https://cdn.example/challenge-platform/api.js"></script>
+        </head><body>
+          <form><input name="q" /><button type="submit" disabled>Search</button></form>
+        </body></html>
+        """
+        parsed = parse_composition_html(
+            html, inspected_url="https://example.com/search", current_url="https://example.com/search"
+        )
+        merged = merge_visual_composition_evidence(
+            parsed,
+            visual_summary={
+                "summary": "A human-verification widget sits above the Search button.",
+                "challenge_detected": True,
+                "challenge_kind": "human_verification",
+                "challenge_location": "above the Search button",
+                "submit_blocked": True,
+                "blocked_submit_controls": ["Search"],
+                "page_obstruction_detected": False,
+                "obstruction_kind": "",
+                "obstruction_location": "",
+                "underlying_page_blocked": None,
+                "visible_dismiss_controls": [],
+                "omissions": [],
+            },
+        )
+        state = merged["challenge_state"]
+        assert state["requires_human_verification"] is True
+        assert state["gates_submit_controls"] is True
+        assert {"text": "Search", "disabled": True} in state["gated_submit_controls"]

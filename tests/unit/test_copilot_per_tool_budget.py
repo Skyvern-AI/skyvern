@@ -43,6 +43,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _mark_page_inspected,
     _mark_pending_reconciliation_run,
     _maybe_clear_reconciliation_flag,
+    _post_budget_terminal_challenge_signal,
+    _post_run_terminal_challenge_reason,
     _record_composition_page_observation,
     _record_per_tool_budget_problem_blocks_from_results,
     _record_run_blocks_result,
@@ -1069,3 +1071,103 @@ def test_nudge_counter_preserved_across_consecutive_budget_trips() -> None:
 
     assert ctx.per_tool_budget_nudge_count == 1
     assert ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
+
+
+def _challenge_gated_post_run_evidence(**extra: object) -> dict:
+    evidence = {
+        "current_url": "https://example.com/registry/search",
+        "workflow_run_id": "wr_budget",
+        "observed_after_workflow_run": True,
+        "anti_bot_indicators": ["human-verification"],
+        "forms": [{"submit_controls": [{"text": "Search", "selector": "#search", "disabled": True}]}],
+        "challenge_state": {
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": True,
+            "gates_submit_controls": True,
+            "gated_submit_controls": [{"text": "Search", "disabled": True}],
+        },
+    }
+    evidence.update(extra)
+    return evidence
+
+
+def _armed_post_run_context() -> CopilotContext:
+    ctx = _fresh_context()
+    ctx.last_failure_category_top = PER_TOOL_BUDGET_FAILURE_CATEGORY
+    ctx.last_test_ok = False
+    ctx.per_tool_budget_problem_block_labels = ["submit_registry_search"]
+    return ctx
+
+
+def test_terminal_challenge_routes_to_answer_path_when_result_evidence_in_same_packet() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence(
+        result_containers=[{"tag": "table", "selector": "#results", "row_selector": "#results tbody tr"}],
+        visible_text_excerpt="SAMPLE, PERSON Anytown, XY Exampleland Certified Active",
+    )
+
+    signal = _post_budget_terminal_challenge_signal(
+        ctx, {"block_labels": ["submit_registry_search"]}, "update_and_run_blocks"
+    )
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_result_evidence"
+    assert signal.renders_final_reply is False
+    assert signal.preserves_workflow_draft is True
+    assert "Answer from the observed page" in signal.agent_steering_text
+    assert "result container" in signal.agent_steering_text
+
+
+def test_terminal_challenge_fires_without_result_evidence_and_names_observed_facts() -> None:
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = _challenge_gated_post_run_evidence()
+
+    signal = _post_budget_terminal_challenge_signal(ctx, None, "update_and_run_blocks")
+
+    assert signal is not None
+    assert signal.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+    assert signal.renders_final_reply is True
+    assert "human verification" in signal.user_facing_reason
+    assert "Search" in signal.user_facing_reason
+    assert "per-tool-call budget" not in signal.user_facing_reason
+    assert "wr_" not in signal.user_facing_reason
+
+
+def test_bare_substring_indicators_do_not_produce_terminal_reason() -> None:
+    # A passive challenge-vendor token over raw HTML plus an unrelated disabled
+    # submit control must not assert a terminal blocked claim.
+    evidence = _challenge_gated_post_run_evidence(
+        challenge_state={
+            "detected": True,
+            "kind": "human_verification",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+            "gated_submit_controls": [],
+        },
+    )
+    evidence["anti_bot_indicators"] = ["challenge"]
+    evidence["challenge_controls"] = [{"tag": "script", "src": "https://cdn.example/challenge-platform/api.js"}]
+
+    assert _post_run_terminal_challenge_reason(evidence) is None
+
+    ctx = _armed_post_run_context()
+    ctx.composition_page_evidence = evidence
+    assert _post_budget_terminal_challenge_signal(ctx, None, "update_and_run_blocks") is None
+
+
+def test_rendered_challenge_widget_still_produces_terminal_reason() -> None:
+    evidence = _challenge_gated_post_run_evidence(
+        challenge_state={
+            "detected": True,
+            "kind": "captcha",
+            "requires_human_verification": False,
+            "gates_submit_controls": False,
+            "gated_submit_controls": [],
+        },
+    )
+    evidence["challenge_controls"] = [{"tag": "div", "class": "cf-turnstile", "data_sitekey": "abc"}]
+
+    reason = _post_run_terminal_challenge_reason(evidence)
+    assert reason is not None
+    assert "disabled" in reason

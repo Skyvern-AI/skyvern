@@ -91,6 +91,20 @@ def test_assert_clean_passes_normal_product_language() -> None:
     assert_clean_user_facing_text("I couldn't complete that on this turn.")
 
 
+def test_assert_clean_raises_on_internal_budget_vocabulary() -> None:
+    with pytest.raises(ValueError):
+        assert_clean_user_facing_text("The run exceeded the 6s per-tool-call budget while still making progress.")
+
+
+def test_assert_clean_raises_on_raw_run_id() -> None:
+    with pytest.raises(ValueError):
+        assert_clean_user_facing_text("Run ID: wr_538438176486379954. Outcome is uncertain.")
+
+
+def test_assert_clean_allows_prose_mentioning_runs_without_ids() -> None:
+    assert_clean_user_facing_text("The last run didn't finish; I stopped without claiming results.")
+
+
 class _Ctx:
     blocker_signal: CopilotToolBlockerSignal | None = None
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None

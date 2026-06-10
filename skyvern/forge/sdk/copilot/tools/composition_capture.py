@@ -25,6 +25,7 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
+    CONSENT_OBSTRUCTION_KIND,
     has_bounded_page_schema,
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
@@ -247,11 +248,12 @@ def _composition_extract_screenshot_b64(result: dict[str, Any]) -> str:
 
 
 def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
+    # The DOM challenge_state / anti-bot token hits are deliberately NOT fed in:
+    # the vision pass classifies obstruction-vs-challenge from the screenshot
+    # alone instead of confirming the detector's anchor.
     context = {
         "page_title": evidence.get("page_title") or "",
         "current_url": evidence.get("current_url") or "",
-        "anti_bot_indicators": evidence.get("anti_bot_indicators") or [],
-        "challenge_state": evidence.get("challenge_state") or {},
         "form_count": len(evidence.get("forms") or []),
         "result_container_count": len(evidence.get("result_containers") or []),
         "page_obstruction_count": len(evidence.get("page_obstructions") or []),
@@ -267,9 +269,18 @@ def _composition_visual_prompt(evidence: dict[str, Any]) -> str:
         "In summary, include the visible page state that would help verify an end-state outcome, "
         "such as cart items, "
         "record rows, visible identifiers, quantities, statuses, prices, confirmations, search results, "
-        "or selected values when legible. Also note visible anti-bot or human-verification state, "
-        "whether it appears to gate a submit/search control, whether any visible artificial barrier "
-        "mechanically blocks the underlying page, and where it appears relative to the page controls. "
+        "or selected values when legible. "
+        "Classify any visible artificial barrier from the screenshot alone: a verification challenge is a "
+        "captcha or human-verification widget asking the visitor to prove they are human; a page "
+        "obstruction is a dismissible layer such as a cookie/privacy consent dialog, promo or newsletter "
+        "modal, chat widget, or loading overlay. "
+        f"Use obstruction_kind values: {CONSENT_OBSTRUCTION_KIND}, promo_modal, chat_widget, "
+        "loading_overlay, other. A cookie/privacy consent dialog is always a page obstruction, never a "
+        "challenge: report it with page_obstruction_detected true and obstruction_kind "
+        f"{CONSENT_OBSTRUCTION_KIND}, and do not set challenge_detected or submit_blocked for it. "
+        "Set challenge_detected to true only for a visible verification challenge, set submit_blocked to "
+        "true only when that challenge visibly gates a submit/search control, and note where the barrier "
+        "appears relative to the page controls. "
         "Do not include raw DOM, code, selectors, personal data, or workflow instructions. "
         "If no challenge is visible, set challenge_detected to false and submit_blocked to false. "
         "If no page obstruction is visible, set page_obstruction_detected to false. "
