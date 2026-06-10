@@ -9,6 +9,7 @@ import {
   CustomCredentialServiceConfig,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useCustomCredentialServiceConfig() {
   const credentialGetter = useCredentialGetter();
@@ -16,7 +17,7 @@ export function useCustomCredentialServiceConfig() {
   const { toast } = useToast();
 
   const { data: customCredentialServiceAuthToken, isLoading } =
-    useQuery<CustomCredentialServiceOrganizationAuthToken>({
+    useQuery<CustomCredentialServiceOrganizationAuthToken | null>({
       queryKey: ["customCredentialServiceAuthToken"],
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -82,6 +83,14 @@ export function useCustomCredentialServiceConfig() {
     },
   });
 
+  const clearConfigMutation = useClearOrganizationAuthToken({
+    providerPath: "custom_credential",
+    queryKey: "customCredentialServiceAuthToken",
+    successDescription:
+      "Custom credential service configuration cleared successfully",
+    errorDescription: "Failed to clear custom credential service configuration",
+  });
+
   const testConnectionMutation = useMutation({
     mutationFn: async (data: CreateCustomCredentialServiceConfigRequest) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
@@ -122,6 +131,8 @@ export function useCustomCredentialServiceConfig() {
     isLoading,
     createOrUpdateConfig: createOrUpdateConfigMutation.mutate,
     isUpdating: createOrUpdateConfigMutation.isPending,
+    clearConfig: clearConfigMutation.mutate,
+    isClearing: clearConfigMutation.isPending,
     testConnection: testConnectionMutation.mutate,
     isTesting: testConnectionMutation.isPending,
   };
