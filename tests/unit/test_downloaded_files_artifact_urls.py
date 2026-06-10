@@ -403,6 +403,22 @@ def test_content_endpoint_non_download_stays_inline():
     assert disposition == "inline"
 
 
+def test_content_endpoint_audio_artifact_serves_audio_webm():
+    from skyvern.forge.sdk.routes.agent_protocol import _artifact_response_config
+
+    audio = Artifact(
+        artifact_id="a_audio",
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://skyvern-artifacts/.../dictation.webm",
+        organization_id="o_1",
+        created_at="2026-04-23T00:00:00Z",
+        modified_at="2026-04-23T00:00:00Z",
+    )
+    media_type, disposition = _artifact_response_config(audio)
+    assert media_type == "audio/webm"
+    assert disposition == "inline"
+
+
 def test_content_endpoint_session_replay_falls_back_to_mp4_for_unknown_extension():
     from skyvern.forge.sdk.routes.agent_protocol import _artifact_response_config
 
