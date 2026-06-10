@@ -1182,7 +1182,10 @@ workflow_definition:
         )
 
         process_mock.assert_not_called()
-        assert "inspect_page_for_composition" in agent_result.user_response
+        # The reject note must be product language, never the gate's
+        # agent-directed tool instruction.
+        assert "(Note:" in agent_result.user_response
+        assert "inspect_page_for_composition" not in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 

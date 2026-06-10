@@ -311,10 +311,9 @@ class TestBuildUnexpectedErrorExitResult:
         result = _build_unexpected_error_exit_result(ctx, global_llm_context=None)
 
         assert result.user_response.startswith(
-            "I built a 3-block draft and tested it, but the test couldn't finish: "
-            "The previous workflow run did not finish before the turn budget expired. "
-            "Last run status: canceled."
+            "I built a 3-block draft and was still testing it when the turn ran out of time."
         )
+        assert "the test failed" not in result.user_response
         assert "draft workflow proposal" in result.user_response
         assert "Do NOT" not in result.user_response
         assert "block-running tools" not in result.user_response
