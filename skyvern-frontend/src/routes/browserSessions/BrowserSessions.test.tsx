@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 
@@ -21,6 +21,8 @@ const openUnoccupiedSession: BrowserSession = {
   vnc_streaming_supported: true,
 };
 
+const createBrowserSessionMock = vi.fn();
+
 vi.mock("@/routes/browserSessions/hooks/useBrowserSessionsQuery", () => ({
   useBrowserSessionsQuery: vi.fn((page: number) => ({
     data: page === 1 ? [openUnoccupiedSession] : [],
@@ -33,13 +35,14 @@ vi.mock(
   () => ({
     useCreateBrowserSessionMutation: vi.fn(() => ({
       isPending: false,
-      mutate: vi.fn(),
+      mutate: createBrowserSessionMock,
     })),
   }),
 );
 
 afterEach(() => {
   cleanup();
+  createBrowserSessionMock.mockClear();
 });
 
 function renderPage() {
@@ -66,5 +69,26 @@ describe("BrowserSessions", () => {
     expect(screen.getAllByText("Yes")).toHaveLength(1);
     // runnable_id === null => not occupied
     expect(screen.getAllByText("No")).toHaveLength(1);
+  });
+
+  it("marks Captcha Solver as enterprise without changing the extension value", () => {
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    const captchaSolverLabel = screen.getByText("Captcha Solver");
+    expect(captchaSolverLabel.parentElement?.textContent).toContain(
+      "Enterprise",
+    );
+
+    fireEvent.click(screen.getByLabelText(/Captcha Solver/));
+    const createButtons = screen.getAllByRole("button", { name: "Create" });
+    fireEvent.click(createButtons[createButtons.length - 1]!);
+
+    expect(createBrowserSessionMock).toHaveBeenCalledWith({
+      proxyLocation: "RESIDENTIAL",
+      timeout: 60,
+      browserType: null,
+      extensions: ["captcha-solver"],
+    });
   });
 });

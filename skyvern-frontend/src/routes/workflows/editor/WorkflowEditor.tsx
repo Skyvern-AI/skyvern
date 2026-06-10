@@ -14,6 +14,8 @@ import { useBlockOutputStore } from "@/store/BlockOutputStore";
 import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getInitialParameters } from "./utils";
 import { Workspace } from "./Workspace";
+import { ProductTour } from "@/components/onboarding/ProductTour";
+import { useProductTourShortcut } from "@/hooks/useProductTourShortcut";
 import { useMountEffect } from "@/hooks/useMountEffect";
 
 function WorkflowEditor() {
@@ -32,6 +34,8 @@ function WorkflowEditor() {
   );
 
   const blockOutputStore = useBlockOutputStore();
+
+  useProductTourShortcut();
 
   useMountEffect(() => blockOutputStore.reset());
 
@@ -128,6 +132,7 @@ function WorkflowEditor() {
           />
         </ReactFlowProvider>
       </div>
+      <ProductTour />
     </div>
   );
 }
