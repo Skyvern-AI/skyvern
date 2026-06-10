@@ -47,6 +47,7 @@ declare global {
 const HEARING_PULSE_MS = 400;
 const MIN_RESTART_INTERVAL_MS = 300;
 const MAX_RAPID_RESTARTS = 8;
+const DEFAULT_AUDIO_MIME_TYPE = "audio/webm";
 
 function getSpeechRecognitionConstructor():
   | SpeechRecognitionConstructor
@@ -120,11 +121,18 @@ function combineDictated(finalText: string, interimText: string): string {
   return finalText || interimText;
 }
 
+function buildAudioBlob(chunks: Blob[], mimeType: string): Blob | null {
+  return chunks.length > 0
+    ? new Blob(chunks, { type: mimeType || DEFAULT_AUDIO_MIME_TYPE })
+    : null;
+}
+
 export interface UseSpeechToTextOptions {
   /** Snapshot of textarea content when dictation starts. */
   getBaseText?: () => string;
   onTranscript: (text: string) => void;
   onError?: (message: string) => void;
+  onAudioCaptured?: (audio: Blob) => void;
   lang?: string;
   /** When false, active recognition is stopped (e.g. panel closed). */
   enabled?: boolean;
@@ -136,8 +144,10 @@ export interface UseSpeechToTextResult {
   /** Briefly true while interim speech is being recognized. */
   isHearingSpeech: boolean;
   start: () => void;
-  stop: () => void;
+  /** Resolves with captured audio when available; callers may ignore it. */
+  stop: () => Promise<Blob | null>;
   toggle: () => void;
+  takeAudioBlob: () => Blob | null;
 }
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -156,7 +166,14 @@ function errorMessageForCode(error: string): string {
 export function useSpeechToText(
   options: UseSpeechToTextOptions,
 ): UseSpeechToTextResult {
-  const { getBaseText, onTranscript, onError, lang, enabled = true } = options;
+  const {
+    getBaseText,
+    onTranscript,
+    onError,
+    onAudioCaptured,
+    lang,
+    enabled = true,
+  } = options;
 
   const isSupported = isSpeechRecognitionSupported();
   const [isListening, setIsListening] = useState(false);
@@ -172,16 +189,26 @@ export function useSpeechToText(
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStartAttemptAtRef = useRef(0);
   const rapidRestartCountRef = useRef(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const latestAudioBlobRef = useRef<Blob | null>(null);
+  const isAudioStartingRef = useRef(false);
+  const audioStopResolverRef = useRef<((blob: Blob | null) => void) | null>(
+    null,
+  );
 
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
+  const onAudioCapturedRef = useRef(onAudioCaptured);
   const getBaseTextRef = useRef(getBaseText);
 
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
     onErrorRef.current = onError;
+    onAudioCapturedRef.current = onAudioCaptured;
     getBaseTextRef.current = getBaseText;
-  }, [onTranscript, onError, getBaseText]);
+  }, [onTranscript, onError, onAudioCaptured, getBaseText]);
 
   useEffect(() => {
     enabledRef.current = enabled;
@@ -213,6 +240,109 @@ export function useSpeechToText(
     }
   }, []);
 
+  const cleanupAudioStream = useCallback(() => {
+    mediaStreamRef.current?.getTracks().forEach((track) => {
+      track.stop();
+    });
+    mediaStreamRef.current = null;
+  }, []);
+
+  const resolveAudioStop = useCallback((blob: Blob | null) => {
+    const resolver = audioStopResolverRef.current;
+    audioStopResolverRef.current = null;
+    resolver?.(blob);
+  }, []);
+
+  const finishAudioCapture = useCallback(
+    (blob: Blob | null) => {
+      mediaRecorderRef.current = null;
+      cleanupAudioStream();
+      if (blob && blob.size > 0) {
+        latestAudioBlobRef.current = blob;
+        onAudioCapturedRef.current?.(blob);
+        resolveAudioStop(blob);
+        return;
+      }
+      resolveAudioStop(null);
+    },
+    [cleanupAudioStream, resolveAudioStop],
+  );
+
+  const startAudioCapture = useCallback(() => {
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      return;
+    }
+    if (isAudioStartingRef.current || mediaRecorderRef.current) {
+      return;
+    }
+
+    audioChunksRef.current = [];
+    latestAudioBlobRef.current = null;
+    isAudioStartingRef.current = true;
+
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        isAudioStartingRef.current = false;
+        if (!shouldKeepListeningRef.current) {
+          stream.getTracks().forEach((track) => {
+            track.stop();
+          });
+          return;
+        }
+        mediaStreamRef.current = stream;
+        const recorder = new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+        recorder.onstop = () => {
+          const blob = buildAudioBlob(
+            audioChunksRef.current,
+            recorder.mimeType,
+          );
+          audioChunksRef.current = [];
+          finishAudioCapture(blob);
+        };
+        recorder.start();
+      })
+      .catch(() => {
+        isAudioStartingRef.current = false;
+        onErrorRef.current?.(
+          "Audio recording failed to start. Check microphone permission and try again.",
+        );
+      });
+  }, [finishAudioCapture]);
+
+  const stopAudioCapture = useCallback((): Promise<Blob | null> => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) {
+      cleanupAudioStream();
+      return Promise.resolve(null);
+    }
+
+    return new Promise((resolve) => {
+      audioStopResolverRef.current = resolve;
+      if (recorder.state === "inactive") {
+        const blob = buildAudioBlob(audioChunksRef.current, recorder.mimeType);
+        audioChunksRef.current = [];
+        finishAudioCapture(blob);
+        return;
+      }
+      try {
+        recorder.stop();
+      } catch {
+        finishAudioCapture(null);
+      }
+    });
+  }, [cleanupAudioStream, finishAudioCapture]);
+
   const teardownRecognition = useCallback(() => {
     clearRestartTimeout();
     const recognition = recognitionRef.current;
@@ -230,7 +360,7 @@ export function useSpeechToText(
     recognitionRef.current = null;
   }, [clearRestartTimeout]);
 
-  const stop = useCallback(() => {
+  const stop = useCallback(async () => {
     shouldKeepListeningRef.current = false;
     isListeningRef.current = false;
     setIsListening(false);
@@ -244,7 +374,13 @@ export function useSpeechToText(
         teardownRecognition();
       }
     }
-  }, [clearHearingSpeech, clearRestartTimeout, teardownRecognition]);
+    return await stopAudioCapture();
+  }, [
+    clearHearingSpeech,
+    clearRestartTimeout,
+    stopAudioCapture,
+    teardownRecognition,
+  ]);
 
   const start = useCallback(() => {
     if (!isSupported || !enabledRef.current || isListeningRef.current) {
@@ -260,6 +396,7 @@ export function useSpeechToText(
     clearHearingSpeech();
     finalizedChunksRef.current.clear();
     rapidRestartCountRef.current = 0;
+    startAudioCapture();
 
     baseTextRef.current = getBaseTextRef.current?.() ?? "";
 
@@ -369,6 +506,7 @@ export function useSpeechToText(
       setIsListening(false);
       clearHearingSpeech();
       teardownRecognition();
+      void stopAudioCapture();
       onErrorRef.current?.("Voice input failed to start. Try again.");
     }
   }, [
@@ -377,12 +515,14 @@ export function useSpeechToText(
     isSupported,
     lang,
     markHearingSpeech,
+    startAudioCapture,
+    stopAudioCapture,
     teardownRecognition,
   ]);
 
   const toggle = useCallback(() => {
     if (isListeningRef.current) {
-      stop();
+      void stop();
     } else {
       start();
     }
@@ -390,7 +530,7 @@ export function useSpeechToText(
 
   useEffect(() => {
     if (!enabled && isListeningRef.current) {
-      stop();
+      void stop();
     }
   }, [enabled, stop]);
 
@@ -400,8 +540,15 @@ export function useSpeechToText(
       isListeningRef.current = false;
       clearHearingSpeech();
       teardownRecognition();
+      void stopAudioCapture();
     };
-  }, [clearHearingSpeech, teardownRecognition]);
+  }, [clearHearingSpeech, stopAudioCapture, teardownRecognition]);
+
+  const takeAudioBlob = useCallback(() => {
+    const blob = latestAudioBlobRef.current;
+    latestAudioBlobRef.current = null;
+    return blob;
+  }, []);
 
   return {
     isSupported,
@@ -410,5 +557,6 @@ export function useSpeechToText(
     start,
     stop,
     toggle,
+    takeAudioBlob,
   };
 }

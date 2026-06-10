@@ -41,6 +41,7 @@ import {
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
+  WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
@@ -194,11 +195,13 @@ type QueuedPrompt = {
   id: string;
   content: string;
   reason: QueuedPromptReason;
+  audioBlob?: Blob | null;
 };
 
 type SendOptions = {
   queuedMessageId?: string;
   skipQueue?: boolean;
+  audioBlob?: Blob | null;
 };
 
 type WorkflowCopilotSsePayload =
@@ -352,8 +355,11 @@ export function WorkflowCopilotChat({
 }: WorkflowCopilotChatProps = {}) {
   const copilotV2Enabled =
     useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2") === true;
-  const codeBlockModeEnabled =
+  const codeBlockModeFlagEnabled =
     useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE") === true;
+  const codeBlockAccessEnabled = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
+  const codeBlockModeEnabled =
+    codeBlockModeFlagEnabled && codeBlockAccessEnabled;
   const [composerMode, setComposerMode] = useState<"ask" | "build">("build");
   const [codeWorkflow, setCodeWorkflow] = useState(true);
   // Build can never be active unless the V2 flag is on.
@@ -540,7 +546,9 @@ export function WorkflowCopilotChat({
     isSupported: isSpeechSupported,
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
+    stop: stopSpeech,
     toggle: toggleSpeech,
+    takeAudioBlob: takeSpeechAudioBlob,
   } = useSpeechToTextField({
     value: inputValue,
     onChange: setInputValue,
@@ -693,6 +701,37 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
   };
+
+  const uploadDictationAudio = useCallback(
+    async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
+      if (!workflowPermanentId) {
+        throw new Error("Missing workflow permanent ID for audio upload.");
+      }
+
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const formData = new FormData();
+      formData.append("workflow_permanent_id", workflowPermanentId);
+      const chatId = workflowCopilotChatIdRef.current?.trim();
+      if (chatId) {
+        formData.append("workflow_copilot_chat_id", chatId);
+      }
+      formData.append("file", audioBlob, `dictation-${Date.now()}.webm`);
+
+      const response = await client.post<WorkflowCopilotAudioUploadResponse>(
+        "/workflow/copilot/chat-audio",
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        },
+      );
+      setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+      workflowCopilotChatIdRef.current = response.data.workflow_copilot_chat_id;
+      return response.data;
+    },
+    [credentialGetter, workflowPermanentId],
+  );
 
   const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
     const clearProposalByChatId = async (chatId: string) => {
@@ -948,11 +987,25 @@ export function WorkflowCopilotChat({
         });
         return;
       }
+
+      let messageAudioBlob = options.audioBlob ?? null;
+      if (!messageAudioBlob && messageOverride === undefined) {
+        if (isSpeechListening) {
+          messageAudioBlob = await stopSpeech();
+        }
+        messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
-        updateQueuedPrompt({ id: queuedId, content: candidate, reason });
+        updateQueuedPrompt({
+          id: queuedId,
+          content: candidate,
+          reason,
+          audioBlob: messageAudioBlob,
+        });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
         if (!options.queuedMessageId) {
@@ -1013,6 +1066,8 @@ export function WorkflowCopilotChat({
         const saveData = getSaveData();
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let chatIdForRequest = workflowCopilotChatId;
+        let audioArtifactId: string | null = null;
 
         if (!workflowId) {
           toast({
@@ -1098,6 +1153,16 @@ export function WorkflowCopilotChat({
               blocks: saveData.blocks,
             },
           } as WorkflowApiResponse;
+        }
+
+        if (messageAudioBlob) {
+          try {
+            const uploadResponse = await uploadDictationAudio(messageAudioBlob);
+            chatIdForRequest = uploadResponse.workflow_copilot_chat_id;
+            audioArtifactId = uploadResponse.audio_artifact_id;
+          } catch (error) {
+            console.warn("Failed to upload dictation audio:", error);
+          }
         }
 
         const handleProcessingUpdate = (
@@ -1225,10 +1290,11 @@ export function WorkflowCopilotChat({
           {
             workflow_id: workflowId,
             workflow_permanent_id: workflowPermanentId,
-            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_copilot_chat_id: chatIdForRequest,
             workflow_run_id: workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
+            audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
             mode: copilotV2Enabled ? composerMode : null,
             code_block: showCodeToggle ? codeWorkflow : null,
@@ -1345,11 +1411,15 @@ export function WorkflowCopilotChat({
       credentialGetter,
       getSaveData,
       inputValue,
+      isSpeechListening,
       isLiveBrowserReady,
       liveBrowserSessionId,
       requiresLiveBrowser,
       showCodeToggle,
+      stopSpeech,
+      takeSpeechAudioBlob,
       updateQueuedPrompt,
+      uploadDictationAudio,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
@@ -1385,6 +1455,7 @@ export function WorkflowCopilotChat({
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
+      audioBlob: promptToSend.audioBlob,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
