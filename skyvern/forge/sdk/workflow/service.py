@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeAlias, cast
 
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -155,7 +155,16 @@ from skyvern.services.script_review_cap import (
 )
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
-from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_HTTP_TIMEOUT_SECONDS,
+    WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+    WEBHOOK_DELIVERY_MISSING_SIGNING_KEY_REASON,
+    WEBHOOK_DELIVERY_MISSING_WORKFLOW_REASON,
+    WEBHOOK_DELIVERY_SUCCESS_REASON,
+    PreparedWorkflowWebhook,
+    deliver_webhook_with_retries,
+    scrub_internal_webhook_delivery_state,
+)
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
@@ -171,6 +180,7 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
 # Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
 POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
+WorkflowWebhookDeliveryStatus: TypeAlias = Literal["pending", "failed"]
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -187,6 +197,31 @@ def _get_workflow_run_max_elapsed_timeout_seconds(workflow_run: WorkflowRun) -> 
 def _format_workflow_run_elapsed_timeout_failure_reason(effective_minutes: int) -> str:
     minute_label = "minute" if effective_minutes == 1 else "minutes"
     return f"Workflow run exceeded max elapsed runtime limit of {effective_minutes} {minute_label}."
+
+
+def _get_workflow_webhook_delivery_status(
+    *,
+    webhook_callback_url: str | None,
+    webhook_failure_reason: str | None,
+    workflow_run_status: WorkflowRunStatus,
+) -> WorkflowWebhookDeliveryStatus | None:
+    if not webhook_callback_url or not workflow_run_status.is_final():
+        return None
+    # Empty string is the persisted webhook delivery success sentinel.
+    if webhook_failure_reason == WEBHOOK_DELIVERY_SUCCESS_REASON:
+        return None
+    if webhook_failure_reason is None or webhook_failure_reason == WEBHOOK_DELIVERY_IN_PROGRESS_REASON:
+        return "pending"
+    return "failed"
+
+
+def _get_public_workflow_webhook_failure_reason(webhook_failure_reason: str | None) -> str | None:
+    if webhook_failure_reason in {
+        WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+        WEBHOOK_DELIVERY_SUCCESS_REASON,
+    }:
+        return None
+    return webhook_failure_reason
 
 
 def _collect_enterprise_gated_workflow_features(
@@ -5624,7 +5659,12 @@ class WorkflowService:
             failure_category=workflow_run.failure_category,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            webhook_failure_reason=workflow_run.webhook_failure_reason,
+            webhook_delivery_status=_get_workflow_webhook_delivery_status(
+                webhook_callback_url=workflow_run.webhook_callback_url,
+                webhook_failure_reason=workflow_run.webhook_failure_reason,
+                workflow_run_status=workflow_run.status,
+            ),
+            webhook_failure_reason=_get_public_workflow_webhook_failure_reason(workflow_run.webhook_failure_reason),
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
@@ -5816,6 +5856,19 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
             )
+            if workflow_run.webhook_callback_url and workflow_run.webhook_callback_url.strip():
+                try:
+                    await app.DATABASE.workflow_runs.update_workflow_run(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        webhook_failure_reason=WEBHOOK_DELIVERY_MISSING_WORKFLOW_REASON,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record skipped workflow webhook delivery for missing workflow",
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        exc_info=True,
+                    )
             return None
         if not workflow_run.webhook_callback_url:
             LOG.warning(
@@ -5844,6 +5897,18 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
             )
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason=WEBHOOK_DELIVERY_MISSING_SIGNING_KEY_REASON,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record skipped workflow webhook delivery",
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    exc_info=True,
+                )
             return None
 
         # build new schema for backward compatible webhook payload
@@ -5877,7 +5942,9 @@ class WorkflowService:
             errors=workflow_run_status_response.errors,
             step_count=workflow_run_status_response.total_steps,
         )
-        payload_dict: dict = json.loads(workflow_run_status_response.model_dump_json())
+        payload_dict: dict = scrub_internal_webhook_delivery_state(
+            json.loads(workflow_run_status_response.model_dump_json())
+        )
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
         payload_dict.update(workflow_run_response_dict)
         signed_data = generate_skyvern_webhook_signature(
@@ -5902,7 +5969,25 @@ class WorkflowService:
             payload_for_log=signed_data.payload_for_log,
         )
 
-    async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
+    async def deliver_prepared_workflow_webhook(
+        self,
+        webhook: PreparedWorkflowWebhook,
+        *,
+        retry_claim_older_than: datetime | None = None,
+    ) -> None:
+        claimed = await app.DATABASE.workflow_runs.claim_workflow_run_webhook_delivery(
+            workflow_run_id=webhook.workflow_run_id,
+            in_progress_reason=WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+            claim_older_than=retry_claim_older_than,
+        )
+        if not claimed:
+            LOG.info(
+                "Skipping workflow webhook delivery because it was already claimed or recorded",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+            )
+            return
+
         LOG.info(
             "Sending webhook run status to webhook callback url",
             workflow_id=webhook.workflow_id,
@@ -5916,7 +6001,7 @@ class WorkflowService:
                 url=webhook.webhook_callback_url,
                 payload=webhook.signed_payload,
                 headers=webhook.headers,
-                timeout_seconds=30.0,
+                timeout_seconds=WEBHOOK_DELIVERY_HTTP_TIMEOUT_SECONDS,
                 organization_id=webhook.organization_id,
                 run_id=webhook.workflow_run_id,
             )
@@ -5953,7 +6038,8 @@ class WorkflowService:
             try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
                     workflow_run_id=webhook.workflow_run_id,
-                    webhook_failure_reason="",
+                    # Empty string is the persisted successful-delivery sentinel.
+                    webhook_failure_reason=WEBHOOK_DELIVERY_SUCCESS_REASON,
                 )
             except Exception:
                 LOG.warning(
@@ -5989,11 +6075,12 @@ class WorkflowService:
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
+        retry_claim_older_than: datetime | None = None,
     ) -> None:
         webhook = await self.prepare_workflow_webhook(workflow_run, api_key)
         if webhook is None:
             return
-        await self.deliver_prepared_workflow_webhook(webhook)
+        await self.deliver_prepared_workflow_webhook(webhook, retry_claim_older_than=retry_claim_older_than)
 
     async def persist_video_data(
         self,
