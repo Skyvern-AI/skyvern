@@ -20,6 +20,15 @@ type Props = {
 // Generic single-tag chip: a styled span (not Badge div) so it can be a Radix
 // TooltipTrigger `asChild` target. Grouped shows `key: value`, standalone the value.
 function TagChip({ tagKey, value, description, onRemove, className }: Props) {
+  // Last line of defense against payload shape skew: a non-string child here
+  // is React error #31, which unmounts the route through the error boundary.
+  if (
+    typeof value !== "string" ||
+    (tagKey !== null && typeof tagKey !== "string")
+  ) {
+    console.warn("[tags] skipping tag chip with a non-string key or value");
+    return null;
+  }
   const label = tagKey === null ? value : `${tagKey}: ${value}`;
   const chip = (
     <span

@@ -152,7 +152,6 @@ import { PoliteDndLiveRegionPolicy } from "./sortable/dragLiveRegionPolicy";
 import { useRecordingStore } from "@/store/useRecordingStore";
 import { useIsCanvasLocked } from "./controls/useIsCanvasLocked";
 import { BlockConfigSidebar } from "./panels/BlockConfigSidebar";
-import { BlockSidebarMigrationPopover } from "./panels/BlockSidebarMigrationPopover";
 
 // Grace period after nodesInitialized before we start tracking changes.
 // Allows mount-time effects (ResizeObserver, visibility toggling) to settle.
@@ -1570,6 +1569,7 @@ function FlowRenderer({
   return (
     <WorkflowScopeContext.Provider value={workflowScopeValue}>
       <div
+        data-tour="editor-canvas"
         className={cn("workflow-editor-shell relative h-full w-full", {
           "react-flow--pre-layout": layoutPhase === "pre-layout",
           "react-flow--initial-load":
@@ -1861,7 +1861,13 @@ function FlowRenderer({
             expose the editable block form.
           */}
             {!readOnly && <BlockConfigSidebar onAddNode={onAddNode} />}
-            {!readOnly && <BlockSidebarMigrationPopover />}
+            {!readOnly && (
+              <div
+                data-tour="sidebar-region"
+                className="pointer-events-none absolute bottom-6 right-6 top-8"
+                style={{ width: 320 }}
+              />
+            )}
             <DragOverlay dropAnimation={null}>
               {(() => {
                 if (!activeDragId) return null;
