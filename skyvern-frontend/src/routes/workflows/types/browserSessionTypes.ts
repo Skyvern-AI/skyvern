@@ -14,6 +14,7 @@ interface BrowserSession {
   timeout: number | null;
   extensions?: BrowserSessionExtension[] | null;
   browser_type?: BrowserSessionType | null;
+  generate_browser_profile?: boolean;
   vnc_streaming_supported: boolean;
 }
 

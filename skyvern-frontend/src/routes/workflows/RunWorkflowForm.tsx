@@ -46,6 +46,11 @@ import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useBlockScriptsQuery } from "@/routes/workflows/hooks/useBlockScriptsQuery";
 import { constructCacheKeyValueFromParameters } from "@/routes/workflows/editor/utils";
 import { useWorkflowQuery } from "@/routes/workflows/hooks/useWorkflowQuery";
+import { CredentialSetupPrompt } from "@/components/onboarding/CredentialSetupPrompt";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT } from "@/util/onboarding/experimentConfig";
+import { isActivationRun } from "@/util/onboarding/rolloutGating";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
 import { type ApiCommandOptions } from "@/util/apiCommands";
 import { parseHeaderJson } from "@/util/secretHeaders";
 
@@ -328,6 +333,14 @@ function RunWorkflowForm({
     [workflow],
   );
   const hasLoginBlockValidationError = loginBlocksWithoutCredentials.length > 0;
+  const onboarding = useOnboardingStateOptional();
+  const onboardingFlagVariant = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
+  const onboardingLoading = onboarding != null && onboarding.isLoading;
+  // Gate on the rollout arm so a 0% rollout / rollback restores the
+  // pre-onboarding login-block alert instead of the credential prompt.
+  const isActivation = isActivationRun(onboardingFlagVariant, onboarding);
+  const showDestructiveLoginAlert =
+    hasLoginBlockValidationError && !isActivation && !onboardingLoading;
 
   const blockingParameterTypes = new Set([
     "boolean",
@@ -623,7 +636,14 @@ function RunWorkflowForm({
           </div>
         </header>
 
-        {hasLoginBlockValidationError && (
+        {hasLoginBlockValidationError && isActivation && (
+          <CredentialSetupPrompt
+            workflowPermanentId={workflowPermanentId}
+            blocksMissingCredentials={loginBlocksWithoutCredentials}
+          />
+        )}
+
+        {showDestructiveLoginAlert && (
           <Alert variant="destructive">
             <ExclamationTriangleIcon className="h-4 w-4" />
             <AlertTitle>Cannot run agent</AlertTitle>

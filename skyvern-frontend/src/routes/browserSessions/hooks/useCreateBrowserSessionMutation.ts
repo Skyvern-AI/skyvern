@@ -22,11 +22,13 @@ function useCreateBrowserSessionMutation() {
       timeout = null,
       extensions = [],
       browserType = null,
+      generateBrowserProfile = false,
     }: {
       proxyLocation: ProxyLocation | null;
       timeout: number | null;
       extensions?: BrowserSessionExtension[];
       browserType?: BrowserSessionType | null;
+      generateBrowserProfile?: boolean;
     }) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
       return client.post<string, { data: BrowserSession }>(
@@ -36,6 +38,7 @@ function useCreateBrowserSessionMutation() {
           timeout,
           extensions,
           browser_type: browserType,
+          generate_browser_profile: generateBrowserProfile,
         },
       );
     },

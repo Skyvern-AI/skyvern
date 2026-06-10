@@ -12,6 +12,7 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import { ClearCredentialDialog } from "@/components/ClearCredentialDialog";
 import { useAzureClientCredentialToken } from "@/hooks/useAzureClientCredentialToken";
 import { EyeOpenIcon, EyeClosedIcon } from "@radix-ui/react-icons";
 
@@ -44,6 +45,8 @@ export function AzureClientSecretCredentialTokenForm({
     isLoading,
     createOrUpdateToken,
     isUpdating,
+    clearCredential,
+    isClearing,
   } = useAzureClientCredentialToken();
 
   const form = useForm<FormData>({
@@ -56,6 +59,7 @@ export function AzureClientSecretCredentialTokenForm({
       },
     },
   });
+  const isMutating = isUpdating || isClearing;
 
   const onSubmit = (data: FormData) => {
     createOrUpdateToken(data, {
@@ -68,10 +72,14 @@ export function AzureClientSecretCredentialTokenForm({
   };
 
   useEffect(() => {
-    if (azureOrganizationAuthToken?.credential) {
-      form.reset({ credential: azureOrganizationAuthToken.credential });
-    }
-  }, [azureOrganizationAuthToken, form]);
+    form.reset({
+      credential: azureOrganizationAuthToken?.credential || {
+        tenant_id: "",
+        client_id: "",
+        client_secret: "",
+      },
+    });
+  }, [azureOrganizationAuthToken?.credential, form]);
 
   return (
     <div className="space-y-4">
@@ -111,7 +119,7 @@ export function AzureClientSecretCredentialTokenForm({
                       {...field}
                       type="text"
                       placeholder="tenant_id"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                 </div>
@@ -131,7 +139,7 @@ export function AzureClientSecretCredentialTokenForm({
                       {...field}
                       type="text"
                       placeholder="client_id"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                 </div>
@@ -151,7 +159,7 @@ export function AzureClientSecretCredentialTokenForm({
                       {...field}
                       type={showClientSecret ? "text" : "password"}
                       placeholder="client_secret"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                   <Button
@@ -160,7 +168,7 @@ export function AzureClientSecretCredentialTokenForm({
                     size="sm"
                     className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
                     onClick={toggleClientSecretVisibility}
-                    disabled={isLoading || isUpdating}
+                    disabled={isLoading || isMutating}
                   >
                     {showClientSecret ? (
                       <EyeClosedIcon className="h-4 w-4" />
@@ -175,9 +183,19 @@ export function AzureClientSecretCredentialTokenForm({
           />
 
           <div className="flex items-center gap-4">
-            <Button type="submit" disabled={isLoading || isUpdating}>
+            <Button type="submit" disabled={isLoading || isMutating}>
               {isUpdating ? "Updating..." : "Update Credential"}
             </Button>
+            {azureOrganizationAuthToken && (
+              <ClearCredentialDialog
+                label="Clear Credential"
+                title="Clear Azure Client Secret Credential?"
+                description="Workflows that use Azure Key Vault credentials will no longer be able to resolve them until a new Azure Client Secret Credential is added."
+                disabled={isLoading || isMutating}
+                isPending={isClearing}
+                onConfirm={() => clearCredential()}
+              />
+            )}
             {azureOrganizationAuthToken && (
               <div className="text-sm text-muted-foreground">
                 Last updated:{" "}

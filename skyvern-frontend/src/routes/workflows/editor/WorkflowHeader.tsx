@@ -256,7 +256,7 @@ function RunButton() {
 
 function EditorActionToolbar() {
   return (
-    <div className="flex items-center gap-2">
+    <div data-tour="editor-actions" className="flex items-center gap-2">
       <BrowserModeButton />
       <SaveButton />
       <PanelToggleButton

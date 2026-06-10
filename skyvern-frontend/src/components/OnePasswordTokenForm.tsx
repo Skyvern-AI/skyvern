@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
@@ -12,6 +12,7 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
+import { ClearCredentialDialog } from "@/components/ClearCredentialDialog";
 import { useOnePasswordToken } from "@/hooks/useOnePasswordToken";
 import { EyeOpenIcon, EyeClosedIcon } from "@radix-ui/react-icons";
 
@@ -27,8 +28,14 @@ type Props = {
 
 export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
   const [showToken, setShowToken] = useState(false);
-  const { onePasswordToken, isLoading, createOrUpdateToken, isUpdating } =
-    useOnePasswordToken();
+  const {
+    onePasswordToken,
+    isLoading,
+    createOrUpdateToken,
+    isUpdating,
+    clearToken,
+    isClearing,
+  } = useOnePasswordToken();
 
   const form = useForm<FormData>({
     resolver: zodResolver(formSchema),
@@ -36,6 +43,11 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
       token: onePasswordToken?.token || "",
     },
   });
+  const isMutating = isUpdating || isClearing;
+
+  useEffect(() => {
+    form.reset({ token: onePasswordToken?.token || "" });
+  }, [form, onePasswordToken?.token]);
 
   const onSubmit = (data: FormData) => {
     createOrUpdateToken(data, {
@@ -46,14 +58,6 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
   const toggleTokenVisibility = () => {
     setShowToken(!showToken);
   };
-
-  // Update form when token data loads
-  if (
-    onePasswordToken?.token &&
-    form.getValues("token") !== onePasswordToken.token
-  ) {
-    form.setValue("token", onePasswordToken.token);
-  }
 
   return (
     <div className="space-y-4">
@@ -93,7 +97,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
                       {...field}
                       type={showToken ? "text" : "password"}
                       placeholder="op_1234567890abcdef"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                   <Button
@@ -102,7 +106,7 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
                     size="sm"
                     className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
                     onClick={toggleTokenVisibility}
-                    disabled={isLoading || isUpdating}
+                    disabled={isLoading || isMutating}
                   >
                     {showToken ? (
                       <EyeClosedIcon className="h-4 w-4" />
@@ -117,9 +121,19 @@ export function OnePasswordTokenForm({ onSuccess }: Props = {}) {
           />
 
           <div className="flex items-center gap-4">
-            <Button type="submit" disabled={isLoading || isUpdating}>
+            <Button type="submit" disabled={isLoading || isMutating}>
               {isUpdating ? "Updating..." : "Update Token"}
             </Button>
+            {onePasswordToken && (
+              <ClearCredentialDialog
+                label="Clear Token"
+                title="Clear 1Password token?"
+                description="Workflows that use 1Password credentials will no longer be able to resolve them until a new service account token is added."
+                disabled={isLoading || isMutating}
+                isPending={isClearing}
+                onConfirm={() => clearToken()}
+              />
+            )}
             {onePasswordToken && (
               <div className="text-sm text-muted-foreground">
                 Last updated:{" "}

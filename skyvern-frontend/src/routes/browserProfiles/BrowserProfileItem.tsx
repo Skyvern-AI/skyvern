@@ -3,6 +3,7 @@ import { Pencil1Icon } from "@radix-ui/react-icons";
 import { useNavigate } from "react-router-dom";
 
 import { BrowserProfileApiResponse } from "@/api/types";
+import { SelectionCheckboxCell } from "@/components/SelectionCheckbox";
 import { Button } from "@/components/ui/button";
 import { TableCell, TableRow } from "@/components/ui/table";
 import {
@@ -18,9 +19,19 @@ import { RenameBrowserProfileDialog } from "./RenameBrowserProfileDialog";
 
 type Props = {
   profile: BrowserProfileApiResponse;
+  index?: number;
+  selected?: boolean;
+  hasSelection?: boolean;
+  onSelect?: (index: number, shiftKey: boolean) => void;
 };
 
-function BrowserProfileItem({ profile }: Props) {
+function BrowserProfileItem({
+  profile,
+  index = -1,
+  selected = false,
+  hasSelection = false,
+  onSelect,
+}: Props) {
   const navigate = useNavigate();
   const [renameOpen, setRenameOpen] = useState(false);
 
@@ -41,7 +52,20 @@ function BrowserProfileItem({ profile }: Props) {
   };
 
   return (
-    <TableRow className="cursor-pointer" onClick={handleRowClick}>
+    <TableRow
+      className="group/row cursor-pointer"
+      data-state={selected ? "selected" : undefined}
+      onClick={handleRowClick}
+    >
+      {onSelect && (
+        <SelectionCheckboxCell
+          index={index}
+          checked={selected}
+          hasSelection={hasSelection}
+          onSelect={onSelect}
+          ariaLabel={`Select ${profile.name}`}
+        />
+      )}
       <TableCell className="truncate">
         <span title={profile.name}>{profile.name}</span>
       </TableCell>
