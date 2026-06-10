@@ -74,6 +74,9 @@ from .blockers import _post_budget_terminal_challenge_signal as _post_budget_ter
 from .blockers import _post_run_terminal_challenge_reason as _post_run_terminal_challenge_reason
 from .blockers import (
     _record_per_tool_budget_problem_blocks_from_results,
+)
+from .blockers import _run_blocks_structured_blocker_message as _run_blocks_structured_blocker_message
+from .blockers import (
     _tool_loop_error,
 )
 from .blockers import _trusted_post_drain_status as _trusted_post_drain_status

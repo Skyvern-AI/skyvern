@@ -567,6 +567,24 @@ _ANTI_BOT_BLOCKER_TERMS: tuple[str, ...] = (
     "human verification",
     "verify you are human",
 )
+# Strict subset of ``_STRUCTURED_BLOCKER_KEY_TERMS`` for the flag/status rules that
+# scan arbitrary code-block JSON; broad terms like ``verification`` stay string-only.
+_STRICT_BLOCKER_FLAG_TERMS: frozenset[str] = frozenset(
+    {
+        "blocker",
+        "blocked",
+        "captcha",
+        "challenge",
+        "human_verification",
+    }
+)
+_BLOCKER_STATUS_KEYS: frozenset[str] = frozenset({"status", "state"})
+_BLOCKER_SIBLING_MESSAGE_KEYS: frozenset[str] = frozenset({"reason", "message", "error", "failure_reason"})
+_MAX_BLOCKER_STATUS_VALUE_LEN = 80
+
+
+def _is_code_block_type(block_type: object) -> bool:
+    return isinstance(block_type, str) and block_type.strip().upper() == BlockType.CODE.value.upper()
 
 
 def _normalize_structured_key(value: object) -> str:
@@ -578,7 +596,7 @@ def _looks_like_anti_bot_blocker(text: str) -> bool:
     return any(term in lowered for term in _ANTI_BOT_BLOCKER_TERMS)
 
 
-def _structured_blocker_message(value: object, *, depth: int = 0) -> str | None:
+def _structured_blocker_message(value: object, *, depth: int = 0, include_flag_keys: bool = False) -> str | None:
     if depth > 5:
         return None
     if isinstance(value, dict):
@@ -594,15 +612,41 @@ def _structured_blocker_message(value: object, *, depth: int = 0) -> str | None:
                 and _looks_like_anti_bot_blocker(item)
             ):
                 return item.strip()[:240]
+        if include_flag_keys:
+            flagged = _blocker_flag_or_status_message(value)
+            if flagged:
+                return flagged
         for item in value.values():
-            nested = _structured_blocker_message(item, depth=depth + 1)
+            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
             if nested:
                 return nested
     elif isinstance(value, list):
         for item in value:
-            nested = _structured_blocker_message(item, depth=depth + 1)
+            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
             if nested:
                 return nested
+    return None
+
+
+def _blocker_flag_or_status_message(value: dict[str, Any]) -> str | None:
+    for key, item in value.items():
+        normalized_key = _normalize_structured_key(key)
+        if item is True and any(term in normalized_key for term in _STRICT_BLOCKER_FLAG_TERMS):
+            for sibling_key, sibling_item in value.items():
+                if (
+                    _normalize_structured_key(sibling_key) in _BLOCKER_SIBLING_MESSAGE_KEYS
+                    and isinstance(sibling_item, str)
+                    and sibling_item.strip()
+                ):
+                    return sibling_item.strip()[:240]
+            return f"The run output flagged {normalized_key.replace('_', ' ')}."
+        if (
+            isinstance(item, str)
+            and normalized_key in _BLOCKER_STATUS_KEYS
+            and 0 < len(item.strip()) <= _MAX_BLOCKER_STATUS_VALUE_LEN
+            and any(term in item.strip().lower() for term in _STRICT_BLOCKER_FLAG_TERMS)
+        ):
+            return f"The run output reported status '{item.strip()}'."
     return None
 
 
@@ -620,13 +664,60 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None
         if not isinstance(block, dict):
             continue
         block_type = block.get("block_type")
-        if block_type not in _DATA_PRODUCING_BLOCK_TYPES or block.get("status") != "completed":
+        if block.get("status") != "completed":
             continue
-        payload = _block_data_payload(block.get("extracted_data"), block_type)
-        blocker = _structured_blocker_message(payload)
+        if _is_code_block_type(block_type):
+            blocker = _structured_blocker_message(block.get("extracted_data"), include_flag_keys=True)
+        elif block_type in _DATA_PRODUCING_BLOCK_TYPES:
+            payload = _block_data_payload(block.get("extracted_data"), block_type)
+            blocker = _structured_blocker_message(payload)
+        else:
+            continue
         if blocker:
             return blocker
     return None
+
+
+def _is_blocker_term_key(key: object) -> bool:
+    normalized_key = _normalize_structured_key(key)
+    return any(term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS)
+
+
+def _code_output_contains_collection(value: Any, *, depth: int = 0) -> bool:
+    if depth > 5:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _code_output_contains_collection(item, depth=depth + 1)
+            for key, item in value.items()
+            if not _is_blocker_term_key(key)
+        )
+    return False
+
+
+def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
+    """Goal content in a code block's output: a non-empty string, truthy number, or
+    non-empty collection surviving after blocker-term, status, and boolean entries
+    are stripped (status/state values are machine shape, not goal data)."""
+    if depth > 5:
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
+    if isinstance(value, dict):
+        return any(
+            _code_output_has_goal_content(item, depth=depth + 1)
+            for key, item in value.items()
+            if not _is_blocker_term_key(key) and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
+        )
+    return False
 
 
 def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
@@ -1016,13 +1107,28 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
             if isinstance(reason, str):
                 texts_to_scan.append(reason)
             block_type = block.get("block_type")
-            if block_type in _DATA_PRODUCING_BLOCK_TYPES and block.get("status") == "completed":
+            if block.get("status") != "completed":
+                continue
+            if block_type in _DATA_PRODUCING_BLOCK_TYPES:
                 has_data_blocks = True
                 payload = _block_data_payload(block.get("extracted_data"), block_type)
                 structured_blocker = _structured_blocker_message(payload)
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
                 if _is_meaningful_extracted_data(payload):
+                    any_data_output = True
+            elif _is_code_block_type(block_type):
+                extracted = block.get("extracted_data")
+                if extracted is None:
+                    continue
+                structured_blocker = _structured_blocker_message(extracted, include_flag_keys=True)
+                if structured_blocker:
+                    texts_to_scan.append(structured_blocker)
+                # A code output joins the emptiness denominator only when it declares a
+                # collection shape; action-only outputs are exempt.
+                if _code_output_contains_collection(extracted):
+                    has_data_blocks = True
+                if _code_output_has_goal_content(extracted):
                     any_data_output = True
 
     combined = "\n".join(texts_to_scan)
