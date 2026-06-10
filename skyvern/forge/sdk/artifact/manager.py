@@ -310,6 +310,7 @@ class ArtifactManager:
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            file_size=len(data) if data is not None else _safe_file_size_from_path(path),
             data=data,
             path=path,
         )
