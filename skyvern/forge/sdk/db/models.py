@@ -1488,6 +1488,7 @@ class WorkflowCopilotChatMessageModel(Base):
     organization_id = Column(String, nullable=False)
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
+    audio_artifact_id = Column(String, nullable=True)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)

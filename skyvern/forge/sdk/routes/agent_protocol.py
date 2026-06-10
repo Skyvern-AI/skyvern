@@ -2113,6 +2113,7 @@ _ARTIFACT_CONTENT_TYPES: dict[ArtifactType, str] = {
     ArtifactType.SCREENSHOT_ACTION: "image/png",
     ArtifactType.SCREENSHOT_FINAL: "image/png",
     ArtifactType.RECORDING: "video/webm",
+    ArtifactType.AUDIO: "audio/webm",
     ArtifactType.SESSION_REPLAY: "video/mp4",
     ArtifactType.DOWNLOAD: "application/octet-stream",
 }
