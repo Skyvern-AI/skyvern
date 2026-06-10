@@ -19,7 +19,6 @@ from skyvern.forge.sdk.workflow.loop_download_filter import (
     to_downloaded_file_signature,
 )
 from skyvern.forge.sdk.workflow.models.block import (
-    BLOCK_BASELINE_MARKER,
     capture_block_download_baseline,
 )
 
@@ -106,12 +105,12 @@ def test_duplicate_files_handled_correctly():
     assert len(filtered) == 1
 
 
-# --- Tests for capture_block_download_baseline marker logic ---
+# --- Tests for capture_block_download_baseline per-block capture ---
 
 
 @pytest.mark.asyncio
 async def test_baseline_captured_when_loop_internal_state_is_none():
-    """When loop_internal_state is None, the helper creates a new baseline with the marker."""
+    """When loop_internal_state is None, the helper creates a new baseline."""
     file1 = _make_file_info("s3://bucket/file1.pdf", "file1.pdf", "checksum1")
     context = SkyvernContext(run_id="wr_test", loop_internal_state=None)
 
@@ -123,13 +122,13 @@ async def test_baseline_captured_when_loop_internal_state_is_none():
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
 
     assert context.loop_internal_state is not None
-    assert BLOCK_BASELINE_MARKER in context.loop_internal_state
     assert len(context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY]) == 1
 
 
 @pytest.mark.asyncio
 async def test_baseline_recaptured_when_set_by_previous_block():
-    """When loop_internal_state was set by a previous block (has marker), it gets overwritten."""
+    """When loop_internal_state was set by a previous block, it gets overwritten with the
+    files that exist now — so the current block is scoped to only what it adds next."""
     file1 = _make_file_info("s3://bucket/file1.pdf", "file1.pdf", "checksum1")
     file2 = _make_file_info("s3://bucket/file2.pdf", "file2.pdf", "checksum2")
 
@@ -138,7 +137,6 @@ async def test_baseline_recaptured_when_set_by_previous_block():
         run_id="wr_test",
         loop_internal_state={
             DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(file1)],
-            BLOCK_BASELINE_MARKER: True,
         },
     )
 
@@ -150,29 +148,36 @@ async def test_baseline_recaptured_when_set_by_previous_block():
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
 
     assert context.loop_internal_state is not None
-    assert BLOCK_BASELINE_MARKER in context.loop_internal_state
     # New baseline includes both files
     assert len(context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY]) == 2
 
 
 @pytest.mark.asyncio
-async def test_loop_baseline_preserved_when_no_marker():
-    """When loop_internal_state was set by ForLoopBlock (no marker), it is NOT overwritten."""
+async def test_baseline_recaptured_even_when_loop_set_it():
+    """SKY-10784: a block inside a loop must re-capture its own baseline rather than
+    defer to the loop's per-iteration baseline. Otherwise sibling download-producing
+    blocks in the same iteration accumulate each other's files."""
     loop_baseline = {
         DOWNLOADED_FILE_SIGS_KEY: [("a.pdf", "abc", "s3://a.pdf")],
     }
     context = SkyvernContext(run_id="wr_test", loop_internal_state=loop_baseline)
 
+    # A sibling block earlier in this iteration already produced b.pdf, so it now
+    # exists alongside the loop's pre-iteration a.pdf.
+    sibling_file = _make_file_info("s3://bucket/b.pdf", "b.pdf", "checksum_b")
     mock_storage = AsyncMock()
-    mock_storage.get_downloaded_files = AsyncMock(return_value=[])
+    mock_storage.get_downloaded_files = AsyncMock(
+        return_value=[_make_file_info("s3://a.pdf", "a.pdf", "abc"), sibling_file]
+    )
 
     with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
         mock_app.STORAGE = mock_storage
-        await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
+        await capture_block_download_baseline(context, "org_1", "wr_test", "block_2")
 
-    # Should be unchanged — loop baseline preserved
-    assert context.loop_internal_state is loop_baseline
-    mock_storage.get_downloaded_files.assert_not_called()
+    # Re-captured: the sibling's file is now part of this block's baseline, so it
+    # will be filtered out of this block's own output.
+    mock_storage.get_downloaded_files.assert_called_once()
+    assert len(context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY]) == 2
 
 
 @pytest.mark.asyncio
@@ -191,10 +196,9 @@ async def test_baseline_capture_degrades_on_timeout():
 
 
 @pytest.mark.asyncio
-async def test_stale_loop_baseline_blocks_fresh_capture_without_restore():
-    """Regression guard: a loop-set baseline (no marker) left in context
-    causes capture_block_download_baseline to skip capture. ForLoopBlock
-    must clear/restore its state so subsequent blocks can re-capture."""
+async def test_stale_loop_baseline_overwritten_by_fresh_capture():
+    """A stale baseline left in context (e.g. from a prior loop iteration) is
+    overwritten by the current files, so it can never cause stale filtering."""
     stale_loop_state = {
         DOWNLOADED_FILE_SIGS_KEY: [("a.pdf", "abc", "s3://a.pdf")],
     }
@@ -206,10 +210,9 @@ async def test_stale_loop_baseline_blocks_fresh_capture_without_restore():
         mock_app.STORAGE = mock_storage
         await capture_block_download_baseline(context, "org_1", "wr_test", "block_1")
 
-    # Capture was skipped because the loop baseline has no marker — this is
-    # why ForLoopBlock.execute() must save/restore loop_internal_state.
-    assert context.loop_internal_state is stale_loop_state
-    mock_storage.get_downloaded_files.assert_not_called()
+    mock_storage.get_downloaded_files.assert_called_once()
+    assert context.loop_internal_state is not stale_loop_state
+    assert context.loop_internal_state[DOWNLOADED_FILE_SIGS_KEY] == []
 
 
 @pytest.mark.asyncio
@@ -264,3 +267,47 @@ async def test_forloopblock_execute_restores_outer_loop_state():
 
     # Outer state must be restored even though _run_loop mutated and raised.
     assert context.loop_internal_state is outer_state
+
+
+@pytest.mark.asyncio
+async def test_sibling_download_blocks_in_loop_iteration_scope_to_own_files():
+    """SKY-10784 regression: multiple download-producing blocks inside one loop
+    iteration must each surface only the file they produced — not their siblings'.
+    Mirrors the reported production run, where three Print Page blocks in a single loop
+    iteration showed 1, then 2, then 3 PDFs instead of 1 each.
+    """
+    pp1 = _make_file_info("https://api/v1/artifacts/a_pp1/content", "page_1.pdf", "c1")
+    pp2 = _make_file_info("https://api/v1/artifacts/a_pp2/content", "page_2.pdf", "c2")
+    pp3 = _make_file_info("https://api/v1/artifacts/a_pp3/content", "page_3.pdf", "c3")
+    pp4 = _make_file_info("https://api/v1/artifacts/a_pp4/content", "page_4.pdf", "c4")
+
+    # The run's download directory, shared across blocks and growing as each produces a file.
+    run_files: list[FileInfo] = []
+
+    # ForLoopBlock sets the per-iteration baseline (no marker) at iteration start.
+    context = SkyvernContext(run_id="wr_test", loop_internal_state={DOWNLOADED_FILE_SIGS_KEY: []})
+
+    mock_storage = AsyncMock()
+    # Each baseline capture reads a snapshot of the files that exist at that moment.
+    mock_storage.get_downloaded_files = AsyncMock(side_effect=lambda **_: list(run_files))
+
+    async def run_download_block(produced: FileInfo) -> list[FileInfo]:
+        with patch("skyvern.forge.sdk.workflow.models.block.app") as mock_app:
+            mock_app.STORAGE = mock_storage
+            await capture_block_download_baseline(context, "org_1", "wr_test", "print")
+        run_files.append(produced)
+        return filter_downloaded_files_for_current_iteration(list(run_files), context.loop_internal_state)
+
+    out1 = await run_download_block(pp1)
+    out2 = await run_download_block(pp2)
+    out3 = await run_download_block(pp3)
+
+    assert [f.filename for f in out1] == ["page_1.pdf"]
+    assert [f.filename for f in out2] == ["page_2.pdf"]
+    assert [f.filename for f in out3] == ["page_3.pdf"]
+
+    # Next loop iteration: ForLoopBlock re-captures the per-iteration baseline, and the
+    # first block of the new iteration must still exclude every prior iteration's file.
+    context.loop_internal_state = {DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(f) for f in run_files]}
+    out4 = await run_download_block(pp4)
+    assert [f.filename for f in out4] == ["page_4.pdf"]
