@@ -7,6 +7,7 @@ import {
   CreateBitwardenCredentialRequest,
 } from "@/api/types";
 import { useToast } from "@/components/ui/use-toast";
+import { useClearOrganizationAuthToken } from "./useClearOrganizationAuthToken";
 
 export function useBitwardenCredential() {
   const credentialGetter = useCredentialGetter();
@@ -14,7 +15,7 @@ export function useBitwardenCredential() {
   const { toast } = useToast();
 
   const { data: bitwardenOrganizationAuthToken, isLoading } =
-    useQuery<BitwardenOrganizationAuthToken>({
+    useQuery<BitwardenOrganizationAuthToken | null>({
       queryKey: ["bitwardenOrganizationAuthToken"],
       queryFn: async () => {
         const client = await getClient(credentialGetter, "sans-api-v1");
@@ -60,10 +61,19 @@ export function useBitwardenCredential() {
     },
   });
 
+  const clearCredentialMutation = useClearOrganizationAuthToken({
+    providerPath: "bitwarden",
+    queryKey: "bitwardenOrganizationAuthToken",
+    successDescription: "Bitwarden credential cleared successfully",
+    errorDescription: "Failed to clear Bitwarden credential",
+  });
+
   return {
     bitwardenOrganizationAuthToken,
     isLoading,
     createOrUpdateToken: createOrUpdateTokenMutation.mutate,
     isUpdating: createOrUpdateTokenMutation.isPending,
+    clearCredential: clearCredentialMutation.mutate,
+    isClearing: clearCredentialMutation.isPending,
   };
 }
