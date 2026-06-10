@@ -238,6 +238,45 @@ export function serializeTagFilterTerm(term: TagFilterTerm): string {
   return `${term.key}:${term.value}`;
 }
 
+export function isTag(value: unknown): value is Tag {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as { key?: unknown; value?: unknown };
+  return (
+    (candidate.key === null || typeof candidate.key === "string") &&
+    typeof candidate.value === "string"
+  );
+}
+
+// Boundary guard for tag payloads. Accepts the current wire shape
+// (Array<Tag>) plus the pre-SKY-10683 key->value record, and degrades
+// anything else to [] - a shape skew must never throw mid-render (React #31)
+// and take the whole route down with the error boundary.
+export function normalizeWorkflowTags(input: unknown): Array<Tag> {
+  if (Array.isArray(input)) {
+    const valid = input.filter(isTag);
+    if (valid.length !== input.length) {
+      console.warn(
+        `[tags] dropped ${input.length - valid.length} malformed tag entries`,
+      );
+    }
+    return valid;
+  }
+  if (input !== null && typeof input === "object") {
+    console.warn("[tags] got a legacy record tag payload; converting");
+    return Object.entries(input)
+      .filter((entry): entry is [string, string] => {
+        return typeof entry[1] === "string";
+      })
+      .map(([key, value]) => ({ key, value }));
+  }
+  if (input !== null && input !== undefined) {
+    console.warn(`[tags] ignoring tag payload of type ${typeof input}`);
+  }
+  return [];
+}
+
 // Stable React key for a tag. Standalone labels and grouped tags live in
 // disjoint namespaces so a null key can't collide with an (invalid) empty key.
 export function tagElementKey(tag: Tag): string {
