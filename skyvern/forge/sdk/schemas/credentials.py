@@ -12,6 +12,7 @@ from skyvern.utils.url_validators import validate_url
 class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
+    GCP = "gcp"
     CUSTOM = "custom"
 
 
