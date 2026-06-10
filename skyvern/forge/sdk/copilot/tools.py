@@ -8185,6 +8185,22 @@ def _discovery_anchor_selector(anchor: dict[str, str]) -> str | None:
 # cumulative cap (cumulative is only checked between awaits).
 _DISCOVERY_PER_CALL_TIMEOUT_SECONDS = 20.0
 _DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE = 0.2
+# Scorer-miss outcomes (page loaded, no keyword match); wall outcomes are excluded as real blocks.
+_DISCOVERY_SCORER_MISS_REASONS = frozenset({"no_candidate", "step_limit", "wall_clock_limit"})
+
+
+def _discovery_last_loaded_url(evidence_trail: list[dict[str, Any]]) -> str | None:
+    """URL of the last page the walk loaded, skipping failed nav/click steps and detected walls."""
+    for entry in reversed(evidence_trail):
+        reason = str(entry.get("transition_reason", ""))
+        if reason.startswith("navigate_failed") or reason.startswith("anchor_click_failed"):
+            continue
+        if entry.get("wall"):
+            continue
+        url = entry.get("url")
+        if isinstance(url, str) and url:
+            return url
+    return None
 
 
 async def _discovery_navigate(
@@ -9167,9 +9183,13 @@ async def _discovery_walk(
             )
 
         anti_bot_detected = _discovery_detect_anti_bot(html, page_title)
+        login_wall_detected = _discovery_detect_login_wall(html, page_title)
         anti_bot_has_no_candidate_evidence = (
             not form_fields and candidate_title_score == 0 and candidate_anchor_score == 0
         )
+        if anti_bot_detected or login_wall_detected:
+            # Tag walls so the scorer-miss fallback refuses them even when they degrade to no_candidate.
+            evidence_trail[-1]["wall"] = True
         if anti_bot_detected and anti_bot_has_no_candidate_evidence:
             origin_url = _discovery_origin_url(current_url)
             if (
@@ -9189,7 +9209,7 @@ async def _discovery_walk(
                 confidence=0.0,
                 failure_reason="anti_bot_wall",
             )
-        if _discovery_detect_login_wall(html, page_title):
+        if login_wall_detected:
             return _discovery_build_result(
                 candidate_url=None,
                 candidate_form_fields=[],
@@ -9401,7 +9421,26 @@ async def _discover_workflow_entrypoint_impl(
 
     data_payload = result.get("data") or {}
     data: dict[str, Any] = data_payload if isinstance(data_payload, dict) else {}
-    copilot_ctx.discovery_evidence_trail = list(data.get("evidence_trail", []))
+    evidence_trail = data.get("evidence_trail") or []
+    copilot_ctx.discovery_evidence_trail = list(evidence_trail)
+    if (
+        result.get("ok")
+        and not data.get("candidate_url")
+        and data.get("failure_reason") in _DISCOVERY_SCORER_MISS_REASONS
+    ):
+        navigated_url = _discovery_last_loaded_url(evidence_trail)
+        if navigated_url:
+            # Don't ask for a URL we already reached; hand the loaded page to composition at low confidence.
+            result = _discovery_build_result(
+                candidate_url=navigated_url,
+                candidate_form_fields=[],
+                evidence_trail=evidence_trail,
+                confidence=_DISCOVERY_NAVIGATION_FALLBACK_CONFIDENCE,
+                failure_reason=None,
+            )
+            rebuilt_data = result.get("data")
+            data = rebuilt_data if isinstance(rebuilt_data, dict) else {}
+            copilot_ctx.discovery_evidence_trail = list(data.get("evidence_trail", []))
     if result.get("ok") and data.get("candidate_url"):
         try:
             advance_to_composing(copilot_ctx, reason="discovery_returned_candidate")

@@ -38,9 +38,12 @@ PROMPT_NAMES_BY_FAMILY: dict[PromptFamily, frozenset[str]] = {
     PromptFamily.PARSE_INPUT_OR_SELECT_CONTEXT: frozenset({"parse-input-or-select-context"}),
 }
 
-# Families whose templates honor the slim variants at runtime. A family is added
-# only after passing its offline backtest gate (SKY-10075).
-SLIM_ENABLED_FAMILIES: frozenset[PromptFamily] = frozenset({PromptFamily.EXTRACT_ACTIONS, PromptFamily.CHECK_USER_GOAL})
+# Families whose templates honor the slim variants at runtime. A family is enabled
+# only after it passes validation; an excluded family keeps its in-template slim
+# conditionals for a later re-test. check-user-goal is excluded deliberately —
+# slimming the verification prompt degrades its complete/terminate judgment (it
+# relies on page_info and full thoughts), so only extract-actions is slimmed.
+SLIM_ENABLED_FAMILIES: frozenset[PromptFamily] = frozenset({PromptFamily.EXTRACT_ACTIONS})
 
 _FAMILY_BY_TEMPLATE: dict[str, PromptFamily] = {
     template: family for family, templates in TEMPLATES_BY_FAMILY.items() for template in templates

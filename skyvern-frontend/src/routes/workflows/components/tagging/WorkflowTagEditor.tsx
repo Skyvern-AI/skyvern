@@ -1,10 +1,5 @@
 import * as React from "react";
-import {
-  ArrowLeftIcon,
-  PlusIcon,
-  ReloadIcon,
-  TokensIcon,
-} from "@radix-ui/react-icons";
+import { PlusIcon, ReloadIcon, TokensIcon } from "@radix-ui/react-icons";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -27,108 +22,100 @@ import {
 } from "@/components/ui/tooltip";
 import { toast } from "@/components/ui/use-toast";
 import {
+  MAX_AUTOCOMPLETE_SUGGESTIONS,
   MAX_TAGS_PER_WORKFLOW,
-  validateTagKey,
-  validateTagValue,
+  parseTagInput,
+  parseTypedTagQuery,
+  serializeTagFilterTerm,
+  sortTags,
+  tagElementKey,
+  validateTag,
+  type Tag,
+  type TagDeleteInput,
   type TagKey,
 } from "../../types/tagTypes";
-import {
-  useApplyWorkflowTagsMutation,
-  useDeleteWorkflowTagMutation,
-} from "../../hooks/useWorkflowTagMutations";
+import { useApplyWorkflowTagsMutation } from "../../hooks/useWorkflowTagMutations";
 import { TagChip } from "./TagChip";
 
 type Props = {
   workflowPermanentId: string;
-  tags: Record<string, string>;
+  tags: Array<Tag>;
+  // Registered groups (keys) for autocomplete; standalone labels aren't here.
   tagKeys: Array<TagKey>;
-  // key -> existing values observed on the page, so the value step can suggest
-  // existing values for the chosen key (the backend has no list-values
-  // endpoint). Free-text entry still works. A Map keeps lookups safe against
-  // tag keys like "constructor".
-  valueSuggestions?: Map<string, Array<string>>;
+  // Standalone label values observed on the page, suggested when typing a label.
+  labelSuggestions?: Array<string>;
+  // Grouped values observed per key, suggested after typing `group:`.
+  valueSuggestionsByKey?: Map<string, Array<string>>;
 };
 
-// Inline tag editor for a workflow row: add / overwrite / remove tags. Uses a
-// cmdk Command (key step -> value step) rather than native <datalist>, which is
-// unreliable inside a Radix popover; this mirrors WorkflowTagFilter so key and
-// value autosuggest behave the same. Adding a key that already exists overwrites
-// its value (backend set-wins) = the edit path.
+// Inline tag editor: type a bare `label` for a standalone tag or `group:label`
+// for a grouped one. Re-adding overwrites that group's label (backend set-wins).
 function WorkflowTagEditor({
   workflowPermanentId,
   tags,
   tagKeys,
-  valueSuggestions,
+  labelSuggestions = [],
+  valueSuggestionsByKey,
 }: Props) {
   const [open, setOpen] = React.useState(false);
-  const [selectedKey, setSelectedKey] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
 
   const applyMutation = useApplyWorkflowTagsMutation();
-  const deleteMutation = useDeleteWorkflowTagMutation();
-  const isPending = applyMutation.isPending || deleteMutation.isPending;
-
-  const entries = Object.entries(tags).sort(([a], [b]) => a.localeCompare(b));
-
-  function resetForm() {
-    setSelectedKey(null);
-    setQuery("");
-    setError(null);
-  }
+  const isPending = applyMutation.isPending;
 
   React.useEffect(() => {
-    // Inline the resets (rather than calling resetForm) so the effect's only
-    // dependency is `open`; setState identities are stable.
     if (!open) {
-      setSelectedKey(null);
       setQuery("");
       setError(null);
     }
   }, [open]);
 
-  function applyTag(key: string, value: string) {
-    // A write is in flight; ignore further selects so quick double Enter/click
-    // can't queue racing POSTs whose arrival order would decide the final tag
-    // (backend is set-wins).
+  const sortedTags = React.useMemo(() => sortTags(tags), [tags]);
+
+  function addTag(tag: Tag) {
+    // A write is in flight; ignore further adds so a quick double Enter/click
+    // can't queue racing POSTs whose arrival order would decide the final tag.
     if (isPending) {
       return;
     }
-    const trimmedKey = key.trim();
-    const trimmedValue = value.trim();
-
-    const keyError = validateTagKey(trimmedKey);
-    if (keyError) {
-      setError(keyError);
+    const validationError = validateTag(tag);
+    if (validationError) {
+      setError(validationError);
       return;
     }
-    const valueError = validateTagValue(trimmedValue);
-    if (valueError) {
-      setError(valueError);
+    const exactExists = tags.some(
+      (existing) => existing.key === tag.key && existing.value === tag.value,
+    );
+    if (exactExists) {
+      setQuery("");
+      setError(null);
       return;
     }
-    // Own-key check: `key in tags` would treat inherited names like
-    // "constructor"/"toString" (valid backend tag keys) as already present.
-    const hasKey = Object.prototype.hasOwnProperty.call(tags, trimmedKey);
-    const previousValue = hasKey ? tags[trimmedKey] : undefined;
-    if (!hasKey && Object.keys(tags).length >= MAX_TAGS_PER_WORKFLOW) {
+    // A grouped tag with an existing key overwrites that group's label (no new
+    // identity); anything else is a new tag and counts against the cap.
+    const previousInGroup =
+      tag.key !== null
+        ? tags.find((existing) => existing.key === tag.key)
+        : undefined;
+    const isOverwrite = previousInGroup !== undefined;
+    if (!isOverwrite && tags.length >= MAX_TAGS_PER_WORKFLOW) {
       setError(`A workflow can have at most ${MAX_TAGS_PER_WORKFLOW} tags.`);
       return;
     }
-    // Same key, different value: the backend overwrites (set-wins); proceed but
-    // tell the user it replaced the existing tag.
-    const isOverwrite =
-      previousValue !== undefined && previousValue !== trimmedValue;
-
     applyMutation.mutate(
-      { workflowPermanentId, data: { tags: { [trimmedKey]: trimmedValue } } },
+      {
+        workflowPermanentId,
+        data: { tags: [{ key: tag.key, value: tag.value }] },
+      },
       {
         onSuccess: () => {
-          resetForm();
-          if (isOverwrite) {
+          setQuery("");
+          setError(null);
+          if (isOverwrite && previousInGroup) {
             toast({
               title: "Tag overwritten",
-              description: `“${trimmedKey}” changed from “${previousValue}” to “${trimmedValue}”.`,
+              description: `“${tag.key}” changed from “${previousInGroup.value}” to “${tag.value}”.`,
             });
           }
         },
@@ -136,37 +123,52 @@ function WorkflowTagEditor({
     );
   }
 
-  function handleRemove(key: string) {
+  function removeTag(tag: Tag) {
     if (isPending) {
       return;
     }
-    deleteMutation.mutate({ workflowPermanentId, key });
+    // Grouped tags delete by key, standalone labels by value.
+    const target: TagDeleteInput =
+      tag.key !== null ? { key: tag.key } : { value: tag.value };
+    applyMutation.mutate({
+      workflowPermanentId,
+      data: { tags_to_delete: [target] },
+    });
   }
 
-  const normalizedQuery = query.trim().toLowerCase();
   const trimmedQuery = query.trim();
+  const normalizedQuery = trimmedQuery.toLowerCase();
+  const candidate = parseTagInput(query);
+  const candidateExists =
+    candidate !== null &&
+    tags.some((t) => t.key === candidate.key && t.value === candidate.value);
+  const showAdd = candidate !== null && !candidateExists;
 
-  // Rank an exact (case-insensitive) match first so cmdk highlights it by
-  // default — plain Enter then commits the exact typed text, while arrow+Enter
-  // still selects any other highlighted suggestion (sort is stable otherwise).
-  const exactFirst = (a: string, b: string) =>
-    (a.toLowerCase() === normalizedQuery ? 0 : 1) -
-    (b.toLowerCase() === normalizedQuery ? 0 : 1);
+  // When the user has typed `group:partial`, suggest existing values for that
+  // group; otherwise suggest groups (to start a grouped tag) and labels.
+  const { typedKey, typedValuePartial } = parseTypedTagQuery(trimmedQuery);
 
-  const filteredKeys = tagKeys
-    .filter((tagKey) => tagKey.key.toLowerCase().includes(normalizedQuery))
-    .sort((a, b) => exactFirst(a.key, b.key));
-  const showUseKey =
-    trimmedQuery.length > 0 && !tagKeys.some((tk) => tk.key === trimmedQuery);
-
-  const suggestionsForKey = selectedKey
-    ? (valueSuggestions?.get(selectedKey) ?? [])
-    : [];
-  const filteredValues = suggestionsForKey
-    .filter((value) => value.toLowerCase().includes(normalizedQuery))
-    .sort(exactFirst);
-  const showAddValue =
-    trimmedQuery.length > 0 && !suggestionsForKey.includes(trimmedQuery);
+  const groupSuggestions =
+    typedKey === null
+      ? tagKeys
+          .filter((tk) => tk.key.toLowerCase().includes(normalizedQuery))
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
+  const labelMatches =
+    typedKey === null
+      ? labelSuggestions
+          .filter((value) => value.toLowerCase().includes(normalizedQuery))
+          .filter(
+            (value) => !tags.some((t) => t.key === null && t.value === value),
+          )
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
+  const groupedValueMatches =
+    typedKey !== null
+      ? (valueSuggestionsByKey?.get(typedKey) ?? [])
+          .filter((value) => value.toLowerCase().includes(typedValuePartial))
+          .slice(0, MAX_AUTOCOMPLETE_SUGGESTIONS)
+      : [];
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -190,14 +192,14 @@ function WorkflowTagEditor({
       <PopoverContent className="w-80 p-0" align="end">
         <div className="space-y-2 p-3">
           <div className="text-sm font-medium">Tags</div>
-          {entries.length > 0 ? (
+          {sortedTags.length > 0 ? (
             <div className="flex flex-wrap gap-1">
-              {entries.map(([key, value]) => (
+              {sortedTags.map((tag) => (
                 <TagChip
-                  key={key}
-                  tagKey={key}
-                  value={value}
-                  onRemove={() => handleRemove(key)}
+                  key={tagElementKey(tag)}
+                  tagKey={tag.key}
+                  value={tag.value}
+                  onRemove={() => removeTag(tag)}
                 />
               ))}
             </div>
@@ -209,119 +211,89 @@ function WorkflowTagEditor({
           ) : null}
         </div>
         <Command shouldFilter={false}>
-          {selectedKey === null ? (
-            <>
-              <CommandInput
-                placeholder="Tag key…"
-                value={query}
-                onValueChange={(value) => {
-                  setQuery(value);
-                  setError(null);
-                }}
-              />
-              <CommandList>
-                <CommandEmpty>Type a key to add.</CommandEmpty>
-                {showUseKey ? (
-                  <CommandGroup>
-                    <CommandItem
-                      value={`__use__,${trimmedQuery}`}
-                      onSelect={() => {
-                        setSelectedKey(trimmedQuery);
-                        setQuery("");
-                      }}
-                    >
-                      <PlusIcon className="mr-2 h-4 w-4" />
-                      Use “{trimmedQuery}”
-                    </CommandItem>
-                  </CommandGroup>
-                ) : null}
-                {filteredKeys.length > 0 ? (
-                  <CommandGroup heading="Existing keys">
-                    {filteredKeys.map((tagKey) => (
-                      <CommandItem
-                        key={tagKey.key}
-                        value={tagKey.key}
-                        onSelect={() => {
-                          setSelectedKey(tagKey.key);
-                          setQuery("");
-                        }}
-                      >
-                        <div className="flex min-w-0 flex-col">
-                          <span className="truncate">{tagKey.key}</span>
-                          {tagKey.description ? (
-                            <span className="truncate text-xs text-muted-foreground">
-                              {tagKey.description}
-                            </span>
-                          ) : null}
-                        </div>
-                      </CommandItem>
-                    ))}
-                  </CommandGroup>
-                ) : null}
-              </CommandList>
-            </>
-          ) : (
-            <>
-              <div className="flex items-center gap-1 border-b px-2 py-1.5">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 shrink-0"
-                  onClick={() => {
-                    setSelectedKey(null);
-                    setQuery("");
-                  }}
+          <CommandInput
+            placeholder="Add a tag — label or group:label…"
+            value={query}
+            onValueChange={(value) => {
+              setQuery(value);
+              setError(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && candidate && showAdd) {
+                event.preventDefault();
+                addTag(candidate);
+              }
+            }}
+          />
+          <CommandList>
+            <CommandEmpty>Type a label or group:label.</CommandEmpty>
+            {showAdd && candidate ? (
+              <CommandGroup>
+                <CommandItem
+                  value={`__add__,${trimmedQuery}`}
+                  onSelect={() => addTag(candidate)}
                 >
-                  <ArrowLeftIcon className="h-4 w-4" />
-                </Button>
-                <span className="truncate text-sm font-medium">
-                  {selectedKey}
-                </span>
-              </div>
-              <CommandInput
-                placeholder="Value…"
-                value={query}
-                onValueChange={(value) => {
-                  setQuery(value);
-                  setError(null);
-                }}
-              />
-              <CommandList>
-                <CommandEmpty>Type a value to add.</CommandEmpty>
-                {showAddValue ? (
-                  <CommandGroup>
-                    {/* cmdk item values must be unique. The comma can't appear
-                        in a valid tag value, so this sentinel can never collide
-                        with a real suggestion's value. */}
-                    <CommandItem
-                      value={`__add__,${trimmedQuery}`}
-                      onSelect={() => applyTag(selectedKey, trimmedQuery)}
-                    >
-                      {applyMutation.isPending ? (
-                        <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
-                      ) : (
-                        <PlusIcon className="mr-2 h-4 w-4" />
-                      )}
-                      Add “{selectedKey}: {trimmedQuery}”
-                    </CommandItem>
-                  </CommandGroup>
-                ) : null}
-                {filteredValues.length > 0 ? (
-                  <CommandGroup heading="Existing values">
-                    {filteredValues.map((value) => (
-                      <CommandItem
-                        key={value}
-                        value={value}
-                        onSelect={() => applyTag(selectedKey, value)}
-                      >
-                        {value}
-                      </CommandItem>
-                    ))}
-                  </CommandGroup>
-                ) : null}
-              </CommandList>
-            </>
-          )}
+                  {isPending ? (
+                    <ReloadIcon className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <PlusIcon className="mr-2 h-4 w-4" />
+                  )}
+                  Add “
+                  {candidate.key !== null
+                    ? `${candidate.key}: ${candidate.value}`
+                    : candidate.value}
+                  ”
+                </CommandItem>
+              </CommandGroup>
+            ) : null}
+            {groupSuggestions.length > 0 ? (
+              <CommandGroup heading="Groups">
+                {groupSuggestions.map((tk) => (
+                  <CommandItem
+                    key={tk.key}
+                    value={`__group__,${tk.key}`}
+                    // Selecting a group seeds `group:` so the next keystrokes
+                    // type the label.
+                    onSelect={() => setQuery(`${tk.key}:`)}
+                  >
+                    <span className="font-medium">{tk.key}</span>
+                    <span className="text-muted-foreground">:</span>
+                    {tk.description ? (
+                      <span className="ml-2 truncate text-xs text-muted-foreground">
+                        {tk.description}
+                      </span>
+                    ) : null}
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : null}
+            {labelMatches.length > 0 ? (
+              <CommandGroup heading="Labels">
+                {labelMatches.map((value) => (
+                  <CommandItem
+                    key={`label:${value}`}
+                    value={`__label__,${value}`}
+                    onSelect={() => addTag({ key: null, value })}
+                  >
+                    {value}
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : null}
+            {groupedValueMatches.length > 0 && typedKey !== null ? (
+              <CommandGroup heading={`Existing ${typedKey} values`}>
+                {groupedValueMatches.map((value) => (
+                  <CommandItem
+                    key={`gv:${value}`}
+                    value={`__gv__,${value}`}
+                    onSelect={() => addTag({ key: typedKey, value })}
+                  >
+                    {serializeTagFilterTerm({ key: typedKey, value })}
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            ) : null}
+          </CommandList>
         </Command>
       </PopoverContent>
     </Popover>

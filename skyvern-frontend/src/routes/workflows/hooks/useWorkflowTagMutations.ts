@@ -5,9 +5,8 @@ import { getClient } from "@/api/AxiosClient";
 import { toast } from "@/components/ui/use-toast";
 import type { TagApplyRequest, TagKey, TagsResponse } from "../types/tagTypes";
 
-// Tag writes surface validation/conflict reasons in the FastAPI `detail`
-// string (422 cap/regex, 409 concurrent write), so prefer it over the generic
-// axios message.
+// Tag writes put validation/conflict reasons in the FastAPI `detail` (422 cap/regex,
+// 409 concurrent write), so prefer it over the generic axios message.
 function tagErrorMessage(error: unknown): string {
   if (isAxiosError(error)) {
     const detail = error.response?.data?.detail;
@@ -53,46 +52,11 @@ function useApplyWorkflowTagsMutation() {
   });
 }
 
-function useDeleteWorkflowTagMutation() {
-  const credentialGetter = useCredentialGetter();
-  const queryClient = useQueryClient();
+// Per-tag removal goes through the apply mutation's `tags_to_delete` (grouped by
+// {key}, standalone by {value}) so one path handles both.
 
-  return useMutation({
-    mutationFn: async ({
-      workflowPermanentId,
-      key,
-    }: {
-      workflowPermanentId: string;
-      key: string;
-    }) => {
-      const client = await getClient(credentialGetter);
-      return client
-        .delete<TagsResponse>(
-          `/workflows/${workflowPermanentId}/tags/${encodeURIComponent(key)}`,
-        )
-        .then((response) => response.data);
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["workflow-tags"] });
-      // Removing a tag decrements the key's workflow_count (and a last-remove
-      // drops it to 0), so refresh the registry that feeds the filter dropdown.
-      queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
-      // A removed tag can drop the row out of the active ?tags= filter.
-      queryClient.invalidateQueries({ queryKey: ["workflows"] });
-    },
-    onError: (error: unknown) => {
-      toast({
-        variant: "destructive",
-        title: "Failed to delete tag",
-        description: tagErrorMessage(error),
-      });
-    },
-  });
-}
-
-// Part of the tag-key mutation surface (SKY-10660). Not yet wired to a UI —
-// the tag-key description editor is a queued follow-up (SKY-10661 optional) —
-// but exported so that surface can consume it without re-deriving the hook.
+// Exported for the not-yet-wired tag-key description editor so that surface can
+// consume it without re-deriving the hook.
 function useUpdateTagKeyMutation() {
   const credentialGetter = useCredentialGetter();
   const queryClient = useQueryClient();
@@ -135,9 +99,8 @@ function useDeleteTagKeyMutation() {
         .then((response) => response.data);
     },
     onSuccess: () => {
-      // Cascade delete drops the key from the registry AND removes the tag from
-      // every workflow, so refresh the registry, batch tags, and the (tag-
-      // filterable) workflows list.
+      // Cascade delete drops the key and removes the tag from every workflow; refresh
+      // the registry, batch tags, and the (tag-filterable) workflows list.
       queryClient.invalidateQueries({ queryKey: ["tag-keys"] });
       queryClient.invalidateQueries({ queryKey: ["workflow-tags"] });
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
@@ -154,7 +117,6 @@ function useDeleteTagKeyMutation() {
 
 export {
   useApplyWorkflowTagsMutation,
-  useDeleteWorkflowTagMutation,
   useUpdateTagKeyMutation,
   useDeleteTagKeyMutation,
 };
