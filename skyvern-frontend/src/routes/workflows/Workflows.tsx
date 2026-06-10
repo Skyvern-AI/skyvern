@@ -1,5 +1,22 @@
 import { getClient } from "@/api/AxiosClient";
+import { GetStartedModal } from "@/components/onboarding/GetStartedModal";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { OnboardingErrorBoundary } from "@/components/onboarding/OnboardingErrorBoundary";
+import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import { Button } from "@/components/ui/button";
+import {
+  SelectionCheckboxCell,
+  SelectionHeaderCheckboxCell,
+} from "@/components/SelectionCheckbox";
+import { useRowSelection } from "@/hooks/useRowSelection";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Pagination,
   PaginationContent,
@@ -25,6 +42,11 @@ import {
 } from "@/components/ui/tooltip";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { basicTimeFormat, compactLocalDateTime } from "@/util/timeFormat";
+import {
+  BULK_CONCURRENCY_LIMIT,
+  runWithConcurrency,
+} from "@/util/runWithConcurrency";
+import { bulkResultToast } from "@/util/bulkResultToast";
 import { cn } from "@/util/utils";
 import {
   BookmarkFilledIcon,
@@ -37,8 +59,14 @@ import {
   ReloadIcon,
 } from "@radix-ui/react-icons";
 import { FolderIcon } from "@/components/icons/FolderIcon";
-import { useQuery } from "@tanstack/react-query";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDebounce } from "use-debounce";
 import {
@@ -48,6 +76,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { NarrativeCard } from "./components/header/NarrativeCard";
+import { BulkActionBar } from "./components/BulkActionBar";
 import { FolderCard } from "./components/FolderCard";
 import { CreateFolderDialog } from "./components/CreateFolderDialog";
 import { CreateFromTemplateDialog } from "./components/CreateFromTemplateDialog";
@@ -68,6 +97,7 @@ import {
   type TagFilterTerm,
 } from "./types/tagTypes";
 import { ImportWorkflowButton } from "./ImportWorkflowButton";
+import { useNodeCollapseStore } from "./editor/collapse/useNodeCollapseStore";
 import { convert } from "./editor/workflowEditorUtils";
 import { WorkflowApiResponse } from "./types/workflowTypes";
 import { WorkflowActions } from "./WorkflowActions";
@@ -90,6 +120,8 @@ function slugifyFolderName(name: string): string {
     .replace(/-+/g, "-") // Replace multiple hyphens with single hyphen
     .replace(/^-|-$/g, ""); // Remove leading/trailing hyphens
 }
+
+const FOLDERS_PAGE_SIZE = 10;
 
 // Generate a unique slug for a folder, appending a number suffix only if there's a collision
 function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
@@ -120,11 +152,17 @@ function getUniqueSlugForFolder(folder: Folder, allFolders: Folder[]): string {
 }
 function Workflows() {
   const credentialGetter = useCredentialGetter();
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const createWorkflowMutation = useCreateWorkflowMutation();
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 250);
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
+  const [bulkDeleteDialog, setBulkDeleteDialog] = useState<{
+    open: boolean;
+    targets: string[];
+  }>({ open: false, targets: [] });
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
     ? Number(searchParams.get("page_size"))
@@ -171,7 +209,7 @@ function Workflows() {
 
   // Fetch folders
   const { data: allFolders = [], isLoading: isFoldersLoading } =
-    useFoldersQuery({ page_size: 10 });
+    useFoldersQuery({ page_size: FOLDERS_PAGE_SIZE });
 
   // Create a memoized map of slugs to folders to avoid O(n²) lookups
   const slugToFolderMap = useMemo(() => {
@@ -185,11 +223,26 @@ function Workflows() {
 
   // Folder state - derived from URL query param
   // Look up the folder by matching the slug (handles collision suffixes like my-folder-2)
+  const resolvedFolderIdBySlug = useRef<Map<string, string>>(new Map());
+  // A short list means we saw every folder, so a lookup miss is a real
+  // deletion/rename rather than pagination dropping the active folder.
+  const foldersListComplete =
+    !isFoldersLoading && allFolders.length < FOLDERS_PAGE_SIZE;
   const selectedFolderId = useMemo(() => {
-    if (!folderSlug || allFolders.length === 0) return null;
+    if (!folderSlug) return null;
     const matchingFolder = slugToFolderMap.get(folderSlug);
-    return matchingFolder?.folder_id ?? null;
-  }, [folderSlug, allFolders.length, slugToFolderMap]);
+    if (matchingFolder) {
+      resolvedFolderIdBySlug.current.set(folderSlug, matchingFolder.folder_id);
+      return matchingFolder.folder_id;
+    }
+    if (foldersListComplete) {
+      resolvedFolderIdBySlug.current.delete(folderSlug);
+      return null;
+    }
+    // The folders list is paginated, so a refetch can transiently drop the
+    // active folder; reuse the last resolution instead of flapping to null.
+    return resolvedFolderIdBySlug.current.get(folderSlug) ?? null;
+  }, [folderSlug, slugToFolderMap, foldersListComplete]);
 
   // Clear folder param if the folder slug is invalid (folder deleted/renamed)
   // Only validate after folders have finished loading to avoid race conditions
@@ -283,6 +336,24 @@ function Workflows() {
     },
     placeholderData: (previousData) => previousData,
   });
+
+  // unfiltered "owns any workflow" check; the filtered/paginated list above can read empty for a user who has workflows
+  const { data: ownedWorkflows = [], isLoading: ownedWorkflowsLoading } =
+    useQuery<Array<WorkflowApiResponse>>({
+      queryKey: ["workflows", "exists"],
+      queryFn: async () => {
+        const client = await getClient(credentialGetter);
+        const params = new URLSearchParams();
+        params.append("page", "1");
+        params.append("page_size", "1");
+        params.append("only_workflows", "true");
+        return client
+          .get(`/workflows`, { params })
+          .then((response) => response.data);
+      },
+    });
+
+  const onboarding = useOnboardingStateOptional();
 
   const { data: nextPageWorkflows } = useQuery<Array<WorkflowApiResponse>>({
     queryKey: [
@@ -468,6 +539,143 @@ function Workflows() {
     return workflows;
   }, [activeImports, workflows, page]);
 
+  const selectableWorkflows = useMemo(
+    () =>
+      displayWorkflows.filter((workflow) => workflow.status !== "importing"),
+    [displayWorkflows],
+  );
+
+  const showCheckbox = selectableWorkflows.length > 0;
+  const columnCount = showCheckbox ? 6 : 5;
+
+  const {
+    selected,
+    selectedItems: selectedWorkflows,
+    isSelected,
+    allSelected,
+    someSelected,
+    indexById: selectableIndexById,
+    handleSelect,
+    toggleSelectAll,
+    clearSelection,
+    replaceSelection,
+  } = useRowSelection({
+    items: selectableWorkflows,
+    getId: (workflow) => workflow.workflow_permanent_id,
+    // Keyed on the folder SLUG (user navigation), not the derived id, so folder
+    // list refetches can never wipe an in-progress selection.
+    resetKey: JSON.stringify([page, folderSlug, debouncedSearch]),
+    // Page-size changes keep the selection; only the shift anchor resets.
+    anchorResetKey: itemsPerPage,
+  });
+
+  async function handleBulkMoveToFolder(folderId: string | null) {
+    if (selectedWorkflows.length === 0) {
+      return;
+    }
+
+    setIsBulkOperating(true);
+    try {
+      const client = await getClient(credentialGetter);
+      const results = await runWithConcurrency(
+        selectedWorkflows.map(
+          (workflow) => () =>
+            client.put(`/workflows/${workflow.workflow_permanent_id}/folder`, {
+              folder_id: folderId,
+            }),
+        ),
+        BULK_CONCURRENCY_LIMIT,
+      );
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      bulkResultToast({
+        succeeded,
+        total: selectedWorkflows.length,
+        results,
+        successTitle: (count) =>
+          folderId
+            ? `Moved ${count} agent${count !== 1 ? "s" : ""} to folder.`
+            : `Removed ${count} agent${count !== 1 ? "s" : ""} from folder.`,
+        failureTitle: (count) =>
+          folderId
+            ? `Failed to move ${count} agent${count !== 1 ? "s" : ""} to folder.`
+            : `Failed to remove ${count} agent${count !== 1 ? "s" : ""} from folder.`,
+        partialTitle: (successCount, failedCount) =>
+          folderId
+            ? `Moved ${successCount} agent${successCount !== 1 ? "s" : ""} to folder. ${failedCount} failed.`
+            : `Removed ${successCount} agent${successCount !== 1 ? "s" : ""} from folder. ${failedCount} failed.`,
+      });
+      if (succeeded === selectedWorkflows.length) {
+        clearSelection();
+      }
+      if (succeeded > 0) {
+        queryClient.invalidateQueries({ queryKey: ["workflows"] });
+        queryClient.invalidateQueries({ queryKey: ["folders"] });
+      }
+    } finally {
+      setIsBulkOperating(false);
+    }
+  }
+
+  async function handleBulkDeleteConfirm() {
+    // Snapshot from dialog-open time; the live selection may have changed since.
+    const targets = bulkDeleteDialog.targets;
+    if (targets.length === 0) {
+      return;
+    }
+
+    setIsBulkOperating(true);
+    try {
+      const client = await getClient(credentialGetter);
+      const results = await runWithConcurrency(
+        targets.map(
+          (workflowId) => () => client.delete(`/workflows/${workflowId}`),
+        ),
+        BULK_CONCURRENCY_LIMIT,
+      );
+
+      const succeededIds: string[] = [];
+      const failedIds = new Set<string>();
+      results.forEach((result, index) => {
+        const workflowId = targets[index]!;
+        if (result.status === "fulfilled") {
+          succeededIds.push(workflowId);
+          useNodeCollapseStore.getState().pruneWorkflow(workflowId);
+        } else {
+          failedIds.add(workflowId);
+        }
+      });
+
+      const succeeded = succeededIds.length;
+      const failed = failedIds.size;
+
+      bulkResultToast({
+        succeeded,
+        total: targets.length,
+        results,
+        successTitle: (count) =>
+          `${count} agent${count !== 1 ? "s" : ""} deleted successfully.`,
+        failureTitle: (count) =>
+          `Failed to delete ${count} agent${count !== 1 ? "s" : ""}.`,
+        partialTitle: (successCount, failedCount) =>
+          `Deleted ${successCount} agent${successCount !== 1 ? "s" : ""}. ${failedCount} failed.`,
+      });
+      // Deletions shift row indices; replace/clear also resets the shift anchor.
+      if (failed === 0) {
+        clearSelection();
+      } else {
+        replaceSelection(failedIds);
+      }
+
+      if (succeeded > 0) {
+        queryClient.invalidateQueries({ queryKey: ["workflows"] });
+        queryClient.invalidateQueries({ queryKey: ["folders"] });
+      }
+    } finally {
+      setIsBulkOperating(false);
+      setBulkDeleteDialog({ open: false, targets: [] });
+    }
+  }
+
   return (
     <div className="space-y-10">
       <div className="flex h-32 justify-between gap-6">
@@ -648,9 +856,23 @@ function Workflows() {
         <div className="overflow-hidden rounded-lg border border-border">
           <Table className="table-fixed">
             <TableHeader>
-              <TableRow>
-                <TableHead className="w-[25%]">ID</TableHead>
-                <TableHead className="w-[30%]">Title</TableHead>
+              <TableRow className="group/header">
+                {showCheckbox && (
+                  <SelectionHeaderCheckboxCell
+                    className="w-[3%]"
+                    allSelected={allSelected}
+                    someSelected={someSelected}
+                    hasSelection={selected.size > 0}
+                    onToggleAll={toggleSelectAll}
+                    ariaLabel="Select all agents"
+                  />
+                )}
+                <TableHead className={showCheckbox ? "w-[22%]" : "w-[25%]"}>
+                  ID
+                </TableHead>
+                <TableHead className={showCheckbox ? "w-[27%]" : "w-[30%]"}>
+                  Title
+                </TableHead>
                 <TableHead className="w-[15%]">Folder</TableHead>
                 <TableHead className="w-[15%]">Created At</TableHead>
                 <TableHead className="w-[15%] text-right">Actions</TableHead>
@@ -663,6 +885,11 @@ function Workflows() {
                 // Show skeleton rows only on initial load (not during search refinement)
                 Array.from({ length: 10 }).map((_, index) => (
                   <TableRow key={`skeleton-${index}`}>
+                    {showCheckbox && (
+                      <TableCell>
+                        <Skeleton className="h-4 w-4" />
+                      </TableCell>
+                    )}
                     <TableCell>
                       <Skeleton className="h-5 w-full" />
                     </TableCell>
@@ -686,7 +913,9 @@ function Workflows() {
                   </TableRow>
                 ))
               ) : displayWorkflows?.length === 0 ? (
-                <TableMessageRow colSpan={5}>No agents found</TableMessageRow>
+                <TableMessageRow colSpan={columnCount}>
+                  No agents found
+                </TableMessageRow>
               ) : (
                 displayWorkflows?.map((workflow) => {
                   const parameterItems = workflow.workflow_definition.parameters
@@ -703,16 +932,25 @@ function Workflows() {
                   const isExpanded = expandedRows.has(
                     workflow.workflow_permanent_id,
                   );
+                  const isRowSelected = isSelected(
+                    workflow.workflow_permanent_id,
+                  );
                   // Check if this is an importing agent
                   const isUploading = workflow.status === "importing";
                   const workflowTags =
                     workflowTagsMap[workflow.workflow_permanent_id];
+                  const selectableIndex = isUploading
+                    ? -1
+                    : (selectableIndexById.get(
+                        workflow.workflow_permanent_id,
+                      ) ?? -1);
 
                   return (
                     <React.Fragment key={workflow.workflow_permanent_id}>
                       {/* Main workflow row */}
                       {isUploading ? (
                         <TableRow className="opacity-70">
+                          {showCheckbox && <TableCell />}
                           <TableCell colSpan={2}>
                             <div className="flex min-w-0 items-center gap-2">
                               <ReloadIcon className="h-4 w-4 shrink-0 animate-spin text-blue-400" />
@@ -729,23 +967,40 @@ function Workflows() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-0.5">
-                              <Button size="icon" variant="ghost" disabled>
-                                <FolderIcon className="h-4 w-4" />
-                              </Button>
+                              {selected.size === 0 && (
+                                <Button size="icon" variant="ghost" disabled>
+                                  <FolderIcon className="h-4 w-4" />
+                                </Button>
+                              )}
                               <Button size="icon" variant="ghost" disabled>
                                 <Pencil2Icon className="h-4 w-4" />
                               </Button>
                               <Button size="icon" variant="ghost" disabled>
                                 <PlayIcon className="h-4 w-4" />
                               </Button>
-                              <Button size="icon" variant="ghost" disabled>
-                                <DotsHorizontalIcon className="h-4 w-4" />
-                              </Button>
+                              {selected.size === 0 && (
+                                <Button size="icon" variant="ghost" disabled>
+                                  <DotsHorizontalIcon className="h-4 w-4" />
+                                </Button>
+                              )}
                             </div>
                           </TableCell>
                         </TableRow>
                       ) : (
-                        <TableRow className="cursor-pointer">
+                        <TableRow
+                          className="group/row cursor-pointer select-none"
+                          data-state={isRowSelected ? "selected" : undefined}
+                        >
+                          {showCheckbox && (
+                            <SelectionCheckboxCell
+                              className="select-none"
+                              index={selectableIndex}
+                              checked={isRowSelected}
+                              hasSelection={selected.size > 0}
+                              onSelect={handleSelect}
+                              ariaLabel={`Select ${workflow.title}`}
+                            />
+                          )}
                           <TableCell
                             onClick={(event) => {
                               handleRowClick(
@@ -847,32 +1102,40 @@ function Workflows() {
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-0.5">
-                              <TooltipProvider>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <div>
-                                      <WorkflowFolderSelector
-                                        workflowPermanentId={
-                                          workflow.workflow_permanent_id
-                                        }
-                                        currentFolderId={workflow.folder_id}
-                                      />
-                                    </div>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    Assign to Folder
-                                  </TooltipContent>
-                                </Tooltip>
-                              </TooltipProvider>
-                              <WorkflowTagEditor
-                                workflowPermanentId={
-                                  workflow.workflow_permanent_id
-                                }
-                                tags={workflowTags ?? []}
-                                tagKeys={tagKeys}
-                                labelSuggestions={labelSuggestions}
-                                valueSuggestionsByKey={valueSuggestionsByKey}
-                              />
+                              {/* Folder, tags, and the row menu yield to the bulk bar while any selection is active; Edit and Run stay. */}
+                              {selected.size === 0 && (
+                                <>
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <div>
+                                          <WorkflowFolderSelector
+                                            workflowPermanentId={
+                                              workflow.workflow_permanent_id
+                                            }
+                                            currentFolderId={workflow.folder_id}
+                                            disabled={isBulkOperating}
+                                          />
+                                        </div>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        Assign to Folder
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                  <WorkflowTagEditor
+                                    workflowPermanentId={
+                                      workflow.workflow_permanent_id
+                                    }
+                                    tags={workflowTags ?? []}
+                                    tagKeys={tagKeys}
+                                    labelSuggestions={labelSuggestions}
+                                    valueSuggestionsByKey={
+                                      valueSuggestionsByKey
+                                    }
+                                  />
+                                </>
+                              )}
                               <TooltipProvider>
                                 <Tooltip>
                                   <TooltipTrigger asChild>
@@ -917,16 +1180,18 @@ function Workflows() {
                                   </TooltipContent>
                                 </Tooltip>
                               </TooltipProvider>
-                              <WorkflowActions
-                                workflow={workflow}
-                                hasParameters={hasParameters}
-                                parametersExpanded={isExpanded}
-                                onToggleParameters={() =>
-                                  toggleParametersExpanded(
-                                    workflow.workflow_permanent_id,
-                                  )
-                                }
-                              />
+                              {selected.size === 0 && (
+                                <WorkflowActions
+                                  workflow={workflow}
+                                  hasParameters={hasParameters}
+                                  parametersExpanded={isExpanded}
+                                  onToggleParameters={() =>
+                                    toggleParametersExpanded(
+                                      workflow.workflow_permanent_id,
+                                    )
+                                  }
+                                />
+                              )}
                             </div>
                           </TableCell>
                         </TableRow>
@@ -938,7 +1203,7 @@ function Workflows() {
                           key={`${workflow.workflow_permanent_id}-params`}
                         >
                           <TableCell
-                            colSpan={5}
+                            colSpan={columnCount}
                             className="bg-slate-50 dark:bg-slate-900/50"
                           >
                             <ParameterDisplayInline
@@ -1001,6 +1266,71 @@ function Workflows() {
           </div>
         </div>
 
+        {selectedWorkflows.length > 0 && (
+          <BulkActionBar
+            selectedWorkflows={selectedWorkflows}
+            isOperating={isBulkOperating}
+            onOperatingChange={setIsBulkOperating}
+            onClearSelection={clearSelection}
+            onDeleteRequest={() =>
+              setBulkDeleteDialog({
+                open: true,
+                targets: selectedWorkflows.map(
+                  (workflow) => workflow.workflow_permanent_id,
+                ),
+              })
+            }
+            onMoveToFolder={handleBulkMoveToFolder}
+            tagKeys={tagKeys}
+            labelSuggestions={labelSuggestions}
+            valueSuggestionsByKey={valueSuggestionsByKey}
+          />
+        )}
+
+        <Dialog
+          open={bulkDeleteDialog.open}
+          onOpenChange={(open) => {
+            if (!open && !isBulkOperating) {
+              setBulkDeleteDialog({ open: false, targets: [] });
+            }
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>
+                Delete {bulkDeleteDialog.targets.length} Agent
+                {bulkDeleteDialog.targets.length === 1 ? "" : "s"}
+              </DialogTitle>
+              <DialogDescription>
+                Are you sure you want to delete{" "}
+                {bulkDeleteDialog.targets.length}{" "}
+                {bulkDeleteDialog.targets.length === 1 ? "agent" : "agents"}?
+                This action cannot be undone.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="secondary"
+                disabled={isBulkOperating}
+                onClick={() =>
+                  setBulkDeleteDialog({ open: false, targets: [] })
+                }
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={isBulkOperating}
+                onClick={() => {
+                  void handleBulkDeleteConfirm();
+                }}
+              >
+                {isBulkOperating ? "Deleting..." : "Delete"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Folder Dialogs */}
         <CreateFolderDialog
           open={isCreateFolderOpen}
@@ -1029,7 +1359,20 @@ function Workflows() {
           }}
         />
 
-        <WorkflowTemplates />
+        <div data-hint="start-template">
+          <WorkflowTemplates />
+        </div>
+
+        {onboarding ? (
+          <OnboardingErrorBoundary
+            onError={() => OnboardingTelemetry.modalRenderError("dashboard")}
+          >
+            <GetStartedModal
+              hasWorkflows={ownedWorkflows.length > 0}
+              isLoading={ownedWorkflowsLoading}
+            />
+          </OnboardingErrorBoundary>
+        ) : null}
       </div>
     </div>
   );

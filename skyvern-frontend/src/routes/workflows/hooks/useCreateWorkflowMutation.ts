@@ -6,6 +6,7 @@ import { useNavigate } from "react-router-dom";
 import { stringify as convertToYAML } from "yaml";
 import { WorkflowApiResponse } from "../types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
+import { OnboardingTelemetry } from "@/util/onboarding/OnboardingTelemetry";
 import axios from "axios";
 
 type CreateWorkflowInput = WorkflowCreateYAMLRequest & { _via?: string };
@@ -53,7 +54,16 @@ function useCreateWorkflowMutation() {
       queryClient.invalidateQueries({
         queryKey: ["folders"],
       });
+      queryClient.invalidateQueries({
+        queryKey: ["userOnboarding"],
+      });
       const via = variables._via;
+      // Emit completion here rather than in the caller's mutate-level onSuccess:
+      // this navigation unmounts the onboarding modal, and React Query skips
+      // mutate-level callbacks once their observer unmounts.
+      if (via === "onboarding_template") {
+        OnboardingTelemetry.flowCompleted("dashboard");
+      }
       const search = via ? `?via=${encodeURIComponent(via)}` : "";
       navigate(
         `/workflows/${response.data.workflow_permanent_id}/build${search}`,

@@ -76,12 +76,22 @@ import { useParameterExpansion } from "./hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "./components/ParameterDisplayInline";
 import { getOrderedRunParameters } from "./utils";
 import { buildWorkflowAnalyticsPath } from "./workflowAnalyticsPath";
-import { useFeatureFlagEnabled } from "posthog-js/react";
+import {
+  useFeatureFlagEnabled,
+  useFeatureFlagVariantKey,
+} from "posthog-js/react";
+import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 import { ANALYTICS_DASHBOARD_FLAG } from "@/util/featureFlags";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
 
 function WorkflowPage() {
   const { workflowPermanentId } = useParams();
   const isCloud = useContext(CloudContext);
+  const onboarding = useOnboardingStateOptional();
+  const isNewUser = onboarding?.isNewUser ?? false;
+  const onboardingState = onboarding?.state ?? null;
+  const onboardingFlag = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const analyticsEnabled =
     useFeatureFlagEnabled(ANALYTICS_DASHBOARD_FLAG) === true;
   const [searchParams, setSearchParams] = useSearchParams();
@@ -226,224 +236,264 @@ function WorkflowPage() {
         <header>
           <h1 className="text-2xl">Past Runs</h1>
         </header>
-        <div className="flex items-center justify-between gap-4">
-          <TableSearchInput
-            value={search}
-            onChange={(value) => {
-              setSearch(value);
-              const params = new URLSearchParams(searchParams);
-              params.set("page", "1");
-              setSearchParams(params, { replace: true });
-            }}
-            placeholder="Search runs by input..."
-            className="w-48 lg:w-72"
-          />
-          <StatusFilterDropdown
-            values={statusFilters}
-            onChange={setStatusFilters}
-          />
-        </div>
-        <div className="overflow-hidden rounded-lg border border-border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-[20%]">ID</TableHead>
-                <TableHead className="w-[20%]">Status</TableHead>
-                <TableHead className="w-[20%]">Created At</TableHead>
-                <TableHead className="w-[20%]">Duration</TableHead>
-                <TableHead className="w-[20%] text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {isLoading ? (
-                <TableMessageRow colSpan={5}>Loading runs…</TableMessageRow>
-              ) : workflowRuns?.length === 0 ? (
-                <TableMessageRow colSpan={5}>
-                  No agent runs found
-                </TableMessageRow>
-              ) : (
-                workflowRuns?.map((workflowRun) => {
-                  const workflowRunId =
-                    workflowRun.script_run === true ? (
-                      <div className="flex items-center gap-2">
-                        <Tip content="Ran with code">
-                          <LightningBoltIcon className="text-[gold]" />
-                        </Tip>
-                        <span>{workflowRun.workflow_run_id ?? ""}</span>
-                      </div>
-                    ) : (
-                      (workflowRun.workflow_run_id ?? "")
-                    );
-
-                  const isExpanded = expandedRows.has(
-                    workflowRun.workflow_run_id,
-                  );
-
-                  return (
-                    <React.Fragment key={workflowRun.workflow_run_id}>
-                      {/* Main run row */}
-                      <TableRow
-                        onClick={(event) => {
-                          const url = env.useNewRunsUrl
-                            ? `/runs/${workflowRun.workflow_run_id}`
-                            : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
-
-                          if (event.ctrlKey || event.metaKey) {
-                            window.open(
-                              window.location.origin + url,
-                              "_blank",
-                              "noopener,noreferrer",
-                            );
-                            return;
-                          }
-                          navigate(url);
-                        }}
-                        className="cursor-pointer"
-                      >
-                        <TableCell className="font-mono text-xs text-muted-foreground">
-                          {workflowRunId}
-                        </TableCell>
-                        <TableCell>
-                          <StatusBadge status={workflowRun.status} />
-                        </TableCell>
-                        <TableCell
-                          className="text-muted-foreground"
-                          title={basicTimeFormat(workflowRun.created_at)}
-                        >
-                          {compactLocalDateTime(workflowRun.created_at)}
-                        </TableCell>
-                        <TableCell className="tabular-nums text-muted-foreground">
-                          {formatExecutionTime(
-                            workflowRun.started_at ?? workflowRun.created_at,
-                            workflowRun.finished_at,
-                          ) ?? "-"}
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex justify-end gap-2">
-                            <TooltipProvider>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    size="icon"
-                                    variant="ghost"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      toggleParametersExpanded(
-                                        workflowRun.workflow_run_id,
-                                      );
-                                    }}
-                                    className={cn(
-                                      isExpanded
-                                        ? "text-blue-400"
-                                        : "text-muted-foreground hover:text-foreground",
-                                    )}
-                                  >
-                                    <MixerHorizontalIcon className="h-4 w-4" />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                  {isExpanded ? "Hide Inputs" : "Show Inputs"}
-                                </TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-
-                      {/* Expanded parameters section */}
-                      {isExpanded && (
-                        <TableRow key={`${workflowRun.workflow_run_id}-params`}>
-                          <TableCell
-                            colSpan={5}
-                            className="bg-slate-50 dark:bg-slate-900/50"
-                          >
-                            <WorkflowRunParameters
-                              workflowPermanentId={workflowPermanentId}
-                              workflowRunId={workflowRun.workflow_run_id}
-                              workflow={workflow}
-                              searchQuery={debouncedSearch}
-                              keywordMatchesParameter={matchesParameter}
-                            />
-                          </TableCell>
-                        </TableRow>
-                      )}
-                    </React.Fragment>
-                  );
-                })
-              )}
-            </TableBody>
-          </Table>
-          <RunParametersDialog
-            open={openRunParams !== null}
-            onOpenChange={(open) => {
-              if (!open) setOpenRunParams(null);
-            }}
-            workflowPermanentId={workflowPermanentId}
-            workflowRunId={openRunParams}
-          />
-          <div className="relative px-3 py-3">
-            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-              <span className="text-slate-400">Items per page</span>
-              <Select
-                value={String(pageSize)}
-                onValueChange={(size) => {
+        {!isLoading &&
+        workflowRuns?.length === 0 &&
+        statusFilters.length === 0 &&
+        !debouncedSearch &&
+        isNewUser &&
+        onboardingState?.first_run_at === null &&
+        isABVariant(onboardingFlag) ? (
+          <div className="rounded-md border">
+            <OnboardingEmptyState
+              surface="runs"
+              icon={<PlayIcon className="h-6 w-6" />}
+              title="No runs yet for this workflow"
+              description="Run this workflow to see results here. Each run tracks status, parameters, and duration."
+              primaryAction={{
+                label: "Run this workflow",
+                onClick: () =>
+                  navigate(`/workflows/${workflowPermanentId}/run`),
+              }}
+              secondaryAction={{
+                label: "View documentation",
+                onClick: () =>
+                  window.open(
+                    "https://docs.skyvern.com",
+                    "_blank",
+                    "noopener,noreferrer",
+                  ),
+              }}
+            />
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-4">
+              <TableSearchInput
+                value={search}
+                onChange={(value) => {
+                  setSearch(value);
                   const params = new URLSearchParams(searchParams);
-                  params.set("page_size", size);
                   params.set("page", "1");
                   setSearchParams(params, { replace: true });
                 }}
-              >
-                <SelectTrigger className="w-[65px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {PAGE_SIZE_OPTIONS.map((size) => (
-                    <SelectItem key={size} value={size}>
-                      {size}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                placeholder="Search runs by input..."
+                className="w-48 lg:w-72"
+              />
+              <StatusFilterDropdown
+                values={statusFilters}
+                onChange={setStatusFilters}
+              />
             </div>
-            <Pagination className="pt-0">
-              <PaginationContent>
-                <PaginationItem>
-                  <PaginationPrevious
-                    className={cn({ "cursor-not-allowed": page === 1 })}
-                    onClick={() => {
-                      if (page === 1) {
-                        return;
-                      }
+            <div className="overflow-hidden rounded-lg border border-border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[20%]">ID</TableHead>
+                    <TableHead className="w-[20%]">Status</TableHead>
+                    <TableHead className="w-[20%]">Created At</TableHead>
+                    <TableHead className="w-[20%]">Duration</TableHead>
+                    <TableHead className="w-[20%] text-right">
+                      Actions
+                    </TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {isLoading ? (
+                    <TableMessageRow colSpan={5}>Loading runs…</TableMessageRow>
+                  ) : workflowRuns?.length === 0 ? (
+                    <TableMessageRow colSpan={5}>
+                      No agent runs found
+                    </TableMessageRow>
+                  ) : (
+                    workflowRuns?.map((workflowRun) => {
+                      const workflowRunId =
+                        workflowRun.script_run === true ? (
+                          <div className="flex items-center gap-2">
+                            <Tip content="Ran with code">
+                              <LightningBoltIcon className="text-[gold]" />
+                            </Tip>
+                            <span>{workflowRun.workflow_run_id ?? ""}</span>
+                          </div>
+                        ) : (
+                          (workflowRun.workflow_run_id ?? "")
+                        );
+
+                      const isExpanded = expandedRows.has(
+                        workflowRun.workflow_run_id,
+                      );
+
+                      return (
+                        <React.Fragment key={workflowRun.workflow_run_id}>
+                          {/* Main run row */}
+                          <TableRow
+                            onClick={(event) => {
+                              const url = env.useNewRunsUrl
+                                ? `/runs/${workflowRun.workflow_run_id}`
+                                : `/workflows/${workflowPermanentId}/${workflowRun.workflow_run_id}/overview`;
+
+                              if (event.ctrlKey || event.metaKey) {
+                                window.open(
+                                  window.location.origin + url,
+                                  "_blank",
+                                  "noopener,noreferrer",
+                                );
+                                return;
+                              }
+                              navigate(url);
+                            }}
+                            className="cursor-pointer"
+                          >
+                            <TableCell className="font-mono text-xs text-muted-foreground">
+                              {workflowRunId}
+                            </TableCell>
+                            <TableCell>
+                              <StatusBadge status={workflowRun.status} />
+                            </TableCell>
+                            <TableCell
+                              className="text-muted-foreground"
+                              title={basicTimeFormat(workflowRun.created_at)}
+                            >
+                              {compactLocalDateTime(workflowRun.created_at)}
+                            </TableCell>
+                            <TableCell className="tabular-nums text-muted-foreground">
+                              {formatExecutionTime(
+                                workflowRun.started_at ??
+                                  workflowRun.created_at,
+                                workflowRun.finished_at,
+                              ) ?? "-"}
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex justify-end gap-2">
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <Button
+                                        size="icon"
+                                        variant="ghost"
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          toggleParametersExpanded(
+                                            workflowRun.workflow_run_id,
+                                          );
+                                        }}
+                                        className={cn(
+                                          isExpanded
+                                            ? "text-blue-400"
+                                            : "text-muted-foreground hover:text-foreground",
+                                        )}
+                                      >
+                                        <MixerHorizontalIcon className="h-4 w-4" />
+                                      </Button>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      {isExpanded
+                                        ? "Hide Inputs"
+                                        : "Show Inputs"}
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+
+                          {/* Expanded parameters section */}
+                          {isExpanded && (
+                            <TableRow
+                              key={`${workflowRun.workflow_run_id}-params`}
+                            >
+                              <TableCell
+                                colSpan={5}
+                                className="bg-slate-50 dark:bg-slate-900/50"
+                              >
+                                <WorkflowRunParameters
+                                  workflowPermanentId={workflowPermanentId}
+                                  workflowRunId={workflowRun.workflow_run_id}
+                                  workflow={workflow}
+                                  searchQuery={debouncedSearch}
+                                  keywordMatchesParameter={matchesParameter}
+                                />
+                              </TableCell>
+                            </TableRow>
+                          )}
+                        </React.Fragment>
+                      );
+                    })
+                  )}
+                </TableBody>
+              </Table>
+              <RunParametersDialog
+                open={openRunParams !== null}
+                onOpenChange={(open) => {
+                  if (!open) setOpenRunParams(null);
+                }}
+                workflowPermanentId={workflowPermanentId}
+                workflowRunId={openRunParams}
+              />
+              <div className="relative px-3 py-3">
+                <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+                  <span className="text-slate-400">Items per page</span>
+                  <Select
+                    value={String(pageSize)}
+                    onValueChange={(size) => {
                       const params = new URLSearchParams(searchParams);
-                      params.set("page", String(Math.max(1, page - 1)));
+                      params.set("page_size", size);
+                      params.set("page", "1");
                       setSearchParams(params, { replace: true });
                     }}
-                  />
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationLink>{page}</PaginationLink>
-                </PaginationItem>
-                <PaginationItem>
-                  <PaginationNext
-                    className={cn({
-                      "cursor-not-allowed":
-                        workflowRuns !== undefined &&
-                        workflowRuns.length < pageSize,
-                    })}
-                    onClick={() => {
-                      if (workflowRuns && workflowRuns.length < pageSize) {
-                        return;
-                      }
-                      const params = new URLSearchParams(searchParams);
-                      params.set("page", String(page + 1));
-                      setSearchParams(params, { replace: true });
-                    }}
-                  />
-                </PaginationItem>
-              </PaginationContent>
-            </Pagination>
-          </div>
-        </div>
+                  >
+                    <SelectTrigger className="w-[65px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PAGE_SIZE_OPTIONS.map((size) => (
+                        <SelectItem key={size} value={size}>
+                          {size}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Pagination className="pt-0">
+                  <PaginationContent>
+                    <PaginationItem>
+                      <PaginationPrevious
+                        className={cn({ "cursor-not-allowed": page === 1 })}
+                        onClick={() => {
+                          if (page === 1) {
+                            return;
+                          }
+                          const params = new URLSearchParams(searchParams);
+                          params.set("page", String(Math.max(1, page - 1)));
+                          setSearchParams(params, { replace: true });
+                        }}
+                      />
+                    </PaginationItem>
+                    <PaginationItem>
+                      <PaginationLink>{page}</PaginationLink>
+                    </PaginationItem>
+                    <PaginationItem>
+                      <PaginationNext
+                        className={cn({
+                          "cursor-not-allowed":
+                            workflowRuns !== undefined &&
+                            workflowRuns.length < pageSize,
+                        })}
+                        onClick={() => {
+                          if (workflowRuns && workflowRuns.length < pageSize) {
+                            return;
+                          }
+                          const params = new URLSearchParams(searchParams);
+                          params.set("page", String(page + 1));
+                          setSearchParams(params, { replace: true });
+                        }}
+                      />
+                    </PaginationItem>
+                  </PaginationContent>
+                </Pagination>
+              </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

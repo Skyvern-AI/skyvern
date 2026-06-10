@@ -6,7 +6,12 @@ import {
 } from "@/components/ui/tooltip";
 import { badgeVariants } from "@/components/ui/badge-variants";
 import { cn } from "@/util/utils";
-import { sortTags, tagElementKey, type Tag } from "../../types/tagTypes";
+import {
+  normalizeWorkflowTags,
+  sortTags,
+  tagElementKey,
+  type Tag,
+} from "../../types/tagTypes";
 import { TagChip } from "./TagChip";
 
 type Props = {
@@ -21,10 +26,13 @@ type Props = {
 // Generic list of tag chips with a "+N" overflow affordance. Standalone labels
 // sort first, then grouped by key, for stable ordering across renders.
 function TagChipList({ tags, descriptions, maxVisible = 3, className }: Props) {
-  if (tags.length === 0) {
+  // Re-validate at render time: callers feed this straight from API payloads,
+  // and a shape skew here previously killed the whole route via React #31.
+  const safeTags = normalizeWorkflowTags(tags);
+  if (safeTags.length === 0) {
     return null;
   }
-  const sorted = sortTags(tags);
+  const sorted = sortTags(safeTags);
   const visible = sorted.slice(0, maxVisible);
   const hidden = sorted.slice(maxVisible);
 
