@@ -12,6 +12,7 @@ const { mockFeatureFlagEnabled } = vi.hoisted(() => ({
 
 vi.mock("posthog-js/react", () => ({
   useFeatureFlagEnabled: (flag: string) => mockFeatureFlagEnabled(flag),
+  useFeatureFlagVariantKey: () => undefined,
 }));
 
 vi.mock("use-debounce", () => ({
@@ -83,6 +84,23 @@ vi.mock("./hooks/useParameterExpansion", () => ({
     expandedRows: new Set<string>(),
     toggleExpanded: vi.fn(),
     setAutoExpandedRows: vi.fn(),
+  }),
+}));
+
+vi.mock("@/store/onboarding/useOnboardingState", () => ({
+  useOnboardingState: () => ({
+    state: null,
+    isLoading: false,
+    updateState: vi.fn(),
+    isNewUser: false,
+    abVariant: null,
+  }),
+  useOnboardingStateOptional: () => ({
+    state: null,
+    isLoading: false,
+    updateState: vi.fn(),
+    isNewUser: false,
+    abVariant: null,
   }),
 }));
 
