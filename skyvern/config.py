@@ -492,8 +492,12 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden or azure_vault
+    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # GCP Secret Manager credential vault settings
+    GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
+    GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
 
     # Azure Setting
     AZURE_TENANT_ID: str | None = None

@@ -179,24 +179,19 @@ def warn_if_file_download_max_steps_low(
     )
 
 
-BLOCK_BASELINE_MARKER = "_set_by_block"
-
-
 async def capture_block_download_baseline(
     context: SkyvernContext,
     organization_id: str,
     workflow_run_id: str,
     block_label: str,
 ) -> None:
-    """Snapshot downloaded files before a task block runs.
+    """Snapshot the files already downloaded before this block runs.
 
-    Sets ``loop_internal_state`` so ``filter_downloaded_files_for_current_iteration``
-    scopes the block's output to only files it downloaded.  Skips capture when the
-    baseline was already set by a ForLoopBlock (no marker).
+    Recorded in ``loop_internal_state`` so ``filter_downloaded_files_for_current_iteration``
+    scopes the block's output to only the files it produced. Captured fresh for every
+    block — including each block inside a loop iteration — so sibling download-producing
+    blocks don't inherit one another's files. Best-effort: cleared on timeout/error.
     """
-    existing = context.loop_internal_state
-    if existing and BLOCK_BASELINE_MARKER not in existing:
-        return
     try:
         async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
             baseline_files = await app.STORAGE.get_downloaded_files(
@@ -205,7 +200,6 @@ async def capture_block_download_baseline(
             )
             context.loop_internal_state = {
                 DOWNLOADED_FILE_SIGS_KEY: [to_downloaded_file_signature(fi) for fi in baseline_files],
-                BLOCK_BASELINE_MARKER: True,
             }
             LOG.debug(
                 "Captured block download baseline",
@@ -2246,7 +2240,9 @@ class ForLoopBlock(Block):
                 )
             LOG.info("Starting loop iteration", loop_idx=loop_idx, loop_over_value=loop_over_value_repr)
 
-            # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
+            # Capture baseline downloaded files for per-iteration scoping (SKY-7005).
+            # Download-producing child blocks re-capture their own per-block baseline
+            # at start; this seed only covers filtering before the first such capture.
             loop_context = skyvern_context.current()
             if loop_context:
                 downloaded_file_sigs_before: list[tuple[str | None, str | None, str | None]] = []
@@ -2971,7 +2967,9 @@ class WhileLoopBlock(Block):
                     last_block=current_block,
                 )
 
-            # Capture baseline downloaded files for per-iteration scoping (SKY-7005)
+            # Capture baseline downloaded files for per-iteration scoping (SKY-7005).
+            # Download-producing child blocks re-capture their own per-block baseline
+            # at start; this seed only covers filtering before the first such capture.
             loop_context = skyvern_context.current()
             if loop_context:
                 downloaded_file_sigs_before: list[tuple[str | None, str | None, str | None]] = []
