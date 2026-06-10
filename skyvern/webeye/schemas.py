@@ -67,6 +67,10 @@ class BrowserSessionResponse(BaseModel):
         default=None,
         description="ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`.",
     )
+    generate_browser_profile: bool = Field(
+        default=False,
+        description="Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
+    )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
     downloaded_files: list[FileInfo] | None = Field(
@@ -153,4 +157,5 @@ class BrowserSessionResponse(BaseModel):
             extensions=browser_session.extensions,
             browser_type=browser_session.browser_type,
             browser_profile_id=browser_session.browser_profile_id,
+            generate_browser_profile=browser_session.generate_browser_profile,
         )

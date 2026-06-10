@@ -1,10 +1,13 @@
 import asyncio
 import io
 import os
-from datetime import datetime
+import shutil
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Generator
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import boto3
 import pytest
@@ -1140,3 +1143,83 @@ class TestS3StorageZIPArchiveRetrieve:
         )
         assert uri.endswith(".zip")
         assert not uri.endswith(".zst")
+
+
+@pytest.mark.asyncio
+class TestS3StoragePerRunRecordingClips:
+    """Integration test for the SKY-7220 per-run clip path: drives the real
+    ``S3Storage.sync_browser_session_file(videos)`` against moto S3 with a real
+    ffmpeg-generated recording, asserting a run-scoped clip is cut and uploaded."""
+
+    async def test_session_close_cuts_and_uploads_run_scoped_clip(
+        self,
+        s3_storage: S3Storage,
+        boto3_test_client: S3Client,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            pytest.skip("ffmpeg/ffprobe not installed")
+
+        # A real ~12s recording standing in for the finalized session video.
+        src = tmp_path / "recording.webm"
+        subprocess.check_call(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x180:rate=10:duration=12",
+                "-c:v",
+                "libvpx",
+                str(src),
+            ]
+        )
+
+        import skyvern.forge.sdk.artifact.storage.run_recording_clips as rrc
+
+        now = datetime.now(UTC)
+        run = SimpleNamespace(
+            workflow_run_id="wr_itest",
+            started_at=now - timedelta(seconds=10),
+            finished_at=now - timedelta(seconds=2),
+        )
+        create_clip = AsyncMock(return_value="a_clip")
+        fake_app = MagicMock()
+        fake_app.DATABASE.workflow_runs.get_workflow_runs_for_browser_session = AsyncMock(return_value=[run])
+        fake_app.DATABASE.artifacts.list_artifacts_for_run_by_type = AsyncMock(return_value=[])
+        fake_app.DATABASE.observer.get_task_v2_by_workflow_run_id = AsyncMock(return_value=None)
+        fake_app.ARTIFACT_MANAGER.create_run_recording_artifact = create_clip
+        monkeypatch.setattr(rrc, "app", fake_app)
+
+        uri = await s3_storage.sync_browser_session_file(
+            organization_id=TEST_ORGANIZATION_ID,
+            browser_session_id=TEST_BROWSER_SESSION_ID,
+            artifact_type="videos",
+            local_file_path=str(src),
+            remote_path="recording.webm",
+            date="2025-01-15",
+        )
+
+        # Full session recording still uploaded under videos/.
+        assert f"/browser_sessions/{TEST_BROWSER_SESSION_ID}/videos/2025-01-15/" in uri
+
+        # Exactly one run-scoped clip registered, run_id propagated, stored under run_recordings/.
+        create_clip.assert_awaited_once()
+        call = create_clip.await_args
+        assert call is not None
+        kwargs = call.kwargs
+        assert kwargs["run_id"] == "wr_itest"
+        assert kwargs["workflow_run_id"] == "wr_itest"
+        assert kwargs["file_size"] and kwargs["file_size"] > 0
+        clip_uri = kwargs["uri"]
+        assert f"/browser_sessions/{TEST_BROWSER_SESSION_ID}/run_recordings/2025-01-15/wr_itest/" in clip_uri
+
+        # The clip bytes really landed in (moto) S3 — proves the real ffmpeg cut + upload ran.
+        clip_key = S3Uri(clip_uri).key
+        head = boto3_test_client.head_object(Bucket=TEST_BUCKET, Key=clip_key)
+        assert head["ContentLength"] > 0
