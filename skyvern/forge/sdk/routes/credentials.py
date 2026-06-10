@@ -83,6 +83,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenCredentialSafe,
     BitwardenOrganizationAuthToken,
     BitwardenOrganizationAuthTokenSafe,
+    ClearOrganizationAuthTokenResponse,
     CreateAzureClientSecretCredentialRequest,
     CreateBitwardenCredentialRequest,
     CreateCustomCredentialServiceConfigRequest,
@@ -128,6 +129,13 @@ _background_tasks: set[asyncio.Task] = set()
 # profile task waits; the status grace period derives from these to stay aligned.
 _SESSION_PERSIST_MAX_RETRIES = 20
 _SESSION_PERSIST_RETRY_INTERVAL_SECONDS = 3
+
+_ORG_AUTH_CREDENTIAL_TOKEN_TYPES = {
+    "onepassword": OrganizationAuthTokenType.onepassword_service_account,
+    "bitwarden": OrganizationAuthTokenType.bitwarden_credential,
+    "azure_credential": OrganizationAuthTokenType.azure_client_secret_credential,
+    "custom_credential": OrganizationAuthTokenType.custom_credential_service,
+}
 # -1 because no sleep follows the final attempt.
 _SESSION_PERSIST_MAX_WAIT_SECONDS = (_SESSION_PERSIST_MAX_RETRIES - 1) * _SESSION_PERSIST_RETRY_INTERVAL_SECONDS
 # Buffer over the max wait so the status endpoint doesn't misreport while the task still retries.
@@ -1884,6 +1892,47 @@ async def update_onepassword_token(
             status_code=500,
             detail=f"Failed to create or update OnePassword service account token: {str(e)}",
         )
+
+
+@base_router.delete(
+    "/credentials/{credential_provider}",
+    response_model=ClearOrganizationAuthTokenResponse,
+    summary="Clear organization auth credential",
+    description="Clears the current organization auth credential for the current organization.",
+    include_in_schema=False,
+)
+@base_router.delete(
+    "/credentials/{credential_provider}/",
+    response_model=ClearOrganizationAuthTokenResponse,
+    include_in_schema=False,
+)
+async def clear_org_auth_credential(
+    credential_provider: str = Path(..., description="The organization auth credential provider to clear."),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ClearOrganizationAuthTokenResponse:
+    """
+    Clear the current organization auth credential for the organization.
+
+    This endpoint is idempotent; it succeeds even when no valid token exists.
+    """
+    token_type = _ORG_AUTH_CREDENTIAL_TOKEN_TYPES.get(credential_provider)
+    if not token_type:
+        raise HTTPException(status_code=404, detail="Unsupported organization auth credential provider")
+    try:
+        await app.DATABASE.organizations.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=token_type,
+        )
+        return ClearOrganizationAuthTokenResponse(success=True)
+    except Exception as e:
+        LOG.error(
+            "Failed to clear organization auth token",
+            organization_id=current_org.organization_id,
+            token_type=token_type.value,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to clear organization auth credential") from e
 
 
 def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> BitwardenCredentialResponse:
