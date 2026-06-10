@@ -40,7 +40,7 @@ from skyvern.forge.sdk.trace import traced
 LOG = structlog.get_logger()
 
 
-def _build_engine(database_string: str) -> AsyncEngine:
+def _build_engine(database_string: str, disable_pool: bool | None = None) -> AsyncEngine:
     """
     Build a SQLAlchemy async engine.
 
@@ -52,6 +52,9 @@ def _build_engine(database_string: str) -> AsyncEngine:
       When DISABLE_CONNECTION_POOL=False (QueuePool): disable prepared statements
       and do not set statement_timeout - set at role level in the database,
       since the transaction pooler does not maintain session-level settings.
+
+    Pass disable_pool to override the global DISABLE_CONNECTION_POOL setting for a
+    single engine.
 
     SQLite behaviour:
       For :memory: databases, uses StaticPool to keep the single connection alive.
@@ -81,8 +84,9 @@ def _build_engine(database_string: str) -> AsyncEngine:
 
         return engine
 
+    use_null_pool = settings.DISABLE_CONNECTION_POOL if disable_pool is None else disable_pool
     connect_args: dict[str, Any] = {}
-    if settings.DISABLE_CONNECTION_POOL:
+    if use_null_pool:
         if "postgresql+psycopg" in database_string:
             connect_args["options"] = f"-c statement_timeout={settings.DATABASE_STATEMENT_TIMEOUT_MS}"
         if "postgresql+asyncpg" in database_string:
@@ -113,8 +117,16 @@ __all__ = ["AgentDB", "ScheduleLimitExceededError"]
 
 
 class AgentDB(BaseAlchemyDB):
-    def __init__(self, database_string: str, debug_enabled: bool = False, db_engine: AsyncEngine | None = None) -> None:
-        super().__init__(db_engine or _build_engine(database_string))
+    def __init__(
+        self,
+        database_string: str,
+        debug_enabled: bool = False,
+        db_engine: AsyncEngine | None = None,
+        disable_pool: bool | None = None,
+    ) -> None:
+        if db_engine is not None and disable_pool is not None:
+            raise ValueError("Pass either db_engine or disable_pool, not both")
+        super().__init__(db_engine or _build_engine(database_string, disable_pool=disable_pool))
         self.debug_enabled = debug_enabled
         # Global lock for SQLite schedule serialization. Unlike Postgres advisory locks
         # (which are scoped per org:workflow via hashtext(key)), this serializes ALL

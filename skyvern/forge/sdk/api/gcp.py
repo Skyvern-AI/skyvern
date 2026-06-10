@@ -79,7 +79,25 @@ class AsyncGcsStorageClient(Protocol):
     async def close(self) -> None: ...
 
 
+class AsyncGcpSecretManagerClient(Protocol):
+    """Interface for GCP Secret Manager operations — the customer-runtime
+    credential vault. Mirrors the method surface of ``AsyncAzureVaultClient``
+    (with ``project_id`` in place of ``vault_name``) so the credential vault
+    service can be a near-copy of the Azure one.
+    """
+
+    async def get_secret(self, secret_id: str, project_id: str) -> str | None: ...
+
+    async def create_or_update_secret(self, secret_id: str, project_id: str, value: str) -> str: ...
+
+    async def delete_secret(self, secret_id: str, project_id: str) -> None: ...
+
+    async def close(self) -> None: ...
+
+
 class GcpClientFactory(Protocol):
-    """Interface for creating GCS storage clients."""
+    """Interface for creating GCS storage and Secret Manager clients."""
 
     def create_storage_client(self, project_id: str | None = None) -> "AsyncGcsStorageClient": ...
+
+    def create_secret_manager_client(self) -> "AsyncGcpSecretManagerClient": ...

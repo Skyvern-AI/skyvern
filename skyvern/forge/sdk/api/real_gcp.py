@@ -5,20 +5,22 @@
 """
 
 import asyncio
+import threading
 from datetime import timedelta
 from mimetypes import add_type, guess_type
 from typing import IO
 
 import structlog
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import Conflict, NotFound
 from google.auth import default as google_auth_default
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.cloud import storage
+from google.cloud import secretmanager_v1, storage
 
 from skyvern.config import settings
 from skyvern.forge.sdk.api.gcp import (
     STORAGE_CLASS_STANDARD,
+    AsyncGcpSecretManagerClient,
     AsyncGcsStorageClient,
     GcpClientFactory,
     GcsUri,
@@ -45,13 +47,19 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
         self.project_id = project_id or settings.GCS_PROJECT_ID
         self._credentials = credentials
         self._client: storage.Client | None = None
+        self._client_lock = threading.Lock()
 
     def _get_client(self) -> storage.Client:
+        # Double-checked locking: _get_client runs inside asyncio.to_thread, so
+        # concurrent first calls would otherwise each build a client and leak all
+        # but the last.
         if self._client is None:
-            # When credentials are omitted the client resolves Application
-            # Default Credentials (GOOGLE_APPLICATION_CREDENTIALS / Workload
-            # Identity). STORAGE_EMULATOR_HOST is honored automatically.
-            self._client = storage.Client(project=self.project_id, credentials=self._credentials)
+            with self._client_lock:
+                if self._client is None:
+                    # When credentials are omitted the client resolves Application
+                    # Default Credentials (GOOGLE_APPLICATION_CREDENTIALS / Workload
+                    # Identity). STORAGE_EMULATOR_HOST is honored automatically.
+                    self._client = storage.Client(project=self.project_id, credentials=self._credentials)
         return self._client
 
     def _get_blob(self, uri: str) -> storage.Blob:
@@ -225,8 +233,102 @@ class RealAsyncGcsStorageClient(AsyncGcsStorageClient):
             self._client = None
 
 
+class RealAsyncGcpSecretManagerClient(AsyncGcpSecretManagerClient):
+    """Async wrapper over the synchronous Secret Manager client.
+
+    Uses the REST transport rather than the default gRPC: REST goes over plain
+    HTTPS so it works behind a TLS-intercepting proxy, and it keeps this module
+    consistent with the sync-lib-in-a-thread pattern used for storage. In a
+    GKE deployment gRPC would also work; REST is functionally equivalent for the
+    low call volume of credential CRUD.
+    """
+
+    def __init__(self, client: secretmanager_v1.SecretManagerServiceClient | None = None) -> None:
+        self._client = client
+        self._client_lock = threading.Lock()
+
+    def _get_client(self) -> secretmanager_v1.SecretManagerServiceClient:
+        # Double-checked locking: _get_client runs inside asyncio.to_thread, so
+        # concurrent first calls would otherwise each build a client and leak all
+        # but the last.
+        if self._client is None:
+            with self._client_lock:
+                if self._client is None:
+                    self._client = secretmanager_v1.SecretManagerServiceClient(transport="rest")
+        return self._client
+
+    async def get_secret(self, secret_id: str, project_id: str) -> str | None:
+        def _do() -> str | None:
+            name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+            try:
+                response = self._get_client().access_secret_version(request={"name": name})
+                return response.payload.data.decode("UTF-8")
+            except NotFound:
+                return None
+
+        return await asyncio.to_thread(_do)
+
+    async def create_or_update_secret(self, secret_id: str, project_id: str, value: str) -> str:
+        def _do() -> str:
+            client = self._get_client()
+            parent = f"projects/{project_id}"
+            try:
+                client.create_secret(
+                    request={
+                        "parent": parent,
+                        "secret_id": secret_id,
+                        "secret": {"replication": {"automatic": {}}},
+                    }
+                )
+            except Conflict:
+                # Secret already exists — proceed to add a new version. The REST
+                # transport raises the generic Conflict (409); gRPC raises the
+                # AlreadyExists subclass. Conflict catches both.
+                pass
+            # The value lives in a version; "updating" a secret means adding one.
+            added = client.add_secret_version(
+                request={"parent": f"{parent}/secrets/{secret_id}", "payload": {"data": value.encode("UTF-8")}}
+            )
+            # Revoke prior versions so a rotated/leaked credential value can't
+            # be read back via an explicit version number. Only destroy versions
+            # numerically OLDER than ours: a concurrent update may have added a
+            # newer version between our add and this list, and destroying it
+            # would race both writers into destroying each other's version
+            # (destruction is permanent), leaving the secret unreadable.
+            # Comparing version numbers makes concurrent updates converge to
+            # last-writer-wins.
+            added_number = int(added.name.rsplit("/", 1)[-1])
+            destroyed_state = secretmanager_v1.SecretVersion.State.DESTROYED
+            for version in client.list_secret_versions(request={"parent": f"{parent}/secrets/{secret_id}"}):
+                if version.state == destroyed_state:
+                    continue
+                if int(version.name.rsplit("/", 1)[-1]) >= added_number:
+                    continue
+                client.destroy_secret_version(request={"name": version.name})
+            return secret_id
+
+        return await asyncio.to_thread(_do)
+
+    async def delete_secret(self, secret_id: str, project_id: str) -> None:
+        def _do() -> None:
+            try:
+                self._get_client().delete_secret(request={"name": f"projects/{project_id}/secrets/{secret_id}"})
+            except NotFound:
+                LOG.debug("GCP secret not found for deletion", secret_id=secret_id, project_id=project_id)
+
+        await asyncio.to_thread(_do)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await asyncio.to_thread(self._client.transport.close)
+            self._client = None
+
+
 class RealGcpClientFactory(GcpClientFactory):
-    """Factory for creating real GCS storage clients."""
+    """Factory for creating real GCS storage and Secret Manager clients."""
 
     def create_storage_client(self, project_id: str | None = None) -> AsyncGcsStorageClient:
         return RealAsyncGcsStorageClient(project_id=project_id)
+
+    def create_secret_manager_client(self) -> AsyncGcpSecretManagerClient:
+        return RealAsyncGcpSecretManagerClient()
