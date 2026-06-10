@@ -117,6 +117,12 @@ class CreateOnePasswordTokenResponse(BaseModel):
     )
 
 
+class ClearOrganizationAuthTokenResponse(BaseModel):
+    """Response model for clearing an organization auth token."""
+
+    success: bool = Field(..., description="Whether the token was cleared successfully")
+
+
 class AzureClientSecretCredentialResponse(BaseModel):
     """Response model for Azure ClientSecretCredential operations."""
 
