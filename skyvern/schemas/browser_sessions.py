@@ -53,6 +53,21 @@ class CreateBrowserSessionRequest(BaseModel):
         pattern=r"^bp_",
     )
 
+    generate_browser_profile: bool = Field(
+        default=False,
+        description="When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage "
+        "when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid "
+        "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
+        "persist their profile regardless of this flag.",
+    )
+
+
+class UpdateBrowserSessionRequest(BaseModel):
+    generate_browser_profile: bool = Field(
+        description="Enable or disable saving this session's browser profile when it ends. Can be toggled while "
+        "the session is still alive; the value is read at session teardown.",
+    )
+
 
 class ProcessBrowserSessionRecordingRequest(BaseModel):
     compressed_chunks: list[str] = Field(

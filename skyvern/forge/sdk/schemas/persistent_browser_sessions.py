@@ -71,6 +71,7 @@ class PersistentBrowserSession(BaseModel):
     extensions: list[Extensions] | None = None
     browser_type: PersistentBrowserType | None = None
     browser_profile_id: str | None = None
+    generate_browser_profile: bool = False
 
     @field_validator("proxy_location", mode="before")
     @classmethod
@@ -78,6 +79,14 @@ class PersistentBrowserSession(BaseModel):
         if isinstance(value, str):
             return deserialize_proxy_location(value, raise_on_invalid_geo_target=True)
         return value
+
+    def should_export_profile(self) -> bool:
+        """A session persists its profile at teardown only when it opted in or is reusing a saved profile.
+
+        A reuse session (browser_profile_id set) must always re-export so the updated session-cookie
+        sidecar survives; gating it off would silently log the profile out on the next reuse.
+        """
+        return bool(self.generate_browser_profile or self.browser_profile_id)
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

@@ -267,6 +267,7 @@ class BrowserSessionsRepository(BaseRepository):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         browser_profile_id: str | None = None,
+        generate_browser_profile: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -282,6 +283,7 @@ class BrowserSessionsRepository(BaseRepository):
                 extensions=extensions_str,
                 browser_type=browser_type.value if browser_type else None,
                 browser_profile_id=browser_profile_id,
+                generate_browser_profile=generate_browser_profile,
             )
             session.add(browser_session)
             await session.commit()
@@ -298,6 +300,7 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         completed_at: datetime | None = None,
         started_at: datetime | None = None,
+        generate_browser_profile: bool | None = None,
     ) -> PersistentBrowserSession:
         async with self.Session() as session:
             persistent_browser_session = (
@@ -319,6 +322,8 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.completed_at = to_naive_utc(completed_at)
             if started_at:
                 persistent_browser_session.started_at = to_naive_utc(started_at)
+            if generate_browser_profile is not None:
+                persistent_browser_session.generate_browser_profile = generate_browser_profile
 
             await session.commit()
             await session.refresh(persistent_browser_session)

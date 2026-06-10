@@ -492,8 +492,12 @@ class Settings(BaseSettings):
     BITWARDEN_EMAIL: str | None = None
     OP_SERVICE_ACCOUNT_TOKEN: str | None = None
 
-    # Where credentials are stored: bitwarden or azure_vault
+    # Where credentials are stored: bitwarden, azure_vault, gcp, or custom
     CREDENTIAL_VAULT_TYPE: str = "bitwarden"
+
+    # GCP Secret Manager credential vault settings
+    GCP_CREDENTIAL_VAULT_PROJECT_ID: str | None = None  # project hosting the Secret Manager secrets
+    GCP_CREDENTIAL_VAULT_PREFIX: str = "skyvern-cred-"  # secret-id prefix; must be unique per deployment
 
     # Azure Setting
     AZURE_TENANT_ID: str | None = None
@@ -651,6 +655,7 @@ class Settings(BaseSettings):
             ("gemini-2.5-flash", "VERTEX_GEMINI_2.5_FLASH", "GEMINI_2.5_FLASH", "Gemini 2.5 Flash"),
             ("gemini-3-pro-preview", "VERTEX_GEMINI_3_PRO", "GEMINI_3_PRO", "Gemini 3 Pro (Latest)"),
             ("gemini-3.0-flash", "VERTEX_GEMINI_3.0_FLASH", "GEMINI_3.0_FLASH", "Gemini 3 Flash"),
+            ("gemini-3.5-flash", "VERTEX_GEMINI_3.5_FLASH", "GEMINI_3.5_FLASH", "Gemini 3.5 Flash"),
         ]
         for model_name, vertex_key, gemini_key, label in gemini_models:
             mapping[model_name] = {
