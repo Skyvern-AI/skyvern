@@ -451,7 +451,7 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
@@ -514,6 +514,27 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
+
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  // Bind the observer when the textarea mounts (it can mount late); the width-only guard avoids a resize loop.
+  const setTextareaRef = useCallback(
+    (node: HTMLTextAreaElement | null) => {
+      textareaRef.current = node;
+      resizeObserverRef.current?.disconnect();
+      resizeObserverRef.current = null;
+      if (!node || typeof ResizeObserver === "undefined") return;
+      let lastWidth = node.clientWidth;
+      const observer = new ResizeObserver(() => {
+        if (node.clientWidth !== lastWidth) {
+          lastWidth = node.clientWidth;
+          adjustTextareaHeight();
+        }
+      });
+      observer.observe(node);
+      resizeObserverRef.current = observer;
+    },
+    [adjustTextareaHeight],
+  );
 
   const {
     isSupported: isSpeechSupported,
@@ -1840,7 +1861,7 @@ export function WorkflowCopilotChat({
             className="h-10 w-10 rounded-lg"
           />
           <textarea
-            ref={textareaRef}
+            ref={setTextareaRef}
             placeholder={
               queuedPrompt
                 ? "Prompt queued..."
