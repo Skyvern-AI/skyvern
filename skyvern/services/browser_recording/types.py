@@ -118,6 +118,10 @@ class RecordingDraftStep(BaseModel):
     editable_fields: list[RecordingDraftStepEditableField] = Field(default_factory=list)
     parameters: list[dict[str, t.Any]] = Field(default_factory=list)
     parameter_keys: list[str] = Field(default_factory=list)
+    # Source-action event timestamps (ms epoch), so clients can correlate
+    # locally-captured artifacts (e.g. stream screenshots) with each step.
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
 
 
 class RecordingInterpretationUpdate(BaseModel):
