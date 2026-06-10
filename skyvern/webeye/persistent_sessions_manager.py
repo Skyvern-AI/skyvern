@@ -82,6 +82,7 @@ class PersistentSessionsManager(Protocol):
         browser_type: PersistentBrowserType | None = None,
         is_high_priority: bool = False,
         browser_profile_id: str | None = None,
+        generate_browser_profile: bool = False,
         wait_for_startup: bool = True,
     ) -> PersistentBrowserSession:
         """Create a new browser session."""

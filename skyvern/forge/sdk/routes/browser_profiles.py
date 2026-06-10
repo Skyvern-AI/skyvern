@@ -401,6 +401,21 @@ async def _create_profile_from_session(
         profile_id=browser_session_id,
     )
     if not session_dir:
+        # An opted-out session never uploads an archive, so retrying can't help — fail fast with a
+        # distinct message the client can tell apart from the transient "upload not finished yet" case.
+        if not browser_session.should_export_profile():
+            LOG.info(
+                "Browser session was not configured to generate a browser profile",
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "This browser session was not configured to generate a browser profile. "
+                    "Start a session with generate_browser_profile enabled to capture a profile."
+                ),
+            )
         LOG.warning(
             "Browser session archive not found for profile creation",
             organization_id=organization_id,
