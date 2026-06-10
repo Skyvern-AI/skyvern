@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -57,7 +58,44 @@ _LEAK_DENY_TOKENS: tuple[str, ...] = (
     "normal instruction",
     "like 'continue",
     'like "continue',
+    "per-tool-call budget",
 )
+
+# Raw workflow-run and browser-session identifiers are internal; user-facing
+# text must reference runs by what they did, never by id.
+_RUN_ID_LEAK_RE = re.compile(r"\b(?:wr|pbs)_[a-z0-9_]+", re.IGNORECASE)
+
+_INTERNAL_GUARD_TOKENS: tuple[str, ...] = (
+    "per_tool_budget",
+    "per-tool-call budget",
+    "active_run_terminal_evidence",
+    "block-running tool",
+    "block running tool",
+)
+
+_INTERNAL_TOOL_NAME_TOKENS: tuple[str, ...] = (
+    "update_workflow",
+    "update_and_run_blocks",
+    "run_blocks_and_collect_debug",
+    "get_run_results",
+    "inspect_page_for_composition",
+    "discover_workflow_entrypoint",
+    "get_browser_screenshot",
+    "list_credentials",
+)
+
+
+def contains_internal_machinery_leak(value: str | None) -> bool:
+    """String-level terminal-output invariant: user-facing text carries no raw
+    run ids, internal guard tokens, or agent-directed tool references."""
+    if not isinstance(value, str) or not value:
+        return False
+    if _RUN_ID_LEAK_RE.search(value):
+        return True
+    lowered = value.lower()
+    if any(token in lowered for token in _INTERNAL_GUARD_TOKENS):
+        return True
+    return any(token in lowered for token in _INTERNAL_TOOL_NAME_TOKENS)
 
 
 def assert_clean_user_facing_text(value: str, *, blocked_tool: str | None = None) -> None:
@@ -65,6 +103,8 @@ def assert_clean_user_facing_text(value: str, *, blocked_tool: str | None = None
     for token in _LEAK_DENY_TOKENS:
         if token.lower() in lowered:
             raise ValueError(f"blocker user-facing text leaked token {token!r}: {value!r}")
+    if contains_internal_machinery_leak(value):
+        raise ValueError(f"blocker user-facing text leaked internal machinery: {value!r}")
     if blocked_tool and blocked_tool.lower() in lowered:
         raise ValueError(f"blocker user-facing text leaked tool name {blocked_tool!r}: {value!r}")
 

@@ -8,7 +8,12 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.failure_classifier import classify_from_failure_reason
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, build_loop_blocker_signal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    assert_clean_user_facing_text,
+    build_loop_blocker_signal,
+)
+from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
@@ -361,12 +366,50 @@ def _post_run_terminal_challenge_reason(evidence: dict[str, Any]) -> str | None:
 
     indicators = evidence.get("anti_bot_indicators")
     has_indicators = isinstance(indicators, list) and any(isinstance(item, str) and item.strip() for item in indicators)
-    if has_indicators:
+    # Raw-HTML token hits alone never justify a terminal claim; a rendered
+    # challenge control must corroborate them.
+    if has_indicators and interactive_challenge_controls(evidence.get("challenge_controls")):
         disabled_controls = _disabled_submit_controls_from_evidence(evidence)
         if disabled_controls:
             labels = ", ".join(_composition_control_label(control) for control in disabled_controls[:3])
             return f"anti-bot evidence remains while submit/search control(s) are disabled ({labels})"
     return None
+
+
+def _post_run_result_evidence_summary(evidence: dict[str, Any]) -> str | None:
+    containers = [container for container in evidence.get("result_containers") or [] if isinstance(container, dict)]
+    if not containers:
+        return None
+    hints: list[str] = []
+    for container in containers[:3]:
+        for key in ("selector", "id", "tag"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                hints.append(value.strip()[:80])
+                break
+    hint_text = f" ({', '.join(hints)})" if hints else ""
+    return f"{len(containers)} result container(s){hint_text}"
+
+
+_TERMINAL_CHALLENGE_FALLBACK_USER_FACING = (
+    "A page barrier was still blocking the workflow's next step after the last run, "
+    "so I stopped without claiming results."
+)
+
+
+def _terminal_challenge_user_facing_reason(reason: str) -> str:
+    # The narrative names the observed evidence (challenge kind, control labels)
+    # instead of asserting a fixed mechanism; page-derived text falls back to a
+    # pre-validated template if it ever trips the leak deny list.
+    candidate = (
+        f"I stopped because the page I inspected after the last run still shows: {reason}. "
+        "I haven't verified any results, so I'm not claiming them."
+    )
+    try:
+        assert_clean_user_facing_text(candidate)
+    except ValueError:
+        return _TERMINAL_CHALLENGE_FALLBACK_USER_FACING
+    return candidate
 
 
 def _post_budget_terminal_challenge_signal(
@@ -391,23 +434,45 @@ def _post_budget_terminal_challenge_signal(
     if not reason:
         return None
 
+    # Same-packet adjudication: when the observed page also carries result
+    # evidence, the answer-from-observed-page path outranks a terminal claim.
+    result_evidence = _post_run_result_evidence_summary(evidence)
+    if result_evidence:
+        agent_steering = (
+            "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
+            f"shows: {reason} — but the SAME observed page also contains result evidence: {result_evidence}. "
+            f"Do NOT claim the page is blocked and do NOT rerun {tool_name} unchanged. "
+            "Answer from the observed page if it contains the requested result/no-result evidence; "
+            "otherwise inspect the live page again before deciding."
+        )
+        return CopilotToolBlockerSignal(
+            blocker_kind="tool_error",
+            agent_steering_text=agent_steering,
+            user_facing_reason=(
+                "The last page I checked already shows results. I'll work from that evidence instead of retrying."
+            ),
+            recovery_hint="retry_with_different_tool",
+            cleared_by_tools=PAGE_INSPECTION_TOOLS
+            | frozenset({"get_run_results", "update_workflow", "update_and_run_blocks"}),
+            preserves_workflow_draft=True,
+            renders_final_reply=False,
+            internal_reason_code="tool_error_post_budget_challenge_result_evidence",
+            blocked_tool=tool_name,
+        )
+
     requested_labels = _requested_block_label_set(arguments)
     labels_text = f" Requested labels: {', '.join(sorted(requested_labels))}." if requested_labels else ""
     agent_steering = (
         "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
         f"now shows: {reason}.{labels_text} Do NOT call "
         f"{tool_name} again in this turn, do NOT try another proxy/location from this evidence state, and "
-        "do NOT claim registry results or no-results were verified. REPLY now with a blocker explanation "
+        "do NOT claim results or no-results were verified. REPLY now with a blocker explanation "
         "that names the observed challenge/disabled control and summarizes the tested workflow state."
-    )
-    user_facing = (
-        "The site's verification challenge is still blocking the submit/search control after live-page inspection, "
-        "so I stopped without claiming results."
     )
     return CopilotToolBlockerSignal(
         blocker_kind="tool_error",
         agent_steering_text=agent_steering,
-        user_facing_reason=user_facing,
+        user_facing_reason=_terminal_challenge_user_facing_reason(reason),
         recovery_hint="report_blocker_to_user",
         cleared_by_tools=frozenset(),
         preserves_workflow_draft=True,

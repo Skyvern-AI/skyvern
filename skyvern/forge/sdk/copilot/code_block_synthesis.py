@@ -271,9 +271,6 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
     return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes)
 
 
-_DEPENDENCY_ID = f"dependency:{_SYNTHESIZED_BLOCK_LABEL}_reached"
-_OBSERVATION_REF_ID = f"observation:{_SYNTHESIZED_BLOCK_LABEL}_scout"
-
 # Model-owned slots the synthesizer cannot prove; the model fills these.
 _FILL_DECLARED_GOAL = "<fill: the durable goal this block accomplishes>"
 _FILL_CLAIM_ID = "claim:<fill>"
@@ -282,9 +279,23 @@ _FILL_CRITERION_ID = "criterion:<fill>"
 _FILL_CRITERION_TEXT = "<fill: the terminal completion criterion>"
 
 
-def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def artifact_dependency_id(block_label: str) -> str:
+    return f"dependency:{_slug(block_label)}_reached"
+
+
+def artifact_observation_ref_id(block_label: str) -> str:
+    return f"observation:{_slug(block_label)}_scout"
+
+
+def build_artifact_metadata_skeleton(
+    trajectory: Sequence[Mapping[str, Any]],
+    *,
+    block_label: str,
+) -> dict[str, Any]:
     """Fill only the scout-proven evidence shape (`observed_not_verified`); the terminal goal and
     outcomes stay as `<fill>` placeholders the model owns."""
+    dependency_id = artifact_dependency_id(block_label)
+    observation_ref_id = artifact_observation_ref_id(block_label)
     # First recorded source_url is the page the synthesized block's leading `page.goto` lands on.
     # The trajectory carries only pre-action source pages, not post-action reached URLs, so this is
     # an advisory entry-page hint, never a reached-page identity (which SPAs would mis-key anyway).
@@ -294,23 +305,23 @@ def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]])
     )
 
     page_dependency: dict[str, Any] = {
-        "id": _DEPENDENCY_ID,
+        "id": dependency_id,
         "scope": "page",
         "status": "observed_not_verified",
-        "observation_refs": [_OBSERVATION_REF_ID],
+        "observation_refs": [observation_ref_id],
     }
     if entry_url_hint:
         page_dependency["url_hint"] = entry_url_hint
 
     observation_ref: dict[str, Any] = {
-        "observation_ref": _OBSERVATION_REF_ID,
-        "dependency_id": _DEPENDENCY_ID,
+        "observation_ref": observation_ref_id,
+        "dependency_id": dependency_id,
         "status": "observed_not_verified",
         "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
     }
 
     return {
-        "block_label": _SYNTHESIZED_BLOCK_LABEL,
+        "block_label": block_label,
         "declared_goal": _FILL_DECLARED_GOAL,
         "page_dependencies": [page_dependency],
         "observation_refs": [observation_ref],
@@ -320,9 +331,9 @@ def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]])
                 "scope": "outcome",
                 "text": _FILL_CLAIM_TEXT,
                 "status": "observed_not_verified",
-                "depends_on": [_DEPENDENCY_ID],
+                "depends_on": [dependency_id],
                 "covered_criteria": [_FILL_CRITERION_ID],
-                "observation_refs": [_OBSERVATION_REF_ID],
+                "observation_refs": [observation_ref_id],
             }
         ],
         "completion_criteria": [
@@ -341,6 +352,10 @@ def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]])
             }
         ],
     }
+
+
+def build_synthesized_artifact_metadata(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return build_artifact_metadata_skeleton(trajectory, block_label=_SYNTHESIZED_BLOCK_LABEL)
 
 
 def _render_artifact_metadata_block(metadata: Mapping[str, Any]) -> str:
