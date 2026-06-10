@@ -15,6 +15,7 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
@@ -37,6 +38,7 @@ from skyvern.forge.sdk.copilot.config import (
     POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
+    PRE_DISCOVERY_URL_QUESTION_NUDGE,
     SCREENSHOT_DROPPED_NUDGE,
     BlockAuthoringPolicy,
     CopilotConfig,
@@ -74,6 +76,7 @@ MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
 MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
+MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # Stops the suspicious-success nudge from re-firing forever when the agent has
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
@@ -572,6 +575,46 @@ def _has_candidate_bound_page_evidence(ctx: Any, candidate_url: str) -> bool:
     return False
 
 
+def _pre_discovery_url_question_nudge(
+    ctx: Any,
+    parsed: dict[str, Any],
+    config: CopilotConfig | None = None,
+) -> str | None:
+    """Steer the model to discovery when it asks before discovery has run.
+
+    INITIAL/DISCOVERING phase with zero discovery calls means the model went
+    straight to asking instead of resolving the entrypoint itself. Credential,
+    loop, and conditional clarifications carry a non-default
+    request_policy.clarification_reason and are let through; the structural
+    triple (phase + zero discovery calls + default clarification_reason) already
+    excludes them. The post-discovery could-not-resolve ask happens after
+    discovery ran (discovery_calls_this_turn > 0) and so never reaches this gate.
+    Steering any remaining pre-discovery ASK to discovery is correct: discovery
+    is cheap, and if the site cannot resolve the model re-asks afterward.
+    """
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    if getattr(ctx, "build_phase", None) not in DISCOVERY_PERMITTED_PHASES:
+        return None
+    if _get_int(ctx, "discovery_calls_this_turn") != 0:
+        return None
+    request_policy = getattr(ctx, "request_policy", None)
+    clarification_reason = getattr(request_policy, "clarification_reason", "none")
+    if clarification_reason not in (None, "none"):
+        return None
+    nudge_count = _get_int(ctx, "pre_discovery_url_question_nudge_count")
+    if nudge_count >= MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES:
+        return None
+    ctx.pre_discovery_url_question_nudge_count = nudge_count + 1
+    LOG.info(
+        "copilot.pre_discovery_url_question_nudge",
+        reason_code="pre_discovery_url_question_steer_to_discovery",
+        build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
+        nudge_count=ctx.pre_discovery_url_question_nudge_count,
+    )
+    return _nudge(config, "pre_discovery_url_question")
+
+
 def _post_discovery_entrypoint_url_question_nudge(
     ctx: Any,
     parsed: dict[str, Any],
@@ -604,6 +647,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
     Returns the nudge string to inject, or None to let the response through.
     """
     response_type = parsed.get("type")
+    pre_discovery_nudge = _pre_discovery_url_question_nudge(ctx, parsed, config)
+    if pre_discovery_nudge is not None:
+        return pre_discovery_nudge
+
     discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
     if discovery_entrypoint_nudge is not None:
         return discovery_entrypoint_nudge
@@ -1249,6 +1296,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
     POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
     POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE: "discovery_entrypoint_url_question",
+    PRE_DISCOVERY_URL_QUESTION_NUDGE: "pre_discovery_url_question",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
@@ -1273,6 +1321,7 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_per_tool_budget_stop": "per_tool_budget_stop",
     "post_no_workflow_delivery": "no_workflow_delivery",
     "post_discovery_entrypoint_url_question": "discovery_entrypoint_url_question",
+    "pre_discovery_url_question": "pre_discovery_url_question",
     "post_failed_test": "post_failed_test",
     "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",

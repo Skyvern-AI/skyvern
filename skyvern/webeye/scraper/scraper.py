@@ -330,6 +330,48 @@ async def _wait_for_scrape_ready(skyvern_frame: SkyvernFrame) -> None:
         await skyvern_frame.safe_wait_for_animation_end(caller="scraper.scrape_ready")
 
 
+def _record_scrape_span_attrs(
+    *,
+    elements: list,
+    html: str,
+    text_content: str,
+    url: str,
+    take_screenshots: bool,
+    draw_boxes: bool,
+    scroll: bool,
+    max_screenshot_number: int,
+    screenshots: list[bytes],
+    id_to_frame_dict: dict,
+    empty_page_retry: bool,
+) -> None:
+    """Attach coarse scrape attribution to the active ``skyvern.agent.scrape`` span.
+
+    Falls back to ``scrape_trigger="unspecified"`` when the caller did not set
+    SkyvernContext.scrape_trigger, so dashboards can quantify the unattributed
+    bucket instead of dropping the data point.
+    """
+    span = otel_trace.get_current_span()
+    span.set_attribute("element_count", len(elements))
+    span.set_attribute("html_bytes", len(html) if html else 0)
+    span.set_attribute("text_bytes", len(text_content) if text_content else 0)
+    span.set_attribute("page_url", strip_query_params(url))
+    span.set_attribute("take_screenshots", take_screenshots)
+    span.set_attribute("draw_boxes", draw_boxes)
+    span.set_attribute("scroll", scroll)
+    span.set_attribute("max_screenshot_number", max_screenshot_number)
+    span.set_attribute("screenshot_count", len(screenshots))
+    span.set_attribute("screenshot_bytes", sum(len(s) for s in screenshots))
+    span.set_attribute("frame_count", len(id_to_frame_dict))
+    span.set_attribute("empty_page_retry", empty_page_retry)
+    ctx = skyvern_context.current()
+    span.set_attribute(
+        "scrape_trigger",
+        ctx.scrape_trigger if ctx and ctx.scrape_trigger else "unspecified",
+    )
+    if ctx and ctx.scrape_screenshots_consumed is not None:
+        span.set_attribute("screenshots_consumed", ctx.scrape_screenshots_consumed)
+
+
 @traced(name="skyvern.agent.scrape")
 async def scrape_web_unsafe(
     browser_state: BrowserState,
@@ -385,9 +427,11 @@ async def scrape_web_unsafe(
         await asyncio.sleep(wait_seconds)
 
     elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
+    empty_page_retry = False
     if not elements and not support_empty_page:
         LOG.warning("No elements found on the page, wait and retry")
         await empty_page_retry_wait()
+        empty_page_retry = True
         elements, element_tree = await get_interactable_element_tree(page, scrape_exclude, must_included_tags)
 
     element_tree = await cleanup_element_tree(page, url, copy.deepcopy(element_tree))
@@ -471,11 +515,19 @@ async def scrape_web_unsafe(
             exc_info=True,
         )
 
-    _scrape_span = otel_trace.get_current_span()
-    _scrape_span.set_attribute("element_count", len(elements))
-    _scrape_span.set_attribute("html_bytes", len(html) if html else 0)
-    _scrape_span.set_attribute("text_bytes", len(text_content) if text_content else 0)
-    _scrape_span.set_attribute("page_url", strip_query_params(url))
+    _record_scrape_span_attrs(
+        elements=elements,
+        html=html,
+        text_content=text_content,
+        url=url,
+        take_screenshots=take_screenshots,
+        draw_boxes=draw_boxes,
+        scroll=scroll,
+        max_screenshot_number=max_screenshot_number,
+        screenshots=screenshots,
+        id_to_frame_dict=id_to_frame_dict,
+        empty_page_retry=empty_page_retry,
+    )
 
     return ScrapedPage(
         elements=elements,
