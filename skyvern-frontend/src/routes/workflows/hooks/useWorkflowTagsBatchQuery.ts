@@ -1,7 +1,11 @@
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useQuery } from "@tanstack/react-query";
-import type { Tag, WorkflowTagsBatchResponse } from "../types/tagTypes";
+import {
+  normalizeWorkflowTags,
+  type Tag,
+  type WorkflowTagsBatchResponse,
+} from "../types/tagTypes";
 
 // Backend rejects more than this many IDs per request (_BATCH_TAGS_MAX_WPIDS); the
 // list page size is unbounded, so chunk rather than slice to avoid dropping tags.
@@ -32,9 +36,16 @@ function useWorkflowTagsBatchQuery(workflowPermanentIds: Array<string>) {
         }),
       );
       // Chunks are disjoint slices, so wpid keys never collide on merge.
+      // Normalize per workflow: the SKY-10683 backend/frontend split shipped a
+      // response-shape skew once already; never let one reach render again.
       const merged: Record<string, Array<Tag>> = {};
       for (const response of responses) {
-        Object.assign(merged, response);
+        if (response === null || typeof response !== "object") {
+          continue;
+        }
+        for (const [wpid, tags] of Object.entries(response)) {
+          merged[wpid] = normalizeWorkflowTags(tags);
+        }
       }
       return merged;
     },
