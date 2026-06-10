@@ -24,6 +24,7 @@ export interface WorkflowCopilotChatMessage {
   workflow_copilot_chat_id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   global_llm_context: string | null;
   created_at: string;
   modified_at: string;
@@ -36,6 +37,7 @@ export interface WorkflowCopilotChatRequest {
   workflow_run_id?: string | null;
   browser_session_id?: string | null;
   message: string;
+  audio_artifact_id?: string | null;
   workflow_yaml: string;
   mode?: "ask" | "build" | null;
   code_block?: boolean | null;
@@ -49,6 +51,7 @@ export interface WorkflowCopilotCancelRequest {
 export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   created_at: string;
   narrative_payload?: Record<string, unknown> | null;
 }
@@ -68,6 +71,11 @@ export interface WorkflowCopilotClearProposedWorkflowRequest {
 export interface WorkflowCopilotApplyProposedWorkflowRequest {
   workflow_copilot_chat_id: string;
   auto_accept: boolean;
+}
+
+export interface WorkflowCopilotAudioUploadResponse {
+  workflow_copilot_chat_id: string;
+  audio_artifact_id: string;
 }
 
 export type WorkflowCopilotStreamMessageType =
