@@ -107,6 +107,10 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
     open: boolean;
     targets: string[];
   }>({ open: false, targets: [] });
+
+  // Selection indices must address the same array the table renders; keep one source for both.
+  const pageItems = profiles ?? [];
+
   const {
     selected,
     selectedItems: selectedProfiles,
@@ -118,7 +122,7 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
     clearSelection,
     replaceSelection,
   } = useRowSelection({
-    items: profiles ?? [],
+    items: pageItems,
     getId: (profile) => profile.browser_profile_id,
     resetKey: JSON.stringify([page, itemsPerPage, searchKey ?? ""]),
   });
@@ -201,8 +205,6 @@ function BrowserProfilesList({ searchKey }: Props = {}) {
       </div>
     );
   }
-
-  const pageItems = profiles ?? [];
 
   if (pageItems.length === 0 && page === 1 && !showPlaceholderRow) {
     return (
