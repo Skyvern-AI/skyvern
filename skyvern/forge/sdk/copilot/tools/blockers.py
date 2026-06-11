@@ -28,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
+    _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS,
     _DATA_PRODUCING_BLOCK_TYPES,
     _FAILED_BLOCK_STATUSES,
     BLOCK_RUNNING_TOOLS,
@@ -931,9 +932,11 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
-    # rely on the progress-aware checks below instead.
+    # rely on the progress-aware checks below instead. fill_credential_field is
+    # exempt because a username+password+TOTP form legitimately needs three
+    # consecutive calls; its failed-step guard above stays argument-aware.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
+    if isinstance(tracker, list) and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
             return _emit_tool_blocker_signal(

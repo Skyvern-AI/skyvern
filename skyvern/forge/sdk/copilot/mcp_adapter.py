@@ -41,6 +41,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -286,7 +287,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 error=str(e),
                 exc_info=True,
             )
-            err = {"ok": False, "error": f"{tool_name} failed: {e}"}
+            err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
@@ -300,6 +301,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        # Scrub before the post hook so evidence the hooks record from raw_mcp
+        # (flow evidence, scout observations) is scrubbed too.
+        raw_mcp = scrub_secrets_from_structure(copilot_ctx, raw_mcp)
         copilot_result = mcp_to_copilot(raw_mcp)
 
         if overlay.post_hook:

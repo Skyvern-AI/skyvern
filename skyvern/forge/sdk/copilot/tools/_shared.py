@@ -193,6 +193,8 @@ def _block_data_payload(extracted_data: Any, block_type: str | None) -> Any:
 
 BLOCK_RUNNING_TOOLS = frozenset({"run_blocks_and_collect_debug", "update_and_run_blocks"})
 
+_CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS = BLOCK_RUNNING_TOOLS | {"fill_credential_field"}
+
 
 WORKFLOW_MUTATION_TOOLS = frozenset({"update_workflow", "update_and_run_blocks"})
 
