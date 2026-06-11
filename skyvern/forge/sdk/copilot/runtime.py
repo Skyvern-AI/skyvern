@@ -170,6 +170,9 @@ class AgentContext:
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
     last_test_failure_reason: str | None = None
+    # Latest evaluated outcome-gate verdict this turn. Deliberately not reset
+    # per-run: a later run that fails before verification keeps the verdict.
+    last_outcome_gate_reason: str | None = None
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None

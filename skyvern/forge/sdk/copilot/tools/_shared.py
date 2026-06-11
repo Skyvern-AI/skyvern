@@ -282,14 +282,61 @@ def _current_workflow_has_evidence_block(ctx: object) -> bool:
     workflow = getattr(ctx, "last_workflow", None)
     blocks = getattr(getattr(workflow, "workflow_definition", None), "blocks", None)
     if blocks:
-        return any(_block_type_name(block) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in blocks)
+        if any(_block_type_name(block) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in blocks):
+            return True
+        code_labels = [
+            getattr(block, "label", None) for block in blocks if _block_type_name(block) == BlockType.CODE.value
+        ]
+        return _code_artifact_metadata_covers_terminal_criterion(ctx, code_labels)
     workflow_yaml = getattr(ctx, "last_workflow_yaml", None)
     if not isinstance(workflow_yaml, str):
         return False
+    parsed_blocks = [block for block in (_parse_workflow_blocks(workflow_yaml) or []) if isinstance(block, dict)]
+    if any(_enum_or_string_name(block.get("block_type")) in _OUTCOME_EVIDENCE_BLOCK_TYPES for block in parsed_blocks):
+        return True
+    code_labels = [
+        _block_label_from_yaml(block)
+        for block in parsed_blocks
+        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
+    ]
+    return _code_artifact_metadata_covers_terminal_criterion(ctx, code_labels)
+
+
+def _code_artifact_metadata_covers_terminal_criterion(ctx: object, labels: list[str | None]) -> bool:
+    metadata = getattr(ctx, "code_artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
     return any(
-        isinstance(block, dict) and _enum_or_string_name(block.get("block_type")) in _OUTCOME_EVIDENCE_BLOCK_TYPES
-        for block in (_parse_workflow_blocks(workflow_yaml) or [])
+        isinstance(metadata.get(label), dict) and _artifact_entry_claims_terminal_criterion(metadata[label])
+        for label in labels
+        if isinstance(label, str)
     )
+
+
+def _artifact_entry_claims_terminal_criterion(entry: dict[str, Any]) -> bool:
+    criteria = entry.get("completion_criteria")
+    criteria_rows = [row for row in criteria if isinstance(row, dict)] if isinstance(criteria, list) else []
+    terminal_ids = {
+        str(row.get("id") or "").strip()
+        for row in criteria_rows
+        if row.get("terminal") is True or str(row.get("level") or "").strip() == "terminal"
+    } - {""}
+    if not terminal_ids:
+        return False
+    claims = entry.get("claimed_outcomes")
+    if not isinstance(claims, list):
+        return False
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        covered: set[str] = set()
+        for field_name in ("covered_criteria", "criteria_ids"):
+            values = claim.get(field_name)
+            if isinstance(values, list):
+                covered.update(str(item).strip() for item in values)
+        if covered & terminal_ids:
+            return True
+    return False
 
 
 def _unverified_current_workflow_labels(ctx: object) -> list[str]:
