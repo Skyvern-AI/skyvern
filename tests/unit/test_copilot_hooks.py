@@ -360,6 +360,7 @@ class TestMCPFailedStepLoopDetection:
             get_browser_state=AsyncMock(return_value=browser_state),
         )
         monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", persistent_session_manager)
+        monkeypatch.setattr(runtime.settings, "ENV", "local")
 
         runtime_skyvern = MagicMock()
         monkeypatch.setattr(runtime, "get_skyvern", lambda: runtime_skyvern)
@@ -389,11 +390,13 @@ class TestMCPFailedStepLoopDetection:
         monkeypatch.setattr(session_manager, "get_skyvern", lambda: fallback_skyvern)
 
         observed_session_ids: list[str | None] = []
+        observed_localhost_access: list[bool | None] = []
 
         async def fake_do_screenshot(page: Any, full_page: bool = False, selector: str | None = None) -> Any:
             del page, full_page, selector
             current = session_manager.get_current_session()
             observed_session_ids.append(current.context.session_id if current.context else None)
+            observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
             assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
             return SimpleNamespace(data=b"fake-png")
 
@@ -435,6 +438,7 @@ class TestMCPFailedStepLoopDetection:
         assert parsed["ok"] is True
         assert parsed["data"]["screenshot_base64"]
         assert observed_session_ids == ["pbs_copilot"]
+        assert observed_localhost_access == [True]
         fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
         persistent_session_manager.get_browser_state.assert_any_await(
             session_id="pbs_copilot",
