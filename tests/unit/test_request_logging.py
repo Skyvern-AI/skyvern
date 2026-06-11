@@ -4,7 +4,10 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
+from skyvern.forge import request_logging
 from skyvern.forge.request_logging import (
     _BINARY_PLACEHOLDER,
     _MAX_BODY_LENGTH,
@@ -14,6 +17,7 @@ from skyvern.forge.request_logging import (
     _is_sensitive_key,
     _sanitize_body,
     _sanitize_response_body,
+    log_raw_request_middleware,
     redact_sensitive_fields,
 )
 
@@ -344,3 +348,113 @@ class TestSanitizeBody:
         body = b'{"totp_identifier": "x@y.com", "content": "Your code is 123456"}'
         result = _sanitize_body(request, body, "application/json")
         assert result == _REDACTED
+
+
+# ---------------------------------------------------------------------------
+# log_raw_request_middleware — which requests produce an api.raw_request log
+# ---------------------------------------------------------------------------
+
+
+def _make_app() -> FastAPI:
+    app = FastAPI()
+    app.middleware("http")(log_raw_request_middleware)
+
+    @app.get("/heartbeat")
+    async def heartbeat() -> dict:
+        return {"ok": True}
+
+    @app.post("/tasks")
+    async def create_task() -> dict:
+        return {"created": True}
+
+    @app.get("/missing")
+    async def missing() -> dict:
+        raise HTTPException(status_code=404, detail="not found")
+
+    @app.get("/protected")
+    async def protected() -> dict:
+        raise HTTPException(status_code=403, detail="Invalid credentials")
+
+    @app.get("/v1/credentials/totp")
+    async def get_totp() -> dict:
+        return {"code": "123456", "content": "Your code is 123456"}
+
+    @app.get("/boom")
+    async def boom() -> dict:
+        raise ValueError("kaboom")
+
+    return app
+
+
+@pytest.fixture
+def log_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    mock = MagicMock()
+    monkeypatch.setattr(request_logging, "LOG", mock)
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", True)
+    monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", False)
+    return mock
+
+
+class TestMiddlewareLogVolume:
+    def test_successful_sensitive_get_keeps_redacted_audit_line(self, log_mock: MagicMock) -> None:
+        """OTP/credential reads must leave an audit trail even though they are successful reads."""
+        client = TestClient(_make_app())
+        response = client.get("/v1/credentials/totp")
+        assert response.status_code == 200
+        log_mock.info.assert_called_once()
+        assert log_mock.info.call_args.args[0] == "api.raw_request"
+        assert log_mock.info.call_args.kwargs["response_body"] == _REDACTED
+
+    def test_successful_get_is_not_logged(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.get("/heartbeat")
+        assert response.status_code == 200
+        log_mock.info.assert_not_called()
+        log_mock.warning.assert_not_called()
+        log_mock.error.assert_not_called()
+
+    def test_successful_get_logged_when_reads_enabled(
+        self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS_SUCCESSFUL_READS", True)
+        client = TestClient(_make_app())
+        response = client.get("/heartbeat")
+        assert response.status_code == 200
+        log_mock.info.assert_called_once()
+        assert log_mock.info.call_args.args[0] == "api.raw_request"
+
+    def test_successful_post_is_logged(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.post("/tasks")
+        assert response.status_code == 200
+        log_mock.info.assert_called_once()
+        assert log_mock.info.call_args.args[0] == "api.raw_request"
+
+    def test_failed_get_is_logged_as_warning(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app())
+        response = client.get("/missing")
+        assert response.status_code == 404
+        log_mock.warning.assert_called_once()
+        assert log_mock.warning.call_args.args[0] == "api.raw_request"
+
+    def test_403_get_keeps_datadog_monitor_contract(self, log_mock: MagicMock) -> None:
+        """The 403-spike monitors query api.raw_request status:warn @status_code:403."""
+        client = TestClient(_make_app())
+        response = client.get("/protected")
+        assert response.status_code == 403
+        log_mock.warning.assert_called_once()
+        assert log_mock.warning.call_args.args[0] == "api.raw_request"
+        assert log_mock.warning.call_args.kwargs["status_code"] == 403
+
+    def test_exception_path_is_logged_as_error(self, log_mock: MagicMock) -> None:
+        client = TestClient(_make_app(), raise_server_exceptions=False)
+        response = client.get("/boom")
+        assert response.status_code == 500
+        log_mock.error.assert_called_once()
+        assert log_mock.error.call_args.args[0] == "api.raw_request"
+
+    def test_disabled_middleware_logs_nothing(self, log_mock: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(request_logging.settings, "LOG_RAW_API_REQUESTS", False)
+        client = TestClient(_make_app())
+        client.post("/tasks")
+        log_mock.info.assert_not_called()
