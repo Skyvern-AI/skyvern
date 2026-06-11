@@ -86,9 +86,7 @@ from .completion import _build_run_evidence_snapshot as _build_run_evidence_snap
 from .completion import _completion_verification_handler as _completion_verification_handler
 from .completion import _is_outcome_evidence_candidate as _is_outcome_evidence_candidate
 from .completion import _is_unfinished_run_verification_candidate as _is_unfinished_run_verification_candidate
-from .completion import (
-    _maybe_run_completion_verification,
-)
+from .completion import _maybe_run_completion_verification as _maybe_run_completion_verification
 from .completion import (
     _maybe_run_completion_verification_from_page_observation as _maybe_run_completion_verification_from_page_observation,
 )
@@ -213,9 +211,12 @@ from .run_execution import _progress_marker as _progress_marker
 from .run_execution import _read_progress_sources as _read_progress_sources
 from .run_execution import (
     _record_diagnosis_repair_contract,
-    _record_run_blocks_result,
+)
+from .run_execution import _record_run_blocks_result as _record_run_blocks_result
+from .run_execution import (
     _run_blocks_and_collect_debug,
     _run_blocks_span_data,
+    _verify_and_record_run_blocks_result,
 )
 from .run_execution import _watchdog_error_message as _watchdog_error_message
 from .run_execution import _watchdog_exit_allows_terminal_promotion as _watchdog_exit_allows_terminal_promotion
@@ -468,8 +469,7 @@ async def run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
-        _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
+        completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,
             result,
@@ -752,8 +752,7 @@ async def update_and_run_blocks_tool(
             block_outputs_to_seed=block_outputs_to_seed,
             frontier_start_label=frontier_start_label,
         )
-        completion_verification = await _maybe_run_completion_verification(copilot_ctx, run_result, handler_start)
-        _record_run_blocks_result(copilot_ctx, run_result, completion_verification=completion_verification)
+        completion_verification = await _verify_and_record_run_blocks_result(copilot_ctx, run_result, handler_start)
         tool_visible_result = _tool_visible_result_after_completion_verification(
             copilot_ctx,
             run_result,

@@ -110,7 +110,11 @@ async def skyvern_browser_session_create(
                     create_kwargs["extensions"] = extensions
                 session = await skyvern.create_browser_session(**create_kwargs)
                 timer.mark("sdk")
-                ctx = BrowserContext(mode="cloud_session", session_id=session.browser_session_id)
+                ctx = BrowserContext(
+                    mode="cloud_session",
+                    session_id=session.browser_session_id,
+                    can_access_localhost=False,
+                )
                 return make_result(
                     "skyvern_browser_session_create",
                     browser_context=ctx,
@@ -132,9 +136,13 @@ async def skyvern_browser_session_create(
             timer.mark("sdk")
 
             if result.local:
-                ctx = BrowserContext(mode="local")
+                ctx = BrowserContext(mode="local", can_access_localhost=True)
             else:
-                ctx = BrowserContext(mode="cloud_session", session_id=result.session_id)
+                ctx = BrowserContext(
+                    mode="cloud_session",
+                    session_id=result.session_id,
+                    can_access_localhost=False,
+                )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=_session_api_key_hash()))
 
         except ValueError as e:

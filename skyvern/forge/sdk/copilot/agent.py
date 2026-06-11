@@ -958,6 +958,8 @@ def _build_narrative_payload(
     design_activity: list[NarrativeActivityEntry] = narrator_state.design_activity if narrator_state is not None else []
     block_labels: list[str] = []
     blocks: list[NarrativeBlock] = []
+    recorded_outcome = ctx.last_run_outcome
+    outcome_labels = set(ctx.last_run_outcome_block_labels) if recorded_outcome is not None else set()
     staged = ctx.staged_workflow
     if staged is not None and getattr(staged, "workflow_definition", None) is not None:
         for block in staged.workflow_definition.blocks:
@@ -971,20 +973,23 @@ def _build_narrative_payload(
             else:
                 block_type = str(block_type_value or "task")
             raw_status = ctx.block_state_map.get(label)
-            blocks.append(
-                {
-                    "label": label,
-                    "blockType": block_type,
-                    "state": _block_ui_state(
-                        raw_status,
-                        drafted_fallback=ctx.has_staged_proposal,
-                    ),
-                    "lastSeenIteration": 0,
-                    "activity": list(block_activity.get(label, [])),
-                    "startedAt": ctx.block_started_at_map.get(label),
-                    "endedAt": ctx.block_ended_at_map.get(label),
-                }
-            )
+            block_entry: NarrativeBlock = {
+                "label": label,
+                "blockType": block_type,
+                "state": _block_ui_state(
+                    raw_status,
+                    drafted_fallback=ctx.has_staged_proposal,
+                ),
+                "lastSeenIteration": 0,
+                "activity": list(block_activity.get(label, [])),
+                "startedAt": ctx.block_started_at_map.get(label),
+                "endedAt": ctx.block_ended_at_map.get(label),
+            }
+            if recorded_outcome is not None and label in outcome_labels:
+                block_entry["outcome"] = recorded_outcome.verdict
+                if recorded_outcome.display_reason is not None:
+                    block_entry["outcomeReason"] = recorded_outcome.display_reason
+            blocks.append(block_entry)
     draft: NarrativeDraft | None = (
         {"blockCount": len(block_labels), "blockLabels": block_labels, "summary": None}
         if ctx.has_staged_proposal
