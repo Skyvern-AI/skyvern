@@ -165,11 +165,17 @@ export function findUnexecutedDefinedBlocks(
   definedBlocks: Array<WorkflowBlock>,
   timelineItems: Array<WorkflowRunTimelineItem>,
 ): Array<WorkflowBlock> {
+  // Walk the whole tree: defined blocks executed inside a conditional's
+  // branch appear as nested children, not roots, and must not be reported
+  // as unexecuted.
   const executedLabels = new Set<string>();
-  for (const item of timelineItems) {
+  const stack = [...timelineItems];
+  while (stack.length > 0) {
+    const item = stack.pop()!;
     if (isBlockItem(item) && item.block.label !== null) {
       executedLabels.add(item.block.label);
     }
+    stack.push(...item.children);
   }
   return definedBlocks.filter((block) => !executedLabels.has(block.label));
 }

@@ -18,8 +18,8 @@ type StreamCall = {
   resolve: () => void;
   reject: (error: unknown) => void;
 };
-const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
-  () => {
+const { streamCalls, postStreaming, cancelPost, historyResponse, speechState } =
+  vi.hoisted(() => {
     const calls: StreamCall[] = [];
     const post = vi.fn().mockResolvedValue({});
     const streaming = vi.fn(
@@ -45,14 +45,23 @@ const { streamCalls, postStreaming, cancelPost, historyResponse } = vi.hoisted(
         auto_accept: false,
       },
     };
+    const speech = {
+      isSupported: false,
+      isListening: false,
+      isHearingSpeech: false,
+      start: vi.fn(),
+      stop: vi.fn<() => Promise<Blob | null>>().mockResolvedValue(null),
+      toggle: vi.fn(),
+      takeAudioBlob: vi.fn<() => Blob | null>().mockReturnValue(null),
+    };
     return {
       streamCalls: calls,
       postStreaming: streaming,
       cancelPost: post,
       historyResponse: history,
+      speechState: speech,
     };
-  },
-);
+  });
 
 vi.mock("@/api/sse", () => ({
   getSseClient: vi.fn().mockResolvedValue({ postStreaming }),
@@ -67,6 +76,10 @@ vi.mock("@/api/AxiosClient", () => ({
 
 vi.mock("@/hooks/useCredentialGetter", () => ({
   useCredentialGetter: () => null,
+}));
+
+vi.mock("@/hooks/useSpeechToTextField", () => ({
+  useSpeechToTextField: () => speechState,
 }));
 
 vi.mock("@/components/ui/use-toast", () => ({ toast: vi.fn() }));
@@ -183,6 +196,15 @@ beforeEach(() => {
   streamCalls.length = 0;
   postStreaming.mockClear();
   cancelPost.mockClear();
+  speechState.isSupported = false;
+  speechState.isListening = false;
+  speechState.isHearingSpeech = false;
+  speechState.start.mockClear();
+  speechState.stop.mockClear();
+  speechState.stop.mockResolvedValue(null);
+  speechState.toggle.mockClear();
+  speechState.takeAudioBlob.mockClear();
+  speechState.takeAudioBlob.mockReturnValue(null);
   historyResponse.data = {
     workflow_copilot_chat_id: null,
     chat_history: [],
@@ -203,6 +225,28 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
 
     expect(textarea().disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("still sends the message when dictation audio upload fails", async () => {
+    await renderChat();
+    speechState.takeAudioBlob.mockReturnValueOnce(
+      new Blob(["audio"], { type: "audio/webm" }),
+    );
+    cancelPost.mockRejectedValueOnce(new Error("upload failed"));
+
+    await submit("dictated prompt");
+
+    await waitFor(() => expect(cancelPost).toHaveBeenCalledTimes(1));
+    expect(cancelPost).toHaveBeenCalledWith(
+      "/workflow/copilot/chat-audio",
+      expect.any(FormData),
+      expect.any(Object),
+    );
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+    expect(streamCalls[0]?.body).toMatchObject({
+      message: "dictated prompt",
+      audio_artifact_id: null,
+    });
   });
 
   it("queues a second submit instead of starting a concurrent stream", async () => {
