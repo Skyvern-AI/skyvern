@@ -18,6 +18,9 @@ _TEXT_MAX = 240
 _SUMMARY_MAX = 180
 _MAX_ITEMS = 20
 _FAILED_STATUSES = {"failed", "terminated", "canceled", "timed_out"}
+_CREDENTIAL_INPUT_MISSING_SKIP_REASONS = {"workflow_credential_inputs_unbound", "credential_name_unresolved"}
+_PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES = {"CREDENTIAL_ERROR", "PARAMETER_BINDING_ERROR"}
+_REPAIRABLE_RUNTIME_CATEGORIES = {"AUTH_FAILURE", "OUTCOME_UNVERIFIED"}
 
 
 class StrictModel(BaseModel):
@@ -304,6 +307,9 @@ def _failure_type(
     result: dict[str, Any],
     data: dict[str, Any],
 ) -> DiagnosisFailureType:
+    skip_reason = _safe_str(data.get("skip_reason"))
+    if skip_reason in _CREDENTIAL_INPUT_MISSING_SKIP_REASONS:
+        return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     if run_ok:
         return DiagnosisFailureType.SUSPICIOUS_SUCCESS if suspicious else DiagnosisFailureType.NO_FAILURE
     error_text = " ".join(
@@ -311,6 +317,7 @@ def _failure_type(
         for value in (result.get("error"), data.get("failure_reason"), data.get("skip_reason"))
         if value
     )
+    category_set = set(categories)
     if (
         "UNRECOVERABLE_TOOL_ERROR" in categories
         or "browser session not found" in error_text
@@ -325,16 +332,16 @@ def _failure_type(
     ):
         return DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
     if (
-        data.get("skip_reason") == "workflow_credential_inputs_unbound"
-        or "credential" in error_text
+        category_set & _PRE_RUN_CREDENTIAL_FAILURE_CATEGORIES
         or "organization not found" in error_text
         or "workflow not found" in error_text
         or "browser session" in error_text
-        or "PARAMETER_BINDING_ERROR" in categories
     ):
         return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
-    if failed_blocks:
+    if failed_blocks or category_set & _REPAIRABLE_RUNTIME_CATEGORIES:
         return DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    if "credential" in error_text:
+        return DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
     return DiagnosisFailureType.FAILED_RUN if result.get("ok") is False else DiagnosisFailureType.UNKNOWN
 
 
