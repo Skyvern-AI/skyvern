@@ -71,6 +71,35 @@ class MockSpeechRecognition {
   }
 }
 
+class MockMediaRecorder {
+  static lastInstance: MockMediaRecorder | null = null;
+
+  mimeType = "audio/webm";
+  state: RecordingState = "inactive";
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onstop: (() => void) | null = null;
+
+  constructor(public stream: MediaStream) {
+    MockMediaRecorder.lastInstance = this;
+  }
+
+  start = vi.fn(() => {
+    this.state = "recording";
+  });
+
+  stop = vi.fn(() => {
+    this.state = "inactive";
+    this.ondataavailable?.({
+      data: new Blob(["audio"], { type: "audio/webm" }),
+    } as BlobEvent);
+    this.onstop?.();
+  });
+
+  emitData(data: Blob) {
+    this.ondataavailable?.({ data } as BlobEvent);
+  }
+}
+
 describe("isSpeechRecognitionSupported", () => {
   afterEach(() => {
     delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
@@ -91,12 +120,30 @@ describe("isSpeechRecognitionSupported", () => {
 });
 
 describe("useSpeechToText", () => {
+  const trackStop = vi.fn();
+
   beforeEach(() => {
     vi.useFakeTimers();
     MockSpeechRecognition.lastInstance = null;
+    MockMediaRecorder.lastInstance = null;
+    trackStop.mockClear();
     (
       window as { SpeechRecognition?: typeof MockSpeechRecognition }
     ).SpeechRecognition = MockSpeechRecognition;
+    Object.defineProperty(globalThis, "MediaRecorder", {
+      configurable: true,
+      value: MockMediaRecorder,
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn(() =>
+          Promise.resolve({
+            getTracks: () => [{ stop: trackStop }],
+          } as unknown as MediaStream),
+        ),
+      },
+    });
   });
 
   afterEach(() => {
@@ -104,6 +151,8 @@ describe("useSpeechToText", () => {
     delete (window as { SpeechRecognition?: unknown }).SpeechRecognition;
     delete (window as { webkitSpeechRecognition?: unknown })
       .webkitSpeechRecognition;
+    delete (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+    delete (navigator as { mediaDevices?: unknown }).mediaDevices;
   });
 
   it("reports support from the browser API", () => {
@@ -133,6 +182,72 @@ describe("useSpeechToText", () => {
 
     expect(result.current.isListening).toBe(false);
     expect(MockSpeechRecognition.lastInstance?.stop).toHaveBeenCalled();
+  });
+
+  it("captures an audio blob while dictating", async () => {
+    const onAudioCaptured = vi.fn();
+    const { result } = renderHook(() =>
+      useSpeechToText({
+        onTranscript: vi.fn(),
+        onAudioCaptured,
+      }),
+    );
+
+    act(() => {
+      result.current.start();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.stop();
+    });
+
+    expect(onAudioCaptured).toHaveBeenCalledTimes(1);
+    const audioBlob = onAudioCaptured.mock.calls[0]?.[0] as Blob;
+    expect(audioBlob.type).toBe("audio/webm");
+    expect(result.current.takeAudioBlob()).toBe(audioBlob);
+    expect(trackStop).toHaveBeenCalled();
+  });
+
+  it("keeps buffered audio chunks when the recorder is already inactive", async () => {
+    const onAudioCaptured = vi.fn();
+    const { result } = renderHook(() =>
+      useSpeechToText({
+        onTranscript: vi.fn(),
+        onAudioCaptured,
+      }),
+    );
+
+    act(() => {
+      result.current.start();
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const recorder = MockMediaRecorder.lastInstance;
+    const audioChunk = new Blob(["partial-audio"], { type: "audio/webm" });
+    act(() => {
+      recorder?.emitData(audioChunk);
+      if (recorder) {
+        recorder.state = "inactive";
+      }
+    });
+
+    let stoppedBlob: Blob | null = null;
+    await act(async () => {
+      stoppedBlob = await result.current.stop();
+    });
+
+    const capturedBlob = stoppedBlob as unknown as Blob;
+    expect(capturedBlob).toBeInstanceOf(Blob);
+    expect(capturedBlob.type).toBe("audio/webm");
+    expect(await capturedBlob.text()).toBe("partial-audio");
+    expect(onAudioCaptured).toHaveBeenCalledWith(capturedBlob);
+    expect(recorder?.stop).not.toHaveBeenCalled();
+    expect(trackStop).toHaveBeenCalled();
   });
 
   it("toggles listening on and off", () => {
