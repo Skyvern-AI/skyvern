@@ -30,7 +30,11 @@ from skyvern.forge.sdk.artifact.storage.base import (
     _file_infos_from_artifacts,
     _file_infos_from_download_artifacts,
 )
-from skyvern.forge.sdk.artifact.storage.run_recording_clips import RUN_RECORDING_PATH_SEGMENT, sync_run_recording_clips
+from skyvern.forge.sdk.artifact.storage.run_recording_clips import (
+    RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS,
+    RUN_RECORDING_PATH_SEGMENT,
+    sync_run_recording_clips,
+)
 from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.files import FileInfo
@@ -912,13 +916,14 @@ class S3Storage(BaseStorage):
                     return clip_uri
 
                 try:
-                    await sync_run_recording_clips(
-                        organization_id=organization_id,
-                        browser_session_id=browser_session_id,
-                        source_path=upload_file_path,
-                        upload_clip=_upload_clip,
-                        now=recording_finalized_at,
-                    )
+                    async with asyncio.timeout(RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS):
+                        await sync_run_recording_clips(
+                            organization_id=organization_id,
+                            browser_session_id=browser_session_id,
+                            source_path=upload_file_path,
+                            upload_clip=_upload_clip,
+                            now=recording_finalized_at,
+                        )
                 except Exception:
                     LOG.warning(
                         "Run recording clip generation failed", browser_session_id=browser_session_id, exc_info=True

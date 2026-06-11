@@ -1469,6 +1469,11 @@ def _build_block_fn(
                 ActionType.COMPLETE,
                 ActionType.TERMINATE,
                 ActionType.NULL_ACTION,
+                # Tab management isn't represented in generated scripts yet (no ACTION_MAP
+                # entry); skip so cached replay of a multi-tab run falls back to the agent
+                # instead of raising KeyError and breaking script generation.
+                ActionType.NEW_TAB,
+                ActionType.SWITCH_TAB,
             ]:
                 continue
 
