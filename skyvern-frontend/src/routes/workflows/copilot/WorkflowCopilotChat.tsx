@@ -41,6 +41,7 @@ import {
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
+  WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
@@ -61,7 +62,7 @@ import {
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -79,6 +80,27 @@ import { cn } from "@/util/utils";
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+
+type ComposerDefaultVariant =
+  | "build"
+  | "build_code"
+  | "build_no_code"
+  | "ask"
+  | "ask_code";
+
+function normalizeComposerDefaultVariant(
+  variant: string | undefined,
+): ComposerDefaultVariant {
+  if (
+    variant === "ask" ||
+    variant === "ask_code" ||
+    variant === "build_code" ||
+    variant === "build_no_code"
+  ) {
+    return variant;
+  }
+  return "build";
+}
 
 function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -194,11 +216,13 @@ type QueuedPrompt = {
   id: string;
   content: string;
   reason: QueuedPromptReason;
+  audioBlob?: Blob | null;
 };
 
 type SendOptions = {
   queuedMessageId?: string;
   skipQueue?: boolean;
+  audioBlob?: Blob | null;
 };
 
 type WorkflowCopilotSsePayload =
@@ -350,15 +374,56 @@ export function WorkflowCopilotChat({
   initialMessage,
   onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
-  const copilotV2Enabled =
-    useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2") === true;
+  const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
+  const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
+  const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
+  const copilotV2Enabled = copilotV2Flag === true;
   const codeBlockModeEnabled =
-    useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE") === true;
-  const [composerMode, setComposerMode] = useState<"ask" | "build">("build");
-  const [codeWorkflow, setCodeWorkflow] = useState(true);
+    codeBlockModeFlag === true && codeBlockAccessFlag === true;
+  const defaultModeVariant = useFeatureFlagValue(
+    "WORKFLOW_COPILOT_DEFAULT_MODE",
+  );
+  // The variant configures the initial default only when both gating flags are on.
+  const effectiveDefaultVariant: ComposerDefaultVariant =
+    copilotV2Enabled && codeBlockModeEnabled
+      ? normalizeComposerDefaultVariant(defaultModeVariant)
+      : "build";
+  const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
+    effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
+      ? "ask"
+      : "build",
+  );
+  const [codeWorkflow, setCodeWorkflow] = useState(
+    () =>
+      effectiveDefaultVariant === "build_code" ||
+      effectiveDefaultVariant === "ask_code",
+  );
+  // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
+  const composerSeededRef = useRef(false);
+  const flagsResolved =
+    copilotV2Flag !== undefined &&
+    codeBlockModeFlag !== undefined &&
+    codeBlockAccessFlag !== undefined;
+  useEffect(() => {
+    if (composerSeededRef.current || !flagsResolved) {
+      return;
+    }
+    composerSeededRef.current = true;
+    setComposerMode(
+      effectiveDefaultVariant === "ask" ||
+        effectiveDefaultVariant === "ask_code"
+        ? "ask"
+        : "build",
+    );
+    setCodeWorkflow(
+      effectiveDefaultVariant === "build_code" ||
+        effectiveDefaultVariant === "ask_code",
+    );
+  }, [flagsResolved, effectiveDefaultVariant]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
-  const showCodeToggle = isBuild && codeBlockModeEnabled;
+  const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
+  const showCodeToggle = isBuild && codeBlockModeEnabled && codeToggleAllowed;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -540,7 +605,9 @@ export function WorkflowCopilotChat({
     isSupported: isSpeechSupported,
     isListening: isSpeechListening,
     isHearingSpeech: isSpeechHearing,
+    stop: stopSpeech,
     toggle: toggleSpeech,
+    takeAudioBlob: takeSpeechAudioBlob,
   } = useSpeechToTextField({
     value: inputValue,
     onChange: setInputValue,
@@ -693,6 +760,37 @@ export function WorkflowCopilotChat({
     setWorkflowCopilotChatId(latestChatId);
     return latestChatId;
   };
+
+  const uploadDictationAudio = useCallback(
+    async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
+      if (!workflowPermanentId) {
+        throw new Error("Missing workflow permanent ID for audio upload.");
+      }
+
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const formData = new FormData();
+      formData.append("workflow_permanent_id", workflowPermanentId);
+      const chatId = workflowCopilotChatIdRef.current?.trim();
+      if (chatId) {
+        formData.append("workflow_copilot_chat_id", chatId);
+      }
+      formData.append("file", audioBlob, `dictation-${Date.now()}.webm`);
+
+      const response = await client.post<WorkflowCopilotAudioUploadResponse>(
+        "/workflow/copilot/chat-audio",
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        },
+      );
+      setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+      workflowCopilotChatIdRef.current = response.data.workflow_copilot_chat_id;
+      return response.data;
+    },
+    [credentialGetter, workflowPermanentId],
+  );
 
   const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
     const clearProposalByChatId = async (chatId: string) => {
@@ -948,11 +1046,25 @@ export function WorkflowCopilotChat({
         });
         return;
       }
+
+      let messageAudioBlob = options.audioBlob ?? null;
+      if (!messageAudioBlob && messageOverride === undefined) {
+        if (isSpeechListening) {
+          messageAudioBlob = await stopSpeech();
+        }
+        messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
-        updateQueuedPrompt({ id: queuedId, content: candidate, reason });
+        updateQueuedPrompt({
+          id: queuedId,
+          content: candidate,
+          reason,
+          audioBlob: messageAudioBlob,
+        });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
         if (!options.queuedMessageId) {
@@ -1013,6 +1125,8 @@ export function WorkflowCopilotChat({
         const saveData = getSaveData();
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let chatIdForRequest = workflowCopilotChatId;
+        let audioArtifactId: string | null = null;
 
         if (!workflowId) {
           toast({
@@ -1098,6 +1212,16 @@ export function WorkflowCopilotChat({
               blocks: saveData.blocks,
             },
           } as WorkflowApiResponse;
+        }
+
+        if (messageAudioBlob) {
+          try {
+            const uploadResponse = await uploadDictationAudio(messageAudioBlob);
+            chatIdForRequest = uploadResponse.workflow_copilot_chat_id;
+            audioArtifactId = uploadResponse.audio_artifact_id;
+          } catch (error) {
+            console.warn("Failed to upload dictation audio:", error);
+          }
         }
 
         const handleProcessingUpdate = (
@@ -1225,13 +1349,14 @@ export function WorkflowCopilotChat({
           {
             workflow_id: workflowId,
             workflow_permanent_id: workflowPermanentId,
-            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_copilot_chat_id: chatIdForRequest,
             workflow_run_id: workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
+            audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
             mode: copilotV2Enabled ? composerMode : null,
-            code_block: showCodeToggle ? codeWorkflow : null,
+            code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
             cancel_token: cancelToken,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -1339,17 +1464,22 @@ export function WorkflowCopilotChat({
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
+      codeBlockModeEnabled,
       codeWorkflow,
       composerMode,
       copilotV2Enabled,
       credentialGetter,
       getSaveData,
       inputValue,
+      isSpeechListening,
+      isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
       requiresLiveBrowser,
-      showCodeToggle,
+      stopSpeech,
+      takeSpeechAudioBlob,
       updateQueuedPrompt,
+      uploadDictationAudio,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
@@ -1385,6 +1515,7 @@ export function WorkflowCopilotChat({
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
+      audioBlob: promptToSend.audioBlob,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });

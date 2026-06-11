@@ -22,6 +22,8 @@ from mcp.types import (
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     build_loop_blocker_signal,
+    loop_blocker_evidence_from_ctx,
+    refresh_held_loop_blocker_evidence,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
@@ -74,7 +76,8 @@ def _hide_code_only_tool(ctx: CopilotContext, tool_name: str) -> bool:
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
-    return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
+    signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
+    return stash_blocker_signal(ctx, signal)
 
 
 def _apply_schema_overlay(
@@ -234,6 +237,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
+        refresh_held_loop_blocker_evidence(copilot_ctx)
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(

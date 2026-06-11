@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     VIDEO_COMPRESSION_CRF: int = 28
     VIDEO_COMPRESSION_PRESET: str = "veryfast"
     VIDEO_COMPRESSION_TIMEOUT_SECONDS: float = 300.0
+    VIDEO_FINAL_SYNC_TIMEOUT_SECONDS: float = 750.0
     HAR_PATH: str | None = "./har"
     LOG_PATH: str = "./log"
     TEMP_PATH: str = "./temp"
@@ -139,6 +140,9 @@ class Settings(BaseSettings):
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
+    # Successful (<400) GET/HEAD/OPTIONS are skipped by default: they dominate
+    # log volume (health checks, polling) while carrying no mutation to audit.
+    LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     # Gate copilot verified-success on per-criterion outcome evidence.

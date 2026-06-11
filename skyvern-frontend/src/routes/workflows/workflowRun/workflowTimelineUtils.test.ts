@@ -8,12 +8,15 @@ import {
   type WorkflowRunTimelineBlockItem,
   type WorkflowRunTimelineItem,
 } from "../types/workflowRunTypes";
+import type { WorkflowBlock } from "../types/workflowTypes";
 import {
   aggregateIterationStatus,
+  classifyUnexecutedDefinedBlocks,
   findActiveItem,
   findBlockSurroundingThought,
   findLastExecutedBlock,
   findRunningBlock,
+  flattenTimelineChronologically,
   resolveScreenshotBlockId,
 } from "./workflowTimelineUtils";
 
@@ -436,6 +439,470 @@ describe("aggregateIterationStatus", () => {
       ]),
     ];
     expect(aggregateIterationStatus(items)).toBe(Status.Failed);
+  });
+});
+
+describe("flattenTimelineChronologically", () => {
+  function rootIds(items: Array<WorkflowRunTimelineItem>): Array<string> {
+    return items.map((item) =>
+      item.type === "block" ? item.block.workflow_run_block_id : "thought",
+    );
+  }
+
+  test("hoists conditional branch chains so visible order matches execution order", () => {
+    // Regression: a conditional's branch blocks executed AFTER a root-level
+    // loop, but tree rendering printed them above it (the terminated block
+    // looked like it ran before the loop).
+    //   root  block_2 conditional      07:16
+    //   root  block_5 for_loop         07:19 (children 07:19–07:27)
+    //   child block_8 (parent block_2) 07:29
+    //   child block_12 (parent block_8) 07:39, terminated
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_block_2",
+      block_type: "conditional",
+      created_at: "2026-06-10T07:16:29Z",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_block_5",
+      block_type: "for_loop",
+      created_at: "2026-06-10T07:19:06Z",
+    });
+    const loopChild = buildBlock({
+      workflow_run_block_id: "wrb_loop_child",
+      parent_workflow_run_block_id: "wrb_block_5",
+      created_at: "2026-06-10T07:19:11Z",
+      current_index: 0,
+    });
+    const branchConditional = buildBlock({
+      workflow_run_block_id: "wrb_block_8",
+      block_type: "conditional",
+      parent_workflow_run_block_id: "wrb_block_2",
+      created_at: "2026-06-10T07:29:32Z",
+    });
+    const terminated = buildBlock({
+      workflow_run_block_id: "wrb_block_12",
+      block_type: "navigation",
+      status: Status.Terminated,
+      parent_workflow_run_block_id: "wrb_block_8",
+      created_at: "2026-06-10T07:39:31Z",
+    });
+
+    const flattened = flattenTimelineChronologically([
+      buildBlockItem(conditional, [
+        buildBlockItem(branchConditional, [buildBlockItem(terminated)]),
+      ]),
+      buildBlockItem(loop, [buildBlockItem(loopChild)]),
+    ]);
+
+    expect(rootIds(flattened)).toEqual([
+      "wrb_block_2",
+      "wrb_block_5",
+      "wrb_block_8",
+      "wrb_block_12",
+    ]);
+    // The loop keeps its iteration children nested; hoisted conditional rows
+    // carry none.
+    const loopRow = flattened.find(
+      (item) =>
+        item.type === "block" &&
+        item.block.workflow_run_block_id === "wrb_block_5",
+    );
+    expect(rootIds(loopRow?.children ?? [])).toEqual(["wrb_loop_child"]);
+    const conditionalRow = flattened.find(
+      (item) =>
+        item.type === "block" &&
+        item.block.workflow_run_block_id === "wrb_block_2",
+    );
+    expect(conditionalRow?.children).toEqual([]);
+  });
+
+  test("interleaves a conditional's scoped blocks around a root loop by created_at", () => {
+    // The same conditional parents blocks both before (07:17) and after
+    // (07:28) the root loop ran (07:19) — they must straddle the loop row.
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      created_at: "2026-06-10T07:16:29Z",
+    });
+    const beforeLoop = buildBlock({
+      workflow_run_block_id: "wrb_before_loop",
+      parent_workflow_run_block_id: "wrb_cond",
+      created_at: "2026-06-10T07:17:40Z",
+    });
+    const afterLoop = buildBlock({
+      workflow_run_block_id: "wrb_after_loop",
+      block_type: "wait",
+      parent_workflow_run_block_id: "wrb_cond",
+      created_at: "2026-06-10T07:28:55Z",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+      created_at: "2026-06-10T07:19:06Z",
+    });
+
+    const flattened = flattenTimelineChronologically([
+      buildBlockItem(conditional, [
+        buildBlockItem(beforeLoop),
+        buildBlockItem(afterLoop),
+      ]),
+      buildBlockItem(loop),
+    ]);
+
+    expect(rootIds(flattened)).toEqual([
+      "wrb_cond",
+      "wrb_before_loop",
+      "wrb_loop",
+      "wrb_after_loop",
+    ]);
+  });
+
+  test("keeps loop children nested and sorts them ascending by created_at", () => {
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+      created_at: "2026-06-10T07:00:00Z",
+    });
+    const later = buildBlock({
+      workflow_run_block_id: "wrb_later",
+      parent_workflow_run_block_id: "wrb_loop",
+      created_at: "2026-06-10T07:05:00Z",
+      current_index: 1,
+    });
+    const earlier = buildBlock({
+      workflow_run_block_id: "wrb_earlier",
+      parent_workflow_run_block_id: "wrb_loop",
+      created_at: "2026-06-10T07:01:00Z",
+      current_index: 0,
+    });
+
+    const flattened = flattenTimelineChronologically([
+      buildBlockItem(loop, [buildBlockItem(later), buildBlockItem(earlier)]),
+    ]);
+
+    expect(rootIds(flattened)).toEqual(["wrb_loop"]);
+    expect(rootIds(flattened[0]!.children)).toEqual([
+      "wrb_earlier",
+      "wrb_later",
+    ]);
+  });
+
+  test("hoists a conditional's branch chain inside a loop into the loop's children", () => {
+    // Inside a loop iteration, branch targets are parented to the in-loop
+    // conditional. They keep their current_index, so hoisting them up to the
+    // loop level preserves iteration grouping.
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+      created_at: "2026-06-10T07:00:00Z",
+    });
+    const inLoopConditional = buildBlock({
+      workflow_run_block_id: "wrb_in_loop_cond",
+      block_type: "conditional",
+      parent_workflow_run_block_id: "wrb_loop",
+      created_at: "2026-06-10T07:01:00Z",
+      current_index: 0,
+    });
+    const branchTask = buildBlock({
+      workflow_run_block_id: "wrb_branch_task",
+      parent_workflow_run_block_id: "wrb_in_loop_cond",
+      created_at: "2026-06-10T07:02:00Z",
+      current_index: 0,
+    });
+
+    const flattened = flattenTimelineChronologically([
+      buildBlockItem(loop, [
+        buildBlockItem(inLoopConditional, [buildBlockItem(branchTask)]),
+      ]),
+    ]);
+
+    expect(rootIds(flattened)).toEqual(["wrb_loop"]);
+    expect(rootIds(flattened[0]!.children)).toEqual([
+      "wrb_in_loop_cond",
+      "wrb_branch_task",
+    ]);
+    const hoistedBranchTask = flattened[0]!.children[1]!;
+    expect(
+      hoistedBranchTask.type === "block" &&
+        hoistedBranchTask.block.current_index,
+    ).toBe(0);
+  });
+
+  test("sorts thought items among blocks chronologically", () => {
+    const thought = buildThoughtItem({
+      thought_id: "thought_mid",
+      created_at: "2026-06-10T07:01:00Z",
+    });
+    const first = buildBlock({
+      workflow_run_block_id: "wrb_first",
+      created_at: "2026-06-10T07:00:00Z",
+    });
+    const last = buildBlock({
+      workflow_run_block_id: "wrb_last",
+      created_at: "2026-06-10T07:02:00Z",
+    });
+
+    const flattened = flattenTimelineChronologically([
+      buildBlockItem(last),
+      thought,
+      buildBlockItem(first),
+    ]);
+
+    expect(rootIds(flattened)).toEqual(["wrb_first", "thought", "wrb_last"]);
+  });
+});
+
+describe("classifyUnexecutedDefinedBlocks", () => {
+  function buildDefinedBlock(
+    overrides: Partial<{
+      label: string;
+      block_type: string;
+      next_block_label: string | null;
+      branch_conditions: Array<{
+        id: string;
+        next_block_label: string | null;
+        is_default: boolean;
+      }>;
+    }>,
+  ): WorkflowBlock {
+    return {
+      label: "defined_default",
+      block_type: "navigation",
+      next_block_label: null,
+      ...overrides,
+    } as unknown as WorkflowBlock;
+  }
+
+  function reasonsByLabel(
+    result: ReturnType<typeof classifyUnexecutedDefinedBlocks>,
+  ): Record<string, string> {
+    return Object.fromEntries(result.map((r) => [r.block.label, r.reason]));
+  }
+
+  test("labels a not-taken branch chain as branch_not_taken using runtime evaluations", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          { id: "br_b", next_block_label: "block_b", is_default: true },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+      buildDefinedBlock({ label: "block_b", next_block_label: "block_b2" }),
+      buildDefinedBlock({ label: "block_b2", next_block_label: null }),
+    ];
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "cond",
+      output: {
+        evaluations: [
+          { is_matched: true, next_block_label: "block_a" },
+          { is_matched: false, next_block_label: "block_b" },
+        ],
+      } as WorkflowRunBlock["output"],
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      parent_workflow_run_block_id: "wrb_cond",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(conditional, [buildBlockItem(taken)]),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({
+      block_b: "branch_not_taken",
+      block_b2: "branch_not_taken",
+    });
+  });
+
+  test("labels an unexecuted block on the TAKEN branch as not_reached (run ended first)", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          { id: "br_b", next_block_label: "block_b", is_default: true },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: "block_a2" }),
+      buildDefinedBlock({ label: "block_a2", next_block_label: null }),
+      buildDefinedBlock({ label: "block_b", next_block_label: null }),
+    ];
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "cond",
+      output: {
+        evaluations: [
+          { is_matched: true, next_block_label: "block_a" },
+          { is_matched: false, next_block_label: "block_b" },
+        ],
+      } as WorkflowRunBlock["output"],
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      status: Status.Terminated,
+      parent_workflow_run_block_id: "wrb_cond",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(conditional, [buildBlockItem(taken)]),
+    ]);
+
+    // block_a2 was on the taken path but the run terminated at block_a.
+    expect(reasonsByLabel(result)).toEqual({
+      block_a2: "not_reached",
+      block_b: "branch_not_taken",
+    });
+  });
+
+  test("labels everything not_reached when the conditional itself never executed", () => {
+    const defined = [
+      buildDefinedBlock({ label: "first", next_block_label: "cond" }),
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+    ];
+    const first = buildBlock({
+      workflow_run_block_id: "wrb_first",
+      label: "first",
+      status: Status.Terminated,
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(first),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({
+      cond: "not_reached",
+      block_a: "not_reached",
+    });
+  });
+
+  test("descends into an unexecuted inner conditional inside a not-taken branch", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "outer",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          { id: "br_inner", next_block_label: "inner", is_default: true },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+      buildDefinedBlock({
+        label: "inner",
+        block_type: "conditional",
+        next_block_label: "inner_merge",
+        branch_conditions: [
+          { id: "br_x", next_block_label: "block_x", is_default: false },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_x", next_block_label: null }),
+      buildDefinedBlock({ label: "inner_merge", next_block_label: null }),
+    ];
+    const outer = buildBlock({
+      workflow_run_block_id: "wrb_outer",
+      block_type: "conditional",
+      label: "outer",
+      output: {
+        evaluations: [
+          { is_matched: true, next_block_label: "block_a" },
+          { is_matched: false, next_block_label: "inner" },
+        ],
+      } as WorkflowRunBlock["output"],
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      parent_workflow_run_block_id: "wrb_outer",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(outer, [buildBlockItem(taken)]),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({
+      inner: "branch_not_taken",
+      block_x: "branch_not_taken",
+      inner_merge: "branch_not_taken",
+    });
+  });
+
+  test("falls back to executed_branch_next_block when output has no evaluations", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          { id: "br_b", next_block_label: "block_b", is_default: true },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+      buildDefinedBlock({ label: "block_b", next_block_label: null }),
+    ];
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "cond",
+      executed_branch_next_block: "block_a",
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      parent_workflow_run_block_id: "wrb_cond",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(conditional, [buildBlockItem(taken)]),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({ block_b: "branch_not_taken" });
+  });
+
+  test("stays conservative (not_reached) when the taken branch is unknowable", () => {
+    const defined = [
+      buildDefinedBlock({
+        label: "cond",
+        block_type: "conditional",
+        branch_conditions: [
+          { id: "br_a", next_block_label: "block_a", is_default: false },
+          { id: "br_b", next_block_label: "block_b", is_default: true },
+        ],
+      }),
+      buildDefinedBlock({ label: "block_a", next_block_label: null }),
+      buildDefinedBlock({ label: "block_b", next_block_label: null }),
+    ];
+    // Legacy run: no evaluations in output, no executed_branch_next_block.
+    const conditional = buildBlock({
+      workflow_run_block_id: "wrb_cond",
+      block_type: "conditional",
+      label: "cond",
+    });
+    const taken = buildBlock({
+      workflow_run_block_id: "wrb_a",
+      label: "block_a",
+      parent_workflow_run_block_id: "wrb_cond",
+    });
+
+    const result = classifyUnexecutedDefinedBlocks(defined, [
+      buildBlockItem(conditional, [buildBlockItem(taken)]),
+    ]);
+
+    expect(reasonsByLabel(result)).toEqual({ block_b: "not_reached" });
   });
 });
 
