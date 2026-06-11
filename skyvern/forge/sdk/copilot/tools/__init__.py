@@ -35,10 +35,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml as _process_workflow_yaml
 
 from ._shared import _COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS
+from ._shared import _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS as _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS
 from ._shared import _FAILED_BLOCK_STATUSES as _FAILED_BLOCK_STATUSES
 from ._shared import BLOCK_RUNNING_TOOLS as BLOCK_RUNNING_TOOLS
 from ._shared import COPILOT_FINAL_REPLY_RESERVE_SECONDS as COPILOT_FINAL_REPLY_RESERVE_SECONDS
@@ -113,6 +115,11 @@ from .composition_capture import (
 )
 from .composition_capture import _normalized_inspect_url as _normalized_inspect_url
 from .composition_capture import _same_inspect_target as _same_inspect_target
+from .credential_fill import _credential_fill_policy_error as _credential_fill_policy_error
+from .credential_fill import (
+    _fill_credential_field_impl,
+)
+from .credential_fill import _resolve_credential_fill_value as _resolve_credential_fill_value
 from .credentials import _credential_id_misbinding_error_message as _credential_id_misbinding_error_message
 from .credentials import _credential_id_misbinding_findings as _credential_id_misbinding_findings
 from .credentials import _credential_reference_validation_error as _credential_reference_validation_error
@@ -792,7 +799,7 @@ async def discover_workflow_entrypoint_tool(
     buttons, run JavaScript, or submit forms.
     """
     result = await _discover_workflow_entrypoint_impl(ctx.context, site_or_url, intent_hint)
-    return json.dumps(result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
 @function_tool(name_override="inspect_page_for_composition", strict_mode=False)
@@ -827,7 +834,38 @@ async def inspect_page_for_composition_tool(
     report the observed anti-bot blocker rather than retrying the same flow.
     """
     result = await _inspect_page_for_composition_impl(ctx.context, target_url)
-    return json.dumps(result)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
+
+
+@function_tool(name_override="fill_credential_field", strict_mode=False)
+async def fill_credential_field_tool(
+    ctx: RunContextWrapper,
+    selector: str,
+    credential_id: str,
+    field: str,
+) -> str:
+    """Fill ONE field of a SAVED credential into the live debug browser during code-only scouting.
+
+    The secret value is resolved server-side from the stored credential and never
+    enters the conversation; the result reports only `typed_length`. Use this
+    instead of `type_text` whenever a login form field should receive a saved
+    credential's username, password, or one-time TOTP code — `type_text` cannot
+    type secrets and you never have the values.
+
+    `selector` must be a CSS selector for the exact input field (no comma-union
+    fallbacks — inspect the page first and target the proven field).
+    `credential_id` must be a credential from the request policy's
+    `resolved_credentials`. `field` is one of `username`, `password`, `totp`
+    (`totp` generates a fresh code at call time).
+
+    This tool only fills; it never clicks or submits. Each successful fill is
+    recorded as a scouted interaction, so the SYNTHESIZED CODE BLOCK will bind
+    the credential as a `credential_id` workflow parameter and reference it as
+    `<parameter_key>.username` / `.password` / `.totp` — keep that attribute
+    form when persisting code blocks.
+    """
+    result = await _fill_credential_field_impl(ctx.context, selector, credential_id, field)
+    return json.dumps(scrub_secrets_from_structure(ctx.context, result))
 
 
 NATIVE_TOOLS = [
@@ -838,4 +876,5 @@ NATIVE_TOOLS = [
     update_and_run_blocks_tool,
     discover_workflow_entrypoint_tool,
     inspect_page_for_composition_tool,
+    fill_credential_field_tool,
 ]

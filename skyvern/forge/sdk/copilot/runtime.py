@@ -116,6 +116,10 @@ class ScoutedInteraction(TypedDict):
     role: NotRequired[str]
     accessible_name: NotRequired[str]
     trajectory_index: NotRequired[int]
+    # Credential fills carry references and metadata only — never secret values.
+    credential_id: NotRequired[str]
+    credential_field: NotRequired[str]
+    credential_name: NotRequired[str]
 
 
 @dataclass
@@ -242,6 +246,10 @@ class AgentContext:
     synthesized_block_offered: bool = False
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
+    # Exact secret strings filled into the live browser this turn (passwords,
+    # call-time-minted OTP codes). Page-readback tool results are exact-string
+    # scrubbed against this set before being recorded or returned to the model.
+    secret_scrub_values: list[str] = field(default_factory=list)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at

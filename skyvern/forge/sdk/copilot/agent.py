@@ -157,6 +157,11 @@ Code block runtime facts:
 - Use deterministic, bounded Playwright calls such as `await page.goto(...)`,
   `await page.click(...)`, `await page.fill(...)`, `await page.press(...)`,
   `await page.wait_for_load_state(...)`, and `await page.evaluate(...)`.
+- A workflow parameter bound to a saved credential (`workflow_parameter_type:
+  credential_id`) resolves at runtime to a credential object: read
+  `<key>.username`, `<key>.password`, and `<key>.totp` (a fresh one-time code
+  generated at block start). Scout saved-credential fields with the
+  `fill_credential_field` tool; never type or embed literal secret values.
 - For extraction blocks, return precise JSON-safe structured data and the
   visible evidence text used to confirm it. Do not return only booleans for
   visible records, products, totals, confirmations, or identifiers.

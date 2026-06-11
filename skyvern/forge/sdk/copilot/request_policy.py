@@ -94,8 +94,11 @@ _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
     "I couldn't find the required credentials for the existing workflow. "
     f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
 )
+SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I
+)
 _RAW_SECRET_PATTERNS = (
-    re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     re.compile(
         r"\b(?:otp|totp|mfa|2fa|verification|auth(?:entication)? code)(?:\s+code)?\s*(?:is|[:=])?\s*\d{6,8}\b",
         re.I,
