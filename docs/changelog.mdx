@@ -44,7 +44,7 @@ keywords:
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
 <a id="week-jun-8-2026"></a>
-<Update label="Week of June 8, 2026" description="Editor onboarding, Copilot modes, GCS storage, API docs split, OTP fixes">
+<Update label="Week of June 8, 2026" description="Multi-tab agent control, Gemini 3.5 Flash, GCP Vault, bulk agent actions, credential clears, code-block credentials">
 
 ## New features
 
@@ -52,6 +52,13 @@ keywords:
 - **GCS Storage Backend** — Added Google Cloud Storage as an artifact storage backend for self-hosted deployments. ([#6442](https://github.com/Skyvern-AI/skyvern/pull/6442))
 - **Key-Optional Labels and Flexible Tag Filters** — Tags now support key-optional labels, and tag filter queries accept more flexible formats for richer agent organization. ([#6458](https://github.com/Skyvern-AI/skyvern/pull/6458))
 - **Self-Serve Editor Onboarding** — New users in the workflow editor now see a get-started modal with intent routing and template cards, a 4-stop guided product tour, and smart empty states on the dashboard and runs pages to accelerate time-to-first-automation. ([#6475](https://github.com/Skyvern-AI/skyvern/pull/6475))
+- **Multi-Tab Browser Control** — The autonomous agent loop can now open and interact with multiple browser tabs simultaneously, enabling workflows that span across new tab links and pop-ups. ([#6507](https://github.com/Skyvern-AI/skyvern/pull/6507))
+- **Gemini 3.5 Flash Model Support** — Added Google Gemini 3.5 Flash as a selectable LLM for agent runs, providing a faster inference option. ([#6505](https://github.com/Skyvern-AI/skyvern/pull/6505))
+- **GCP Secret Manager Vault Adapter** — Added Google Cloud Secret Manager as a supported vault backend for storing and retrieving secrets in self-hosted deployments. ([#6488](https://github.com/Skyvern-AI/skyvern/pull/6488))
+- **Bulk Actions on Agents List** — You can now select multiple agents at once and apply bulk actions directly from the agents list page. ([#6485](https://github.com/Skyvern-AI/skyvern/pull/6485))
+- **Self-Service Credential Clears** — Saved credentials can now be individually cleared from the credentials settings page without deleting and recreating them. ([#6480](https://github.com/Skyvern-AI/skyvern/pull/6480))
+- **Per-Run Session Recordings as Artifacts** — Recordings are now clipped to each run's time window and stored as downloadable run-scoped artifacts. ([#6479](https://github.com/Skyvern-AI/skyvern/pull/6479))
+- **Credential-Aware Scouting in Code-Block Mode** — The Copilot now uses saved credentials while scouting pages for code-block generation and produces credential-typed code that fills login fields using your stored credentials. ([#6521](https://github.com/Skyvern-AI/skyvern/pull/6521))
 
 ## Improvements
 
@@ -64,6 +71,10 @@ keywords:
 - **Block Title Editable from Settings Sidebar** — Workflow block titles can now be edited from the right-hand settings sidebar, without needing to use the inline editor on the canvas. ([#6443](https://github.com/Skyvern-AI/skyvern/pull/6443))
 - **API Reference Split into Agents and Runs Sections** — The public API reference is now organized into separate Agents and Runs sections for easier navigation. ([#6448](https://github.com/Skyvern-AI/skyvern/pull/6448))
 - **Label-First Tag Editor and Flexible Tag Filter UI** — The tag editor now accepts standalone labels or `group:label` format in a single input, and the filter bar supports filtering by label, group, or group:label for richer agent organization. ([#6470](https://github.com/Skyvern-AI/skyvern/pull/6470))
+- **2FA Field Progressive Disclosure in Login Block** — Two-factor authentication fields in the login workflow block are now collapsed by default and expanded on demand, reducing visual noise for workflows that don't use 2FA. ([#6490](https://github.com/Skyvern-AI/skyvern/pull/6490))
+- **Persistent Browser Session Profile Generation Now Opt-In** — Automatic browser profile generation during persistent sessions is now opt-in, giving you explicit control over when profiles are captured. ([#6489](https://github.com/Skyvern-AI/skyvern/pull/6489))
+- **Icon-Only Status Pills on Mobile Viewports** — Status badges now render in a compact icon-only format on small screen widths, preventing layout overflow on mobile devices. ([#6481](https://github.com/Skyvern-AI/skyvern/pull/6481))
+- **Hardened Webhook Delivery** — Workflow webhook delivery is now more reliable, with improved handling of transient failures and prioritized delivery ordering. ([#6478](https://github.com/Skyvern-AI/skyvern/pull/6478))
 
 ## Bug fixes
 
@@ -72,6 +83,12 @@ keywords:
 - Fixed persistent-session screen recordings not appearing in the run view when the recording timestamp fell outside the run's time window. ([#6454](https://github.com/Skyvern-AI/skyvern/pull/6454))
 - Fixed Copilot inconsistently asking for a URL before running discovery when the user had only named a site without providing one. ([#6473](https://github.com/Skyvern-AI/skyvern/pull/6473))
 - Fixed Copilot asking for a URL after already successfully navigating to the requested site during discovery. ([#6472](https://github.com/Skyvern-AI/skyvern/pull/6472))
+- Fixed self-hosted deployments rejecting requests with "Invalid credentials" (HTTP 403) when the Docker UI injected an API key that the container's server incorrectly filtered out.
+- Fixed persistent session recordings not being finalized when the video encoding process outlasted the session's cleanup window. ([#6519](https://github.com/Skyvern-AI/skyvern/pull/6519))
+- Fixed the saved credentials status indicator not updating until the page was manually refreshed. ([#6517](https://github.com/Skyvern-AI/skyvern/pull/6517))
+- Fixed the workflow run timeline rendering blocks in branch-tree order instead of execution order, producing a confusing step sequence. ([#6515](https://github.com/Skyvern-AI/skyvern/pull/6515))
+- Fixed downloaded files inside loop blocks being shared across all iterations instead of scoped to the block that downloaded them. ([#6487](https://github.com/Skyvern-AI/skyvern/pull/6487))
+- Fixed session recordings defaulting to an incorrect resolution; recordings now use Playwright's default viewport size. ([#6524](https://github.com/Skyvern-AI/skyvern/pull/6524))
 
 </Update>
 
