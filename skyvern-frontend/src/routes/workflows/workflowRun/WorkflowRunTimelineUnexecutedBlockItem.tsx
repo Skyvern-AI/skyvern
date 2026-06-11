@@ -1,9 +1,27 @@
 import { workflowBlockTitle } from "../editor/nodes/types";
 import { WorkflowBlockIcon } from "../editor/nodes/WorkflowBlockIcon";
 import { WorkflowBlock } from "../types/workflowTypes";
+import { type UnexecutedBlockReason } from "./workflowTimelineUtils";
 
 type Props = {
   block: WorkflowBlock;
+  reason?: UnexecutedBlockReason;
+};
+
+const reasonBadge: Record<
+  UnexecutedBlockReason,
+  { label: string; title: string }
+> = {
+  branch_not_taken: {
+    label: "skipped",
+    title:
+      "This block did not execute because its conditional branch was not taken",
+  },
+  not_reached: {
+    label: "did not execute",
+    title:
+      "This block did not execute because the workflow ended before reaching it",
+  },
 };
 
 function getTypeLabel(block: WorkflowBlock): string {
@@ -24,9 +42,13 @@ function getTypeLabel(block: WorkflowBlock): string {
   }
 }
 
-function WorkflowRunTimelineUnexecutedBlockItem({ block }: Props) {
+function WorkflowRunTimelineUnexecutedBlockItem({
+  block,
+  reason = "not_reached",
+}: Props) {
   const typeLabel = getTypeLabel(block);
   const blockTypeTitle = workflowBlockTitle[block.block_type];
+  const badge = reasonBadge[reason];
   return (
     <div className="min-w-0 opacity-60">
       <div className="flex min-h-[28px] items-stretch text-xs">
@@ -51,9 +73,9 @@ function WorkflowRunTimelineUnexecutedBlockItem({ block }: Props) {
             </span>
             <span
               className="ml-auto shrink-0 rounded bg-slate-800 px-1 text-[10px] uppercase tracking-wide text-slate-400"
-              title="This block did not execute because the workflow ended before reaching it"
+              title={badge.title}
             >
-              did not execute
+              {badge.label}
             </span>
           </div>
         </div>
