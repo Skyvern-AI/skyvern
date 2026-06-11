@@ -27,6 +27,12 @@ def _ctx(**overrides: Any) -> Any:
         "last_workflow_yaml": None,
         "last_test_ok": None,
         "copilot_run_start_monotonic": None,
+        "last_test_failure_reason": None,
+        "last_outcome_gate_reason": None,
+        "last_test_anti_bot": None,
+        "staged_workflow": None,
+        "staged_workflow_yaml": None,
+        "has_staged_proposal": False,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
