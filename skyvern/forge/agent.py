@@ -3475,6 +3475,8 @@ class ForgeAgent:
         verification_code_check: bool,
         show_close_page_action: bool,
         complete_criterion: str | None,
+        show_new_tab_action: bool = False,
+        show_switch_tab_action: bool = False,
         enriched_tree_enabled: bool = False,
         llm_screenshots_enabled: bool = True,
         slim_output: str | None = None,
@@ -3489,6 +3491,10 @@ class ForgeAgent:
             variant_parts.append("vc")
         if show_close_page_action:
             variant_parts.append("cp")
+        if show_new_tab_action:
+            variant_parts.append("nt")
+        if show_switch_tab_action:
+            variant_parts.append("st")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
@@ -3763,6 +3769,11 @@ class ForgeAgent:
 
         open_tabs_context = await _build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
+        # NEW_TAB/SWITCH_TAB are gated behind a flag (default off) so single-tab tasks are
+        # unaffected. SWITCH_TAB additionally requires >= 2 open tabs, like CLOSE_PAGE.
+        multi_tab_enabled = await self._is_multi_tab_control_enabled(context)
+        show_new_tab_action = multi_tab_enabled
+        show_switch_tab_action = multi_tab_enabled and open_tabs_context is not None
         llm_screenshots_enabled = context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
         enriched_tree_enabled = context.enriched_tree_enabled()
 
@@ -3790,6 +3801,8 @@ class ForgeAgent:
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "show_close_page_action": show_close_page_action,
+                    "show_new_tab_action": show_new_tab_action,
+                    "show_switch_tab_action": show_switch_tab_action,
                     "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                     "llm_screenshots_enabled": llm_screenshots_enabled,
@@ -3799,6 +3812,8 @@ class ForgeAgent:
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
                     show_close_page_action=show_close_page_action,
+                    show_new_tab_action=show_new_tab_action,
+                    show_switch_tab_action=show_switch_tab_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
@@ -3888,6 +3903,8 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             show_close_page_action=show_close_page_action,
+            show_new_tab_action=show_new_tab_action,
+            show_switch_tab_action=show_switch_tab_action,
             open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
             llm_screenshots_enabled=llm_screenshots_enabled,
@@ -3962,6 +3979,26 @@ class ForgeAgent:
             )
 
         return context.prompt_caching_settings
+
+    async def _is_multi_tab_control_enabled(self, context: SkyvernContext) -> bool:
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        if not distinct_id or not organization_id:
+            return False
+        try:
+            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "MULTI_TAB_CONTROL",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate multi-tab control experiment; defaulting to disabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return False
 
     def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
         """Detect TOTP pages by checking for multiple input fields or verification keywords."""

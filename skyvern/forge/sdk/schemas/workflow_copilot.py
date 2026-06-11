@@ -47,6 +47,7 @@ class WorkflowCopilotChatMessage(BaseModel):
     workflow_copilot_chat_id: str = Field(..., description="ID of the parent workflow copilot chat")
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for audio captured during dictation")
     global_llm_context: str | None = Field(None, description="Optional global LLM context for the message")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows)")
     narrative_payload: TurnNarrativePayload | None = Field(
@@ -67,6 +68,10 @@ class WorkflowCopilotChatRequest(BaseModel):
         description="Optional persistent browser session ID to reuse instead of creating a new one.",
     )
     message: str = Field(..., description="The message that user sends")
+    audio_artifact_id: str | None = Field(
+        None,
+        description="Artifact ID for audio captured while dictating this message.",
+    )
     workflow_yaml: str = Field(..., description="Current workflow YAML including unsaved changes")
     mode: Literal["ask", "build"] | None = Field(
         None, description="Per-request copilot path selector; None falls back to feature flags."
@@ -103,6 +108,7 @@ class WorkflowCopilotApplyProposedWorkflowRequest(BaseModel):
 class WorkflowCopilotChatHistoryMessage(BaseModel):
     sender: WorkflowCopilotChatSender = Field(..., description="Message sender")
     content: str = Field(..., description="Message content")
+    audio_artifact_id: str | None = Field(None, description="Artifact ID for captured dictation audio")
     turn_outcome: TurnOutcome | None = Field(None, description="Typed turn outcome (assistant rows only)")
     narrative_payload: TurnNarrativePayload | None = Field(
         None,
@@ -116,6 +122,11 @@ class WorkflowCopilotChatHistoryResponse(BaseModel):
     chat_history: list[WorkflowCopilotChatHistoryMessage] = Field(default_factory=list, description="Chat messages")
     proposed_workflow: dict | None = Field(None, description="Latest workflow proposed by the copilot")
     auto_accept: bool | None = Field(None, description="Whether copilot auto-accepts workflow updates")
+
+
+class WorkflowCopilotAudioUploadResponse(BaseModel):
+    workflow_copilot_chat_id: str = Field(..., description="Chat ID the audio artifact is associated with")
+    audio_artifact_id: str = Field(..., description="Stored audio artifact ID")
 
 
 class WorkflowCopilotStreamMessageType(StrEnum):

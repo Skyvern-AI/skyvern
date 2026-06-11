@@ -139,6 +139,9 @@ class Settings(BaseSettings):
     EXECUTE_ALL_STEPS: bool = True
     JSON_LOGGING: bool = False
     LOG_RAW_API_REQUESTS: bool = True
+    # Successful (<400) GET/HEAD/OPTIONS are skipped by default: they dominate
+    # log volume (health checks, polling) while carrying no mutation to audit.
+    LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     # Gate copilot verified-success on per-criterion outcome evidence.
