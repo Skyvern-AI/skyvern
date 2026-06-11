@@ -343,6 +343,36 @@ async def test_resolve_browser_does_not_reuse_session_for_different_api_key(
     fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
 
 
+@pytest.mark.parametrize(
+    ("env", "expected_can_access_localhost"),
+    [
+        ("local", True),
+        ("prod", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resolve_browser_classifies_explicit_cloud_session_localhost_reachability(
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    expected_can_access_localhost: bool,
+) -> None:
+    monkeypatch.setattr(session_manager.settings, "ENV", env)
+    replacement_browser = MagicMock()
+    fake_skyvern = MagicMock()
+    fake_skyvern.connect_to_cloud_browser_session = AsyncMock(return_value=replacement_browser)
+    monkeypatch.setattr(session_manager, "get_skyvern", lambda: fake_skyvern)
+
+    browser, ctx = await session_manager.resolve_browser(session_id="pbs_123")
+
+    assert browser is replacement_browser
+    assert ctx == BrowserContext(
+        mode="cloud_session",
+        session_id="pbs_123",
+        can_access_localhost=expected_can_access_localhost,
+    )
+    fake_skyvern.connect_to_cloud_browser_session.assert_awaited_once_with("pbs_123")
+
+
 @pytest.mark.asyncio
 async def test_resolve_browser_does_not_reuse_registered_copilot_session_for_different_api_key_override(
     monkeypatch: pytest.MonkeyPatch,
@@ -762,6 +792,10 @@ async def test_session_create_persists_active_api_key_hash_in_session_state(
     assert result["ok"] is True
     current = mcp_session.get_current_session()
     assert current.browser is fake_browser
-    assert current.context == BrowserContext(mode="cloud_session", session_id="pbs_123")
+    assert current.context == BrowserContext(
+        mode="cloud_session",
+        session_id="pbs_123",
+        can_access_localhost=False,
+    )
     assert current.api_key_hash == session_manager._api_key_hash("sk_key_create")
     assert current.api_key_hash != "sk_key_create"
