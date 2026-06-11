@@ -47,6 +47,8 @@ from skyvern.constants import (
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
+    BlockedHost,
+    SkyvernHTTPException,
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
@@ -140,7 +142,7 @@ from skyvern.services.error_detection_service import detect_user_defined_errors_
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
-from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.utils.url_validators import prepend_scheme_and_validate_url, validate_url as _ssrf_validate_url
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -6370,10 +6372,35 @@ class HttpRequestBlock(Block):
                 organization_id=organization_id,
             )
 
-        if not self.validate_url(self.url):
+        try:
+            validated_url = _ssrf_validate_url(self.url)
+            if not validated_url:
+                return await self.build_block_result(
+                    success=False,
+                    failure_reason=f"Invalid URL: {self.url}",
+                    output_parameter_value=None,
+                    status=BlockStatus.failed,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                )
+            self.url = validated_url
+        except BlockedHost as exc:
+            host = getattr(exc, "host", "unknown")
             return await self.build_block_result(
                 success=False,
-                failure_reason=f"Invalid URL format: {self.url}",
+                failure_reason=(
+                    f"URL is blocked by SSRF protection (host: {host}). "
+                    "Add the host to ALLOWED_HOSTS to reach internal endpoints."
+                ),
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except SkyvernHTTPException as exc:
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Invalid URL: {getattr(exc, 'message', str(exc))}",
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
