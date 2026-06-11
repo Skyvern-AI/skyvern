@@ -24,6 +24,7 @@ from skyvern.cli.core.session_manager import (
     scoped_session,
     unregister_copilot_session,
 )
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -85,6 +86,10 @@ def _browser_context_is_attachable(browser_context: object | None) -> bool:
             return False
 
     return True
+
+
+def _copilot_session_can_access_localhost() -> bool:
+    return settings.ENV == "local"
 
 
 def _browser_session_status_is_final(status: str | None) -> bool:
@@ -335,7 +340,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser_state.browser_context,
             browser_session_id=ctx.browser_session_id,
         )
-        mcp_ctx = MCPBrowserContext(mode="cloud_session", session_id=ctx.browser_session_id)
+        mcp_ctx = MCPBrowserContext(
+            mode="cloud_session",
+            session_id=ctx.browser_session_id,
+            can_access_localhost=_copilot_session_can_access_localhost(),
+        )
         active_key = get_active_api_key()
         state = SessionState(
             browser=skyvern_browser,
