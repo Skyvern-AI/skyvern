@@ -39,6 +39,8 @@ class BrowserState(Protocol):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None: ...
 
+    async def set_active_page(self, page: Page) -> None: ...
+
     async def navigate_to_url(
         self,
         page: Page,

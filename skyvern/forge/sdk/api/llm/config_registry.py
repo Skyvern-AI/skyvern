@@ -1789,6 +1789,25 @@ if settings.ENABLE_VERTEX_AI:
             ),
         ),
     )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.5_FLASH_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.5-flash",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.5-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
+    )
     # Register old keys as aliases to prevent breaking existing tasks
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_2.5_FLASH_PREVIEW_09_2025",

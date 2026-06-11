@@ -59,6 +59,13 @@ class RealBrowserState(BrowserState):
         browser_cleanup: BrowserCleanupFunc = None,
     ):
         self.__page = page
+        # An explicitly selected tab (set by NEW_TAB/SWITCH_TAB). When set, it overrides the
+        # last-page default in get_working_page so multi-tab targeting is deterministic.
+        self.__active_page: Page | None = None
+        # Snapshot of the valid pages present when the active tab was pinned. If a page appears
+        # that was not in this set, a new tab opened and auto-takes focus (legacy behavior),
+        # so the pin is dropped.
+        self.__active_page_known_pages: set[Page] = set()
         self.pw = pw
         self.browser_context = browser_context
         self.browser_artifacts = browser_artifacts
@@ -170,18 +177,31 @@ class RealBrowserState(BrowserState):
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
 
     async def get_working_page(self) -> Page | None:
-        # HACK: currently, assuming the last page is always the working page.
-        # Need to refactor this logic when we want to manipulate multi pages together
-        # TODO: do not use index of pages, it should be more robust if we want to fully support multi pages manipulation
         if self.__page is None or self.browser_context is None:
             return None
 
-        # pick the last and http/https page as the working page
         pages = await self.list_valid_pages()
         if len(pages) == 0:
             LOG.info("No http, https or blank page found in the browser context, return None")
             return None
 
+        # Honor a tab explicitly selected via NEW_TAB/SWITCH_TAB while it is still open and no
+        # new tab has appeared since selection. A newly-opened tab (any page not in the snapshot)
+        # auto-takes focus, preserving the legacy last-page behavior; closing an unrelated tab
+        # does not drop the pin.
+        active_page = self.__active_page
+        if (
+            active_page is not None
+            and not active_page.is_closed()
+            and active_page in pages
+            and all(page in self.__active_page_known_pages for page in pages)
+        ):
+            self.__page = active_page
+            return active_page
+
+        # No (or stale) pin: fall back to the last http/https page as the working page.
+        self.__active_page = None
+        self.__active_page_known_pages = set()
         last_page = pages[-1]
         if self.__page == last_page:
             return self.__page
@@ -257,6 +277,14 @@ class RealBrowserState(BrowserState):
 
     async def set_working_page(self, page: Page | None, index: int = 0) -> None:
         self.__page = page
+        if page is None:
+            self.__active_page = None
+            self.__active_page_known_pages = set()
+
+    async def set_active_page(self, page: Page) -> None:
+        self.__active_page = page
+        self.__page = page
+        self.__active_page_known_pages = set(await self.list_valid_pages())
 
     async def get_or_create_page(
         self,
