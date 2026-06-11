@@ -218,6 +218,10 @@ class Action(BaseModel):
                 return GoForwardAction.model_validate(value)
             elif action_type is ActionType.CLOSE_PAGE:
                 return ClosePageAction.model_validate(value)
+            elif action_type is ActionType.NEW_TAB:
+                return NewTabAction.model_validate(value)
+            elif action_type is ActionType.SWITCH_TAB:
+                return SwitchTabAction.model_validate(value)
             elif action_type is ActionType.EXECUTE_JS:
                 return ExecuteJsAction.model_validate(value)
             else:
@@ -251,6 +255,16 @@ class ReloadPageAction(Action):
 # TODO: right now, it's only enabled when there's magic link during login
 class ClosePageAction(Action):
     action_type: ActionType = ActionType.CLOSE_PAGE
+
+
+class NewTabAction(Action):
+    action_type: ActionType = ActionType.NEW_TAB
+    url: str
+
+
+class SwitchTabAction(Action):
+    action_type: ActionType = ActionType.SWITCH_TAB
+    tab_index: int
 
 
 class ClickAction(WebAction):
