@@ -17,6 +17,10 @@ LOG = structlog.get_logger()
 # unbounded number of ffmpeg jobs at close time.
 MAX_RUNS_PER_SESSION = 200
 
+# Total wall-clock budget for one session's clip pass, enforced by callers so clip
+# generation can never starve the budget that delivers the session recording itself.
+RUN_RECORDING_CLIPS_SYNC_TIMEOUT_SECONDS = 300.0
+
 # Artifact-type folder for per-run clips. Kept distinct from "videos" so the session recording
 # listing (which scans .../videos) never picks up clips, and used as the URI marker that
 # identifies a clip created by this path (vs. a run's own full recording).

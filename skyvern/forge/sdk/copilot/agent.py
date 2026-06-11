@@ -53,7 +53,7 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
-from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
+from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified, verified_goal_satisfied_context
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
@@ -910,6 +910,10 @@ def _make_agent_result(
             payload_updates["responseType"] = response_type
         if proposal_disposition is not None and "proposalDisposition" not in narrative_payload:
             payload_updates["proposalDisposition"] = proposal_disposition
+        if turn_outcome is not None and "responseKind" not in narrative_payload:
+            payload_updates["responseKind"] = turn_outcome.response_kind.value
+        if ctx is not None and "verifiedSuccess" not in narrative_payload:
+            payload_updates["verifiedSuccess"] = bool(verified_goal_satisfied_context(ctx))
         if payload_updates:
             kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)

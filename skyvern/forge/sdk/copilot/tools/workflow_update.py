@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 
 import structlog
 import yaml
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _goal_likely_needs_more_blocks,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -232,6 +233,23 @@ def _format_code_artifact_violations(violations: list[str]) -> str:
     return f"Artifact metadata has {len(violations)} contract violations; fix all of them in one update:\n{numbered}"
 
 
+def _code_artifact_validation_error_message(exc: ValidationError) -> str:
+    # Build from loc/type only; pydantic's str(exc) embeds input_value, which would
+    # carry submitted metadata values onto the scrubbing-exempt durable span.
+    parts = [
+        f"{'.'.join(str(loc) for loc in err.get('loc', ()))}: {err.get('type', 'invalid')}" for err in exc.errors()
+    ]
+    detail = "; ".join(part for part in parts if part) or "schema validation failed"
+    return f"Artifact metadata is malformed ({detail})."
+
+
+class CodeArtifactNormalization(NamedTuple):
+    normalized: dict[str, dict[str, Any]]
+    error: str | None
+    violations: list[str]
+    offending_labels: list[str]
+
+
 def _normalize_code_artifact_metadata(
     raw_metadata: Any,
     workflow_yaml: str,
@@ -239,18 +257,36 @@ def _normalize_code_artifact_metadata(
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
+    result = _normalize_code_artifact_metadata_detailed(
+        raw_metadata,
+        workflow_yaml,
+        impose_defaults=impose_defaults,
+        scout_trajectory=scout_trajectory,
+    )
+    return result.normalized, result.error
+
+
+def _normalize_code_artifact_metadata_detailed(
+    raw_metadata: Any,
+    workflow_yaml: str,
+    *,
+    impose_defaults: bool = False,
+    scout_trajectory: list[ScoutedInteraction] | None = None,
+) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
     Entries keyed to a missing code-block label are re-keyed to the single
     uncovered block or dropped, never rejected. When imposing, mechanical graph
     fields are server-defaulted (and uncovered labels get a deterministic
-    skeleton) so only contradictions reject."""
+    skeleton) so only contradictions reject. Returns the per-violation list and
+    offending labels alongside the batched error for durable telemetry."""
     if raw_metadata in (None, [], {}):
-        return {}, None
+        return CodeArtifactNormalization({}, None, [], [])
     items = _code_artifact_metadata_items(raw_metadata)
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
     violations: list[str] = []
+    offending_labels: list[str] = []
     anchored: list[dict[str, Any]] = []
     unanchored: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -262,7 +298,7 @@ def _normalize_code_artifact_metadata(
                 else CodeArtifactMetadata.model_validate(raw_item)
             )
         except ValidationError as exc:
-            violations.append(f"Artifact metadata is malformed: {exc}")
+            violations.append(_code_artifact_validation_error_message(exc))
             continue
         dumped = metadata.model_dump(mode="json", exclude_none=True)
         label = str(dumped.get("block_label") or "").strip()
@@ -327,14 +363,17 @@ def _normalize_code_artifact_metadata(
         item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
         if item_violations:
             violations.extend(item_violations)
+            offending_labels.append(label)
             continue
         normalized[label] = dumped
     if impose_defaults:
         for label in uncovered:
             normalized[label] = _imposed_artifact_skeleton(label, code_blocks[label], trajectory)
     if violations:
-        return normalized, _format_code_artifact_violations(violations)
-    return normalized, None
+        return CodeArtifactNormalization(
+            normalized, _format_code_artifact_violations(violations), violations, offending_labels
+        )
+    return CodeArtifactNormalization(normalized, None, [], [])
 
 
 def _artifact_label_fragment(label: str) -> str:
@@ -716,12 +755,16 @@ async def _update_workflow(
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
-    code_artifact_metadata, code_artifact_metadata_error = _normalize_code_artifact_metadata(
+    normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),
         workflow_yaml,
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
     )
+    code_artifact_metadata = normalization.normalized
+    code_artifact_metadata_error = normalization.error
+    if code_artifact_metadata_error is not None:
+        record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     # Per-label salvage keeps conforming metadata across a rejection; a
