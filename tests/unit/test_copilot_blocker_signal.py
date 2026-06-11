@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -8,11 +10,14 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_llm_tool_error_payload,
+    build_loop_blocker_signal,
     clear_blocker_signal_for_reason_codes,
     maybe_clear_blocker_signal_on_tool_success,
+    refresh_held_loop_blocker_evidence,
     stash_blocker_signal,
     to_trace_data,
 )
+from skyvern.forge.sdk.copilot.context import CopilotContext
 
 
 def _make(
@@ -315,3 +320,84 @@ def test_agent_context_and_copilot_context_blocker_signal_defaults_match() -> No
     assert agent_ctx.latest_tool_blocker_signal == copilot_ctx.latest_tool_blocker_signal
     assert agent_ctx.tool_blocker_signals == []
     assert copilot_ctx.tool_blocker_signals == []
+
+
+def _copilot_ctx() -> CopilotContext:
+    return CopilotContext(
+        organization_id="org",
+        workflow_id="wf",
+        workflow_permanent_id="wfp",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+
+_CONSECUTIVE_LOOP_MESSAGE = "LOOP DETECTED: 'evaluate' has been called 3 times consecutively."
+_LATE_RECORDED_REASON = (
+    "Failed: The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
+    "on a public registry site with a search form and expandable result rows. "
+    "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
+)
+
+
+def test_stash_refreshes_held_loop_signal_with_evidence_recorded_after_the_stash() -> None:
+    ctx = _copilot_ctx()
+    loop_signal = build_loop_blocker_signal(_CONSECUTIVE_LOOP_MESSAGE, tool_name="evaluate")
+    stash_blocker_signal(ctx, loop_signal)
+    assert ctx.blocker_signal is loop_signal
+    assert dict(loop_signal.extra) == {}
+
+    ctx.last_outcome_gate_reason = _LATE_RECORDED_REASON
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.has_staged_proposal = True
+
+    late_error = _make(kind="tool_error", internal_reason_code="tool_error_late_block_running")
+    payload = stash_blocker_signal(ctx, late_error)
+    assert payload == late_error.agent_steering_text
+    assert ctx.latest_tool_blocker_signal is late_error
+
+    held = ctx.blocker_signal
+    assert isinstance(held, CopilotToolBlockerSignal)
+    assert held is not loop_signal
+    assert held.internal_reason_code == "loop_detected_consecutive_same_tool"
+    assert held.agent_steering_text == loop_signal.agent_steering_text
+    assert held.recovery_hint == loop_signal.recovery_hint
+    assert held.blocked_tool == loop_signal.blocked_tool
+    assert held.cleared_by_tools == loop_signal.cleared_by_tools
+    assert "did not demonstrate the goal outcome" in held.user_facing_reason
+    assert "Add an end-state confirmation" not in held.user_facing_reason
+    assert "verification challenge" in held.user_facing_reason
+    assert held.preserves_workflow_draft is True
+    assert dict(held.extra) == {"loop_evidence_tiers": ["verdict", "anti_bot", "draft"]}
+
+
+def test_stash_keeps_non_loop_held_signal_unrefreshed() -> None:
+    ctx = _copilot_ctx()
+    held = _make()
+    stash_blocker_signal(ctx, held)
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    stash_blocker_signal(ctx, _make(internal_reason_code="second"))
+    assert ctx.blocker_signal is held
+
+
+def test_refresh_held_loop_blocker_evidence_is_idempotent() -> None:
+    ctx = _copilot_ctx()
+    ctx.blocker_signal = build_loop_blocker_signal(_CONSECUTIVE_LOOP_MESSAGE, tool_name="evaluate")
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+
+    refresh_held_loop_blocker_evidence(ctx)
+    refreshed = ctx.blocker_signal
+    assert isinstance(refreshed, CopilotToolBlockerSignal)
+    assert "verification challenge" in refreshed.user_facing_reason
+    assert dict(refreshed.extra) == {"loop_evidence_tiers": ["anti_bot"]}
+
+    refresh_held_loop_blocker_evidence(ctx)
+    assert ctx.blocker_signal is refreshed
+
+
+def test_refresh_with_no_held_signal_is_a_no_op() -> None:
+    ctx = _copilot_ctx()
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    refresh_held_loop_blocker_evidence(ctx)
+    assert ctx.blocker_signal is None
