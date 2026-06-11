@@ -3161,6 +3161,71 @@ async def handle_close_page_action(
     return [ActionSuccess()]
 
 
+@traced(name="skyvern.agent.action.new_tab")
+async def handle_new_tab_action(
+    action: actions.NewTabAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    if browser_state is None:
+        return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+    new_page = await browser_state.new_page()
+    try:
+        await browser_state.navigate_to_url(page=new_page, url=action.url)
+    except Exception as e:
+        # Don't leave a blank/failed tab as the newest page — the next scrape would fail it.
+        try:
+            await new_page.close()
+        except Exception:
+            LOG.debug("Failed to close new tab after navigation failure", exc_info=True)
+        return [ActionFailure(e, stop_execution_on_failure=False)]
+    await browser_state.set_active_page(new_page)
+    try:
+        await new_page.bring_to_front()
+    except Exception:
+        LOG.debug("Failed to bring new tab to front", exc_info=True)
+    # The remaining batch was planned against the old tab's scraped page; stop here so the
+    # next step re-scrapes the newly active tab.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
+
+
+@traced(name="skyvern.agent.action.switch_tab")
+async def handle_switch_tab_action(
+    action: actions.SwitchTabAction,
+    page: Page,
+    scraped_page: ScrapedPage,
+    task: Task,
+    step: Step,
+) -> list[ActionResult]:
+    browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
+    if browser_state is None:
+        return [ActionFailure(Exception("No browser state found for the task"), stop_execution_on_failure=False)]
+    pages = await browser_state.list_valid_pages()
+    if action.tab_index < 0 or action.tab_index >= len(pages):
+        return [
+            ActionFailure(
+                Exception(f"SWITCH_TAB tab_index {action.tab_index} is out of range (0-{len(pages) - 1})"),
+                stop_execution_on_failure=False,
+            )
+        ]
+    target_page = pages[action.tab_index]
+    await browser_state.set_active_page(target_page)
+    try:
+        await target_page.bring_to_front()
+    except Exception:
+        LOG.debug("Failed to bring switched tab to front", exc_info=True)
+    # The remaining batch was planned against the previous tab; stop so the next step
+    # re-scrapes the now-active tab.
+    result = ActionSuccess()
+    result.skip_remaining_actions = True
+    return [result]
+
+
 async def handle_execute_js_action(
     action: actions.ExecuteJsAction,
     page: Page,
@@ -3198,6 +3263,8 @@ ActionHandler.register_action_type(ActionType.VERIFICATION_CODE, handle_verifica
 ActionHandler.register_action_type(ActionType.LEFT_MOUSE, handle_left_mouse_action)
 ActionHandler.register_action_type(ActionType.GOTO_URL, handle_goto_url_action)
 ActionHandler.register_action_type(ActionType.CLOSE_PAGE, handle_close_page_action)
+ActionHandler.register_action_type(ActionType.NEW_TAB, handle_new_tab_action)
+ActionHandler.register_action_type(ActionType.SWITCH_TAB, handle_switch_tab_action)
 ActionHandler.register_action_type(ActionType.GO_BACK, handle_go_back_action)
 ActionHandler.register_action_type(ActionType.GO_FORWARD, handle_go_forward_action)
 ActionHandler.register_action_type(ActionType.RELOAD_PAGE, handle_reload_page_action)

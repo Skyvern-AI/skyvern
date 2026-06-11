@@ -19,6 +19,8 @@ class ActionType(StrEnum):
     COMPLETE = "complete"
     RELOAD_PAGE = "reload_page"
     CLOSE_PAGE = "close_page"
+    NEW_TAB = "new_tab"
+    SWITCH_TAB = "switch_tab"
 
     EXTRACT = "extract"
     VERIFICATION_CODE = "verification_code"
