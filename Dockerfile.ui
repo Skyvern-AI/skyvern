@@ -5,7 +5,9 @@ WORKDIR /app
 
 # Copy dependency files first for better Docker layer caching
 COPY ./skyvern-frontend/package.json ./skyvern-frontend/package-lock.json ./
-RUN npm ci
+# --include=dev keeps tsc/vite installed even if NODE_ENV=production is inherited
+# from the host/build env (npm omits devDependencies otherwise -> "tsc: not found").
+RUN npm ci --include=dev
 
 # Copy source code
 COPY ./skyvern-frontend/ ./
