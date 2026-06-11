@@ -20,13 +20,20 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
+from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.routes import workflow_copilot as workflow_copilot_route
-from skyvern.forge.sdk.routes.workflow_copilot import COPILOT_V2_FLAG_KEY, workflow_copilot_chat_post
+from skyvern.forge.sdk.routes.workflow_copilot import (
+    COPILOT_V2_FLAG_KEY,
+    _validate_copilot_audio_artifact_id,
+    workflow_copilot_chat_audio,
+    workflow_copilot_chat_post,
+)
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
     WorkflowCopilotStreamErrorUpdate,
@@ -45,6 +52,142 @@ def _make_chat_request(mode: str | None = None, code_block: bool | None = None) 
         mode=mode,
         code_block=code_block,
     )
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_stores_artifact_for_existing_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat = SimpleNamespace(
+        workflow_copilot_chat_id="chat-1",
+        workflow_permanent_id="wpid-1",
+        organization_id="org-1",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "workflow_params",
+        SimpleNamespace(
+            get_workflow_copilot_chat_by_id=AsyncMock(return_value=chat),
+            create_workflow_copilot_chat=AsyncMock(),
+        ),
+    )
+    artifact_manager = SimpleNamespace(
+        create_log_artifact=AsyncMock(return_value="a_audio"),
+        wait_for_upload_aiotasks=AsyncMock(),
+    )
+    monkeypatch.setattr(app, "ARTIFACT_MANAGER", artifact_manager)
+    file = SimpleNamespace(
+        content_type="audio/webm",
+        read=AsyncMock(return_value=b"audio-bytes"),
+        close=AsyncMock(),
+    )
+
+    response = await workflow_copilot_chat_audio(
+        workflow_permanent_id="wpid-1",
+        workflow_copilot_chat_id="chat-1",
+        file=file,
+        organization=SimpleNamespace(organization_id="org-1"),
+    )
+
+    assert response.workflow_copilot_chat_id == "chat-1"
+    assert response.audio_artifact_id == "a_audio"
+    app.DATABASE.workflow_params.create_workflow_copilot_chat.assert_not_called()
+    artifact_manager.create_log_artifact.assert_awaited_once()
+    artifact_manager.wait_for_upload_aiotasks.assert_awaited_once_with(["chat-1"])
+    file.read.assert_awaited_once_with(settings.MAX_UPLOAD_FILE_SIZE + 1)
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_rejects_unsupported_audio_content_type() -> None:
+    file = SimpleNamespace(
+        content_type="audio/fake-binary",
+        read=AsyncMock(return_value=b"audio-bytes"),
+        close=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_audio(
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            file=file,
+            organization=SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Unsupported audio format"
+    file.read.assert_not_awaited()
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_audio_upload_rejects_oversized_audio_without_reading_past_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "MAX_UPLOAD_FILE_SIZE", 4)
+    file = SimpleNamespace(
+        content_type="audio/webm;codecs=opus",
+        read=AsyncMock(return_value=b"12345"),
+        close=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await workflow_copilot_chat_audio(
+            workflow_permanent_id="wpid-1",
+            workflow_copilot_chat_id="chat-1",
+            file=file,
+            organization=SimpleNamespace(organization_id="org-1"),
+        )
+
+    assert exc_info.value.status_code == 413
+    file.read.assert_awaited_once_with(5)
+    file.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_validate_copilot_audio_artifact_id_rejects_foreign_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = SimpleNamespace(
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://bucket/v1/local/org-1/logs/workflow_copilot_chat/chat-2/t.webm",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "artifacts",
+        SimpleNamespace(get_artifact_by_id=AsyncMock(return_value=artifact)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _validate_copilot_audio_artifact_id(
+            audio_artifact_id="a_audio",
+            organization_id="org-1",
+            workflow_copilot_chat_id="chat-1",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "not linked" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_validate_copilot_audio_artifact_id_accepts_chat_scoped_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = SimpleNamespace(
+        artifact_type=ArtifactType.AUDIO,
+        uri="s3://bucket/v1/local/org-1/logs/workflow_copilot_chat/chat-1/t.webm",
+    )
+    monkeypatch.setattr(
+        app.DATABASE,
+        "artifacts",
+        SimpleNamespace(get_artifact_by_id=AsyncMock(return_value=artifact)),
+    )
+
+    validated = await _validate_copilot_audio_artifact_id(
+        audio_artifact_id="a_audio",
+        organization_id="org-1",
+        workflow_copilot_chat_id="chat-1",
+    )
+
+    assert validated == "a_audio"
 
 
 def test_terminal_narrative_metadata_preserves_payload_and_adds_contract_fields() -> None:

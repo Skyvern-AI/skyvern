@@ -7,8 +7,10 @@ from skyvern.webeye.actions.actions import (
     Action,
     ClickAction,
     KeypressAction,
+    NewTabAction,
     NullAction,
     SelectOptionAction,
+    SwitchTabAction,
     WebAction,
 )
 from skyvern.webeye.actions.parse_actions import parse_action
@@ -225,3 +227,81 @@ def test_parse_click_download_field(download_value: bool | None) -> None:
     assert isinstance(action, ClickAction)
     expected = download_value if download_value is not None else False
     assert action.download is expected
+
+
+def test_parse_new_tab_action_with_url() -> None:
+    action = parse_action(
+        action={"action_type": "NEW_TAB", "url": "https://example.test/page", "reasoning": "open a separate tab"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NewTabAction)
+    assert action.url == "https://example.test/page"
+    assert action.element_id is None
+
+
+def test_parse_new_tab_action_prepends_scheme() -> None:
+    action = parse_action(
+        action={"action_type": "NEW_TAB", "url": "example.test/page", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NewTabAction)
+    assert action.url == "https://example.test/page"
+
+
+def test_parse_new_tab_action_missing_url_returns_null() -> None:
+    action = parse_action(
+        action={"action_type": "NEW_TAB", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_new_tab_action_blocked_host_returns_null() -> None:
+    action = parse_action(
+        action={"action_type": "NEW_TAB", "url": "http://localhost:8000/admin", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_switch_tab_action_valid_index() -> None:
+    action = parse_action(
+        action={"action_type": "SWITCH_TAB", "tab_index": 1, "reasoning": "go back to first tab"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, SwitchTabAction)
+    assert action.tab_index == 1
+    assert action.element_id is None
+
+
+def test_parse_switch_tab_action_coerces_string_index() -> None:
+    action = parse_action(
+        action={"action_type": "SWITCH_TAB", "tab_index": "2", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, SwitchTabAction)
+    assert action.tab_index == 2
+
+
+def test_parse_switch_tab_action_missing_index_returns_null() -> None:
+    action = parse_action(
+        action={"action_type": "SWITCH_TAB", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_parse_switch_tab_action_non_integer_index_returns_null() -> None:
+    action = parse_action(
+        action={"action_type": "SWITCH_TAB", "tab_index": "not-a-number", "reasoning": "test"},
+        scraped_page=_mock_scraped_page(),
+    )
+    assert isinstance(action, NullAction)
+
+
+def test_tab_actions_registered_for_db_hydration() -> None:
+    from skyvern.forge.sdk.db.utils import ACTION_TYPE_TO_CLASS
+    from skyvern.webeye.actions.action_types import ActionType
+
+    assert ACTION_TYPE_TO_CLASS[ActionType.NEW_TAB] is NewTabAction
+    assert ACTION_TYPE_TO_CLASS[ActionType.SWITCH_TAB] is SwitchTabAction
