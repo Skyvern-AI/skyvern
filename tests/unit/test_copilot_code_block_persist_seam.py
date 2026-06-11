@@ -71,6 +71,63 @@ def _code_only_ctx() -> CopilotContext:
     return ctx
 
 
+def _standard_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+    return ctx
+
+
+def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> str:
+    indented_code = textwrap.indent(textwrap.dedent(code).strip(), " " * 8)
+    return (
+        "title: Login with saved credential\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "    - parameter_type: workflow\n"
+        "      workflow_parameter_type: credential_id\n"
+        "      key: login_credential\n"
+        f"      default_value: {credential_id}\n"
+        "  blocks:\n"
+        "    - block_type: code\n"
+        "      label: login_with_saved_credential\n"
+        "      code: |\n"
+        f"{indented_code}\n"
+    )
+
+
+def _credential_fill_interaction(
+    field: str,
+    *,
+    credential_id: str = "cred_missing",
+    source_url: str = "https://authenticationtest.com/totpChallenge/",
+) -> dict[str, object]:
+    selectors = {
+        "username": "#email",
+        "password": "input[type='password']",
+        "totp": "#totpmfa",
+    }
+    typed_lengths = {"username": 20, "password": 14, "totp": 6}
+    return {
+        "tool_name": "fill_credential_field",
+        "selector": selectors[field],
+        "source_url": source_url,
+        "credential_id": credential_id,
+        "credential_field": field,
+        "typed_length": typed_lengths[field],
+    }
+
+
+def _submit_interaction(
+    *,
+    source_url: str = "https://authenticationtest.com/totpChallenge/",
+) -> dict[str, object]:
+    return {
+        "tool_name": "click",
+        "selector": "input[type='submit']",
+        "source_url": source_url,
+    }
+
+
 class TestCodeSafetySeam:
     def test_import_in_new_code_block_is_a_seam_error(self) -> None:
         errors = _code_block_safety_errors(_IMPORTING_CODE_YAML, None)
@@ -261,6 +318,101 @@ class TestStaleLabelSeamFlow:
         ref = ctx.code_artifact_metadata["search_registry"]["observation_refs"][0]
         assert ref["dependency_id"]
         assert ref["source_tool"]
+
+
+class TestCredentialScoutPersistGate:
+    _SUBMIT_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(login_credential.totp)
+        await page.locator("input[type='submit']").click()
+        await page.wait_for_load_state("load")
+        """
+    )
+    _FILL_ONLY_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(login_credential.totp)
+        """
+    )
+
+    @pytest.mark.asyncio
+    async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "fill_credential_field" in result["error"]
+        assert "click the submit control or press Enter" in result["error"]
+        assert result["user_facing_summary"] == (
+            "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+            _submit_interaction(),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "was not found in this organization" in error_text
+        assert "fill_credential_field" not in error_text
+        assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_submit_code_still_requires_later_submit_after_matching_fills(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "later submit action on the same page" in result["error"]
+        assert "click the submit control or press Enter" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fill_only_code_requires_matching_fill_scouts_but_not_submit(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._FILL_ONLY_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "was not found in this organization" in error_text
+        assert "click the submit control or press Enter" not in error_text
+        assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_standard_mode_behavior_is_unchanged(self) -> None:
+        ctx = _standard_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "fill_credential_field" not in error_text
+        assert "saved-credential login flow" not in error_text
 
 
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:
