@@ -25,10 +25,12 @@ export function useSpeechToTextField({
 
   const getBaseText = useCallback(() => value, [value]);
 
-  return useSpeechToText({
+  const speech = useSpeechToText({
     getBaseText,
     onTranscript: onChange,
     onError: handleSpeechError,
     enabled,
   });
+
+  return speech;
 }
