@@ -467,8 +467,10 @@ def test_record_run_blocks_keeps_building_on_mid_build_no_evidence() -> None:
     # A nav-only WIP that has not added a confirmation block yet must keep building,
     # not enter repair...
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is True
-    # ...but terminal success stays withheld because the outcome is unverified.
+    # ...but terminal success and good-workflow promotion stay withheld because
+    # the outcome is unverified.
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_good_workflow is None
     assert _completion_contract_not_violated(ctx) is False
 
 

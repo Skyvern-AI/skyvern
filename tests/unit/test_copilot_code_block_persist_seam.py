@@ -223,6 +223,30 @@ def _submit_interaction(
     }
 
 
+def _terminal_metadata(label: str, declared_goal: str) -> dict:
+    goal_value_paths = ["records[].number"]
+    return {
+        "block_label": label,
+        "declared_goal": declared_goal,
+        "claimed_outcomes": [
+            {
+                "id": f"claim:{label}",
+                "scope": "outcome",
+                "text": declared_goal,
+                "status": "observed_not_verified",
+                "goal_value_paths": goal_value_paths,
+            }
+        ],
+        "terminal_verifier_expectations": [
+            {
+                "id": f"expectation:{label}",
+                "text": declared_goal,
+                "goal_value_paths": goal_value_paths,
+            }
+        ],
+    }
+
+
 class TestCodeSafetySeam:
     def test_import_in_new_code_block_is_a_seam_error(self) -> None:
         errors = _code_block_safety_errors(_IMPORTING_CODE_YAML, None)
@@ -257,7 +281,7 @@ class TestCodeSafetySeam:
     @pytest.mark.asyncio
     async def test_code_rejection_does_not_salvage_metadata_into_ctx(self) -> None:
         ctx = _code_only_ctx()
-        metadata = [{"block_label": "search_registry", "declared_goal": "search the registry"}]
+        metadata = [_terminal_metadata("search_registry", "search the registry")]
         result = await _update_workflow(
             {"workflow_yaml": _IMPORTING_CODE_YAML, "code_artifact_metadata": metadata}, ctx
         )
@@ -442,7 +466,7 @@ class TestSeamSalvageIntoContext:
             """
         )
         metadata = [
-            {"block_label": "block_one", "declared_goal": "search the registry"},
+            _terminal_metadata("block_one", "search the registry"),
             {
                 "block_label": "block_two",
                 "declared_goal": "expand the result rows",
@@ -492,15 +516,15 @@ class TestSeamSalvageIntoContext:
         )
         ctx = _code_only_ctx()
         ctx.workflow_yaml = draft_yaml
-        stored_block_b = {"block_label": "block_b", "declared_goal": "expand the result rows"}
+        stored_block_b = _terminal_metadata("block_b", "expand the result rows")
         ctx.code_artifact_metadata = {
-            "block_a": {"block_label": "block_a", "declared_goal": "search the registry"},
+            "block_a": _terminal_metadata("block_a", "search the registry"),
             "block_b": stored_block_b,
         }
         ctx.workflow_verification_evidence.code_artifact_metadata = dict(ctx.code_artifact_metadata)
         metadata = [
-            {"block_label": "block_a", "declared_goal": "search the registry"},
-            {"block_label": "ghost", "declared_goal": "does not exist"},
+            _terminal_metadata("block_a", "search the registry"),
+            _terminal_metadata("ghost", "does not exist"),
         ]
 
         result = await _update_workflow({"workflow_yaml": submitted_yaml, "code_artifact_metadata": metadata}, ctx)
@@ -517,7 +541,7 @@ class TestSeamSalvageIntoContext:
     @pytest.mark.asyncio
     async def test_minimal_metadata_with_trajectory_produces_no_violation_error(self) -> None:
         ctx = _code_only_ctx()
-        metadata = [{"block_label": "search_registry", "declared_goal": "search the registry"}]
+        metadata = [_terminal_metadata("search_registry", "search the registry")]
         result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML, "code_artifact_metadata": metadata}, ctx)
         # The seam may reject later (credential checks need the app); the metadata
         # contract itself must not be the rejection.
@@ -536,7 +560,7 @@ class TestStaleLabelSeamFlow:
         # path can bounce the submission back to the model.
         ctx = _code_only_ctx()
         ctx.workflow_yaml = _SAFE_CODE_YAML
-        metadata = [{"block_label": "search_certificant_stale", "declared_goal": "search the registry"}]
+        metadata = [_terminal_metadata("search_certificant_stale", "search the registry")]
 
         result = await _update_workflow({"workflow_yaml": _SAFE_CODE_YAML, "code_artifact_metadata": metadata}, ctx)
 
@@ -557,8 +581,7 @@ class TestStaleLabelSeamFlow:
         ctx.scout_trajectory = []
         metadata = [
             {
-                "block_label": "search_registry",
-                "declared_goal": "search the registry",
+                **_terminal_metadata("search_registry", "search the registry"),
                 "observation_refs": [{"observation_ref": "obs1", "status": "observed_not_verified"}],
             }
         ]
