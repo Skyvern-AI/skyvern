@@ -246,6 +246,8 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
         "anthropic/claude-opus-4-7",
         "anthropic/claude-opus-4-8",
         "anthropic/claude-fable-5",
+        "anthropic-claude-opus-4-8",
+        "anthropic-claude-fable-5",
     ],
 )
 def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str) -> None:
