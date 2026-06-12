@@ -18,6 +18,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 
 
 def _yaml(body: str) -> str:
@@ -49,6 +51,74 @@ _SAFE_CODE_YAML = _yaml(
     """
 )
 
+_SUBMITTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("button.lookup").click()
+    """
+)
+
+_SUBMITTED_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(provider_name)
+    """
+)
+
+_SUBMITTED_LOCAL_CONSTANT_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          provider_query = "Taylor Brooks"
+          await page.locator("input[placeholder='Search']").fill(str(provider_query))
+    """
+)
+
+_SUBMITTED_COMPUTED_PARAMETER_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      parameters:
+      - parameter_type: workflow
+        workflow_parameter_type: string
+        key: provider_query
+        default_value: Taylor Brooks
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(str(provider_query))
+    """
+)
+
+_SUBMITTED_MIXED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("#other").fill(provider_name)
+    """
+)
+
 
 def _code_only_ctx() -> CopilotContext:
     ctx = CopilotContext(
@@ -75,6 +145,31 @@ def _standard_ctx() -> CopilotContext:
     ctx = _code_only_ctx()
     ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
     return ctx
+
+
+def _enable_imposition(ctx: CopilotContext) -> None:
+    ctx.impose_synthesized_code_block = True
+
+
+def _stub_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_process_workflow_yaml(**_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="search_registry")]),
+            proxy_location=None,
+        )
+
+    async def _fake_get_prior_workflow(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_process_workflow_yaml)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _fake_get_prior_workflow)
+    monkeypatch.setattr(workflow_update_module, "composition_page_evidence_error", lambda *_args, **_kwargs: None)
+
+
+def _single_code_block(parsed: dict[str, object]) -> dict[str, object]:
+    blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
+    assert len(blocks) == 1
+    return blocks[0]
 
 
 def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> str:
@@ -168,6 +263,164 @@ class TestCodeSafetySeam:
         )
         assert result["ok"] is False
         assert ctx.code_artifact_metadata == {}
+
+
+class TestCompiledAuthoringImposition:
+    def _provider_search_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#provInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 13,
+                "role": "textbox",
+                "accessible_name": "Provider Name",
+                "trajectory_index": 0,
+            }
+        ]
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_imposes_strict_scout_selector_and_lifts_singleton_literal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert "input[placeholder='Search']" not in block["code"]
+        assert block["parameter_keys"] == ["provider_name"]
+        parameters = parsed["workflow_definition"]["parameters"]
+        assert parameters == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+                "default_value": "Taylor Brooks",
+            }
+        ]
+        assert result["data"]["imposed_substitutions"] == {
+            "block_label": "search_registry",
+            "source_trajectory_count": 1,
+            "parameter_keys": ["provider_name"],
+            "credential_parameter_keys": [],
+            "selector_provenance": [
+                {
+                    "trajectory_index": 0,
+                    "selector": "#provInput",
+                    "emitted_literal": "#provInput",
+                    "source": "selector",
+                }
+            ],
+            "prior_source": "workflow_yaml",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.workflow_yaml = _SUBMITTED_LITERAL_YAML
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert "imposed_substitutions" not in result["data"]
+        assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
+
+    @pytest.mark.asyncio
+    async def test_flag_off_code_only_mode_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.impose_synthesized_code_block = False
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert "imposed_substitutions" not in result["data"]
+        assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
+
+    @pytest.mark.asyncio
+    async def test_unbound_synthesized_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_single_local_string_constant_is_lifted_for_synthesized_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LOCAL_CONSTANT_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert block["parameter_keys"] == ["provider_name"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+                "default_value": "Taylor Brooks",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_single_submitted_string_parameter_is_adopted_for_synthesized_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.scout_trajectory[0]["accessible_name"] = "Search by doctor name or specialty, hospital, procedure, and more"
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_PARAMETER_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        synthesized_key = "search_by_doctor_name_or_specialty_hospital_procedure_and_more"
+        assert f'await page.locator("#provInput").fill(str({synthesized_key}))' in block["code"]
+        assert block["parameter_keys"] == [synthesized_key]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": synthesized_key,
+                "default_value": "Taylor Brooks",
+            }
+        ]
+        assert result["data"]["imposed_substitutions"]["parameter_keys"] == [synthesized_key]
+
+    @pytest.mark.asyncio
+    async def test_mixed_literal_and_computed_fill_rejects_before_persist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "exactly one direct browser-locator string literal fill/type call" in result["error"]
+        assert ctx.workflow_yaml == ""
 
 
 class TestSeamSalvageIntoContext:

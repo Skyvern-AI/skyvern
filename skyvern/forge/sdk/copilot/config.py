@@ -379,6 +379,7 @@ class CopilotConfig:
     enforcement_nudges: dict[str, str] = field(default_factory=_default_enforcement_nudges)
     fallback_llm_key: str | None = field(default_factory=_default_fallback_llm_key)
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
 
     def nudge(self, key: str) -> str:
         return self.enforcement_nudges.get(key, DEFAULT_ENFORCEMENT_NUDGES[key])
