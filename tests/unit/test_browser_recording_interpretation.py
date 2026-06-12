@@ -17,7 +17,10 @@ from skyvern.services.browser_recording.interpretation import (
 from skyvern.services.browser_recording.service import Processor
 from skyvern.services.browser_recording.types import (
     ActionKind,
+    ActionTarget,
+    ActionWait,
     ExfiltratedConsoleEvent,
+    Mouse,
     RecordingDraftStep,
 )
 
@@ -220,7 +223,7 @@ async def test_recording_interpretation_session_flush_cancels_debounce(monkeypat
     debounce_started = asyncio.Event()
     allow_debounce_finish = asyncio.Event()
 
-    async def fake_debounced_interpret(self: RecordingInterpretationSession) -> None:
+    async def fake_debounced_interpret(self: RecordingInterpretationSession, delay: float) -> None:
         debounce_started.set()
         await allow_debounce_finish.wait()
 
@@ -252,11 +255,24 @@ async def test_recording_interpretation_session_flush_cancels_debounce(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_recording_interpretation_session_advances_only_matched_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    wait_block = WorkflowDefinitionYamlBlocksItem_Wait(label="wait", wait_sec=5)
+async def test_recording_interpretation_session_advances_past_unhandled_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wait_action = ActionWait(
+        kind=ActionKind.WAIT,
+        target=ActionTarget(mouse=Mouse(xp=None, yp=None)),
+        timestamp_start=1000.0,
+        timestamp_end=8000.0,
+        url="https://example.com",
+        duration_ms=7000,
+    )
+    unhandled_action = MagicMock()
+    unhandled_action.kind = "unsupported"
+
     processor = MagicMock()
-    processor.events_to_actions.return_value = [MagicMock(), MagicMock()]
-    processor.actions_to_blocks = AsyncMock(return_value=[wait_block])
+    processor.create_wait_block = AsyncMock(
+        return_value=WorkflowDefinitionYamlBlocksItem_Wait(label="wait_7s", wait_sec=7),
+    )
     monkeypatch.setattr(
         "skyvern.services.browser_recording.interpretation.Processor",
         lambda *args, **kwargs: processor,
@@ -270,9 +286,9 @@ async def test_recording_interpretation_session_advances_only_matched_blocks(mon
     )
     session.events = [MagicMock(), MagicMock()]
     session._processed_event_count = len(session.events)
-    session._all_actions = processor.events_to_actions.return_value
+    session._all_actions = [wait_action, unhandled_action]
 
     await session._interpret(finalized=False)
 
-    assert session.emitted_action_count == 1
+    assert session.emitted_action_count == 2
     assert len(session.steps) == 1
