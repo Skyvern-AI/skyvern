@@ -15,6 +15,7 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import (
@@ -55,6 +56,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import raise_if_turn_halt, stash_turn_halt_from_blocker_signal
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -195,6 +197,13 @@ def _probable_site_block_stop_nudge(ctx: Any, config: CopilotConfig | None = Non
     return _nudge(config, "post_probable_site_block_stop_prefix") + _probable_site_block_proxy_options(ctx)
 
 
+def _probable_site_block_stop_agent_text(ctx: Any, config: CopilotConfig | None = None) -> str:
+    return (
+        f"{_probable_site_block_stop_nudge(ctx, config)}\n"
+        f"Latest internal failure reason: {_single_line_failure_reason(ctx)}"
+    )
+
+
 def _single_line_failure_reason(ctx: Any) -> str:
     reason = getattr(ctx, "last_test_failure_reason", None)
     if not isinstance(reason, str) or not reason.strip():
@@ -212,8 +221,28 @@ def build_probable_site_block_user_question(ctx: Any) -> str | None:
     return (
         "The site could not be loaded after repeated attempts. "
         f'The latest failure_reason was: "{failure_reason}". '
-        "Repeating the same IP/workflow shape is unlikely to help, so I should stop retrying that path.\n\n"
+        "Repeating the same IP/workflow shape is unlikely to help, so I should stop this path.\n\n"
         f"Would you like me to {options}"
+    )
+
+
+def _probable_site_block_stop_signal(ctx: Any, config: CopilotConfig | None = None) -> CopilotToolBlockerSignal:
+    user_facing = build_probable_site_block_user_question(ctx)
+    if user_facing is None:
+        user_facing = (
+            "The site could not be loaded after repeated attempts. Tell me whether to try a different URL, "
+            "configure a proxy, or use an alternate entry point."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=_probable_site_block_stop_agent_text(ctx, config),
+        user_facing_reason=user_facing,
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="probable_site_block_stop",
+        blocked_tool="update_and_run_blocks",
     )
 
 
@@ -914,6 +943,10 @@ def _check_enforcement(
     config: CopilotConfig | None = None,
 ) -> str | None:
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
+    terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
+    if terminal_signal is not None:
+        stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
+    raise_if_turn_halt(ctx)
     _raise_if_unrecoverable_contract_stop(ctx)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
@@ -988,7 +1021,10 @@ def _check_enforcement(
     # failed_test_nudge_count slot.
     if _needs_probable_site_block_stop_nudge(ctx):
         ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
-        return _probable_site_block_stop_nudge(ctx, config)
+        signal = _probable_site_block_stop_signal(ctx, config)
+        stash_blocker_signal(ctx, signal)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
+        raise_if_turn_halt(ctx)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1

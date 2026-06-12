@@ -7,16 +7,45 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.tools import (
     _COPILOT_BANNED_BLOCK_TYPES,
     _get_block_schema_post_hook,
     _get_block_schema_pre_hook,
 )
+from skyvern.forge.sdk.copilot.tools.banned_blocks import (
+    _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES,
+    CopilotBlockPolicyStatus,
+)
+from skyvern.forge.sdk.copilot.tools.mcp_hooks import _validate_block_pre_hook
+
+_CODE_ONLY_UNAVAILABLE = tuple(
+    "action browser_task extraction file_download file_upload goto_url login navigation print_page task task_v2 validation".split()
+)
+_CODE_ONLY_REQUIRED_TEXT = {
+    "file_download": "download registration",
+    "file_upload": "file materialization",
+    "login": "credential-typed code",
+    "task": "declared AI leaf",
+    "task_v2": "declared AI leaf",
+}
+_CODE_ONLY_HELPERS = tuple(
+    "conditional for_loop while_loop http_request send_email file_url_parser download_to_s3 upload_to_s3 google_sheets_read google_sheets_write".split()
+)
 
 
 @pytest.fixture
 def ctx() -> MagicMock:
-    return MagicMock()
+    ctx = MagicMock()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+    return ctx
+
+
+@pytest.fixture
+def code_only_ctx() -> MagicMock:
+    ctx = MagicMock()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    return ctx
 
 
 @pytest.mark.parametrize("block_type", ["task", "task_v2", "TASK", "Task_V2", "  task  "])
@@ -102,6 +131,113 @@ async def test_post_hook_handles_missing_or_malformed_data(ctx: MagicMock) -> No
 
 def test_banned_types_set_contents() -> None:
     assert _COPILOT_BANNED_BLOCK_TYPES == frozenset({"task", "task_v2"})
+
+
+def test_code_only_policy_table_derives_unavailable_types() -> None:
+    assert _COPILOT_CODE_ONLY_BROWSER_BANNED_BLOCK_TYPES == frozenset(_CODE_ONLY_UNAVAILABLE)
+    assert "native_allowed" not in {status.value for status in CopilotBlockPolicyStatus}
+
+
+@pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE)
+@pytest.mark.asyncio
+async def test_code_only_schema_pre_hook_rejects_table_entries(block_type: str, code_only_ctx: MagicMock) -> None:
+    result = await _get_block_schema_pre_hook({"block_type": block_type}, code_only_ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert "not available in the workflow copilot" in result["error"]
+    assert _CODE_ONLY_REQUIRED_TEXT.get(block_type, "focused `code` blocks") in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_only_schema_pre_hook_normalizes_case_whitespace_and_alias(code_only_ctx: MagicMock) -> None:
+    params = {"block_type": "  BROWSER_TASK  "}
+
+    result = await _get_block_schema_pre_hook(params, code_only_ctx)
+
+    assert result is not None
+    assert result["ok"] is False
+    assert params["block_type"] == "navigation"
+    assert "focused `code` blocks" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_only_post_hook_scrubs_all_policy_table_entries(code_only_ctx: MagicMock) -> None:
+    result = {
+        "ok": True,
+        "data": {
+            "block_types": dict.fromkeys(
+                ("navigation", "code", "conditional", "task", "task_v2", "login", "file_download", "file_upload"),
+                "...",
+            ),
+            "count": 8,
+        },
+    }
+
+    out = await _get_block_schema_post_hook(result, raw={}, ctx=code_only_ctx)
+
+    assert set(out["data"]["block_types"]) == {"code", "conditional"}
+    assert out["data"]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_code_schema_guidance_is_policy_rendered_and_allows_helper_validation(code_only_ctx: MagicMock) -> None:
+    result = {"ok": True, "data": {"block_type": "code", "summary": "..."}}
+
+    out = await _get_block_schema_post_hook(result, raw={}, ctx=code_only_ctx)
+
+    assert "Browser/page workflow block types are unavailable" in out["data"]["code_only_note"]
+    assert "validate_block only for allowed non-browser helper blocks" in " ".join(out["data"]["code_only_guidance"])
+    assert "Do not persist navigation/action/login" not in " ".join(out["data"]["code_only_guidance"])
+
+
+@pytest.mark.parametrize("block_type", ["task", "task_v2"])
+@pytest.mark.asyncio
+async def test_standard_validate_block_pre_hook_preserves_existing_behavior(block_type: str, ctx: MagicMock) -> None:
+    result = await _validate_block_pre_hook({"block_json": f'{{"block_type": "{block_type}", "label": "x"}}'}, ctx)
+
+    assert result is None
+
+
+@pytest.mark.parametrize("block_type", _CODE_ONLY_UNAVAILABLE + ("code", " LOGIN ", "BROWSER_TASK"))
+@pytest.mark.asyncio
+async def test_code_only_validate_block_pre_hook_rejects_unavailable_or_probe_types(
+    block_type: str, code_only_ctx: MagicMock
+) -> None:
+    result = await _validate_block_pre_hook(
+        {"block_json": f'{{"block_type": "{block_type}", "label": "candidate"}}'},
+        code_only_ctx,
+    )
+
+    assert result is not None
+    assert result["ok"] is False
+    if block_type.strip().lower() == "code":
+        assert "validate real code blocks through update_and_run_blocks" in result["error"]
+    else:
+        assert "not available in the workflow copilot" in result["error"]
+
+
+@pytest.mark.parametrize("block_type", _CODE_ONLY_HELPERS)
+@pytest.mark.asyncio
+async def test_code_only_validate_block_pre_hook_allows_non_browser_helpers(
+    block_type: str, code_only_ctx: MagicMock
+) -> None:
+    result = await _validate_block_pre_hook(
+        {"block_json": f'{{"block_type": "{block_type}", "label": "candidate"}}'},
+        code_only_ctx,
+    )
+
+    assert result is None
+
+
+@pytest.mark.parametrize("block_json", ["not json", "[]", '{"label": "missing_type"}'])
+@pytest.mark.asyncio
+async def test_code_only_validate_block_pre_hook_leaves_shape_errors_to_validator(
+    block_json: str, code_only_ctx: MagicMock
+) -> None:
+    result = await _validate_block_pre_hook({"block_json": block_json}, code_only_ctx)
+
+    assert result is None
 
 
 def test_pre_hook_and_post_emission_reject_share_constant() -> None:

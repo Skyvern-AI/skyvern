@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from typing import Any
 
@@ -20,10 +21,13 @@ from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from .banned_blocks import (
     _CODE_ONLY_SELECTOR_ACTION_TOOLS,
     _CODE_ONLY_TARGET_EVIDENCE_KEYS,
-    _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES,
+    _code_only_browser_schema_guidance,
+    _code_only_browser_unavailable_summary,
     _copilot_banned_block_alternatives,
     _copilot_banned_block_types,
     _copilot_block_authoring_policy,
+    _copilot_block_policy,
+    _render_block_policy_detail,
 )
 from .completion import _maybe_run_completion_verification_from_page_observation
 from .page_observation import (
@@ -59,11 +63,16 @@ async def _get_block_schema_pre_hook(
     normalized = normalize_copilot_block_type_alias(block_type)
     if normalized != block_type.strip().lower():
         params["block_type"] = normalized
-    if normalized not in _copilot_banned_block_types(ctx):
+    policy_entry = _copilot_block_policy(normalized, ctx)
+    if policy_entry is None:
         return None
+    normalized, policy = policy_entry
     return {
         "ok": False,
-        "error": f"Block type {block_type!r} is not available in the workflow copilot. {_copilot_banned_block_alternatives(ctx)}",
+        "error": (
+            f"Block type {block_type!r} is not available in the workflow copilot. "
+            f"{_render_block_policy_detail(normalized, policy)} {_copilot_banned_block_alternatives(ctx)}"
+        ),
     }
 
 
@@ -73,12 +82,37 @@ async def _validate_block_pre_hook(
 ) -> dict[str, Any] | None:
     if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
+    block_json = params.get("block_json")
+    if not isinstance(block_json, str):
+        return None
+    try:
+        raw = json.loads(block_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    block_type = raw.get("block_type")
+    if not isinstance(block_type, str):
+        return None
+    normalized = normalize_copilot_block_type_alias(block_type.strip().lower())
+    if normalized == "code":
+        return {
+            "ok": False,
+            "error": (
+                "CODE-ONLY CODE VALIDATION BLOCKED: do not use validate_block for `code` blocks, dummy code "
+                "blocks, or probe code blocks in code-only browser mode. validate real code blocks through "
+                "update_and_run_blocks."
+            ),
+        }
+    policy_entry = _copilot_block_policy(normalized, ctx)
+    if policy_entry is None:
+        return None
+    normalized, policy = policy_entry
     return {
         "ok": False,
         "error": (
-            "CODE-ONLY BLOCK VALIDATION DISABLED: do not use validate_block, dummy code blocks, or probe code "
-            "blocks in code-only browser mode. Use MCP browser tools to explore the page, then call "
-            "update_and_run_blocks with real focused code blocks that implement the workflow behavior."
+            f"Block type {block_type!r} is not available in the workflow copilot. "
+            f"{_render_block_policy_detail(normalized, policy)} {_copilot_banned_block_alternatives(ctx)}"
         ),
     }
 
@@ -96,18 +130,12 @@ async def _get_block_schema_post_hook(
         if isinstance(block_types, dict):
             for banned in _copilot_banned_block_types(ctx):
                 block_types.pop(banned, None)
+            data["count"] = len(block_types)
         block_type = data.get("block_type")
         if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER and block_type == "code":
             ctx.code_only_code_schema_seen = True
-            data["code_only_note"] = _COPILOT_CODE_ONLY_BROWSER_ALTERNATIVES
-            data["code_only_guidance"] = [
-                "Use one focused code block per durable browser goal, such as open, search, submit, expand, or extract.",
-                "Do not persist navigation/action/login/extraction/validation blocks for browser page work.",
-                "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
-                "Call update_and_run_blocks with a connected runnable set of real code blocks instead of validating dummy or probe blocks.",
-                "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
-                "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
-            ]
+            data["code_only_note"] = _code_only_browser_unavailable_summary()
+            data["code_only_guidance"] = _code_only_browser_schema_guidance()
     return result
 
 

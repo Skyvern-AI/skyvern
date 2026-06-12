@@ -20,6 +20,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
+from skyvern.forge.sdk.copilot.turn_halt import (
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -123,6 +127,13 @@ class CopilotRunHooks(RunHooksBase):
                 exc_info=True,
             )
             return
+
+        stash_turn_halt_from_blocker_signal(
+            self._ctx,
+            getattr(self._ctx, "latest_tool_blocker_signal", None) or getattr(self._ctx, "blocker_signal", None),
+            source="hook",
+        )
+        raise_if_turn_halt(self._ctx)
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
             LOG.info(

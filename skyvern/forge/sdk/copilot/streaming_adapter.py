@@ -87,6 +87,11 @@ async def stream_to_sse(
         CopilotUnrecoverableToolError,
         _maybe_raise_unrecoverable_tool_error,
     )
+    from skyvern.forge.sdk.copilot.turn_halt import (
+        CopilotTurnHalt,
+        raise_if_turn_halt,
+        stash_turn_halt_from_blocker_signal,
+    )
 
     call_id_to_name: dict[str, str] = {}
     # Counts completed tool round-trips (tool_called + tool_output pair), not
@@ -224,6 +229,16 @@ async def stream_to_sse(
                 try:
                     _maybe_raise_unrecoverable_tool_error(ctx, tool_name, parsed)
                 except CopilotUnrecoverableToolError:
+                    result.cancel()
+                    raise
+                stash_turn_halt_from_blocker_signal(
+                    ctx,
+                    getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None),
+                    source="streaming_adapter",
+                )
+                try:
+                    raise_if_turn_halt(ctx)
+                except CopilotTurnHalt:
                     result.cancel()
                     raise
                 # Keep latest_tool_blocker_signal scoped to the tool result
