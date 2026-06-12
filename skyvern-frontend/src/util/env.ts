@@ -80,12 +80,13 @@ function getRuntimeApiKey(): string | null {
 
   // Treat placeholder / example values as missing so they are never sent
   // as real credentials (e.g. from .env.example or an un-replaced Docker placeholder).
-  const PLACEHOLDER_VALUES = [
-    "YOUR_API_KEY",
-    "__SKYVERN_API_KEY_PLACEHOLDER__",
-  ];
-  runtimeApiKey =
-    candidate && PLACEHOLDER_VALUES.includes(candidate) ? null : candidate;
+  // The Docker sentinel is matched by its suffix on purpose: the prebuilt-image
+  // entrypoint sed-replaces every occurrence of the full sentinel in the bundle
+  // with the real API key, so spelling it out here would put the real key in its
+  // own deny-list and strip the x-api-key header from every request.
+  const isPlaceholder =
+    candidate === "YOUR_API_KEY" || candidate?.endsWith("_PLACEHOLDER__");
+  runtimeApiKey = candidate && isPlaceholder ? null : candidate;
   return runtimeApiKey;
 }
 

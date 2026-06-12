@@ -224,7 +224,7 @@ async def _fill_credential_field_impl(
         credential_field=field,
         credential_name=credential_name,
     )
-    observation_step = _register_scout_interaction_observation(
+    observation_step, _ = await _register_scout_interaction_observation(
         copilot_ctx, tool_name="fill_credential_field", selector=selector, source_url=source_url, url=url
     )
     data: dict[str, Any] = {

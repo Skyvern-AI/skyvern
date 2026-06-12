@@ -2904,6 +2904,7 @@ async def _run_copilot_turn_impl(
         turn_index=turn_index,
         prior_block_count=prior_block_count,
         block_authoring_policy=copilot_config.block_authoring_policy,
+        impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
