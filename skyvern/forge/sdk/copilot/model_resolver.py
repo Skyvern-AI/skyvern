@@ -6,11 +6,12 @@ Known limitations:
   ``prompt_name`` input, so prompt-specific thinking-budget tuning applied by
   ``api_handler_factory`` for certain prompt / model combinations cannot be
   reproduced here.
-* ``LLMRouterConfig`` (fallback chains) is accepted by degrading to the
-  ``main_model_group`` entry as a direct ``LLMConfig``. Load-balancing across
-  ``model_list``, cross-provider fallbacks, and Redis-coordinated cooldowns
-  are not applied on the copilot-v2 path. Proper router support through the
-  Agents SDK model interface is tracked in SKY-9256.
+* ``LLMRouterConfig`` (fallback chains) is accepted by resolving the
+  ``main_model_group`` entry as the primary ``LLMConfig`` and passing the
+  remaining provider model names through LiteLLM's ``fallbacks`` argument.
+  Load-balancing across multiple deployments for the same router group and
+  Redis-coordinated cooldowns are not applied on the copilot-v2 path. Proper
+  router support through the Agents SDK model interface is tracked in SKY-9256.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ _EXTRA_ARGS_FIELDS = frozenset(
         "timeout",
         "thinking",
         "service_tier",
+        "fallbacks",
     }
 )
 
@@ -69,16 +71,36 @@ _DROP_FIELDS = frozenset({"thinking_level"})
 _WARNED_DROP_KEYS: set[str] = set()
 
 
+def _router_model_name(config: LLMRouterConfig, model_group: str) -> str:
+    """Return the concrete provider model for a router group alias."""
+    entry = next((m for m in config.model_list if m.model_name == model_group), None)
+    if entry is None:
+        return model_group
+    return str(entry.litellm_params.get("model") or entry.model_name)
+
+
+def _router_fallback_models(config: LLMRouterConfig) -> list[str]:
+    if not config.fallback_model_group:
+        return []
+    if isinstance(config.fallback_model_group, str):
+        fallback_groups = [config.fallback_model_group]
+    else:
+        fallback_groups = list(config.fallback_model_group)
+    return [_router_model_name(config, group) for group in fallback_groups]
+
+
 def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfig:
-    """Collapse an LLMRouterConfig down to its main_model_group entry as a direct LLMConfig.
+    """Resolve an LLMRouterConfig to its primary direct model plus LiteLLM fallbacks.
 
     The Agents SDK model interface takes a single model, not a router; until the
     full bridge lands (SKY-9256), the copilot-v2 path needs a way to run on
     orgs whose configured llm_key resolves to a router. We use the entry whose
     ``model_name`` matches ``main_model_group``; if none match we fall back to
-    ``model_list[0]`` and warn.
+    ``model_list[0]`` and warn. Fallback groups are converted to concrete
+    provider model strings and passed to LiteLLM's plain ``acompletion``
+    fallback path via ModelSettings.extra_args.
 
-    The happy-path degradation is the expected code path on every copilot-v2
+    The happy-path resolution is the expected code path on every copilot-v2
     call in staging/prod, so it logs at INFO. WARN is reserved for the
     main_model_group-miss misconfig case.
     """
@@ -102,12 +124,16 @@ def _degrade_router_to_direct(llm_key: str, config: LLMRouterConfig) -> LLMConfi
     # entry.model_name is just a router group alias.
     params = dict(selected.litellm_params)
     direct_model_name = params.pop("model", None) or selected.model_name
+    fallback_models = _router_fallback_models(config)
+    if fallback_models:
+        params["fallbacks"] = fallback_models
 
     LOG.info(
-        "Degrading LLMRouterConfig to main model on copilot-v2 path; fallbacks/load-balancing not applied",
+        "Resolved LLMRouterConfig to primary model on copilot-v2 path",
         llm_key=llm_key,
         main_model_group=config.main_model_group,
         selected_model_name=direct_model_name,
+        fallback_models=fallback_models,
     )
 
     return LLMConfig(

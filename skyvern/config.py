@@ -755,6 +755,18 @@ class Settings(BaseSettings):
                 "label": "Anthropic Claude 4.6 Opus",
             }
 
+        # Anthropic Claude Fable 5: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["claude-fable-5"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
+                "label": "Anthropic Claude Fable 5",
+            }
+        else:
+            mapping["claude-fable-5"] = {
+                "llm_key": "ANTHROPIC_CLAUDE5_FABLE",
+                "label": "Anthropic Claude Fable 5",
+            }
+
         return mapping
 
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
