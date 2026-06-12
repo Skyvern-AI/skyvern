@@ -10,6 +10,7 @@ import {
   WorkflowCopilotDesignEndUpdate,
   WorkflowCopilotDesignStartUpdate,
   WorkflowCopilotNarrationUpdate,
+  WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotStreamErrorUpdate,
   WorkflowCopilotStreamResponseUpdate,
   WorkflowCopilotToolCallUpdate,
@@ -26,6 +27,7 @@ export type NarrativeEvent =
   | WorkflowCopilotDesignEndUpdate
   | WorkflowCopilotWorkflowDraftUpdate
   | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotRunOutcomeUpdate
   | WorkflowCopilotStreamResponseUpdate
   | WorkflowCopilotStreamErrorUpdate
   | WorkflowCopilotNarrationUpdate
@@ -43,11 +45,22 @@ export type BlockUIState =
   | "failed"
   | "skipped";
 
+// Recorded per-run outcome verdict, distinct from lifecycle state: a row can
+// be `completed` (it ran) yet carry a `not_demonstrated` verdict.
+export type BlockOutcome =
+  | "evaluating"
+  | "demonstrated"
+  | "not_demonstrated"
+  | "not_evaluated";
+
 export interface BlockState {
   workflowRunBlockId: string;
   label: string;
   blockType: string;
   state: BlockUIState;
+  // Undefined when no verdict was recorded (older backend or unadjudicated run).
+  outcome?: BlockOutcome;
+  outcomeReason?: string;
   lastSeenIteration: number;
   // Tool calls and results emitted while this block was running are
   // appended here so the expanded card shows what the agent did.
@@ -271,6 +284,19 @@ export function mapBlockStatus(raw: string): BlockUIState {
   }
 }
 
+// A completed row claims the success affordance only when no recorded verdict
+// contradicts it; `evaluating` and `not_demonstrated` both withhold the check.
+export function isBlockOk(
+  block: Pick<BlockState, "state" | "outcome">,
+): boolean {
+  if (block.state !== "completed") return false;
+  return (
+    block.outcome === undefined ||
+    block.outcome === "demonstrated" ||
+    block.outcome === "not_evaluated"
+  );
+}
+
 export function applyNarrativeEvent(
   prev: TurnNarrativeState,
   event: NarrativeEvent,
@@ -365,6 +391,10 @@ export function applyNarrativeEvent(
         label: event.block_label,
         blockType: event.block_type,
         state: incomingState,
+        // A late or replayed block_progress must not wipe a recorded verdict;
+        // lifecycle frames never carry outcome, so always keep the prior one.
+        outcome: previousBlock?.outcome,
+        outcomeReason: previousBlock?.outcomeReason,
         lastSeenIteration: event.iteration,
         activity: previousBlock?.activity ?? [],
         startedAt,
@@ -376,6 +406,22 @@ export function applyNarrativeEvent(
         return { ...prev, blocks: nextBlocks };
       }
       return { ...prev, blocks: [...prev.blocks, baseEntry] };
+    }
+
+    case "run_outcome": {
+      // Apply the recorded verdict by run-block id only — no label fallback, so
+      // a prior run's rows in the same turn keep their own verdict.
+      const ids = new Set(event.workflow_run_block_ids);
+      const blocks = prev.blocks.map((b) =>
+        ids.has(b.workflowRunBlockId)
+          ? {
+              ...b,
+              outcome: event.verdict,
+              outcomeReason: event.display_reason ?? undefined,
+            }
+          : b,
+      );
+      return { ...prev, blocks };
     }
 
     case "tool_call": {
@@ -563,6 +609,17 @@ export function hydrateNarrativeFromPayload(
   const blocksRaw = Array.isArray(payload.blocks) ? payload.blocks : [];
   const blocks: BlockState[] = blocksRaw.map((b) => {
     const obj = b as Record<string, unknown>;
+    const outcome = ((): BlockOutcome | undefined => {
+      const o = obj.outcome;
+      if (
+        o === "evaluating" ||
+        o === "demonstrated" ||
+        o === "not_demonstrated" ||
+        o === "not_evaluated"
+      )
+        return o;
+      return undefined;
+    })();
     return {
       workflowRunBlockId:
         typeof obj.workflowRunBlockId === "string"
@@ -570,6 +627,9 @@ export function hydrateNarrativeFromPayload(
           : "",
       label: typeof obj.label === "string" ? obj.label : "",
       blockType: typeof obj.blockType === "string" ? obj.blockType : "task",
+      outcome,
+      outcomeReason:
+        typeof obj.outcomeReason === "string" ? obj.outcomeReason : undefined,
       state: ((): BlockState["state"] => {
         const s = obj.state;
         if (

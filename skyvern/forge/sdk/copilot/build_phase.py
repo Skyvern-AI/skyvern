@@ -65,6 +65,7 @@ _BROWSER_PRIMITIVE_TOOLS: frozenset[str] = frozenset(
         "evaluate",
         "click",
         "type_text",
+        "fill_credential_field",
         "scroll",
         "select_option",
         "press_key",

@@ -8,7 +8,13 @@ from __future__ import annotations
 import re
 import textwrap
 
+from skyvern.forge.sdk.copilot.outcome_verification_trace import (
+    finalize_outcome_verification_trace,
+    record_code_artifact_violations,
+)
+from skyvern.forge.sdk.copilot.output_utils import _sanitize_failure_text
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
+from skyvern.forge.sdk.copilot.tools.workflow_update import _normalize_code_artifact_metadata_detailed
 
 
 def _code_block_yaml(label: str) -> str:
@@ -426,3 +432,96 @@ class TestStaleLabelRekey:
         normalized, error = _normalize_code_artifact_metadata([first, second], _code_block_yaml("my_block"))
         assert error is None
         assert normalized["my_block"]["declared_goal"] == "g"
+
+
+def _two_code_block_yaml(first: str, second: str) -> str:
+    return textwrap.dedent(
+        f"""
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: {first}
+              code: |
+                await page.goto("https://example.com/")
+            - block_type: code
+              label: {second}
+              code: |
+                await page.goto("https://example.com/")
+        """
+    ).strip()
+
+
+class _FakeSpan:
+    def __init__(self) -> None:
+        self.attrs: dict = {}
+
+    def set_attributes(self, fields: dict) -> None:
+        self.attrs.update(fields)
+
+
+def _record_and_flush(violations: list[str], offending_labels: list[str]) -> dict:
+    ctx = type("Ctx", (), {})()
+    record_code_artifact_violations(ctx, violations, offending_labels)
+    span = _FakeSpan()
+    finalize_outcome_verification_trace(ctx, span)
+    return span.attrs
+
+
+class TestViolationBatchIsDurablyRecoverable:
+    def test_full_batch_recoverable_from_span_even_with_credential_labels(self) -> None:
+        yaml = _two_code_block_yaml("credential_login", "credential_vault")
+        result = _normalize_code_artifact_metadata_detailed(
+            [_broken_metadata("credential_login"), _broken_metadata("credential_vault")], yaml
+        )
+        assert result.error is not None
+        attrs = _record_and_flush(result.violations, result.offending_labels)
+
+        assert attrs["copilot.code_artifact_violations"] == result.violations
+        assert attrs["copilot.code_artifact_violation_count"] == len(result.violations)
+        assert attrs["copilot.code_artifact_violation_block_labels"] == ["credential_login", "credential_vault"]
+        # Every numbered line from the batched error survives as its own element.
+        numbered = [line.split(". ", 1)[1] for line in result.error.splitlines() if re.match(r"^\d+\.", line)]
+        assert numbered == result.violations
+
+    def test_malformed_only_batch_records_count_without_labels_or_values(self) -> None:
+        secret = "SUPER_SECRET_VALUE_12345"
+        result = _normalize_code_artifact_metadata_detailed(
+            [{"block_label": "credential_x", "claimed_outcomes": secret}], _code_block_yaml("credential_x")
+        )
+        assert result.error is not None
+        assert result.offending_labels == []
+        assert all(secret not in violation for violation in result.violations)
+        attrs = _record_and_flush(result.violations, result.offending_labels)
+        assert attrs["copilot.code_artifact_violation_count"] == len(result.violations)
+        assert attrs["copilot.code_artifact_violation_block_labels"] == []
+        assert all(secret not in violation for violation in attrs["copilot.code_artifact_violations"])
+
+    def test_span_keeps_violations_the_backend_log_summary_truncates_away(self) -> None:
+        yaml = _two_code_block_yaml("credential_login", "credential_vault")
+        result = _normalize_code_artifact_metadata_detailed(
+            [_broken_metadata("credential_login"), _broken_metadata("credential_vault")], yaml
+        )
+        bounded = _sanitize_failure_text(result.error)
+        assert len(bounded) <= 120
+        assert len(result.violations) > 1
+        attrs = _record_and_flush(result.violations, result.offending_labels)
+        # The bounded summary loses all but the first violation; the span keeps them all.
+        assert attrs["copilot.code_artifact_violations"][-1] not in bounded
+        assert len(attrs["copilot.code_artifact_violations"]) == len(result.violations)
+
+    def test_empty_batch_is_a_noop(self) -> None:
+        ctx = type("Ctx", (), {})()
+        record_code_artifact_violations(ctx, [], [])
+        span = _FakeSpan()
+        finalize_outcome_verification_trace(ctx, span)
+        assert "copilot.code_artifact_violations" not in span.attrs
+
+    def test_latest_batch_wins_on_retry(self) -> None:
+        ctx = type("Ctx", (), {})()
+        record_code_artifact_violations(ctx, ["v1", "v2", "v3"], ["a"])
+        record_code_artifact_violations(ctx, ["only_one"], ["b"])
+        span = _FakeSpan()
+        finalize_outcome_verification_trace(ctx, span)
+        assert span.attrs["copilot.code_artifact_violations"] == ["only_one"]
+        assert span.attrs["copilot.code_artifact_violation_count"] == 1
+        assert span.attrs["copilot.code_artifact_violation_block_labels"] == ["b"]
