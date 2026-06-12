@@ -5,6 +5,7 @@ import pathlib
 import re
 import typing as t
 import zlib
+from urllib.parse import urlparse
 
 import structlog
 
@@ -20,6 +21,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionInputText,
     ActionKind,
     ActionUrlChange,
     ActionWait,
@@ -91,6 +93,31 @@ def _is_duplicate_action(candidate: Action, existing_actions: list[Action]) -> b
         and previous.timestamp_start == candidate.timestamp_start
         and previous.timestamp_end == candidate.timestamp_end
     )
+
+
+def deterministic_goto_url_label(url: str) -> str:
+    host = ""
+    try:
+        host = urlparse(url).netloc
+    except ValueError:
+        pass
+
+    return normalize_recording_block_label(f"goto_{host}" if host else None, fallback="goto_url")
+
+
+def deterministic_wait_seconds(duration_ms: int) -> int:
+    return int(max(duration_ms / 1000.0, ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0))
+
+
+def deterministic_input_text_parameter_key(action: ActionInputText) -> str:
+    target = action.target
+    for candidate in (target.id, *(target.texts or []), target.sky_id):
+        if not candidate:
+            continue
+        key = normalize_recording_block_label(str(candidate), fallback="")
+        if key:
+            return key.lower()
+    return "input_value"
 
 
 def normalize_recording_block_label(label: str | None, *, fallback: str) -> str:
@@ -475,58 +502,20 @@ class Processor:
         return block
 
     async def create_url_block(self, action: ActionUrlChange) -> WorkflowDefinitionYamlBlocksItem_GotoUrl:
-        """
-        Create a YAML goto URL block from an `ActionUrlChange`.
-        """
-
-        prompt_name = "recording-go-to-url-block-prompt"
-
-        metadata_prompt = prompt_engine.load_prompt(
-            prompt_name,
-            action=action,
-        )
-
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            prompt_name=prompt_name,
-            organization_id=self.organization_id,
-        )
-
-        block_label: str = metadata_response.get("block_label", None) or "goto_url"
-
-        block = WorkflowDefinitionYamlBlocksItem_GotoUrl(
-            label=block_label,
+        """Build a goto-url block with a host-derived label and the action URL."""
+        return WorkflowDefinitionYamlBlocksItem_GotoUrl(
+            label=deterministic_goto_url_label(action.url),
             url=action.url,
         )
 
-        return block
-
     async def create_wait_block(self, action: ActionWait) -> WorkflowDefinitionYamlBlocksItem_Wait:
-        """
-        Create a YAML wait block from an `ActionWait`.
-        """
+        """Build a wait block with a duration-derived label and wait seconds."""
+        wait_sec = deterministic_wait_seconds(action.duration_ms)
 
-        prompt_name = "recording-wait-block-prompt"
-
-        metadata_prompt = prompt_engine.load_prompt(
-            prompt_name,
-            action=action,
+        return WorkflowDefinitionYamlBlocksItem_Wait(
+            label=f"wait_{wait_sec}s",
+            wait_sec=wait_sec,
         )
-
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            prompt_name=prompt_name,
-            organization_id=self.organization_id,
-        )
-
-        block_label: str = metadata_response.get("block_label", None) or "wait"
-
-        block = WorkflowDefinitionYamlBlocksItem_Wait(
-            label=block_label,
-            wait_sec=int(max(action.duration_ms / 1000.0, ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0)),
-        )
-
-        return block
 
     async def process(
         self,
