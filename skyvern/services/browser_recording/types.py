@@ -160,6 +160,9 @@ class ExfiltratedEventCdpParams(BaseModel):
     # frame_navigated events
     frame: CdpEventFrame | None = None
 
+    # net:activity events
+    count: int | None = None
+
 
 class EventTarget(BaseModel):
     className: str | None = None

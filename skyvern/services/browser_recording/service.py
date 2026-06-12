@@ -502,14 +502,24 @@ class Processor:
         return block
 
     async def create_url_block(self, action: ActionUrlChange) -> WorkflowDefinitionYamlBlocksItem_GotoUrl:
-        """Build a goto-url block with a host-derived label and the action URL."""
+        """
+        Create a YAML goto URL block from an `ActionUrlChange`.
+
+        Fully deterministic: goto blocks carry no LLM-generated metadata, so
+        skipping the LLM round-trip makes navigation drafts instant.
+        """
         return WorkflowDefinitionYamlBlocksItem_GotoUrl(
             label=deterministic_goto_url_label(action.url),
             url=action.url,
         )
 
     async def create_wait_block(self, action: ActionWait) -> WorkflowDefinitionYamlBlocksItem_Wait:
-        """Build a wait block with a duration-derived label and wait seconds."""
+        """
+        Create a YAML wait block from an `ActionWait`.
+
+        Fully deterministic: wait blocks carry no LLM-generated metadata, so
+        skipping the LLM round-trip makes wait drafts instant.
+        """
         wait_sec = deterministic_wait_seconds(action.duration_ms)
 
         return WorkflowDefinitionYamlBlocksItem_Wait(

@@ -452,7 +452,7 @@ class RecordingInterpretationSession:
         self._emit_update()
 
     async def _drain_enrichment(self) -> None:
-        if self._enrichment_tasks:
+        while self._enrichment_tasks:
             await asyncio.gather(*list(self._enrichment_tasks), return_exceptions=True)
 
     def _unique_step_label(self, label: str, step: RecordingDraftStep) -> str:
