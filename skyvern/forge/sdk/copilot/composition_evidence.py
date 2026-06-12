@@ -79,6 +79,16 @@ _ANTI_BOT_PATTERNS = (
     "access denied",
     "are you a robot",
 )
+_EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
+    {
+        "0 results",
+        "no matching records",
+        "no records found",
+        "no results",
+        "no results found",
+        "nothing found",
+    }
+)
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
 _ANTI_BOT_SCAN_BYTES = 250_000
@@ -1350,6 +1360,11 @@ def _page_title(soup: Any) -> str:
     return " ".join(parts)[:240]
 
 
+def _result_row_text_is_content(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    return bool(normalized) and not any(pattern in normalized for pattern in _EMPTY_RESULT_TEXT_PATTERNS)
+
+
 def _result_container_entry(node: Any) -> dict[str, Any]:
     tag_name = str(getattr(node, "name", "") or "").lower()
     node_id = str(node.get("id") or "")
@@ -1368,6 +1383,18 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
             f"{selector} tbody tr a",
             f"{selector} tbody tr td:first-child",
         ]
+        data_rows = [row for row in node.select("tbody tr") if row.find("td") is not None]
+        if not data_rows:
+            data_rows = [row for row in node.select("tr") if row.find("td") is not None]
+        sample_rows = [_schema_text(_node_text(row), 240) for row in data_rows]
+        sample_rows = [row for row in sample_rows if _result_row_text_is_content(row)][:5]
+        if sample_rows:
+            entry["row_count"] = len(sample_rows)
+            entry["sample_rows"] = sample_rows
+    else:
+        text_excerpt = _schema_text(_node_text(node), 240)
+        if text_excerpt:
+            entry["text_excerpt"] = text_excerpt
     return entry
 
 
@@ -1827,6 +1854,23 @@ def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
             "id": _structured_str(node.get("id"))[:120],
             "selector": selector,
         }
+        sample_rows = [
+            _schema_text(_structured_str(row), 240)
+            for row in (node.get("sample_rows") or [])
+            if isinstance(row, str) and _result_row_text_is_content(row)
+        ][:5]
+        if sample_rows:
+            row_count = node.get("row_count")
+            entry["row_count"] = row_count if isinstance(row_count, int) and row_count > 0 else len(sample_rows)
+            entry["sample_rows"] = sample_rows
+        text_excerpt = _schema_text(
+            _structured_str(
+                node.get("text_excerpt") or node.get("content_excerpt") or node.get("sample_text") or node.get("text")
+            ),
+            240,
+        )
+        if text_excerpt:
+            entry["text_excerpt"] = text_excerpt
         if tag_name == "table" or node.get("is_table") is True:
             entry["row_selector"] = f"{selector} tbody tr"
             entry["expand_toggle_candidates"] = [
