@@ -47,6 +47,8 @@ class NarrativeBlock(TypedDict):
     activity: list[NarrativeActivityEntry]
     startedAt: str | None
     endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.

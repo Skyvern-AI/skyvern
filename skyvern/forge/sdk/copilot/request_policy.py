@@ -77,6 +77,9 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+# A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
+# digit-only body and length floor keep this off prose like `cred and the password`.
+_MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
 _JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
     {
@@ -361,7 +364,15 @@ def _clean_list(values: list[Any]) -> list[str]:
 
 
 def _credential_ids(text: str) -> list[str]:
-    return list(dict.fromkeys(_CREDENTIAL_ID_RE.findall(text or "")))
+    text = text or ""
+    canonical = _CREDENTIAL_ID_RE.findall(text)
+    normalized = [f"cred_{body}" for body in _MALFORMED_CREDENTIAL_ID_RE.findall(text)]
+    return list(dict.fromkeys(canonical + normalized))
+
+
+def _canonicalize_credential_ref(ref: str) -> str:
+    malformed = _MALFORMED_CREDENTIAL_ID_RE.fullmatch(ref.strip())
+    return f"cred_{malformed.group(1)}" if malformed else ref
 
 
 def _raw_secret_detected(text: str) -> bool:
@@ -604,7 +615,8 @@ async def _classify_request(
 
     policy = _classification_from_raw(raw)
     policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
-    policy.credential_refs = _clean_list(policy.credential_refs + ids)
+    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
+    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
     if raw_secret_present:
         policy.raw_secret_detected = True
         if policy.raw_secret_handling == "redacted_draft":
@@ -617,8 +629,16 @@ async def _classify_request(
             policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
     if policy.testing_intent == "skip_test" and policy.completion_contract:
         policy.testing_intent = "unspecified"
-    if ids and policy.credential_input_kind in ("none", "placeholder"):
-        policy.credential_input_kind = "credential_id"
+    if ids and policy.credential_input_kind != "raw_secret":
+        # A deterministically-extracted `cred_`-shaped token overrides a non-ID kind, unless the
+        # classifier pointed at another resolvable target — a saved name (an ID-shaped ref does
+        # not count) or a login-page URL — leaving the cred_ token as contextual.
+        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
+        classifier_target_wins = (
+            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
+        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
+        if not classifier_target_wins:
+            policy.credential_input_kind = "credential_id"
     if (
         policy.credential_input_kind == "raw_secret"
         and not raw_secret_present
