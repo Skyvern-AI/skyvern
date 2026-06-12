@@ -1439,7 +1439,9 @@ async def _generate_loop_task(
     else:
         LOG.info("Loop values are not links", loop_values=loop_values)
         url = None
-        context_parameter_key = "target"
+        # Suffix with the per-loop random string so multiple non-link loop tasks in one run
+        # don't all emit a parameter keyed "target", which fails duplicate-key validation.
+        context_parameter_key = f"target_{loop_random_string}"
 
     # create ContextParameter for the value
     url_value_context_parameter = ContextParameter(
