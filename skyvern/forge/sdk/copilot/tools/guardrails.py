@@ -12,6 +12,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
     workflow_target_url,
 )
+from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -79,10 +80,15 @@ def _workflow_yaml_output_policy_guardrail(data: ToolInputGuardrailData) -> Tool
     )
     LOG.info("copilot output policy tool guardrail verdict", **trace_data)
     if not verdict.allowed:
-        return ToolGuardrailFunctionOutput.reject_content(
-            format_output_policy_tool_error(verdict),
-            output_info=trace_data,
-        )
+        error = format_output_policy_tool_error(verdict)
+        tool_name = getattr(tool_context, "tool_name", None)
+        if isinstance(tool_name, str) and tool_name:
+            record_consecutive_tool_result_boundary_for_ctx(
+                getattr(tool_context, "context", None),
+                tool_name,
+                {"ok": False, "error": error},
+            )
+        return ToolGuardrailFunctionOutput.reject_content(error, output_info=trace_data)
     return ToolGuardrailFunctionOutput.allow(output_info=trace_data)
 
 
