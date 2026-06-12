@@ -240,6 +240,58 @@ def test_normalize_llm_model_strips_provider_prefix() -> None:
     assert api_handler_factory._normalize_llm_model(None) is None
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-fable-5",
+    ],
+)
+def test_requires_adaptive_thinking_for_direct_anthropic_models(model_name: str) -> None:
+    assert LLMAPIHandlerFactory.requires_adaptive_thinking(model_name) is True
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "bedrock/us.anthropic.claude-opus-4-8",
+        "bedrock/us.anthropic.claude-fable-5",
+        "anthropic/claude-sonnet-4-6",
+        None,
+    ],
+)
+def test_requires_adaptive_thinking_does_not_rewrite_other_providers(model_name: str | None) -> None:
+    assert LLMAPIHandlerFactory.requires_adaptive_thinking(model_name) is False
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-fable-5",
+    ],
+)
+def test_apply_anthropic_thinking_optimization_uses_adaptive_shape(model_name: str) -> None:
+    llm_config = LLMConfig(
+        model_name=model_name,
+        required_env_vars=[],
+        supports_vision=True,
+        add_assistant_prefix=False,
+    )
+    params: dict[str, Any] = {}
+
+    LLMAPIHandlerFactory._apply_anthropic_thinking_optimization(
+        params,
+        new_budget=2048,
+        llm_config=llm_config,
+        prompt_name="workflow-copilot-request-policy",
+    )
+
+    assert params["thinking"] == {"type": "adaptive"}
+    assert params["output_config"] == {"effort": LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT}
+
+
 def test_assert_step_thought_block_exclusive_rejects_both_set() -> None:
     with pytest.raises(ValueError, match="mutually exclusive"):
         api_handler_factory._assert_step_thought_block_exclusive(MagicMock(), MagicMock(), None)

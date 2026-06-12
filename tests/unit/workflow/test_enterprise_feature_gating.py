@@ -165,9 +165,10 @@ def test_ignores_stale_model_on_task_v2_block() -> None:
         ("claude-opus-4-6", "Anthropic Claude 4.6 Opus"),
         ("claude-opus-4-7", "Anthropic Claude 4.7 Opus"),
         ("claude-opus-4-8", "Anthropic Claude 4.8 Opus"),
+        ("claude-fable-5", "Anthropic Claude Fable 5"),
     ],
 )
-def test_collects_opus_model_alias_enterprise_features(model_name: str, feature_name: str) -> None:
+def test_collects_enterprise_model_alias_features(model_name: str, feature_name: str) -> None:
     assert collect_enterprise_gated_run_features(model={"model_name": model_name}) == {feature_name}
 
 

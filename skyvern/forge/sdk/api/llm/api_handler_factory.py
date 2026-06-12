@@ -639,10 +639,14 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def requires_adaptive_thinking(model_name: str | None) -> bool:
-        # Claude Opus 4.7 rejects `thinking.type=enabled` and requires
+        # Newer direct Anthropic models reject `thinking.type=enabled` and require
         # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
         # does not yet accept the new shape, so gate to direct Anthropic.
-        return model_name == "anthropic/claude-opus-4-7"
+        return model_name in {
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-fable-5",
+        }
 
     @staticmethod
     def _apply_anthropic_thinking_optimization(

@@ -35,9 +35,13 @@ class TestModelResolver:
         with pytest.raises(InvalidLLMConfigError, match="empty model_list"):
             resolve_model_config(handler)
 
-    def test_router_config_degrades_to_main_model_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Shim for SKY-9257: a router key resolves to its main_model_group entry as a direct
-        LLMConfig so copilot-v2 can run until SKY-9256 lands the real bridge.
+    def test_router_config_resolves_primary_model_with_litellm_fallbacks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Router keys resolve to a primary model while preserving LiteLLM fallbacks.
+
+        This is still not full router parity: deployment load-balancing and
+        cooldowns remain outside the Agents SDK path until SKY-9256. The
+        fallback chain itself must be carried through so Bedrock-primary
+        Copilot keys can fall through when the primary provider is unavailable.
         """
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
 
@@ -53,14 +57,18 @@ class TestModelResolver:
             model_name="gpt-4-1-mini-fallback",
             litellm_params={"model": "azure/gpt-4-1-mini"},
         )
+        final_fallback = LLMRouterModelConfig(
+            model_name="claude-fallback",
+            litellm_params={"model": "anthropic/claude-sonnet-4-20250514"},
+        )
         router_config = LLMRouterConfig(
             model_name="gemini-2.5-flash-fallback-router",
-            model_list=[main, fallback],
+            model_list=[main, fallback, final_fallback],
             required_env_vars=["VERTEX_CREDENTIALS"],
             supports_vision=True,
             add_assistant_prefix=False,
             main_model_group="vertex-gemini-2.5-flash",
-            fallback_model_group="gpt-4-1-mini-fallback",
+            fallback_model_group=["gpt-4-1-mini-fallback", "claude-fallback"],
             temperature=0.3,
             max_completion_tokens=8192,
         )
@@ -84,6 +92,10 @@ class TestModelResolver:
         assert run_config.model_settings.max_tokens == 8192
         assert run_config.model_settings.extra_args is not None
         assert run_config.model_settings.extra_args["timeout"] == 900.0
+        assert run_config.model_settings.extra_args["fallbacks"] == [
+            "azure/gpt-4-1-mini",
+            "anthropic/claude-sonnet-4-20250514",
+        ]
 
     def test_router_config_no_main_group_match_falls_back_to_first_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.schemas.llm import LLMRouterConfig, LLMRouterModelConfig
