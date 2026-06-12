@@ -33,8 +33,13 @@ console.log(session.browser_session_id); // pbs_abc123
 | `proxy_location` | `ProxyLocation` | No | `None` | Route browser traffic through a geographic proxy. |
 | `extensions` | `list[Extensions]` | No | `None` | Browser extensions to install. Options: `"ad-blocker"`, `"captcha-solver"`. |
 | `browser_type` | `PersistentBrowserType` | No | `None` | Browser type. Options: `"chrome"`, `"msedge"`. |
-| `browser_profile_id` | `str` | No | `None` | Load a browser profile (cookies, localStorage) into this session. ID starts with `bpf_`. |
+| `browser_profile_id` | `str` | No | `None` | Load a browser profile (cookies, localStorage) into this session. ID starts with `bp_`. |
+| `generate_browser_profile` | `bool` | No | `False` | REST API only for now — not yet accepted by the SDK methods (see note below). Save the session's browser profile when it ends so it can be turned into a reusable [browser profile](/sdk-reference/browser-profiles/create-browser-profile). Sessions started with `browser_profile_id` always save theirs. |
 | `request_options` | `RequestOptions` | No | | Per-request configuration (see below). |
+
+<Note>
+`generate_browser_profile` is not yet accepted as a keyword by the SDK methods (watch the [changelog](/changelog) for SDK availability). Until SDK support lands, pass it from Python via `request_options` with `additional_body_parameters={"generate_browser_profile": True}` (see [Request options](#request-options) below); from TypeScript, call the REST API directly. You can also toggle it on a live session via `PATCH /v1/browser_sessions/{browser_session_id}` — the value is read when the session ends. See [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile).
+</Note>
 
 ### Returns `BrowserSessionResponse`
 

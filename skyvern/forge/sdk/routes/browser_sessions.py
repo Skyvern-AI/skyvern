@@ -173,6 +173,7 @@ async def close_browser_session(
         200: {"description": "Successfully updated browser session"},
         404: {"description": "Browser session not found"},
         403: {"description": "Unauthorized - Invalid or missing authentication"},
+        409: {"description": "Conflict - browser session has already ended and can no longer be updated"},
     },
 )
 @base_router.patch(
