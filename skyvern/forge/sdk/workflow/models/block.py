@@ -3524,7 +3524,12 @@ async def wrapper({default_args}):
         excluded_parameter_keys = frozenset(parameter_defaults)
 
         async def filtered_user_function() -> dict[str, Any]:
-            result = await user_function()
+            result: Any = await user_function()
+            # An explicit `return <non-dict>` in user code yields that value directly,
+            # not the __capture_locals() dict; only the implicit dict needs the injected
+            # parameter keys stripped. SKY-10789: this guard avoids result.items() on a list.
+            if not isinstance(result, dict):
+                return result
             return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
 
         return filtered_user_function
