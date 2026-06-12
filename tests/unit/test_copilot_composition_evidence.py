@@ -1983,6 +1983,33 @@ def test_structured_parses_forms_labels_options_and_submit() -> None:
     assert has_bounded_page_schema(parsed) is True
 
 
+def test_structured_preserves_populated_result_container_content() -> None:
+    payload = {
+        "page_title": "Lookup",
+        "forms": [],
+        "navigation_targets": [],
+        "result_containers": [
+            {"tag": "table", "selector": "#results", "row_count": 1, "sample_rows": ["Jane Doe Active"]},
+            {"tag": "div", "selector": "#records", "text": "Record A ready"},
+        ],
+        "challenge_controls": [],
+        "modal_overlays": [],
+        "visual_obstruction_candidates": [],
+        "visible_text_excerpt": "Jane Doe Active Record A ready",
+        "anti_bot_indicators": [],
+    }
+
+    parsed = parse_composition_structured(
+        payload, inspected_url="https://example.com/lookup", current_url="https://example.com/lookup"
+    )
+
+    assert parsed is not None
+    table, records = parsed["result_containers"]
+    assert table["row_count"] == 1
+    assert table["sample_rows"] == ["Jane Doe Active"]
+    assert records["text_excerpt"] == "Record A ready"
+
+
 def test_structured_detects_modal_overlay_with_dismiss_controls() -> None:
     payload = {
         "page_title": "",
@@ -2207,6 +2234,10 @@ def _ac_projection(evidence: dict[str, Any]) -> dict[str, Any]:
         "forms": forms,
         "navigation_targets": sorted(target["href"] for target in evidence["navigation_targets"]),
         "result_containers": sorted((rc["tag"], rc["selector"]) for rc in evidence["result_containers"]),
+        "result_content": sorted(
+            (rc["selector"], rc.get("row_count"), tuple(rc.get("sample_rows") or []), rc.get("text_excerpt", ""))
+            for rc in evidence["result_containers"]
+        ),
         "modal_selectors": sorted(
             (overlay["selector"], bool(overlay.get("dismiss_controls"))) for overlay in evidence["modal_overlays"]
         ),

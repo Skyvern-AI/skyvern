@@ -100,6 +100,13 @@ class CodeArtifactClaimedOutcome(BaseModel):
     depends_on: list[str] = Field(default_factory=list, description="Page-dependency ids this claim relies on.")
     covered_criteria: list[str] = Field(default_factory=list, description="Completion-criterion ids this claim covers.")
     criteria_ids: list[str] = Field(default_factory=list)
+    goal_value_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Output JSON paths that carry the goal values for this claim, for example "
+            "`records[].number` or `records[].expiration_date`."
+        ),
+    )
     evidence_refs: list[str] = Field(default_factory=list)
     observation_refs: list[str] = Field(default_factory=list)
     required_tokens: list[str] = Field(default_factory=list)
@@ -148,6 +155,10 @@ class CodeArtifactTerminalVerifierExpectation(BaseModel):
     text: str = ""
     criteria_ids: list[str] = Field(default_factory=list)
     claimed_outcome_ids: list[str] = Field(default_factory=list)
+    goal_value_paths: list[str] = Field(
+        default_factory=list,
+        description="Output JSON paths terminal verification should treat as goal-value evidence.",
+    )
 
 
 class CodeArtifactExplorationObservation(BaseModel):
@@ -372,7 +383,13 @@ def _normalize_code_artifact_metadata_detailed(
                 item_violations.append(f"Artifact metadata for `{label}` requires non-empty `{field_name}`.")
         if not dumped.get("evidence_refs") and not dumped.get("observation_refs"):
             item_violations.append(f"Artifact metadata for `{label}` requires `evidence_refs` or `observation_refs`.")
-        item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
+        item_violations.extend(
+            _code_artifact_metadata_shape_errors(
+                label,
+                dumped,
+                reject_unfilled_goal_value_paths=impose_defaults,
+            )
+        )
         if item_violations:
             violations.extend(item_violations)
             offending_labels.append(label)
@@ -417,6 +434,9 @@ def _impose_code_artifact_metadata_defaults(
     dependency_id = artifact_dependency_id(label)
     observation_ref_id = artifact_observation_ref_id(label)
     declared_goal = str(artifact.get("declared_goal") or "").strip()
+    default_goal_value_paths = _first_artifact_goal_value_paths(artifact.get("claimed_outcomes")) or (
+        _first_artifact_goal_value_paths(artifact.get("terminal_verifier_expectations"))
+    )
 
     dependencies = _artifact_mutable_rows(artifact.get("page_dependencies"))
     for index, dependency in enumerate(dependencies):
@@ -460,6 +480,8 @@ def _impose_code_artifact_metadata_defaults(
                 "observation_refs": [observation_ref_id],
             }
         ]
+        if default_goal_value_paths:
+            artifact["claimed_outcomes"][0]["goal_value_paths"] = list(default_goal_value_paths)
         claims = _artifact_mutable_rows(artifact.get("claimed_outcomes"))
 
     criteria = _artifact_mutable_rows(artifact.get("completion_criteria"))
@@ -493,6 +515,8 @@ def _impose_code_artifact_metadata_defaults(
             and not _artifact_string_list(claim.get("criteria_ids"))
         ):
             claim["covered_criteria"] = list(criterion_ids)
+        if default_goal_value_paths and not _artifact_string_list(claim.get("goal_value_paths")):
+            claim["goal_value_paths"] = list(default_goal_value_paths)
         status = str(claim.get("status") or "").strip()
         if (
             status not in {"missing", "satisfied"}
@@ -535,6 +559,8 @@ def _impose_code_artifact_metadata_defaults(
             and not _artifact_string_list(expectation.get("claimed_outcome_ids"))
         ):
             expectation["criteria_ids"] = list(criterion_ids)
+        if default_goal_value_paths and not _artifact_string_list(expectation.get("goal_value_paths")):
+            expectation["goal_value_paths"] = list(default_goal_value_paths)
 
     if not _artifact_mutable_rows(artifact.get("evidence_refs")) and not _artifact_mutable_rows(
         artifact.get("observation_refs")
@@ -587,6 +613,9 @@ def _imposed_artifact_skeleton(
         "block_label": label,
         "artifact_id": _artifact_id_for_block_label(label),
         "declared_goal": _block_goal_fallback(label, block),
+        "terminal_verifier_expectations": [
+            {"goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"]}
+        ],
     }
     block_id = str(block.get("block_id") or block.get("id") or "").strip()
     if block_id:
@@ -1044,9 +1073,23 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     )
 
 
-def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]) -> list[str]:
+def _code_artifact_metadata_shape_errors(
+    label: str,
+    artifact: Mapping[str, Any],
+    *,
+    reject_unfilled_goal_value_paths: bool = False,
+) -> list[str]:
     """Return every shape violation for one artifact; the caller aggregates them."""
     errors: list[str] = []
+    criteria_rows = _artifact_rows(artifact.get("completion_criteria"))
+    terminal_criterion_ids = {
+        str(row.get("id") or "").strip()
+        for row in criteria_rows
+        if row.get("terminal") is True or str(row.get("level") or "").strip() == "terminal"
+    } - {""}
+    # Populated while validating claimed outcomes, then used by terminal
+    # verifier expectations below to require goal paths for terminal claims.
+    terminal_claim_ids: set[str] = set()
     for field_name, ref_key in (("evidence_refs", "evidence_ref"), ("observation_refs", "observation_ref")):
         for index, ref in enumerate(_artifact_rows(artifact.get(field_name))):
             if not str(ref.get(ref_key) or "").strip():
@@ -1074,8 +1117,28 @@ def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]
         claim_criteria = _artifact_string_list(claim.get("covered_criteria")) or _artifact_string_list(
             claim.get("criteria_ids")
         )
+        claim_goal_value_paths = (
+            _artifact_goal_value_paths(claim.get("goal_value_paths"))
+            if reject_unfilled_goal_value_paths
+            else _artifact_string_list(claim.get("goal_value_paths"))
+        )
         if not claim_criteria:
             errors.append(f"Artifact metadata claim `{claim_id}` for `{label}` requires covered criterion ids.")
+        if set(claim_criteria) & terminal_criterion_ids:
+            if claim_id:
+                terminal_claim_ids.add(claim_id)
+            if reject_unfilled_goal_value_paths and _artifact_has_unfilled_goal_value_path(
+                claim.get("goal_value_paths")
+            ):
+                errors.append(
+                    f"Artifact metadata claim `{claim_id or index}` for `{label}` has unfilled "
+                    "`goal_value_paths`; replace `<fill...>` placeholders with output JSON paths."
+                )
+            elif not claim_goal_value_paths:
+                errors.append(
+                    f"Artifact metadata claim `{claim_id or index}` for `{label}` covers a terminal criterion "
+                    "and requires `goal_value_paths`."
+                )
         claim_evidence_refs = _artifact_string_list(claim.get("evidence_refs"))
         claim_observation_refs = _artifact_string_list(claim.get("observation_refs"))
         if claim.get("status") == "satisfied" and not claim_evidence_refs:
@@ -1106,13 +1169,31 @@ def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]
 
     for index, expectation in enumerate(_artifact_rows(artifact.get("terminal_verifier_expectations"))):
         expectation_id = str(expectation.get("id") or "").strip()
-        if not _artifact_string_list(expectation.get("criteria_ids")) and not _artifact_string_list(
-            expectation.get("claimed_outcome_ids")
-        ):
+        expectation_criteria = _artifact_string_list(expectation.get("criteria_ids"))
+        expectation_claims = _artifact_string_list(expectation.get("claimed_outcome_ids"))
+        expectation_goal_value_paths = (
+            _artifact_goal_value_paths(expectation.get("goal_value_paths"))
+            if reject_unfilled_goal_value_paths
+            else _artifact_string_list(expectation.get("goal_value_paths"))
+        )
+        if not expectation_criteria and not expectation_claims:
             errors.append(
                 f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
                 "requires `criteria_ids` or `claimed_outcome_ids`."
             )
+        if set(expectation_criteria) & terminal_criterion_ids or set(expectation_claims) & terminal_claim_ids:
+            if reject_unfilled_goal_value_paths and _artifact_has_unfilled_goal_value_path(
+                expectation.get("goal_value_paths")
+            ):
+                errors.append(
+                    f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
+                    "has unfilled `goal_value_paths`; replace `<fill...>` placeholders with output JSON paths."
+                )
+            elif not expectation_goal_value_paths:
+                errors.append(
+                    f"Artifact metadata terminal verifier expectation `{expectation_id or index}` for `{label}` "
+                    "requires `goal_value_paths` for terminal criteria."
+                )
 
     for index, observation in enumerate(_artifact_rows(artifact.get("exploration_observations"))):
         if observation.get("status") != "observed_not_verified":
@@ -1130,6 +1211,30 @@ def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]
 
 def _artifact_rows(value: Any) -> list[Mapping[str, Any]]:
     return [row for row in value if isinstance(row, Mapping)] if isinstance(value, list) else []
+
+
+def _first_artifact_goal_value_paths(value: Any) -> list[str]:
+    # Best-effort default propagation: preserve the first explicit contract
+    # instead of inventing a union that may mix unrelated output shapes.
+    for row in _artifact_rows(value):
+        paths = _artifact_goal_value_paths(row.get("goal_value_paths"))
+        if paths:
+            return paths
+    return []
+
+
+def _artifact_goal_value_paths(value: Any) -> list[str]:
+    # Keep in sync with blockers._metadata_goal_value_paths; duplicated locally
+    # so authoring validation does not depend on runtime blocker helpers.
+    return [path for path in _artifact_string_list(value) if not _is_unfilled_artifact_placeholder(path)]
+
+
+def _artifact_has_unfilled_goal_value_path(value: Any) -> bool:
+    return any(_is_unfilled_artifact_placeholder(path) for path in _artifact_string_list(value))
+
+
+def _is_unfilled_artifact_placeholder(value: str) -> bool:
+    return value.casefold().startswith("<fill")
 
 
 def _artifact_string_list(value: Any) -> list[str]:

@@ -488,6 +488,7 @@ def build_artifact_metadata_skeleton(
                 "status": "observed_not_verified",
                 "depends_on": [dependency_id],
                 "covered_criteria": [_FILL_CRITERION_ID],
+                "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
                 "observation_refs": [observation_ref_id],
             }
         ],
@@ -504,6 +505,7 @@ def build_artifact_metadata_skeleton(
                 "id": "expectation:<fill>",
                 "text": "<fill: what terminal verification must observe>",
                 "criteria_ids": [_FILL_CRITERION_ID],
+                "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
             }
         ],
     }
@@ -552,6 +554,7 @@ def render_synthesized_offer_text(
         parts.append(
             "Pass this `code_artifact_metadata` for the block (the scouted page evidence is filled in; "
             "replace the `<fill: ...>` slots with the terminal goal and outcome this block delivers, then "
+            "include `goal_value_paths` for the output JSON fields carrying requested goal values, then "
             "submit it whole — the validator returns every remaining violation at once):"
         )
         parts.append("```json")

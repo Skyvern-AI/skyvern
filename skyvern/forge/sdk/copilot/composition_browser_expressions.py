@@ -329,15 +329,32 @@ for (const link of document.querySelectorAll('a[href]')) {
 }
 
 const resultContainers = [];
-for (const node of all) {
-  if (resultContainers.length >= MAX_RESULT_CONTAINERS) break;
-  const tag = (node.tagName || '').toLowerCase();
-  if (SKIP_TAGS.has(tag)) continue;
-  const identity = (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase();
-  if (tag === 'table' || RESULT_CONTAINER_HINTS.some((h) => identity.includes(h))) {
-    resultContainers.push({ tag: tag, id: attr(node, 'id'), selector: selectorFor(node), is_table: tag === 'table' });
-  }
-}
+const resultRowTextIsContent = (s) => {
+  const text = lower(String(s || '').replace(/\s+/g, ' ').trim());
+  return !!text && !['0 results', 'no matching records', 'no records found', 'no results', 'no results found', 'nothing found'].some((p) => text.includes(p));
+};
+const resultEntry = (node, tag) => {
+  const entry = { tag: tag, id: attr(node, 'id'), selector: selectorFor(node), is_table: tag === 'table' };
+	  if (tag === 'table') {
+	    let rows = Array.from(node.querySelectorAll('tbody tr')).filter((r) => r.querySelector('td'));
+	    if (!rows.length) rows = Array.from(node.querySelectorAll('tr')).filter((r) => r.querySelector('td'));
+	    const sampleRows = rows.map((r) => Array.from(r.children || []).map((c) => nodeText(c)).filter(Boolean).join(' ') || nodeText(r)).filter(resultRowTextIsContent).slice(0, 5);
+	    if (sampleRows.length) { entry.row_count = sampleRows.length; entry.sample_rows = sampleRows; }
+	  } else {
+	    const text = nodeText(node);
+	    if (text) entry.text_excerpt = text;
+	  }
+	  return entry;
+	};
+	for (const node of all) {
+	  if (resultContainers.length >= MAX_RESULT_CONTAINERS) break;
+	  const tag = (node.tagName || '').toLowerCase();
+	  if (SKIP_TAGS.has(tag)) continue;
+	  const identity = (attr(node, 'id') + ' ' + classesFor(node).join(' ')).toLowerCase();
+	  if (tag === 'table' || RESULT_CONTAINER_HINTS.some((h) => identity.includes(h))) {
+	    resultContainers.push(resultEntry(node, tag));
+	  }
+	}
 
 const challengeControls = [];
 const seenChallenge = new Set();
