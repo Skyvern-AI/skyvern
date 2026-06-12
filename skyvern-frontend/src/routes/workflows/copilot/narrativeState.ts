@@ -89,12 +89,27 @@ export interface ActivityEntry {
   id: string;
 }
 
+// Closed vocabulary of the backend TurnOutcome.response_kind enum. Unknown
+// wire values parse to null so a newer backend cannot crash the renderer.
+export type TurnResponseKind =
+  | "build"
+  | "clarify"
+  | "diagnose"
+  | "refuse"
+  | "recover";
+
 export interface TurnNarrativeState {
   turnId: string | null;
   turnIndex: number | null;
   mode: string;
   responseType: CopilotResponseType | null;
   proposalDisposition: ProposalDisposition | null;
+  // Typed terminal adjudication of the turn (TurnOutcome.response_kind).
+  // Null on legacy rows and frames from an older backend.
+  responseKind: TurnResponseKind | null;
+  // Outcome-evidence verdict authorizing tested-success claims (ADR 0005).
+  // Null means unknown (legacy/grafted rows) — distinct from false.
+  verifiedSuccess: boolean | null;
   designStarted: boolean;
   designEnded: boolean;
   draft: {
@@ -126,6 +141,8 @@ export const EMPTY_NARRATIVE: TurnNarrativeState = Object.freeze({
   mode: "unknown",
   responseType: null,
   proposalDisposition: null,
+  responseKind: null,
+  verifiedSuccess: null,
   designStarted: false,
   designEnded: false,
   draft: null,
@@ -155,6 +172,16 @@ export function parseUtcIsoMs(iso: string | null | undefined): number | null {
   const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(iso);
   const ms = Date.parse(hasTz ? iso : `${iso}+00:00`);
   return Number.isFinite(ms) ? ms : null;
+}
+
+export function parseResponseKind(value: unknown): TurnResponseKind | null {
+  return value === "build" ||
+    value === "clarify" ||
+    value === "diagnose" ||
+    value === "refuse" ||
+    value === "recover"
+    ? value
+    : null;
 }
 
 // Tool names we never surface in the user-facing activity log. Internal
@@ -688,6 +715,11 @@ export function hydrateNarrativeFromPayload(
     responseType,
     cancelled: payload.cancelled === true,
     proposalDisposition,
+    responseKind: parseResponseKind(payload.responseKind),
+    verifiedSuccess:
+      typeof payload.verifiedSuccess === "boolean"
+        ? payload.verifiedSuccess
+        : null,
     designStarted: true,
     designEnded: true,
     draft,
@@ -737,4 +769,229 @@ export function effectiveMode(turn: TurnNarrativeState): string {
     return "clarify";
   }
   return turn.mode;
+}
+
+// History rows persisted before narrative_payload carried responseKind still
+// have the adjacent persisted turn_outcome; graft its response_kind so
+// adjudicated clarify/refuse/recover history corrects retroactively.
+// verifiedSuccess stays null (unknown), so grafted build-kind rows render
+// via the legacy inference chain and tested successes never downgrade.
+export function hydrateHistoryNarrative(
+  payload: Record<string, unknown> | null | undefined,
+  turnOutcome: { response_kind?: string | null } | null | undefined,
+): TurnNarrativeState | undefined {
+  const hydrated = hydrateNarrativeFromPayload(payload);
+  if (!hydrated || hydrated.responseKind !== null) return hydrated;
+  const grafted = parseResponseKind(turnOutcome?.response_kind);
+  if (grafted === null) return hydrated;
+  return { ...hydrated, responseKind: grafted };
+}
+
+export function formatElapsed(
+  startedAt: string | null,
+  endedAt: string | null,
+): string | null {
+  const startMs = parseUtcIsoMs(startedAt);
+  const endMs = parseUtcIsoMs(endedAt);
+  if (startMs === null || endMs === null) return null;
+  const seconds = Math.max(0, Math.round((endMs - startMs) / 1000));
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+export interface TurnSummary {
+  headline: string;
+  stats: string[];
+  accent: "ok" | "fail" | "qa";
+  glyph: string;
+  isFail: boolean;
+  isQA: boolean;
+  isStoppedWithDraft: boolean;
+}
+
+export function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
+  const latest = new Map<string, BlockState>();
+  for (const block of blocks) {
+    latest.set(block.label, block);
+  }
+  return Array.from(latest.values());
+}
+
+// Legacy prose heuristic, consulted only when the turn has no typed
+// adjudication (responseKind null).
+function asksUserForInput(turn: TurnNarrativeState): boolean {
+  if (turn.responseType === "ASK_QUESTION") {
+    return true;
+  }
+  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
+    .toLowerCase()
+    .trim();
+  return (
+    text.includes("please provide") ||
+    text.includes("please share") ||
+    text.includes("could you provide") ||
+    text.includes("can you provide") ||
+    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
+  );
+}
+
+interface AdjudicatedParts {
+  headline: string;
+  accent: TurnSummary["accent"];
+  glyph: string;
+}
+
+// Headline parts from the typed terminal adjudication. Returns null when the
+// turn predates the typed signal; a build kind without a verdict also falls
+// back to the legacy inference chain so genuinely-tested historical turns
+// never downgrade.
+function adjudicatedSummaryParts(
+  turn: TurnNarrativeState,
+  flags: {
+    needsUntestedProposalReview: boolean;
+    needsTestedProposalReview: boolean;
+    hasEdited: boolean;
+    hasDrafts: boolean;
+  },
+): AdjudicatedParts | null {
+  if (turn.responseKind === null) return null;
+  if (turn.responseKind !== "build") {
+    return {
+      headline:
+        turn.responseKind === "refuse"
+          ? "Declined"
+          : turn.responseKind === "diagnose"
+            ? "Answered"
+            : "Question",
+      accent: "qa",
+      glyph: "✦",
+    };
+  }
+  if (turn.verifiedSuccess === null) return null;
+  if (flags.needsUntestedProposalReview) {
+    return { headline: "Draft needs review", accent: "qa", glyph: "!" };
+  }
+  if (flags.needsTestedProposalReview) {
+    return { headline: "Workflow ready for review", accent: "qa", glyph: "!" };
+  }
+  if (!turn.verifiedSuccess) {
+    return { headline: "Stopped", accent: "qa", glyph: "!" };
+  }
+  if (flags.hasEdited) {
+    return {
+      headline: "Applied edits and re-tested",
+      accent: "ok",
+      glyph: "✓",
+    };
+  }
+  if (flags.hasDrafts) {
+    return {
+      headline: "Built and tested the workflow",
+      accent: "ok",
+      glyph: "✓",
+    };
+  }
+  return { headline: "Completed the run", accent: "ok", glyph: "✓" };
+}
+
+export function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
+  const rollupBlocks = latestBlocksByLabel(turn.blocks);
+  const isFail =
+    turn.terminal === "error" || rollupBlocks.some((b) => b.state === "failed");
+  const mode = effectiveMode(turn);
+  const needsInput = asksUserForInput(turn);
+  const isQA =
+    mode === "docs_answer" ||
+    mode === "diagnose" ||
+    mode === "clarify" ||
+    mode === "refuse";
+  const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
+  const needsUntestedProposalReview =
+    hasDrafts && turn.proposalDisposition === "review_untested";
+  const needsTestedProposalReview =
+    hasDrafts && turn.proposalDisposition === "review_tested";
+  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
+  const hasReviewableDraft =
+    hasDrafts &&
+    (turn.proposalDisposition === "review_untested" ||
+      turn.proposalDisposition === "review_tested" ||
+      (turn.cancelled && turn.proposalDisposition !== "no_proposal"));
+  const isStoppedWithDraft = hasReviewableDraft && (isFail || turn.cancelled);
+
+  // Fail/cancel precedence is absolute: a verdict never upgrades a halt.
+  const adjudicated =
+    isStoppedWithDraft || isFail
+      ? null
+      : adjudicatedSummaryParts(turn, {
+          needsUntestedProposalReview,
+          needsTestedProposalReview,
+          hasEdited,
+          hasDrafts,
+        });
+
+  const headline = adjudicated
+    ? adjudicated.headline
+    : isStoppedWithDraft
+      ? "Stopped with a draft"
+      : isFail
+        ? "Run halted"
+        : needsInput
+          ? "Question"
+          : needsUntestedProposalReview
+            ? "Draft needs review"
+            : needsTestedProposalReview
+              ? "Workflow ready for review"
+              : isQA
+                ? mode === "refuse"
+                  ? "Declined"
+                  : mode === "clarify"
+                    ? "Question"
+                    : "Answered"
+                : hasEdited
+                  ? "Applied edits and re-tested"
+                  : hasDrafts
+                    ? "Built and tested the workflow"
+                    : "Completed the run";
+
+  const stats: string[] = [];
+  const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
+  if (turnElapsed) stats.push(turnElapsed);
+  if (!isQA) {
+    const ok = rollupBlocks.filter((b) => isBlockOk(b)).length;
+    const failed = rollupBlocks.filter((b) => b.state === "failed").length;
+    const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
+    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
+    if (newBlocks) stats.push(`${newBlocks} new`);
+    if (failed) stats.push(`${failed} failed`);
+  }
+
+  const accent = adjudicated
+    ? adjudicated.accent
+    : isStoppedWithDraft
+      ? "qa"
+      : isFail
+        ? "fail"
+        : needsUntestedProposalReview || needsTestedProposalReview || isQA
+          ? "qa"
+          : "ok";
+  return {
+    headline,
+    stats,
+    accent,
+    glyph: adjudicated
+      ? adjudicated.glyph
+      : isStoppedWithDraft ||
+          needsUntestedProposalReview ||
+          needsTestedProposalReview
+        ? "!"
+        : isFail
+          ? "✕"
+          : isQA
+            ? "✦"
+            : "✓",
+    isFail,
+    isQA,
+    isStoppedWithDraft,
+  };
 }
