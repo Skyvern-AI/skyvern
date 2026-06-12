@@ -210,6 +210,7 @@ _LOOP_PROGRESS_TOOLS = frozenset(
     }
 )
 _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES = frozenset({"tool_error_per_tool_budget_rerun"})
+_TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES = frozenset({"tool_error_post_budget_challenge_result_evidence"})
 
 
 def _should_stash_over_existing(
@@ -221,6 +222,11 @@ def _should_stash_over_existing(
     if (
         incoming.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE
         and existing.internal_reason_code in _ACTIVE_TERMINAL_REPLACEABLE_REASON_CODES
+    ):
+        return True
+    if (
+        incoming.internal_reason_code == "tool_error_post_budget_challenge_blocker"
+        and existing.internal_reason_code in _TERMINAL_CHALLENGE_REPLACEABLE_REASON_CODES
     ):
         return True
     return False

@@ -395,6 +395,260 @@ def _post_run_result_evidence_summary(evidence: dict[str, Any]) -> str | None:
     return f"{len(containers)} result container(s){hint_text}"
 
 
+_POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON = "tool_error_post_budget_challenge_result_evidence"
+_POST_BUDGET_CHALLENGE_BLOCKER_REASON = "tool_error_post_budget_challenge_blocker"
+_CHALLENGE_STOP_TERMS = frozenset(
+    {
+        "anti bot",
+        "anti-bot",
+        "captcha",
+        "challenge",
+        "disabled search",
+        "disabled submit",
+        "human verification",
+        "turnstile",
+        "verification",
+    }
+)
+_VISIBLE_TEXT_CHROME_TOKENS = frozenset(
+    {
+        "and",
+        "are",
+        "bot",
+        "button",
+        "captcha",
+        "challenge",
+        "clear",
+        "control",
+        "disabled",
+        "enter",
+        "first",
+        "form",
+        "full",
+        "human",
+        "last",
+        "lookup",
+        "name",
+        "reset",
+        "search",
+        "select",
+        "state",
+        "submit",
+        "verification",
+        "verify",
+        "you",
+        "your",
+    }
+)
+_RESULT_CONTAINER_CHROME_TOKENS = _VISIBLE_TEXT_CHROME_TOKENS | frozenset(
+    {"found", "matching", "record", "records", "result", "results"}
+)
+
+
+def _safe_signature_text(value: Any, max_chars: int = 180) -> str:
+    text = "" if value is None else str(value).strip()
+    return text[:max_chars]
+
+
+def _signature_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _diagnosis_stop_has_challenge_evidence(ctx: Any, reason: str) -> bool:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    repair_decision = getattr(contract, "repair_decision", None)
+    if _enum_or_string_name(getattr(repair_decision, "next_action", None)) != "stop":
+        return False
+
+    diagnosis_input = getattr(contract, "diagnosis_input", None)
+    diagnosis_result = getattr(contract, "diagnosis_result", None)
+    verification_result = getattr(contract, "verification_result", None)
+    categories = getattr(diagnosis_input, "failure_categories", None)
+    category_text = (
+        " ".join(str(category) for category in categories if category) if isinstance(categories, list) else ""
+    )
+    haystack = " ".join(
+        part
+        for part in (
+            reason,
+            category_text,
+            _enum_or_string_name(getattr(diagnosis_result, "suspected_failure_type", None)),
+            getattr(diagnosis_result, "root_cause_summary", None),
+            getattr(verification_result, "remaining_blocker", None),
+            getattr(ctx, "last_test_anti_bot", None),
+        )
+        if isinstance(part, str) and part
+    )
+    normalized = haystack.replace("_", " ").lower()
+    return any(term in normalized for term in _CHALLENGE_STOP_TERMS)
+
+
+def _challenge_control_signature(control: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "label": _composition_control_label(control),
+        "disabled": control.get("disabled") is True,
+    }
+
+
+def _post_budget_challenge_signature(evidence: dict[str, Any], reason: str) -> str:
+    challenge_state = evidence.get("challenge_state")
+    challenge = challenge_state if isinstance(challenge_state, dict) else {}
+    gated_controls = [
+        _challenge_control_signature(control)
+        for control in challenge.get("gated_submit_controls") or []
+        if isinstance(control, dict)
+    ]
+    disabled_controls = [
+        _challenge_control_signature(control) for control in _disabled_submit_controls_from_evidence(evidence)
+    ]
+    return _signature_json(
+        {
+            "reason": reason,
+            "challenge": {
+                "detected": challenge.get("detected") is True,
+                "gates_submit_controls": challenge.get("gates_submit_controls") is True,
+                "kind": _safe_signature_text(challenge.get("kind"), 80),
+                "requires_human_verification": challenge.get("requires_human_verification") is True,
+            },
+            "disabled_submit_controls": sorted(disabled_controls, key=lambda item: item["label"]),
+            "gated_submit_controls": sorted(gated_controls, key=lambda item: item["label"]),
+        }
+    )
+
+
+def _post_budget_result_evidence_signature(evidence: dict[str, Any], result_evidence: str) -> str:
+    containers = [container for container in evidence.get("result_containers") or [] if isinstance(container, dict)]
+    normalized_containers: list[dict[str, Any]] = []
+    for container in containers[:5]:
+        normalized_containers.append(
+            {
+                "id": _safe_signature_text(container.get("id"), 120),
+                "row_count": container.get("row_count") if isinstance(container.get("row_count"), int) else None,
+                "selector": _safe_signature_text(container.get("selector"), 160),
+                "tag": _safe_signature_text(container.get("tag"), 40),
+            }
+        )
+    return _signature_json({"containers": normalized_containers, "summary": result_evidence})
+
+
+def _result_container_has_content(container: dict[str, Any]) -> bool:
+    row_count = container.get("row_count")
+    if isinstance(row_count, int) and row_count > 0:
+        return True
+    for key in ("sample_rows", "rows", "items"):
+        value = container.get(key)
+        if isinstance(value, list) and _is_meaningful_extracted_data(value):
+            return True
+    for key in ("content_excerpt", "sample_text", "text", "text_excerpt", "visible_results_evidence"):
+        value = container.get(key)
+        if isinstance(value, str):
+            tokens = {token for token in re.findall(r"[a-z0-9]{2,}", value.lower()) if token}
+            if tokens - set(_RESULT_CONTAINER_CHROME_TOKENS):
+                return True
+            continue
+        if value:
+            return True
+    return False
+
+
+def _visible_text_excerpt_has_result_content(evidence: dict[str, Any]) -> bool:
+    text = evidence.get("visible_text_excerpt")
+    if not isinstance(text, str) or not text.strip():
+        return False
+    tokens = {token for token in re.findall(r"[a-z0-9]{2,}", text.lower()) if token}
+    if not tokens:
+        return False
+    control_tokens: set[str] = set(_VISIBLE_TEXT_CHROME_TOKENS)
+    for form in evidence.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        for field in form.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            for key in ("label", "name", "placeholder", "value"):
+                value = field.get(key)
+                if isinstance(value, str):
+                    control_tokens.update(re.findall(r"[a-z0-9]{2,}", value.lower()))
+            for option in field.get("options") or []:
+                if isinstance(option, dict):
+                    for key in ("text", "value"):
+                        value = option.get(key)
+                        if isinstance(value, str):
+                            control_tokens.update(re.findall(r"[a-z0-9]{2,}", value.lower()))
+    for control in _disabled_submit_controls_from_evidence(evidence):
+        control_tokens.update(re.findall(r"[a-z0-9]{2,}", _composition_control_label(control).lower()))
+    challenge_state = evidence.get("challenge_state")
+    if isinstance(challenge_state, dict):
+        control_tokens.update(re.findall(r"[a-z0-9]{2,}", str(challenge_state.get("kind") or "").lower()))
+        for indicator in challenge_state.get("indicators") or []:
+            if isinstance(indicator, str):
+                control_tokens.update(re.findall(r"[a-z0-9]{2,}", indicator.lower()))
+    for indicator in evidence.get("anti_bot_indicators") or []:
+        if isinstance(indicator, str):
+            control_tokens.update(re.findall(r"[a-z0-9]{2,}", indicator.lower()))
+    return bool(tokens - control_tokens)
+
+
+def _post_run_result_evidence_has_content(evidence: dict[str, Any]) -> bool:
+    containers = [container for container in evidence.get("result_containers") or [] if isinstance(container, dict)]
+    if any(_result_container_has_content(container) for container in containers):
+        return True
+    if containers and _visible_text_excerpt_has_result_content(evidence):
+        return True
+    for key in ("visible_results_evidence", "result_text_excerpt"):
+        value = evidence.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _has_prior_matching_challenge_result_evidence(
+    ctx: Any, *, challenge_signature: str, result_evidence_signature: str
+) -> bool:
+    history = getattr(ctx, "tool_blocker_signals", None)
+    if not isinstance(history, list):
+        return False
+    for signal in reversed(history):
+        if not isinstance(signal, CopilotToolBlockerSignal):
+            continue
+        if signal.internal_reason_code != _POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON:
+            continue
+        extra = signal.extra
+        if (
+            extra.get("challenge_signature") == challenge_signature
+            and extra.get("result_evidence_signature") == result_evidence_signature
+            and extra.get("result_evidence_populated") is not True
+        ):
+            return True
+    return False
+
+
+def _terminal_challenge_signal(
+    *, reason: str, arguments: dict[str, Any] | None, tool_name: str, extra: dict[str, Any] | None = None
+) -> CopilotToolBlockerSignal:
+    requested_labels = _requested_block_label_set(arguments)
+    labels_text = f" Requested labels: {', '.join(sorted(requested_labels))}." if requested_labels else ""
+    agent_steering = (
+        "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
+        f"now shows: {reason}.{labels_text} Do NOT call "
+        f"{tool_name} again in this turn, do NOT try another proxy/location from this evidence state, and "
+        "do NOT claim results or no-results were verified. REPLY now with a blocker explanation "
+        "that names the observed challenge/disabled control and summarizes the tested workflow state."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=_terminal_challenge_user_facing_reason(reason),
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code=_POST_BUDGET_CHALLENGE_BLOCKER_REASON,
+        blocked_tool=tool_name,
+        extra=extra or {},
+    )
+
+
 _TERMINAL_CHALLENGE_FALLBACK_USER_FACING = (
     "A page barrier was still blocking the workflow's next step after the last run, "
     "so I stopped without claiming results."
@@ -442,6 +696,33 @@ def _post_budget_terminal_challenge_signal(
     # evidence, the answer-from-observed-page path outranks a terminal claim.
     result_evidence = _post_run_result_evidence_summary(evidence)
     if result_evidence:
+        challenge_signature = _post_budget_challenge_signature(evidence, reason)
+        result_evidence_signature = _post_budget_result_evidence_signature(evidence, result_evidence)
+        result_evidence_populated = _post_run_result_evidence_has_content(evidence)
+        extra = {
+            "challenge_signature": challenge_signature,
+            "result_evidence_populated": result_evidence_populated,
+            "result_evidence_signature": result_evidence_signature,
+        }
+        if (
+            not result_evidence_populated
+            and _diagnosis_stop_has_challenge_evidence(ctx, reason)
+            and _has_prior_matching_challenge_result_evidence(
+                ctx,
+                challenge_signature=challenge_signature,
+                result_evidence_signature=result_evidence_signature,
+            )
+        ):
+            return _terminal_challenge_signal(
+                reason=reason,
+                arguments=arguments,
+                tool_name=tool_name,
+                extra={
+                    **extra,
+                    "escalated_from_reason_code": _POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON,
+                },
+            )
+
         agent_steering = (
             "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
             f"shows: {reason} — but the SAME observed page also contains result evidence: {result_evidence}. "
@@ -460,30 +741,12 @@ def _post_budget_terminal_challenge_signal(
             | frozenset({"get_run_results", "update_workflow", "update_and_run_blocks"}),
             preserves_workflow_draft=True,
             renders_final_reply=False,
-            internal_reason_code="tool_error_post_budget_challenge_result_evidence",
+            internal_reason_code=_POST_BUDGET_CHALLENGE_RESULT_EVIDENCE_REASON,
             blocked_tool=tool_name,
+            extra=extra,
         )
 
-    requested_labels = _requested_block_label_set(arguments)
-    labels_text = f" Requested labels: {', '.join(sorted(requested_labels))}." if requested_labels else ""
-    agent_steering = (
-        "The prior block-running tool hit a failed/budgeted frontier, and bounded current-page inspection "
-        f"now shows: {reason}.{labels_text} Do NOT call "
-        f"{tool_name} again in this turn, do NOT try another proxy/location from this evidence state, and "
-        "do NOT claim results or no-results were verified. REPLY now with a blocker explanation "
-        "that names the observed challenge/disabled control and summarizes the tested workflow state."
-    )
-    return CopilotToolBlockerSignal(
-        blocker_kind="tool_error",
-        agent_steering_text=agent_steering,
-        user_facing_reason=_terminal_challenge_user_facing_reason(reason),
-        recovery_hint="report_blocker_to_user",
-        cleared_by_tools=frozenset(),
-        preserves_workflow_draft=True,
-        renders_final_reply=True,
-        internal_reason_code="tool_error_post_budget_challenge_blocker",
-        blocked_tool=tool_name,
-    )
+    return _terminal_challenge_signal(reason=reason, arguments=arguments, tool_name=tool_name)
 
 
 _RECONCILIATION_REQUIRES_INPUT_USER_FACING = (

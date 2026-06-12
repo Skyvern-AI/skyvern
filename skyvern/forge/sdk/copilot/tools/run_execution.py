@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
+from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
@@ -97,6 +98,7 @@ from .composition_capture import (
 )
 from .credentials import (
     _credential_ids_validation_error,
+    _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
     _extract_credential_ids_from_workflow_definition,
 )
@@ -656,6 +658,13 @@ async def _run_blocks_and_collect_debug(
             + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
         )
     )
+    credential_approval_error = _credential_run_approval_error(
+        credential_ids,
+        getattr(ctx, "request_policy", None),
+    )
+    if credential_approval_error is not None:
+        return {"ok": False, "error": credential_approval_error}
+
     credential_error = await _credential_ids_validation_error(credential_ids, ctx)
     if credential_error is not None:
         return {"ok": False, "error": credential_error}
@@ -1755,6 +1764,7 @@ def _run_output_terminal_blocker_signal(
 
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
     result = {"ok": False, "error": error}
+    record_consecutive_tool_result_boundary_for_ctx(copilot_ctx, source_tool, result)
     _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
     return json.dumps(result)
 
