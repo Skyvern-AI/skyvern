@@ -467,6 +467,7 @@ async def run_task_v2(
     task_v2_id: str,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> TaskV2:
     organization_id = organization.organization_id
@@ -517,6 +518,7 @@ async def run_task_v2(
                 task_v2=task_v2,
                 request_id=request_id,
                 max_steps_override=max_steps_override,
+                max_iterations_override=max_iterations_override,
                 browser_session_id=browser_session_id,
             )
         except TaskTerminationError as e:
@@ -566,11 +568,29 @@ async def run_task_v2(
     return task_v2
 
 
+def _resolve_max_iterations(max_iterations_override: str | int | None) -> int:
+    """Resolve the planner-iteration budget, never below the historical floor.
+
+    The planner always ran DEFAULT_MAX_ITERATIONS regardless of the block field, so workflows
+    persisted with the old (smaller) default must not regress — floor every value at it.
+    """
+    if max_iterations_override:
+        try:
+            return max(int(max_iterations_override), DEFAULT_MAX_ITERATIONS)
+        except (ValueError, TypeError):
+            LOG.info(
+                "max_iterations_override isn't an integer, won't override",
+                max_iterations_override=max_iterations_override,
+            )
+    return DEFAULT_MAX_ITERATIONS
+
+
 async def run_task_v2_helper(
     organization: Organization,
     task_v2: TaskV2,
     request_id: str | None = None,
     max_steps_override: str | int | None = None,
+    max_iterations_override: str | int | None = None,
     browser_session_id: str | None = None,
 ) -> tuple[Workflow, WorkflowRun, TaskV2] | tuple[None, None, TaskV2]:
     organization_id = organization.organization_id
@@ -700,11 +720,12 @@ async def run_task_v2_helper(
     url = str(task_v2.url)
 
     max_steps = int_max_steps_override or settings.MAX_STEPS_PER_TASK_V2
+    max_iterations = _resolve_max_iterations(max_iterations_override)
 
     # When TaskV2 is inside a loop, each loop iteration should get fresh attempts
     # This is managed at the ForLoop level by calling run_task_v2 for each iteration
-    # The DEFAULT_MAX_ITERATIONS limit applies to this single TaskV2 execution
-    for i in range(DEFAULT_MAX_ITERATIONS):
+    # The max_iterations limit applies to this single TaskV2 execution
+    for i in range(max_iterations):
         # validate the task execution
         await app.AGENT_FUNCTION.validate_task_execution(
             organization_id=organization_id,
@@ -1194,13 +1215,13 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
     else:
         # Loop completed without early exit - task exceeded max iterations
-        max_iterations_failure_reason = f"Task exceeded maximum of {DEFAULT_MAX_ITERATIONS} planning iterations. Consider simplifying the task or breaking it into smaller steps."
+        max_iterations_failure_reason = f"Task exceeded maximum of {max_iterations} planning iterations. Consider simplifying the task or breaking it into smaller steps."
         max_iterations_failure_category = classify_from_failure_reason(
             max_iterations_failure_reason, fallback_to_unknown=True
         )
         LOG.info(
             "Task v2 failed - exceeded maximum iterations",
-            max_iterations=DEFAULT_MAX_ITERATIONS,
+            max_iterations=max_iterations,
             workflow_run_id=workflow_run_id,
         )
         LOG.info(

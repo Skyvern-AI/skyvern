@@ -6055,6 +6055,7 @@ class TaskV2Block(Block):
             task_v2_id=task_v2.observer_cruise_id,
             request_id=None,
             max_steps_override=self.max_steps,
+            max_iterations_override=self.max_iterations,
             browser_session_id=browser_session_id,
         )
         result_dict = None

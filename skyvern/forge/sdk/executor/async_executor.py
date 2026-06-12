@@ -48,6 +48,7 @@ class AsyncExecutor(abc.ABC):
         task_v2_id: str,
         max_steps_override: int | str | None,
         browser_session_id: str | None,
+        max_iterations_override: int | str | None = None,
         **kwargs: dict,
     ) -> None:
         pass
