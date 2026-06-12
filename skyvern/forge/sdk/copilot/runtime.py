@@ -24,6 +24,7 @@ from skyvern.cli.core.session_manager import (
     scoped_session,
     unregister_copilot_session,
 )
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
@@ -85,6 +87,10 @@ def _browser_context_is_attachable(browser_context: object | None) -> bool:
             return False
 
     return True
+
+
+def _copilot_session_can_access_localhost() -> bool:
+    return settings.ENV == "local"
 
 
 def _browser_session_status_is_final(status: str | None) -> bool:
@@ -204,6 +210,10 @@ class AgentContext:
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
+    last_run_blocks_block_ids: list[str] = field(default_factory=list)
+    last_run_blocks_block_labels: list[str] = field(default_factory=list)
+    last_run_outcome: RecordedRunOutcome | None = None
+    last_run_outcome_block_labels: list[str] = field(default_factory=list)
     completion_verification_result: CompletionVerificationResult | None = None
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
@@ -335,7 +345,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser_state.browser_context,
             browser_session_id=ctx.browser_session_id,
         )
-        mcp_ctx = MCPBrowserContext(mode="cloud_session", session_id=ctx.browser_session_id)
+        mcp_ctx = MCPBrowserContext(
+            mode="cloud_session",
+            session_id=ctx.browser_session_id,
+            can_access_localhost=_copilot_session_can_access_localhost(),
+        )
         active_key = get_active_api_key()
         state = SessionState(
             browser=skyvern_browser,

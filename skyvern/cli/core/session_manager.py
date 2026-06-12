@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import structlog
 
+from skyvern.config import settings
+
 from .api_key_hash import hash_api_key_for_cache
 from .client import get_active_api_key, get_skyvern, has_api_key_override
 from .result import BrowserContext, ErrorCode, make_error
@@ -89,6 +91,10 @@ def register_copilot_session(session_id: str, state: SessionState) -> None:
 def unregister_copilot_session(session_id: str) -> None:
     """Remove a copilot browser session from the process-local registry."""
     _copilot_sessions.pop(session_id, None)
+
+
+def _explicit_cloud_session_can_access_localhost() -> bool:
+    return settings.ENV == "local"
 
 
 def get_current_session() -> SessionState:
@@ -223,7 +229,11 @@ async def resolve_browser(
     try:
         if session_id:
             browser = await skyvern.connect_to_cloud_browser_session(session_id)
-            ctx = BrowserContext(mode="cloud_session", session_id=session_id)
+            ctx = BrowserContext(
+                mode="cloud_session",
+                session_id=session_id,
+                can_access_localhost=_explicit_cloud_session_can_access_localhost(),
+            )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
@@ -235,13 +245,17 @@ async def resolve_browser(
 
         if local:
             browser = await skyvern.launch_local_browser(headless=headless)
-            ctx = BrowserContext(mode="local")
+            ctx = BrowserContext(mode="local", can_access_localhost=True)
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
 
         if create_session:
             browser = await skyvern.launch_cloud_browser(timeout=timeout)
-            ctx = BrowserContext(mode="cloud_session", session_id=browser.browser_session_id)
+            ctx = BrowserContext(
+                mode="cloud_session",
+                session_id=browser.browser_session_id,
+                can_access_localhost=False,
+            )
             set_current_session(SessionState(browser=browser, context=ctx, api_key_hash=active_api_key_hash))
             return browser, ctx
     except Exception:
