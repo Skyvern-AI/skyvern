@@ -31,6 +31,7 @@ from .page_observation import (
     _resolve_url_title,
 )
 from .scouting import (
+    _attach_scout_page_summary,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -320,12 +321,14 @@ async def _click_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
@@ -419,12 +422,14 @@ async def _type_text_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
@@ -511,12 +516,14 @@ async def _select_option_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
