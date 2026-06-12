@@ -957,6 +957,7 @@ else:
         WhileLoopBlockLoopBlocksItem_WorkflowTrigger,
     ):
         update_forward_refs(_cls)
+    # Back-resolve everything that couldn't resolve mid-chain.
     from . import for_loop_block_loop_blocks_item as _fllb
     _fllb.WhileLoopBlockLoopBlocksItem = WhileLoopBlockLoopBlocksItem  # type: ignore[attr-defined]
     for _cls in (

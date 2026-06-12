@@ -203,6 +203,7 @@ class AgentContext:
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
     effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None

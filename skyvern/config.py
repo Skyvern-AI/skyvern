@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     # Gate copilot verified-success on per-criterion outcome evidence.
     # Off restores the prior run-status/suspicious-success gate and classifier prompt.
     COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
+    # Capture bounded page evidence synchronously in scout interaction post-hooks.
+    # Off restores schema-less interaction packets plus standalone page inspects.
+    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
@@ -156,6 +160,9 @@ class Settings(BaseSettings):
     # Experimental Workflow Copilot v2 branch mode.
     # Off = standard block authoring. On = prefer code blocks for browser work.
     WORKFLOW_COPILOT_CODE_BLOCK_MODE: bool = False
+    # Default-off companion to code-block mode. When enabled, Copilot can impose
+    # strict scout-trajectory synthesis at the persist seam for the narrow PR-1 envelope.
+    WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -17,10 +18,17 @@ from skyvern.forge.sdk.copilot.composition_browser_expressions import (
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_STRIPPED_HTML_MAX_CHARS as _COMPOSITION_STRIPPED_HTML_MAX_CHARS,
 )
-from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
+)
+from skyvern.forge.sdk.copilot.composition_browser_expressions import (
+    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
+)
+from skyvern.forge.sdk.copilot.composition_evidence import has_bounded_page_schema, parse_composition_structured
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -649,3 +657,41 @@ async def _composition_get_html(copilot_ctx: Any, *, skip_raw: bool = False) -> 
         return stripped, None, truncated, True
     error = html_result.get("error")
     return "", str(error) if error else None, False, True
+
+
+async def _composition_get_structured_evidence(
+    copilot_ctx: Any,
+    *,
+    inspected_url: str,
+    current_url: str,
+    timeout_seconds: float = _DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
+    server = getattr(copilot_ctx, "discovery_mcp_server", None)
+    if server is None:
+        return None
+    with copilot_span("composition_structured_extract"):
+        try:
+            result = await asyncio.wait_for(
+                server.call_internal_tool(
+                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
+                ),
+                timeout=timeout_seconds,
+            )
+        except Exception:
+            return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    raw = (result.get("data") or {}).get("result")
+    if isinstance(raw, str):
+        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
