@@ -89,6 +89,9 @@ keywords:
 - Fixed the workflow run timeline rendering blocks in branch-tree order instead of execution order, producing a confusing step sequence. ([#6515](https://github.com/Skyvern-AI/skyvern/pull/6515))
 - Fixed downloaded files inside loop blocks being shared across all iterations instead of scoped to the block that downloaded them. ([#6487](https://github.com/Skyvern-AI/skyvern/pull/6487))
 - Fixed session recordings defaulting to an incorrect resolution; recordings now use Playwright's default viewport size. ([#6524](https://github.com/Skyvern-AI/skyvern/pull/6524))
+- Fixed Copilot failing to recognize and use a saved credential when the credential ID was typed with a space or hyphen separator instead of an underscore; malformed IDs are now normalized and resolved correctly. ([#6529](https://github.com/Skyvern-AI/skyvern/pull/6529))
+- Fixed Copilot chat showing workflow blocks as completed even when the overall run goal was not demonstrated — the recorded run outcome verdict is now surfaced in the chat narrative. ([#6528](https://github.com/Skyvern-AI/skyvern/pull/6528))
+- Fixed Copilot browser sessions incorrectly blocking localhost navigation during page scouting, which could prevent evidence from being gathered from locally-served pages. ([#6527](https://github.com/Skyvern-AI/skyvern/pull/6527))
 
 </Update>
 
