@@ -12,6 +12,7 @@ from typing import Any
 
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _MAX_STEPS,
     _SYNTHESIZED_BLOCK_LABEL,
     build_synthesized_artifact_metadata,
     render_synthesized_offer_text,
@@ -368,15 +369,113 @@ class TestTrajectoryFidelity:
         for key in keys:
             assert f"fill(str({key}))" in result.code
 
-    def test_step_cap_truncates_at_twenty(self) -> None:
+    def test_step_cap_truncates_at_configured_limit(self) -> None:
         trajectory = [
             _interaction("click", selector=f'role=button[name="b{i}"]', source_url="https://example.com/")
-            for i in range(25)
+            for i in range(_MAX_STEPS + 5)
         ]
         result = synthesize_code_block(trajectory)
         assert result is not None
-        assert result.code.count(".click()") == 20
+        assert result.code.count(".click()") == _MAX_STEPS
+        assert result.diagnostics.truncated is True
         assert any("truncated" in note for note in result.notes)
+
+    def test_strict_synthesis_emits_byte_equal_selector_provenance(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#provInput",
+                    source_url="https://example.com/find-care",
+                    typed_length=13,
+                    role="textbox",
+                    accessible_name="Provider Name",
+                )
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in result.code
+        assert result.diagnostics.dropped_interactions == []
+        assert result.diagnostics.locator_provenance == [
+            {
+                "trajectory_index": 0,
+                "selector": "#provInput",
+                "emitted_literal": "#provInput",
+                "source": "selector",
+            }
+        ]
+
+    def test_strict_synthesis_reports_unsupported_interaction(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/"),
+                _interaction("hover", selector="#menu", source_url="https://example.com/"),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        assert result.diagnostics.dropped_interactions == [
+            {"trajectory_index": 1, "tool_name": "hover", "reason_code": "unsupported_tool"}
+        ]
+
+    def test_synthesis_scrubs_credentials_from_emitted_url_literals(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                )
+            ]
+        )
+        metadata = build_synthesized_artifact_metadata(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                )
+            ]
+        )
+
+        assert result is not None
+        assert "user:password" not in result.code
+        assert "secret-token" not in result.code
+        assert "fragment-token" not in result.code
+        assert "q=provider" in result.code
+        assert "section=results" in result.code
+        page_dependency = metadata["page_dependencies"][0]
+        assert page_dependency["url_hint"] == (
+            "https://example.com/search?token=__redacted__&q=provider#access_token=__redacted__&section=results"
+        )
+
+    def test_synthesis_scrubs_bare_sensitive_url_fragments(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                )
+            ]
+        )
+        metadata = build_synthesized_artifact_metadata(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                )
+            ]
+        )
+
+        assert result is not None
+        assert "secret-token-fragment" not in result.code
+        assert 'await page.goto("https://example.com/search?q=provider#__redacted__")' in result.code
+        assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=provider#__redacted__"
 
 
 class TestDeterminismAndEmpty:

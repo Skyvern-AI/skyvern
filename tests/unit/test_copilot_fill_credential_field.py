@@ -261,7 +261,11 @@ def _wire_impl(
     monkeypatch.setattr(credential_fill_module, "_tool_loop_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "_authority_tool_error", lambda *a, **k: None)
     monkeypatch.setattr(credential_fill_module, "record_tool_step_result_for_ctx", lambda *a, **k: None)
-    monkeypatch.setattr(credential_fill_module, "_register_scout_interaction_observation", lambda *a, **k: 3)
+
+    async def fake_register(*_args: object, **_kwargs: object) -> tuple[int, None]:
+        return 3, None
+
+    monkeypatch.setattr(credential_fill_module, "_register_scout_interaction_observation", fake_register)
 
 
 class TestFillCredentialFieldImpl:

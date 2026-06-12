@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
 
 @dataclass
@@ -36,6 +38,17 @@ def _mcp_text_output(payload: dict[str, Any]) -> list[dict[str, str]]:
     return [{"type": "text", "text": json.dumps(payload)}]
 
 
+def _terminal_loop_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="LOOP DETECTED: 'update_workflow' has already failed 3 times.",
+        user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_workflow",
+    )
+
+
 @pytest.mark.asyncio
 async def test_on_tool_end_appends_generic_tool_entry() -> None:
     ctx = _FakeContext()
@@ -49,6 +62,20 @@ async def test_on_tool_end_appends_generic_tool_entry() -> None:
     assert entry["tool"] == "navigate_browser"
     assert "summary" in entry
     assert "output_preview" not in entry  # non-whitelisted tool
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_raises_turn_halt_after_activity_recording() -> None:
+    ctx = _FakeContext()
+    ctx.turn_halt = turn_halt_from_blocker_signal(_terminal_loop_signal(), source="test")  # type: ignore[attr-defined]
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": False, "error": "terminal blocker"})
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("update_workflow"), output)
+
+    assert exc_info.value.halt is ctx.turn_halt
+    assert ctx.tool_activity[0]["tool"] == "update_workflow"
 
 
 @pytest.mark.asyncio

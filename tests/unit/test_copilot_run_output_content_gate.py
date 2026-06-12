@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.tools import (
     _record_run_blocks_result,
     _run_blocks_structured_blocker_message,
 )
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
 
 def _code_block(label: str, extracted: Any, *, block_type: str = "CODE") -> dict[str, Any]:
@@ -149,6 +150,8 @@ def test_blocked_flag_run_records_suspicious_success() -> None:
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
 
+    assert result["ok"] is False
+    assert result["error"] == ctx.last_test_failure_reason
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
@@ -156,6 +159,10 @@ def test_blocked_flag_run_records_suspicious_success() -> None:
     assert ctx.last_failed_workflow_yaml == "blocks: []"
     categories = result["data"]["failure_categories"]
     assert any(category["category"] == "ANTI_BOT_DETECTION" for category in categories)
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_run_output_terminal_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     assert verified_goal_satisfied_context(ctx) is False
     assert _verified_workflow_or_none(ctx) == (None, None)
     snapshot = getattr(ctx, "outcome_verification_trace_snapshot", {})
@@ -192,6 +199,11 @@ def test_blocked_status_value_rejected_deterministically(block_type: str) -> Non
     assert _is_outcome_evidence_candidate(ctx, result) is False
 
     _record_run_blocks_result(ctx, result, completion_verification=None)
+    assert result["ok"] is False
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_run_output_terminal_blocker"
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.ACTIVE_TERMINAL_CHALLENGE
     assert ctx.last_test_ok is False
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
