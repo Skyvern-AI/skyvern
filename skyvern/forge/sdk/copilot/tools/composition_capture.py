@@ -16,12 +16,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     evaluate_completion_criteria,
 )
 from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION as _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
-    COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS as _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS,
-)
-from skyvern.forge.sdk.copilot.composition_browser_expressions import (
     COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION as _COMPOSITION_VISUAL_OBSTRUCTION_CANDIDATES_EXPRESSION,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import (
@@ -30,7 +24,6 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     merge_visual_composition_evidence,
     page_evidence_needs_visual_fallback,
     parse_composition_html,
-    parse_composition_structured,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
@@ -44,6 +37,7 @@ from ._shared import (
     _append_flow_evidence,
     _composition_evidence_page_url,
     _composition_get_html,
+    _composition_get_structured_evidence,
     _discovery_extract_current_url,
     _discovery_navigate,
     _fallback_page_info,
@@ -603,43 +597,6 @@ async def _augment_composition_evidence_with_computed_obstruction_candidates(
         return evidence
     candidates = await _composition_get_computed_visual_obstruction_candidates(copilot_ctx)
     return _merge_visual_obstruction_candidates(evidence, candidates)
-
-
-async def _composition_get_structured_evidence(
-    copilot_ctx: Any,
-    *,
-    inspected_url: str,
-    current_url: str,
-) -> dict[str, Any] | None:
-    """Capture composition evidence via the page-side extractor; None when it can't yield a usable payload."""
-    server = getattr(copilot_ctx, "discovery_mcp_server", None)
-    if server is None:
-        return None
-    with copilot_span("composition_structured_extract"):
-        try:
-            result = await asyncio.wait_for(
-                server.call_internal_tool(
-                    "skyvern_evaluate", {"expression": _COMPOSITION_STRUCTURED_EVIDENCE_EXPRESSION}
-                ),
-                timeout=_DISCOVERY_PER_CALL_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    raw = (result.get("data") or {}).get("result")
-    if isinstance(raw, str):
-        if len(raw) > _COMPOSITION_STRUCTURED_EVIDENCE_MAX_CHARS:
-            return None
-        try:
-            payload = json.loads(raw)
-        except (ValueError, TypeError):
-            return None
-    elif isinstance(raw, dict):
-        payload = raw
-    else:
-        return None
-    return parse_composition_structured(payload, inspected_url=inspected_url, current_url=current_url)
 
 
 async def _capture_composition_evidence(

@@ -345,6 +345,7 @@ class CopilotContext(AgentContext):
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
