@@ -4528,7 +4528,8 @@ async def run_task_v2(
         background_tasks=background_tasks,
         organization_id=organization.organization_id,
         task_v2_id=task_v2.observer_cruise_id,
-        max_steps_override=x_max_steps_override or x_max_iterations_override,
+        max_steps_override=x_max_steps_override,
+        max_iterations_override=x_max_iterations_override,
         browser_session_id=data.browser_session_id,
     )
     return task_v2.model_dump(by_alias=True)

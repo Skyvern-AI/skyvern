@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
-    MAX_ITERATIONS_PER_TASK_V2: int = 10
+    MAX_ITERATIONS_PER_TASK_V2: int = 50
     MAX_NUM_SCREENSHOTS: int = 10
     # Emit per-call image_tokens/image_cost/image_count on the LLM duration log so
     # screenshot spend can be monitored independently of the provider's blended tokens.
