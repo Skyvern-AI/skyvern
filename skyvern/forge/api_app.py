@@ -394,7 +394,8 @@ def create_api_app() -> FastAPI:
     @fastapi_app.exception_handler(Exception)
     async def unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
         LOG.exception("Unexpected error in agent server.", exc_info=exc)
-        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {exc}"})
+        # Exception class only: str(exc) can carry raw SQL, bind params, or internal paths.
+        return JSONResponse(status_code=500, content={"error": f"Unexpected error: {type(exc).__name__}"})
 
     @fastapi_app.middleware("http")
     async def request_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
