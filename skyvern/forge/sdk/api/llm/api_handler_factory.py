@@ -646,6 +646,8 @@ class LLMAPIHandlerFactory:
             "anthropic/claude-opus-4-7",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-fable-5",
+            "anthropic-claude-opus-4-8",
+            "anthropic-claude-fable-5",
         }
 
     @staticmethod
@@ -654,8 +656,9 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
-        if LLMAPIHandlerFactory.requires_adaptive_thinking(model_label):
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
             parameters["thinking"] = {"type": "adaptive"}
             parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
             LOG.debug(
@@ -783,7 +786,8 @@ class LLMAPIHandlerFactory:
         check_model = model_label
         if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
             try:
-                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+                primary_model = llm_config.model_list[0]  # type: ignore[attr-defined]
+                check_model = primary_model.litellm_params.get("model") or primary_model.model_name or model_label
             except Exception:
                 check_model = model_label
         return check_model
