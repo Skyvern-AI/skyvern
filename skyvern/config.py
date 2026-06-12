@@ -148,6 +148,10 @@ class Settings(BaseSettings):
     # Gate copilot verified-success on per-criterion outcome evidence.
     # Off restores the prior run-status/suspicious-success gate and classifier prompt.
     COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
+    # Capture bounded page evidence synchronously in scout interaction post-hooks.
+    # Off restores schema-less interaction packets plus standalone page inspects.
+    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
+    COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
