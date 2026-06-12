@@ -627,8 +627,10 @@ async def wrapper({default_args}):
 
         excluded_parameter_keys = frozenset(parameter_defaults)
 
-        async def filtered_user_function() -> dict:
+        async def filtered_user_function():
             result = await user_function()
+            if not isinstance(result, dict):
+                return result
             return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
 
         return filtered_user_function
@@ -811,6 +813,47 @@ async def wrapper({default_args}):
         )
         with pytest.raises(NameError, match="open"):
             await fn()
+
+    @pytest.mark.asyncio
+    async def test_real_method_explicit_list_return_passes_through(self) -> None:
+        """SKY-10789 regression: a parameterized code block ending in an explicit
+        `return <list>` must yield the list, not crash on result.items().
+
+        Exercises the real CodeBlock.generate_async_user_function (not the helper)
+        so the fix is locked at the source. #11869 introduced the regression;
+        without this guard it raised AttributeError: 'list' object has no attribute 'items'.
+        """
+        from unittest.mock import MagicMock
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="check_max_docs_output",
+            description="test output",
+            output_parameter_id="op_test_return",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        code = "candidates = diff_documents_output.get('candidates') or []\nreturn list(candidates)"
+        block = CodeBlock(label="check_max_docs", code=code, output_parameter=output_parameter)
+        fn = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={"diff_documents_output": {"candidates": [{"name": "a"}, {"name": "b"}]}},
+        )
+        result = await fn()
+        assert result == [{"name": "a"}, {"name": "b"}]
+
+    @pytest.mark.asyncio
+    async def test_explicit_non_dict_return_does_not_leak_parameters(self) -> None:
+        """A parameterized block returning a non-dict passes the value through verbatim."""
+        fn = self._exec_user_code(
+            "rows = [public_value, public_value]\nreturn rows",
+            parameters={"public_value": "x", "secret_token": "sensitive"},
+        )
+        result = await fn()
+        assert result == ["x", "x"]
 
     def test_wrapper_uses_capture_locals_not_locals(self) -> None:
         """Regression: the wrapper template must use __capture_locals(), not return locals()."""
