@@ -14,7 +14,7 @@ import yaml
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -1189,6 +1189,38 @@ workflow_definition:
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
+    def test_code_only_inline_replace_workflow_rejects_native_browser_block(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.output_policy import OutputPolicyVerdict
+
+        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+        monkeypatch.setattr(agent_module, "evaluate_output_policy", lambda **kwargs: OutputPolicyVerdict())
+
+        submitted_yaml = """
+title: Navigation example
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: open_step
+      navigation_goal: Open the example page.
+"""
+        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        process_mock.assert_not_called()
+        assert "not available in the workflow copilot" in agent_result.user_response
+        assert "focused `code` blocks" in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
     def test_inline_replace_with_invalid_yaml_keeps_prior_pass(self, monkeypatch) -> None:
         # _process_workflow_yaml raising on a malformed REPLACE must leave
         # ctx untouched — no spurious last_test_ok reset, no workflow swap —
@@ -1884,6 +1916,19 @@ class TestCredentialRefusalReachesAgent:
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
         assert "MUST NOT build, update, or run a workflow" in prompt
         assert "redacted from the outbound client stream" not in prompt
+
+    def test_code_only_prompt_renders_policy_table_and_helper_validation_guidance(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        config = CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        prompt = _build_system_prompt("", config=config)
+
+        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in prompt
+        assert "credential-typed code" in prompt
+        assert "download registration" in prompt
+        assert "Use validate_block only for allowed non-browser helper blocks" in prompt
+        assert "Do not call `validate_block`" not in prompt
+        assert "native_allowed" not in prompt
 
     def test_native_tools_carry_refusal_reference(self) -> None:
         import re

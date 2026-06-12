@@ -18,6 +18,7 @@ from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer, _stas
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
+from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
 
 _LEAK_TOKENS = ("safe_reason_code", "LOOP DETECTED:")
 
@@ -102,6 +103,9 @@ def test_native_dispatch_failed_step_loop_sets_signal_and_returns_payload() -> N
     # Renderer-side string is clean.
     for token in _LEAK_TOKENS:
         assert token not in ctx.blocker_signal.user_facing_reason
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
+    assert ctx.turn_halt.blocker_signal is ctx.blocker_signal
 
 
 def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
@@ -111,6 +115,8 @@ def test_native_dispatch_consecutive_tool_loop_sets_signal() -> None:
     assert isinstance(ctx.blocker_signal, CopilotToolBlockerSignal)
     assert ctx.blocker_signal.internal_reason_code == "loop_detected_consecutive_same_tool"
     assert ctx.blocker_signal.cleared_by_tools == frozenset()
+    assert ctx.turn_halt is not None
+    assert ctx.turn_halt.kind == TurnHaltKind.LOOP_DETECTED
 
 
 def test_native_and_mcp_paths_produce_equivalent_loop_signal() -> None:

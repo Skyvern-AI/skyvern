@@ -17,7 +17,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.tools import (
+    _banned_block_reject_message,
     _detect_new_banned_blocks,
     _proxy_location_trace_value,
     _raw_yaml_proxy_location,
@@ -264,10 +266,17 @@ def test_block_without_label_is_skipped() -> None:
 
 def _ctx(prior_yaml: str | None = None) -> MagicMock:
     ctx = MagicMock()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
     ctx.workflow_yaml = prior_yaml
     ctx.workflow_id = "w_test"
     ctx.workflow_permanent_id = "wpid_test"
     ctx.organization_id = "o_test"
+    return ctx
+
+
+def _code_only_ctx(prior_yaml: str | None = None) -> MagicMock:
+    ctx = _ctx(prior_yaml=prior_yaml)
+    ctx.block_authoring_policy = BlockAuthoringPolicy.CODE_ONLY_BROWSER
     return ctx
 
 
@@ -372,3 +381,33 @@ async def test_update_workflow_allows_all_allowed_block_types() -> None:
         result = await _update_workflow({"workflow_yaml": submitted}, ctx)
 
     assert result["ok"] is True
+
+
+def test_code_only_reject_message_groups_per_type_capability_text() -> None:
+    ctx = _code_only_ctx()
+    message = _banned_block_reject_message(
+        [("login_step", "login"), ("download_step", "file_download"), ("open_step", "navigation")],
+        ctx,
+    )
+
+    assert "not available in the workflow copilot" in message
+    assert "login_step" in message
+    assert "download_step" in message
+    assert "open_step" in message
+    assert "credential-typed code" in message
+    assert "download registration" in message
+    assert "focused `code` blocks" in message
+
+
+@pytest.mark.asyncio
+async def test_code_only_update_workflow_rejects_new_browser_block_with_policy_text() -> None:
+    submitted = _yaml({"block_type": "login", "label": "login_step"})
+    ctx = _code_only_ctx(prior_yaml=None)
+
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update._record_banned_block_reject_span") as mock_span:
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+    assert result["ok"] is False
+    assert "not available in the workflow copilot" in result["error"]
+    assert "credential-typed code" in result["error"]
+    mock_span.assert_called_once_with("_update_workflow", [("login_step", "login")])
