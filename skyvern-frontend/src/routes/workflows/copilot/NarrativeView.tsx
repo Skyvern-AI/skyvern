@@ -4,8 +4,12 @@ import {
   ActivityEntry,
   BlockState,
   TurnNarrativeState,
+  TurnSummary,
+  computeTurnSummary,
   effectiveMode,
+  formatElapsed,
   isBlockOk,
+  latestBlocksByLabel,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
@@ -72,19 +76,6 @@ function paletteFor(blockType: string): BlockPalette {
     return PALETTE_ACTION;
   }
   return PALETTE_TASK;
-}
-
-function formatElapsed(
-  startedAt: string | null,
-  endedAt: string | null,
-): string | null {
-  const startMs = parseUtcIsoMs(startedAt);
-  const endMs = parseUtcIsoMs(endedAt);
-  if (startMs === null || endMs === null) return null;
-  const seconds = Math.max(0, Math.round((endMs - startMs) / 1000));
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function liveElapsed(startedAt: string | null): string | null {
@@ -461,125 +452,6 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
       ) : null}
     </div>
   );
-}
-
-interface TurnSummary {
-  headline: string;
-  stats: string[];
-  accent: "ok" | "fail" | "qa";
-  glyph: string;
-  isFail: boolean;
-  isQA: boolean;
-  isStoppedWithDraft: boolean;
-}
-
-function latestBlocksByLabel(blocks: BlockState[]): BlockState[] {
-  const latest = new Map<string, BlockState>();
-  for (const block of blocks) {
-    latest.set(block.label, block);
-  }
-  return Array.from(latest.values());
-}
-
-function asksUserForInput(turn: TurnNarrativeState): boolean {
-  if (turn.responseType === "ASK_QUESTION") {
-    return true;
-  }
-  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
-    .toLowerCase()
-    .trim();
-  return (
-    text.includes("please provide") ||
-    text.includes("please share") ||
-    text.includes("could you provide") ||
-    text.includes("can you provide") ||
-    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
-  );
-}
-
-function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
-  const rollupBlocks = latestBlocksByLabel(turn.blocks);
-  const isFail =
-    turn.terminal === "error" || rollupBlocks.some((b) => b.state === "failed");
-  const mode = effectiveMode(turn);
-  const needsInput = asksUserForInput(turn);
-  const isQA =
-    mode === "docs_answer" ||
-    mode === "diagnose" ||
-    mode === "clarify" ||
-    mode === "refuse";
-  const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
-  const needsUntestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_untested";
-  const needsTestedProposalReview =
-    hasDrafts && turn.proposalDisposition === "review_tested";
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-  const hasReviewableDraft =
-    hasDrafts &&
-    (turn.proposalDisposition === "review_untested" ||
-      turn.proposalDisposition === "review_tested" ||
-      (turn.cancelled && turn.proposalDisposition !== "no_proposal"));
-  const isStoppedWithDraft = hasReviewableDraft && (isFail || turn.cancelled);
-
-  const headline = isStoppedWithDraft
-    ? "Stopped with a draft"
-    : isFail
-      ? "Run halted"
-      : needsInput
-        ? "Question"
-        : needsUntestedProposalReview
-          ? "Draft needs review"
-          : needsTestedProposalReview
-            ? "Workflow ready for review"
-            : isQA
-              ? mode === "refuse"
-                ? "Declined"
-                : mode === "clarify"
-                  ? "Question"
-                  : "Answered"
-              : hasEdited
-                ? "Applied edits and re-tested"
-                : hasDrafts
-                  ? "Built and tested the workflow"
-                  : "Completed the run";
-
-  const stats: string[] = [];
-  const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
-  if (turnElapsed) stats.push(turnElapsed);
-  if (!isQA) {
-    const ok = rollupBlocks.filter((b) => isBlockOk(b)).length;
-    const failed = rollupBlocks.filter((b) => b.state === "failed").length;
-    const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-    if (newBlocks) stats.push(`${newBlocks} new`);
-    if (failed) stats.push(`${failed} failed`);
-  }
-
-  const accent = isStoppedWithDraft
-    ? "qa"
-    : isFail
-      ? "fail"
-      : needsUntestedProposalReview || needsTestedProposalReview || isQA
-        ? "qa"
-        : "ok";
-  return {
-    headline,
-    stats,
-    accent,
-    glyph:
-      isStoppedWithDraft ||
-      needsUntestedProposalReview ||
-      needsTestedProposalReview
-        ? "!"
-        : isFail
-          ? "✕"
-          : isQA
-            ? "✦"
-            : "✓",
-    isFail,
-    isQA,
-    isStoppedWithDraft,
-  };
 }
 
 function accentBg(accent: TurnSummary["accent"]): string {

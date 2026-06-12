@@ -53,6 +53,9 @@ export interface WorkflowCopilotChatHistoryMessage {
   content: string;
   audio_artifact_id?: string | null;
   created_at: string;
+  // Typed turn outcome persisted on assistant rows; optional so the FE
+  // tolerates an older backend that does not serve it.
+  turn_outcome?: { response_kind?: string | null } | null;
   narrative_payload?: Record<string, unknown> | null;
 }
 
