@@ -27,6 +27,9 @@ const DialogOverlay = React.forwardRef<
 ));
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
+// Overlays and contents all render at z-50, so nested dialogs paint correctly
+// only by portal DOM order; a dialog nested inside another should raise its
+// content above z-50 (e.g. className="z-[60]").
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>

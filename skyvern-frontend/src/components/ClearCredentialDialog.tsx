@@ -40,7 +40,13 @@ export function ClearCredentialDialog({
           {label}
         </Button>
       </DialogTrigger>
-      <DialogContent onCloseAutoFocus={(e) => e.preventDefault()}>
+      {/* z-[60]: this dialog can be nested inside another Dialog (cloud
+          integrations tile); all overlays/contents share z-50, so paint order
+          otherwise depends on portal DOM order alone. */}
+      <DialogContent
+        className="z-[60]"
+        onCloseAutoFocus={(e) => e.preventDefault()}
+      >
         <DialogTitle>{title}</DialogTitle>
         <DialogDescription>{description}</DialogDescription>
         <DialogFooter>
