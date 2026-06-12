@@ -99,6 +99,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHalt, turn_halt_to_trace_data
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
@@ -132,49 +133,18 @@ WORKFLOW_KNOWLEDGE_BASE_PATH = (
 _COPILOT_TURN_SPAN_NAME = "copilot.turn"
 _USER_MESSAGE_PREVIEW_MAX_CHARS = 40
 
-_CODE_ONLY_BROWSER_AUTHORING_PROMPT = """
-ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE
 
-Browser/page workflow block types are unavailable in this mode: `navigation`,
-`action`, `login`, `extraction`, `goto_url`, `validation`, `file_download`,
-`file_upload`, `print_page`, `task`, `task_v2`, and `browser_task`.
+def _render_code_only_browser_authoring_prompt() -> str:
+    from skyvern.forge.sdk.copilot.tools.banned_blocks import _code_only_browser_authoring_prompt
 
-If a durable step touches the browser page or browser session, author it as a
-focused `code` block. Allowed non-browser helper blocks remain available when
-they do not directly interact with the browser page, such as `conditional`,
-`for_loop`, `while_loop`, `send_email`, S3/Google Sheets helpers, and workflow
-triggers.
-
-Do not call `validate_block`, do not create dummy/probe code blocks, and do not
-call `get_run_results` before a real workflow run exists.
-
-Code block runtime facts:
-- `code` is async Python executed with a Playwright `page` object and workflow
-  parameters available by key.
-- Workflow parameter keys that are valid Python identifiers are available as
-  local variables. Normalize them with locals such as
-  `name = str(person_name).strip()` before using them in page inputs.
-- Use deterministic, bounded Playwright calls such as `await page.goto(...)`,
-  `await page.click(...)`, `await page.fill(...)`, `await page.press(...)`,
-  `await page.wait_for_load_state(...)`, and `await page.evaluate(...)`.
-- A workflow parameter bound to a saved credential (`workflow_parameter_type:
-  credential_id`) resolves at runtime to a credential object: read
-  `<key>.username`, `<key>.password`, and `<key>.totp` (a fresh one-time code
-  generated at block start). Scout saved-credential fields with the
-  `fill_credential_field` tool; never type or embed literal secret values.
-- For extraction blocks, return precise JSON-safe structured data and the
-  visible evidence text used to confirm it. Do not return only booleans for
-  visible records, products, totals, confirmations, or identifiers.
-- For multi-line code in workflow YAML, always use a YAML block scalar
-  (`code: |`). Never include placeholder text such as `[... truncated ...]`;
-  pass complete workflow YAML to update tools.
-
-When a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page
-interactions you scouted as deterministic Playwright. Persist that block VERBATIM
-via update_workflow / update_and_run_blocks — do not rewrite, reorder, or
-re-derive its locators. Only hand-author the steps it does not cover, such as the
-extraction or report block that returns the structured result.
-"""
+    return (
+        _code_only_browser_authoring_prompt()
+        + "\n\nWhen a SYNTHESIZED CODE BLOCK is offered to you, it already encodes the page\n"
+        "interactions you scouted as deterministic Playwright. Persist that block VERBATIM\n"
+        "via update_workflow / update_and_run_blocks — do not rewrite, reorder, or\n"
+        "re-derive its locators. Only hand-author the steps it does not cover, such as the\n"
+        "extraction or report block that returns the structured result."
+    )
 
 
 @runtime_checkable
@@ -469,7 +439,7 @@ def _build_system_prompt(
         security_rules=copilot_config.security_rules,
     )
     if copilot_config.block_authoring_policy == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
-        prompt = f"{prompt}\n\n{_CODE_ONLY_BROWSER_AUTHORING_PROMPT.strip()}"
+        prompt = f"{prompt}\n\n{_render_code_only_browser_authoring_prompt()}"
     return prompt
 
 
@@ -907,6 +877,8 @@ def _make_agent_result(
         else global_llm_context
     )
     narrative_payload = kwargs.get("narrative_payload")
+    if ctx is not None and narrative_payload is None:
+        raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     response_type = kwargs.get("response_type", "REPLY")
     proposal_disposition = kwargs.get("proposal_disposition")
     if isinstance(narrative_payload, dict):
@@ -1165,8 +1137,33 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="verified_goal_satisfied",
+    )
+
+
+def _build_turn_halt_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    halt: TurnHalt,
+) -> AgentResult:
+    signal = halt.blocker_signal
+    user_response = (
+        signal.user_facing_reason
+        if isinstance(signal, CopilotToolBlockerSignal)
+        else "I could not continue this turn safely. Tell me what to change and I'll try again."
+    )
+    return _build_exit_result(
+        ctx,
+        user_response,
+        global_llm_context,
+        terminal_reason=f"turn_halt:{halt.kind.value}",
     )
 
 
@@ -1955,16 +1952,21 @@ async def _translate_to_agent_result(
                 composition_page_evidence_error,
                 workflow_target_url,
             )
+            from skyvern.forge.sdk.copilot.tools.banned_blocks import _copilot_banned_block_types
 
             wait_block_error = _timing_only_challenge_wait_reject_message(ctx, workflow_yaml)
             if wait_block_error:
                 user_response = _with_inline_reject_note(user_response, wait_block_error)
                 ctx.last_test_ok = None
                 workflow_yaml = ""
-            banned_items = _detect_new_banned_blocks(workflow_yaml, ctx.last_workflow_yaml)
+            banned_items = _detect_new_banned_blocks(
+                workflow_yaml,
+                ctx.last_workflow_yaml,
+                banned_types=_copilot_banned_block_types(ctx),
+            )
             if banned_items:
                 _record_banned_block_reject_span("replace_workflow_inline", banned_items)
-                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items))
+                user_response = _with_inline_reject_note(user_response, _banned_block_reject_message(banned_items, ctx))
                 workflow_yaml = ""
             stale_metadata = _detect_stale_block_metadata(workflow_yaml, ctx.last_workflow_yaml or ctx.workflow_yaml)
             if stale_metadata:
@@ -3248,6 +3250,13 @@ async def _run_copilot_turn_impl(
                     workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
                 )
                 return _build_goal_satisfied_exit_result(ctx, global_llm_context)
+            except CopilotTurnHalt as exc:
+                LOG.info(
+                    "Copilot run stopped after typed turn halt",
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    **turn_halt_to_trace_data(exc.halt),
+                )
+                return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
@@ -3315,6 +3324,15 @@ async def _run_copilot_turn_impl(
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        turn_halt = getattr(ctx, "turn_halt", None)
+        if isinstance(turn_halt, TurnHalt):
+            LOG.info(
+                "Copilot run stopped after typed turn halt from wrapped exception",
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                error_type=type(e).__name__,
+                **turn_halt_to_trace_data(turn_halt),
+            )
+            return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
         if goal_satisfied:
             # The Agents SDK can wrap exceptions raised from hooks; keep this
             # fallback so a verified-goal stop is not rendered as a generic error.

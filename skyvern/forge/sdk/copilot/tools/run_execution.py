@@ -54,6 +54,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
@@ -1479,11 +1480,14 @@ def _record_run_blocks_result(
         signal = _active_run_terminal_evidence_signal(copilot_ctx, "update_and_run_blocks")
         if signal is not None:
             stash_blocker_signal(copilot_ctx, signal)
+            stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_execution")
 
     if run_ok:
         _mark_page_inspected(copilot_ctx)
         if structured_blocker:
             failure_reason = f"Run completed, but extracted data reported a blocker: {structured_blocker}"
+            result["ok"] = False
+            result.setdefault("error", failure_reason)
             copilot_ctx.last_test_ok = False
             copilot_ctx.last_test_suspicious_success = True
             copilot_ctx.last_test_failure_reason = failure_reason
@@ -1500,6 +1504,14 @@ def _record_run_blocks_result(
                         "reasoning": "Structured extracted data reported an anti-bot blocker.",
                     }
                     data["failure_categories"] = [anti_bot_category]
+            if _looks_like_anti_bot_blocker(structured_blocker):
+                signal = _run_output_terminal_blocker_signal(
+                    structured_blocker=structured_blocker,
+                    failure_reason=failure_reason,
+                    tool_name="update_and_run_blocks",
+                )
+                stash_blocker_signal(copilot_ctx, signal)
+                stash_turn_halt_from_blocker_signal(copilot_ctx, signal, source="run_output_content_gate")
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
             return _stash_recorded_run_outcome(
@@ -1707,6 +1719,36 @@ def _record_diagnosis_repair_contract(
     with copilot_span("diagnosis_repair_contract", data=trace_data):
         pass
     return contract
+
+
+def _run_output_terminal_blocker_signal(
+    *,
+    structured_blocker: str,
+    failure_reason: str,
+    tool_name: str,
+) -> CopilotToolBlockerSignal:
+    agent_steering = (
+        "The workflow run completed with structured anti-bot or challenge blocker evidence: "
+        f"{structured_blocker[:240]}. Do NOT call "
+        f"{tool_name} again in this turn. Reply from the recorded blocker and preserved draft; "
+        "do not claim the workflow is verified end-to-end."
+    )
+    user_facing = (
+        "The page is gated by a site verification challenge, so I stopped instead of retrying the same path. "
+        "The draft workflow is preserved, but it is not verified end-to-end."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="tool_error_run_output_terminal_blocker",
+        blocked_tool=tool_name,
+        extra={"failure_reason": failure_reason[:240]},
+    )
 
 
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
