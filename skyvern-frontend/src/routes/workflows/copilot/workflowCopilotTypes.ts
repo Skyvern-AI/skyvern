@@ -87,6 +87,7 @@ export type WorkflowCopilotStreamMessageType =
   | "condensing"
   | "narration"
   | "block_progress"
+  | "run_outcome"
   | "turn_start"
   | "design_start"
   | "design_end"
@@ -193,6 +194,24 @@ export interface WorkflowCopilotBlockProgressUpdate {
   block_label: string;
   block_type: string;
   status: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export type WorkflowCopilotRunOutcomeVerdict =
+  | "evaluating"
+  | "demonstrated"
+  | "not_demonstrated"
+  | "not_evaluated";
+
+export interface WorkflowCopilotRunOutcomeUpdate {
+  type: "run_outcome";
+  workflow_run_id: string;
+  workflow_run_block_ids: string[];
+  block_labels: string[];
+  verdict: WorkflowCopilotRunOutcomeVerdict;
+  reason_code?: string | null;
+  display_reason?: string | null;
   iteration: number;
   timestamp: string;
 }

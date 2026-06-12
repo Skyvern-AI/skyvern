@@ -2949,6 +2949,166 @@ workflow_definition:
         assert agent_result.proposal_disposition == "review_untested"
         assert "without testing it, as requested" in agent_result.user_response
 
+    @pytest.mark.asyncio
+    async def test_malformed_then_corrected_credential_id_resolves_when_valid(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_530299673029518520")
+        get_credentials_by_ids = AsyncMock(return_value=[credential])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        malformed = await build_request_policy(
+            user_message="Build it with cred 530299673029518520.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+        assert malformed.credential_input_kind == "credential_id"
+        assert malformed.resolved_credentials == [credential]
+        assert malformed.invalid_credential_ids == []
+        assert malformed.requires_user_clarification is False
+
+        corrected = await build_request_policy(
+            user_message="cred_530299673029518520",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "Build it with cred 530299673029518520."),
+                ("ai", "The credential ID `530299673029518520` appears to be invalid."),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+        assert corrected.credential_input_kind == "credential_id"
+        assert corrected.resolved_credentials == [credential]
+        assert corrected.invalid_credential_ids == []
+        assert corrected.requires_user_clarification is False
+
+    @pytest.mark.asyncio
+    async def test_malformed_then_corrected_credential_id_blocks_authoritatively_when_invalid(
+        self, monkeypatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        for user_message, history in (
+            ("Build it with cred 530299673029518520.", []),
+            (
+                "cred_530299673029518520",
+                _history(
+                    ("user", "Build it with cred 530299673029518520."),
+                    ("ai", "The credential ID `530299673029518520` appears to be invalid."),
+                ),
+            ),
+        ):
+            policy = await build_request_policy(
+                user_message=user_message,
+                workflow_yaml="",
+                chat_history=history,
+                global_llm_context="",
+                organization_id="org-1",
+                handler=None,
+            )
+            assert policy.credential_input_kind == "credential_id"
+            assert policy.invalid_credential_ids == ["cred_530299673029518520"]
+            assert "not found in this organization" in (policy.clarification_question or "")
+            assert "previously identified" not in (policy.clarification_question or "")
+
+    @pytest.mark.asyncio
+    async def test_malformed_id_promotes_over_non_id_kind_without_competing_scope(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_530299673029518520")
+
+        for classifier_body in (
+            {"credential_input_kind": "credential_name", "credential_refs": []},
+            {"credential_input_kind": "website_stored_credential", "login_page_urls": []},
+        ):
+            get_credentials_by_ids = AsyncMock(return_value=[credential])
+            monkeypatch.setattr(
+                policy_module.app,
+                "DATABASE",
+                SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+            )
+
+            async def handler(*, prompt: str, prompt_name: str, _body=classifier_body) -> dict:
+                return {"testing_intent": "unspecified", **_body}
+
+            policy = await build_request_policy(
+                user_message="Build it with cred 530299673029518520.",
+                workflow_yaml="",
+                chat_history=[],
+                global_llm_context="",
+                organization_id="org-1",
+                handler=handler,
+            )
+            assert policy.credential_input_kind == "credential_id", classifier_body
+            assert policy.resolved_credentials == [credential], classifier_body
+            get_credentials_by_ids.assert_awaited_once_with(["cred_530299673029518520"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_contextual_credential_id_does_not_override_classifier_target(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        bank = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[bank]),
+                    get_credentials_by_ids=AsyncMock(side_effect=AssertionError("contextual id must not be resolved")),
+                )
+            ),
+        )
+
+        async def name_handler(*, prompt: str, prompt_name: str) -> dict:
+            return {"credential_input_kind": "credential_name", "credential_refs": ["Bank"]}
+
+        name_policy = await build_request_policy(
+            user_message="Replace cred_530299673029518520 with my saved credential named Bank.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=name_handler,
+        )
+        assert name_policy.credential_input_kind == "credential_name"
+        assert name_policy.resolved_credentials == [bank]
+
+        async def url_handler(*, prompt: str, prompt_name: str) -> dict:
+            return {
+                "credential_input_kind": "website_stored_credential",
+                "login_page_urls": ["https://bank.example/login"],
+            }
+
+        url_policy = await build_request_policy(
+            user_message="Use the saved login for https://bank.example/login instead of cred_530299673029518520.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=url_handler,
+        )
+        assert url_policy.credential_input_kind == "website_stored_credential"
+        assert url_policy.resolved_credentials == [bank]
+
 
 class TestNativeToolCredentialIdValidation:
     def test_extracts_credential_ids_from_nested_tool_values(self) -> None:

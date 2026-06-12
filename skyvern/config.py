@@ -231,6 +231,11 @@ class Settings(BaseSettings):
     DEFAULT_BROWSER_PROFILE_DIR: str = ""
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
+    # Playwright's ffmpeg encoder runs continuously while the browser is open and its CPU cost
+    # scales with pixel count. Unset means Playwright's default (viewport scaled to fit 800x800);
+    # set both to record at an explicit resolution.
+    BROWSER_RECORDING_WIDTH: int | None = None
+    BROWSER_RECORDING_HEIGHT: int | None = None
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_CURSOR_VISUALIZATION: bool = False

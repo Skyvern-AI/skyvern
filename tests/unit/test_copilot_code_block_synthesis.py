@@ -648,6 +648,158 @@ class TestSynthesizedArtifactMetadata:
         assert "```json" not in text
 
 
+class TestCredentialFillSynthesis:
+    """A scouted fill_credential_field compiles into an attribute read on a
+    credential-bound parameter — references only, never values."""
+
+    def _credential_fill(self, **overrides: Any) -> dict[str, Any]:
+        fields = {
+            "selector": "#userName",
+            "source_url": "https://authenticationtest.com/simpleFormAuth/",
+            "typed_length": 24,
+            "credential_id": "cred_123",
+            "credential_field": "username",
+            "credential_name": "authtest simple",
+        }
+        fields.update(overrides)
+        return _interaction("fill_credential_field", **fields)
+
+    def test_emits_attribute_fill_and_credential_parameter(self) -> None:
+        result = synthesize_code_block([self._credential_fill()])
+        assert result is not None
+        assert 'await page.locator("#userName").fill(authtest_simple.username)' in result.code
+        assert result.parameters == [{"key": "authtest_simple", "credential_id": "cred_123"}]
+
+    def test_same_credential_shares_one_parameter(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(),
+                self._credential_fill(selector="#passwordInput", credential_field="password", typed_length=12),
+            ]
+        )
+        assert result is not None
+        assert 'await page.locator("#userName").fill(authtest_simple.username)' in result.code
+        assert 'await page.locator("#passwordInput").fill(authtest_simple.password)' in result.code
+        assert result.parameters == [{"key": "authtest_simple", "credential_id": "cred_123"}]
+
+    def test_totp_field_reads_totp_attribute(self) -> None:
+        result = synthesize_code_block(
+            [self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6)]
+        )
+        assert result is not None
+        assert 'await page.locator("#totpCode").fill(authtest_simple.totp)' in result.code
+
+    def test_missing_credential_reference_is_dropped_with_note(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(credential_id=""),
+                _interaction("click", selector="#next", source_url="https://example.com/login"),
+            ]
+        )
+        assert result is not None
+        assert ".fill(" not in result.code
+        assert result.parameters == []
+        assert any("credential" in note for note in result.notes)
+
+    def test_unknown_credential_field_is_dropped(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(credential_field="cvv"),
+                _interaction("click", selector="#next", source_url="https://example.com/login"),
+            ]
+        )
+        assert result is not None
+        assert ".fill(" not in result.code
+        assert result.parameters == []
+
+    def test_param_key_defaults_when_credential_name_missing(self) -> None:
+        result = synthesize_code_block([self._credential_fill(credential_name="")])
+        assert result is not None
+        assert ".fill(credential.username)" in result.code
+        assert result.parameters == [{"key": "credential", "credential_id": "cred_123"}]
+
+    def test_credential_param_key_does_not_collide_with_typed_param(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#company",
+                    source_url="https://example.com/form",
+                    typed_length=6,
+                    role="textbox",
+                    accessible_name="authtest simple",
+                ),
+                self._credential_fill(),
+            ]
+        )
+        assert result is not None
+        assert result.parameters[0] == {"key": "authtest_simple"}
+        assert result.parameters[1] == {"key": "authtest_simple_2", "credential_id": "cred_123"}
+        assert ".fill(authtest_simple_2.username)" in result.code
+
+    def test_offer_text_carries_credential_binding_contract(self) -> None:
+        trajectory = [self._credential_fill()]
+        synthesized = synthesize_code_block(trajectory)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, trajectory)
+        assert "`authtest_simple` -> `cred_123`" in text
+        assert "workflow_parameter_type: credential_id" in text
+        assert "default_value" in text
+        assert ".username` / `.password` / `.totp`" in text
+        assert "authtest_simple" not in [p.get("key") for p in synthesized.parameters if "credential_id" not in p]
+
+    def test_credential_parameters_excluded_from_plain_bind_line(self) -> None:
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#q",
+                source_url="https://example.com/",
+                typed_length=4,
+                role="textbox",
+                accessible_name="Search",
+            ),
+            self._credential_fill(),
+        ]
+        synthesized = synthesize_code_block(trajectory)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, trajectory)
+        assert "Workflow parameters referenced (bind these): search." in text
+        assert "Credential parameters referenced" in text
+
+    def test_plain_param_never_takes_a_bare_credential_field_name(self) -> None:
+        # CodeBlock.execute injects a bound credential's fields under the bare
+        # names username/password/totp, so a plain typed parameter must not
+        # claim those keys or it would resolve to the secret value at runtime.
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#confirm",
+                    source_url="https://example.com/form",
+                    typed_length=8,
+                    role="textbox",
+                    accessible_name="Password",
+                ),
+                self._credential_fill(),
+            ]
+        )
+        assert result is not None
+        assert result.parameters[0] == {"key": "password_field"}
+        assert "fill(str(password_field))" in result.code
+        assert {"key": "password"} not in result.parameters
+
+    def test_synthesized_credential_code_is_valid_python(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(),
+                self._credential_fill(selector="#passwordInput", credential_field="password"),
+            ]
+        )
+        assert result is not None
+        wrapped = "async def _block(page, authtest_simple):\n" + result.code
+        ast.parse(wrapped)
+
+
 def test_code_block_preflight_restores_recursion_limit() -> None:
     before = sys.getrecursionlimit()
     preflight_code_block("await page.locator('button[type=submit]').first.click(timeout=5000)\n")

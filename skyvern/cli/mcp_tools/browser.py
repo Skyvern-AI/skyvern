@@ -65,6 +65,10 @@ def _blank_to_none(value: str | None) -> str | None:
     return value if value is None or value.strip() else None
 
 
+def _must_reject_localhost_url(ctx: Any, url: str | None) -> bool:
+    return bool(url and is_localhost_url(url) and getattr(ctx, "can_access_localhost", None) is False)
+
+
 _SelectorMode = Annotated[
     Literal["resilient", "direct"],
     Field(
@@ -111,7 +115,7 @@ async def skyvern_navigate(
     except BrowserNotAvailableError:
         return make_result("skyvern_navigate", ok=False, error=no_browser_error())
 
-    if ctx.mode == "cloud_session" and is_localhost_url(url):
+    if _must_reject_localhost_url(ctx, url):
         return make_result(
             "skyvern_navigate",
             ok=False,
@@ -1455,7 +1459,7 @@ async def skyvern_run_task(
     except BrowserNotAvailableError:
         return make_result("skyvern_run_task", ok=False, error=no_browser_error())
 
-    if url and ctx.mode == "cloud_session" and is_localhost_url(url):
+    if _must_reject_localhost_url(ctx, url):
         return make_result(
             "skyvern_run_task",
             ok=False,
