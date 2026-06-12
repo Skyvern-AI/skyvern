@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from agents import ToolInputGuardrailData
+from agents.tool_context import ToolContext
 
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
@@ -22,6 +24,10 @@ from skyvern.forge.sdk.copilot.output_policy import (
     normalize_response_scaffolding,
 )
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+from skyvern.forge.sdk.copilot.tools import (
+    _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
+    NATIVE_TOOLS,
+)
 from skyvern.forge.sdk.copilot.turn_intent import TurnIntent, TurnIntentMode
 
 
@@ -1474,14 +1480,6 @@ workflow_definition:
 
 @pytest.mark.asyncio
 async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_secret() -> None:
-    from agents import ToolInputGuardrailData
-    from agents.tool_context import ToolContext
-
-    from skyvern.forge.sdk.copilot.tools import (
-        _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL,
-        NATIVE_TOOLS,
-    )
-
     guarded_tools = {
         tool.name: tool for tool in NATIVE_TOOLS if tool.name in {"update_workflow", "update_and_run_blocks"}
     }
@@ -1489,11 +1487,15 @@ async def test_workflow_mutation_tools_have_sdk_input_guardrails_and_reject_raw_
     assert guarded_tools["update_workflow"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
     assert guarded_tools["update_and_run_blocks"].tool_input_guardrails == [_WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL]
 
+    ctx = _ctx()
+    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+    ctx.failed_tool_step_tracker = {"sentinel": 2}
+
     result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
         ToolInputGuardrailData(
             context=ToolContext(
-                context=_ctx(),
-                tool_name="update_workflow",
+                context=ctx,
+                tool_name="update_and_run_blocks",
                 tool_call_id="call-1",
                 tool_arguments=json.dumps(
                     {
@@ -1513,6 +1515,39 @@ workflow_definition:
 
     assert result.behavior["type"] == "reject_content"
     assert "raw_secret_leak" in result.behavior["message"]
+    assert ctx.consecutive_tool_tracker == ["update_and_run_blocks"]
+    assert ctx.failed_tool_step_tracker == {"sentinel": 2}
+
+
+@pytest.mark.asyncio
+async def test_allowed_sdk_input_guardrail_does_not_record_consecutive_boundary() -> None:
+    ctx = _ctx()
+    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+
+    result = await _WORKFLOW_YAML_OUTPUT_POLICY_GUARDRAIL.run(
+        ToolInputGuardrailData(
+            context=ToolContext(
+                context=ctx,
+                tool_name="update_and_run_blocks",
+                tool_call_id="call-allow",
+                tool_arguments=json.dumps(
+                    {
+                        "workflow_yaml": """
+workflow_definition:
+  blocks:
+    - block_type: goto_url
+      label: open_example
+      url: https://example.com
+"""
+                    }
+                ),
+            ),
+            agent=SimpleNamespace(),
+        )
+    )
+
+    assert result.behavior["type"] == "allow"
+    assert ctx.consecutive_tool_tracker == ["update_workflow", "update_workflow"]
 
 
 @pytest.mark.asyncio
