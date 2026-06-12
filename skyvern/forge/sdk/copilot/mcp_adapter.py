@@ -42,6 +42,7 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
 from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -78,7 +79,9 @@ def _hide_code_only_tool(ctx: CopilotContext, tool_name: str) -> bool:
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
     signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
-    return stash_blocker_signal(ctx, signal)
+    payload = stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
+    return payload
 
 
 def _apply_schema_overlay(

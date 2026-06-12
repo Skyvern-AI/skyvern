@@ -99,6 +99,7 @@ from skyvern.forge.sdk.copilot.streaming_adapter import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
 from skyvern.forge.sdk.copilot.turn_context import TurnContextAssembler, TurnContextInputs, TurnContextPacket
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, TurnHalt, turn_halt_to_trace_data
 from skyvern.forge.sdk.copilot.turn_intent import (
     NO_MUTATION_TURN_INTENT_MODES,
     RequiredContextKey,
@@ -907,6 +908,8 @@ def _make_agent_result(
         else global_llm_context
     )
     narrative_payload = kwargs.get("narrative_payload")
+    if ctx is not None and narrative_payload is None:
+        raise ValueError("_make_agent_result requires narrative_payload when ctx is provided")
     response_type = kwargs.get("response_type", "REPLY")
     proposal_disposition = kwargs.get("proposal_disposition")
     if isinstance(narrative_payload, dict):
@@ -1165,8 +1168,33 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
+            narrative_payload=_build_narrative_payload(
+                ctx,
+                terminal="response",
+                terminal_message=final_text,
+                narrative_summary=ctx.narrative_summary,
+            ),
         ),
         exit_site="verified_goal_satisfied",
+    )
+
+
+def _build_turn_halt_exit_result(
+    ctx: CopilotContext,
+    global_llm_context: str | None,
+    halt: TurnHalt,
+) -> AgentResult:
+    signal = halt.blocker_signal
+    user_response = (
+        signal.user_facing_reason
+        if isinstance(signal, CopilotToolBlockerSignal)
+        else "I could not continue this turn safely. Tell me what to change and I'll try again."
+    )
+    return _build_exit_result(
+        ctx,
+        user_response,
+        global_llm_context,
+        terminal_reason=f"turn_halt:{halt.kind.value}",
     )
 
 
@@ -2904,6 +2932,7 @@ async def _run_copilot_turn_impl(
         turn_index=turn_index,
         prior_block_count=prior_block_count,
         block_authoring_policy=copilot_config.block_authoring_policy,
+        impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
@@ -3247,6 +3276,13 @@ async def _run_copilot_turn_impl(
                     workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
                 )
                 return _build_goal_satisfied_exit_result(ctx, global_llm_context)
+            except CopilotTurnHalt as exc:
+                LOG.info(
+                    "Copilot run stopped after typed turn halt",
+                    workflow_permanent_id=chat_request.workflow_permanent_id,
+                    **turn_halt_to_trace_data(exc.halt),
+                )
+                return _build_turn_halt_exit_result(ctx, global_llm_context, exc.halt)
             except MaxTurnsExceeded:
                 return _build_max_turns_exit_result(ctx, global_llm_context)
             except CopilotTotalTimeoutError:
@@ -3314,6 +3350,15 @@ async def _run_copilot_turn_impl(
         except Exception:
             LOG.error("Copilot agent error", error=str(e), exc_info=True)
             return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
+        turn_halt = getattr(ctx, "turn_halt", None)
+        if isinstance(turn_halt, TurnHalt):
+            LOG.info(
+                "Copilot run stopped after typed turn halt from wrapped exception",
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                error_type=type(e).__name__,
+                **turn_halt_to_trace_data(turn_halt),
+            )
+            return _build_turn_halt_exit_result(ctx, global_llm_context, turn_halt)
         if goal_satisfied:
             # The Agents SDK can wrap exceptions raised from hooks; keep this
             # fallback so a verified-goal stop is not rendered as a generic error.
