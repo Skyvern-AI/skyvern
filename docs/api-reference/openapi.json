@@ -2731,7 +2731,8 @@
               "schema": {
                 "$ref": "#/components/schemas/CreateBrowserSessionRequest",
                 "default": {
-                  "timeout": 60
+                  "timeout": 60,
+                  "generate_browser_profile": false
                 }
               }
             }
@@ -2937,6 +2938,90 @@
       }
     },
     "/v1/browser_sessions/{browser_session_id}": {
+      "patch": {
+        "tags": [
+          "Browser Sessions"
+        ],
+        "summary": "Update a session",
+        "description": "Update a live browser session. Currently supports toggling generate_browser_profile, which is read when the session ends to decide whether to save its browser profile.",
+        "operationId": "update_browser_session_v1_browser_sessions__browser_session_id__patch",
+        "parameters": [
+          {
+            "name": "browser_session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The ID of the browser session. browser_session_id starts with `pbs_`",
+              "examples": [
+                "pbs_123456"
+              ],
+              "title": "Browser Session Id"
+            },
+            "description": "The ID of the browser session. browser_session_id starts with `pbs_`"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBrowserSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated browser session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSessionResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "409": {
+            "description": "Conflict - browser session has already ended and can no longer be updated"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_browser_session"
+      },
       "get": {
         "tags": [
           "Browser Sessions"
@@ -7038,6 +7123,8 @@
           "complete",
           "reload_page",
           "close_page",
+          "new_tab",
+          "switch_tab",
           "extract",
           "verification_code",
           "goto_url",
@@ -7249,6 +7336,7 @@
         "type": "string",
         "enum": [
           "recording",
+          "audio",
           "session_replay",
           "browser_console_log",
           "skyvern_log",
@@ -8397,6 +8485,12 @@
             "title": "Browser Profile Id",
             "description": "ID of the browser profile loaded into this session, if any. browser_profile_id starts with `bp_`."
           },
+          "generate_browser_profile": {
+            "type": "boolean",
+            "title": "Generate Browser Profile",
+            "description": "Whether this session's browser profile will be saved when it ends so it can become a reusable browser profile.",
+            "default": false
+          },
           "vnc_streaming_supported": {
             "type": "boolean",
             "title": "Vnc Streaming Supported",
@@ -9241,6 +9335,12 @@
             ],
             "title": "Browser Profile Id",
             "description": "ID of a browser profile to load into this session (restores cookies, localStorage, etc.). browser_profile_id starts with `bp_`."
+          },
+          "generate_browser_profile": {
+            "type": "boolean",
+            "title": "Generate Browser Profile",
+            "description": "When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid storing profiles for sessions that never need them. Sessions started with a browser_profile_id always persist their profile regardless of this flag.",
+            "default": false
           }
         },
         "type": "object",
@@ -9667,6 +9767,7 @@
         "enum": [
           "bitwarden",
           "azure_vault",
+          "gcp",
           "custom"
         ],
         "title": "CredentialVaultType"
@@ -20195,6 +20296,20 @@
         },
         "type": "object",
         "title": "UpdateBrowserProfileRequest"
+      },
+      "UpdateBrowserSessionRequest": {
+        "properties": {
+          "generate_browser_profile": {
+            "type": "boolean",
+            "title": "Generate Browser Profile",
+            "description": "Enable or disable saving this session's browser profile when it ends. Can be toggled while the session is still alive; the value is read at session teardown."
+          }
+        },
+        "type": "object",
+        "required": [
+          "generate_browser_profile"
+        ],
+        "title": "UpdateBrowserSessionRequest"
       },
       "UpdateWorkflowFolderRequest": {
         "properties": {

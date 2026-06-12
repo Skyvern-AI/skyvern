@@ -128,7 +128,7 @@ From the session detail page, click **Stop**. A confirmation dialog appears. The
 Sessions also close automatically when their timeout expires, **even if a task is still running**. Set timeouts with enough margin for your longest expected task.
 
 <Warning>
-Closed sessions cannot be reopened. If you need the same login state later, create a [browser profile](/cloud/browser-management/browser-profiles) before closing.
+Closed sessions cannot be reopened, and a session only saves its browser state at close when profile generation is enabled for it. The **Save browser session** credential flow handles this automatically; for API-created sessions, see [Save a session's profile](/developers/optimization/browser-sessions#save-a-sessions-profile). If you need the same login state later, capture it as a [browser profile](/cloud/browser-management/browser-profiles) before closing.
 </Warning>
 
 ---
