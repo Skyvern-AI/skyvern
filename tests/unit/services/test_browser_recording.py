@@ -13,6 +13,9 @@ from skyvern.forge.sdk.routes.streaming.channels.exfiltration import Exfiltrated
 from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
     ExfiltratedEventSource as StreamingExfiltratedEventSource,
 )
+from skyvern.forge.sdk.routes.streaming.channels.exfiltration import (
+    ExfiltrationChannel,
+)
 from skyvern.services.browser_recording.interpretation import RecordingInterpretationSession
 from skyvern.services.browser_recording.service import (
     Processor,
@@ -36,6 +39,13 @@ from skyvern.services.browser_recording.types import (
 ORG_ID = "org_123"
 PBS_ID = "pbs_123"
 WP_ID = "wpid_123"
+
+
+class DummyVncChannel:
+    identity: t.ClassVar[dict[str, t.Any]] = {}
+    browser_session: t.ClassVar[None] = None
+    x_api_key: t.ClassVar[None] = None
+    organization_id: t.ClassVar[str] = ORG_ID
 
 
 def make_console_event(
@@ -433,6 +443,100 @@ async def test_live_interpretation_max_wait_fires_during_continuous_events() -> 
         session.cancel()
         # let the cancelled debounce task unwind before the loop closes
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_network_activity_trailing_flush_preserves_throttled_activity() -> None:
+    events: list[StreamingExfiltratedEvent] = []
+    channel = ExfiltrationChannel(
+        on_event=lambda messages: events.extend(messages),
+        vnc_channel=t.cast(t.Any, DummyVncChannel()),
+    )
+    channel.NETWORK_ACTIVITY_THROTTLE_SECONDS = 0.01
+
+    channel._handle_network_activity()
+    assert len(events) == 1
+    assert events[0].params == {"count": 1}
+
+    channel._handle_network_activity()
+    assert len(events) == 1
+
+    await asyncio.sleep(0.02)
+
+    assert len(events) == 2
+    assert events[1].event_name == "net:activity"
+    assert events[1].params == {"count": 1}
+
+
+def make_cdp_event(
+    event_name: str, timestamp_seconds: float, params: dict[str, t.Any] | None = None
+) -> ExfiltratedCdpEvent:
+    return ExfiltratedCdpEvent(
+        kind="exfiltrated-event",
+        event_name=event_name,
+        params=ExfiltratedEventCdpParams(**(params or {})),
+        source="cdp",
+        timestamp=timestamp_seconds,
+    )
+
+
+def make_focus_event(target: dict[str, t.Any], timestamp: float) -> ExfiltratedConsoleEvent:
+    params: dict[str, t.Any] = {
+        "type": "focus",
+        "target": target,
+        "timestamp": timestamp,
+    }
+
+    return make_console_event(params=params, timestamp=timestamp)
+
+
+def test_wait_suppressed_when_page_idle() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_click_event(target=target, timestamp=1000.0),
+        make_focus_event(target=target, timestamp=8000.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK]
+
+
+def test_wait_emitted_when_page_showed_network_activity() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        make_click_event(target=target, timestamp=1000.0),
+        # page was loading during the idle gap (cdp timestamps are seconds)
+        make_cdp_event("net:activity", timestamp_seconds=4.0, params={"count": 12}),
+        make_focus_event(target=target, timestamp=8000.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK, ActionKind.WAIT]
+    wait_action = actions[1]
+    assert isinstance(wait_action, ActionWait)
+    assert wait_action.duration_ms == 7000
+
+
+def test_wait_ignores_activity_outside_the_idle_gap() -> None:
+    target = dict(id="button-1", skyId="sky-123", tagName="BUTTON", text=["Click me"])
+
+    events = [
+        # activity happened before the gap even started
+        make_cdp_event("net:activity", timestamp_seconds=0.5, params={"count": 3}),
+        make_click_event(target=target, timestamp=1000.0),
+        make_focus_event(target=target, timestamp=8000.0),
+    ]
+
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    actions = processor.events_to_actions(events)
+
+    assert [action.kind for action in actions] == [ActionKind.CLICK]
 
 
 def test_summarize_exfiltrated_recording_events_mixed() -> None:

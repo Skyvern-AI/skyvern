@@ -250,6 +250,26 @@ class TestExfiltrationChannelEvents:
         assert channel._page_console_captures[page].cdp_session is None
 
     @pytest.mark.asyncio
+    async def test_stop_cancels_pending_network_activity_flush_task(self) -> None:
+        events: list[object] = []
+        channel, _ = _make_channel(on_event=lambda messages: events.extend(messages))
+        channel.NETWORK_ACTIVITY_THROTTLE_SECONDS = 0.05
+
+        channel._handle_network_activity()
+        assert len(events) == 1
+
+        channel._handle_network_activity()
+        assert len(events) == 1
+        assert channel._network_activity_flush_task is not None
+        assert not channel._network_activity_flush_task.done()
+
+        await channel.stop()
+
+        assert channel._network_activity_flush_task is None
+        await asyncio.sleep(0.1)
+        assert len(events) == 1
+
+    @pytest.mark.asyncio
     async def test_exfiltrate_rearms_existing_page_without_duplicate_listeners(self) -> None:
         channel, _ = _make_channel()
         page = _make_page()
