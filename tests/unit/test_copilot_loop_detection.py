@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.loop_detection import (
     clear_failed_step_tracker_for_tools,
     detect_failed_tool_step_loop,
     detect_tool_loop,
+    record_consecutive_tool_result_boundary,
+    record_consecutive_tool_result_boundary_for_ctx,
     record_tool_step_result,
+    record_tool_step_result_for_ctx,
 )
+from skyvern.forge.sdk.copilot.tools.run_execution import _diagnosis_repair_tool_error
 
 
 def test_returns_none_below_threshold() -> None:
@@ -44,6 +53,138 @@ def test_requires_full_fresh_threshold_after_warning() -> None:
     assert detect_tool_loop(tracker, "click") is None
     assert detect_tool_loop(tracker, "click") is None
     assert detect_tool_loop(tracker, "click") is not None
+
+
+def test_same_tool_result_boundary_does_not_double_count_dispatch() -> None:
+    tracker = ["update_workflow"]
+
+    record_consecutive_tool_result_boundary(tracker, "update_workflow")
+
+    assert tracker == ["update_workflow"]
+
+
+def test_different_tool_result_boundary_resets_to_new_tool() -> None:
+    tracker = ["update_workflow", "update_workflow"]
+
+    record_consecutive_tool_result_boundary(tracker, "inspect_page_for_composition")
+
+    assert tracker == ["inspect_page_for_composition"]
+
+
+def test_result_recording_makes_normal_tool_body_boundaries_visible() -> None:
+    ctx = SimpleNamespace(consecutive_tool_tracker=["update_workflow", "update_workflow"])
+
+    record_tool_step_result_for_ctx(
+        ctx,
+        "inspect_page_for_composition",
+        {"target_url": "current_page"},
+        {"ok": True, "data": {"summary": "observed"}},
+    )
+
+    assert ctx.consecutive_tool_tracker == ["inspect_page_for_composition"]
+
+
+def test_workflow_progress_result_boundary_clears_tracker() -> None:
+    progress_results = [
+        ("update_workflow", {"ok": True, "_workflow": object()}),
+        ("update_workflow", {"ok": False, "data": {"workflow_updated": True}}),
+        ("update_and_run_blocks", {"ok": False, "data": {"workflow_updated": True}}),
+        ("run_blocks_and_collect_debug", {"ok": True, "data": {"workflow_run_id": "wr_123"}}),
+        ("update_and_run_blocks", {"ok": True, "data": {"workflow_run_id": "wr_123"}}),
+    ]
+
+    for tool_name, result in progress_results:
+        ctx = SimpleNamespace(consecutive_tool_tracker=["update_workflow", "update_workflow"])
+        record_consecutive_tool_result_boundary_for_ctx(ctx, tool_name, result)
+        assert ctx.consecutive_tool_tracker == []
+
+
+def test_get_run_results_workflow_run_id_is_not_run_creation_progress() -> None:
+    ctx = SimpleNamespace(consecutive_tool_tracker=["update_workflow", "update_workflow"])
+
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "get_run_results",
+        {"ok": True, "data": {"workflow_run_id": "wr_123"}},
+    )
+
+    assert ctx.consecutive_tool_tracker == ["get_run_results"]
+
+
+def test_telco_mixed_dispatch_stream_does_not_trigger_consecutive_update_halt() -> None:
+    ctx = SimpleNamespace(consecutive_tool_tracker=[])
+
+    assert detect_tool_loop(ctx.consecutive_tool_tracker, "update_workflow") is None
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "update_workflow",
+        {"ok": False, "error": "workflow yaml rejected"},
+    )
+
+    assert detect_tool_loop(ctx.consecutive_tool_tracker, "update_workflow") is None
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "update_workflow",
+        {"ok": True, "_workflow": object()},
+    )
+    assert ctx.consecutive_tool_tracker == []
+
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "run_blocks_and_collect_debug",
+        {"ok": True, "data": {"workflow_run_id": "wr_123"}},
+    )
+    assert ctx.consecutive_tool_tracker == []
+
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "update_and_run_blocks",
+        {"ok": False, "error": "guardrail blocked the run"},
+    )
+    assert ctx.consecutive_tool_tracker == ["update_and_run_blocks"]
+
+    record_consecutive_tool_result_boundary_for_ctx(
+        ctx,
+        "inspect_page_for_composition",
+        {"ok": True, "data": {"observation_step": 4}},
+    )
+    assert ctx.consecutive_tool_tracker == ["inspect_page_for_composition"]
+
+    assert detect_tool_loop(ctx.consecutive_tool_tracker, "update_workflow") is None
+
+
+def test_strict_get_run_results_three_dispatches_still_halts() -> None:
+    tracker: list[str] = []
+
+    assert detect_tool_loop(tracker, "get_run_results") is None
+    record_consecutive_tool_result_boundary(tracker, "get_run_results")
+    assert detect_tool_loop(tracker, "get_run_results") is None
+    record_consecutive_tool_result_boundary(tracker, "get_run_results")
+
+    msg = detect_tool_loop(tracker, "get_run_results")
+
+    assert msg is not None
+    assert "LOOP DETECTED" in msg
+    assert "get_run_results" in msg
+
+
+def test_diagnosis_repair_tool_error_records_consecutive_boundary_only() -> None:
+    ctx = CopilotContext(
+        organization_id="o",
+        workflow_id="w",
+        workflow_permanent_id="wp",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(),
+    )
+    ctx.consecutive_tool_tracker = ["update_workflow", "update_workflow"]
+    ctx.failed_tool_step_tracker = {"sentinel": 2}
+
+    payload = json.loads(_diagnosis_repair_tool_error(ctx, "run_blocks_and_collect_debug", "blocked"))
+
+    assert payload == {"ok": False, "error": "blocked"}
+    assert ctx.consecutive_tool_tracker == ["run_blocks_and_collect_debug"]
+    assert ctx.failed_tool_step_tracker == {"sentinel": 2}
 
 
 class TestLoopDetection:

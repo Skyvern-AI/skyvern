@@ -5,6 +5,7 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 
 from __future__ import annotations
 
+import copy
 import re
 import textwrap
 
@@ -47,6 +48,7 @@ def _valid_metadata(label: str) -> dict:
                 "status": "observed_not_verified",
                 "depends_on": ["dependency:p"],
                 "covered_criteria": ["criterion:c"],
+                "goal_value_paths": ["records[].number"],
                 "observation_refs": ["obs1"],
             }
         ],
@@ -54,7 +56,9 @@ def _valid_metadata(label: str) -> dict:
             {"id": "dependency:p", "scope": "page", "status": "observed_not_verified", "observation_refs": ["obs1"]}
         ],
         "completion_criteria": [{"id": "criterion:c", "text": "c", "level": "terminal"}],
-        "terminal_verifier_expectations": [{"id": "exp", "text": "e", "criteria_ids": ["criterion:c"]}],
+        "terminal_verifier_expectations": [
+            {"id": "exp", "text": "e", "criteria_ids": ["criterion:c"], "goal_value_paths": ["records[].number"]}
+        ],
         "observation_refs": [
             {
                 "observation_ref": "obs1",
@@ -151,6 +155,25 @@ class TestAccumulateAllViolations:
         assert error is None
         assert list(normalized.keys()) == ["my_block"]
 
+    def test_terminal_goal_value_path_placeholders_are_rejected(self) -> None:
+        metadata = _valid_metadata("my_block")
+        metadata["claimed_outcomes"][0]["goal_value_paths"] = [
+            "<fill: output JSON path(s) carrying requested goal values>"
+        ]
+        metadata["terminal_verifier_expectations"][0]["goal_value_paths"] = [
+            "<fill: output JSON path(s) carrying requested goal values>"
+        ]
+
+        normalized, error = _normalize_code_artifact_metadata(
+            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
+        )
+
+        assert normalized == {}
+        assert error is not None
+        assert "claim `claim:x`" in error
+        assert "terminal verifier expectation `exp`" in error
+        assert "has unfilled `goal_value_paths`" in error
+
     def test_empty_metadata_is_noop(self) -> None:
         assert _normalize_code_artifact_metadata(None, _code_block_yaml("my_block")) == ({}, None)
         assert _normalize_code_artifact_metadata([], _code_block_yaml("my_block")) == ({}, None)
@@ -175,9 +198,24 @@ def _assert_passes_full_validator(row: dict) -> None:
     assert list(renormalized.keys()) == [row["block_label"]]
 
 
+def _assert_passes_skeleton_validator(row: dict) -> None:
+    """Skeleton rows may keep fill-placeholders until the authoring imposition pass."""
+    placeholder = row["terminal_verifier_expectations"][0]["goal_value_paths"][0]
+    assert placeholder.startswith("<fill:")
+    validator_row = copy.deepcopy(row)
+    validator_row["claimed_outcomes"][0]["goal_value_paths"] = [placeholder]
+    # This helper exercises the non-imposition validator path, where skeleton
+    # placeholders are intentionally preserved for the later authoring pass.
+    _assert_passes_full_validator(validator_row)
+
+
 class TestSeamImposition:
     def test_minimal_metadata_is_fully_defaulted(self) -> None:
-        metadata = {"block_label": "my_block", "declared_goal": "Search the registry and expand result rows"}
+        metadata = {
+            "block_label": "my_block",
+            "declared_goal": "Search the registry and expand result rows",
+            "terminal_verifier_expectations": [{"goal_value_paths": ["records[].number"]}],
+        }
         normalized, error = _normalize_code_artifact_metadata(
             [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
         )
@@ -190,6 +228,28 @@ class TestSeamImposition:
         assert row["terminal_verifier_expectations"]
         assert row["observation_refs"]
         _assert_passes_full_validator(row)
+
+    def test_unfilled_goal_value_path_is_not_propagated_as_default(self) -> None:
+        metadata = {
+            "block_label": "my_block",
+            "declared_goal": "Search the registry and expand result rows",
+            "claimed_outcomes": [
+                {
+                    "text": "records visible",
+                    "goal_value_paths": ["<fill: output JSON path(s) carrying requested goal values>"],
+                }
+            ],
+        }
+
+        normalized, error = _normalize_code_artifact_metadata(
+            [metadata], _code_block_yaml("my_block"), impose_defaults=True, scout_trajectory=_SCOUT_TRAJECTORY
+        )
+
+        assert normalized == {}
+        assert error is not None
+        assert "has unfilled `goal_value_paths`" in error
+        assert "terminal verifier expectation" in error
+        assert "requires `goal_value_paths` for terminal criteria" in error
 
     def test_omitted_page_dependencies_filled_from_trajectory(self) -> None:
         metadata = _valid_metadata("my_block")
@@ -299,6 +359,7 @@ class TestSeamImposition:
         metadata = {
             "block_label": "my_block",
             "declared_goal": "g",
+            "terminal_verifier_expectations": [{"goal_value_paths": ["records[].number"]}],
             "observation_refs": [{"observation_ref": "obs1", "status": "observed_not_verified"}],
         }
         normalized, error = _normalize_code_artifact_metadata(
@@ -315,7 +376,7 @@ class TestSeamImposition:
         metadata = {
             "block_label": "my_block",
             "declared_goal": "g",
-            "claimed_outcomes": [{"text": "rows visible"}],
+            "claimed_outcomes": [{"text": "rows visible", "goal_value_paths": ["records[].number"]}],
             "completion_criteria": [{"text": "rows shown"}],
         }
         normalized, error = _normalize_code_artifact_metadata(
@@ -398,7 +459,7 @@ class TestStaleLabelRekey:
         assert row["declared_goal"]
         assert row["page_dependencies"]
         assert row["observation_refs"]
-        _assert_passes_full_validator(row)
+        _assert_passes_skeleton_validator(row)
 
     def test_partial_coverage_gets_skeleton_for_uncovered_label_when_imposing(self) -> None:
         yaml = textwrap.dedent(
@@ -423,7 +484,7 @@ class TestStaleLabelRekey:
         )
         assert error is None
         assert sorted(normalized.keys()) == ["block_one", "block_two"]
-        _assert_passes_full_validator(normalized["block_two"])
+        _assert_passes_skeleton_validator(normalized["block_two"])
 
     def test_duplicate_label_keeps_first_entry(self) -> None:
         first = _valid_metadata("my_block")

@@ -119,6 +119,93 @@ def _genuine_success_run_result() -> dict[str, Any]:
     )
 
 
+def _all_null_goal_fields_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "expand_result_rows",
+                {
+                    "search_completed": True,
+                    "no_results": False,
+                    "certification_records": [
+                        {
+                            "name": "Generic Credential A",
+                            "number": None,
+                            "expiration_date": None,
+                            "evidence_text": "Navigation menu text: Generic Credential A",
+                        },
+                        {
+                            "name": "Generic Credential B",
+                            "number": "",
+                            "expiration_date": None,
+                            "evidence_text": "Footer text from registry.example.com",
+                        },
+                    ],
+                },
+            )
+        ]
+    )
+
+
+def _goal_field_success_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "expand_result_rows",
+                {
+                    "search_completed": True,
+                    "certification_records": [
+                        {
+                            "name": "DOE, JANE",
+                            "number": "12345",
+                            "expiration_date": "2027-01-31",
+                            "evidence_text": "DOE, JANE - credential 12345 expires 2027-01-31",
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+
+
+def _partial_goal_field_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "expand_result_rows",
+                {
+                    "search_completed": True,
+                    "certification_records": [
+                        {
+                            "name": "DOE, JANE",
+                            "number": "12345",
+                            "expiration_date": None,
+                            "evidence_text": "DOE, JANE - credential 12345",
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+
+
+def _top_level_goal_field_success_run_result() -> dict[str, Any]:
+    return _run_result(
+        [
+            _code_block(
+                "expand_result_rows",
+                [
+                    {
+                        "name": "DOE, JANE",
+                        "number": "12345",
+                        "expiration_date": "2027-01-31",
+                    }
+                ],
+            )
+        ]
+    )
+
+
 def _terminal_metadata_entry(label: str = "search_registry_person") -> dict[str, Any]:
     return {
         "block_label": label,
@@ -136,6 +223,28 @@ def _terminal_metadata_entry(label: str = "search_registry_person") -> dict[str,
             {"id": "criterion:goal_0", "text": "result rows extracted", "level": "terminal", "terminal": True}
         ],
     }
+
+
+def _terminal_metadata_with_goal_fields(label: str = "expand_result_rows") -> dict[str, Any]:
+    entry = _terminal_metadata_entry(label)
+    goal_value_paths = ["certification_records[].number", "certification_records[].expiration_date"]
+    entry["claimed_outcomes"][0]["goal_value_paths"] = goal_value_paths
+    entry["terminal_verifier_expectations"] = [
+        {
+            "id": "expectation:goal",
+            "text": "Terminal verification observes requested registry fields.",
+            "criteria_ids": ["criterion:goal_0"],
+            "goal_value_paths": goal_value_paths,
+        }
+    ]
+    return entry
+
+
+def _terminal_metadata_with_top_level_goal_fields(label: str = "expand_result_rows") -> dict[str, Any]:
+    entry = _terminal_metadata_entry(label)
+    goal_value_paths = ["$[*].number", "$[0].expiration_date"]
+    entry["claimed_outcomes"][0]["goal_value_paths"] = goal_value_paths
+    return entry
 
 
 def test_blocked_flag_run_reports_structured_blocker() -> None:
@@ -222,6 +331,83 @@ def test_genuine_success_run_keeps_clean_path() -> None:
     assert ctx.last_test_ok is True
     assert ctx.last_test_suspicious_success is False
     assert ctx.last_full_workflow_test_ok is True
+
+
+def test_all_null_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
+    result = _all_null_goal_fields_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
+
+    assert _run_blocks_structured_blocker_message(result) is None
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+    assert _is_outcome_evidence_candidate(ctx, result) is False
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
+    assert ctx.null_data_streak_count == 1
+    assert ctx.last_full_workflow_test_ok is False
+    assert getattr(ctx, "last_good_workflow", None) is None
+
+
+def test_metadata_goal_fields_with_values_keep_clean_path() -> None:
+    result = _goal_field_success_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True
+
+
+def test_partial_metadata_goal_fields_are_flagged_as_no_goal_content() -> None:
+    result = _partial_goal_field_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+    assert _is_outcome_evidence_candidate(ctx, result) is False
+
+
+def test_top_level_array_goal_value_paths_keep_clean_path() -> None:
+    result = _top_level_goal_field_success_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_top_level_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+
+def test_array_goal_value_path_does_not_match_scalar_root() -> None:
+    result = _run_result([_code_block("expand_result_rows", {"number": "12345"})])
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_top_level_goal_fields()}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is True
+    assert _is_outcome_evidence_candidate(ctx, result) is False
+
+
+def test_candidacy_and_recording_agree_on_all_null_metadata_goal_fields() -> None:
+    result = _all_null_goal_fields_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    ctx.code_artifact_metadata = {"expand_result_rows": _terminal_metadata_with_goal_fields()}
+
+    assert _is_outcome_evidence_candidate(ctx, result) is False
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+    assert ctx.last_test_ok is None
+    assert ctx.last_test_suspicious_success is True
 
 
 def test_empty_goal_collections_without_blocker_are_flagged() -> None:
@@ -341,4 +527,30 @@ def test_judge_no_evidence_keeps_building_without_metadata() -> None:
     _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
 
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
+    assert getattr(ctx, "last_good_workflow", None) is None
+    assert "failure_reason" not in result["data"]
+
+
+@pytest.mark.parametrize("metadata_shape", ["none", "terminal", "prefix_only"])
+def test_judge_unmet_on_detector_clean_run_does_not_reset_streaks_or_promote(metadata_shape: str) -> None:
+    result = _genuine_success_run_result()
+    ctx = _ctx(result["data"]["blocks"])
+    if metadata_shape == "terminal":
+        ctx.code_artifact_metadata = {"search_registry_person": _terminal_metadata_entry()}
+    elif metadata_shape == "prefix_only":
+        entry = _terminal_metadata_entry()
+        entry["completion_criteria"][0]["level"] = "prefix"
+        entry["completion_criteria"][0]["terminal"] = False
+        ctx.code_artifact_metadata = {"search_registry_person": entry}
+    ctx.failed_test_nudge_count = 2
+    ctx.null_data_streak_count = 3
+    ctx.probable_site_block_streak_count = 4
+
+    _record_run_blocks_result(ctx, result, completion_verification=_no_evidence("c0"))
+
+    assert ctx.failed_test_nudge_count == 2
+    assert ctx.null_data_streak_count == 3
+    assert ctx.probable_site_block_streak_count == 4
+    assert ctx.last_full_workflow_test_ok is False
+    assert getattr(ctx, "last_good_workflow", None) is None
