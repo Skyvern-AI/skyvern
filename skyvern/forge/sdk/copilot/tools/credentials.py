@@ -9,6 +9,7 @@ import yaml
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.workflow_credential_utils import workflow_blocks
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.utils.yaml_loader import safe_load_no_dates
@@ -78,7 +79,11 @@ def _extract_credential_ids_from_workflow_parameters(parameters: Any) -> list[st
 
 def _extract_credential_ids_from_workflow_definition(workflow_definition: Any) -> list[str]:
     definition = _workflow_definition_as_dict(workflow_definition)
-    return _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+    found = _extract_credential_ids_from_workflow_parameters(definition.get("parameters"))
+    for block in workflow_blocks({"workflow_definition": definition}):
+        found.extend(_extract_credential_ids_from_workflow_parameters(block.get("parameters")))
+        found.extend(_extract_credential_ids_from_tool_value(block.get("credential_id")))
+    return list(dict.fromkeys(found))
 
 
 def _parsed_workflow_definition(workflow_yaml: str | None) -> dict[str, Any] | None:
@@ -100,7 +105,7 @@ def _extract_credential_ids_from_workflow_yaml(workflow_yaml: str | None) -> lis
     workflow_definition = _parsed_workflow_definition(workflow_yaml)
     if workflow_definition is None:
         return []
-    return _extract_credential_ids_from_workflow_parameters(workflow_definition.get("parameters"))
+    return _extract_credential_ids_from_workflow_definition(workflow_definition)
 
 
 _MISBINDING_WORKFLOW_LOCATION = "workflow"
@@ -190,6 +195,36 @@ def _missing_credential_reference_tool_error(missing_credential_ids: list[str]) 
         "credential ID, create the credential in the Credentials UI and return with its ID, or explicitly "
         "choose an unvalidated draft workflow that will not be run until credentials are available."
     )
+
+
+def _unapproved_credential_reference_tool_error(unapproved_credential_ids: list[str]) -> str:
+    formatted_ids = ", ".join(f"`{credential_id}`" for credential_id in unapproved_credential_ids)
+    id_word = "ID" if len(unapproved_credential_ids) == 1 else "IDs"
+    return (
+        "Credential approval blocked this Copilot run before dispatch. "
+        f"Reason codes: unapproved_credential_reference. Unapproved credential {id_word}: {formatted_ids}. "
+        "Ask the user to select or confirm the saved credential for this request before running the workflow."
+    )
+
+
+def _approved_run_credential_ids(request_policy: RequestPolicy | None) -> set[str]:
+    if request_policy is None:
+        return set()
+    return {
+        credential.credential_id
+        for credential in request_policy.resolved_credentials
+        if isinstance(getattr(credential, "credential_id", None), str)
+    }
+
+
+def _credential_run_approval_error(credential_ids: list[str], request_policy: RequestPolicy | None) -> str | None:
+    if not credential_ids:
+        return None
+    approved_ids = _approved_run_credential_ids(request_policy)
+    unapproved_ids = [credential_id for credential_id in credential_ids if credential_id not in approved_ids]
+    if not unapproved_ids:
+        return None
+    return _unapproved_credential_reference_tool_error(unapproved_ids)
 
 
 async def _credential_ids_validation_error(credential_ids: list[str], ctx: AgentContext) -> str | None:

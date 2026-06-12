@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     compute_action_sequence_fingerprint,
     update_repeated_failure_state,
 )
+from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.narration import NarratorState
 from skyvern.forge.sdk.copilot.narration import handler_available as narration_handler_available
 from skyvern.forge.sdk.copilot.narration import narrator_poll_tick
@@ -97,6 +98,7 @@ from .composition_capture import (
 )
 from .credentials import (
     _credential_ids_validation_error,
+    _credential_run_approval_error,
     _extract_credential_ids_from_tool_value,
     _extract_credential_ids_from_workflow_definition,
 )
@@ -656,6 +658,13 @@ async def _run_blocks_and_collect_debug(
             + _extract_credential_ids_from_workflow_definition(workflow.workflow_definition)
         )
     )
+    credential_approval_error = _credential_run_approval_error(
+        credential_ids,
+        getattr(ctx, "request_policy", None),
+    )
+    if credential_approval_error is not None:
+        return {"ok": False, "error": credential_approval_error}
+
     credential_error = await _credential_ids_validation_error(credential_ids, ctx)
     if credential_error is not None:
         return {"ok": False, "error": credential_error}
@@ -1437,7 +1446,7 @@ def _record_run_blocks_result(
     copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
 
     structured_blocker = _run_blocks_structured_blocker_message(result)
-    anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result)
+    anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
     record_gate_decision(
         copilot_ctx,
         {
@@ -1544,34 +1553,36 @@ def _record_run_blocks_result(
                     display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
                 ),
             )
-        copilot_ctx.failed_test_nudge_count = 0
-        copilot_ctx.null_data_streak_count = 0
-        copilot_ctx.probable_site_block_streak_count = 0
-        copilot_ctx.last_failed_workflow_yaml = None
-        # Real success: clear the signature latch so a subsequent bad URL in
-        # the same session can re-fire the stop nudge.
-        copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
         unverified = _unverified_current_workflow_labels(copilot_ctx)
         copilot_ctx.last_unverified_block_labels = unverified
         outcome_unverified_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
-        if outcome_unverified_reason is not None and _outcome_failure_warrants_repair(
-            copilot_ctx, completion_verification
-        ):
+        if outcome_unverified_reason is not None:
             # The workflow already has a confirmation block, yet the produced
             # evidence does not demonstrate the outcome (or contradicts it). Treat
             # it as a suspicious success so the existing repair/partial machinery
             # fires. A mid-build run with no confirmation block yet falls through to
-            # keep-building below; terminal success stays withheld either way via
-            # the verification result.
-            copilot_ctx.last_test_suspicious_success = True
-            copilot_ctx.last_test_failure_reason = outcome_unverified_reason
-            if isinstance(data, dict):
-                data.setdefault("failure_reason", outcome_unverified_reason)
-        elif not unverified:
+            # keep-building below. It still does not count as a verified success,
+            # so preserve streak state until produced evidence demonstrates the
+            # outcome; terminal success stays withheld either way via the
+            # verification result.
+            if _outcome_failure_warrants_repair(copilot_ctx, completion_verification):
+                copilot_ctx.last_test_suspicious_success = True
+                copilot_ctx.last_test_failure_reason = outcome_unverified_reason
+                if isinstance(data, dict):
+                    data.setdefault("failure_reason", outcome_unverified_reason)
+        else:
+            copilot_ctx.failed_test_nudge_count = 0
+            copilot_ctx.null_data_streak_count = 0
+            copilot_ctx.probable_site_block_streak_count = 0
+            copilot_ctx.last_failed_workflow_yaml = None
+            # Real success: clear the signature latch so a subsequent bad URL in
+            # the same session can re-fire the stop nudge.
+            copilot_ctx.non_retriable_nav_error_last_emitted_signature = None
+        if outcome_unverified_reason is None and not unverified:
             copilot_ctx.last_full_workflow_test_ok = True
             copilot_ctx.last_good_workflow = copilot_ctx.last_workflow
             copilot_ctx.last_good_workflow_yaml = copilot_ctx.last_workflow_yaml
-        else:
+        elif outcome_unverified_reason is None:
             copilot_ctx.last_test_failure_reason = (
                 "The last run verified only the current browser frontier; unverified workflow blocks remain: "
                 + ", ".join(unverified[:8])
@@ -1753,6 +1764,7 @@ def _run_output_terminal_blocker_signal(
 
 def _diagnosis_repair_tool_error(copilot_ctx: Any, source_tool: str, error: str) -> str:
     result = {"ok": False, "error": error}
+    record_consecutive_tool_result_boundary_for_ctx(copilot_ctx, source_tool, result)
     _record_diagnosis_repair_contract(copilot_ctx, source_tool=source_tool, result=result)
     return json.dumps(result)
 
