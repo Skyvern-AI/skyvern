@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -689,7 +690,7 @@ def _is_blocker_term_key(key: object) -> bool:
 def _code_output_contains_collection(value: Any, *, depth: int = 0) -> bool:
     if depth > 5:
         return False
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, (list, tuple)):
         return True
     if isinstance(value, dict):
         return any(
@@ -721,6 +722,93 @@ def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
             if not _is_blocker_term_key(key) and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
         )
     return False
+
+
+def _metadata_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _metadata_goal_value_paths(value: Any) -> list[str]:
+    # Keep in sync with workflow_update._artifact_goal_value_paths; duplicated
+    # locally to avoid importing the authoring validator into runtime blockers.
+    return [path for path in _metadata_string_list(value) if not path.casefold().startswith("<fill")]
+
+
+def _goal_value_paths_for_code_block(copilot_ctx: Any | None, label: Any) -> list[str]:
+    if copilot_ctx is None or not isinstance(label, str):
+        return []
+    metadata = getattr(copilot_ctx, "code_artifact_metadata", None)
+    if not isinstance(metadata, dict):
+        return []
+    entry = metadata.get(label)
+    if not isinstance(entry, dict):
+        return []
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for row_group in (entry.get("claimed_outcomes"), entry.get("terminal_verifier_expectations")):
+        rows = [row for row in row_group if isinstance(row, dict)] if isinstance(row_group, list) else []
+        for row in rows:
+            for path in _metadata_goal_value_paths(row.get("goal_value_paths")):
+                if path not in seen:
+                    seen.add(path)
+                    paths.append(path)
+    return paths
+
+
+_GOAL_PATH_INDEX_PATTERN = re.compile(r"\[\d+\]")
+
+
+def _normalize_goal_value_path(path: str) -> list[str]:
+    normalized = path.strip()
+    if normalized.startswith("$."):
+        normalized = normalized[2:]
+    elif normalized.startswith("$"):
+        normalized = normalized[1:]
+    normalized = normalized.replace("[*]", "[]")
+    normalized = _GOAL_PATH_INDEX_PATTERN.sub("[]", normalized)
+    return [part for part in normalized.split(".") if part]
+
+
+def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]:
+    if not path_parts:
+        return [value]
+    current_part = path_parts[0]
+    if isinstance(value, (list, tuple, set)):
+        child_parts = path_parts[1:] if current_part == "[]" else path_parts
+        expanded_values: list[Any] = []
+        for item in value:
+            expanded_values.extend(_iter_goal_value_path_values(item, child_parts))
+        return expanded_values
+
+    if current_part == "[]":
+        return []
+
+    expand_collection = current_part.endswith("[]")
+    key = current_part[:-2] if expand_collection else current_part
+    if not isinstance(value, Mapping) or key not in value:
+        return []
+
+    next_value = value.get(key)
+    remaining = path_parts[1:]
+    if expand_collection:
+        if isinstance(next_value, (list, tuple)):
+            child_values: list[Any] = []
+            for item in next_value:
+                child_values.extend(_iter_goal_value_path_values(item, remaining))
+            return child_values
+        return []
+    return _iter_goal_value_path_values(next_value, remaining)
+
+
+def _code_output_goal_paths_have_content(value: Any, goal_value_paths: list[str]) -> bool:
+    for path in goal_value_paths:
+        values = _iter_goal_value_path_values(value, _normalize_goal_value_path(path))
+        if not any(_code_output_has_goal_content(item) for item in values):
+            return False
+    return True
 
 
 def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
@@ -1066,7 +1154,9 @@ def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any
 _build_loop_blocker_signal = build_loop_blocker_signal
 
 
-def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[dict] | None]:
+def _analyze_run_blocks(
+    result: dict[str, Any], copilot_ctx: Any | None = None
+) -> tuple[str | None, bool, list[dict] | None]:
     """Single-pass analysis of run result blocks.
 
     Returns ``(anti_bot_match, has_empty_data_blocks, failure_categories)``
@@ -1109,6 +1199,7 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
 
     has_data_blocks = False
     any_data_output = False
+    missing_metadata_goal_content = False
 
     blocks = data.get("blocks")
     if isinstance(blocks, list):
@@ -1136,6 +1227,19 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
                 structured_blocker = _structured_blocker_message(extracted, include_flag_keys=True)
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
+                goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
+                if goal_value_paths:
+                    has_data_blocks = True
+                    if _code_output_goal_paths_have_content(extracted, goal_value_paths):
+                        any_data_output = True
+                    else:
+                        # Terminal goal paths are conjunctive: one missing
+                        # declared field means the block did not prove the
+                        # requested outcome, even if another path had data.
+                        missing_metadata_goal_content = True
+                    # Goal-path contracts supersede the generic collection-shape
+                    # fallback below; they are the stronger outcome evidence check.
+                    continue
                 # A code output joins the emptiness denominator only when it declares a
                 # collection shape; action-only outputs are exempt.
                 if _code_output_contains_collection(extracted):
@@ -1151,5 +1255,5 @@ def _analyze_run_blocks(result: dict[str, Any]) -> tuple[str | None, bool, list[
                 anti_bot_match = cat.get("reasoning", "anti-bot pattern detected")
                 break
 
-    empty_data_blocks = has_data_blocks and not any_data_output
+    empty_data_blocks = (has_data_blocks and not any_data_output) or missing_metadata_goal_content
     return anti_bot_match, empty_data_blocks, categories

@@ -163,7 +163,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
         return False
     if _run_blocks_structured_blocker_message(result):
         return False
-    _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result)
+    _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
     return not empty_data_blocks
 
 
