@@ -15,6 +15,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     CopilotOutputKind,
     OutputPolicyReason,
     OutputPolicyVerdict,
+    _contains_internal_tool_vocab_leak,
     derive_output_kind,
     evaluate_output_policy,
     hard_block_output_policy_verdict,
@@ -707,6 +708,204 @@ def test_allows_single_task_block_reference_without_deprecated_identifier() -> N
     assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
 
 
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "TurnIntent classified this turn as `edit`, but we couldn't proceed. safe_reason_code=turn_intent_no_mutation_run_blocked.",
+        "Skipping: safe_reason_code=request_policy_clarification this turn.",
+        "Blocked by `TurnIntent`: please rephrase.",
+        "Hit turn_intent_unresolved_edit_target while routing.",
+        "RequestPolicy blocked this turn for clarification.",
+        "TurnIntent requires clarification before proceeding.",
+        "Trace shows safe_reason_code = turn_intent_no_mutation_run_blocked at exit.",
+        "Final safe_reason_code : request_policy_clarification reported.",
+    ],
+)
+def test_rejects_internal_classifier_vocab_leak(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "The request policy resolved your saved credential automatically.",
+        "Use a turn-by-turn approach to walk through each step.",
+        "I'll classify the turn as edit if you confirm.",
+        "Need turnintent context? Tell me what you want to change.",
+    ],
+)
+def test_allows_benign_prose_referencing_classifier_terms(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK not in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Saw [copilot:nudge] in the trace before the failure.",
+        "[copilot:screenshot] context truncated to keep this prompt small.",
+        "LOOP DETECTED: same tool dispatched three times in a row.",
+        "Loop Detected: same tool dispatched three times in a row.",
+        "loop detected: same tool dispatched three times in a row.",
+        "[Copilot:nudge] surfaced in the trace before the failure.",
+        "[COPILOT:NUDGE] surfaced in the trace before the failure.",
+        "Couldn't finish the diagnostic step on this nudge turn.",
+    ],
+)
+def test_rejects_internal_machinery_vocab_via_extended_taxonomy(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        'I\'ll call get_run_results(workflow_run_id="wr_123") and report back.',
+        "Next I need to run_blocks_and_collect_debug[block_labels=['login']].",
+        "Use `update_workflow` to apply that change.",
+        "Trace shows get_run_results was the last tool dispatched on this turn.",
+        "Falling back to list_credentials since the user did not specify one.",
+    ],
+)
+def test_rejects_internal_tool_name_leak_via_tool_instruction(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in hard_block_output_policy_verdict(verdict).reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "I'll get the run results for you once it finishes.",
+        "Update the workflow to log in before extracting data.",
+        "List your saved credentials in the Credentials UI.",
+        "I'll take a screenshot once the page loads.",
+        "Nudge me if you want a different approach.",
+    ],
+)
+def test_allows_benign_prose_referencing_tool_names(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Use `update_workflow` to apply that change.",
+        "LOOP DETECTED: same tool dispatched three times in a row.",
+        "Couldn't finish the diagnostic step on this nudge turn.",
+        "Saw [copilot:nudge] in the trace before the failure.",
+        "Trace shows get_run_results was the last tool dispatched on this turn.",
+    ],
+)
+def test_extended_taxonomy_leak_skipped_on_ask_question(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="ASK_QUESTION",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "output_kind",
+    [
+        CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
+        CopilotOutputKind.WORKFLOW_UPDATE_PROPOSAL,
+        CopilotOutputKind.WORKFLOW_RUN_RESULT,
+    ],
+)
+def test_tool_name_leak_hard_blocks_across_output_kinds(
+    output_kind: CopilotOutputKind,
+) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response="Use `update_workflow` to apply that change.",
+        output_kind=output_kind,
+    )
+
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "Send me a normal instruction like 'run it', and I'll continue.",
+        "Reply 'yes' to proceed.",
+        "Please send 'continue debugging' and I'll keep going.",
+        "Type 'cancel' to stop the workflow.",
+        "Kindly type 'cancel' to abort the current draft.",
+        "   Reply 'yes' to proceed.",
+        "\tReply 'yes' to proceed.",
+    ],
+)
+def test_rejects_self_prescriptive_phrase(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response",
+    [
+        "I need the value for 'account_id' to continue.",
+        "The user can reply 'yes' to confirm.",
+        "I'll respond once I have 'account_id'.",
+        "I'll save the workflow once you confirm.",
+        "Please confirm whether to continue.",
+        "I have a draft workflow proposal. I need this before I can build and test it: which credential should I use?",
+        "Send me what you'd like changed and I'll update the workflow.",
+        "Reply once you've reviewed the draft.",
+        "Type the field name where you'd like the value populated.",
+        "Respond once you've decided which credential to use.",
+        'Type "navigate" in the action field of the block.',
+        'Send "data" as JSON to the endpoint.',
+        'Reply objects include a status field like "success" or "error".',
+        "Reply 2's text is just a numeric ordinal, not a quote.",
+    ],
+)
+def test_allows_benign_prose_around_quoted_examples(user_response: str) -> None:
+    verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLY",
+        user_response=user_response,
+    )
+
+    assert OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK not in verdict.reason_codes
+
+
 def test_rejects_unapproved_credential_id_in_final_text() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),
@@ -1004,6 +1203,7 @@ def test_sdk_output_guardrail_hard_blocks_raw_secret_final_text() -> None:
     assert diagnostics == {
         "raw_output_kind": "informational_answer",
         "final_output_kind": "refusal",
+        "raw_reason_codes": ["raw_secret_leak"],
         "hard_block_reason_codes": ["raw_secret_leak"],
         "soft_rewrite_reason_codes": [],
         "raw_would_have_failed": True,
@@ -1719,6 +1919,7 @@ def test_translate_to_agent_result_rewrites_unbacked_workflow_claim() -> None:
     assert agent_result.output_policy_diagnostics == {
         "raw_output_kind": "informational_answer",
         "final_output_kind": "clarification_request",
+        "raw_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
         "hard_block_reason_codes": [],
         "soft_rewrite_reason_codes": ["unbacked_workflow_delivery_claim", "missing_proposal_state"],
         "raw_would_have_failed": True,
@@ -1767,12 +1968,179 @@ def test_translate_to_agent_result_rewrites_deprecated_block_taxonomy() -> None:
     assert agent_result.output_policy_diagnostics == {
         "raw_output_kind": "informational_answer",
         "final_output_kind": "informational_answer",
+        "raw_reason_codes": ["internal_block_taxonomy_leak"],
         "hard_block_reason_codes": [],
         "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
         "raw_would_have_failed": True,
         "contained_failure": True,
         "final_output_policy_allowed": True,
     }
+
+
+def test_translate_to_agent_result_rewrites_internal_classifier_vocab_leak() -> None:
+    leak = (
+        "TurnIntent classified this turn as `edit`, so the request couldn't continue. "
+        "safe_reason_code=turn_intent_no_mutation_run_blocked."
+    )
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert "TurnIntent" not in agent_result.user_response
+    assert "safe_reason_code" not in agent_result.user_response
+    assert "Tell me what you'd like to do next" in agent_result.user_response
+    diagnostics = agent_result.output_policy_diagnostics or {}
+    assert "internal_classifier_vocab_leak" in diagnostics["soft_rewrite_reason_codes"]
+    assert "internal_classifier_vocab_leak" in diagnostics["raw_reason_codes"]
+    assert diagnostics["raw_would_have_failed"] is True
+    assert diagnostics["contained_failure"] is True
+
+
+def test_translate_to_agent_result_hard_blocks_extended_taxonomy_tool_name_leak() -> None:
+    leak = "Trace shows `get_run_results` was the last tool dispatched on this turn."
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert "get_run_results" not in agent_result.user_response
+    assert "I could not safely return" in agent_result.user_response
+    diagnostics = agent_result.output_policy_diagnostics or {}
+    assert "internal_tool_instruction_leak" in diagnostics["hard_block_reason_codes"]
+    assert "internal_block_taxonomy_leak" not in diagnostics["raw_reason_codes"]
+
+
+def test_translate_to_agent_result_rewrites_self_prescriptive_phrase_leak() -> None:
+    leak = "Please send 'continue debugging' next and I'll keep going."
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert "continue debugging" not in agent_result.user_response
+    assert "Tell me what you'd like to do next" in agent_result.user_response
+    diagnostics = agent_result.output_policy_diagnostics or {}
+    assert "self_prescriptive_phrase_leak" in diagnostics["soft_rewrite_reason_codes"]
+    assert "self_prescriptive_phrase_leak" in diagnostics["raw_reason_codes"]
+
+
+def test_translate_to_agent_result_unbacked_workflow_wins_over_self_prescriptive_rewrite() -> None:
+    leak = "Here's the workflow. Send me a normal instruction like 'run it' next."
+    result = _fake_run_result({"type": "REPLY", "user_response": leak})
+
+    agent_result = asyncio.run(
+        agent_module._translate_to_agent_result(
+            result,
+            _ctx(),
+            global_llm_context=None,
+            chat_request=_chat_request(),
+            organization_id="org-1",
+        )
+    )
+
+    assert "run it" not in agent_result.user_response
+    assert "Send me a normal instruction" not in agent_result.user_response
+    diagnostics = agent_result.output_policy_diagnostics or {}
+    soft_reasons = diagnostics["soft_rewrite_reason_codes"]
+    assert "unbacked_workflow_delivery_claim" in soft_reasons
+    assert "self_prescriptive_phrase_leak" in soft_reasons
+
+
+def test_sdk_output_guardrail_records_raw_soft_reason_alongside_hard_block() -> None:
+    leak = "Call get_run_results(workflow_run_id='wr_123') and do not retry. Saw [copilot:nudge] in the trace."
+    verdict, response_type, diagnostics = agent_module._evaluate_copilot_final_output_policy(
+        _ctx(),
+        {"type": "REPLY", "user_response": leak},
+    )
+
+    assert not verdict.allowed
+    assert "internal_tool_instruction_leak" in diagnostics["hard_block_reason_codes"]
+    assert "internal_block_taxonomy_leak" not in diagnostics["hard_block_reason_codes"]
+    assert diagnostics["soft_rewrite_reason_codes"] == []
+    raw_reason_codes = diagnostics["raw_reason_codes"]
+    assert "internal_tool_instruction_leak" in raw_reason_codes
+    assert "internal_block_taxonomy_leak" in raw_reason_codes
+
+
+def test_evaluate_output_policy_skips_new_detectors_on_ask_question() -> None:
+    classifier_leak = "TurnIntent classified this turn as edit, safe_reason_code=turn_intent_no_mutation_run_blocked."
+    self_prescriptive_leak = "Please send 'continue debugging' next and I'll keep going."
+    tool_name_leak = "Use `get_run_results` to fetch the prior run output."
+
+    for leak in (classifier_leak, self_prescriptive_leak, tool_name_leak):
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            response_type="ASK_QUESTION",
+            user_response=leak,
+        )
+        assert OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK not in verdict.reason_codes
+        assert OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK not in verdict.reason_codes
+        assert OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK not in verdict.reason_codes
+
+
+def test_evaluate_output_policy_runs_new_detectors_on_replace_workflow() -> None:
+    classifier_leak = "TurnIntent classified this turn as edit, safe_reason_code=turn_intent_no_mutation_run_blocked."
+    self_prescriptive_leak = "Please send 'continue debugging' next and I'll keep going."
+    tool_name_leak = "Use `get_run_results` to fetch the prior run output."
+
+    classifier_verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLACE_WORKFLOW",
+        user_response=classifier_leak,
+    )
+    assert OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK in classifier_verdict.reason_codes
+
+    self_prescriptive_verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLACE_WORKFLOW",
+        user_response=self_prescriptive_leak,
+    )
+    assert OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK in self_prescriptive_verdict.reason_codes
+
+    tool_name_verdict = evaluate_output_policy(
+        request_policy=_policy(),
+        response_type="REPLACE_WORKFLOW",
+        user_response=tool_name_leak,
+    )
+    assert OutputPolicyReason.INTERNAL_TOOL_INSTRUCTION_LEAK in tool_name_verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    "user_response,expected",
+    [
+        ("LOOP DETECTED: same tool dispatched three times in a row.", True),
+        ("Saw [copilot:nudge] in the trace before the failure.", True),
+        ("Couldn't finish the diagnostic step on this nudge turn.", True),
+        ("nudge-turn was cleared before the next iteration.", True),
+        ("Update the workflow to log in before extracting data.", False),
+        ("I'll get the run results once it finishes.", False),
+        ("", False),
+    ],
+)
+def test_contains_internal_tool_vocab_leak_helper(user_response: str, expected: bool) -> None:
+    assert _contains_internal_tool_vocab_leak(user_response) is expected
 
 
 def test_translate_to_agent_result_prioritizes_unbacked_workflow_claim_over_taxonomy_rewrite() -> None:

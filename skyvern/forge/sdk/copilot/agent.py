@@ -1013,7 +1013,7 @@ def _build_exit_result(
         workflow_attempted=workflow_attempted,
         unvalidated=False,
     )
-    output_policy_verdict = evaluate_output_policy(
+    raw_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type="REPLY",
         user_response=final_text,
@@ -1025,18 +1025,20 @@ def _build_exit_result(
         unvalidated=False,
         output_kind=output_kind,
     )
-    if not output_policy_verdict.allowed:
+    if not raw_verdict.allowed:
+        hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
+        soft_rewrite_reasons = [r for r in raw_verdict.reason_codes if r not in hard_block_verdict.reason_codes]
         return _build_output_policy_blocked_result(
             ctx,
-            output_policy_verdict,
+            raw_verdict,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=verified_yaml,
             output_policy_diagnostics=build_output_policy_diagnostics(
-                raw_verdict=output_policy_verdict,
-                final_verdict=output_policy_verdict,
-                final_output_kind=_blocked_final_output_kind(output_policy_verdict),
-                hard_block_reason_codes=list(output_policy_verdict.reason_codes),
-                soft_rewrite_reason_codes=[],
+                raw_verdict=raw_verdict,
+                final_verdict=raw_verdict,
+                final_output_kind=_blocked_final_output_kind(raw_verdict),
+                hard_block_reason_codes=list(hard_block_verdict.reason_codes),
+                soft_rewrite_reason_codes=soft_rewrite_reasons,
             ),
         )
     return _finalize_result_with_blocker_override(
@@ -1096,7 +1098,7 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
         workflow_attempted=True,
         unvalidated=False,
     )
-    output_policy_verdict = evaluate_output_policy(
+    raw_verdict = evaluate_output_policy(
         request_policy=ctx.request_policy,
         response_type="REPLY",
         user_response=final_text,
@@ -1108,18 +1110,20 @@ def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: s
         unvalidated=False,
         output_kind=output_kind,
     )
-    if not output_policy_verdict.allowed:
+    if not raw_verdict.allowed:
+        hard_block_verdict = hard_block_output_policy_verdict(raw_verdict)
+        soft_rewrite_reasons = [r for r in raw_verdict.reason_codes if r not in hard_block_verdict.reason_codes]
         return _build_output_policy_blocked_result(
             ctx,
-            output_policy_verdict,
+            raw_verdict,
             prior_global_llm_context=global_llm_context,
             prior_workflow_yaml=verified_yaml,
             output_policy_diagnostics=build_output_policy_diagnostics(
-                raw_verdict=output_policy_verdict,
-                final_verdict=output_policy_verdict,
-                final_output_kind=_blocked_final_output_kind(output_policy_verdict),
-                hard_block_reason_codes=list(output_policy_verdict.reason_codes),
-                soft_rewrite_reason_codes=[],
+                raw_verdict=raw_verdict,
+                final_verdict=raw_verdict,
+                final_output_kind=_blocked_final_output_kind(raw_verdict),
+                hard_block_reason_codes=list(hard_block_verdict.reason_codes),
+                soft_rewrite_reason_codes=soft_rewrite_reasons,
             ),
         )
     return _finalize_result_with_blocker_override(
@@ -1235,6 +1239,10 @@ _INTERNAL_BLOCK_TAXONOMY_REPLY = (
     "Internal workflow names are not the right interface to use when building with Copilot. "
     "Describe the page action, data to collect, sign-in step, or check you want, and I'll translate that into "
     "a supported workflow update."
+)
+_INTERNAL_VOCAB_LEAK_REPLY = (
+    "Tell me what you'd like to do next — describe the page action, data to collect, sign-in step, "
+    "or check you want, and I'll translate that into a supported workflow update."
 )
 _BLOCK_YAML_IN_REPLY_REWRITE_NO_PROPOSAL = (
     "I drafted a change to the workflow but haven't applied it yet. Want me to update the workflow now?"
@@ -1919,23 +1927,30 @@ async def _translate_to_agent_result(
         LOG.warning("Agent used inline REPLACE_WORKFLOW instead of update_workflow tool")
         workflow_yaml = action_data.get("workflow_yaml", "")
         if workflow_yaml:
-            inline_policy_verdict = hard_block_output_policy_verdict(
-                evaluate_output_policy(
-                    request_policy=ctx.request_policy,
-                    response_type=resp_type,
-                    user_response=str(user_response),
-                    workflow_yaml=workflow_yaml,
-                    tool_arguments=action_data,
-                    has_workflow_proposal=True,
-                    output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
-                )
+            inline_raw_verdict = evaluate_output_policy(
+                request_policy=ctx.request_policy,
+                response_type=resp_type,
+                user_response=str(user_response),
+                workflow_yaml=workflow_yaml,
+                tool_arguments=action_data,
+                has_workflow_proposal=True,
+                output_kind=CopilotOutputKind.WORKFLOW_DRAFT_PROPOSAL,
             )
+            inline_policy_verdict = hard_block_output_policy_verdict(inline_raw_verdict)
             if not inline_policy_verdict.allowed:
+                inline_diagnostics = build_output_policy_diagnostics(
+                    raw_verdict=inline_raw_verdict,
+                    final_verdict=inline_policy_verdict,
+                    final_output_kind=_blocked_final_output_kind(inline_policy_verdict),
+                    hard_block_reason_codes=list(inline_policy_verdict.reason_codes),
+                    soft_rewrite_reason_codes=[],
+                )
                 return _build_output_policy_blocked_result(
                     ctx,
                     inline_policy_verdict,
                     prior_global_llm_context=global_llm_context,
                     prior_workflow_yaml=chat_request.workflow_yaml,
+                    output_policy_diagnostics=inline_diagnostics,
                 )
             # REPLACE_WORKFLOW bypasses the update_workflow tool guardrail, so
             # policy and post-emission rejects run here before YAML processing.
@@ -2124,6 +2139,14 @@ async def _translate_to_agent_result(
             user_response = _INTERNAL_BLOCK_TAXONOMY_REPLY
             soft_rewrite_reasons.append(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
             output_policy_verdict.remove(OutputPolicyReason.INTERNAL_BLOCK_TAXONOMY_LEAK)
+        for _residual_vocab_reason in (
+            OutputPolicyReason.INTERNAL_CLASSIFIER_VOCAB_LEAK,
+            OutputPolicyReason.SELF_PRESCRIPTIVE_PHRASE_LEAK,
+        ):
+            if _residual_vocab_reason in output_policy_verdict.reason_codes:
+                user_response = _INTERNAL_VOCAB_LEAK_REPLY
+                soft_rewrite_reasons.append(_residual_vocab_reason)
+                output_policy_verdict.remove(_residual_vocab_reason)
         if OutputPolicyReason.WORKFLOW_YAML_IN_REPLY in output_policy_verdict.reason_codes:
             user_response = (
                 _BLOCK_YAML_IN_REPLY_REWRITE_WITH_PROPOSAL
@@ -2613,6 +2636,7 @@ def _output_policy_diagnostics_from_guardrail_exception(exc: BaseException) -> d
     keys = {
         "raw_output_kind",
         "final_output_kind",
+        "raw_reason_codes",
         "hard_block_reason_codes",
         "soft_rewrite_reason_codes",
         "raw_would_have_failed",
