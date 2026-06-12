@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from skyvern.forge.sdk.copilot.agent import _make_agent_result
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
@@ -117,5 +119,10 @@ def test_backfill_tolerates_ctx_none() -> None:
 
 
 def test_backfill_tolerates_missing_payload() -> None:
-    result = _result(_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=None)
+    with pytest.raises(ValueError, match="narrative_payload"):
+        _result(_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=None)
+
+
+def test_missing_payload_is_allowed_without_ctx() -> None:
+    result = _result(None, turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=None)
     assert result.narrative_payload is None

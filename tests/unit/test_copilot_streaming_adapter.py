@@ -399,6 +399,60 @@ async def test_tool_result_sse_uses_latest_blocker_signal_for_activity_surface()
 
 
 @pytest.mark.asyncio
+async def test_stream_to_sse_cancels_and_stops_on_terminal_turn_halt() -> None:
+    from agents.items import RunItem
+    from agents.stream_events import RunItemStreamEvent
+
+    from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt
+
+    signal = CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="LOOP DETECTED: 'update_workflow' has already failed 3 times.",
+        user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_workflow",
+    )
+
+    call_item = MagicMock(spec=RunItem)
+    call_item.raw_item = {"call_id": "c1", "name": "update_workflow", "arguments": "{}"}
+    tool_call_event = RunItemStreamEvent(name="tool_called", item=call_item)
+
+    out_item = MagicMock(spec=RunItem)
+    out_item.raw_item = {"call_id": "c1", "name": "update_workflow"}
+    out_item.output = [{"type": "text", "text": json.dumps({"ok": False, "error": signal.agent_steering_text})}]
+    tool_output_event = RunItemStreamEvent(name="tool_output", item=out_item)
+
+    late_call_item = MagicMock(spec=RunItem)
+    late_call_item.raw_item = {"call_id": "c2", "name": "update_and_run_blocks", "arguments": "{}"}
+    late_tool_call_event = RunItemStreamEvent(name="tool_called", item=late_call_item)
+    consumed_late_event = False
+
+    async def _events() -> Any:
+        nonlocal consumed_late_event
+        yield tool_call_event
+        yield tool_output_event
+        consumed_late_event = True
+        yield late_tool_call_event
+
+    result = MagicMock()
+    result.stream_events = _events
+    result.cancel = MagicMock()
+
+    stream = MagicMock()
+    stream.is_disconnected = AsyncMock(return_value=False)
+    stream.send = AsyncMock(return_value=True)
+    ctx = SimpleNamespace(latest_tool_blocker_signal=signal, tool_blocker_signals=[signal])
+
+    with pytest.raises(CopilotTurnHalt):
+        await stream_to_sse(result, stream, ctx)
+
+    result.cancel.assert_called_once()
+    assert consumed_late_event is False
+
+
+@pytest.mark.asyncio
 async def test_stream_to_sse_raises_and_cancels_on_repeated_unrecoverable_tool_error() -> None:
     from agents.items import RunItem
     from agents.stream_events import RunItemStreamEvent
