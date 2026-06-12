@@ -18,6 +18,8 @@ from skyvern.forge.sdk.copilot.tools import (
     _detect_stale_block_metadata,
     _update_workflow,
 )
+from skyvern.forge.sdk.copilot.tools import workflow_update as workflow_update_module
+from skyvern.forge.sdk.copilot.workflow_credential_utils import parse_workflow_yaml, workflow_blocks
 
 
 def _yaml(body: str) -> str:
@@ -49,6 +51,74 @@ _SAFE_CODE_YAML = _yaml(
     """
 )
 
+_SUBMITTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("button.lookup").click()
+    """
+)
+
+_SUBMITTED_COMPUTED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(provider_name)
+    """
+)
+
+_SUBMITTED_LOCAL_CONSTANT_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          provider_query = "Taylor Brooks"
+          await page.locator("input[placeholder='Search']").fill(str(provider_query))
+    """
+)
+
+_SUBMITTED_COMPUTED_PARAMETER_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      parameters:
+      - parameter_type: workflow
+        workflow_parameter_type: string
+        key: provider_query
+        default_value: Taylor Brooks
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill(str(provider_query))
+    """
+)
+
+_SUBMITTED_MIXED_LITERAL_YAML = _yaml(
+    """
+    title: Provider lookup
+    workflow_definition:
+      blocks:
+      - block_type: code
+        label: search_registry
+        code: |
+          await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
+          await page.locator("#other").fill(provider_name)
+    """
+)
+
 
 def _code_only_ctx() -> CopilotContext:
     ctx = CopilotContext(
@@ -69,6 +139,88 @@ def _code_only_ctx() -> CopilotContext:
         }
     ]
     return ctx
+
+
+def _standard_ctx() -> CopilotContext:
+    ctx = _code_only_ctx()
+    ctx.block_authoring_policy = BlockAuthoringPolicy.STANDARD
+    return ctx
+
+
+def _enable_imposition(ctx: CopilotContext) -> None:
+    ctx.impose_synthesized_code_block = True
+
+
+def _stub_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_process_workflow_yaml(**_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            workflow_definition=SimpleNamespace(blocks=[SimpleNamespace(label="search_registry")]),
+            proxy_location=None,
+        )
+
+    async def _fake_get_prior_workflow(_ctx: CopilotContext) -> None:
+        return None
+
+    monkeypatch.setattr(workflow_update_module, "_process_workflow_yaml", _fake_process_workflow_yaml)
+    monkeypatch.setattr(workflow_update_module, "_get_prior_workflow", _fake_get_prior_workflow)
+    monkeypatch.setattr(workflow_update_module, "composition_page_evidence_error", lambda *_args, **_kwargs: None)
+
+
+def _single_code_block(parsed: dict[str, object]) -> dict[str, object]:
+    blocks = [block for block in workflow_blocks(parsed) if str(block.get("block_type") or "").lower() == "code"]
+    assert len(blocks) == 1
+    return blocks[0]
+
+
+def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> str:
+    indented_code = textwrap.indent(textwrap.dedent(code).strip(), " " * 8)
+    return (
+        "title: Login with saved credential\n"
+        "workflow_definition:\n"
+        "  parameters:\n"
+        "    - parameter_type: workflow\n"
+        "      workflow_parameter_type: credential_id\n"
+        "      key: login_credential\n"
+        f"      default_value: {credential_id}\n"
+        "  blocks:\n"
+        "    - block_type: code\n"
+        "      label: login_with_saved_credential\n"
+        "      code: |\n"
+        f"{indented_code}\n"
+    )
+
+
+def _credential_fill_interaction(
+    field: str,
+    *,
+    credential_id: str = "cred_missing",
+    source_url: str = "https://authenticationtest.com/totpChallenge/",
+) -> dict[str, object]:
+    selectors = {
+        "username": "#email",
+        "password": "input[type='password']",
+        "totp": "#totpmfa",
+    }
+    typed_lengths = {"username": 20, "password": 14, "totp": 6}
+    return {
+        "tool_name": "fill_credential_field",
+        "selector": selectors[field],
+        "source_url": source_url,
+        "credential_id": credential_id,
+        "credential_field": field,
+        "typed_length": typed_lengths[field],
+    }
+
+
+def _submit_interaction(
+    *,
+    source_url: str = "https://authenticationtest.com/totpChallenge/",
+) -> dict[str, object]:
+    return {
+        "tool_name": "click",
+        "selector": "input[type='submit']",
+        "source_url": source_url,
+    }
 
 
 class TestCodeSafetySeam:
@@ -111,6 +263,164 @@ class TestCodeSafetySeam:
         )
         assert result["ok"] is False
         assert ctx.code_artifact_metadata == {}
+
+
+class TestCompiledAuthoringImposition:
+    def _provider_search_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#provInput",
+                "source_url": "https://example.com/find-care",
+                "typed_length": 13,
+                "role": "textbox",
+                "accessible_name": "Provider Name",
+                "trajectory_index": 0,
+            }
+        ]
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_imposes_strict_scout_selector_and_lifts_singleton_literal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert "input[placeholder='Search']" not in block["code"]
+        assert block["parameter_keys"] == ["provider_name"]
+        parameters = parsed["workflow_definition"]["parameters"]
+        assert parameters == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+                "default_value": "Taylor Brooks",
+            }
+        ]
+        assert result["data"]["imposed_substitutions"] == {
+            "block_label": "search_registry",
+            "source_trajectory_count": 1,
+            "parameter_keys": ["provider_name"],
+            "credential_parameter_keys": [],
+            "selector_provenance": [
+                {
+                    "trajectory_index": 0,
+                    "selector": "#provInput",
+                    "emitted_literal": "#provInput",
+                    "source": "selector",
+                }
+            ],
+            "prior_source": "workflow_yaml",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.workflow_yaml = _SUBMITTED_LITERAL_YAML
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert "imposed_substitutions" not in result["data"]
+        assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
+
+    @pytest.mark.asyncio
+    async def test_flag_off_code_only_mode_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.impose_synthesized_code_block = False
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert "imposed_substitutions" not in result["data"]
+        assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
+
+    @pytest.mark.asyncio
+    async def test_unbound_synthesized_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "Unable to bind synthesized parameter `provider_name`" in result["error"]
+        assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_single_local_string_constant_is_lifted_for_synthesized_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_LOCAL_CONSTANT_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+        assert block["parameter_keys"] == ["provider_name"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_name",
+                "default_value": "Taylor Brooks",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_single_submitted_string_parameter_is_adopted_for_synthesized_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        ctx.scout_trajectory[0]["accessible_name"] = "Search by doctor name or specialty, hospital, procedure, and more"
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_COMPUTED_PARAMETER_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        synthesized_key = "search_by_doctor_name_or_specialty_hospital_procedure_and_more"
+        assert f'await page.locator("#provInput").fill(str({synthesized_key}))' in block["code"]
+        assert block["parameter_keys"] == [synthesized_key]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": synthesized_key,
+                "default_value": "Taylor Brooks",
+            }
+        ]
+        assert result["data"]["imposed_substitutions"]["parameter_keys"] == [synthesized_key]
+
+    @pytest.mark.asyncio
+    async def test_mixed_literal_and_computed_fill_rejects_before_persist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_MIXED_LITERAL_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "exactly one direct browser-locator string literal fill/type call" in result["error"]
+        assert ctx.workflow_yaml == ""
 
 
 class TestSeamSalvageIntoContext:
@@ -261,6 +571,101 @@ class TestStaleLabelSeamFlow:
         ref = ctx.code_artifact_metadata["search_registry"]["observation_refs"][0]
         assert ref["dependency_id"]
         assert ref["source_tool"]
+
+
+class TestCredentialScoutPersistGate:
+    _SUBMIT_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(login_credential.totp)
+        await page.locator("input[type='submit']").click()
+        await page.wait_for_load_state("load")
+        """
+    )
+    _FILL_ONLY_CODE_YAML = _credential_code_yaml(
+        code="""
+        await page.locator("#email").fill(login_credential.username)
+        await page.locator("input[type='password']").fill(login_credential.password)
+        await page.locator("#totpmfa").fill(login_credential.totp)
+        """
+    )
+
+    @pytest.mark.asyncio
+    async def test_rejects_credential_submit_code_without_matching_fill_scouts(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "fill_credential_field" in result["error"]
+        assert "click the submit control or press Enter" in result["error"]
+        assert result["user_facing_summary"] == (
+            "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
+        )
+
+    @pytest.mark.asyncio
+    async def test_allows_submit_code_gate_once_matching_fills_and_submit_are_scouted(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+            _submit_interaction(),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "was not found in this organization" in error_text
+        assert "fill_credential_field" not in error_text
+        assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_submit_code_still_requires_later_submit_after_matching_fills(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        assert "later submit action on the same page" in result["error"]
+        assert "click the submit control or press Enter" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fill_only_code_requires_matching_fill_scouts_but_not_submit(self) -> None:
+        ctx = _code_only_ctx()
+        ctx.scout_trajectory = [
+            _credential_fill_interaction("username"),
+            _credential_fill_interaction("password"),
+            _credential_fill_interaction("totp"),
+        ]
+
+        result = await _update_workflow({"workflow_yaml": self._FILL_ONLY_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "was not found in this organization" in error_text
+        assert "click the submit control or press Enter" not in error_text
+        assert "saved-credential login flow" not in error_text
+
+    @pytest.mark.asyncio
+    async def test_standard_mode_behavior_is_unchanged(self) -> None:
+        ctx = _standard_ctx()
+        ctx.scout_trajectory = []
+
+        result = await _update_workflow({"workflow_yaml": self._SUBMIT_CODE_YAML}, ctx)
+
+        assert result["ok"] is False
+        error_text = str(result.get("error") or "")
+        assert "fill_credential_field" not in error_text
+        assert "saved-credential login flow" not in error_text
 
 
 def test_run_id_leak_check_covers_non_numeric_ids() -> None:

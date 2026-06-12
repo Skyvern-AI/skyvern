@@ -14,20 +14,31 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
 
-_MAX_STEPS = 20
+_MAX_STEPS = 60
 _INDENT = "    "
+
+CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
+_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
 
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
 # plus the injected `page`). A parameter key colliding with one of these is silently dropped
 # at bind time, so the synthesized fill would stringify the builtin instead of the user value.
+# "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
+# injects a bound credential's fields under those bare names, so a plain parameter named
+# `password` would resolve to the credential's secret value instead of the user input.
 _RESERVED_PARAM_NAMES = frozenset(
     {
         "page",
+        "username",
+        "password",
+        "totp",
+        "totp_identifier",
         "print",
         "len",
         "range",
@@ -67,10 +78,19 @@ _POSITIONAL_RE = re.compile(
 
 
 @dataclass
+class SynthesisDiagnostics:
+    emitted_interaction_count: int = 0
+    truncated: bool = False
+    dropped_interactions: list[dict[str, Any]] = field(default_factory=list)
+    locator_provenance: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class SynthesizedCodeBlock:
     code: str
     parameters: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
 
 
 # str.splitlines() and several parsers treat these codepoints as line boundaries, so a raw one in a
@@ -81,6 +101,44 @@ _EXTRA_LINE_SEPARATORS = ("\u2028", "\u2029")
 _CONTROL_CODEPOINTS = frozenset(
     chr(cp) for cp in (*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0)) if chr(cp) not in ("\n", "\r")
 )
+_SENSITIVE_URL_QUERY_RE = re.compile(
+    r"(?:password|passwd|token|secret|api[_-]?key|credential|auth|session|cookie)", re.I
+)
+
+
+def _scrub_url_for_code_literal(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return url
+    if not parts.scheme or not parts.netloc or hostname is None:
+        return url
+
+    netloc = hostname
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+
+    query = urlencode(
+        [
+            (key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        ],
+        doseq=True,
+    )
+    fragment = parts.fragment
+    fragment_pairs = parse_qsl(fragment, keep_blank_values=True) if "=" in fragment or "&" in fragment else []
+    if fragment_pairs:
+        fragment = urlencode(
+            [(key, "__redacted__" if _SENSITIVE_URL_QUERY_RE.search(key) else value) for key, value in fragment_pairs],
+            doseq=True,
+        )
+    elif fragment and _SENSITIVE_URL_QUERY_RE.search(fragment):
+        fragment = "__redacted__"
+    return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
 
 def _py_str(value: str) -> str:
@@ -144,6 +202,11 @@ def _get_by_role_expr(role: str, name: str) -> str:
 def _locator_expr(
     interaction: Mapping[str, Any],
     notes: list[str],
+    *,
+    diagnostics: SynthesisDiagnostics | None = None,
+    trajectory_index: int | None = None,
+    tool_name: str = "",
+    strict_selectors: bool = False,
 ) -> str:
     """Selector-first: emit the scout's captured working selector verbatim, and only fall back to an
     ARIA get_by_role anchor when that selector is positional/index-based (and a role/name is available).
@@ -155,6 +218,29 @@ def _locator_expr(
     selector = str(interaction.get("selector") or "").strip()
     role = str(interaction.get("role") or "").strip()
     name = str(interaction.get("accessible_name") or "").strip()
+
+    if strict_selectors:
+        if not selector:
+            notes.append("dropped an interaction with no selector")
+            if diagnostics is not None:
+                diagnostics.dropped_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                        "tool_name": tool_name,
+                        "reason_code": "missing_selector",
+                    }
+                )
+            return ""
+        if diagnostics is not None:
+            diagnostics.locator_provenance.append(
+                {
+                    "trajectory_index": trajectory_index if trajectory_index is not None else -1,
+                    "selector": selector,
+                    "emitted_literal": selector,
+                    "source": "selector",
+                }
+            )
+        return f"page.locator({_py_str(selector)})"
 
     parsed = _parse_role_name(selector) if selector else None
     if parsed is not None:
@@ -184,10 +270,7 @@ def _locator_expr(
     return ""
 
 
-def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
-    name = str(interaction.get("accessible_name") or "").strip()
-    role = str(interaction.get("role") or "").strip()
-    base = _safe_param_base(name or role or "value")
+def _unique_key(base: str, used: set[str]) -> str:
     candidate = base
     suffix = 2
     while candidate in used:
@@ -197,7 +280,20 @@ def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
     return candidate
 
 
-def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> SynthesizedCodeBlock | None:
+def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
+    name = str(interaction.get("accessible_name") or "").strip()
+    role = str(interaction.get("role") or "").strip()
+    return _unique_key(_safe_param_base(name or role or "value"), used)
+
+
+def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
+    name = str(interaction.get("credential_name") or "").strip()
+    return _unique_key(_safe_param_base(name or "credential"), used)
+
+
+def synthesize_code_block(
+    trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool = False
+) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
         return None
@@ -205,7 +301,9 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
     lines: list[str] = []
     notes: list[str] = []
     parameters: list[dict[str, str]] = []
+    diagnostics = SynthesisDiagnostics()
     used_param_keys: set[str] = set()
+    credential_param_keys: dict[str, str] = {}
 
     entry_url = ""
     entry_index = -1
@@ -218,12 +316,13 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
     if entry_url:
         if entry_index > 0:
             notes.append("entry URL taken from a later interaction; earlier steps had no source_url")
-        lines.append(f"{_INDENT}await page.goto({_py_str(entry_url)})")
+        lines.append(f"{_INDENT}await page.goto({_py_str(_scrub_url_for_code_literal(entry_url))})")
         lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
 
     emitted = 0
-    for interaction in trajectory:
+    for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
+            diagnostics.truncated = True
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
             break
         tool_name = str(interaction.get("tool_name") or "")
@@ -231,17 +330,47 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
         if tool_name == "press_key":
             key = str(interaction.get("key") or "").strip()
             if not key:
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_key"}
+                )
                 continue
-            locator = _locator_expr(interaction, notes) if interaction.get("selector") else ""
+            locator = (
+                _locator_expr(
+                    interaction,
+                    notes,
+                    diagnostics=diagnostics,
+                    trajectory_index=trajectory_index,
+                    tool_name=tool_name,
+                    strict_selectors=strict_selectors,
+                )
+                if interaction.get("selector")
+                else ""
+            )
             if locator:
                 lines.append(f"{_INDENT}await {locator}.press({_py_str(key)})")
             else:
+                if strict_selectors:
+                    diagnostics.dropped_interactions.append(
+                        {
+                            "trajectory_index": trajectory_index,
+                            "tool_name": tool_name,
+                            "reason_code": "missing_selector",
+                        }
+                    )
+                    continue
                 lines.append(f"{_INDENT}await page.keyboard.press({_py_str(key)})")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
             emitted += 1
             continue
 
-        locator = _locator_expr(interaction, notes)
+        locator = _locator_expr(
+            interaction,
+            notes,
+            diagnostics=diagnostics,
+            trajectory_index=trajectory_index,
+            tool_name=tool_name,
+            strict_selectors=strict_selectors,
+        )
         if not locator:
             continue
 
@@ -252,23 +381,49 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
             param_key = _param_key(interaction, used_param_keys)
             parameters.append({"key": param_key})
             lines.append(f"{_INDENT}await {locator}.fill(str({param_key}))")
+        elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
+            credential_id = str(interaction.get("credential_id") or "").strip()
+            credential_field = str(interaction.get("credential_field") or "").strip()
+            if not credential_id or credential_field not in _CREDENTIAL_FIELDS:
+                notes.append("dropped a credential fill with no usable credential reference")
+                diagnostics.dropped_interactions.append(
+                    {
+                        "trajectory_index": trajectory_index,
+                        "tool_name": tool_name,
+                        "reason_code": "missing_credential_reference",
+                    }
+                )
+                continue
+            credential_param_key = credential_param_keys.get(credential_id)
+            if credential_param_key is None:
+                credential_param_key = _credential_param_key(interaction, used_param_keys)
+                credential_param_keys[credential_id] = credential_param_key
+                parameters.append({"key": credential_param_key, "credential_id": credential_id})
+            lines.append(f"{_INDENT}await {locator}.fill({credential_param_key}.{credential_field})")
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
                 notes.append("dropped a select_option interaction with no recorded value")
+                diagnostics.dropped_interactions.append(
+                    {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_value"}
+                )
                 continue
             lines.append(f"{_INDENT}await {locator}.select_option({_py_str(value)})")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
+            diagnostics.dropped_interactions.append(
+                {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "unsupported_tool"}
+            )
             continue
         emitted += 1
 
     if not lines:
         return None
 
+    diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
-    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes)
+    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics)
 
 
 # Model-owned slots the synthesizer cannot prove; the model fills these.
@@ -311,7 +466,7 @@ def build_artifact_metadata_skeleton(
         "observation_refs": [observation_ref_id],
     }
     if entry_url_hint:
-        page_dependency["url_hint"] = entry_url_hint
+        page_dependency["url_hint"] = _scrub_url_for_code_literal(entry_url_hint)
 
     observation_ref: dict[str, Any] = {
         "observation_ref": observation_ref_id,
@@ -367,7 +522,8 @@ def render_synthesized_offer_text(
     trajectory: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Render the offer body the copilot sees for a synthesized block (pure)."""
-    param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key")]
+    param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key") and not p.get("credential_id")]
+    credential_parameters = [p for p in synthesized.parameters if p.get("key") and p.get("credential_id")]
     parts = [
         "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
@@ -379,6 +535,16 @@ def render_synthesized_offer_text(
     ]
     if param_keys:
         parts.append("Workflow parameters referenced (bind these): " + ", ".join(param_keys) + ".")
+    if credential_parameters:
+        bindings = ", ".join(f"`{p['key']}` -> `{p['credential_id']}`" for p in credential_parameters)
+        parts.append(
+            "Credential parameters referenced: "
+            + bindings
+            + ". Bind each as a workflow parameter with `workflow_parameter_type: credential_id` and the "
+            "credential ID in `default_value`; at runtime the key resolves to a credential object whose "
+            "`.username` / `.password` / `.totp` attributes the snippet reads (`.totp` is a fresh one-time "
+            "code generated when the block starts). Never replace these attribute reads with literal values."
+        )
     if synthesized.notes:
         parts.append("Synthesis notes: " + "; ".join(synthesized.notes) + ".")
     if trajectory:

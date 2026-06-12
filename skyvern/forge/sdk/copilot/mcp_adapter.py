@@ -22,6 +22,8 @@ from mcp.types import (
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     build_loop_blocker_signal,
+    loop_blocker_evidence_from_ctx,
+    refresh_held_loop_blocker_evidence,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
@@ -39,6 +41,7 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -74,7 +77,8 @@ def _hide_code_only_tool(ctx: CopilotContext, tool_name: str) -> bool:
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
-    return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
+    signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
+    return stash_blocker_signal(ctx, signal)
 
 
 def _apply_schema_overlay(
@@ -234,6 +238,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
+        refresh_held_loop_blocker_evidence(copilot_ctx)
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
@@ -282,7 +287,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 error=str(e),
                 exc_info=True,
             )
-            err = {"ok": False, "error": f"{tool_name} failed: {e}"}
+            err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
@@ -296,6 +301,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        # Scrub before the post hook so evidence the hooks record from raw_mcp
+        # (flow evidence, scout observations) is scrubbed too.
+        raw_mcp = scrub_secrets_from_structure(copilot_ctx, raw_mcp)
         copilot_result = mcp_to_copilot(raw_mcp)
 
         if overlay.post_hook:

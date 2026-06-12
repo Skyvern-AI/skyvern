@@ -1,3 +1,6 @@
+import pytest
+
+from skyvern.config import settings
 from skyvern.forge.sdk.db.utils import deserialize_proxy_location, serialize_proxy_location
 from skyvern.schemas.runs import GeoTarget, ProxyLocation
 from skyvern.webeye.browser_factory import BrowserContextFactory, _redact_proxy_url
@@ -33,10 +36,19 @@ def test_build_browser_args_invalid_custom_proxy_url_ignored() -> None:
     assert "proxy" not in args
 
 
-def test_build_browser_args_sets_record_video_size_to_viewport() -> None:
+def test_build_browser_args_defaults_to_playwright_recording_size() -> None:
     args = BrowserContextFactory.build_browser_args()
 
-    assert args["record_video_size"] == args["viewport"]
+    assert "record_video_size" not in args
+
+
+def test_build_browser_args_uses_configured_recording_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "BROWSER_RECORDING_WIDTH", 1280)
+    monkeypatch.setattr(settings, "BROWSER_RECORDING_HEIGHT", 720)
+
+    args = BrowserContextFactory.build_browser_args()
+
+    assert args["record_video_size"] == {"width": 1280, "height": 720}
 
 
 def test_deserialize_proxy_location_custom_url_returns_dict() -> None:

@@ -12,6 +12,8 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
     build_loop_blocker_signal,
+    loop_blocker_evidence_from_ctx,
+    refresh_held_loop_blocker_evidence,
 )
 from skyvern.forge.sdk.copilot.composition_evidence import interactive_challenge_controls
 from skyvern.forge.sdk.copilot.enforcement import TOTAL_TIMEOUT_SECONDS
@@ -26,6 +28,7 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
+    _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS,
     _DATA_PRODUCING_BLOCK_TYPES,
     _FAILED_BLOCK_STATUSES,
     BLOCK_RUNNING_TOOLS,
@@ -919,18 +922,27 @@ def _challenge_gated_anti_bot_rerun_signal(
 
 
 def _tool_loop_error(ctx: AgentContext, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
+    refresh_held_loop_blocker_evidence(ctx)
     detected = detect_failed_tool_step_loop_for_ctx(ctx, tool_name, arguments or {})
     if detected is not None:
-        return _emit_tool_blocker_signal(ctx, _build_loop_blocker_signal(detected, tool_name=tool_name))
+        return _emit_tool_blocker_signal(
+            ctx,
+            _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
+        )
 
     # Consecutive same-name guard: false-positives on the intended iterative
     # build (one new block per update_and_run_blocks). Block-running tools
-    # rely on the progress-aware checks below instead.
+    # rely on the progress-aware checks below instead. fill_credential_field is
+    # exempt because a username+password+TOTP form legitimately needs three
+    # consecutive calls; its failed-step guard above stays argument-aware.
     tracker = getattr(ctx, "consecutive_tool_tracker", None)
-    if isinstance(tracker, list) and tool_name not in BLOCK_RUNNING_TOOLS:
+    if isinstance(tracker, list) and tool_name not in _CONSECUTIVE_LOOP_GUARD_EXEMPT_TOOLS:
         detected = detect_tool_loop(tracker, tool_name)
         if detected is not None:
-            return _emit_tool_blocker_signal(ctx, _build_loop_blocker_signal(detected, tool_name=tool_name))
+            return _emit_tool_blocker_signal(
+                ctx,
+                _build_loop_blocker_signal(detected, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx)),
+            )
 
     if tool_name == "update_workflow" or tool_name in BLOCK_RUNNING_TOOLS:
         active_terminal_signal = _active_run_terminal_evidence_signal(ctx, tool_name)

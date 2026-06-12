@@ -53,7 +53,7 @@ from skyvern.forge.sdk.copilot.context import (
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
-from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified
+from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified, verified_goal_satisfied_context
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
@@ -157,6 +157,11 @@ Code block runtime facts:
 - Use deterministic, bounded Playwright calls such as `await page.goto(...)`,
   `await page.click(...)`, `await page.fill(...)`, `await page.press(...)`,
   `await page.wait_for_load_state(...)`, and `await page.evaluate(...)`.
+- A workflow parameter bound to a saved credential (`workflow_parameter_type:
+  credential_id`) resolves at runtime to a credential object: read
+  `<key>.username`, `<key>.password`, and `<key>.totp` (a fresh one-time code
+  generated at block start). Scout saved-credential fields with the
+  `fill_credential_field` tool; never type or embed literal secret values.
 - For extraction blocks, return precise JSON-safe structured data and the
   visible evidence text used to confirm it. Do not return only booleans for
   visible records, products, totals, confirmations, or identifiers.
@@ -910,6 +915,10 @@ def _make_agent_result(
             payload_updates["responseType"] = response_type
         if proposal_disposition is not None and "proposalDisposition" not in narrative_payload:
             payload_updates["proposalDisposition"] = proposal_disposition
+        if turn_outcome is not None and "responseKind" not in narrative_payload:
+            payload_updates["responseKind"] = turn_outcome.response_kind.value
+        if ctx is not None and "verifiedSuccess" not in narrative_payload:
+            payload_updates["verifiedSuccess"] = bool(verified_goal_satisfied_context(ctx))
         if payload_updates:
             kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
     return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
@@ -949,6 +958,8 @@ def _build_narrative_payload(
     design_activity: list[NarrativeActivityEntry] = narrator_state.design_activity if narrator_state is not None else []
     block_labels: list[str] = []
     blocks: list[NarrativeBlock] = []
+    recorded_outcome = ctx.last_run_outcome
+    outcome_labels = set(ctx.last_run_outcome_block_labels) if recorded_outcome is not None else set()
     staged = ctx.staged_workflow
     if staged is not None and getattr(staged, "workflow_definition", None) is not None:
         for block in staged.workflow_definition.blocks:
@@ -962,20 +973,23 @@ def _build_narrative_payload(
             else:
                 block_type = str(block_type_value or "task")
             raw_status = ctx.block_state_map.get(label)
-            blocks.append(
-                {
-                    "label": label,
-                    "blockType": block_type,
-                    "state": _block_ui_state(
-                        raw_status,
-                        drafted_fallback=ctx.has_staged_proposal,
-                    ),
-                    "lastSeenIteration": 0,
-                    "activity": list(block_activity.get(label, [])),
-                    "startedAt": ctx.block_started_at_map.get(label),
-                    "endedAt": ctx.block_ended_at_map.get(label),
-                }
-            )
+            block_entry: NarrativeBlock = {
+                "label": label,
+                "blockType": block_type,
+                "state": _block_ui_state(
+                    raw_status,
+                    drafted_fallback=ctx.has_staged_proposal,
+                ),
+                "lastSeenIteration": 0,
+                "activity": list(block_activity.get(label, [])),
+                "startedAt": ctx.block_started_at_map.get(label),
+                "endedAt": ctx.block_ended_at_map.get(label),
+            }
+            if recorded_outcome is not None and label in outcome_labels:
+                block_entry["outcome"] = recorded_outcome.verdict
+                if recorded_outcome.display_reason is not None:
+                    block_entry["outcomeReason"] = recorded_outcome.display_reason
+            blocks.append(block_entry)
     draft: NarrativeDraft | None = (
         {"blockCount": len(block_labels), "blockLabels": block_labels, "summary": None}
         if ctx.has_staged_proposal
@@ -2890,6 +2904,7 @@ async def _run_copilot_turn_impl(
         turn_index=turn_index,
         prior_block_count=prior_block_count,
         block_authoring_policy=copilot_config.block_authoring_policy,
+        impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry

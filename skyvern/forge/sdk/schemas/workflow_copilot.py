@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.context import ProposalDisposition, ResponseType, TurnNarrativePayload
+from skyvern.forge.sdk.copilot.run_outcome import RunOutcomeReasonCode, RunOutcomeVerdict
 from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
 
@@ -138,6 +139,7 @@ class WorkflowCopilotStreamMessageType(StrEnum):
     CONDENSING = "condensing"
     NARRATION = "narration"
     BLOCK_PROGRESS = "block_progress"
+    RUN_OUTCOME = "run_outcome"
     TURN_START = "turn_start"
     DESIGN_START = "design_start"
     DESIGN_END = "design_end"
@@ -269,6 +271,28 @@ class WorkflowCopilotBlockProgressUpdate(BaseModel):
         ..., description="BlockStatus value: running, completed, failed, terminated, timed_out, canceled, skipped"
     )
     iteration: int = Field(..., description="Agent loop iteration number this block belongs to")
+    timestamp: datetime = Field(..., description="Server timestamp")
+
+
+class WorkflowCopilotRunOutcomeUpdate(BaseModel):
+    # Emitted once as an "evaluating" hold when an ok run enters adjudication and
+    # once with the final recorded verdict; rows render success from this, not raw status.
+    type: WorkflowCopilotStreamMessageType = Field(
+        WorkflowCopilotStreamMessageType.RUN_OUTCOME, description="Message type"
+    )
+    workflow_run_id: str = Field(..., description="Workflow run the verdict applies to")
+    workflow_run_block_ids: list[str] = Field(
+        default_factory=list, description="Run-block ids of the adjudicated run; match the FE per-row keys"
+    )
+    block_labels: list[str] = Field(
+        default_factory=list, description="Block labels of the adjudicated run; key the persisted narrative payload"
+    )
+    verdict: RunOutcomeVerdict = Field(..., description="Recorded outcome verdict for the run")
+    reason_code: RunOutcomeReasonCode | None = Field(
+        None, description="Machine-readable cause for a not_demonstrated verdict"
+    )
+    display_reason: str | None = Field(None, description="Short product-safe reason for user-facing rendering")
+    iteration: int = Field(..., description="Agent loop iteration number")
     timestamp: datetime = Field(..., description="Server timestamp")
 
 

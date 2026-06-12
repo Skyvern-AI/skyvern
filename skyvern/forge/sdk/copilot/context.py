@@ -47,6 +47,8 @@ class NarrativeBlock(TypedDict):
     activity: list[NarrativeActivityEntry]
     startedAt: str | None
     endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
@@ -57,6 +59,11 @@ class TurnNarrativePayload(TypedDict):
     responseType: NotRequired[ResponseType]
     cancelled: NotRequired[bool]
     proposalDisposition: NotRequired[ProposalDisposition]
+    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    responseKind: NotRequired[str]
+    # The ADR-0005 terminal adjudication (enforcement.verified_goal_satisfied_context):
+    # True only when outcome evidence authorizes a tested-success claim.
+    verifiedSuccess: NotRequired[bool]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -338,6 +345,7 @@ class CopilotContext(AgentContext):
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None

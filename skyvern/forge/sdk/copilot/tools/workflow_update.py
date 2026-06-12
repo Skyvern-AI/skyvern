@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
 import re
+import textwrap
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from typing import Annotated, Any, Literal, NamedTuple
 
 import structlog
 import yaml
@@ -10,7 +14,11 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
-from skyvern.forge.sdk.copilot.code_block_synthesis import artifact_dependency_id, artifact_observation_ref_id
+from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    artifact_dependency_id,
+    artifact_observation_ref_id,
+    synthesize_code_block,
+)
 from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     composition_page_evidence_error,
@@ -24,6 +32,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _goal_likely_needs_more_blocks,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -32,6 +41,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -213,6 +223,9 @@ _CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
     "completion_criteria",
     "terminal_verifier_expectations",
 )
+_CREDENTIAL_FIELD_ACCESS_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(username|password|totp)\b")
+_CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
+_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
 
 
 def _code_artifact_metadata_as_tool_argument(
@@ -232,6 +245,23 @@ def _format_code_artifact_violations(violations: list[str]) -> str:
     return f"Artifact metadata has {len(violations)} contract violations; fix all of them in one update:\n{numbered}"
 
 
+def _code_artifact_validation_error_message(exc: ValidationError) -> str:
+    # Build from loc/type only; pydantic's str(exc) embeds input_value, which would
+    # carry submitted metadata values onto the scrubbing-exempt durable span.
+    parts = [
+        f"{'.'.join(str(loc) for loc in err.get('loc', ()))}: {err.get('type', 'invalid')}" for err in exc.errors()
+    ]
+    detail = "; ".join(part for part in parts if part) or "schema validation failed"
+    return f"Artifact metadata is malformed ({detail})."
+
+
+class CodeArtifactNormalization(NamedTuple):
+    normalized: dict[str, dict[str, Any]]
+    error: str | None
+    violations: list[str]
+    offending_labels: list[str]
+
+
 def _normalize_code_artifact_metadata(
     raw_metadata: Any,
     workflow_yaml: str,
@@ -239,18 +269,36 @@ def _normalize_code_artifact_metadata(
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
+    result = _normalize_code_artifact_metadata_detailed(
+        raw_metadata,
+        workflow_yaml,
+        impose_defaults=impose_defaults,
+        scout_trajectory=scout_trajectory,
+    )
+    return result.normalized, result.error
+
+
+def _normalize_code_artifact_metadata_detailed(
+    raw_metadata: Any,
+    workflow_yaml: str,
+    *,
+    impose_defaults: bool = False,
+    scout_trajectory: list[ScoutedInteraction] | None = None,
+) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
     Entries keyed to a missing code-block label are re-keyed to the single
     uncovered block or dropped, never rejected. When imposing, mechanical graph
     fields are server-defaulted (and uncovered labels get a deterministic
-    skeleton) so only contradictions reject."""
+    skeleton) so only contradictions reject. Returns the per-violation list and
+    offending labels alongside the batched error for durable telemetry."""
     if raw_metadata in (None, [], {}):
-        return {}, None
+        return CodeArtifactNormalization({}, None, [], [])
     items = _code_artifact_metadata_items(raw_metadata)
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
     violations: list[str] = []
+    offending_labels: list[str] = []
     anchored: list[dict[str, Any]] = []
     unanchored: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -262,7 +310,7 @@ def _normalize_code_artifact_metadata(
                 else CodeArtifactMetadata.model_validate(raw_item)
             )
         except ValidationError as exc:
-            violations.append(f"Artifact metadata is malformed: {exc}")
+            violations.append(_code_artifact_validation_error_message(exc))
             continue
         dumped = metadata.model_dump(mode="json", exclude_none=True)
         label = str(dumped.get("block_label") or "").strip()
@@ -327,14 +375,17 @@ def _normalize_code_artifact_metadata(
         item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
         if item_violations:
             violations.extend(item_violations)
+            offending_labels.append(label)
             continue
         normalized[label] = dumped
     if impose_defaults:
         for label in uncovered:
             normalized[label] = _imposed_artifact_skeleton(label, code_blocks[label], trajectory)
     if violations:
-        return normalized, _format_code_artifact_violations(violations)
-    return normalized, None
+        return CodeArtifactNormalization(
+            normalized, _format_code_artifact_violations(violations), violations, offending_labels
+        )
+    return CodeArtifactNormalization(normalized, None, [], [])
 
 
 def _artifact_label_fragment(label: str) -> str:
@@ -605,6 +656,394 @@ def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected:
     return "I need to adjust how the workflow verifies its results before testing."
 
 
+@dataclass
+class _SynthesizedCodeImpositionResult:
+    workflow_yaml: str
+    substitutions: dict[str, Any] | None = None
+    violations: list[str] = dataclass_field(default_factory=list)
+
+
+_SUBMITTED_LITERAL_METHODS = frozenset({"fill", "type"})
+_SECRET_LIKE_LITERAL_RE = re.compile(
+    r"(?:password|passwd|token|secret|api[_-]?key|credential|bearer\s+|sk-[a-zA-Z0-9])",
+    re.I,
+)
+
+
+def _compiled_authoring_user_summary() -> str:
+    return "I need to bind the compiled browser-step code safely before saving this workflow."
+
+
+def _prior_yaml_source(ctx: AgentContext) -> tuple[str, str | None]:
+    last_yaml = getattr(ctx, "last_workflow_yaml", None)
+    if isinstance(last_yaml, str) and last_yaml:
+        return "last_workflow_yaml", last_yaml
+    workflow_yaml = getattr(ctx, "workflow_yaml", None)
+    return "workflow_yaml", workflow_yaml if isinstance(workflow_yaml, str) else None
+
+
+def _workflow_code_blocks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        block
+        for block in workflow_blocks(parsed)
+        if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value
+    ]
+
+
+def _submitted_code_block_changed(block: Mapping[str, Any], prior_yaml: str | None) -> bool:
+    label = str(block.get("label") or "").strip()
+    if not label or not prior_yaml:
+        return True
+    prior = parse_workflow_yaml(prior_yaml)
+    if not isinstance(prior, dict):
+        return True
+    for prior_block in _workflow_code_blocks(prior):
+        if str(prior_block.get("label") or "").strip() != label:
+            continue
+        return str(prior_block.get("code") or "") != str(block.get("code") or "")
+    return True
+
+
+def _wrapped_code_ast(code: str) -> ast.AST | None:
+    body = "\n".join(f"    {line}" for line in code.splitlines())
+    if not body.strip():
+        body = "    pass"
+    try:
+        return ast.parse(f"async def __submitted_code__():\n{body}\n")
+    except SyntaxError:
+        return None
+
+
+def _is_page_locator_expression(value: ast.AST) -> bool:
+    if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
+        return False
+    if value.func.attr not in {"locator", "get_by_role"}:
+        return False
+    return isinstance(value.func.value, ast.Name) and value.func.value.id == "page"
+
+
+def _single_assignment_string_literals(tree: ast.AST) -> dict[str, str]:
+    assignments: dict[str, list[str | None]] = {}
+
+    def record(name: str, value: ast.AST | None) -> None:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            assignments.setdefault(name, []).append(value.value)
+        else:
+            assignments.setdefault(name, []).append(None)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    record(target.id, node.value)
+            continue
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            record(node.target.id, node.value)
+            continue
+        if isinstance(node, (ast.AugAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name):
+            record(node.target.id, None)
+            continue
+        if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
+            record(node.target.id, None)
+
+    return {name: values[0] for name, values in assignments.items() if len(values) == 1 and values[0] is not None}
+
+
+def _string_literal_argument(first_arg: ast.AST, assignment_literals: Mapping[str, str]) -> str | None:
+    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+        return first_arg.value
+    if isinstance(first_arg, ast.Name):
+        return assignment_literals.get(first_arg.id)
+    if (
+        isinstance(first_arg, ast.Call)
+        and isinstance(first_arg.func, ast.Name)
+        and first_arg.func.id == "str"
+        and len(first_arg.args) == 1
+        and isinstance(first_arg.args[0], ast.Name)
+        and not first_arg.keywords
+    ):
+        return assignment_literals.get(first_arg.args[0].id)
+    return None
+
+
+def _submitted_fill_type_arguments(code: str) -> list[str | None]:
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return []
+    assignment_literals = _single_assignment_string_literals(tree)
+    arguments: list[str | None] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in _SUBMITTED_LITERAL_METHODS:
+            continue
+        if not _is_page_locator_expression(func.value):
+            arguments.append(None)
+            continue
+        if not node.args:
+            arguments.append(None)
+            continue
+        arguments.append(_string_literal_argument(node.args[0], assignment_literals))
+    return arguments
+
+
+def _safe_singleton_literal_for_parameter(
+    code: str, parameter_key: str, typed_length: int | None
+) -> tuple[str | None, str | None]:
+    arguments = _submitted_fill_type_arguments(code)
+    if len(arguments) != 1 or arguments[0] is None:
+        return (
+            None,
+            f"Unable to bind synthesized parameter `{parameter_key}`: submitted code must contain exactly one direct browser-locator string literal fill/type call or single local string constant binding.",
+        )
+    literal = arguments[0]
+    if _SECRET_LIKE_LITERAL_RE.search(literal):
+        return None, f"Unable to bind synthesized parameter `{parameter_key}`: submitted literal looks credential-like."
+    if typed_length is not None and typed_length > 0 and len(literal) != typed_length:
+        return (
+            None,
+            f"Unable to bind synthesized parameter `{parameter_key}`: submitted literal length does not match the scout record.",
+        )
+    return literal, None
+
+
+def _is_credential_parameter(parameter: Mapping[str, Any]) -> bool:
+    parameter_type = str(parameter.get("parameter_type") or "").lower()
+    workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+    return parameter_type == "credential" or (
+        parameter_type == "workflow" and workflow_parameter_type == "credential_id"
+    )
+
+
+def _submitted_string_parameter_default(
+    parameters: list[Any],
+    *,
+    synthesized_key: str,
+    typed_length: int | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    candidates: list[dict[str, Any]] = []
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            continue
+        candidate_key = str(parameter.get("key") or "").strip()
+        if not candidate_key or candidate_key == synthesized_key:
+            continue
+        if _is_credential_parameter(parameter):
+            continue
+        parameter_type = str(parameter.get("parameter_type") or "").lower()
+        workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+        if parameter_type and parameter_type != "workflow":
+            continue
+        if workflow_parameter_type and workflow_parameter_type != "string":
+            continue
+        default_value = parameter.get("default_value")
+        if isinstance(default_value, str):
+            candidates.append(parameter)
+
+    if len(candidates) != 1:
+        return None, None
+
+    candidate = candidates[0]
+    default_value = str(candidate.get("default_value") or "")
+    if _SECRET_LIKE_LITERAL_RE.search(default_value):
+        return (
+            None,
+            f"Unable to bind synthesized parameter `{synthesized_key}`: submitted parameter default looks credential-like.",
+        )
+    if typed_length is not None and typed_length > 0 and len(default_value) != typed_length:
+        return (
+            None,
+            f"Unable to bind synthesized parameter `{synthesized_key}`: submitted parameter default length does not match the scout record.",
+        )
+    return candidate, None
+
+
+def _reconcile_synthesized_parameters(
+    *,
+    parsed: dict[str, Any],
+    code_block: dict[str, Any],
+    submitted_code: str,
+    synthesized_parameters: list[dict[str, str]],
+    scout_trajectory: list[ScoutedInteraction],
+) -> tuple[list[str], list[str]]:
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return [], ["Unable to bind synthesized parameters: workflow_definition is missing."]
+    parameters = workflow_definition.get("parameters")
+    if parameters is None:
+        parameters = []
+        workflow_definition["parameters"] = parameters
+    if not isinstance(parameters, list):
+        return [], ["Unable to bind synthesized parameters: workflow_definition.parameters must be a list."]
+
+    existing_by_key = {
+        str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
+    }
+    existing_credentials = credential_params(parameters)
+    parameter_keys: list[str] = []
+    violations: list[str] = []
+    non_credential_synthesized = [param for param in synthesized_parameters if not param.get("credential_id")]
+    typed_lengths = [
+        int(interaction.get("typed_length") or 0)
+        for interaction in scout_trajectory
+        if str(interaction.get("tool_name") or "") == "type_text"
+    ]
+
+    for synthesized_param in synthesized_parameters:
+        key = str(synthesized_param.get("key") or "").strip()
+        if not key:
+            violations.append("Unable to bind synthesized parameter: parameter key is missing.")
+            continue
+        if key in parameter_keys:
+            violations.append(f"Unable to bind synthesized parameter `{key}`: duplicate synthesized key.")
+            continue
+        parameter_keys.append(key)
+
+        credential_id = str(synthesized_param.get("credential_id") or "").strip()
+        existing = existing_by_key.get(key)
+        if credential_id:
+            if existing is not None:
+                if existing_credentials.get(key) != credential_id:
+                    violations.append(
+                        f"Unable to bind synthesized credential parameter `{key}`: submitted credential binding does not match scout metadata."
+                    )
+                continue
+            parameters.append(
+                {
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "credential_id",
+                    "key": key,
+                    "default_value": credential_id,
+                }
+            )
+            continue
+
+        if existing is not None:
+            if _is_credential_parameter(existing):
+                violations.append(
+                    f"Unable to bind synthesized parameter `{key}`: submitted parameter is credential-typed."
+                )
+            continue
+
+        if len(non_credential_synthesized) != 1:
+            violations.append(
+                f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
+            )
+            continue
+
+        typed_length = typed_lengths[0] if len(typed_lengths) == 1 else None
+        submitted_parameter, error = _submitted_string_parameter_default(
+            parameters,
+            synthesized_key=key,
+            typed_length=typed_length,
+        )
+        if error:
+            violations.append(error)
+            continue
+        if submitted_parameter is not None:
+            submitted_parameter["parameter_type"] = "workflow"
+            submitted_parameter["workflow_parameter_type"] = "string"
+            submitted_parameter["key"] = key
+            continue
+
+        literal, error = _safe_singleton_literal_for_parameter(submitted_code, key, typed_length)
+        if error:
+            violations.append(error)
+            continue
+        parameters.append(
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": key,
+                "default_value": literal,
+            }
+        )
+
+    code_block["parameter_keys"] = parameter_keys
+    return parameter_keys, violations
+
+
+def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) -> _SynthesizedCodeImpositionResult:
+    if not getattr(ctx, "impose_synthesized_code_block", False):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    if getattr(ctx, "update_workflow_called", False):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+
+    scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(scout_trajectory, list) or not scout_trajectory:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    first_source_url = str(scout_trajectory[0].get("source_url") or "").strip()
+    if not first_source_url:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    code_blocks = _workflow_code_blocks(parsed)
+    if len(code_blocks) != 1:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+    code_block = code_blocks[0]
+    submitted_code = str(code_block.get("code") or "")
+
+    prior_source, prior_yaml = _prior_yaml_source(ctx)
+    if not _submitted_code_block_changed(code_block, prior_yaml):
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
+
+    synthesized = synthesize_code_block(scout_trajectory, strict_selectors=True)
+    if synthesized is None:
+        return _SynthesizedCodeImpositionResult(
+            workflow_yaml=workflow_yaml,
+            violations=["Unable to impose synthesized code block: scout trajectory produced no runnable code."],
+        )
+
+    diagnostics = synthesized.diagnostics
+    violations: list[str] = []
+    if diagnostics.truncated:
+        violations.append("Unable to impose synthesized code block: scout trajectory was truncated.")
+    for dropped in diagnostics.dropped_interactions:
+        reason = str(dropped.get("reason_code") or "unknown")
+        tool_name = str(dropped.get("tool_name") or "unknown")
+        index = dropped.get("trajectory_index", "?")
+        violations.append(
+            f"Unable to impose synthesized code block: dropped scout interaction {index} from `{tool_name}` ({reason})."
+        )
+    for provenance in diagnostics.locator_provenance:
+        if provenance.get("source") != "selector" or provenance.get("selector") != provenance.get("emitted_literal"):
+            violations.append("Unable to impose synthesized code block: locator provenance was not byte-equal.")
+            break
+
+    parameter_keys, parameter_violations = _reconcile_synthesized_parameters(
+        parsed=parsed,
+        code_block=code_block,
+        submitted_code=submitted_code,
+        synthesized_parameters=synthesized.parameters,
+        scout_trajectory=scout_trajectory,
+    )
+    violations.extend(parameter_violations)
+    if violations:
+        return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml, violations=violations)
+
+    code_block["code"] = textwrap.dedent(synthesized.code).lstrip("\n")
+    credential_parameter_keys = [
+        str(param.get("key") or "") for param in synthesized.parameters if str(param.get("credential_id") or "").strip()
+    ]
+    substitutions = {
+        "block_label": str(code_block.get("label") or ""),
+        "source_trajectory_count": len(scout_trajectory),
+        "parameter_keys": parameter_keys,
+        "credential_parameter_keys": credential_parameter_keys,
+        "selector_provenance": diagnostics.locator_provenance,
+        "prior_source": prior_source,
+    }
+    return _SynthesizedCodeImpositionResult(
+        workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
+        substitutions=substitutions,
+    )
+
+
 def _code_artifact_metadata_shape_errors(label: str, artifact: Mapping[str, Any]) -> list[str]:
     """Return every shape violation for one artifact; the caller aggregates them."""
     errors: list[str] = []
@@ -699,6 +1138,102 @@ def _artifact_string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _credentialed_code_block_scout_gate_errors(
+    workflow_yaml: str | None,
+    ctx: AgentContext,
+) -> list[str]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return []
+    if not workflow_yaml:
+        return []
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return []
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return []
+    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    if not credential_params_by_key:
+        return []
+    scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(scout_trajectory, list):
+        scout_trajectory = []
+
+    errors: list[str] = []
+    for block in workflow_blocks(parsed):
+        if _enum_or_string_name(block.get("block_type")) != BlockType.CODE.value:
+            continue
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        required_fields_by_credential: dict[str, set[str]] = {}
+        for parameter_key, field in _CREDENTIAL_FIELD_ACCESS_RE.findall(code):
+            credential_id = credential_params_by_key.get(parameter_key)
+            if credential_id:
+                required_fields_by_credential.setdefault(credential_id, set()).add(field)
+        if not required_fields_by_credential:
+            continue
+
+        matched_fill_indexes: list[int] = []
+        matched_source_urls: set[str] = set()
+        missing_fields: list[str] = []
+        for credential_id, required_fields in required_fields_by_credential.items():
+            matched_fields: set[str] = set()
+            for index, interaction in enumerate(scout_trajectory):
+                if str(interaction.get("tool_name") or "").strip() != "fill_credential_field":
+                    continue
+                if str(interaction.get("credential_id") or "").strip() != credential_id:
+                    continue
+                field = str(interaction.get("credential_field") or "").strip()
+                if field not in required_fields:
+                    continue
+                matched_fields.add(field)
+                matched_fill_indexes.append(index)
+                source_url = str(interaction.get("source_url") or "").strip()
+                if source_url:
+                    matched_source_urls.add(source_url)
+            for field in sorted(required_fields - matched_fields):
+                missing_fields.append(field)
+
+        requires_submit = bool(_CODE_SUBMIT_ACTION_RE.search(code))
+        missing_submit = False
+        if requires_submit:
+            latest_fill_index = max(matched_fill_indexes, default=-1)
+            if latest_fill_index < 0:
+                missing_submit = True
+            else:
+                missing_submit = True
+                for index, interaction in enumerate(scout_trajectory):
+                    if index <= latest_fill_index:
+                        continue
+                    if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+                        continue
+                    source_url = str(interaction.get("source_url") or "").strip()
+                    if matched_source_urls and source_url not in matched_source_urls:
+                        continue
+                    missing_submit = False
+                    break
+
+        if not missing_fields and not missing_submit:
+            continue
+
+        block_label = str(block.get("label") or "").strip() or "this code block"
+        requirements: list[str] = []
+        if missing_fields:
+            joined_fields = ", ".join(f"`{field}`" for field in missing_fields)
+            requirements.append(f"successful `fill_credential_field` scouting for {joined_fields}")
+        if missing_submit:
+            requirements.append("a later submit action on the same page")
+        requirement_text = " and ".join(requirements)
+        errors.append(
+            f"Code block `{block_label}` reads saved credential fields, but the current debug-browser scout "
+            f"record is missing {requirement_text}. First scout the live form with `fill_credential_field` for "
+            "each referenced credential field, then click the submit control or press Enter in the debug browser "
+            "before retrying `update_workflow` or `update_and_run_blocks`."
+        )
+    return errors
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -715,13 +1250,26 @@ async def _update_workflow(
     ctx.raw_block_observation_refs = params.get("raw_block_observation_refs", params.get("block_observation_refs"))
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
+    imposition = _maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+    if imposition.violations:
+        return {
+            "ok": False,
+            "error": "\n".join(imposition.violations),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+        }
+    workflow_yaml = imposition.workflow_yaml
+    params["workflow_yaml"] = workflow_yaml
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
-    code_artifact_metadata, code_artifact_metadata_error = _normalize_code_artifact_metadata(
+    normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),
         workflow_yaml,
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
     )
+    code_artifact_metadata = normalization.normalized
+    code_artifact_metadata_error = normalization.error
+    if code_artifact_metadata_error is not None:
+        record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     # Per-label salvage keeps conforming metadata across a rejection; a
@@ -749,6 +1297,15 @@ async def _update_workflow(
             "user_facing_summary": _code_seam_rejection_user_summary(
                 metadata_rejected=code_artifact_metadata_error is not None,
                 code_rejected=bool(code_safety_errors),
+            ),
+        }
+    credential_scout_errors = _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    if credential_scout_errors:
+        return {
+            "ok": False,
+            "error": "\n".join(credential_scout_errors),
+            "user_facing_summary": (
+                "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
             ),
         }
     if allow_missing_credentials is None:
@@ -887,12 +1444,15 @@ async def _update_workflow(
                 await emit_workflow_draft(ctx.stream, ctx, workflow)
             except Exception as emit_err:
                 LOG.warning("copilot_narrative_workflow_draft_emit_failed", error=str(emit_err))
+        data: dict[str, Any] = {
+            "message": "Workflow updated successfully.",
+            "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
+        }
+        if imposition.substitutions is not None:
+            data["imposed_substitutions"] = imposition.substitutions
         return {
             "ok": True,
-            "data": {
-                "message": "Workflow updated successfully.",
-                "block_count": len(workflow.workflow_definition.blocks) if workflow.workflow_definition else 0,
-            },
+            "data": data,
             "_workflow": workflow,
         }
     except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException) as e:

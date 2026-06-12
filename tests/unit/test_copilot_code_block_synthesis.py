@@ -12,6 +12,7 @@ from typing import Any
 
 from skyvern.forge.sdk.copilot.code_block_preflight import preflight_code_block
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
+    _MAX_STEPS,
     _SYNTHESIZED_BLOCK_LABEL,
     build_synthesized_artifact_metadata,
     render_synthesized_offer_text,
@@ -368,15 +369,113 @@ class TestTrajectoryFidelity:
         for key in keys:
             assert f"fill(str({key}))" in result.code
 
-    def test_step_cap_truncates_at_twenty(self) -> None:
+    def test_step_cap_truncates_at_configured_limit(self) -> None:
         trajectory = [
             _interaction("click", selector=f'role=button[name="b{i}"]', source_url="https://example.com/")
-            for i in range(25)
+            for i in range(_MAX_STEPS + 5)
         ]
         result = synthesize_code_block(trajectory)
         assert result is not None
-        assert result.code.count(".click()") == 20
+        assert result.code.count(".click()") == _MAX_STEPS
+        assert result.diagnostics.truncated is True
         assert any("truncated" in note for note in result.notes)
+
+    def test_strict_synthesis_emits_byte_equal_selector_provenance(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#provInput",
+                    source_url="https://example.com/find-care",
+                    typed_length=13,
+                    role="textbox",
+                    accessible_name="Provider Name",
+                )
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in result.code
+        assert result.diagnostics.dropped_interactions == []
+        assert result.diagnostics.locator_provenance == [
+            {
+                "trajectory_index": 0,
+                "selector": "#provInput",
+                "emitted_literal": "#provInput",
+                "source": "selector",
+            }
+        ]
+
+    def test_strict_synthesis_reports_unsupported_interaction(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction("click", selector="#open", source_url="https://example.com/"),
+                _interaction("hover", selector="#menu", source_url="https://example.com/"),
+            ],
+            strict_selectors=True,
+        )
+
+        assert result is not None
+        assert result.diagnostics.dropped_interactions == [
+            {"trajectory_index": 1, "tool_name": "hover", "reason_code": "unsupported_tool"}
+        ]
+
+    def test_synthesis_scrubs_credentials_from_emitted_url_literals(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                )
+            ]
+        )
+        metadata = build_synthesized_artifact_metadata(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://user:password@example.com/search?token=secret-token&q=provider#access_token=fragment-token&section=results",
+                )
+            ]
+        )
+
+        assert result is not None
+        assert "user:password" not in result.code
+        assert "secret-token" not in result.code
+        assert "fragment-token" not in result.code
+        assert "q=provider" in result.code
+        assert "section=results" in result.code
+        page_dependency = metadata["page_dependencies"][0]
+        assert page_dependency["url_hint"] == (
+            "https://example.com/search?token=__redacted__&q=provider#access_token=__redacted__&section=results"
+        )
+
+    def test_synthesis_scrubs_bare_sensitive_url_fragments(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                )
+            ]
+        )
+        metadata = build_synthesized_artifact_metadata(
+            [
+                _interaction(
+                    "click",
+                    selector="#go",
+                    source_url="https://example.com/search?q=provider#secret-token-fragment",
+                )
+            ]
+        )
+
+        assert result is not None
+        assert "secret-token-fragment" not in result.code
+        assert 'await page.goto("https://example.com/search?q=provider#__redacted__")' in result.code
+        assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=provider#__redacted__"
 
 
 class TestDeterminismAndEmpty:
@@ -646,6 +745,158 @@ class TestSynthesizedArtifactMetadata:
         text = render_synthesized_offer_text(synthesized)
         assert "code_artifact_metadata" not in text
         assert "```json" not in text
+
+
+class TestCredentialFillSynthesis:
+    """A scouted fill_credential_field compiles into an attribute read on a
+    credential-bound parameter — references only, never values."""
+
+    def _credential_fill(self, **overrides: Any) -> dict[str, Any]:
+        fields = {
+            "selector": "#userName",
+            "source_url": "https://authenticationtest.com/simpleFormAuth/",
+            "typed_length": 24,
+            "credential_id": "cred_123",
+            "credential_field": "username",
+            "credential_name": "authtest simple",
+        }
+        fields.update(overrides)
+        return _interaction("fill_credential_field", **fields)
+
+    def test_emits_attribute_fill_and_credential_parameter(self) -> None:
+        result = synthesize_code_block([self._credential_fill()])
+        assert result is not None
+        assert 'await page.locator("#userName").fill(authtest_simple.username)' in result.code
+        assert result.parameters == [{"key": "authtest_simple", "credential_id": "cred_123"}]
+
+    def test_same_credential_shares_one_parameter(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(),
+                self._credential_fill(selector="#passwordInput", credential_field="password", typed_length=12),
+            ]
+        )
+        assert result is not None
+        assert 'await page.locator("#userName").fill(authtest_simple.username)' in result.code
+        assert 'await page.locator("#passwordInput").fill(authtest_simple.password)' in result.code
+        assert result.parameters == [{"key": "authtest_simple", "credential_id": "cred_123"}]
+
+    def test_totp_field_reads_totp_attribute(self) -> None:
+        result = synthesize_code_block(
+            [self._credential_fill(selector="#totpCode", credential_field="totp", typed_length=6)]
+        )
+        assert result is not None
+        assert 'await page.locator("#totpCode").fill(authtest_simple.totp)' in result.code
+
+    def test_missing_credential_reference_is_dropped_with_note(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(credential_id=""),
+                _interaction("click", selector="#next", source_url="https://example.com/login"),
+            ]
+        )
+        assert result is not None
+        assert ".fill(" not in result.code
+        assert result.parameters == []
+        assert any("credential" in note for note in result.notes)
+
+    def test_unknown_credential_field_is_dropped(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(credential_field="cvv"),
+                _interaction("click", selector="#next", source_url="https://example.com/login"),
+            ]
+        )
+        assert result is not None
+        assert ".fill(" not in result.code
+        assert result.parameters == []
+
+    def test_param_key_defaults_when_credential_name_missing(self) -> None:
+        result = synthesize_code_block([self._credential_fill(credential_name="")])
+        assert result is not None
+        assert ".fill(credential.username)" in result.code
+        assert result.parameters == [{"key": "credential", "credential_id": "cred_123"}]
+
+    def test_credential_param_key_does_not_collide_with_typed_param(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#company",
+                    source_url="https://example.com/form",
+                    typed_length=6,
+                    role="textbox",
+                    accessible_name="authtest simple",
+                ),
+                self._credential_fill(),
+            ]
+        )
+        assert result is not None
+        assert result.parameters[0] == {"key": "authtest_simple"}
+        assert result.parameters[1] == {"key": "authtest_simple_2", "credential_id": "cred_123"}
+        assert ".fill(authtest_simple_2.username)" in result.code
+
+    def test_offer_text_carries_credential_binding_contract(self) -> None:
+        trajectory = [self._credential_fill()]
+        synthesized = synthesize_code_block(trajectory)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, trajectory)
+        assert "`authtest_simple` -> `cred_123`" in text
+        assert "workflow_parameter_type: credential_id" in text
+        assert "default_value" in text
+        assert ".username` / `.password` / `.totp`" in text
+        assert "authtest_simple" not in [p.get("key") for p in synthesized.parameters if "credential_id" not in p]
+
+    def test_credential_parameters_excluded_from_plain_bind_line(self) -> None:
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector="#q",
+                source_url="https://example.com/",
+                typed_length=4,
+                role="textbox",
+                accessible_name="Search",
+            ),
+            self._credential_fill(),
+        ]
+        synthesized = synthesize_code_block(trajectory)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, trajectory)
+        assert "Workflow parameters referenced (bind these): search." in text
+        assert "Credential parameters referenced" in text
+
+    def test_plain_param_never_takes_a_bare_credential_field_name(self) -> None:
+        # CodeBlock.execute injects a bound credential's fields under the bare
+        # names username/password/totp, so a plain typed parameter must not
+        # claim those keys or it would resolve to the secret value at runtime.
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "type_text",
+                    selector="#confirm",
+                    source_url="https://example.com/form",
+                    typed_length=8,
+                    role="textbox",
+                    accessible_name="Password",
+                ),
+                self._credential_fill(),
+            ]
+        )
+        assert result is not None
+        assert result.parameters[0] == {"key": "password_field"}
+        assert "fill(str(password_field))" in result.code
+        assert {"key": "password"} not in result.parameters
+
+    def test_synthesized_credential_code_is_valid_python(self) -> None:
+        result = synthesize_code_block(
+            [
+                self._credential_fill(),
+                self._credential_fill(selector="#passwordInput", credential_field="password"),
+            ]
+        )
+        assert result is not None
+        wrapped = "async def _block(page, authtest_simple):\n" + result.code
+        ast.parse(wrapped)
 
 
 def test_code_block_preflight_restores_recursion_limit() -> None:

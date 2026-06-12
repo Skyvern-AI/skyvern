@@ -11,7 +11,12 @@ from skyvern.forge.sdk.copilot.output_utils import (
     looks_like_workflow_delivery_claim,
     looks_like_workflow_yaml_in_chat,
 )
-from skyvern.forge.sdk.copilot.request_policy import RAW_SECRET_PATTERNS, RequestPolicy, contains_email_password_pair
+from skyvern.forge.sdk.copilot.request_policy import (
+    RAW_SECRET_PATTERNS,
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
+    RequestPolicy,
+    contains_email_password_pair,
+)
 from skyvern.forge.sdk.copilot.workflow_credential_utils import (
     block_credential_ids,
     credential_params,
@@ -25,6 +30,18 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import (
 WORKFLOW_PRESENT_SENTINEL = object()
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
 _PLACEHOLDER_MARKERS = ("{{", "{%", "[REDACTED_SECRET]")
+# RHS of a secret-keyword assignment that references a bound value instead of carrying one:
+# a `parameters`-rooted lookup (quoted-key subscript / .get / attribute), or an attribute
+# chain ending in a credential field (`cred.password`), optionally wrapped in str(...).
+# Fully anchored — only closing punctuation may follow, so a literal appended to a
+# reference (`cred.password+"hunter2"`) or a dotted literal (a JWT) never passes.
+_SANCTIONED_SECRET_REFERENCE_RE = re.compile(
+    r"^(?:str\()?"
+    r"(?:parameters(?:\[(?:'[^']*'|\"[^\"]*\")\]|\.get\((?:'[^']*'|\"[^\"]*\")\)|(?:\.[A-Za-z_][A-Za-z0-9_]*)+)"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.(?:username|password|totp))"
+    r"[)\]\},;.'\"]*$"
+)
+_SECRET_ASSIGNMENT_RHS_RE = re.compile(r"[:=]\s*(\S+)\s*$")
 _UNVALIDATED_PROPOSAL_AFFORDANCE_RE = re.compile(
     r"\baccept\b(?=[\s\S]{0,120}\bsav(?:e|ed|ing)\b)(?=[\s\S]{0,160}\b(?:reject|discard)\b)",
     re.IGNORECASE,
@@ -369,9 +386,20 @@ def _contains_raw_secret(value: Any) -> bool:
             return True
         for pattern in RAW_SECRET_PATTERNS:
             for match in pattern.finditer(text):
-                if not any(marker in match.group(0) for marker in _PLACEHOLDER_MARKERS):
-                    return True
+                matched = match.group(0)
+                if any(marker in matched for marker in _PLACEHOLDER_MARKERS):
+                    continue
+                if pattern is SECRET_KEYWORD_ASSIGNMENT_PATTERN and _is_sanctioned_secret_reference(matched):
+                    continue
+                return True
     return False
+
+
+def _is_sanctioned_secret_reference(matched: str) -> bool:
+    rhs_match = _SECRET_ASSIGNMENT_RHS_RE.search(matched)
+    if rhs_match is None:
+        return False
+    return bool(_SANCTIONED_SECRET_REFERENCE_RE.match(rhs_match.group(1)))
 
 
 def _contains_internal_tool_instruction(user_response: str | None) -> bool:

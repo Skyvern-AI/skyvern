@@ -31,6 +31,7 @@ from .page_observation import (
     _resolve_url_title,
 )
 from .scouting import (
+    _attach_scout_page_summary,
     _capture_scout_source_url,
     _clear_pending_browser_interaction_observation,
     _consume_scout_source_url,
@@ -105,6 +106,7 @@ async def _get_block_schema_post_hook(
                 "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
                 "Call update_and_run_blocks with a connected runnable set of real code blocks instead of validating dummy or probe blocks.",
                 "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
+                "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
             ]
     return result
 
@@ -319,12 +321,14 @@ async def _click_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
@@ -418,12 +422,14 @@ async def _type_text_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="type_text", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 
@@ -510,12 +516,14 @@ async def _select_option_post_hook(
             role=role,
             accessible_name=accessible_name,
         )
-        observation_step = _register_scout_interaction_observation(
+        observation_step, page_evidence = await _register_scout_interaction_observation(
             ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
             result["data"]["observation_step"] = observation_step
+        if page_evidence is not None:
+            _attach_scout_page_summary(result, page_evidence)
     return result
 
 

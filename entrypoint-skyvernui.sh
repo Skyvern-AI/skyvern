@@ -28,8 +28,11 @@ VITE_ENABLE_2FA_NOTIFICATIONS="${VITE_ENABLE_2FA_NOTIFICATIONS:-false}"
 # 1. Environment variable (from .env file or docker-compose environment),
 #    but only if it's not a placeholder/sentinel value. Both the Dockerfile
 #    default (__SKYVERN_API_KEY_PLACEHOLDER__) and the .env.example default
-#    (YOUR_API_KEY) can leak through if users skip configuration. Keep this
-#    filter list aligned with the frontend's PLACEHOLDER_VALUES.
+#    (YOUR_API_KEY) can leak through if users skip configuration. Keep these
+#    sentinels aligned with the frontend's placeholder check in
+#    skyvern-frontend/src/util/env.ts (which matches the Docker sentinel by
+#    its _PLACEHOLDER__ suffix — the sed below rewrites every occurrence of
+#    the full sentinel in the bundle, so the frontend must never spell it out).
 # 2. Generated credentials file from the backend first-run setup
 #    (volume-mounted at /app/.skyvern/credentials.toml in docker-compose)
 VITE_SKYVERN_API_KEY="${VITE_SKYVERN_API_KEY:-}"
