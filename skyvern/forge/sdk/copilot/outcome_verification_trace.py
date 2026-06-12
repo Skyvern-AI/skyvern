@@ -19,6 +19,9 @@ LOG = structlog.get_logger()
 
 _SNAPSHOT_ATTR = "outcome_verification_trace_snapshot"
 _COMPLETION_PREFIX = "completion_verification_"
+_CODE_ARTIFACT_VIOLATIONS_KEY = "copilot.code_artifact_violations"
+_CODE_ARTIFACT_VIOLATION_LABELS_KEY = "copilot.code_artifact_violation_block_labels"
+_CODE_ARTIFACT_VIOLATION_COUNT_KEY = "copilot.code_artifact_violation_count"
 
 
 def _snapshot(ctx: Any) -> dict[str, Any] | None:
@@ -40,6 +43,26 @@ def record_gate_decision(ctx: Any, fields: dict[str, Any]) -> None:
             snapshot.update(fields)
     except Exception:
         LOG.warning("failed to record copilot gate decision telemetry", exc_info=True)
+
+
+def record_code_artifact_violations(ctx: Any, violations: list[str], offending_labels: list[str]) -> None:
+    """Persist the code-artifact-metadata violation batch onto the turn snapshot.
+
+    The strings carry schema field names and the graph's structural identifiers
+    (block labels, claim/dependency/expectation ids) but never free-text content,
+    so they ride the prod span verbatim without value-scrubbing.
+    """
+    try:
+        if not violations:
+            return
+        snapshot = _snapshot(ctx)
+        if snapshot is None:
+            return
+        snapshot[_CODE_ARTIFACT_VIOLATIONS_KEY] = [str(message) for message in violations]
+        snapshot[_CODE_ARTIFACT_VIOLATION_LABELS_KEY] = sorted({str(label) for label in offending_labels if str(label)})
+        snapshot[_CODE_ARTIFACT_VIOLATION_COUNT_KEY] = len(violations)
+    except Exception:
+        LOG.warning("failed to record copilot code artifact violation telemetry", exc_info=True)
 
 
 def record_completion_verification(ctx: Any, result: Any | None) -> None:

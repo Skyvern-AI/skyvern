@@ -105,6 +105,7 @@ async def _get_block_schema_post_hook(
                 "Use concrete selectors and text anchors found during exploration. If only intent targeting is available, inspect the page again before mutating.",
                 "Call update_and_run_blocks with a connected runnable set of real code blocks instead of validating dummy or probe blocks.",
                 "Keep block outputs JSON-safe and include visible evidence text when extracting records, products, totals, confirmations, or identifiers.",
+                "For saved credentials: bind the credential as a workflow parameter with workflow_parameter_type credential_id and the credential ID in default_value. At runtime the parameter key resolves to a credential object — read <key>.username, <key>.password, and <key>.totp (a fresh one-time code generated when the block starts). Never put literal secret values in code; scout credential fields with fill_credential_field.",
             ]
     return result
 

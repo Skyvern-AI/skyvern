@@ -315,6 +315,119 @@ def test_rejects_raw_secret_in_structured_tool_arguments() -> None:
     assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
 
 
+class TestSanctionedSecretReferenceIdiom:
+    """`password = parameters[...]` / attribute-chain reads are references to bound
+    values, not leaks — the code-only authoring idiom must pass the syntactic
+    backstop while literal values keep blocking."""
+
+    def test_allows_parameters_subscript_assignment_in_tool_arguments(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": 'code: |\n  password = parameters["login_credential"]'},
+        )
+
+        assert verdict.allowed
+
+    def test_allows_credential_attribute_read_in_workflow_yaml(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            workflow_yaml=(
+                "code: |\n"
+                "  username = login_credential.username\n"
+                "  password = login_credential.password\n"
+                '  await page.locator("#passwordInput").fill(login_credential.password)\n'
+            ),
+        )
+
+        assert verdict.allowed
+
+    def test_allows_str_wrapped_parameter_reference(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": 'code: |\n  token = str(parameters.get("api_token"))'},
+        )
+
+        assert verdict.allowed
+
+    def test_still_rejects_literal_appended_to_reference(self) -> None:
+        for rhs in (
+            'login_credential.password+"hunter2"',
+            'str(login_credential.password)+"hunter2"',
+            'parameters["cred"]or"hunter2"',
+        ):
+            verdict = evaluate_output_policy(
+                request_policy=_policy(),
+                tool_arguments={"workflow_yaml": f"code: |\n  password = {rhs}"},
+            )
+
+            assert not verdict.allowed, rhs
+            assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_allows_keyword_argument_reference_with_closing_paren(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": 'code: |\n  await do_login(password=parameters["cred"])'},
+        )
+
+        assert verdict.allowed
+
+    def test_still_rejects_jwt_shaped_literal_assignment(self) -> None:
+        # A dotted literal (JWT-shaped) must not pass as an "attribute chain".
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  token = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig"},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_dotted_literal_not_ending_in_credential_field(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "code: |\n  password = admin.password123"},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_quoted_literal_assignment(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": 'code: |\n  password = "hunter2"'},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_bare_literal_assignment(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={"workflow_yaml": "password: hunter2"},
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_still_rejects_email_password_pair_next_to_reference_idiom(self) -> None:
+        verdict = evaluate_output_policy(
+            request_policy=_policy(),
+            tool_arguments={
+                "workflow_yaml": 'code: |\n  password = parameters["cred"]\nnotes: qa.user@example.test:FakePass123!'
+            },
+        )
+
+        assert not verdict.allowed
+        assert OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes
+
+    def test_chat_surface_request_policy_detection_is_unchanged(self) -> None:
+        # The pre-agent chat-surface detector stays conservative: even the code
+        # idiom pasted into chat still counts as a raw-secret signal there.
+        from skyvern.forge.sdk.copilot.request_policy import _raw_secret_detected
+
+        assert _raw_secret_detected("password: hunter2")
+        assert _raw_secret_detected('password = parameters["cred"]')
+
+
 def test_rejects_bulk_colon_delimited_credentials_in_tool_arguments() -> None:
     verdict = evaluate_output_policy(
         request_policy=_policy(),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 
 import structlog
 import yaml
@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _goal_likely_needs_more_blocks,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
+from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
     format_output_policy_tool_error,
@@ -32,6 +33,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_params, parse_workflow_yaml, workflow_blocks
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
@@ -213,6 +215,9 @@ _CODE_ARTIFACT_REQUIRED_LIST_FIELDS = (
     "completion_criteria",
     "terminal_verifier_expectations",
 )
+_CREDENTIAL_FIELD_ACCESS_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(username|password|totp)\b")
+_CODE_SUBMIT_ACTION_RE = re.compile(r"\.(?:click|press)\s*\(")
+_SCOUT_SUBMIT_TOOL_NAMES = frozenset({"click", "press_key"})
 
 
 def _code_artifact_metadata_as_tool_argument(
@@ -232,6 +237,23 @@ def _format_code_artifact_violations(violations: list[str]) -> str:
     return f"Artifact metadata has {len(violations)} contract violations; fix all of them in one update:\n{numbered}"
 
 
+def _code_artifact_validation_error_message(exc: ValidationError) -> str:
+    # Build from loc/type only; pydantic's str(exc) embeds input_value, which would
+    # carry submitted metadata values onto the scrubbing-exempt durable span.
+    parts = [
+        f"{'.'.join(str(loc) for loc in err.get('loc', ()))}: {err.get('type', 'invalid')}" for err in exc.errors()
+    ]
+    detail = "; ".join(part for part in parts if part) or "schema validation failed"
+    return f"Artifact metadata is malformed ({detail})."
+
+
+class CodeArtifactNormalization(NamedTuple):
+    normalized: dict[str, dict[str, Any]]
+    error: str | None
+    violations: list[str]
+    offending_labels: list[str]
+
+
 def _normalize_code_artifact_metadata(
     raw_metadata: Any,
     workflow_yaml: str,
@@ -239,18 +261,36 @@ def _normalize_code_artifact_metadata(
     impose_defaults: bool = False,
     scout_trajectory: list[ScoutedInteraction] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
+    result = _normalize_code_artifact_metadata_detailed(
+        raw_metadata,
+        workflow_yaml,
+        impose_defaults=impose_defaults,
+        scout_trajectory=scout_trajectory,
+    )
+    return result.normalized, result.error
+
+
+def _normalize_code_artifact_metadata_detailed(
+    raw_metadata: Any,
+    workflow_yaml: str,
+    *,
+    impose_defaults: bool = False,
+    scout_trajectory: list[ScoutedInteraction] | None = None,
+) -> CodeArtifactNormalization:
     """Normalize submitted artifact metadata at the persist seam.
 
     Entries keyed to a missing code-block label are re-keyed to the single
     uncovered block or dropped, never rejected. When imposing, mechanical graph
     fields are server-defaulted (and uncovered labels get a deterministic
-    skeleton) so only contradictions reject."""
+    skeleton) so only contradictions reject. Returns the per-violation list and
+    offending labels alongside the batched error for durable telemetry."""
     if raw_metadata in (None, [], {}):
-        return {}, None
+        return CodeArtifactNormalization({}, None, [], [])
     items = _code_artifact_metadata_items(raw_metadata)
     code_blocks = _workflow_yaml_code_blocks_by_label(workflow_yaml)
     trajectory: list[ScoutedInteraction] = scout_trajectory or []
     violations: list[str] = []
+    offending_labels: list[str] = []
     anchored: list[dict[str, Any]] = []
     unanchored: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
@@ -262,7 +302,7 @@ def _normalize_code_artifact_metadata(
                 else CodeArtifactMetadata.model_validate(raw_item)
             )
         except ValidationError as exc:
-            violations.append(f"Artifact metadata is malformed: {exc}")
+            violations.append(_code_artifact_validation_error_message(exc))
             continue
         dumped = metadata.model_dump(mode="json", exclude_none=True)
         label = str(dumped.get("block_label") or "").strip()
@@ -327,14 +367,17 @@ def _normalize_code_artifact_metadata(
         item_violations.extend(_code_artifact_metadata_shape_errors(label, dumped))
         if item_violations:
             violations.extend(item_violations)
+            offending_labels.append(label)
             continue
         normalized[label] = dumped
     if impose_defaults:
         for label in uncovered:
             normalized[label] = _imposed_artifact_skeleton(label, code_blocks[label], trajectory)
     if violations:
-        return normalized, _format_code_artifact_violations(violations)
-    return normalized, None
+        return CodeArtifactNormalization(
+            normalized, _format_code_artifact_violations(violations), violations, offending_labels
+        )
+    return CodeArtifactNormalization(normalized, None, [], [])
 
 
 def _artifact_label_fragment(label: str) -> str:
@@ -699,6 +742,102 @@ def _artifact_string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _credentialed_code_block_scout_gate_errors(
+    workflow_yaml: str | None,
+    ctx: AgentContext,
+) -> list[str]:
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return []
+    if not workflow_yaml:
+        return []
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return []
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return []
+    credential_params_by_key = credential_params(workflow_definition.get("parameters"))
+    if not credential_params_by_key:
+        return []
+    scout_trajectory = getattr(ctx, "scout_trajectory", None)
+    if not isinstance(scout_trajectory, list):
+        scout_trajectory = []
+
+    errors: list[str] = []
+    for block in workflow_blocks(parsed):
+        if _enum_or_string_name(block.get("block_type")) != BlockType.CODE.value:
+            continue
+        code = str(block.get("code") or "")
+        if not code.strip():
+            continue
+        required_fields_by_credential: dict[str, set[str]] = {}
+        for parameter_key, field in _CREDENTIAL_FIELD_ACCESS_RE.findall(code):
+            credential_id = credential_params_by_key.get(parameter_key)
+            if credential_id:
+                required_fields_by_credential.setdefault(credential_id, set()).add(field)
+        if not required_fields_by_credential:
+            continue
+
+        matched_fill_indexes: list[int] = []
+        matched_source_urls: set[str] = set()
+        missing_fields: list[str] = []
+        for credential_id, required_fields in required_fields_by_credential.items():
+            matched_fields: set[str] = set()
+            for index, interaction in enumerate(scout_trajectory):
+                if str(interaction.get("tool_name") or "").strip() != "fill_credential_field":
+                    continue
+                if str(interaction.get("credential_id") or "").strip() != credential_id:
+                    continue
+                field = str(interaction.get("credential_field") or "").strip()
+                if field not in required_fields:
+                    continue
+                matched_fields.add(field)
+                matched_fill_indexes.append(index)
+                source_url = str(interaction.get("source_url") or "").strip()
+                if source_url:
+                    matched_source_urls.add(source_url)
+            for field in sorted(required_fields - matched_fields):
+                missing_fields.append(field)
+
+        requires_submit = bool(_CODE_SUBMIT_ACTION_RE.search(code))
+        missing_submit = False
+        if requires_submit:
+            latest_fill_index = max(matched_fill_indexes, default=-1)
+            if latest_fill_index < 0:
+                missing_submit = True
+            else:
+                missing_submit = True
+                for index, interaction in enumerate(scout_trajectory):
+                    if index <= latest_fill_index:
+                        continue
+                    if str(interaction.get("tool_name") or "").strip() not in _SCOUT_SUBMIT_TOOL_NAMES:
+                        continue
+                    source_url = str(interaction.get("source_url") or "").strip()
+                    if matched_source_urls and source_url not in matched_source_urls:
+                        continue
+                    missing_submit = False
+                    break
+
+        if not missing_fields and not missing_submit:
+            continue
+
+        block_label = str(block.get("label") or "").strip() or "this code block"
+        requirements: list[str] = []
+        if missing_fields:
+            joined_fields = ", ".join(f"`{field}`" for field in missing_fields)
+            requirements.append(f"successful `fill_credential_field` scouting for {joined_fields}")
+        if missing_submit:
+            requirements.append("a later submit action on the same page")
+        requirement_text = " and ".join(requirements)
+        errors.append(
+            f"Code block `{block_label}` reads saved credential fields, but the current debug-browser scout "
+            f"record is missing {requirement_text}. First scout the live form with `fill_credential_field` for "
+            "each referenced credential field, then click the submit control or press Enter in the debug browser "
+            "before retrying `update_workflow` or `update_and_run_blocks`."
+        )
+    return errors
+
+
 async def _update_workflow(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -716,12 +855,16 @@ async def _update_workflow(
     ctx.block_observation_refs = normalize_block_observation_refs(params.get("block_observation_refs"))
     ctx.raw_code_artifact_metadata = params.get("raw_code_artifact_metadata", params.get("code_artifact_metadata"))
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
-    code_artifact_metadata, code_artifact_metadata_error = _normalize_code_artifact_metadata(
+    normalization = _normalize_code_artifact_metadata_detailed(
         params.get("code_artifact_metadata"),
         workflow_yaml,
         impose_defaults=_copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER,
         scout_trajectory=scout_trajectory if isinstance(scout_trajectory, list) else None,
     )
+    code_artifact_metadata = normalization.normalized
+    code_artifact_metadata_error = normalization.error
+    if code_artifact_metadata_error is not None:
+        record_code_artifact_violations(ctx, normalization.violations, normalization.offending_labels)
     prior_workflow_yaml = getattr(ctx, "workflow_yaml", None)
     code_safety_errors = _code_block_safety_errors(workflow_yaml, prior_workflow_yaml)
     # Per-label salvage keeps conforming metadata across a rejection; a
@@ -749,6 +892,15 @@ async def _update_workflow(
             "user_facing_summary": _code_seam_rejection_user_summary(
                 metadata_rejected=code_artifact_metadata_error is not None,
                 code_rejected=bool(code_safety_errors),
+            ),
+        }
+    credential_scout_errors = _credentialed_code_block_scout_gate_errors(workflow_yaml, ctx)
+    if credential_scout_errors:
+        return {
+            "ok": False,
+            "error": "\n".join(credential_scout_errors),
+            "user_facing_summary": (
+                "I need to scout the saved-credential login flow in the debug browser before I can persist or run this code."
             ),
         }
     if allow_missing_credentials is None:

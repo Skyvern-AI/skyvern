@@ -20,14 +20,24 @@ from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVI
 _MAX_STEPS = 20
 _INDENT = "    "
 
+CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
+_CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
 # Names the code-block executor reserves in its exec() namespace (block.py build_safe_vars
 # plus the injected `page`). A parameter key colliding with one of these is silently dropped
 # at bind time, so the synthesized fill would stringify the builtin instead of the user value.
+# "username"/"password"/"totp"/"totp_identifier" are reserved too: CodeBlock.execute also
+# injects a bound credential's fields under those bare names, so a plain parameter named
+# `password` would resolve to the credential's secret value instead of the user input.
 _RESERVED_PARAM_NAMES = frozenset(
     {
         "page",
+        "username",
+        "password",
+        "totp",
+        "totp_identifier",
         "print",
         "len",
         "range",
@@ -184,10 +194,7 @@ def _locator_expr(
     return ""
 
 
-def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
-    name = str(interaction.get("accessible_name") or "").strip()
-    role = str(interaction.get("role") or "").strip()
-    base = _safe_param_base(name or role or "value")
+def _unique_key(base: str, used: set[str]) -> str:
     candidate = base
     suffix = 2
     while candidate in used:
@@ -195,6 +202,17 @@ def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
         suffix += 1
     used.add(candidate)
     return candidate
+
+
+def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
+    name = str(interaction.get("accessible_name") or "").strip()
+    role = str(interaction.get("role") or "").strip()
+    return _unique_key(_safe_param_base(name or role or "value"), used)
+
+
+def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
+    name = str(interaction.get("credential_name") or "").strip()
+    return _unique_key(_safe_param_base(name or "credential"), used)
 
 
 def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> SynthesizedCodeBlock | None:
@@ -206,6 +224,7 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
     notes: list[str] = []
     parameters: list[dict[str, str]] = []
     used_param_keys: set[str] = set()
+    credential_param_keys: dict[str, str] = {}
 
     entry_url = ""
     entry_index = -1
@@ -252,6 +271,18 @@ def synthesize_code_block(trajectory: Sequence[Mapping[str, Any]]) -> Synthesize
             param_key = _param_key(interaction, used_param_keys)
             parameters.append({"key": param_key})
             lines.append(f"{_INDENT}await {locator}.fill(str({param_key}))")
+        elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
+            credential_id = str(interaction.get("credential_id") or "").strip()
+            credential_field = str(interaction.get("credential_field") or "").strip()
+            if not credential_id or credential_field not in _CREDENTIAL_FIELDS:
+                notes.append("dropped a credential fill with no usable credential reference")
+                continue
+            credential_param_key = credential_param_keys.get(credential_id)
+            if credential_param_key is None:
+                credential_param_key = _credential_param_key(interaction, used_param_keys)
+                credential_param_keys[credential_id] = credential_param_key
+                parameters.append({"key": credential_param_key, "credential_id": credential_id})
+            lines.append(f"{_INDENT}await {locator}.fill({credential_param_key}.{credential_field})")
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
@@ -367,7 +398,8 @@ def render_synthesized_offer_text(
     trajectory: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Render the offer body the copilot sees for a synthesized block (pure)."""
-    param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key")]
+    param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key") and not p.get("credential_id")]
+    credential_parameters = [p for p in synthesized.parameters if p.get("key") and p.get("credential_id")]
     parts = [
         "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
@@ -379,6 +411,16 @@ def render_synthesized_offer_text(
     ]
     if param_keys:
         parts.append("Workflow parameters referenced (bind these): " + ", ".join(param_keys) + ".")
+    if credential_parameters:
+        bindings = ", ".join(f"`{p['key']}` -> `{p['credential_id']}`" for p in credential_parameters)
+        parts.append(
+            "Credential parameters referenced: "
+            + bindings
+            + ". Bind each as a workflow parameter with `workflow_parameter_type: credential_id` and the "
+            "credential ID in `default_value`; at runtime the key resolves to a credential object whose "
+            "`.username` / `.password` / `.totp` attributes the snippet reads (`.totp` is a fresh one-time "
+            "code generated when the block starts). Never replace these attribute reads with literal values."
+        )
     if synthesized.notes:
         parts.append("Synthesis notes: " + "; ".join(synthesized.notes) + ".")
     if trajectory:

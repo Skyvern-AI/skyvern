@@ -479,6 +479,47 @@ def test_record_run_blocks_downgrades_on_contradiction_without_confirmation_bloc
     assert ctx.last_full_workflow_test_ok is False
 
 
+def _failed_code_block_result() -> dict:
+    raw = (
+        "code block failed. failure reason: Failed to execute code block. Reason: TimeoutError: "
+        "Timeout 30000ms exceeded. =========================== logs =========================== "
+        '"load" event fired ============================================================'
+    )
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_x",
+            "overall_status": "failed",
+            "executed_block_labels": ["b0"],
+            "blocks": [{"label": "b0", "block_type": "code", "status": "failed", "failure_reason": raw}],
+        },
+    }
+
+
+def test_failed_run_records_gate_reason_separately_from_raw_block_failure() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _failed_code_block_result(), completion_verification=_evaluated(("c0", False)))
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+    assert "TimeoutError" not in (ctx.last_outcome_gate_reason or "")
+    assert "TimeoutError" in (ctx.last_test_failure_reason or "")
+
+
+def test_gate_reason_survives_a_later_run_without_verification() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+    _record_run_blocks_result(ctx, _failed_code_block_result(), completion_verification=None)
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+
+
+def test_gate_reason_cleared_when_outcome_verified() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
+    assert ctx.last_outcome_gate_reason is not None
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    assert ctx.last_outcome_gate_reason is None
+
+
 def test_record_run_blocks_keeps_success_when_outcome_verified() -> None:
     ctx = _ctx_with_blocks("extraction")
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))

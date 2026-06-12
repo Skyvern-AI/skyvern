@@ -72,6 +72,7 @@ class BrowserContext:
     mode: str
     session_id: str | None = None
     cdp_url: str | None = None
+    can_access_localhost: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
