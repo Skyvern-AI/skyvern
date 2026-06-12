@@ -57,7 +57,7 @@ import {
   NarrativeEvent,
   TurnNarrativeState,
   applyNarrativeEvent,
-  hydrateNarrativeFromPayload,
+  hydrateHistoryNarrative,
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
@@ -898,8 +898,9 @@ export function WorkflowCopilotChat({
             content: message.content,
             timestamp: message.created_at,
             narrative: (() => {
-              const hydrated = hydrateNarrativeFromPayload(
+              const hydrated = hydrateHistoryNarrative(
                 message.narrative_payload,
+                message.turn_outcome,
               );
               if (!hydrated) return undefined;
               // Fall back to the legacy message body when the persisted
