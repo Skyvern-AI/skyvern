@@ -104,7 +104,7 @@ The interaction blocks differ by how specifically you describe the step — from
 
 - navigation — the general, goal-level block. State the outcome you want as a navigation_goal (e.g. "search for {{ query }} and open the first result") and the agent works out and performs the actions to get there. Use it when the step is best expressed as where you want to end up, stated as intent — never as a click-by-click script.
 - action — one specific UI action you name directly: a single click, type, or select on the current page (e.g. "click the Add to Cart button"). If you can name the exact action, prefer action over navigation.
-- login — authentication. Handles stored credentials and 2FA/TOTP. Whenever the step is logging in, this is the right block; do NOT hand-build a navigation login or avoid login to save steps.
+- login — authentication. Handles stored credentials and 2FA/TOTP. Whenever the step is logging in, this is the right block; do NOT hand-build a navigation login or avoid login to save steps. When the active block authoring policy makes the login block unavailable, bind the saved credential as a credential_id workflow parameter on the replacement block instead — never inline secret values.
 - file_download — the step's purpose is to download a file (detects when the download completes).
 - extraction — capturing structured data, validated against data_schema.
 

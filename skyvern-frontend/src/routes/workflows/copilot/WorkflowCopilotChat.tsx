@@ -35,6 +35,7 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
@@ -62,7 +63,7 @@ import {
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
 import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
 import { SpeechInputButton } from "@/components/SpeechInputButton";
-import { useFeatureFlag } from "@/hooks/useFeatureFlag";
+import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -80,6 +81,27 @@ import { cn } from "@/util/utils";
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+
+type ComposerDefaultVariant =
+  | "build"
+  | "build_code"
+  | "build_no_code"
+  | "ask"
+  | "ask_code";
+
+function normalizeComposerDefaultVariant(
+  variant: string | undefined,
+): ComposerDefaultVariant {
+  if (
+    variant === "ask" ||
+    variant === "ask_code" ||
+    variant === "build_code" ||
+    variant === "build_no_code"
+  ) {
+    return variant;
+  }
+  return "build";
+}
 
 function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -213,6 +235,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotRunOutcomeUpdate
   | WorkflowCopilotTurnStartUpdate
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
@@ -353,18 +376,56 @@ export function WorkflowCopilotChat({
   initialMessage,
   onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
-  const copilotV2Enabled =
-    useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2") === true;
-  const codeBlockModeFlagEnabled =
-    useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE") === true;
-  const codeBlockAccessEnabled = useFeatureFlag("CODE_BLOCK_ACCESS") === true;
+  const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
+  const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
+  const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
+  const copilotV2Enabled = copilotV2Flag === true;
   const codeBlockModeEnabled =
-    codeBlockModeFlagEnabled && codeBlockAccessEnabled;
-  const [composerMode, setComposerMode] = useState<"ask" | "build">("build");
-  const [codeWorkflow, setCodeWorkflow] = useState(true);
+    codeBlockModeFlag === true && codeBlockAccessFlag === true;
+  const defaultModeVariant = useFeatureFlagValue(
+    "WORKFLOW_COPILOT_DEFAULT_MODE",
+  );
+  // The variant configures the initial default only when both gating flags are on.
+  const effectiveDefaultVariant: ComposerDefaultVariant =
+    copilotV2Enabled && codeBlockModeEnabled
+      ? normalizeComposerDefaultVariant(defaultModeVariant)
+      : "build";
+  const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
+    effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
+      ? "ask"
+      : "build",
+  );
+  const [codeWorkflow, setCodeWorkflow] = useState(
+    () =>
+      effectiveDefaultVariant === "build_code" ||
+      effectiveDefaultVariant === "ask_code",
+  );
+  // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
+  const composerSeededRef = useRef(false);
+  const flagsResolved =
+    copilotV2Flag !== undefined &&
+    codeBlockModeFlag !== undefined &&
+    codeBlockAccessFlag !== undefined;
+  useEffect(() => {
+    if (composerSeededRef.current || !flagsResolved) {
+      return;
+    }
+    composerSeededRef.current = true;
+    setComposerMode(
+      effectiveDefaultVariant === "ask" ||
+        effectiveDefaultVariant === "ask_code"
+        ? "ask"
+        : "build",
+    );
+    setCodeWorkflow(
+      effectiveDefaultVariant === "build_code" ||
+        effectiveDefaultVariant === "ask_code",
+    );
+  }, [flagsResolved, effectiveDefaultVariant]);
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
-  const showCodeToggle = isBuild && codeBlockModeEnabled;
+  const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
+  const showCodeToggle = isBuild && codeBlockModeEnabled && codeToggleAllowed;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -1297,7 +1358,7 @@ export function WorkflowCopilotChat({
             audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
             mode: copilotV2Enabled ? composerMode : null,
-            code_block: showCodeToggle ? codeWorkflow : null,
+            code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
             cancel_token: cancelToken,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -1311,6 +1372,7 @@ export function WorkflowCopilotChat({
               case "tool_result":
               case "narration":
               case "block_progress":
+              case "run_outcome":
                 applyStoredNarrativeEvent(payload);
                 return false;
               case "turn_start": {
@@ -1405,6 +1467,7 @@ export function WorkflowCopilotChat({
       applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
+      codeBlockModeEnabled,
       codeWorkflow,
       composerMode,
       copilotV2Enabled,
@@ -1412,10 +1475,10 @@ export function WorkflowCopilotChat({
       getSaveData,
       inputValue,
       isSpeechListening,
+      isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
       requiresLiveBrowser,
-      showCodeToggle,
       stopSpeech,
       takeSpeechAudioBlob,
       updateQueuedPrompt,

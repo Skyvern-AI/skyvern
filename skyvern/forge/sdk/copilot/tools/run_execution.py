@@ -6,7 +6,7 @@ import json
 import time
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -43,11 +43,18 @@ from skyvern.forge.sdk.copilot.output_utils import (
     iter_failure_reasons,
     truncate_output,
 )
+from skyvern.forge.sdk.copilot.run_outcome import (
+    RecordedRunOutcome,
+    RunOutcomeReasonCode,
+    RunOutcomeVerdict,
+    run_outcome_display_reason,
+)
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -77,6 +84,7 @@ from .blockers import (
 )
 from .completion import (
     _emit_completion_verification_trace,
+    _maybe_run_completion_verification,
     _outcome_failure_warrants_repair,
     _outcome_unverified_reason,
 )
@@ -621,6 +629,8 @@ async def _run_blocks_and_collect_debug(
     ctx.last_requested_block_labels = list(block_labels)
     ctx.last_executed_block_labels = list(labels_to_execute)
     ctx.last_frontier_start_label = frontier_start_label
+    ctx.last_run_blocks_block_ids = []
+    ctx.last_run_blocks_block_labels = []
 
     # Verified state is NOT invalidated pre-run. On a failed / partial run we
     # want the prior verified prefix preserved so the next edit can still use
@@ -1041,6 +1051,13 @@ async def _run_blocks_and_collect_debug(
                 block_outputs_by_label[block.label] = block.output
         results.append(block_result)
 
+    # Repository returns DESC by created_at; reverse for chronological order.
+    run_block_rows = list(reversed(blocks))
+    ctx.last_run_blocks_block_ids = list(
+        dict.fromkeys(block.workflow_run_block_id for block in run_block_rows if block.workflow_run_block_id)
+    )
+    ctx.last_run_blocks_block_labels = list(dict.fromkeys(block.label for block in run_block_rows if block.label))
+
     await _attach_action_traces(blocks, results, ctx.organization_id)
 
     # final_status is guaranteed set here: every non-success exit returns
@@ -1382,7 +1399,9 @@ def _update_verification_evidence_from_run_result(copilot_ctx: AgentContext, res
 
 def _record_run_blocks_result(
     copilot_ctx: Any, result: dict[str, Any], completion_verification: CompletionVerificationResult | None = None
-) -> None:
+) -> RecordedRunOutcome | None:
+    """Record the run adjudication on ctx; for an ok run, return the typed
+    per-run outcome verdict mirroring exactly what was recorded."""
     run_ok = bool(result.get("ok", False))
     data = result.get("data")
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
@@ -1400,7 +1419,11 @@ def _record_run_blocks_result(
     copilot_ctx.last_full_workflow_test_ok = False
     copilot_ctx.last_unverified_block_labels = _unverified_current_workflow_labels(copilot_ctx)
     copilot_ctx.last_test_failure_reason = None
+    if completion_verification is not None and completion_verification.status == "evaluated":
+        copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
     copilot_ctx.last_test_suspicious_success = False
+    copilot_ctx.last_run_outcome = None
+    copilot_ctx.last_run_outcome_block_labels = []
     copilot_ctx.suspicious_success_nudge_count = 0
     copilot_ctx.last_test_anti_bot = None
     prior_budget_flag = copilot_ctx.last_failure_category_top == PER_TOOL_BUDGET_FAILURE_CATEGORY
@@ -1479,7 +1502,14 @@ def _record_run_blocks_result(
                     data["failure_categories"] = [anti_bot_category]
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
-            return
+            return _stash_recorded_run_outcome(
+                copilot_ctx,
+                RecordedRunOutcome(
+                    verdict="not_demonstrated",
+                    reason_code="blocker_reported",
+                    display_reason=run_outcome_display_reason(structured_blocker),
+                ),
+            )
         if empty_data_blocks:
             copilot_ctx.last_test_ok = None
             copilot_ctx.last_test_suspicious_success = True
@@ -1494,7 +1524,14 @@ def _record_run_blocks_result(
             copilot_ctx.probable_site_block_streak_count = 0
             update_repeated_failure_state(copilot_ctx, result)
             _update_verification_evidence_from_run_result(copilot_ctx, result)
-            return
+            return _stash_recorded_run_outcome(
+                copilot_ctx,
+                RecordedRunOutcome(
+                    verdict="not_demonstrated",
+                    reason_code="no_meaningful_output",
+                    display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
+                ),
+            )
         copilot_ctx.failed_test_nudge_count = 0
         copilot_ctx.null_data_streak_count = 0
         copilot_ctx.probable_site_block_streak_count = 0
@@ -1529,7 +1566,7 @@ def _record_run_blocks_result(
             )
         update_repeated_failure_state(copilot_ctx, result)
         _update_verification_evidence_from_run_result(copilot_ctx, result)
-        return
+        return _stash_recorded_run_outcome(copilot_ctx, _adjudicated_run_outcome(copilot_ctx, completion_verification))
 
     copilot_ctx.last_failed_workflow_yaml = getattr(copilot_ctx, "workflow_yaml", None)
     copilot_ctx.last_test_non_retriable_nav_error = _detect_non_retriable_nav_error(result)
@@ -1552,6 +1589,100 @@ def _record_run_blocks_result(
         copilot_ctx.last_test_failure_reason = str(result["error"])
     update_repeated_failure_state(copilot_ctx, result)
     _update_verification_evidence_from_run_result(copilot_ctx, result)
+    return None
+
+
+def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
+    copilot_ctx.last_run_outcome = outcome
+    copilot_ctx.last_run_outcome_block_labels = list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or [])
+    return outcome
+
+
+def _adjudicated_run_outcome(
+    copilot_ctx: Any, completion_verification: CompletionVerificationResult | None
+) -> RecordedRunOutcome:
+    if completion_verification is not None and completion_verification.status == "evaluated":
+        if not completion_verification.is_fully_satisfied():
+            return RecordedRunOutcome(
+                verdict="not_demonstrated",
+                reason_code="outcome_not_demonstrated",
+                display_reason=run_outcome_display_reason(
+                    _outcome_unverified_reason(copilot_ctx, completion_verification)
+                ),
+            )
+        if copilot_ctx.last_full_workflow_test_ok:
+            return RecordedRunOutcome(verdict="demonstrated")
+        return RecordedRunOutcome(verdict="not_evaluated")
+    if copilot_ctx.last_test_suspicious_success:
+        return RecordedRunOutcome(
+            verdict="not_demonstrated",
+            reason_code="outcome_not_demonstrated",
+            display_reason=run_outcome_display_reason(copilot_ctx.last_test_failure_reason),
+        )
+    return RecordedRunOutcome(verdict="not_evaluated")
+
+
+async def _send_run_outcome_update(
+    copilot_ctx: Any,
+    result: dict[str, Any],
+    *,
+    verdict: RunOutcomeVerdict,
+    reason_code: RunOutcomeReasonCode | None,
+    display_reason: str | None,
+) -> None:
+    stream = getattr(copilot_ctx, "stream", None)
+    if stream is None:
+        return
+    data = result.get("data")
+    run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
+    narrator_state = getattr(copilot_ctx, "narrator_state", None)
+    iteration = narrator_state.current_iteration if narrator_state is not None else 0
+    try:
+        await stream.send(
+            WorkflowCopilotRunOutcomeUpdate(
+                type=WorkflowCopilotStreamMessageType.RUN_OUTCOME,
+                workflow_run_id=run_id if isinstance(run_id, str) else "",
+                workflow_run_block_ids=list(getattr(copilot_ctx, "last_run_blocks_block_ids", []) or []),
+                block_labels=list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or []),
+                verdict=verdict,
+                reason_code=reason_code,
+                display_reason=display_reason,
+                iteration=iteration,
+                timestamp=datetime.now(timezone.utc),
+            )
+        )
+    except Exception:
+        LOG.debug("copilot run_outcome send failed", exc_info=True)
+
+
+async def _verify_and_record_run_blocks_result(
+    copilot_ctx: Any, result: dict[str, Any], handler_start: float
+) -> CompletionVerificationResult | None:
+    """Single producer of run_outcome frames: verify, record, then emit the recorded verdict.
+    An ok run gets an "evaluating" hold the moment it enters adjudication and is
+    guaranteed a final frame, so completed-row status alone never implies success."""
+    run_ok = bool(result.get("ok", False))
+    if not run_ok:
+        completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
+        _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
+        return completion_verification
+
+    await _send_run_outcome_update(copilot_ctx, result, verdict="evaluating", reason_code=None, display_reason=None)
+    completion_verification = None
+    recorded: RecordedRunOutcome | None = None
+    try:
+        completion_verification = await _maybe_run_completion_verification(copilot_ctx, result, handler_start)
+        recorded = _record_run_blocks_result(copilot_ctx, result, completion_verification=completion_verification)
+    finally:
+        final = recorded if recorded is not None else RecordedRunOutcome(verdict="not_evaluated")
+        await _send_run_outcome_update(
+            copilot_ctx,
+            result,
+            verdict=final.verdict,
+            reason_code=final.reason_code,
+            display_reason=final.display_reason,
+        )
+    return completion_verification
 
 
 def _record_diagnosis_repair_contract(

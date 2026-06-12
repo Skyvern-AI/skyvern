@@ -31,9 +31,10 @@ type ActiveTest = {
  * The hook polls the backend, shows toast notifications on completion/failure,
  * and invalidates the credentials query so the list updates.
  *
- * Active test state is persisted in a zustand store backed by sessionStorage
- * so it survives both SPA navigation and full page reloads. On mount, the hook
- * checks for persisted state and resumes polling if a test was in progress.
+ * Active test state is persisted in a zustand store backed by localStorage so
+ * it survives reloads and is visible across tabs (e.g. the noopener watch-run
+ * tab). The hook adopts the persisted test on mount and whenever the slot
+ * changes (a test started in another tab), resuming polling either way.
  *
  * Instantiate this in a component that outlives the modal (e.g. CredentialsPage)
  * so polling survives modal close.
@@ -47,11 +48,13 @@ function useBackgroundCredentialTest() {
   // Full cleanup: stop polling AND clear the persisted store.
   // Used when a test reaches a terminal state (completed/failed/timeout).
   const cleanup = useCallback(() => {
-    if (activeTestRef.current?.timeoutId) {
-      clearTimeout(activeTestRef.current.timeoutId);
+    const current = activeTestRef.current;
+    if (current?.timeoutId) {
+      clearTimeout(current.timeoutId);
     }
     activeTestRef.current = null;
-    clearActiveTest();
+    // Scoped to this tab's run so it can't wipe a newer test from another tab.
+    clearActiveTest(current?.workflowRunId);
   }, [clearActiveTest]);
 
   // On unmount, only stop the timer — don't clear the store so the test
@@ -98,10 +101,12 @@ function useBackgroundCredentialTest() {
       );
       const data = response.data;
 
-      // Reset error counter on successful poll
-      if (activeTestRef.current) {
-        activeTestRef.current.errorCount = 0;
+      // A newer test may have superseded this run while the request was in
+      // flight — its own poll chain owns the state now.
+      if (activeTestRef.current?.workflowRunId !== test.workflowRunId) {
+        return;
       }
+      activeTestRef.current.errorCount = 0;
 
       if (data.status === "completed") {
         // The backend sets browser_profile_id in a separate background task
@@ -165,6 +170,9 @@ function useBackgroundCredentialTest() {
         activeTestRef.current.timeoutId = setTimeout(poll, POLL_INTERVAL_MS);
       }
     } catch {
+      if (activeTestRef.current?.workflowRunId !== test.workflowRunId) {
+        return;
+      }
       // Network error — increment counter and bail if too many consecutive failures
       if (activeTestRef.current) {
         activeTestRef.current.errorCount++;
@@ -183,33 +191,40 @@ function useBackgroundCredentialTest() {
     }
   }, [credentialGetter, queryClient, cleanup]);
 
-  // Rehydrate polling from persisted store after a full page reload.
-  // If a test was in progress before the reload, resume polling so the
-  // link stays visible and the toast fires when the test finishes.
-  const rehydratedRef = useRef(false);
+  // Adopt the persisted test whenever this tab isn't already polling it —
+  // covers mount rehydration AND tests started in other tabs (storage sync).
+  const storedTest = useCredentialTestStore((s) => s.activeTest);
   useEffect(() => {
-    if (rehydratedRef.current) return;
-    rehydratedRef.current = true;
+    if (!storedTest) return;
 
-    const stored = useCredentialTestStore.getState().activeTest;
-    if (!stored || activeTestRef.current) return;
-
-    // If the persisted test already exceeded the timeout, clean up
-    if (Date.now() - stored.startTime > MAX_POLL_DURATION_MS) {
-      clearActiveTest();
+    const current = activeTestRef.current;
+    if (
+      current?.workflowRunId === storedTest.workflowRunId &&
+      current.timeoutId !== null
+    ) {
       return;
     }
 
+    // If the persisted test already exceeded the timeout, clean up
+    if (Date.now() - storedTest.startTime > MAX_POLL_DURATION_MS) {
+      clearActiveTest(storedTest.workflowRunId);
+      return;
+    }
+
+    if (current?.timeoutId) {
+      clearTimeout(current.timeoutId);
+    }
     activeTestRef.current = {
-      credentialId: stored.credentialId,
-      workflowRunId: stored.workflowRunId,
-      url: stored.url,
-      startTime: stored.startTime,
-      timeoutId: setTimeout(poll, POLL_INTERVAL_MS),
+      credentialId: storedTest.credentialId,
+      workflowRunId: storedTest.workflowRunId,
+      url: storedTest.url,
+      startTime: storedTest.startTime,
+      // Poll immediately, not after a full interval: the test may have already
+      // finished, and the credentials list shouldn't sit stale any longer.
+      timeoutId: setTimeout(poll, 0),
       errorCount: 0,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally runs once on mount
-  }, []);
+  }, [storedTest, poll, clearActiveTest]);
 
   const startBackgroundTest = useCallback(
     async (credentialId: string, url: string, userContext?: string) => {

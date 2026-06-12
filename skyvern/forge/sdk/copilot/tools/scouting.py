@@ -193,6 +193,9 @@ def _record_scouted_interaction(
     typed_length: int = 0,
     role: str = "",
     accessible_name: str = "",
+    credential_id: str = "",
+    credential_field: str = "",
+    credential_name: str = "",
 ) -> None:
     selector = selector.strip()
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
@@ -213,6 +216,12 @@ def _record_scouted_interaction(
         artifact["role"] = role
     if accessible_name:
         artifact["accessible_name"] = accessible_name
+    if credential_id:
+        artifact["credential_id"] = credential_id
+    if credential_field:
+        artifact["credential_field"] = credential_field
+    if credential_name:
+        artifact["credential_name"] = credential_name
     interactions = [
         item
         for item in ctx.scouted_interactions
@@ -220,6 +229,7 @@ def _record_scouted_interaction(
             item.get("tool_name") == artifact["tool_name"]
             and item.get("selector") == artifact.get("selector")
             and item.get("source_url") == artifact.get("source_url")
+            and item.get("credential_field") == artifact.get("credential_field")
         )
     ]
     interactions.append(artifact)
