@@ -984,6 +984,7 @@ async def test_unvalidated_timeout_wip_overrides_auto_accept(monkeypatch: pytest
         output_policy_diagnostics={
             "raw_output_kind": "informational_answer",
             "final_output_kind": "informational_answer",
+            "raw_reason_codes": ["internal_block_taxonomy_leak"],
             "hard_block_reason_codes": [],
             "soft_rewrite_reason_codes": ["internal_block_taxonomy_leak"],
             "raw_would_have_failed": True,
