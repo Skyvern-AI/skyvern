@@ -34,6 +34,12 @@ Do NOT terminate when:
 
 When in doubt, DO NOT terminate. Try an alternative approach instead.
 
+CRITICAL - Do not declare success on a partially-complete multi-part goal:
+- Many goals have multiple required parts/legs (e.g. "find X AND find Y AND find Z"). The goal is achieved ONLY when ALL required parts are done.
+- If your own analysis (task_history_information, thoughts, or required_subgoals) identifies ANY required part as missing, unmet, or not yet found, you MUST set user_goal_achieved to false and set plan to the next mini goal that makes progress on the missing part.
+- A required part that needs information is satisfied ONLY when an extract task has actually captured that information. A completed navigate/goto step that merely reached the relevant page does NOT satisfy it; plan an extract task instead.
+- Setting user_goal_achieved to false does NOT fail the task — it lets the agent keep working on the missing part. Only set should_terminate to true if a required part is genuinely IMPOSSIBLE per the termination rules above.
+
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
@@ -44,7 +50,13 @@ Reply in JSON format with the following keys:
   "task_history_information": str, // Think step by step. In task history, what information has been collected that's helpful and relevant to the user goal, and what information is missing if any.
   "information_extracted": optional[bool], // True if the needed information has been extracted. False if the needed information has not been extracted. If task history has no "extract" type, that means no data extraction has happened, return false. Null if the user goal does not require information extraction.
   "thoughts": str, // Think step by step. What has been done so far and what is the next reasonable mini goal a human can do foreseeably move towards the overall goal. If the goal appears impossible to achieve, explain why.
-  "user_goal_achieved": bool, // True if the user goal has been completed, false otherwise. If the user wants to extract information and it has not been done, the user goal is not achieved.
+  "required_subgoals": array, // Decompose the user goal into its distinct required parts/legs. For a multi-part goal (e.g. "do A, and B, and C"), list each required part separately. For each part, decide whether the task history and current page actually satisfy it.
+    [{
+        "subgoal": str, // one required part of the user goal
+        "satisfied": bool, // true ONLY if this part is fully met based on task history / extracted information. A part that requires information is satisfied ONLY when an extract task has actually captured that information; a completed navigate/visit to the relevant page alone does NOT satisfy it.
+        "evidence": str // brief evidence it is satisfied, or a description of what is still missing
+    }],
+  "user_goal_achieved": bool, // True ONLY if EVERY entry in required_subgoals is satisfied. If task_history_information OR any entry in required_subgoals indicates a required part is missing, unmet, or not yet found, this MUST be false. Never set this true while simultaneously acknowledging in thoughts or task_history_information that a required part is missing. If the user wants to extract information and it has not been done, the user goal is not achieved.
   "should_terminate": bool, // True ONLY if the user goal is definitively IMPOSSIBLE to achieve. Must have explicit evidence from the page. See termination guidelines above. False if there's any chance the goal can still be achieved.
   "termination_reason": str, // If should_terminate is true, quote the EXACT error message or text from the page that proves impossibility. Be specific. Null if should_terminate is false.
   "plan": str, // The mini goal to achieve to move towards the user goal. DO NOT come up or hallucinate any data that's not provided in the user goal. Be accurate and precise. Return null if the user goal has been achieved or if should_terminate is true.
