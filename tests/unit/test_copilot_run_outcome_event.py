@@ -205,7 +205,7 @@ async def test_mid_build_fall_through_still_emits_not_demonstrated(monkeypatch: 
     assert [frame.verdict for frame in frames] == ["evaluating", "not_demonstrated"]
     assert frames[-1].reason_code == "outcome_not_demonstrated"
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is True
+    assert ctx.last_full_workflow_test_ok is False
 
 
 @pytest.mark.asyncio
