@@ -1219,6 +1219,36 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
+async def _retarget_disabled_element_for_click(
+    dom: DomUtil,
+    skyvern_element: SkyvernElement,
+    action: actions.ClickAction,
+) -> SkyvernElement | None:
+    child_id = skyvern_element.find_deepest_interactable_descendant_in_single_chain()
+    if not child_id:
+        LOG.debug(
+            "No unambiguous single-chain descendant; preserving disabled-element failure",
+            parent_id=skyvern_element.get_id(),
+        )
+        return None
+    LOG.info(
+        "Re-targeting click from disabled wrapper to deepest single-chain descendant",
+        parent_id=skyvern_element.get_id(),
+        child_id=child_id,
+    )
+    child_element = await dom.safe_get_skyvern_element_by_id(child_id)
+    if not child_element or await child_element.is_disabled(dynamic=True):
+        LOG.debug(
+            "Single-chain descendant not found or dynamically disabled; preserving failure",
+            parent_id=skyvern_element.get_id(),
+            child_id=child_id,
+        )
+        return None
+    # Mutate only after DOM resolution + dynamic disabled validation.
+    action.element_id = child_id
+    return child_element
+
+
 @traced(name="skyvern.agent.action.click")
 async def handle_click_action(
     action: actions.ClickAction,
@@ -1282,12 +1312,20 @@ async def handle_click_action(
 
     # dynamically validate the attr, since it could change into enabled after the previous actions
     if await skyvern_element.is_disabled(dynamic=True):
-        LOG.warning(
-            "Try to click on a disabled element",
-            action_type=action.action_type,
-            element_id=skyvern_element.get_id(),
+        child = await _retarget_disabled_element_for_click(
+            dom=dom,
+            skyvern_element=skyvern_element,
+            action=action,
         )
-        return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
+        if child is not None:
+            skyvern_element = child
+        else:
+            LOG.warning(
+                "Try to click on a disabled element",
+                action_type=action.action_type,
+                element_id=skyvern_element.get_id(),
+            )
+            return [ActionFailure(InteractWithDisabledElement(skyvern_element.get_id()))]
 
     # Skip scroll_into_view when a SCROLL action just completed on THIS element.
     # The scroll may have positioned the page or a container at the bottom to enable
