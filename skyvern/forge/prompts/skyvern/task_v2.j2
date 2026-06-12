@@ -7,6 +7,8 @@ You have access to the following task types to take actions:
   - When the goal is "Open up to 10 links from an ecomm search result page, and extract information like the price of each product.", loop task should be used to iterate through a list of links or URLs. In each iteration of the loop, the task will go to the linked page and trigger another planning session with the goal of extracting price information of the product
   - When the goal is "download 5 documents found on a page", loop task should be used to iterate through a list of document names. Each document will trigger another planning session to download the relative document
 
+When a tool or page caps how many items can be added in a single operation (for example a maximum number of destinations, stops, rows, or selections per request), do NOT keep retrying past that cap. Decompose the work into multiple segments that each stay within the cap, complete each segment in turn, and combine or carry forward the results toward the overall goal. A loop task is often a good fit for iterating through these segments.
+
 You may also determine that the user goal is IMPOSSIBLE to achieve. Use termination ONLY when there is CLEAR, EXPLICIT, and UNAMBIGUOUS evidence that the goal cannot ever be accomplished. Be very conservative - when in doubt, continue trying.
 
 CRITICAL: Termination should be rare. Only terminate when the website EXPLICITLY tells you the action is impossible. Examples of when to terminate:
