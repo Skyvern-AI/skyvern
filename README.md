@@ -88,6 +88,18 @@ pip install "skyvern[all]"
 skyvern quickstart
 ```
 
+> **Windows users (native, not WSL)**
+> Skyvern handles the required asyncio event loop policy automatically starting
+> from this version. If you're on an older version and hit a `NotImplementedError`
+> during browser launch, add the following at the top of your script:
+>
+> ```python
+> import asyncio, sys
+> if sys.platform == "win32":
+>     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+> ```
+
+
 The pip quickstart uses SQLite by default. For a local Postgres container, run `skyvern quickstart --postgres`.
 
 ### Option B: Docker Compose
