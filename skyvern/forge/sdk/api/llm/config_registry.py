@@ -1638,13 +1638,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite",
+            "vertex_ai/gemini-3.1-flash-lite-preview",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1757,13 +1757,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite",
+            "vertex_ai/gemini-3.1-flash-lite-preview",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
