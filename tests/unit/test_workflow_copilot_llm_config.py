@@ -1,7 +1,7 @@
 """Tests for the workflow-copilot v2 LLM key wiring (SKY-10642).
 
 Two optional settings give operators independent control over (a) the main
-Copilot reasoning/guardrail/evidence lane and (b) the narration-only fast lane:
+Copilot reasoning/guardrail/evidence lane and (b) the fast-consumer lane:
 ``WORKFLOW_COPILOT_AGENT_LLM_KEY`` and ``WORKFLOW_COPILOT_FAST_LLM_KEY``.
 These tests cover the public contract: defaults, fallback chains, and
 PostHog → env-specific → default resolution order.
@@ -353,7 +353,10 @@ async def test_completion_verification_handler_uses_main_copilot_lane(
         assert organization_id == "org_1"
         return main_handler
 
-    monkeypatch.setattr(copilot_tools, "resolve_main_copilot_handler", _main_lookup)
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion.resolve_main_copilot_handler",
+        _main_lookup,
+    )
     ctx: Any = SimpleNamespace(workflow_permanent_id="wpid_1", organization_id="org_1")
 
     handler = await copilot_tools._completion_verification_handler(ctx)
@@ -361,18 +364,18 @@ async def test_completion_verification_handler_uses_main_copilot_lane(
 
 
 @pytest.mark.asyncio
-async def test_composition_visual_handler_uses_main_copilot_lane(
+async def test_composition_visual_handler_uses_fast_copilot_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    main_handler = object()
+    fast_handler = object()
 
-    async def _main_lookup(workflow_permanent_id: str | None, organization_id: str | None) -> object:
+    async def _fast_lookup(workflow_permanent_id: str | None, organization_id: str | None) -> object:
         assert workflow_permanent_id == "wpid_1"
         assert organization_id == "org_1"
-        return main_handler
+        return fast_handler
 
-    monkeypatch.setattr(copilot_tools, "resolve_main_copilot_handler", _main_lookup)
+    monkeypatch.setattr(copilot_tools.composition_capture, "resolve_fast_copilot_handler", _fast_lookup)
     ctx: Any = SimpleNamespace(workflow_permanent_id="wpid_1", organization_id="org_1")
 
     handler = await copilot_tools._composition_visual_handler(ctx)
-    assert handler is main_handler
+    assert handler is fast_handler

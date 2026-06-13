@@ -2,6 +2,7 @@ import {
   ExclamationTriangleIcon,
   LightningBoltIcon,
   MixerHorizontalIcon,
+  RocketIcon,
 } from "@radix-ui/react-icons";
 
 import {
@@ -66,6 +67,10 @@ import { useKeywordSearch } from "@/routes/workflows/hooks/useKeywordSearch";
 import { useParameterExpansion } from "@/routes/workflows/hooks/useParameterExpansion";
 import { ParameterDisplayInline } from "@/routes/workflows/components/ParameterDisplayInline";
 import { HighlightText } from "@/routes/workflows/components/HighlightText";
+import { useOnboardingStateOptional } from "@/store/onboarding/useOnboardingState";
+import { OnboardingEmptyState } from "@/components/onboarding/OnboardingEmptyState";
+import { useFeatureFlagVariantKey } from "posthog-js/react";
+import { EXPERIMENT, isABVariant } from "@/util/onboarding/experimentConfig";
 
 const statusValues = new Set<string>(Object.values(Status));
 function isKnownStatus(value: string): value is Status {
@@ -116,6 +121,10 @@ function getRunNavigationPath(run: TaskRunListItem): string {
 }
 
 function RunHistory() {
+  const onboarding = useOnboardingStateOptional();
+  const isNewUser = onboarding?.isNewUser ?? false;
+  const onboardingState = onboarding?.state ?? null;
+  const onboardingFlag = useFeatureFlagVariantKey(EXPERIMENT.flagKey);
   const [searchParams, setSearchParams] = useSearchParams();
   const page = searchParams.get("page") ? Number(searchParams.get("page")) : 1;
   const itemsPerPage = searchParams.get("page_size")
@@ -242,7 +251,7 @@ function RunHistory() {
       return <TableMessageRow colSpan={6}>No runs found</TableMessageRow>;
     }
 
-    return runs?.map((run) => {
+    return runs?.map((run, index) => {
       const executionTime = formatExecutionTime(
         run.started_at ?? run.created_at,
         run.finished_at,
@@ -283,6 +292,7 @@ function RunHistory() {
         <React.Fragment key={run.task_run_id}>
           <TableRow
             className="cursor-pointer"
+            data-hint={index === 0 ? "run-recording" : undefined}
             onClick={(event) => {
               handleNavigate(event, navPath);
             }}
@@ -372,125 +382,158 @@ function RunHistory() {
     setSearchParams(params, { replace: true });
   }
 
+  const hasActiveFilters =
+    statusFilters.length > 0 ||
+    !!debouncedSearch ||
+    !!workflowPermanentIdFilter;
+  const showOnboardingEmpty =
+    !isFetching &&
+    runs?.length === 0 &&
+    !hasActiveFilters &&
+    isNewUser &&
+    onboardingState?.first_run_at === null &&
+    isABVariant(onboardingFlag);
+
   return (
     <div className="space-y-4">
       <header>
         <h1 className="text-2xl">Run History</h1>
       </header>
-      {workflowPermanentIdFilter ? (
-        <div
-          className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
-          data-testid="workflow-filter-banner"
-        >
-          <span className="truncate">
-            Filtering runs for agent{" "}
-            <span className="font-mono">{workflowPermanentIdFilter}</span>
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={clearWorkflowFilter}
-            className="h-auto py-1 text-xs"
-          >
-            Clear
-          </Button>
+      {showOnboardingEmpty ? (
+        <div className="rounded-lg border">
+          <OnboardingEmptyState
+            surface="runs"
+            icon={<RocketIcon className="h-6 w-6" />}
+            title="Your run history will appear here"
+            description="Every time you run a workflow, the result shows up on this page. Create your first workflow to get started."
+            primaryAction={{
+              label: "Create your first workflow",
+              onClick: () => navigate("/workflows"),
+            }}
+            secondaryAction={{
+              label: "Browse templates",
+              onClick: () => navigate("/workflows"),
+            }}
+          />
         </div>
-      ) : null}
-      <div className="flex items-center justify-between gap-4">
-        <TableSearchInput
-          value={search}
-          onChange={(value) => {
-            setSearch(value);
-            const params = new URLSearchParams(searchParams);
-            params.set("page", "1");
-            setSearchParams(params, { replace: true });
-          }}
-          placeholder={
-            workflowPermanentIdFilter
-              ? "Clear the agent filter above to search"
-              : "Search by run ID or input..."
-          }
-          disabled={!!workflowPermanentIdFilter}
-          className="w-48 lg:w-72"
-        />
-        <StatusFilterDropdown
-          values={statusFilters}
-          onChange={(filters) => {
-            const params = new URLSearchParams(searchParams);
-            if (filters.length === 0) {
-              params.delete("status");
-            } else {
-              params.set("status", filters.join(","));
-            }
-            params.set("page", "1");
-            setSearchParams(params, { replace: true });
-          }}
-        />
-      </div>
-      <div className="overflow-hidden rounded-lg border border-border">
-        <Table className="sm:table-fixed">
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-[20%]">Run ID</TableHead>
-              <TableHead className="w-[20%]">Detail</TableHead>
-              <TableHead className="w-[16%]">Status</TableHead>
-              <TableHead className="w-[27%]">Created At</TableHead>
-              <TableHead className="w-[8%]">Duration</TableHead>
-              <TableHead className="w-[8%]"></TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>{displayTableBody()}</TableBody>
-        </Table>
-        <div className="relative px-3 py-3">
-          <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
-            <span className="text-neutral-600 dark:text-slate-400">
-              Items per page
-            </span>
-            <Select
-              value={String(itemsPerPage)}
-              onValueChange={(size) => {
+      ) : (
+        <>
+          {workflowPermanentIdFilter ? (
+            <div
+              className="flex items-center justify-between gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs"
+              data-testid="workflow-filter-banner"
+            >
+              <span className="truncate">
+                Filtering runs for workflow{" "}
+                <span className="font-mono">{workflowPermanentIdFilter}</span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearWorkflowFilter}
+                className="h-auto py-1 text-xs"
+              >
+                Clear
+              </Button>
+            </div>
+          ) : null}
+          <div className="flex items-center justify-between gap-4">
+            <TableSearchInput
+              value={search}
+              onChange={(value) => {
+                setSearch(value);
                 const params = new URLSearchParams(searchParams);
-                params.set("page_size", size);
                 params.set("page", "1");
                 setSearchParams(params, { replace: true });
               }}
-            >
-              <SelectTrigger className="w-[65px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="5">5</SelectItem>
-                <SelectItem value="10">10</SelectItem>
-                <SelectItem value="20">20</SelectItem>
-                <SelectItem value="50">50</SelectItem>
-              </SelectContent>
-            </Select>
+              placeholder={
+                workflowPermanentIdFilter
+                  ? "Clear the agent filter above to search"
+                  : "Search by run ID or input..."
+              }
+              disabled={!!workflowPermanentIdFilter}
+              className="w-48 lg:w-72"
+            />
+            <StatusFilterDropdown
+              values={statusFilters}
+              onChange={(filters) => {
+                const params = new URLSearchParams(searchParams);
+                if (filters.length === 0) {
+                  params.delete("status");
+                } else {
+                  params.set("status", filters.join(","));
+                }
+                params.set("page", "1");
+                setSearchParams(params, { replace: true });
+              }}
+            />
           </div>
-          <Pagination className="pt-0">
-            <PaginationContent>
-              <PaginationItem>
-                <PaginationPrevious
-                  className={cn({
-                    "cursor-not-allowed opacity-50": page === 1,
-                  })}
-                  onClick={handlePreviousPage}
-                />
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationLink>{page}</PaginationLink>
-              </PaginationItem>
-              <PaginationItem>
-                <PaginationNext
-                  className={cn({
-                    "cursor-not-allowed opacity-50": isNextDisabled,
-                  })}
-                  onClick={handleNextPage}
-                />
-              </PaginationItem>
-            </PaginationContent>
-          </Pagination>
-        </div>
-      </div>
+          <div className="overflow-hidden rounded-lg border border-border">
+            <Table className="sm:table-fixed">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="w-[20%]">Run ID</TableHead>
+                  <TableHead className="w-[20%]">Detail</TableHead>
+                  <TableHead className="w-[16%]">Status</TableHead>
+                  <TableHead className="w-[27%]">Created At</TableHead>
+                  <TableHead className="w-[8%]">Duration</TableHead>
+                  <TableHead className="w-[8%]"></TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>{displayTableBody()}</TableBody>
+            </Table>
+            <div className="relative px-3 py-3">
+              <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-2 text-sm">
+                <span className="text-neutral-600 dark:text-slate-400">
+                  Items per page
+                </span>
+                <Select
+                  value={String(itemsPerPage)}
+                  onValueChange={(size) => {
+                    const params = new URLSearchParams(searchParams);
+                    params.set("page_size", size);
+                    params.set("page", "1");
+                    setSearchParams(params, { replace: true });
+                  }}
+                >
+                  <SelectTrigger className="w-[65px]">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="5">5</SelectItem>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Pagination className="pt-0">
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      className={cn({
+                        "cursor-not-allowed opacity-50": page === 1,
+                      })}
+                      onClick={handlePreviousPage}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationLink>{page}</PaginationLink>
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      className={cn({
+                        "cursor-not-allowed opacity-50": isNextDisabled,
+                      })}
+                      onClick={handleNextPage}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

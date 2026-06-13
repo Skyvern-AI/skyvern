@@ -1,6 +1,6 @@
 import { PlusIcon } from "@radix-ui/react-icons";
 import { Handle, NodeProps, Position, useEdges, useNodes } from "@xyflow/react";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
 import { useProcessRecordingMutation } from "@/routes/browserSessions/hooks/useProcessRecordingMutation";
@@ -48,6 +48,8 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
 
   // SOP upload
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [menuPinned, setMenuPinned] = useState(false);
 
   const deriveBranchContext = (previousNodeId: string | undefined) =>
     findBranchContextForInsertion(nodes, previousNodeId, parentId);
@@ -207,8 +209,8 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
     e.target.value = "";
   };
 
-  // Highlight the + CTA the same way withSelectableBlock highlights a selected block,
-  // active while the node library is open targeting this specific NodeAdder.
+  // Highlight the + CTA the same way withSelectableBlock highlights a selected
+  // block, while its add menu is pinned open or the node library is open targeting it.
   const isAdding =
     workflowStatePanel.workflowPanelState.active &&
     workflowStatePanel.workflowPanelState.content === "nodeLibrary" &&
@@ -225,7 +227,7 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
         {
           "cursor-not-allowed bg-muted text-muted-foreground hover:bg-muted hover:ring-0":
             isDisabled,
-          [SELECTED_RING_CLASSES]: isAdding,
+          [SELECTED_RING_CLASSES]: isAdding || menuPinned,
         },
       )}
       onClick={() => {
@@ -282,13 +284,14 @@ function NodeAdderNode({ id, parentId }: NodeProps<NodeAdderNode>) {
       onRecord={onRecord}
       onUploadSOP={onUploadSOP}
       isUploadingSOP={isUploadingSOP}
+      onPinnedChange={setMenuPinned}
     >
       {adder}
     </WorkflowAddMenu>
   );
 
   return (
-    <div>
+    <div data-tour="node-adder">
       <input
         ref={fileInputRef}
         type="file"

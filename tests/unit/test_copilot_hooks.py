@@ -11,7 +11,9 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
+from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
 
 @dataclass
@@ -36,6 +38,17 @@ def _mcp_text_output(payload: dict[str, Any]) -> list[dict[str, str]]:
     return [{"type": "text", "text": json.dumps(payload)}]
 
 
+def _terminal_loop_signal() -> CopilotToolBlockerSignal:
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text="LOOP DETECTED: 'update_workflow' has already failed 3 times.",
+        user_facing_reason="I retried without making progress. Tell me what to change and I'll try again.",
+        recovery_hint="report_blocker_to_user",
+        internal_reason_code="loop_detected_repeated_failed_step",
+        blocked_tool="update_workflow",
+    )
+
+
 @pytest.mark.asyncio
 async def test_on_tool_end_appends_generic_tool_entry() -> None:
     ctx = _FakeContext()
@@ -49,6 +62,20 @@ async def test_on_tool_end_appends_generic_tool_entry() -> None:
     assert entry["tool"] == "navigate_browser"
     assert "summary" in entry
     assert "output_preview" not in entry  # non-whitelisted tool
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_raises_turn_halt_after_activity_recording() -> None:
+    ctx = _FakeContext()
+    ctx.turn_halt = turn_halt_from_blocker_signal(_terminal_loop_signal(), source="test")  # type: ignore[attr-defined]
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": False, "error": "terminal blocker"})
+    with pytest.raises(CopilotTurnHalt) as exc_info:
+        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("update_workflow"), output)
+
+    assert exc_info.value.halt is ctx.turn_halt
+    assert ctx.tool_activity[0]["tool"] == "update_workflow"
 
 
 @pytest.mark.asyncio
@@ -115,6 +142,43 @@ async def test_on_tool_end_failed_whitelisted_tool_skips_preview() -> None:
 
     entry = ctx.tool_activity[0]
     assert "output_preview" not in entry
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_records_resolved_ids() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output(
+        {
+            "ok": True,
+            "data": {
+                "credentials": [
+                    {"credential_id": "cred_amazon", "name": "Amazon", "username": "shopper@example.test"},
+                    {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+                ],
+                "count": 2,
+            },
+        }
+    )
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+
+    entry = ctx.tool_activity[0]
+    assert entry["credentials"] == [
+        {"credential_id": "cred_amazon", "name": "Amazon"},
+        {"credential_id": "cred_quicken", "name": "Quicken Classic"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_list_credentials_empty_skips_field() -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"credentials": [], "count": 0}})
+    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("list_credentials"), output)
+
+    assert "credentials" not in ctx.tool_activity[0]
 
 
 @pytest.mark.asyncio
@@ -323,6 +387,7 @@ class TestMCPFailedStepLoopDetection:
             get_browser_state=AsyncMock(return_value=browser_state),
         )
         monkeypatch.setattr(runtime.app, "PERSISTENT_SESSIONS_MANAGER", persistent_session_manager)
+        monkeypatch.setattr(runtime.settings, "ENV", "local")
 
         runtime_skyvern = MagicMock()
         monkeypatch.setattr(runtime, "get_skyvern", lambda: runtime_skyvern)
@@ -352,11 +417,13 @@ class TestMCPFailedStepLoopDetection:
         monkeypatch.setattr(session_manager, "get_skyvern", lambda: fallback_skyvern)
 
         observed_session_ids: list[str | None] = []
+        observed_localhost_access: list[bool | None] = []
 
         async def fake_do_screenshot(page: Any, full_page: bool = False, selector: str | None = None) -> Any:
             del page, full_page, selector
             current = session_manager.get_current_session()
             observed_session_ids.append(current.context.session_id if current.context else None)
+            observed_localhost_access.append(current.context.can_access_localhost if current.context else None)
             assert current.api_key_hash == session_manager._api_key_hash("sk-copilot-org")
             return SimpleNamespace(data=b"fake-png")
 
@@ -398,6 +465,7 @@ class TestMCPFailedStepLoopDetection:
         assert parsed["ok"] is True
         assert parsed["data"]["screenshot_base64"]
         assert observed_session_ids == ["pbs_copilot"]
+        assert observed_localhost_access == [True]
         fallback_skyvern.connect_to_cloud_browser_session.assert_not_awaited()
         persistent_session_manager.get_browser_state.assert_any_await(
             session_id="pbs_copilot",
@@ -721,7 +789,13 @@ class TestBrowserInteractionObservationHooks:
     async def test_click_hook_marks_pending_interaction_observation(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _click_post_hook
 
-        ctx = SimpleNamespace(pending_browser_interaction_observation=None, discovery_mcp_server=None)
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
+        )
         result = await _click_post_hook(
             {"ok": True, "data": {"selector": "#add-to-cart"}},
             {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
@@ -748,6 +822,9 @@ class TestBrowserInteractionObservationHooks:
                 url="https://example.com/results",
             ),
             discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
         )
 
         result = await _click_post_hook(
@@ -769,8 +846,14 @@ class TestBrowserInteractionObservationHooks:
         async def fake_verify(*_args: object, **_kwargs: object) -> dict[str, object]:
             return {"ok": False, "error": "field is still empty"}
 
-        monkeypatch.setattr(tools_module, "_verify_scout_type_landed", fake_verify)
-        ctx = SimpleNamespace(pending_browser_interaction_observation=None, discovery_mcp_server=None)
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fake_verify)
+        ctx = SimpleNamespace(
+            pending_browser_interaction_observation=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            pending_scout_source_url=None,
+        )
 
         result = await tools_module._type_text_post_hook(
             {"ok": True, "data": {"selector": "#q", "text_length": 12}},
@@ -780,3 +863,308 @@ class TestBrowserInteractionObservationHooks:
 
         assert result == {"ok": False, "error": "field is still empty"}
         assert ctx.pending_browser_interaction_observation is None
+
+
+class TestScoutedInteractionCapture:
+    """A scouted interaction with a concrete selector is captured and surfaced to
+    code-only authoring; intent-only and failed-readback actions are not."""
+
+    def _ctx(self, *, policy: object = None, source_url: str | None = None) -> SimpleNamespace:
+        ns = SimpleNamespace(
+            pending_browser_interaction_observation=None,
+            discovery_mcp_server=None,
+            scouted_interactions=[],
+            scout_trajectory=[],
+            observed_browser_urls=[],
+            pending_scout_source_url=source_url,
+        )
+        if policy is not None:
+            ns.block_authoring_policy = policy
+        return ns
+
+    def test_record_requires_concrete_selector(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="click", selector="")
+        _record_scouted_interaction(ctx, tool_name="type_text", selector="   ")
+        assert ctx.scouted_interactions == []
+
+    def test_record_press_key_without_selector_is_kept(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="press_key", selector="", key="Enter")
+        assert ctx.scouted_interactions == [{"tool_name": "press_key", "key": "Enter"}]
+
+    def test_record_takes_source_url_param(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(
+            ctx, tool_name="click", selector="#add-to-cart", source_url="https://example.com/product"
+        )
+        assert ctx.scouted_interactions == [
+            {"tool_name": "click", "selector": "#add-to-cart", "source_url": "https://example.com/product"}
+        ]
+
+    def test_consume_scout_source_url_reads_and_clears(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _consume_scout_source_url
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        assert _consume_scout_source_url(ctx) == "https://example.com/product"
+        # cleared so a failed/non-recording action cannot bleed into a later interaction
+        assert ctx.pending_scout_source_url is None
+        assert _consume_scout_source_url(ctx) is None
+
+    def test_record_dedups_identical_interaction(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="click", selector="#x", source_url="https://e.com/a")
+        _record_scouted_interaction(ctx, tool_name="click", selector="#x", source_url="https://e.com/a")
+        _record_scouted_interaction(ctx, tool_name="click", selector="#y", source_url="https://e.com/a")
+        assert ctx.scouted_interactions == [
+            {"tool_name": "click", "selector": "#x", "source_url": "https://e.com/a"},
+            {"tool_name": "click", "selector": "#y", "source_url": "https://e.com/a"},
+        ]
+
+    def test_record_drops_zero_typed_length(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _record_scouted_interaction
+
+        ctx = self._ctx()
+        _record_scouted_interaction(ctx, tool_name="type_text", selector="#q", typed_length=0)
+        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q"}]
+
+    def test_record_omits_empty_extras_and_caps_history(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _MAX_SCOUTED_INTERACTIONS, _record_scouted_interaction
+
+        ctx = self._ctx()
+        for index in range(_MAX_SCOUTED_INTERACTIONS + 5):
+            _record_scouted_interaction(ctx, tool_name="click", selector=f"#item-{index}")
+        assert len(ctx.scouted_interactions) == _MAX_SCOUTED_INTERACTIONS
+        # oldest dropped, newest kept
+        assert ctx.scouted_interactions[-1]["selector"] == f"#item-{_MAX_SCOUTED_INTERACTIONS + 4}"
+        assert "source_url" not in ctx.scouted_interactions[-1]
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_registers_interaction_reached_observation(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        ctx.flow_evidence = []
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert len(ctx.flow_evidence) == 1
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["evidence"]["source_tool"] == "scout_interaction"
+        assert entry["evidence"]["current_url"] == "https://example.com/cart"
+        assert entry["evidence"]["interaction_selector"] == "#add-to-cart"
+        assert entry["evidence"]["interaction_source_url"] == "https://example.com/product"
+        assert result["observation_step"] == entry["step"]
+        assert result["data"]["observation_step"] == entry["step"]
+
+    @pytest.mark.asyncio
+    async def test_post_hook_skips_observation_without_flow_evidence(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = self._ctx()  # no flow_evidence on this context
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert "observation_step" not in result
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_records_source_page_not_destination(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        # pre-hook stashed the product page; the click navigates to the cart
+        ctx = self._ctx(source_url="https://example.com/product")
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == [
+            {"tool_name": "click", "selector": "#add-to-cart", "source_url": "https://example.com/product"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_omits_source_url_when_unavailable(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = self._ctx()  # no pre-hook source url
+        await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart"}},
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == [{"tool_name": "click", "selector": "#add-to-cart"}]
+
+    @pytest.mark.asyncio
+    async def test_type_post_hook_records_selector_and_length_not_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == [{"tool_name": "type_text", "selector": "#q", "typed_length": 8}]
+        # the raw typed text is never captured (PII)
+        assert all("text" not in item for item in ctx.scouted_interactions)
+
+    @pytest.mark.asyncio
+    async def test_type_post_hook_records_nothing_when_readback_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def fails(*_a: object, **_k: object) -> dict[str, object]:
+            return {"ok": False, "error": "field is still empty"}
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fails)
+        ctx = self._ctx()
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_select_and_press_key_capture_value_and_key(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _press_key_post_hook, _select_option_post_hook
+
+        ctx = self._ctx()
+        await _select_option_post_hook(
+            {"ok": True, "data": {"selector": "#sort", "value": "price_asc"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        await _press_key_post_hook(
+            {"ok": True, "data": {"selector": "#q", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        assert ctx.scouted_interactions == [
+            {"tool_name": "select_option", "selector": "#sort", "value": "price_asc"},
+            {"tool_name": "press_key", "selector": "#q", "key": "Enter"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multi_action_sequence_preserves_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+        await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": "#q", "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/search", "title": "Search"}},
+            ctx,
+        )
+        await tools_module._press_key_post_hook(
+            {"ok": True, "data": {"selector": "#q", "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        assert [item["tool_name"] for item in ctx.scouted_interactions] == ["type_text", "press_key"]
+
+    @pytest.mark.asyncio
+    async def test_post_hook_clears_source_url_even_when_action_fails(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        # a failed click must not leave its source page to bleed into a later interaction
+        ctx = self._ctx(source_url="https://example.com/product")
+        await _click_post_hook({"ok": False, "error": "not found"}, {}, ctx)
+        assert ctx.pending_scout_source_url is None
+        assert ctx.scouted_interactions == []
+
+    @pytest.mark.asyncio
+    async def test_capture_scout_source_url_reads_live_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+        from skyvern.forge.sdk.copilot.tools import scouting as scouting_module
+
+        async def fake_url(_ctx: object) -> str:
+            return "https://example.com/product"
+
+        monkeypatch.setattr(scouting_module, "_live_working_page_url", fake_url)
+        ctx = self._ctx()
+        await tools_module._capture_scout_source_url(ctx)
+        assert ctx.pending_scout_source_url == "https://example.com/product"
+
+    @pytest.mark.asyncio
+    async def test_select_option_post_hook_surfaces_observation_step(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _select_option_post_hook
+
+        ctx = self._ctx()
+        ctx.flow_evidence = []
+        result = await _select_option_post_hook(
+            {"ok": True, "data": {"selector": "#sort", "value": "price_asc"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+        entry = ctx.flow_evidence[0]
+        assert entry["reached_via"] == "interaction"
+        assert entry["evidence"]["interaction_selector"] == "#sort"
+        assert result["data"]["observation_step"] == entry["step"]
+
+
+class TestAssembleEnforcementMessages:
+    @staticmethod
+    def _screenshot_msg() -> dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "screenshot"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }
+
+    @staticmethod
+    def _offer_msg() -> dict[str, Any]:
+        return {"role": "user", "content": "Here is a code block you can add."}
+
+    def test_screenshot_nudge_and_offer_ordering(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        offer_msg = self._offer_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, "please finish the workflow", offer_msg)
+
+        screenshot_indices = [i for i, m in enumerate(msgs) if m is screenshot_msg]
+        assert screenshot_indices == [msgs.index(screenshot_msg)]
+        assert len(screenshot_indices) == 1
+
+        nudge_index = next(
+            i
+            for i, m in enumerate(msgs)
+            if isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL)
+        )
+        assert nudge_index == len(msgs) - 1
+
+        offer_index = msgs.index(offer_msg)
+        assert offer_index < nudge_index
+
+    def test_offer_and_screenshot_without_nudge(self) -> None:
+        from skyvern.forge.sdk.copilot.enforcement import NUDGE_SENTINEL, _assemble_enforcement_messages
+
+        screenshot_msg = self._screenshot_msg()
+        offer_msg = self._offer_msg()
+        msgs = _assemble_enforcement_messages(screenshot_msg, None, offer_msg)
+
+        assert offer_msg in msgs
+        assert msgs.count(screenshot_msg) == 1
+        assert not any(isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL) for m in msgs)

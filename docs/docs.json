@@ -63,19 +63,19 @@
             ]
           },
           {
-            "group": "Building Workflows",
+            "group": "Building Agents",
             "pages": [
-              "cloud/building-workflows/build-a-workflow",
-              "cloud/building-workflows/manage-workflows",
-              "cloud/building-workflows/add-parameters",
-              "cloud/building-workflows/run-a-workflow",
-              "cloud/building-workflows/scheduling",
-              "cloud/building-workflows/run-from-code"
+              "cloud/building-agents/build-an-agent",
+              "cloud/building-agents/manage-agents",
+              "cloud/building-agents/add-parameters",
+              "cloud/building-agents/run-an-agent",
+              "cloud/building-agents/scheduling",
+              "cloud/building-agents/run-from-code"
             ]
           },
           {
-            "group": "Workflow Blocks",
-            "pages": ["cloud/building-workflows/configure-blocks"]
+            "group": "Agent Blocks",
+            "pages": ["cloud/building-agents/configure-blocks"]
           },
           {
             "group": "Running Tasks",
@@ -165,7 +165,7 @@
             ]
           },
           {
-            "group": "Workflow Blocks",
+            "group": "Agent Blocks",
             "pages": ["developers/browser-automations/actions-reference"]
           },
           {
@@ -314,7 +314,7 @@
             ]
           },
           {
-            "group": "Workflows",
+            "group": "Agents",
             "pages": [
               "sdk-reference/workflows/run-workflow",
               "sdk-reference/workflows/create-workflow",
@@ -547,19 +547,19 @@
     },
     {
       "source": "/workflows/manage-workflows",
-      "destination": "/cloud/building-workflows/manage-workflows"
+      "destination": "/cloud/building-agents/manage-agents"
     },
     {
       "source": "/workflows/workflow-blocks-details",
-      "destination": "/cloud/building-workflows/configure-blocks"
+      "destination": "/cloud/building-agents/configure-blocks"
     },
     {
       "source": "/workflows/workflow-parameters",
-      "destination": "/cloud/building-workflows/add-parameters"
+      "destination": "/cloud/building-agents/add-parameters"
     },
     {
       "source": "/workflows/run-workflows",
-      "destination": "/cloud/building-workflows/run-a-workflow"
+      "destination": "/cloud/building-agents/run-an-agent"
     },
     {
       "source": "/workflows/consistent-workflows",
@@ -567,27 +567,27 @@
     },
     {
       "source": "/workflows/running-workflows",
-      "destination": "/cloud/building-workflows/run-a-workflow"
+      "destination": "/cloud/building-agents/run-an-agent"
     },
     {
       "source": "/workflows/introduction",
-      "destination": "/cloud/building-workflows/build-a-workflow"
+      "destination": "/cloud/building-agents/build-an-agent"
     },
     {
       "source": "/workflows/workflow-blocks",
-      "destination": "/cloud/building-workflows/configure-blocks"
+      "destination": "/cloud/building-agents/configure-blocks"
     },
     {
       "source": "/workflows/creating-workflows",
-      "destination": "/cloud/building-workflows/build-a-workflow"
+      "destination": "/cloud/building-agents/build-an-agent"
     },
     {
       "source": "/workflows/getting-workflows",
-      "destination": "/cloud/building-workflows/run-a-workflow"
+      "destination": "/cloud/building-agents/run-an-agent"
     },
     {
       "source": "/workflows/what-is-a-parameter",
-      "destination": "/cloud/building-workflows/add-parameters"
+      "destination": "/cloud/building-agents/add-parameters"
     },
     {
       "source": "/multi-step-automations/overview",
@@ -623,11 +623,11 @@
     },
     {
       "source": "/multi-step-automations/workflow-parameters",
-      "destination": "/cloud/building-workflows/add-parameters"
+      "destination": "/cloud/building-agents/add-parameters"
     },
     {
       "source": "/multi-step-automations/scheduling-workflows",
-      "destination": "/cloud/building-workflows/scheduling"
+      "destination": "/cloud/building-agents/scheduling"
     },
     {
       "source": "/credentials/introduction",
@@ -860,6 +860,34 @@
     {
       "source": "/browser-automations/:slug*",
       "destination": "/developers/browser-automations/:slug*"
+    },
+    {
+      "source": "/cloud/building-workflows/build-a-workflow",
+      "destination": "/cloud/building-agents/build-an-agent"
+    },
+    {
+      "source": "/cloud/building-workflows/manage-workflows",
+      "destination": "/cloud/building-agents/manage-agents"
+    },
+    {
+      "source": "/cloud/building-workflows/run-a-workflow",
+      "destination": "/cloud/building-agents/run-an-agent"
+    },
+    {
+      "source": "/cloud/building-workflows/add-parameters",
+      "destination": "/cloud/building-agents/add-parameters"
+    },
+    {
+      "source": "/cloud/building-workflows/configure-blocks",
+      "destination": "/cloud/building-agents/configure-blocks"
+    },
+    {
+      "source": "/cloud/building-workflows/run-from-code",
+      "destination": "/cloud/building-agents/run-from-code"
+    },
+    {
+      "source": "/cloud/building-workflows/scheduling",
+      "destination": "/cloud/building-agents/scheduling"
     }
   ]
 }

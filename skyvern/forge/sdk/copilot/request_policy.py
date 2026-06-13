@@ -77,6 +77,9 @@ _STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX = (
 )
 _STORED_CREDENTIAL_URL_QUESTION = f"{_STORED_CREDENTIAL_URL_QUESTION_STABLE_PREFIX} {_CREDENTIALS_UI_DIRECTIONS}"
 _CREDENTIAL_ID_RE = re.compile(r"\bcred_[A-Za-z0-9][A-Za-z0-9_-]*\b")
+# A credential ID typed with the wrong separator (`cred 530…`, `cred-530…`). The
+# digit-only body and length floor keep this off prose like `cred and the password`.
+_MALFORMED_CREDENTIAL_ID_RE = re.compile(r"\bcred[ \t\-]+([0-9]{12,})\b")
 _JINJA_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _CREDENTIAL_PARAM_METADATA_FIELDS = frozenset(
     {
@@ -94,8 +97,11 @@ _WORKFLOW_CREDENTIAL_INPUTS_UNBOUND_QUESTION = (
     "I couldn't find the required credentials for the existing workflow. "
     f"Please add them via the Credentials UI and I can try again. {_CREDENTIALS_UI_DIRECTIONS}"
 )
+SECRET_KEYWORD_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I
+)
 _RAW_SECRET_PATTERNS = (
-    re.compile(r"\b(?:password|passcode|api[_ -]?key|secret|token|bearer|authorization)\s*[:=]\s*\S+", re.I),
+    SECRET_KEYWORD_ASSIGNMENT_PATTERN,
     re.compile(
         r"\b(?:otp|totp|mfa|2fa|verification|auth(?:entication)? code)(?:\s+code)?\s*(?:is|[:=])?\s*\d{6,8}\b",
         re.I,
@@ -144,6 +150,9 @@ class RequestPolicy:
     completion_contract: str | None = None
     completion_criteria: list[CompletionCriterion] = field(default_factory=list)
     resolved_credentials: list[Credential] = field(default_factory=list)
+    # Approves persisting a bound credential, not running it: run authority stays
+    # scoped to resolved_credentials (ADR 0002).
+    discovered_credentials: list[Credential] = field(default_factory=list)
     invalid_credential_ids: list[str] = field(default_factory=list)
     clarification_question: str | None = None
     raw_secret_detected: bool = False
@@ -355,7 +364,15 @@ def _clean_list(values: list[Any]) -> list[str]:
 
 
 def _credential_ids(text: str) -> list[str]:
-    return list(dict.fromkeys(_CREDENTIAL_ID_RE.findall(text or "")))
+    text = text or ""
+    canonical = _CREDENTIAL_ID_RE.findall(text)
+    normalized = [f"cred_{body}" for body in _MALFORMED_CREDENTIAL_ID_RE.findall(text)]
+    return list(dict.fromkeys(canonical + normalized))
+
+
+def _canonicalize_credential_ref(ref: str) -> str:
+    malformed = _MALFORMED_CREDENTIAL_ID_RE.fullmatch(ref.strip())
+    return f"cred_{malformed.group(1)}" if malformed else ref
 
 
 def _raw_secret_detected(text: str) -> bool:
@@ -598,7 +615,8 @@ async def _classify_request(
 
     policy = _classification_from_raw(raw)
     policy.completion_contract = _ground_completion_contract(user_message, policy.completion_contract)
-    policy.credential_refs = _clean_list(policy.credential_refs + ids)
+    classifier_credential_refs = [_canonicalize_credential_ref(ref) for ref in policy.credential_refs]
+    policy.credential_refs = _clean_list(classifier_credential_refs + ids)
     if raw_secret_present:
         policy.raw_secret_detected = True
         if policy.raw_secret_handling == "redacted_draft":
@@ -611,8 +629,16 @@ async def _classify_request(
             policy.clarification_reason = structural_reason if structural_reason != "none" else "raw_secret"
     if policy.testing_intent == "skip_test" and policy.completion_contract:
         policy.testing_intent = "unspecified"
-    if ids and policy.credential_input_kind in ("none", "placeholder"):
-        policy.credential_input_kind = "credential_id"
+    if ids and policy.credential_input_kind != "raw_secret":
+        # A deterministically-extracted `cred_`-shaped token overrides a non-ID kind, unless the
+        # classifier pointed at another resolvable target — a saved name (an ID-shaped ref does
+        # not count) or a login-page URL — leaving the cred_ token as contextual.
+        classifier_named_a_credential = any(not _credential_ids(ref) for ref in classifier_credential_refs)
+        classifier_target_wins = (
+            policy.credential_input_kind == "credential_name" and classifier_named_a_credential
+        ) or (policy.credential_input_kind == "website_stored_credential" and bool(policy.login_page_urls))
+        if not classifier_target_wins:
+            policy.credential_input_kind = "credential_id"
     if (
         policy.credential_input_kind == "raw_secret"
         and not raw_secret_present
@@ -774,6 +800,30 @@ def _previous_credential_clarification_was_asked(global_llm_context: str) -> boo
     return any(
         decision.startswith(_CLARIFICATION_DECISION_PREFIX) and "/credential_name_unresolved" in decision
         for decision in structured.decisions_made
+    )
+
+
+def _discovered_credential_ids_from_context(global_llm_context: str) -> set[str]:
+    structured = StructuredContext.from_json_str(global_llm_context)
+    return {
+        check.credential_id
+        for check in structured.credentials_checked
+        if check.found and isinstance(check.credential_id, str) and check.credential_id.startswith("cred_")
+    }
+
+
+async def _seed_discovered_credentials(
+    policy: RequestPolicy,
+    *,
+    organization_id: str,
+    global_llm_context: str,
+) -> None:
+    discovered_ids = _discovered_credential_ids_from_context(global_llm_context)
+    if not discovered_ids:
+        return
+    policy.discovered_credentials = await app.DATABASE.credentials.get_credentials_by_ids(
+        sorted(discovered_ids),
+        organization_id=organization_id,
     )
 
 
@@ -1035,6 +1085,18 @@ async def build_request_policy(
     policy.existing_workflow_credential_origins = {
         credential_id: sorted(origins) for credential_id, origins in workflow_credential_origins(workflow_yaml).items()
     }
+    try:
+        await _seed_discovered_credentials(
+            policy,
+            organization_id=organization_id,
+            global_llm_context=global_llm_context,
+        )
+    except Exception:
+        LOG.warning(
+            "request-policy discovered-credential seeding failed",
+            organization_id=organization_id,
+            exc_info=True,
+        )
     _prioritize_credential_clarification(policy)
 
     if policy.raw_secret_detected and policy.raw_secret_handling == "redacted_draft":

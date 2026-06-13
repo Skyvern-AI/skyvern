@@ -38,7 +38,12 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.hooks import _tool_completion_satisfies_turn
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy, _parse_completion_criteria
 from skyvern.forge.sdk.copilot.tools import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    _active_run_terminal_evidence_needs_visual_fallback,
+    _active_run_terminal_evidence_result,
+    _active_run_terminal_evidence_sample,
     _build_run_evidence_snapshot,
+    _composition_visual_prompt,
     _current_workflow_has_evidence_block,
     _is_outcome_evidence_candidate,
     _is_unfinished_run_verification_candidate,
@@ -48,7 +53,9 @@ from skyvern.forge.sdk.copilot.tools import (
     _outcome_unverified_reason,
     _record_composition_page_observation,
     _record_run_blocks_result,
+    _tool_loop_error,
     _tool_visible_result_after_completion_verification,
+    _watchdog_exit_allows_terminal_promotion,
 )
 
 
@@ -152,6 +159,106 @@ def test_snapshot_has_evidence() -> None:
     assert RunEvidenceSnapshot().has_evidence() is False
     assert RunEvidenceSnapshot(current_url="https://example.com").has_evidence() is True
     assert RunEvidenceSnapshot(block_outputs={"a": 1}).has_evidence() is True
+    assert RunEvidenceSnapshot(page_evidence={"visible_text_excerpt": "cart item PART-001-TEST"}).has_evidence() is True
+
+
+def test_snapshot_renders_bounded_page_evidence() -> None:
+    long_visible_text = "Footer recommendation " * 200
+    snapshot = RunEvidenceSnapshot(
+        workflow_run_id="wr_active",
+        current_url="https://example.com/cart",
+        page_title="Cart",
+        page_evidence={
+            "visible_text_excerpt": long_visible_text,
+            "visual_evidence_summary": "Screenshot shows the cart with TESTBRAND PART-001-TEST quantity 1.",
+            "screenshot_used": True,
+            "evidence_sources": ["dom_html", "screenshot", "vision_summary"],
+            "forms": [{"id": "checkout", "submit_controls": [{"text": "Checkout"}]}],
+            "result_containers": [{"selector": "#cart"}],
+            "anti_bot_indicators": [],
+            "raw_html": "<div>must not render</div>",
+        },
+    )
+
+    rendered = snapshot.render_prompt_block()
+
+    assert "page_evidence:" in rendered
+    assert "visible_text_excerpt" in rendered
+    assert "visual_evidence_summary" in rendered
+    assert "screenshot" in rendered
+    assert "PART-001-TEST" in rendered
+    assert rendered.index("visual_evidence_summary") < rendered.index("visible_text_excerpt")
+    assert "raw_html" not in rendered
+
+
+def test_active_run_terminal_visual_fallback_uses_screenshot_when_missing() -> None:
+    assert (
+        _active_run_terminal_evidence_needs_visual_fallback(
+            {
+                "visible_text_excerpt": "",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "evidence_confidence": 0.1,
+            }
+        )
+        is True
+    )
+    assert (
+        _active_run_terminal_evidence_needs_visual_fallback(
+            {
+                "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "evidence_confidence": 0.1,
+            }
+        )
+        is True
+    )
+    assert (
+        _active_run_terminal_evidence_needs_visual_fallback(
+            {
+                "visible_text_excerpt": "Cart contains item PART-001-TEST with quantity 1. " * 4,
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [],
+                "evidence_confidence": 0.1,
+            }
+        )
+        is True
+    )
+    assert (
+        _active_run_terminal_evidence_needs_visual_fallback(
+            {
+                "visible_text_excerpt": "",
+                "forms": [],
+                "navigation_targets": [],
+                "result_containers": [{"selector": "#cart"}],
+                "evidence_confidence": 0.3,
+            }
+        )
+        is True
+    )
+    assert (
+        _active_run_terminal_evidence_needs_visual_fallback(
+            {
+                "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+                "result_containers": [{"selector": "#cart"}],
+                "screenshot_used": True,
+            }
+        )
+        is False
+    )
+
+
+def test_visual_prompt_requests_outcome_relevant_page_state() -> None:
+    prompt = _composition_visual_prompt({"current_url": "https://example.com/cart", "page_title": "Cart"})
+
+    assert "cart items" in prompt
+    assert "visible identifiers" in prompt
+    assert "quantities" in prompt
+    assert "human-verification" in prompt
 
 
 def test_summarize_unsatisfied_lists_unmet_outcomes() -> None:
@@ -360,8 +467,10 @@ def test_record_run_blocks_keeps_building_on_mid_build_no_evidence() -> None:
     # A nav-only WIP that has not added a confirmation block yet must keep building,
     # not enter repair...
     assert ctx.last_test_suspicious_success is False
-    assert ctx.last_full_workflow_test_ok is True
-    # ...but terminal success stays withheld because the outcome is unverified.
+    # ...but terminal success and good-workflow promotion stay withheld because
+    # the outcome is unverified.
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_good_workflow is None
     assert _completion_contract_not_violated(ctx) is False
 
 
@@ -370,6 +479,47 @@ def test_record_run_blocks_downgrades_on_contradiction_without_confirmation_bloc
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
+
+
+def _failed_code_block_result() -> dict:
+    raw = (
+        "code block failed. failure reason: Failed to execute code block. Reason: TimeoutError: "
+        "Timeout 30000ms exceeded. =========================== logs =========================== "
+        '"load" event fired ============================================================'
+    )
+    return {
+        "ok": False,
+        "data": {
+            "workflow_run_id": "wr_x",
+            "overall_status": "failed",
+            "executed_block_labels": ["b0"],
+            "blocks": [{"label": "b0", "block_type": "code", "status": "failed", "failure_reason": raw}],
+        },
+    }
+
+
+def test_failed_run_records_gate_reason_separately_from_raw_block_failure() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _failed_code_block_result(), completion_verification=_evaluated(("c0", False)))
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+    assert "TimeoutError" not in (ctx.last_outcome_gate_reason or "")
+    assert "TimeoutError" in (ctx.last_test_failure_reason or "")
+
+
+def test_gate_reason_survives_a_later_run_without_verification() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+    _record_run_blocks_result(ctx, _failed_code_block_result(), completion_verification=None)
+    assert "item in cart" in (ctx.last_outcome_gate_reason or "")
+
+
+def test_gate_reason_cleared_when_outcome_verified() -> None:
+    ctx = _ctx_with_blocks("extraction")
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", False)))
+    assert ctx.last_outcome_gate_reason is not None
+    _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_evaluated(("c0", True)))
+    assert ctx.last_outcome_gate_reason is None
 
 
 def test_record_run_blocks_keeps_success_when_outcome_verified() -> None:
@@ -385,6 +535,12 @@ def test_current_workflow_has_evidence_block() -> None:
     assert _current_workflow_has_evidence_block(_ctx_with_blocks("goto_url", "validation")) is True
     assert _current_workflow_has_evidence_block(_ctx_with_blocks("goto_url", "navigation")) is False
     assert _current_workflow_has_evidence_block(_run_ctx()) is False
+
+
+def test_active_terminal_watchdog_exit_cannot_promote_to_terminal_success() -> None:
+    assert _watchdog_exit_allows_terminal_promotion("active_run_terminal_evidence") is False
+    assert _watchdog_exit_allows_terminal_promotion("per_tool_budget") is True
+    assert _watchdog_exit_allows_terminal_promotion("task_exit_unfinalized") is True
 
 
 def test_outcome_failure_warrants_repair() -> None:
@@ -450,7 +606,7 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -458,6 +614,195 @@ async def test_maybe_run_completion_verification_runs_on_canceled_run(monkeypatc
     assert result is not None
     assert result.status == "evaluated"
     assert result.is_fully_satisfied() is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_completion_verification_skips_active_terminal_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("active-run terminal evidence must not be promoted to final success")
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    ctx = _run_ctx()
+    result = _canceled_budget_result()
+    result["data"]["active_run_terminal_evidence_detected"] = True
+
+    assert await _maybe_run_completion_verification(ctx, result, time.monotonic()) is None
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_evidence_sample_matches_current_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def handler(**kwargs: object) -> dict:
+        captured.update(kwargs)
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    async def fake_fallback_page_info(_ctx: object) -> tuple[str, str]:
+        return "https://example.com/cart", "Cart"
+
+    async def fake_capture_composition_evidence(
+        _ctx: object,
+        *,
+        inspected_url: str,
+        current_url: str,
+        active_run_terminal_sample: bool = False,
+    ) -> tuple[dict, None]:
+        captured["active_run_terminal_sample"] = active_run_terminal_sample
+        return (
+            {
+                "inspected_url": inspected_url,
+                "current_url": current_url,
+                "page_title": "Cart",
+                "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+                "forms": [],
+                "result_containers": [{"selector": "#cart"}],
+                "anti_bot_indicators": [],
+            },
+            None,
+        )
+
+    async def fake_completion_verification_handler(_ctx: object) -> object:
+        return handler
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler",
+        fake_completion_verification_handler,
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._fallback_page_info", fake_fallback_page_info
+    )
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._capture_composition_evidence",
+        fake_capture_composition_evidence,
+    )
+    ctx = _run_ctx()
+
+    sample = await _active_run_terminal_evidence_sample(
+        ctx,
+        workflow_run_id="wr_active",
+        labels_to_execute=["search_and_add"],
+        sample_index=1,
+    )
+
+    assert sample is not None
+    assert sample.completion_verification.is_fully_satisfied() is True
+    assert sample.current_url == "https://example.com/cart"
+    assert sample.page_evidence["observed_during_active_workflow_run"] is True
+    assert captured["active_run_terminal_sample"] is True
+    assert "PART-001-TEST" in str(captured["prompt"])
+
+
+@pytest.mark.asyncio
+async def test_active_run_terminal_evidence_sample_skips_method_only_criteria(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("method-mandated criteria cannot be verified from page state")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.composition_capture._completion_verification_handler", lambda: handler
+    )
+    ctx = _run_ctx()
+    ctx.request_policy = RequestPolicy(
+        completion_criteria=[_criterion("c0", "must use website search", method_mandated=True)]
+    )
+
+    assert (
+        await _active_run_terminal_evidence_sample(
+            ctx,
+            workflow_run_id="wr_active",
+            labels_to_execute=["search_and_add"],
+            sample_index=1,
+        )
+        is None
+    )
+
+
+def test_active_run_terminal_evidence_result_shape_is_not_final_success() -> None:
+    sample = SimpleNamespace(
+        current_url="https://example.com/cart",
+        page_title="Cart",
+        sample_index=2,
+        completion_verification=_evaluated(("c0", True)),
+        page_evidence={
+            "current_url": "https://example.com/cart",
+            "page_title": "Cart",
+            "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+        },
+    )
+
+    result = _active_run_terminal_evidence_result(
+        workflow_run_id="wr_active",
+        run_status="running",
+        sample=sample,
+        requested_block_labels=["search_and_add"],
+        executed_block_labels=["search_and_add"],
+    )
+
+    assert result["ok"] is False
+    assert result["data"]["active_run_terminal_evidence_detected"] is True
+    assert result["data"]["full_workflow_verified"] is False
+    assert result["data"]["failure_categories"][0]["category"] == ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+
+
+def test_record_active_run_terminal_evidence_keeps_workflow_unverified() -> None:
+    sample = SimpleNamespace(
+        current_url="https://example.com/cart",
+        page_title="Cart",
+        sample_index=2,
+        completion_verification=_evaluated(("c0", True)),
+        page_evidence={
+            "current_url": "https://example.com/cart",
+            "page_title": "Cart",
+            "visible_text_excerpt": "Cart TESTBRAND PART-001-TEST quantity 1",
+        },
+    )
+    result = _active_run_terminal_evidence_result(
+        workflow_run_id="wr_active",
+        run_status="canceled",
+        sample=sample,
+        requested_block_labels=["search_and_add"],
+        executed_block_labels=["search_and_add"],
+    )
+    ctx = _run_ctx()
+
+    _record_run_blocks_result(ctx, result)
+
+    assert ctx.last_test_ok is False
+    assert ctx.last_full_workflow_test_ok is False
+    assert ctx.last_failure_category_top == ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+    assert ctx.workflow_verification_evidence.full_workflow_verified is False
+    assert ctx.workflow_verification_evidence.live_page_state_verified is True
+    assert ctx.workflow_verification_evidence.active_run_terminal_evidence_detected is True
+    assert ctx.workflow_verification_evidence.active_run_terminal_evidence_workflow_run_id == "wr_active"
+    assert ctx.workflow_verification_evidence.active_run_terminal_evidence_sample_index == 2
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_active_run_terminal_evidence"
+
+
+def test_active_run_terminal_evidence_blocks_same_turn_mutation_tools() -> None:
+    ctx = _run_ctx()
+    ctx.last_failure_category_top = ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+    ctx.workflow_verification_evidence.active_run_terminal_evidence_detected = True
+    ctx.workflow_verification_evidence.current_url = "https://example.com/cart"
+    ctx.workflow_verification_evidence.workflow_run_id = "wr_active"
+
+    result = _tool_loop_error(ctx, "update_and_run_blocks", {"block_labels": ["search_and_add"]})
+
+    assert result is not None
+    assert "ACTIVE_RUN_TERMINAL_EVIDENCE" in result
+    assert ctx.blocker_signal is not None
+    assert ctx.blocker_signal.internal_reason_code == "tool_error_active_run_terminal_evidence"
 
 
 def test_outcome_fully_verified_predicate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -517,7 +862,7 @@ async def test_page_observation_verification_recognizes_budgeted_outcome(
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -563,7 +908,7 @@ async def test_page_observation_verification_does_not_overwrite_satisfied_verdic
         raise AssertionError("handler should not be called once the outcome is verified")
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -600,7 +945,7 @@ async def test_page_observation_verification_preserves_existing_unsatisfied_verd
         return {"verdicts": [{"criterion_id": "c0", "satisfied": False, "reason_code": "no_evidence"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -634,7 +979,7 @@ async def test_page_observation_verification_can_upgrade_unsatisfied_verdict(
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -740,7 +1085,7 @@ async def test_maybe_run_completion_verification_runs_on_unverified_prefix(monke
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _ctx_unverified_prefix()
@@ -770,7 +1115,7 @@ async def test_method_mandated_criteria_excluded_from_verification(monkeypatch: 
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -903,7 +1248,7 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         }
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", True)
@@ -973,7 +1318,7 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
         return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
 
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
     ctx = _run_ctx()
@@ -987,7 +1332,7 @@ async def test_maybe_run_completion_verification_unavailable_on_low_budget(monke
 
     # A missing judge handler stays a soft fallback (None), not a hard block.
     monkeypatch.setattr(
-        "skyvern.forge.sdk.copilot.tools._completion_verification_handler",
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(None),
     )
     assert await _maybe_run_completion_verification(ctx, _clean_success_result(), time.monotonic()) is None

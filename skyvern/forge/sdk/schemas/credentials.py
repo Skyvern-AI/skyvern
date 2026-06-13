@@ -12,6 +12,7 @@ from skyvern.utils.url_validators import validate_url
 class CredentialVaultType(StrEnum):
     BITWARDEN = "bitwarden"
     AZURE_VAULT = "azure_vault"
+    GCP = "gcp"
     CUSTOM = "custom"
 
 
@@ -195,6 +196,11 @@ class CredentialResponse(BaseModel):
         default=None,
         description="Whether the user intends to save a browser session, regardless of test outcome",
     )
+    folder_id: str | None = Field(
+        default=None,
+        description="ID of the credential folder this credential belongs to, if any",
+        examples=["cfld_1234567890"],
+    )
 
 
 class Credential(BaseModel):
@@ -233,6 +239,10 @@ class Credential(BaseModel):
     save_browser_session_intent: bool | None = Field(
         default=False,
         description="Whether the user intends to save a browser session, regardless of test outcome",
+    )
+    folder_id: str | None = Field(
+        default=None,
+        description="ID of the credential folder this credential belongs to, if any",
     )
 
     created_at: datetime = Field(..., description="Timestamp when the credential was created")

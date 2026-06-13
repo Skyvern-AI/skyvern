@@ -9,7 +9,7 @@
     "/v1/run/tasks": {
       "post": {
         "tags": [
-          "Agent"
+          "Agents"
         ],
         "summary": "Run a task",
         "description": "Run a task",
@@ -85,6 +85,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "run_task",
         "x-fern-examples": [
           {
@@ -102,14 +103,14 @@
         ]
       }
     },
-    "/v1/run/workflows": {
+    "/v1/run/agents": {
       "post": {
         "tags": [
-          "Workflow Runs"
+          "Agents"
         ],
-        "summary": "Run a workflow",
-        "description": "Run a workflow",
-        "operationId": "run_workflow_v1_run_workflows_post",
+        "summary": "Run an agent",
+        "description": "Run an agent",
+        "operationId": "run_workflow_v1_run_agents_post",
         "parameters": [
           {
             "name": "template",
@@ -184,7 +185,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successfully run workflow",
+            "description": "Successfully ran agent",
             "content": {
               "application/json": {
                 "schema": {
@@ -194,7 +195,7 @@
             }
           },
           "400": {
-            "description": "Invalid workflow run request"
+            "description": "Invalid agent run request"
           },
           "422": {
             "description": "Validation Error",
@@ -227,11 +228,9 @@
     "/v1/runs/{run_id}": {
       "get": {
         "tags": [
-          "Agent",
-          "Workflow Runs",
-          "Workflows"
+          "Agents"
         ],
-        "summary": "Get a run by id",
+        "summary": "Get run info by id",
         "description": "Get run information (task run, workflow run)",
         "operationId": "get_run_v1_runs__run_id__get",
         "parameters": [
@@ -335,8 +334,7 @@
     "/v1/runs/{run_id}/cancel": {
       "post": {
         "tags": [
-          "Agent",
-          "Workflow Runs"
+          "Agents"
         ],
         "summary": "Cancel a run by id",
         "description": "Cancel a run (task or workflow)",
@@ -412,8 +410,7 @@
     "/v1/runs/cancel": {
       "post": {
         "tags": [
-          "Agent",
-          "Workflow Runs"
+          "Agents"
         ],
         "summary": "Bulk cancel runs",
         "description": "Cancel multiple runs (tasks or workflows) in a single request",
@@ -487,14 +484,14 @@
         ]
       }
     },
-    "/v1/workflows": {
+    "/v1/agents": {
       "post": {
         "tags": [
-          "Workflows"
+          "Agents"
         ],
-        "summary": "Create a new workflow",
-        "description": "Create a new workflow",
-        "operationId": "create_workflow_v1_workflows_post",
+        "summary": "Create a new agent",
+        "description": "Create a new agent",
+        "operationId": "create_workflow_v1_agents_post",
         "parameters": [
           {
             "name": "folder_id",
@@ -545,7 +542,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successfully created workflow",
+            "description": "Successfully created agent",
             "content": {
               "application/json": {
                 "schema": {
@@ -555,7 +552,7 @@
             }
           },
           "422": {
-            "description": "Invalid workflow definition"
+            "description": "Invalid agent definition"
           }
         },
         "x-fern-sdk-method-name": "create_workflow",
@@ -580,9 +577,9 @@
       },
       "get": {
         "tags": [
-          "Workflows"
+          "Agents"
         ],
-        "summary": "Get Workflows",
+        "summary": "Get all agents",
         "description": "Get all workflows with the latest version for the organization.\n\nSearch semantics:\n- If `search_key` is provided, its value is used as a unified search term for\n  `workflows.title`, `folders.title`, and workflow parameter metadata (key, description, and default_value for\n  `WorkflowParameterModel`).\n- Falls back to deprecated `title` (title-only search) if `search_key` is not provided.\n- Parameter metadata search excludes soft-deleted parameter rows across all parameter tables.",
         "operationId": "get_workflows_v1_workflows_get",
         "parameters": [
@@ -713,6 +710,32 @@
             }
           },
           {
+            "name": "tags",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "maxItems": 20
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`.",
+              "examples": [
+                "env:prod",
+                "customer:acme,env:prod"
+              ],
+              "title": "Tags"
+            },
+            "description": "Filter by tags as `key:value` pairs. Repeat the param or comma-separate (`?tags=env:prod,env:staging`). AND across distinct keys, OR within a key (`?tags=customer:acme,env:prod,env:staging` -> customer=acme AND env in (prod, staging)). Matches current tag values only. Not supported with `template=true`."
+          },
+          {
             "name": "template",
             "in": "query",
             "required": false,
@@ -784,14 +807,14 @@
         ]
       }
     },
-    "/v1/workflows/{workflow_id}": {
+    "/v1/agents/{workflow_id}": {
       "post": {
         "tags": [
-          "Workflows"
+          "Agents"
         ],
-        "summary": "Update a workflow",
-        "description": "Update a workflow",
-        "operationId": "update_workflow_v1_workflows__workflow_id__post",
+        "summary": "Update an agent",
+        "description": "Update an agent",
+        "operationId": "update_workflow_v1_agents__workflow_id__post",
         "parameters": [
           {
             "name": "workflow_id",
@@ -799,13 +822,13 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "The ID of the workflow to update. Workflow ID starts with `wpid_`.",
+              "description": "The ID of the agent to update. Starts with `wpid_`.",
               "examples": [
                 "wpid_123"
               ],
               "title": "Workflow Id"
             },
-            "description": "The ID of the workflow to update. Workflow ID starts with `wpid_`."
+            "description": "The ID of the agent to update. Starts with `wpid_`."
           },
           {
             "name": "x-api-key",
@@ -838,7 +861,7 @@
         },
         "responses": {
           "200": {
-            "description": "Successfully updated workflow",
+            "description": "Successfully updated agent",
             "content": {
               "application/json": {
                 "schema": {
@@ -848,7 +871,7 @@
             }
           },
           "422": {
-            "description": "Invalid workflow definition"
+            "description": "Invalid agent definition"
           }
         },
         "x-fern-sdk-method-name": "update_workflow",
@@ -872,14 +895,14 @@
         ]
       }
     },
-    "/v1/workflows/{workflow_id}/delete": {
+    "/v1/agents/{workflow_id}/delete": {
       "post": {
         "tags": [
-          "Workflows"
+          "Agents"
         ],
-        "summary": "Delete a workflow",
-        "description": "Delete a workflow",
-        "operationId": "delete_workflow_v1_workflows__workflow_id__delete_post",
+        "summary": "Delete an agent",
+        "description": "Delete an agent",
+        "operationId": "delete_workflow_v1_agents__workflow_id__delete_post",
         "parameters": [
           {
             "name": "workflow_id",
@@ -887,13 +910,13 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "The ID of the workflow to delete. Workflow ID starts with `wpid_`.",
+              "description": "The ID of the agent to delete. Starts with `wpid_`.",
               "examples": [
                 "wpid_123"
               ],
               "title": "Workflow Id"
             },
-            "description": "The ID of the workflow to delete. Workflow ID starts with `wpid_`."
+            "description": "The ID of the agent to delete. Starts with `wpid_`."
           },
           {
             "name": "x-api-key",
@@ -916,7 +939,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Successfully deleted workflow",
+            "description": "Successfully deleted agent",
             "content": {
               "application/json": {
                 "schema": {}
@@ -954,7 +977,7 @@
     "/v1/folders": {
       "post": {
         "tags": [
-          "Workflow Folders"
+          "Agent Folders"
         ],
         "summary": "Create folder",
         "description": "Create a new folder to organize workflows",
@@ -1018,7 +1041,7 @@
       },
       "get": {
         "tags": [
-          "Workflow Folders"
+          "Agent Folders"
         ],
         "summary": "Get folders",
         "description": "Get all folders for the organization",
@@ -1120,7 +1143,7 @@
     "/v1/folders/{folder_id}": {
       "get": {
         "tags": [
-          "Workflow Folders"
+          "Agent Folders"
         ],
         "summary": "Get folder",
         "description": "Get a specific folder by ID",
@@ -1188,7 +1211,7 @@
       },
       "put": {
         "tags": [
-          "Workflow Folders"
+          "Agent Folders"
         ],
         "summary": "Update folder",
         "description": "Update a folder's title or description",
@@ -1266,7 +1289,7 @@
       },
       "delete": {
         "tags": [
-          "Workflow Folders"
+          "Agent Folders"
         ],
         "summary": "Delete folder",
         "description": "Delete a folder. Optionally delete all workflows in the folder.",
@@ -1347,403 +1370,10 @@
         "x-fern-sdk-method-name": "delete_folder"
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/folder": {
-      "put": {
-        "tags": [
-          "Workflow Folders"
-        ],
-        "summary": "Update workflow folder",
-        "description": "Update a workflow's folder assignment for the latest version",
-        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully updated workflow folder",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Workflow"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Folder not found"
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "update_workflow_folder"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/tags": {
-      "post": {
-        "tags": [
-          "Workflow Tags"
-        ],
-        "summary": "Apply workflow tags",
-        "description": "Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
-        "operationId": "apply_workflow_tags_v1_workflows__workflow_permanent_id__tags_post",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TagApplyRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successfully applied tag changes",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TagsResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Invalid tag key or value"
-          }
-        },
-        "x-fern-sdk-method-name": "apply_workflow_tags"
-      },
-      "get": {
-        "tags": [
-          "Workflow Tags"
-        ],
-        "summary": "Get workflow tags",
-        "description": "Get the current tag state for a workflow.",
-        "operationId": "get_workflow_tags_v1_workflows__workflow_permanent_id__tags_get",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved tags",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TagsResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow_tags"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/tags/{key}": {
-      "delete": {
-        "tags": [
-          "Workflow Tags"
-        ],
-        "summary": "Delete workflow tag",
-        "description": "Soft-delete a single tag from a workflow. Writes a DELETE event row.",
-        "operationId": "delete_workflow_tag_v1_workflows__workflow_permanent_id__tags__key__delete",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          },
-          {
-            "name": "key",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Tag key to delete",
-              "examples": [
-                "env"
-              ],
-              "title": "Key"
-            },
-            "description": "Tag key to delete"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully deleted tag (or no-op if absent)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TagsResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "delete_workflow_tag"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/tags/history": {
-      "get": {
-        "tags": [
-          "Workflow Tags"
-        ],
-        "summary": "Get workflow tag history",
-        "description": "Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
-        "operationId": "get_workflow_tag_history_v1_workflows__workflow_permanent_id__tags_history_get",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "Workflow permanent ID",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "Workflow permanent ID"
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 500,
-              "minimum": 1,
-              "description": "Max events to return",
-              "default": 100,
-              "title": "Limit"
-            },
-            "description": "Max events to return"
-          },
-          {
-            "name": "since",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "format": "date-time"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Only return events at or after this timestamp",
-              "title": "Since"
-            },
-            "description": "Only return events at or after this timestamp"
-          },
-          {
-            "name": "key",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Filter to events for a single tag key",
-              "title": "Key"
-            },
-            "description": "Filter to events for a single tag key"
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retrieved tag history",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TagHistoryResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow_tag_history"
-      }
-    },
     "/v1/tag-keys": {
       "get": {
         "tags": [
-          "Workflow Tags"
+          "Agent Tags"
         ],
         "summary": "List tag keys",
         "description": "List all tag keys registered for the organization with their descriptions.",
@@ -1800,7 +1430,7 @@
     "/v1/tag-keys/{key}": {
       "patch": {
         "tags": [
-          "Workflow Tags"
+          "Agent Tags"
         ],
         "summary": "Update tag key",
         "description": "Update the description for a tag key.",
@@ -1865,14 +1495,64 @@
           }
         },
         "x-fern-sdk-method-name": "update_tag_key"
+      },
+      "delete": {
+        "tags": [
+          "Workflow Tags"
+        ],
+        "summary": "Delete tag key",
+        "description": "Delete a tag key from the organization registry and remove that tag from every workflow that currently has it (cascade). Returns how many workflows the tag was removed from.",
+        "operationId": "delete_tag_key_v1_tag_keys__key__delete",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagKeyDeleteResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Tag key not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_tag_key"
       }
     },
     "/v1/workflow-tags": {
       "get": {
         "tags": [
-          "Workflow Tags"
+          "Agent Tags"
         ],
-        "summary": "Batch get workflow tags",
+        "summary": "Batch get agent tags",
         "description": "Batch fetch current tags for many workflows. Avoids N+1 on the workflows-list page.",
         "operationId": "batch_get_workflow_tags_v1_workflow_tags_get",
         "parameters": [
@@ -1941,13 +1621,14 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_workflow_tags"
       },
       "post": {
         "tags": [
-          "Workflow Tags"
+          "Agent Tags"
         ],
-        "summary": "Batch get workflow tags (POST)",
+        "summary": "Batch get agent tags (POST)",
         "description": "Batch fetch current tags for many workflows (POST variant for id lists exceeding URL length).",
         "operationId": "batch_get_workflow_tags_post_v1_workflow_tags_post",
         "parameters": [
@@ -2005,6 +1686,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "batch_get_workflow_tags_post"
       }
     },
@@ -2151,10 +1833,9 @@
     "/v1/runs/{run_id}/retry_webhook": {
       "post": {
         "tags": [
-          "Agent",
-          "Workflow Runs"
+          "Agents"
         ],
-        "summary": "Retry run webhook",
+        "summary": "Replay a run webhook",
         "description": "Retry sending the webhook for a run",
         "operationId": "retry_run_webhook_v1_runs__run_id__retry_webhook_post",
         "parameters": [
@@ -2251,9 +1932,7 @@
     "/v1/runs/{run_id}/timeline": {
       "get": {
         "tags": [
-          "Agent",
-          "Workflow Runs",
-          "Workflows"
+          "Agents"
         ],
         "summary": "Get run timeline",
         "description": "Get timeline for a run (workflow run or task_v2 run)",
@@ -2366,112 +2045,6 @@
             }
           }
         }
-      }
-    },
-    "/v1/workflows/runs/{workflow_run_id}/retry": {
-      "post": {
-        "tags": [
-          "Workflow Runs",
-          "Workflows"
-        ],
-        "summary": "Retry workflow run",
-        "description": "Retry a workflow run using the original run parameters.",
-        "operationId": "retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post",
-        "parameters": [
-          {
-            "name": "workflow_run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The id of the workflow run to retry.",
-              "examples": [
-                "wr_123"
-              ],
-              "title": "Workflow Run Id"
-            },
-            "description": "The id of the workflow run to retry."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          },
-          {
-            "name": "x-max-steps-override",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Max-Steps-Override"
-            }
-          },
-          {
-            "name": "x-user-agent",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-User-Agent"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successfully retried workflow run",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkflowRunResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Workflow run is not retryable"
-          },
-          "404": {
-            "description": "Workflow run not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "retry_workflow_run"
       }
     },
     "/v1/runs": {
@@ -2593,549 +2166,8 @@
             }
           }
         },
+        "x-hidden": true,
         "x-fern-sdk-method-name": "get_runs_v2"
-      }
-    },
-    "/v1/workflows/runs": {
-      "get": {
-        "tags": [
-          "Workflow Runs"
-        ],
-        "summary": "List workflow runs",
-        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
-        "operationId": "get_workflow_runs_v1_workflows_runs_get",
-        "parameters": [
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Page number for pagination.",
-              "default": 1,
-              "title": "Page"
-            },
-            "description": "Page number for pagination."
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Number of runs to return per page.",
-              "default": 10,
-              "title": "Page Size"
-            },
-            "description": "Number of runs to return per page."
-          },
-          {
-            "name": "status",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/WorkflowRunStatus"
-                  }
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Filter by one or more run statuses.",
-              "title": "Status"
-            },
-            "description": "Filter by one or more run statuses."
-          },
-          {
-            "name": "search_key",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "maxLength": 500
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
-              "examples": [
-                "login_url",
-                "credential_value",
-                "wr_abc123"
-              ],
-              "title": "Search Key"
-            },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
-          },
-          {
-            "name": "error_code",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "maxLength": 500
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.",
-              "examples": [
-                "INVALID_CREDENTIALS",
-                "LOGIN_FAILED",
-                "CAPTCHA_DETECTED"
-              ],
-              "title": "Error Code"
-            },
-            "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/WorkflowRun"
-                  },
-                  "title": "Response Get Workflow Runs V1 Workflows Runs Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow_runs"
-      }
-    },
-    "/v1/workflows/{workflow_id}/runs": {
-      "get": {
-        "tags": [
-          "Workflow Runs",
-          "Workflows"
-        ],
-        "summary": "List runs for a workflow",
-        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
-        "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
-        "parameters": [
-          {
-            "name": "workflow_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Id"
-            }
-          },
-          {
-            "name": "page",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Page number for pagination.",
-              "default": 1,
-              "title": "Page"
-            },
-            "description": "Page number for pagination."
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "Number of runs to return per page.",
-              "default": 10,
-              "title": "Page Size"
-            },
-            "description": "Number of runs to return per page."
-          },
-          {
-            "name": "status",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/WorkflowRunStatus"
-                  }
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Filter by one or more run statuses.",
-              "title": "Status"
-            },
-            "description": "Filter by one or more run statuses."
-          },
-          {
-            "name": "search_key",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "maxLength": 500
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
-              "examples": [
-                "login_url",
-                "credential_value",
-                "wr_abc123"
-              ],
-              "title": "Search Key"
-            },
-            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
-          },
-          {
-            "name": "error_code",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "maxLength": 500
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.",
-              "examples": [
-                "INVALID_CREDENTIALS",
-                "LOGIN_FAILED",
-                "CAPTCHA_DETECTED"
-              ],
-              "title": "Error Code"
-            },
-            "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/WorkflowRun"
-                  },
-                  "title": "Response Get Workflow Runs By Id V1 Workflows  Workflow Id  Runs Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow_runs_by_id"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}": {
-      "get": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Get Workflow",
-        "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Permanent Id"
-            }
-          },
-          {
-            "name": "version",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Version"
-            }
-          },
-          {
-            "name": "template",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Workflow"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/versions": {
-      "get": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Get Workflow Versions",
-        "description": "Get all versions of a workflow by its permanent ID.",
-        "operationId": "get_workflow_versions_v1_workflows__workflow_permanent_id__versions_get",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Workflow Permanent Id"
-            }
-          },
-          {
-            "name": "template",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Template"
-            }
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Workflow"
-                  },
-                  "title": "Response Get Workflow Versions V1 Workflows  Workflow Permanent Id  Versions Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        },
-        "x-fern-sdk-method-name": "get_workflow_versions"
-      }
-    },
-    "/v1/workflows/{workflow_permanent_id}/browser_session/reset_profile": {
-      "post": {
-        "tags": [
-          "Workflows"
-        ],
-        "summary": "Reset persisted browser profile",
-        "description": "Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.",
-        "operationId": "reset_workflow_browser_profile",
-        "parameters": [
-          {
-            "name": "workflow_permanent_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "description": "The permanent ID of the workflow. Starts with `wpid_`.",
-              "examples": [
-                "wpid_123"
-              ],
-              "title": "Workflow Permanent Id"
-            },
-            "description": "The permanent ID of the workflow. Starts with `wpid_`."
-          },
-          {
-            "name": "x-api-key",
-            "in": "header",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
-              "title": "X-Api-Key"
-            },
-            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successfully cleared persisted browser profile"
-          },
-          "404": {
-            "description": "Workflow not found"
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Storage deletion failed; retry"
-          }
-        }
       }
     },
     "/v1/upload_file": {
@@ -4229,6 +3261,43 @@
             "description": "Filter credentials by vault type (e.g. 'custom', 'bitwarden', 'azure_vault')"
           },
           {
+            "name": "credential_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/skyvern__forge__sdk__schemas__credentials__CredentialType"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')",
+              "title": "Credential Type"
+            },
+            "description": "Filter credentials by type (e.g. 'password', 'credit_card', 'secret')"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 200
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive search across credential name, username, secret label, and card details",
+              "title": "Search"
+            },
+            "description": "Case-insensitive search across credential name, username, secret label, and card details"
+          },
+          {
             "name": "x-api-key",
             "in": "header",
             "required": false,
@@ -4562,7 +3631,7 @@
     "/v1/run/tasks/login": {
       "post": {
         "tags": [
-          "Agent"
+          "Agents"
         ],
         "summary": "Login Task",
         "description": "Log in to a website using either credential stored in Skyvern, Bitwarden, 1Password, or Azure Vault",
@@ -4635,6 +3704,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-excluded": true,
         "x-fern-sdk-method-name": "login",
         "x-fern-examples": [
@@ -4672,7 +3742,7 @@
     "/v1/run/tasks/download_files": {
       "post": {
         "tags": [
-          "Agent"
+          "Agents"
         ],
         "summary": "File Download Task",
         "description": "Download a file from a website by navigating and clicking download buttons",
@@ -4745,6 +3815,7 @@
             }
           }
         },
+        "x-hidden": true,
         "x-excluded": true,
         "x-fern-sdk-method-name": "download_files",
         "x-fern-examples": [
@@ -5299,12 +4370,1052 @@
         }
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/schedules": {
+    "/v1/agents/{workflow_permanent_id}/folder": {
+      "put": {
+        "tags": [
+          "Agent Folders"
+        ],
+        "summary": "Update agent folder",
+        "description": "Update a workflow's folder assignment for the latest version",
+        "operationId": "update_workflow_folder_v1_workflows__workflow_permanent_id__folder_put",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowFolderRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully updated workflow folder",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "update_workflow_folder"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/tags": {
+      "post": {
+        "tags": [
+          "Agent Tags"
+        ],
+        "summary": "Apply agent tags",
+        "description": "Atomically apply tag changes to a workflow. Sets and deletes happen in one transaction; same-key collisions resolve set-wins.",
+        "operationId": "apply_workflow_tags_v1_workflows__workflow_permanent_id__tags_post",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successfully applied tag changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Invalid tag key or value"
+          }
+        },
+        "x-fern-sdk-method-name": "apply_workflow_tags"
+      },
+      "get": {
+        "tags": [
+          "Agent Tags"
+        ],
+        "summary": "Get agent tags",
+        "description": "Get the current tag state for a workflow.",
+        "operationId": "get_workflow_tags_v1_workflows__workflow_permanent_id__tags_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_tags"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/tags/{key}": {
+      "delete": {
+        "tags": [
+          "Agent Tags"
+        ],
+        "summary": "Delete agent tag",
+        "description": "Soft-delete a single tag from a workflow. Writes a DELETE event row.",
+        "operationId": "delete_workflow_tag_v1_workflows__workflow_permanent_id__tags__key__delete",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Tag key to delete",
+              "examples": [
+                "env"
+              ],
+              "title": "Key"
+            },
+            "description": "Tag key to delete"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully deleted tag (or no-op if absent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "delete_workflow_tag"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/tags/history": {
+      "get": {
+        "tags": [
+          "Agent Tags"
+        ],
+        "summary": "Get agent tag history",
+        "description": "Chronological tag-event log for a workflow (newest first). Includes SET and DELETE events.",
+        "operationId": "get_workflow_tag_history_v1_workflows__workflow_permanent_id__tags_history_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Workflow permanent ID",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "Workflow permanent ID"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "description": "Max events to return",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Max events to return"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only return events at or after this timestamp",
+              "title": "Since"
+            },
+            "description": "Only return events at or after this timestamp"
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to events for a single tag key",
+              "title": "Key"
+            },
+            "description": "Filter to events for a single tag key"
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retrieved tag history",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagHistoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_tag_history"
+      }
+    },
+    "/v1/agents/runs/{workflow_run_id}/retry": {
+      "post": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Retry a run",
+        "description": "Retry a workflow run using the original run parameters.",
+        "operationId": "retry_workflow_run_v1_workflows_runs__workflow_run_id__retry_post",
+        "parameters": [
+          {
+            "name": "workflow_run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The id of the workflow run to retry.",
+              "examples": [
+                "wr_123"
+              ],
+              "title": "Workflow Run Id"
+            },
+            "description": "The id of the workflow run to retry."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          },
+          {
+            "name": "x-max-steps-override",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Max-Steps-Override"
+            }
+          },
+          {
+            "name": "x-user-agent",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successfully retried workflow run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Workflow run is not retryable"
+          },
+          "404": {
+            "description": "Workflow run not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "retry_workflow_run"
+      }
+    },
+    "/v1/agents/runs": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Get all runs",
+        "description": "List workflow runs across all workflows for the current organization.\n\nResults are paginated and can be filtered by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic — a run must match every supplied filter to be returned.\n\n### search_key\n\nA case-insensitive substring search that matches against **any** of the following fields:\n\n| Searched field | Description |\n|---|---|\n| `workflow_run_id` | The unique run identifier (e.g. `wr_123…`) |\n| Parameter **key** | The `key` of any workflow parameter definition associated with the run |\n| Parameter **description** | The `description` of any workflow parameter definition |\n| Run parameter **value** | The actual value supplied for any parameter when the run was created |\n| `extra_http_headers` | Extra HTTP headers attached to the run (searched as raw JSON text) |\n\nSoft-deleted parameter definitions are excluded from key/description matching. A run is returned if **any** of the fields above contain the search term.\n\n### error_code\n\nAn **exact-match** filter against the `error_code` field inside each task's `errors` JSON array. A run matches if **any** of its tasks contains an error object with a matching `error_code` value. Error codes are user-defined strings set during workflow execution (e.g. `INVALID_CREDENTIALS`, `LOGIN_FAILED`, `CAPTCHA_DETECTED`).\n\n### Combining filters\n\nAll query parameters use AND logic:\n- `?status=failed` — only failed runs\n- `?status=failed&error_code=LOGIN_FAILED` — failed runs **and** have a LOGIN_FAILED error\n- `?status=failed&error_code=LOGIN_FAILED&search_key=prod_credential` — all three conditions must match",
+        "operationId": "get_workflow_runs_v1_workflows_runs_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of runs to return per page.",
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of runs to return per page."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRunStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by one or more run statuses.",
+              "title": "Status"
+            },
+            "description": "Filter by one or more run statuses."
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "examples": [
+                "login_url",
+                "credential_value",
+                "wr_abc123"
+              ],
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+          },
+          {
+            "name": "error_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.",
+              "examples": [
+                "INVALID_CREDENTIALS",
+                "LOGIN_FAILED",
+                "CAPTCHA_DETECTED"
+              ],
+              "title": "Error Code"
+            },
+            "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRun"
+                  },
+                  "title": "Response Get Workflow Runs V1 Workflows Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_runs"
+      }
+    },
+    "/v1/agents/{workflow_id}/runs": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Get all runs by agent",
+        "description": "List runs for a specific workflow.\n\nSupports filtering by **status**, **search_key**, and **error_code**. All filters are combined with **AND** logic.\n\n### search_key\n\nCase-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. Soft-deleted parameter definitions are excluded.\n\n### error_code\n\nExact-match filter on the `error_code` field inside each task's `errors` JSON array. A run matches if any of its tasks contains an error with a matching `error_code`.",
+        "operationId": "get_workflow_runs_by_id_v1_workflows__workflow_id__runs_get",
+        "parameters": [
+          {
+            "name": "workflow_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number for pagination.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number for pagination."
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Number of runs to return per page.",
+              "default": 10,
+              "title": "Page Size"
+            },
+            "description": "Number of runs to return per page."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRunStatus"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by one or more run statuses.",
+              "title": "Status"
+            },
+            "description": "Filter by one or more run statuses."
+          },
+          {
+            "name": "search_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching.",
+              "examples": [
+                "login_url",
+                "credential_value",
+                "wr_abc123"
+              ],
+              "title": "Search Key"
+            },
+            "description": "Case-insensitive substring search across: workflow run ID, parameter key, parameter description, run parameter value, and extra HTTP headers. A run is returned if any of these fields match. Soft-deleted parameter definitions are excluded from key/description matching."
+          },
+          {
+            "name": "error_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 500
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution.",
+              "examples": [
+                "INVALID_CREDENTIALS",
+                "LOGIN_FAILED",
+                "CAPTCHA_DETECTED"
+              ],
+              "title": "Error Code"
+            },
+            "description": "Exact-match filter on the error_code field inside each task's errors JSON array. A run matches if any of its tasks contains an error with a matching error_code. Error codes are user-defined strings set during workflow execution."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/WorkflowRun"
+                  },
+                  "title": "Response Get Workflow Runs By Id V1 Workflows  Workflow Id  Runs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_runs_by_id"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Get an agent by id",
+        "operationId": "get_workflow_v1_workflows__workflow_permanent_id__get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Workflow"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/versions": {
+      "get": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Get agent versions",
+        "description": "Get all versions of a workflow by its permanent ID.",
+        "operationId": "get_workflow_versions_v1_workflows__workflow_permanent_id__versions_get",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Workflow Permanent Id"
+            }
+          },
+          {
+            "name": "template",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Template"
+            }
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Workflow"
+                  },
+                  "title": "Response Get Workflow Versions V1 Workflows  Workflow Permanent Id  Versions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-fern-sdk-method-name": "get_workflow_versions"
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/browser_session/reset_profile": {
+      "post": {
+        "tags": [
+          "Agents"
+        ],
+        "summary": "Reset persisted browser profile",
+        "description": "Clear the persisted browser profile for a workflow that uses `Save & Reuse Session`. The next run will start from a fresh browser state. Use when a saved profile is corrupted.",
+        "operationId": "reset_workflow_browser_profile",
+        "parameters": [
+          {
+            "name": "workflow_permanent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "The permanent ID of the workflow. Starts with `wpid_`.",
+              "examples": [
+                "wpid_123"
+              ],
+              "title": "Workflow Permanent Id"
+            },
+            "description": "The permanent ID of the workflow. Starts with `wpid_`."
+          },
+          {
+            "name": "x-api-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings.",
+              "title": "X-Api-Key"
+            },
+            "description": "Skyvern API key for authentication. API key can be found at https://app.skyvern.com/settings."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successfully cleared persisted browser profile"
+          },
+          "404": {
+            "description": "Workflow not found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage deletion failed; retry"
+          }
+        },
+        "x-hidden": true
+      }
+    },
+    "/v1/agents/{workflow_permanent_id}/schedules": {
       "post": {
         "tags": [
           "Schedules"
         ],
-        "summary": "Create a schedule for a workflow",
+        "summary": "Create a schedule for an agent",
         "operationId": "schedules_create",
         "parameters": [
           {
@@ -5372,7 +5483,7 @@
         "tags": [
           "Schedules"
         ],
-        "summary": "List schedules for a workflow",
+        "summary": "List schedules for an agent",
         "operationId": "schedules_list",
         "parameters": [
           {
@@ -5427,12 +5538,12 @@
         }
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
+    "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}": {
       "get": {
         "tags": [
           "Schedules"
         ],
-        "summary": "Get a workflow schedule by id",
+        "summary": "Get an agent schedule by id",
         "operationId": "schedules_get",
         "parameters": [
           {
@@ -5499,7 +5610,7 @@
         "tags": [
           "Schedules"
         ],
-        "summary": "Update a workflow schedule",
+        "summary": "Update an agent schedule",
         "operationId": "schedules_update",
         "parameters": [
           {
@@ -5576,7 +5687,7 @@
         "tags": [
           "Schedules"
         ],
-        "summary": "Delete a workflow schedule",
+        "summary": "Delete an agent schedule",
         "operationId": "schedules_delete",
         "parameters": [
           {
@@ -5640,12 +5751,12 @@
         }
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
+    "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/enable": {
       "post": {
         "tags": [
           "Schedules"
         ],
-        "summary": "Enable a workflow schedule",
+        "summary": "Enable an agent schedule",
         "operationId": "schedules_enable",
         "parameters": [
           {
@@ -5709,12 +5820,12 @@
         }
       }
     },
-    "/v1/workflows/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
+    "/v1/agents/{workflow_permanent_id}/schedules/{workflow_schedule_id}/disable": {
       "post": {
         "tags": [
           "Schedules"
         ],
-        "summary": "Disable a workflow schedule",
+        "summary": "Disable an agent schedule",
         "operationId": "schedules_disable",
         "parameters": [
           {
@@ -7135,6 +7246,7 @@
         "type": "string",
         "enum": [
           "recording",
+          "session_replay",
           "browser_console_log",
           "skyvern_log",
           "skyvern_log_raw",
@@ -9510,6 +9622,21 @@
             ],
             "title": "Save Browser Session Intent",
             "description": "Whether the user intends to save a browser session, regardless of test outcome"
+          },
+          "folder_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Id",
+            "description": "ID of the credential folder this credential belongs to, if any",
+            "examples": [
+              "cfld_1234567890"
+            ]
           }
         },
         "type": "object",
@@ -17538,6 +17665,11 @@
               }
             ],
             "title": "Description"
+          },
+          "workflow_count": {
+            "type": "integer",
+            "title": "Workflow Count",
+            "default": 0
           }
         },
         "type": "object",
@@ -17546,6 +17678,25 @@
         ],
         "title": "TagKey",
         "description": "Tag-key registry entry."
+      },
+      "TagKeyDeleteResponse": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "removed_from_workflow_count": {
+            "type": "integer",
+            "title": "Removed From Workflow Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "removed_from_workflow_count"
+        ],
+        "title": "TagKeyDeleteResponse",
+        "description": "Response for ``DELETE /v1/tag-keys/{key}``."
       },
       "TagKeyUpdate": {
         "properties": {
@@ -21944,6 +22095,12 @@
               }
             ],
             "title": "Deleted At"
+          },
+          "agent_id": {
+            "type": "string",
+            "title": "Agent Id",
+            "description": "Alias of `workflow_permanent_id` — the stable agent identifier (starts with `wpid_`).",
+            "readOnly": true
           }
         },
         "type": "object",
@@ -21956,7 +22113,8 @@
           "is_saved_task",
           "workflow_definition",
           "created_at",
-          "modified_at"
+          "modified_at",
+          "agent_id"
         ],
         "title": "Workflow"
       },
@@ -23721,10 +23879,10 @@
       },
       "WorkflowRunRequest-Input": {
         "properties": {
-          "workflow_id": {
+          "agent_id": {
             "type": "string",
-            "title": "Workflow Id",
-            "description": "ID of the workflow to run. Workflow ID starts with `wpid_`.",
+            "title": "Agent Id",
+            "description": "ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.",
             "examples": [
               "wpid_123"
             ]
@@ -23960,7 +24118,7 @@
         },
         "type": "object",
         "required": [
-          "workflow_id"
+          "agent_id"
         ],
         "title": "WorkflowRunRequest"
       },
@@ -23969,7 +24127,7 @@
           "workflow_id": {
             "type": "string",
             "title": "Workflow Id",
-            "description": "ID of the workflow to run. Workflow ID starts with `wpid_`.",
+            "description": "ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.",
             "examples": [
               "wpid_123"
             ]

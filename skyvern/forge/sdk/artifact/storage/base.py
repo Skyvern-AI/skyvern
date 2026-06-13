@@ -63,6 +63,8 @@ async def _file_infos_from_download_artifacts(artifacts: list[Artifact]) -> list
 # TODO: This should be a part of the ArtifactType model
 FILE_EXTENTSION_MAP: dict[ArtifactType, str] = {
     ArtifactType.RECORDING: "webm",
+    ArtifactType.AUDIO: "webm",
+    ArtifactType.SESSION_REPLAY: "mp4",
     ArtifactType.BROWSER_CONSOLE_LOG: "log",
     ArtifactType.SCREENSHOT_LLM: "png",
     ArtifactType.SCREENSHOT_ACTION: "png",

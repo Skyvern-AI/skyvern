@@ -24,6 +24,7 @@ export interface WorkflowCopilotChatMessage {
   workflow_copilot_chat_id: string;
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   global_llm_context: string | null;
   created_at: string;
   modified_at: string;
@@ -36,7 +37,10 @@ export interface WorkflowCopilotChatRequest {
   workflow_run_id?: string | null;
   browser_session_id?: string | null;
   message: string;
+  audio_artifact_id?: string | null;
   workflow_yaml: string;
+  mode?: "ask" | "build" | null;
+  code_block?: boolean | null;
   cancel_token?: string;
 }
 
@@ -47,7 +51,11 @@ export interface WorkflowCopilotCancelRequest {
 export interface WorkflowCopilotChatHistoryMessage {
   sender: WorkflowCopilotChatSender;
   content: string;
+  audio_artifact_id?: string | null;
   created_at: string;
+  // Typed turn outcome persisted on assistant rows; optional so the FE
+  // tolerates an older backend that does not serve it.
+  turn_outcome?: { response_kind?: string | null } | null;
   narrative_payload?: Record<string, unknown> | null;
 }
 
@@ -68,6 +76,11 @@ export interface WorkflowCopilotApplyProposedWorkflowRequest {
   auto_accept: boolean;
 }
 
+export interface WorkflowCopilotAudioUploadResponse {
+  workflow_copilot_chat_id: string;
+  audio_artifact_id: string;
+}
+
 export type WorkflowCopilotStreamMessageType =
   | "processing_update"
   | "response"
@@ -77,6 +90,7 @@ export type WorkflowCopilotStreamMessageType =
   | "condensing"
   | "narration"
   | "block_progress"
+  | "run_outcome"
   | "turn_start"
   | "design_start"
   | "design_end"
@@ -183,6 +197,24 @@ export interface WorkflowCopilotBlockProgressUpdate {
   block_label: string;
   block_type: string;
   status: string;
+  iteration: number;
+  timestamp: string;
+}
+
+export type WorkflowCopilotRunOutcomeVerdict =
+  | "evaluating"
+  | "demonstrated"
+  | "not_demonstrated"
+  | "not_evaluated";
+
+export interface WorkflowCopilotRunOutcomeUpdate {
+  type: "run_outcome";
+  workflow_run_id: string;
+  workflow_run_block_ids: string[];
+  block_labels: string[];
+  verdict: WorkflowCopilotRunOutcomeVerdict;
+  reason_code?: string | null;
+  display_reason?: string | null;
   iteration: number;
   timestamp: string;
 }

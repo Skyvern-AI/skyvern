@@ -12,6 +12,11 @@ from typing import TYPE_CHECKING, Any
 from skyvern.forge.sdk.agents.context import sanitize_agent_tool_result_for_llm as sanitize_generic_tool_result_for_llm
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.context import COPILOT_RESPONSE_TYPES
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE,
+    PER_TOOL_BUDGET_FAILURE_CATEGORY,
+)
 from skyvern.forge.sdk.copilot.loop_detection import LOOP_DETECTED_MARKER
 from skyvern.schemas.workflows import BlockType
 
@@ -307,7 +312,6 @@ def iter_failure_reasons(result: dict[str, Any]) -> Iterator[str]:
 
 
 _UNKNOWN_ERROR_SENTINEL = "Unknown error"
-_PER_TOOL_BUDGET_FAILURE_CATEGORY = "PER_TOOL_BUDGET"
 _USER_FACING_SUMMARY_KEYS: tuple[str, ...] = ("user_facing_summary", "user_facing_reason")
 _STRUCTURED_UNSAFE_FALLBACK = "Couldn't complete that step."
 
@@ -345,7 +349,11 @@ def _blocker_signal_matches_result(signal: CopilotToolBlockerSignal, result: dic
     if not isinstance(error, str) or not error:
         return False
     steering = signal.agent_steering_text
-    return error == steering or steering in error
+    if error == steering or steering in error:
+        return True
+    return signal.internal_reason_code == ACTIVE_RUN_TERMINAL_EVIDENCE_REASON_CODE and _has_failure_category(
+        result, ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+    )
 
 
 def _failure_categories(result: dict[str, Any]) -> list[Any]:
@@ -406,7 +414,7 @@ def _structured_failure_summary_for_user(
     if saw_structured_summary:
         return _STRUCTURED_UNSAFE_FALLBACK
 
-    if _has_failure_category(result, _PER_TOOL_BUDGET_FAILURE_CATEGORY):
+    if _has_failure_category(result, PER_TOOL_BUDGET_FAILURE_CATEGORY):
         # An explicit but empty failure_reason still means the structured
         # watchdog path fired; use the generic safe copy rather than raw error
         # fallback.

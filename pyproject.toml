@@ -1,6 +1,6 @@
 [project]
 name = "skyvern"
-version = "1.0.37"
+version = "1.0.41"
 description = ""
 authors = [{ name = "Skyvern AI", email = "info@skyvern.com" }]
 requires-python = ">=3.11,<3.14"
@@ -26,6 +26,7 @@ dependencies = [
 # browser-only runtime until local stops importing Forge internals.
 local = [
     "azure-storage-blob>=12.26.0",
+    "google-cloud-storage>=2.18,<4",
     "openai>=1.68.2",
     "yutori>=0.5.0",
     "sqlalchemy>=2.0.29,<3",
@@ -70,6 +71,7 @@ local = [
     "pandas>=2.3.1,<4",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.2.0,<5",
+    "google-cloud-secret-manager>=2.29,<3",
     "jsonschema>=4.23.0",
     "python-calamine>=0.6.1",
     "python-docx>=1.1.0",
@@ -87,6 +89,7 @@ local = [
 # with local until the embedded runtime is separated from Forge/server internals.
 server = [
     "azure-storage-blob>=12.26.0",
+    "google-cloud-storage>=2.18,<4",
     "openai>=1.68.2",
     "yutori>=0.5.0",
     # Plain pip sees LiteLLM's exact openai pin and therefore resolves this
@@ -145,6 +148,7 @@ server = [
     "pandas>=2.3.1,<4",
     "azure-identity>=1.24.0,<2",
     "azure-keyvault-secrets>=4.2.0,<5",
+    "google-cloud-secret-manager>=2.29,<3",
     "jsonschema>=4.23.0",
     "python-calamine>=0.6.1",
     "python-docx>=1.1.0",

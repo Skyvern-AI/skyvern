@@ -1,11 +1,11 @@
 ---
 title: Core Concepts
 subtitle: The building blocks of every automation in the Skyvern dashboard
-description: Understand tasks, workflows, blocks, runs, browser sessions, browser profiles, and credentials in the Skyvern Cloud UI — what each is, where to find it, and how it fits together.
+description: Understand tasks, agents, blocks, runs, browser sessions, browser profiles, and credentials in the Skyvern Cloud UI — what each is, where to find it, and how it fits together.
 slug: cloud/getting-started/core-concepts
 keywords:
   - task
-  - workflow
+  - agent
   - block
   - browser session
   - browser profile
@@ -29,9 +29,9 @@ You create tasks from the **Discover** page. Type your prompt and target URL int
 
 <img src="/images/cloud/discover-page-overview.png" alt="Discover page where you create one-off tasks" />
 
-Tasks are the right starting point for one-off automations, ad-hoc data extraction, or quickly testing whether an idea is feasible before turning it into a workflow.
+Tasks are the right starting point for one-off automations, ad-hoc data extraction, or quickly testing whether an idea is feasible before turning it into an agent.
 
-When you outgrow a single task — you need parameters, branching, loops, or to run the same flow on a schedule — graduate to a Workflow.
+When you outgrow a single task — you need parameters, branching, loops, or to run the same flow on a schedule — graduate to an Agent.
 
 <Card title="Run a task →" icon="play" href="/cloud/getting-started/run-a-task">
   Walkthrough of every option on the Discover page.
@@ -39,22 +39,22 @@ When you outgrow a single task — you need parameters, branching, loops, or to 
 
 ---
 
-## Workflows
+## Agents
 
-A **Workflow** is a reusable automation built by chaining blocks together on a visual canvas. Workflows are versioned, parameterized, and shareable across your team.
+An **Agent** is a reusable automation built by chaining blocks together on a visual canvas. Agents are versioned, parameterized, and shareable across your team.
 
-You build them on the **Workflows** page. Click any workflow to open the editor, where blocks appear as connected nodes you can drag and configure.
+You build them on the **Agents** page. Click any agent to open the editor, where blocks appear as connected nodes you can drag and configure.
 
-<img src="/images/cloud/workflow-editor-overview.png" alt="Workflow editor with blocks chained together" />
+<img src="/images/cloud/workflow-editor-overview.png" alt="Agent editor with blocks chained together" />
 
-Use a workflow when:
+Use an agent when:
 
 - The same flow needs to run repeatedly with different inputs
 - You need to loop over a list, branch on a condition, or pass data between steps
 - You want to schedule the automation to run on a cadence
 - You want a teammate to be able to re-run it without re-deriving the logic
 
-<Card title="Build a workflow →" icon="diagram-project" href="/cloud/building-workflows/build-a-workflow">
+<Card title="Build an agent →" icon="diagram-project" href="/cloud/building-agents/build-an-agent">
   Tutorial covering blocks, parameters, branching, and execution.
 </Card>
 
@@ -62,9 +62,9 @@ Use a workflow when:
 
 ## Blocks
 
-**Blocks** are the units a workflow is built from. Each block performs one thing — navigate, log in, extract data, branch on a condition, send an email — and passes its output to the next block.
+**Blocks** are the units an agent is built from. Each block performs one thing — navigate, log in, extract data, branch on a condition, send an email — and passes its output to the next block.
 
-In the workflow editor, click the **+** button on any node to insert a new block. The picker groups every available block by category.
+In the agent editor, click the **+** button on any node to insert a new block. The picker groups every available block by category.
 
 <img src="/images/cloud/add-block-panel.png" alt="Block picker with categories and block types" />
 
@@ -76,13 +76,13 @@ There are 20+ block types organized into:
 - **Files** — File Download, Cloud Storage Upload
 - **Communication** — Send Email, HTTP Request, Human Interaction
 
-Each block has its own configuration panel. The full reference, with every field for every block, lives at [Workflow Blocks](/cloud/building-workflows/configure-blocks).
+Each block has its own configuration panel. The full reference, with every field for every block, lives at [Agent Blocks](/cloud/building-agents/configure-blocks).
 
 ---
 
 ## Runs
 
-Every time a task or workflow executes, Skyvern creates a **Run** — a record of what happened, with a video, screenshots, action log, and any extracted data.
+Every time a task or agent executes, Skyvern creates a **Run** — a record of what happened, with a video, screenshots, action log, and any extracted data.
 
 The **Runs** page is your history. Filter by status, search by run ID, click any row to drill in.
 
@@ -168,9 +168,9 @@ You can also sync credentials from **Bitwarden**, **1Password**, or **Azure Key 
 
 ## Schedules
 
-A **schedule** runs a workflow automatically on a recurring cadence. You set a cron expression and timezone, and Skyvern fires the workflow at every interval — no manual trigger needed.
+A **schedule** runs an agent automatically on a recurring cadence. You set a cron expression and timezone, and Skyvern fires the agent at every interval — no manual trigger needed.
 
-Schedules are configured per workflow. Open any workflow's actions menu and choose **Schedule**.
+Schedules are configured per agent. Open any agent's actions menu and choose **Schedule**.
 
 <Frame>
 <img src="/images/cloud/create-sched-form.png" alt="Schedule form with cron expression and timezone" width="300" />
@@ -178,7 +178,7 @@ Schedules are configured per workflow. Open any workflow's actions menu and choo
 
 Use schedules for daily reports, hourly monitoring, periodic data syncs, or anything that should "just keep running" without you remembering to click Run.
 
-<Card title="Scheduling →" icon="calendar" href="/cloud/building-workflows/scheduling">
+<Card title="Scheduling →" icon="calendar" href="/cloud/building-agents/scheduling">
   Cron syntax, timezones, and managing scheduled runs.
 </Card>
 
@@ -188,17 +188,17 @@ Use schedules for daily reports, hourly monitoring, periodic data syncs, or anyt
 
 An **engine** is the AI model Skyvern uses to drive the browser. Different engines have different strengths — speed, accuracy on complex pages, cost — and you can pick one per task or per block.
 
-The engine picker appears in API/SDK task requests and on supported browser-driven blocks in the workflow editor.
+The engine picker appears in API/SDK task requests and on supported browser-driven blocks in the agent editor.
 
 | Engine | When to use |
 |--------|-------------|
 | **Skyvern 1.0** | Default for new tasks. Lighter and faster for simple, single-page interactions. |
-| **Skyvern 2.0** | Available for existing V2 workflows and explicitly requested V2 task runs. |
+| **Skyvern 2.0** | Available for existing V2 agents and explicitly requested V2 task runs. |
 | **OpenAI CUA** | OpenAI's Computer Use Agent. Good for visual reasoning. |
 | **Anthropic CUA** | Anthropic's Claude Computer Use. Strong at multi-step planning. |
 | **UI-TARS** | Lightweight CUA model option. |
 
-If you're not sure, use the default. Move repeated automations into workflows when you need scheduling, reusable parameters, or cached code replays.
+If you're not sure, use the default. Move repeated automations into agents when you need scheduling, reusable parameters, or cached code replays.
 
 ---
 
@@ -221,7 +221,7 @@ flowchart LR
 A typical day in the dashboard:
 
 1. **Prototype** with a Task on the Discover page. Iterate on the prompt until it works.
-2. **Productionize** by turning the prompt into a Workflow with Blocks, Parameters, and a Schedule.
+2. **Productionize** by turning the prompt into an Agent with Blocks, Parameters, and a Schedule.
 3. **Persist state** by saving a Browser Profile after the first authenticated run, so future runs skip login.
 4. **Audit** every execution on the Runs page — recording, actions, output, downloaded files.
 
@@ -238,9 +238,9 @@ A typical day in the dashboard:
     Hands-on tutorial — go from prompt to extracted data in a few minutes.
   </Card>
   <Card
-    title="Build a Workflow"
+    title="Build an Agent"
     icon="diagram-project"
-    href="/cloud/building-workflows/build-a-workflow"
+    href="/cloud/building-agents/build-an-agent"
   >
     Wire blocks together into a reusable, parameterized automation.
   </Card>

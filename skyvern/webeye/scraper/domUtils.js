@@ -464,7 +464,22 @@ function isElementVisible(element) {
     !element.disabled
   ) {
     if (tagLower !== "input" || element.type !== "hidden") {
-      return true;
+      // Skip force-visible when the dropdown host/trigger is closed.
+      const host = element.getRootNode().host;
+      const hostClosed = host && host.getAttribute("aria-expanded") === "false";
+      if (!hostClosed) {
+        // Only suppress combobox/filter inputs whose sibling trigger is closed —
+        // regular text inputs next to an unrelated closed element stay visible.
+        const isFilter = element.getAttribute("role") === "combobox";
+        const prevSibling = element.previousElementSibling;
+        const siblingClosed =
+          isFilter &&
+          prevSibling &&
+          prevSibling.getAttribute("aria-expanded") === "false";
+        if (!siblingClosed) {
+          return true;
+        }
+      }
     }
   }
 
@@ -506,6 +521,16 @@ function isElementVisible(element) {
   if (rect.width <= 0 || rect.height <= 0) {
     // Check if this element might be visible on hover before marking as invisible
     if (isHoverOnlyElement(element)) {
+      return true;
+    }
+    // Icon buttons using ::before/::after pseudo-content may have zero rect
+    // when positioned outside their parent. Only bypass if cursor:pointer is own, not inherited.
+    if (
+      style.cursor === "pointer" &&
+      hasBeforeOrAfterPseudoContent(element) &&
+      (!element.parentElement ||
+        getElementComputedStyle(element.parentElement)?.cursor !== "pointer")
+    ) {
       return true;
     }
     return false;

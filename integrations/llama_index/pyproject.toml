@@ -8,7 +8,9 @@ readme = "README.md"
 dependencies = [
     "skyvern>=0.2.0",
     "llama-index>=0.12.19,<0.14",
-    "urllib3>=2.6.0",
+    # Dependabot #645 (GHSA-qccp-gfcp-xxvc / CVE-2026-44431): urllib3 < 2.7.0
+    # forwards sensitive headers across origins on proxied low-level redirects.
+    "urllib3>=2.7.0",
 ]
 
 [build-system]
@@ -48,6 +50,10 @@ override-dependencies = [
     "mako>=1.3.11",
     "cryptography>=46.0.7",
     "pygments>=2.20.0",
+    # Dependabot #631 (GHSA-gphh-9q3h-jgpp / CVE-2026-44209): banks <= 2.4.1
+    # renders prompt templates with an unsandboxed Jinja2 environment (SSTI -> RCE).
+    # Pulled in transitively via llama-index-core. Fixed in 2.4.2.
+    "banks>=2.4.2",
 ]
 
 [tool.uv.sources]

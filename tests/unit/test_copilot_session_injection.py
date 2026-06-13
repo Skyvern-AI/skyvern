@@ -300,7 +300,9 @@ class TestScreenshotAdapter:
         async def handler_lookup(_: object) -> object:
             return handler
 
-        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._completion_verification_handler", handler_lookup)
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler", handler_lookup
+        )
         ctx = _make_ctx(
             request_policy=RequestPolicy(
                 completion_criteria=[CompletionCriterion(id="c0", outcome="the requested item is visible")]
@@ -489,7 +491,7 @@ class TestUpdateWorkflowDirect:
         mock_workflow.workflow_definition.blocks = [MagicMock(), MagicMock()]
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: mock_workflow,
         )
 
@@ -521,7 +523,7 @@ class TestUpdateWorkflowDirect:
         mock_workflow.workflow_definition.blocks = []
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: mock_workflow,
         )
 
@@ -548,7 +550,7 @@ class TestUpdateWorkflowDirect:
             raise _yaml.YAMLError("bad yaml")
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             raise_yaml_error,
         )
 
@@ -576,7 +578,7 @@ class TestUpdateWorkflowDirect:
             )
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             raise_validation_error,
         )
 

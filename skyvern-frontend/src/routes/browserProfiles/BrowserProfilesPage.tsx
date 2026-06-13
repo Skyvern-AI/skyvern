@@ -9,7 +9,8 @@ import { BrowserProfilesList } from "./BrowserProfilesList";
 import { CreateBrowserProfileButton } from "./CreateBrowserProfileButton";
 import { useBackgroundBrowserProfileCreate } from "./hooks/useBackgroundBrowserProfileCreate";
 
-const subHeaderText = "Manage saved browser profiles used by your agent runs.";
+const subHeaderText =
+  "Saved browser state — cookies, logins, and settings — that agents launch a fresh browser from. Cheap to store and reusable in parallel, so one saved login can fan out across many concurrent runs.";
 
 function BrowserProfilesPage() {
   const [searchParams, setSearchParams] = useSearchParams();

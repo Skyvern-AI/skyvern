@@ -310,6 +310,7 @@ class ArtifactManager:
             workflow_run_id=workflow_run_id,
             workflow_run_block_id=workflow_run_block_id,
             organization_id=organization_id,
+            file_size=len(data) if data is not None else _safe_file_size_from_path(path),
             data=data,
             path=path,
         )
@@ -424,6 +425,53 @@ class ArtifactManager:
             uri=uri,
             filename=filename,
             artifact_type=ArtifactType.RECORDING,
+            checksum=checksum,
+            file_size=file_size,
+        )
+
+    async def create_run_recording_artifact(
+        self,
+        *,
+        organization_id: str,
+        run_id: str,
+        uri: str,
+        workflow_run_id: str | None = None,
+        checksum: str | None = None,
+        file_size: int | None = None,
+    ) -> str:
+        """Register a per-run clip as a RECORDING Artifact scoped to ``run_id`` (``browser_session_id``
+        unset). Idempotency is the caller's responsibility.
+        """
+        artifact_id = generate_artifact_id()
+        await app.DATABASE.artifacts.create_artifact(
+            artifact_id=artifact_id,
+            artifact_type=ArtifactType.RECORDING,
+            uri=uri,
+            organization_id=organization_id,
+            run_id=run_id,
+            workflow_run_id=workflow_run_id,
+            checksum=checksum,
+            file_size=file_size,
+        )
+        LOG.debug("Registered run-scoped recording artifact", artifact_id=artifact_id, run_id=run_id, uri=uri)
+        return artifact_id
+
+    async def create_browser_session_replay_artifact(
+        self,
+        *,
+        organization_id: str,
+        browser_session_id: str,
+        uri: str,
+        filename: str,
+        checksum: str | None = None,
+        file_size: int | None = None,
+    ) -> str:
+        return await self._create_browser_session_artifact(
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            uri=uri,
+            filename=filename,
+            artifact_type=ArtifactType.SESSION_REPLAY,
             checksum=checksum,
             file_size=file_size,
         )

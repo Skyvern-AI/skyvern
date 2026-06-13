@@ -88,6 +88,7 @@ class CredentialRepository(BaseRepository):
         vault_type: str | None = None,
         credential_type: str | None = None,
         search: str | None = None,
+        folder_id: str | None = None,
     ) -> list[Credential]:
         async with self.Session() as session:
             query = (
@@ -99,6 +100,8 @@ class CredentialRepository(BaseRepository):
                 query = query.filter(CredentialModel.vault_type == vault_type)
             if credential_type is not None:
                 query = query.filter(CredentialModel.credential_type == credential_type)
+            if folder_id is not None:
+                query = query.filter(CredentialModel.folder_id == folder_id)
             if search:
                 # Escape LIKE wildcards so a literal % or _ in the query narrows rather than broadens.
                 escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

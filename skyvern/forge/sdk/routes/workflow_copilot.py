@@ -11,7 +11,7 @@ from typing import Any, Iterator
 
 import structlog
 import yaml
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, File, Form, HTTPException, Request, UploadFile, status
 from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
@@ -22,7 +22,7 @@ from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.llm.api_handler import LLMAPIHandler
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType
+from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityType
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write, resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
@@ -43,7 +43,9 @@ from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotApplyProposedWorkflowRequest,
+    WorkflowCopilotAudioUploadResponse,
     WorkflowCopilotCancelRequest,
+    WorkflowCopilotChat,
     WorkflowCopilotChatHistoryMessage,
     WorkflowCopilotChatHistoryResponse,
     WorkflowCopilotChatMessage,
@@ -78,6 +80,15 @@ from skyvern.utils.yaml_loader import safe_load_no_dates
 
 WORKFLOW_KNOWLEDGE_BASE_PATH = Path("skyvern/forge/prompts/skyvern/workflow_knowledge_base.txt")
 CHAT_HISTORY_CONTEXT_MESSAGES = 10
+ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES = {
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/wave",
+    "audio/webm",
+    "audio/x-wav",
+}
 
 LOG = structlog.get_logger()
 
@@ -326,6 +337,21 @@ def _make_error_narrative_payload(turn_id: str | None, turn_index: int | None, m
     }
 
 
+def _with_terminal_narrative_metadata(
+    narrative_payload: TurnNarrativePayload | None,
+    *,
+    cancelled: bool,
+    proposal_disposition: ProposalDisposition,
+) -> TurnNarrativePayload | None:
+    if narrative_payload is None:
+        return None
+    return {
+        **narrative_payload,
+        "cancelled": cancelled,
+        "proposalDisposition": proposal_disposition,
+    }
+
+
 def _build_recoverable_route_agent_result(
     error: BaseException,
     *,
@@ -410,6 +436,7 @@ async def _persist_cancel_turn(
     original_workflow: Workflow | None,
     user_message: str,
     agent_result: AgentResult | None,
+    audio_artifact_id: str | None = None,
     turn_id: str | None = None,
 ) -> None:
     """Persist a cancelled turn and emit a terminal SSE response frame.
@@ -458,12 +485,20 @@ async def _persist_cancel_turn(
         narrative_summary = agent_result.narrative_summary
         narrative_payload = agent_result.narrative_payload
 
+    proposal_disposition = _proposal_disposition(agent_result)
+    narrative_payload = _with_terminal_narrative_metadata(
+        narrative_payload,
+        cancelled=True,
+        proposal_disposition=proposal_disposition,
+    )
+
     await asyncio.shield(
         app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
             organization_id=chat.organization_id,
             workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
             sender=WorkflowCopilotChatSender.USER,
             content=user_message,
+            audio_artifact_id=audio_artifact_id,
         )
     )
     assistant_message = await asyncio.shield(
@@ -477,7 +512,6 @@ async def _persist_cancel_turn(
             narrative_payload=narrative_payload,
         )
     )
-    proposal_disposition = _proposal_disposition(agent_result)
     try:
         await asyncio.shield(
             stream.send(
@@ -559,12 +593,19 @@ async def _finalise_normal_turn(
             raise
 
     await _persist_proposed_workflow_state(chat, agent_result, restored)
+    proposal_disposition = _proposal_disposition(agent_result)
+    narrative_payload = _with_terminal_narrative_metadata(
+        agent_result.narrative_payload,
+        cancelled=False,
+        proposal_disposition=proposal_disposition,
+    )
 
     await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
         organization_id=chat.organization_id,
         workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
         sender=WorkflowCopilotChatSender.USER,
         content=chat_request.message,
+        audio_artifact_id=chat_request.audio_artifact_id,
     )
 
     assistant_message = await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -574,10 +615,9 @@ async def _finalise_normal_turn(
         content=user_response,
         global_llm_context=updated_global_llm_context,
         turn_outcome=agent_result.turn_outcome,
-        narrative_payload=agent_result.narrative_payload,
+        narrative_payload=narrative_payload,
     )
 
-    proposal_disposition = _proposal_disposition(agent_result)
     await stream.send(
         WorkflowCopilotStreamResponseUpdate(
             type=WorkflowCopilotStreamMessageType.RESPONSE,
@@ -591,7 +631,7 @@ async def _finalise_normal_turn(
             output_policy_diagnostics=agent_result.output_policy_diagnostics,
             turn_id=agent_result.turn_id,
             narrative_summary=agent_result.narrative_summary,
-            narrative_payload=agent_result.narrative_payload,
+            narrative_payload=narrative_payload,
         )
     )
 
@@ -1489,22 +1529,17 @@ async def _new_copilot_chat_post(
                 )
             )
 
-            if chat_request.workflow_copilot_chat_id:
-                chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
-                    organization_id=organization.organization_id,
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                if not chat:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
-                if chat_request.workflow_permanent_id != chat.workflow_permanent_id:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
-            else:
-                chat = await app.DATABASE.workflow_params.create_workflow_copilot_chat(
-                    organization_id=organization.organization_id,
-                    workflow_permanent_id=chat_request.workflow_permanent_id,
-                )
-
+            chat = await _get_or_create_workflow_copilot_chat(
+                organization_id=organization.organization_id,
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+            )
             chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
+            chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
+                audio_artifact_id=chat_request.audio_artifact_id,
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
 
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -1603,7 +1638,11 @@ async def _new_copilot_chat_post(
                 )
                 return
 
-            copilot_config = app.AGENT_FUNCTION.get_copilot_config() or CopilotConfig()
+            copilot_config = (
+                await app.AGENT_FUNCTION.get_copilot_config_for_request(
+                    organization.organization_id, code_block_mode=chat_request.code_block
+                )
+            ) or CopilotConfig()
 
             # Spawn the cancel watcher only after the chat row exists; cancels
             # that land during pre-agent setup are not user-cancellable
@@ -1665,6 +1704,7 @@ async def _new_copilot_chat_post(
                     original_workflow=original_workflow,
                     user_message=chat_request.message,
                     agent_result=agent_result,
+                    audio_artifact_id=chat_request.audio_artifact_id,
                     turn_id=turn_id,
                 )
                 terminal_frame_emitted = True
@@ -1786,6 +1826,7 @@ async def _new_copilot_chat_post(
                         original_workflow=None,
                         user_message=chat_request.message,
                         agent_result=None,
+                        audio_artifact_id=chat_request.audio_artifact_id,
                         turn_id=turn_id,
                     )
                 )
@@ -1877,7 +1918,11 @@ async def _new_copilot_chat_post(
 COPILOT_V2_FLAG_KEY = "ENABLE_WORKFLOW_COPILOT_V2"
 
 
-async def _should_use_copilot_v2(organization: Organization, workflow_permanent_id: str) -> bool:
+async def _should_use_copilot_v2(
+    organization: Organization, workflow_permanent_id: str, mode: str | None = None
+) -> bool:
+    if mode is not None:
+        return mode == "build"
     if settings.ENABLE_WORKFLOW_COPILOT_V2:
         return True
     try:
@@ -1899,13 +1944,127 @@ async def _should_use_copilot_v2(organization: Organization, workflow_permanent_
         return False
 
 
+async def _get_or_create_workflow_copilot_chat(
+    *,
+    organization_id: str,
+    workflow_permanent_id: str,
+    workflow_copilot_chat_id: str | None,
+) -> WorkflowCopilotChat:
+    if workflow_copilot_chat_id:
+        chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
+            organization_id=organization_id,
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+        )
+        if not chat:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+        if workflow_permanent_id != chat.workflow_permanent_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
+        return chat
+
+    return await app.DATABASE.workflow_params.create_workflow_copilot_chat(
+        organization_id=organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+    )
+
+
+async def _validate_copilot_audio_artifact_id(
+    *,
+    audio_artifact_id: str | None,
+    organization_id: str,
+    workflow_copilot_chat_id: str,
+) -> str | None:
+    if not audio_artifact_id:
+        return None
+
+    artifact = await app.DATABASE.artifacts.get_artifact_by_id(
+        audio_artifact_id,
+        organization_id=organization_id,
+    )
+    if not artifact:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Audio artifact not found")
+    if artifact.artifact_type != ArtifactType.AUDIO:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid audio artifact type")
+
+    # Audio artifacts are written through create_log_artifact for this chat, so
+    # the log URI carries the chat id. Keep this in sync with artifact storage
+    # path construction if that layout changes.
+    log_marker = f"/logs/{LogEntityType.WORKFLOW_COPILOT_CHAT}/{workflow_copilot_chat_id}/"
+    if log_marker not in (artifact.uri or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Audio artifact is not linked to this chat",
+        )
+    return audio_artifact_id
+
+
+@base_router.post("/workflow/copilot/chat-audio", include_in_schema=False)
+async def workflow_copilot_chat_audio(
+    workflow_permanent_id: str = Form(...),
+    workflow_copilot_chat_id: str | None = Form(None),
+    file: UploadFile = File(...),
+    organization: Organization = Depends(org_auth_service.get_current_org),
+) -> WorkflowCopilotAudioUploadResponse:
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type not in ALLOWED_WORKFLOW_COPILOT_AUDIO_CONTENT_TYPES:
+        await file.close()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported audio format")
+
+    max_upload_bytes = settings.MAX_UPLOAD_FILE_SIZE
+    try:
+        audio_bytes = await file.read(max_upload_bytes + 1)
+    except Exception as exc:
+        LOG.exception("Failed to read workflow copilot dictation audio upload")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to read audio file"
+        ) from exc
+    finally:
+        await file.close()
+
+    if not audio_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Audio file is empty")
+
+    if len(audio_bytes) > max_upload_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Audio file exceeds the maximum allowed size ({max_upload_bytes / 1024 / 1024:.0f} MB)",
+        )
+
+    chat = await _get_or_create_workflow_copilot_chat(
+        organization_id=organization.organization_id,
+        workflow_permanent_id=workflow_permanent_id,
+        workflow_copilot_chat_id=workflow_copilot_chat_id,
+    )
+
+    LOG.info(
+        "Workflow copilot dictation audio upload",
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        workflow_permanent_id=workflow_permanent_id,
+        organization_id=organization.organization_id,
+        audio_bytes=len(audio_bytes),
+    )
+
+    audio_artifact_id = await app.ARTIFACT_MANAGER.create_log_artifact(
+        log_entity_type=LogEntityType.WORKFLOW_COPILOT_CHAT,
+        log_entity_id=chat.workflow_copilot_chat_id,
+        artifact_type=ArtifactType.AUDIO,
+        organization_id=organization.organization_id,
+        data=audio_bytes,
+    )
+    await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([chat.workflow_copilot_chat_id])
+
+    return WorkflowCopilotAudioUploadResponse(
+        workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        audio_artifact_id=audio_artifact_id,
+    )
+
+
 @base_router.post("/workflow/copilot/chat-post", include_in_schema=False)
 async def workflow_copilot_chat_post(
     request: Request,
     chat_request: WorkflowCopilotChatRequest,
     organization: Organization = Depends(org_auth_service.get_current_org),
 ) -> EventSourceResponse:
-    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id):
+    if await _should_use_copilot_v2(organization, chat_request.workflow_permanent_id, mode=chat_request.mode):
         return await _new_copilot_chat_post(request, chat_request, organization)
 
     async def stream_handler(stream: EventSourceStream) -> None:
@@ -1928,20 +2087,17 @@ async def workflow_copilot_chat_post(
                 )
             )
 
-            if chat_request.workflow_copilot_chat_id:
-                chat = await app.DATABASE.workflow_params.get_workflow_copilot_chat_by_id(
-                    organization_id=organization.organization_id,
-                    workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
-                )
-                if not chat:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
-                if chat_request.workflow_permanent_id != chat.workflow_permanent_id:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Wrong workflow permanent ID")
-            else:
-                chat = await app.DATABASE.workflow_params.create_workflow_copilot_chat(
-                    organization_id=organization.organization_id,
-                    workflow_permanent_id=chat_request.workflow_permanent_id,
-                )
+            chat = await _get_or_create_workflow_copilot_chat(
+                organization_id=organization.organization_id,
+                workflow_permanent_id=chat_request.workflow_permanent_id,
+                workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
+            )
+            chat_request.workflow_copilot_chat_id = chat.workflow_copilot_chat_id
+            chat_request.audio_artifact_id = await _validate_copilot_audio_artifact_id(
+                audio_artifact_id=chat_request.audio_artifact_id,
+                organization_id=organization.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
 
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
@@ -2008,6 +2164,7 @@ async def workflow_copilot_chat_post(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
                 sender=WorkflowCopilotChatSender.USER,
                 content=chat_request.message,
+                audio_artifact_id=chat_request.audio_artifact_id,
             )
 
             assistant_message = await app.DATABASE.workflow_params.create_workflow_copilot_chat_message(
@@ -2221,6 +2378,7 @@ def convert_to_history_messages(
         WorkflowCopilotChatHistoryMessage(
             sender=message.sender,
             content=message.content,
+            audio_artifact_id=message.audio_artifact_id,
             turn_outcome=message.turn_outcome,
             created_at=message.created_at,
             narrative_payload=message.narrative_payload,

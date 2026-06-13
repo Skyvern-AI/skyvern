@@ -19,6 +19,7 @@
     "start": "npm run serve & npm run run-artifact-server"
   },
   "dependencies": {
+    "@clerk/clerk-react": "^5.61.8",
     "@codemirror/lang-html": "^6.4.9",
     "@codemirror/lang-json": "^6.0.1",
     "@codemirror/lang-python": "^6.1.6",
@@ -61,6 +62,7 @@
     "cron-parser": "^5.5.0",
     "cronstrue": "^3.13.0",
     "cross-spawn": "^7.0.6",
+    "driver.js": "^1.4.0",
     "embla-carousel-react": "^8.0.0",
     "express": "^4.21.2",
     "fetch-to-curl": "^0.6.0",

@@ -34,6 +34,7 @@ from skyvern.forge.sdk.db.id import (
     generate_bitwarden_login_credential_parameter_id,
     generate_bitwarden_sensitive_information_parameter_id,
     generate_browser_profile_id,
+    generate_credential_folder_id,
     generate_credential_id,
     generate_credential_parameter_id,
     generate_debug_session_id,
@@ -308,10 +309,13 @@ class WorkflowTagEventModel(Base):
     """Append-only event log for workflow tags.
 
     Every state change writes a new row. SET events carry value; DELETE
-    events have value=NULL and carry their own attribution. Supersession
-    sets superseded_at on the previously-current row so the partial unique
-    index keeps exactly one active SET per (org, wpid, key). superseded_at
-    means "no longer current but still historical fact"; deleted_at follows
+    events carry their own attribution (and a value only for standalone-label
+    deletes, which are identified by value). A tag is a label (value, always
+    present) with an optional group (key): grouped labels are identified by
+    key, standalone labels by value. Two partial unique indexes keep exactly
+    one active SET per (org, wpid, key) for grouped labels and per
+    (org, wpid, value) for standalone labels. superseded_at means "no longer
+    current but still historical fact"; deleted_at follows
     the same soft-delete convention as SoftDeleteMixin (via a manual column)
     and is separate.
 
@@ -342,15 +346,36 @@ class WorkflowTagEventModel(Base):
             postgresql_include=["workflow_permanent_id"],
             postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
         ),
-        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # Powers the value-only ("filter by label") term, which matches a value
+        # across any/no group.
         Index(
-            "workflow_tag_events_active_set_unique",
+            "workflow_tag_events_org_value_active_idx",
+            "organization_id",
+            "value",
+            postgresql_include=["workflow_permanent_id"],
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
+        ),
+        Index("workflow_tag_events_org_set_at_idx", "organization_id", "set_at"),
+        # One active SET per group (key) on a workflow = one-label-per-group.
+        Index(
+            "workflow_tag_events_active_grouped_unique",
             "organization_id",
             "workflow_permanent_id",
             "key",
             unique=True,
-            postgresql_where=text("superseded_at IS NULL AND event_type = 'set'"),
-            sqlite_where=text("superseded_at IS NULL AND event_type = 'set'"),
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NOT NULL"),
+        ),
+        # A standalone label (no group) is identified by its value, so it gets
+        # its own one-active-SET-per-value uniqueness.
+        Index(
+            "workflow_tag_events_active_label_unique",
+            "organization_id",
+            "workflow_permanent_id",
+            "value",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
+            sqlite_where=text("superseded_at IS NULL AND event_type = 'set' AND key IS NULL"),
         ),
         CheckConstraint("event_type IN ('set', 'delete')", name="ck_workflow_tag_events_event_type"),
         CheckConstraint(
@@ -361,13 +386,16 @@ class WorkflowTagEventModel(Base):
             "caller_type IS NULL OR caller_type IN ('user', 'api_key', 'system')",
             name="ck_workflow_tag_events_caller_type",
         ),
-        CheckConstraint("event_type != 'delete' OR value IS NULL", name="ck_workflow_tag_events_delete_null_value"),
+        # SET rows require a value; DELETE rows carry a value (standalone-label
+        # delete) or null (grouped delete, identified by key).
+        CheckConstraint("event_type != 'set' OR value IS NOT NULL", name="ck_workflow_tag_events_set_has_value"),
     )
 
     tag_event_id = Column(String, primary_key=True, default=generate_tag_event_id)
     workflow_permanent_id = Column(String, nullable=False)
     organization_id = Column(String, ForeignKey("organizations.organization_id"), nullable=False)
-    key = Column(String, nullable=False)
+    # Nullable: null = standalone label (group-less); non-null = grouped label.
+    key = Column(String, nullable=True)
     value = Column(String, nullable=True)
     event_type = Column(String, nullable=False)
     set_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
@@ -1115,6 +1143,7 @@ class PersistentBrowserSessionModel(Base):
     extensions = Column(JSON, nullable=True)
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
+    generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
@@ -1229,8 +1258,31 @@ class OrganizationBitwardenCollectionModel(Base):
     deleted_at = Column(DateTime, nullable=True)
 
 
+class CredentialFolderModel(Base):
+    __tablename__ = "credential_folders"
+    __table_args__ = (
+        Index("credential_folder_organization_id_idx", "organization_id"),
+        Index("credential_folder_organization_title_idx", "organization_id", "title"),
+    )
+
+    folder_id = Column(String, primary_key=True, default=generate_credential_folder_id)
+    organization_id = Column(String, ForeignKey("organizations.organization_id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+    deleted_at = Column(DateTime, nullable=True)
+
+
 class CredentialModel(Base):
     __tablename__ = "credentials"
+    __table_args__ = (Index("credential_folder_id_idx", "folder_id"),)
 
     credential_id = Column(String, primary_key=True, default=generate_credential_id)
     organization_id = Column(String, nullable=False)
@@ -1249,6 +1301,7 @@ class CredentialModel(Base):
     tested_url = Column(String, nullable=True)
     user_context = Column(String(1000), nullable=True)
     save_browser_session_intent = Column(Boolean, nullable=True, default=False)
+    folder_id = Column(String, ForeignKey("credential_folders.folder_id", ondelete="SET NULL"), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -1435,6 +1488,7 @@ class WorkflowCopilotChatMessageModel(Base):
     organization_id = Column(String, nullable=False)
     sender = Column(String, nullable=False)
     content = Column(UnicodeText, nullable=False)
+    audio_artifact_id = Column(String, nullable=True)
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)

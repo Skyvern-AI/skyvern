@@ -65,6 +65,7 @@ _BROWSER_PRIMITIVE_TOOLS: frozenset[str] = frozenset(
         "evaluate",
         "click",
         "type_text",
+        "fill_credential_field",
         "scroll",
         "select_option",
         "press_key",
@@ -76,6 +77,7 @@ _MUTATION_TOOLS: frozenset[str] = frozenset(
     {"update_workflow", "update_and_run_blocks", "run_blocks_and_collect_debug"}
 )
 _DISCOVERY_TOOLS: frozenset[str] = frozenset({"discover_workflow_entrypoint"})
+_COMPOSITION_CONTEXT_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition"})
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)]+", re.IGNORECASE)
 
@@ -212,6 +214,21 @@ def _phase_blocker_signal(ctx: Any, tool_name: str) -> CopilotToolBlockerSignal 
             recovery_hint="retry_with_different_tool",
             cleared_by_tools=frozenset({"update_workflow", "update_and_run_blocks"}),
             internal_reason_code="build_phase_discovery_disallowed_post_compose",
+            blocked_tool=tool_name,
+        )
+
+    if tool_name in _COMPOSITION_CONTEXT_TOOLS and in_discovery:
+        return CopilotToolBlockerSignal(
+            blocker_kind="phase_gated",
+            agent_steering_text=(
+                "Page inspection for composition is only available after an entrypoint URL is known. "
+                "Call discover_workflow_entrypoint to resolve the entrypoint URL, or ASK_QUESTION for a URL first. "
+                "safe_reason_code=build_phase_composition_inspection_blocked_pre_compose."
+            ),
+            user_facing_reason="I need to know what page to inspect before I can read its form controls.",
+            recovery_hint="ask_user_clarifying",
+            cleared_by_tools=frozenset({"discover_workflow_entrypoint"}),
+            internal_reason_code="build_phase_composition_inspection_blocked_pre_compose",
             blocked_tool=tool_name,
         )
 

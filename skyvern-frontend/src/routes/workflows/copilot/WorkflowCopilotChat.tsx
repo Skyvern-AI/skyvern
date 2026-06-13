@@ -10,7 +10,12 @@ import {
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
 import { useParams } from "react-router-dom";
-import { ReloadIcon, Cross2Icon, ChevronDownIcon } from "@radix-ui/react-icons";
+import {
+  ReloadIcon,
+  Cross2Icon,
+  ChevronDownIcon,
+  CheckIcon,
+} from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
@@ -30,12 +35,14 @@ import {
   WorkflowCopilotCondensingUpdate,
   WorkflowCopilotNarrationUpdate,
   WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotRunOutcomeUpdate,
   WorkflowCopilotTurnStartUpdate,
   WorkflowCopilotWorkflowDraftUpdate,
   WorkflowCopilotChatSender,
   WorkflowCopilotChatRequest,
   WorkflowCopilotClearProposedWorkflowRequest,
   WorkflowCopilotApplyProposedWorkflowRequest,
+  WorkflowCopilotAudioUploadResponse,
 } from "./workflowCopilotTypes";
 import { shouldWaitForLiveBrowser } from "./browserReadiness";
 import {
@@ -47,22 +54,98 @@ import { shouldAutoApplyWorkflowResponse } from "./proposalDisposition";
 import { NarrativeView } from "./NarrativeView";
 import {
   EMPTY_NARRATIVE,
+  NarrativeEvent,
   TurnNarrativeState,
   applyNarrativeEvent,
-  hydrateNarrativeFromPayload,
+  hydrateHistoryNarrative,
   parseUtcIsoMs,
 } from "./narrativeState";
 import { computeFollowSignature, useStickToBottom } from "./useStickToBottom";
+import { useSpeechToTextField } from "@/hooks/useSpeechToTextField";
+import { SpeechInputButton } from "@/components/SpeechInputButton";
+import { useFeatureFlag, useFeatureFlagValue } from "@/hooks/useFeatureFlag";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { cn } from "@/util/utils";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
 // handful of turns; this ceiling guards a runaway long-running chat.
 const MAX_TURN_SNAPSHOTS = 20;
+
+type ComposerDefaultVariant =
+  | "build"
+  | "build_code"
+  | "build_no_code"
+  | "ask"
+  | "ask_code";
+
+function normalizeComposerDefaultVariant(
+  variant: string | undefined,
+): ComposerDefaultVariant {
+  if (
+    variant === "ask" ||
+    variant === "ask_code" ||
+    variant === "build_code" ||
+    variant === "build_no_code"
+  ) {
+    return variant;
+  }
+  return "build";
+}
 
 function formatElapsedSeconds(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Ask's mark is a text dingbat; Build's is a color emoji that ModeGlyph flattens
+// to a tone-adaptive monochrome silhouette so both read flat on the dark UI.
+const ASK_GLYPH = "\u275D\uFE0E";
+const BUILD_GLYPH = "\uD83D\uDC09";
+
+function isPictographic(glyph: string): boolean {
+  try {
+    return /\p{Extended_Pictographic}/u.test(glyph);
+  } catch {
+    return false;
+  }
+}
+
+function ModeGlyph({
+  mode,
+  tone = "light",
+}: {
+  mode: "ask" | "build";
+  tone?: "light" | "dark";
+}) {
+  const glyph = mode === "build" ? BUILD_GLYPH : ASK_GLYPH;
+  const filter = isPictographic(glyph)
+    ? tone === "dark"
+      ? "grayscale(1) brightness(0)"
+      : "grayscale(1) brightness(0) invert(1)"
+    : undefined;
+  return (
+    <span className="inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+      <span
+        className={cn(mode === "build" ? "text-[16px]" : "text-[15px]")}
+        style={{ lineHeight: 1, filter }}
+      >
+        {glyph}
+      </span>
+    </span>
+  );
 }
 
 function ConvoAggregatePill({
@@ -134,11 +217,13 @@ type QueuedPrompt = {
   id: string;
   content: string;
   reason: QueuedPromptReason;
+  audioBlob?: Blob | null;
 };
 
 type SendOptions = {
   queuedMessageId?: string;
   skipQueue?: boolean;
+  audioBlob?: Blob | null;
 };
 
 type WorkflowCopilotSsePayload =
@@ -150,6 +235,7 @@ type WorkflowCopilotSsePayload =
   | WorkflowCopilotCondensingUpdate
   | WorkflowCopilotNarrationUpdate
   | WorkflowCopilotBlockProgressUpdate
+  | WorkflowCopilotRunOutcomeUpdate
   | WorkflowCopilotTurnStartUpdate
   | WorkflowCopilotDesignStartUpdate
   | WorkflowCopilotDesignEndUpdate
@@ -290,6 +376,56 @@ export function WorkflowCopilotChat({
   initialMessage,
   onInitialMessageConsumed,
 }: WorkflowCopilotChatProps = {}) {
+  const copilotV2Flag = useFeatureFlag("ENABLE_WORKFLOW_COPILOT_V2");
+  const codeBlockModeFlag = useFeatureFlag("WORKFLOW_COPILOT_CODE_BLOCK_MODE");
+  const codeBlockAccessFlag = useFeatureFlag("CODE_BLOCK_ACCESS");
+  const copilotV2Enabled = copilotV2Flag === true;
+  const codeBlockModeEnabled =
+    codeBlockModeFlag === true && codeBlockAccessFlag === true;
+  const defaultModeVariant = useFeatureFlagValue(
+    "WORKFLOW_COPILOT_DEFAULT_MODE",
+  );
+  // The variant configures the initial default only when both gating flags are on.
+  const effectiveDefaultVariant: ComposerDefaultVariant =
+    copilotV2Enabled && codeBlockModeEnabled
+      ? normalizeComposerDefaultVariant(defaultModeVariant)
+      : "build";
+  const [composerMode, setComposerMode] = useState<"ask" | "build">(() =>
+    effectiveDefaultVariant === "ask" || effectiveDefaultVariant === "ask_code"
+      ? "ask"
+      : "build",
+  );
+  const [codeWorkflow, setCodeWorkflow] = useState(
+    () =>
+      effectiveDefaultVariant === "build_code" ||
+      effectiveDefaultVariant === "ask_code",
+  );
+  // Flags arrive asynchronously from /customer; seed the default once they resolve, never again.
+  const composerSeededRef = useRef(false);
+  const flagsResolved =
+    copilotV2Flag !== undefined &&
+    codeBlockModeFlag !== undefined &&
+    codeBlockAccessFlag !== undefined;
+  useEffect(() => {
+    if (composerSeededRef.current || !flagsResolved) {
+      return;
+    }
+    composerSeededRef.current = true;
+    setComposerMode(
+      effectiveDefaultVariant === "ask" ||
+        effectiveDefaultVariant === "ask_code"
+        ? "ask"
+        : "build",
+    );
+    setCodeWorkflow(
+      effectiveDefaultVariant === "build_code" ||
+        effectiveDefaultVariant === "ask_code",
+    );
+  }, [flagsResolved, effectiveDefaultVariant]);
+  // Build can never be active unless the V2 flag is on.
+  const isBuild = copilotV2Enabled && composerMode === "build";
+  const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
+  const showCodeToggle = isBuild && codeBlockModeEnabled && codeToggleAllowed;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -306,6 +442,15 @@ export function WorkflowCopilotChat({
   useEffect(() => {
     narrativeRef.current = narrative;
   }, [narrative]);
+  const applyStoredNarrativeEvent = useCallback(
+    (event: NarrativeEvent, base?: TurnNarrativeState) => {
+      const next = applyNarrativeEvent(base ?? narrativeRef.current, event);
+      narrativeRef.current = next;
+      setNarrative(next);
+      return next;
+    },
+    [],
+  );
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const streamingAbortController = useRef<AbortController | null>(null);
   // Synchronous in-flight gate. State (isLoading) lags a render behind, so a
@@ -373,7 +518,7 @@ export function WorkflowCopilotChat({
   });
   const credentialGetter = useCredentialGetter();
   const { workflowRunId, workflowPermanentId } = useParams();
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const { getSaveData } = useWorkflowHasChangesStore();
   const hasInitializedPosition = useRef(false);
   const hasAutoSentRef = useRef(false);
@@ -421,13 +566,55 @@ export function WorkflowCopilotChat({
     const textarea = textareaRef.current;
     if (!textarea) return;
 
+    if (!textarea.value) {
+      textarea.style.height = "40px";
+      textarea.style.overflowY = "hidden";
+      return;
+    }
+
     textarea.style.height = "auto";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
+    const newHeight = Math.min(textarea.scrollHeight, 150);
+    textarea.style.height = `${newHeight}px`;
+    textarea.style.overflowY = newHeight >= 150 ? "auto" : "hidden";
   }, []);
 
   useEffect(() => {
     adjustTextareaHeight();
   }, [adjustTextareaHeight, inputValue]);
+
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  // Bind the observer when the textarea mounts (it can mount late); the width-only guard avoids a resize loop.
+  const setTextareaRef = useCallback(
+    (node: HTMLTextAreaElement | null) => {
+      textareaRef.current = node;
+      resizeObserverRef.current?.disconnect();
+      resizeObserverRef.current = null;
+      if (!node || typeof ResizeObserver === "undefined") return;
+      let lastWidth = node.clientWidth;
+      const observer = new ResizeObserver(() => {
+        if (node.clientWidth !== lastWidth) {
+          lastWidth = node.clientWidth;
+          adjustTextareaHeight();
+        }
+      });
+      observer.observe(node);
+      resizeObserverRef.current = observer;
+    },
+    [adjustTextareaHeight],
+  );
+
+  const {
+    isSupported: isSpeechSupported,
+    isListening: isSpeechListening,
+    isHearingSpeech: isSpeechHearing,
+    stop: stopSpeech,
+    toggle: toggleSpeech,
+    takeAudioBlob: takeSpeechAudioBlob,
+  } = useSpeechToTextField({
+    value: inputValue,
+    onChange: setInputValue,
+    enabled: isOpen && !queuedPrompt,
+  });
 
   const updateQueuedPrompt = useCallback((next: QueuedPrompt | null) => {
     queuedPromptRef.current = next;
@@ -576,6 +763,37 @@ export function WorkflowCopilotChat({
     return latestChatId;
   };
 
+  const uploadDictationAudio = useCallback(
+    async (audioBlob: Blob): Promise<WorkflowCopilotAudioUploadResponse> => {
+      if (!workflowPermanentId) {
+        throw new Error("Missing workflow permanent ID for audio upload.");
+      }
+
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const formData = new FormData();
+      formData.append("workflow_permanent_id", workflowPermanentId);
+      const chatId = workflowCopilotChatIdRef.current?.trim();
+      if (chatId) {
+        formData.append("workflow_copilot_chat_id", chatId);
+      }
+      formData.append("file", audioBlob, `dictation-${Date.now()}.webm`);
+
+      const response = await client.post<WorkflowCopilotAudioUploadResponse>(
+        "/workflow/copilot/chat-audio",
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        },
+      );
+      setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+      workflowCopilotChatIdRef.current = response.data.workflow_copilot_chat_id;
+      return response.data;
+    },
+    [credentialGetter, workflowPermanentId],
+  );
+
   const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
     const clearProposalByChatId = async (chatId: string) => {
       const client = await getClient(credentialGetter, "sans-api-v1");
@@ -680,8 +898,9 @@ export function WorkflowCopilotChat({
             content: message.content,
             timestamp: message.created_at,
             narrative: (() => {
-              const hydrated = hydrateNarrativeFromPayload(
+              const hydrated = hydrateHistoryNarrative(
                 message.narrative_payload,
+                message.turn_outcome,
               );
               if (!hydrated) return undefined;
               // Fall back to the legacy message body when the persisted
@@ -830,11 +1049,25 @@ export function WorkflowCopilotChat({
         });
         return;
       }
+
+      let messageAudioBlob = options.audioBlob ?? null;
+      if (!messageAudioBlob && messageOverride === undefined) {
+        if (isSpeechListening) {
+          messageAudioBlob = await stopSpeech();
+        }
+        messageAudioBlob = messageAudioBlob ?? takeSpeechAudioBlob();
+      }
+
       if (action === "queue_working" || action === "queue_live_browser") {
         const reason: QueuedPromptReason =
           action === "queue_working" ? "working" : "live_browser";
         const queuedId = options.queuedMessageId ?? crypto.randomUUID();
-        updateQueuedPrompt({ id: queuedId, content: candidate, reason });
+        updateQueuedPrompt({
+          id: queuedId,
+          content: candidate,
+          reason,
+          audioBlob: messageAudioBlob,
+        });
         // First queue adds the user bubble; a re-queue (a working drain that
         // then had to wait for the browser) reuses the existing bubble.
         if (!options.queuedMessageId) {
@@ -895,6 +1128,8 @@ export function WorkflowCopilotChat({
         const saveData = getSaveData();
         const workflowId = saveData?.workflow.workflow_id;
         let workflowYaml = "";
+        let chatIdForRequest = workflowCopilotChatId;
+        let audioArtifactId: string | null = null;
 
         if (!workflowId) {
           toast({
@@ -982,6 +1217,16 @@ export function WorkflowCopilotChat({
           } as WorkflowApiResponse;
         }
 
+        if (messageAudioBlob) {
+          try {
+            const uploadResponse = await uploadDictationAudio(messageAudioBlob);
+            chatIdForRequest = uploadResponse.workflow_copilot_chat_id;
+            audioArtifactId = uploadResponse.audio_artifact_id;
+          } catch (error) {
+            console.warn("Failed to upload dictation audio:", error);
+          }
+        }
+
         const handleProcessingUpdate = (
           payload: WorkflowCopilotProcessingUpdate,
         ) => {
@@ -1001,6 +1246,7 @@ export function WorkflowCopilotChat({
 
         const handleResponse = (
           response: WorkflowCopilotStreamResponseUpdate,
+          responseNarrative?: TurnNarrativeState,
         ) => {
           // Stream completed; a Cancel click after this point should no-op.
           pendingCancelToken.current = null;
@@ -1011,19 +1257,20 @@ export function WorkflowCopilotChat({
           // Read via narrativeRef because this callback was closed over at
           // handleSend time (pre-turn_start), so the React state binding is
           // stale here.
-          const liveNarrative = narrativeRef.current;
+          const liveNarrative = responseNarrative ?? narrativeRef.current;
           const hasNarrativePayload =
             response.narrative_payload !== null &&
             typeof response.narrative_payload === "object";
           const frozenNarrative: TurnNarrativeState | undefined =
-            liveNarrative.turnId !== null || hasNarrativePayload
+            responseNarrative ??
+            (liveNarrative.turnId !== null || hasNarrativePayload
               ? applyNarrativeEvent(
                   liveNarrative.turnId !== null
                     ? liveNarrative
                     : EMPTY_NARRATIVE,
                   response,
                 )
-              : undefined;
+              : undefined);
 
           const aiMessage: ChatMessage = {
             id: Date.now().toString(),
@@ -1050,6 +1297,8 @@ export function WorkflowCopilotChat({
             )
           ) {
             applyWorkflowUpdate(response.updated_workflow);
+          } else if (response.updated_workflow) {
+            setProposedWorkflow(response.updated_workflow);
           } else if (
             // Cancel/error terminal on a turn that produced staged content →
             // snap canvas back to the pre-submit client snapshot.
@@ -1067,13 +1316,17 @@ export function WorkflowCopilotChat({
           }
         };
 
-        const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+        const handleError = (
+          payload: WorkflowCopilotStreamErrorUpdate,
+          errorNarrative?: TurnNarrativeState,
+        ) => {
           pendingCancelToken.current = null;
-          const liveNarrative = narrativeRef.current;
+          const liveNarrative = errorNarrative ?? narrativeRef.current;
           const frozenNarrative: TurnNarrativeState | undefined =
-            liveNarrative.turnId !== null
+            errorNarrative ??
+            (liveNarrative.turnId !== null
               ? applyNarrativeEvent(liveNarrative, payload)
-              : undefined;
+              : undefined);
           const errorMessage: ChatMessage = {
             id: Date.now().toString(),
             sender: "ai",
@@ -1099,11 +1352,14 @@ export function WorkflowCopilotChat({
           {
             workflow_id: workflowId,
             workflow_permanent_id: workflowPermanentId,
-            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_copilot_chat_id: chatIdForRequest,
             workflow_run_id: workflowRunId,
             browser_session_id: liveBrowserSessionId ?? null,
             message: messageContent,
+            audio_artifact_id: audioArtifactId,
             workflow_yaml: workflowYaml,
+            mode: copilotV2Enabled ? composerMode : null,
+            code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
             cancel_token: cancelToken,
           } as WorkflowCopilotChatRequest,
           (payload) => {
@@ -1117,7 +1373,8 @@ export function WorkflowCopilotChat({
               case "tool_result":
               case "narration":
               case "block_progress":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+              case "run_outcome":
+                applyStoredNarrativeEvent(payload);
                 return false;
               case "turn_start": {
                 // Move the pre-submit canvas snapshot into the per-turn
@@ -1135,14 +1392,12 @@ export function WorkflowCopilotChat({
                   map.delete(oldest);
                 }
                 latestTurnId.current = payload.turn_id;
-                setNarrative(() =>
-                  applyNarrativeEvent(EMPTY_NARRATIVE, payload),
-                );
+                applyStoredNarrativeEvent(payload, EMPTY_NARRATIVE);
                 return false;
               }
               case "design_start":
               case "design_end":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
               case "workflow_draft": {
                 // Render the staged workflow on the canvas mid-turn. Only
@@ -1159,17 +1414,19 @@ export function WorkflowCopilotChat({
                     }
                   }
                 }
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
+                applyStoredNarrativeEvent(payload);
                 return false;
               }
-              case "response":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleResponse(payload);
+              case "response": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleResponse(payload, frozenNarrative);
                 return true;
-              case "error":
-                setNarrative((prev) => applyNarrativeEvent(prev, payload));
-                handleError(payload);
+              }
+              case "error": {
+                const frozenNarrative = applyStoredNarrativeEvent(payload);
+                handleError(payload, frozenNarrative);
                 return true;
+              }
               default:
                 return false;
             }
@@ -1208,15 +1465,25 @@ export function WorkflowCopilotChat({
       }
     },
     [
+      applyStoredNarrativeEvent,
       applyWorkflowUpdate,
       autoAccept,
+      codeBlockModeEnabled,
+      codeWorkflow,
+      composerMode,
+      copilotV2Enabled,
       credentialGetter,
       getSaveData,
       inputValue,
+      isSpeechListening,
+      isBuild,
       isLiveBrowserReady,
       liveBrowserSessionId,
       requiresLiveBrowser,
+      stopSpeech,
+      takeSpeechAudioBlob,
       updateQueuedPrompt,
+      uploadDictationAudio,
       workflowCopilotChatId,
       workflowPermanentId,
       workflowRunId,
@@ -1252,6 +1519,7 @@ export function WorkflowCopilotChat({
     handleSend(promptToSend.content, {
       queuedMessageId: promptToSend.id,
       skipQueue: drainAction === "drain_skip_queue",
+      audioBlob: promptToSend.audioBlob,
     }).catch((error) => {
       console.error("Queued send failed:", error);
     });
@@ -1498,6 +1766,11 @@ export function WorkflowCopilotChat({
       : isWaitingForLiveBrowser
         ? "Live browser is starting. Send now to queue your prompt."
         : null;
+  const inputStatusText = isSpeechListening
+    ? browserStatusText
+      ? `Listening… · ${browserStatusText}`
+      : "Listening…"
+    : browserStatusText;
 
   return (
     <div
@@ -1705,14 +1978,25 @@ export function WorkflowCopilotChat({
 
       {/* Input */}
       <div className="border-t border-border p-3">
-        {browserStatusText ? (
-          <div className="mb-2 text-xs text-muted-foreground">
-            {browserStatusText}
+        {inputStatusText ? (
+          <div
+            className="mb-2 text-xs text-muted-foreground"
+            aria-live="polite"
+          >
+            {inputStatusText}
           </div>
         ) : null}
         <div className="flex items-end gap-2">
+          <SpeechInputButton
+            isSupported={isSpeechSupported}
+            isListening={isSpeechListening}
+            isHearingSpeech={isSpeechHearing}
+            disabled={inputDisabled}
+            onToggle={toggleSpeech}
+            className="h-10 w-10 rounded-lg"
+          />
           <textarea
-            ref={textareaRef}
+            ref={setTextareaRef}
             placeholder={
               queuedPrompt
                 ? "Prompt queued..."
@@ -1720,18 +2004,18 @@ export function WorkflowCopilotChat({
                   ? "Type a message to queue for the next turn…"
                   : isWaitingForLiveBrowser
                     ? "Type a prompt to queue..."
-                    : "Type your message... (Shift+Enter for new line)"
+                    : "Message Skyvern Copilot…"
             }
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={handleKeyPress}
             disabled={inputDisabled}
             rows={1}
-            className="flex-1 resize-none rounded-md border border-input bg-slate-elevation2 px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-h-10 flex-1 resize-none rounded-lg border border-input bg-slate-elevation2 px-3 py-2 text-sm leading-6 text-foreground placeholder:text-muted-foreground focus:border-ring focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
             style={{
-              minHeight: "38px",
+              minHeight: "40px",
               maxHeight: "150px",
-              overflow: "auto",
+              overflowY: "hidden",
             }}
           />
           {isLoading && queuedPrompt ? (
@@ -1739,14 +2023,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={cancelQueuedPrompt}
                 title="Edit queued message"
-                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Edit queued
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1756,14 +2040,14 @@ export function WorkflowCopilotChat({
               <button
                 onClick={() => handleSend()}
                 title="Queue for the next turn"
-                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                className="flex h-10 items-center justify-center rounded-lg border border-border px-3 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               >
                 Queue
               </button>
               <button
                 onClick={cancelSend}
                 title="Cancel run"
-                className="rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+                className="flex h-10 items-center justify-center rounded-lg bg-destructive px-3 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
               >
                 Cancel run
               </button>
@@ -1772,17 +2056,108 @@ export function WorkflowCopilotChat({
             <button
               onClick={cancelQueuedPrompt}
               title="Edit queued prompt"
-              className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
+              className="flex h-10 items-center justify-center rounded-lg bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90"
             >
               Cancel
             </button>
-          ) : (
+          ) : !copilotV2Enabled ? (
             <button
               onClick={() => handleSend()}
-              className="rounded-md bg-cta px-4 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
+              className="flex h-10 items-center justify-center rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground hover:bg-cta-hover"
             >
               Send
             </button>
+          ) : (
+            <div className="flex items-end gap-2">
+              {showCodeToggle ? (
+                <TooltipProvider>
+                  <Tooltip delayDuration={300}>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-pressed={codeWorkflow}
+                        onClick={() => setCodeWorkflow((v) => !v)}
+                        className={cn(
+                          "flex h-10 w-10 items-center justify-center rounded-lg border transition-colors hover:brightness-[1.18] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                          codeWorkflow
+                            ? "border-sky-300 bg-sky-300/15 text-sky-300"
+                            : "border-slate-600 bg-transparent text-slate-400",
+                        )}
+                      >
+                        <span
+                          className="text-[13px] font-semibold"
+                          style={{ lineHeight: 1 }}
+                        >
+                          {"</>"}
+                        </span>
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-[260px]">
+                      Build the workflow as code. Faster and more flexible, but
+                      may need extra detail to handle every edge case.
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ) : null}
+              <div className="flex items-stretch">
+                <button
+                  onClick={() => handleSend()}
+                  className="flex h-10 items-center gap-1.5 rounded-l-lg bg-cta px-3 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ModeGlyph mode={isBuild ? "build" : "ask"} tone="dark" />
+                  {isBuild ? "Build" : "Ask"}
+                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      title="Switch mode"
+                      aria-label="Switch mode"
+                      className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <ChevronDownIcon className="h-3.5 w-3.5" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    side="top"
+                    align="end"
+                    className="w-[272px] p-1.5"
+                  >
+                    <DropdownMenuItem
+                      onSelect={() => setComposerMode("ask")}
+                      className="flex items-start gap-2.5"
+                    >
+                      <ModeGlyph mode="ask" />
+                      <span className="flex flex-1 flex-col">
+                        <span className="text-sm font-medium">Ask</span>
+                        <span className="text-xs leading-snug text-muted-foreground">
+                          Answer questions and make quick workflow edits.
+                        </span>
+                      </span>
+                      {!isBuild ? (
+                        <CheckIcon className="h-4 w-4 text-sky-400" />
+                      ) : null}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => setComposerMode("build")}
+                      className="flex items-start gap-2.5"
+                    >
+                      <ModeGlyph mode="build" />
+                      <span className="flex flex-1 flex-col">
+                        <span className="text-sm font-medium">Build</span>
+                        <span className="text-xs leading-snug text-muted-foreground">
+                          Navigates the site to design your workflow, then tests
+                          that it works.
+                        </span>
+                      </span>
+                      {isBuild ? (
+                        <CheckIcon className="h-4 w-4 text-sky-400" />
+                      ) : null}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            </div>
           )}
         </div>
       </div>

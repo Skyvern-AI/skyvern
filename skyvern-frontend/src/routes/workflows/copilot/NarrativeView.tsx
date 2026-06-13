@@ -4,7 +4,12 @@ import {
   ActivityEntry,
   BlockState,
   TurnNarrativeState,
+  TurnSummary,
+  computeTurnSummary,
   effectiveMode,
+  formatElapsed,
+  isBlockOk,
+  latestBlocksByLabel,
   parseUtcIsoMs,
   toolActivityDisplayLabel,
 } from "./narrativeState";
@@ -71,19 +76,6 @@ function paletteFor(blockType: string): BlockPalette {
     return PALETTE_ACTION;
   }
   return PALETTE_TASK;
-}
-
-function formatElapsed(
-  startedAt: string | null,
-  endedAt: string | null,
-): string | null {
-  const startMs = parseUtcIsoMs(startedAt);
-  const endMs = parseUtcIsoMs(endedAt);
-  if (startMs === null || endMs === null) return null;
-  const seconds = Math.max(0, Math.round((endMs - startMs) / 1000));
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function liveElapsed(startedAt: string | null): string | null {
@@ -207,13 +199,21 @@ function useSecondTick(active: boolean): void {
 
 interface FBlockRunProps {
   block: BlockState;
+  turnEnded: boolean;
   onSelect?: (label: string) => void;
 }
 
-function FBlockRun({ block, onSelect }: FBlockRunProps) {
+function FBlockRun({ block, turnEnded, onSelect }: FBlockRunProps) {
   const palette = paletteFor(block.blockType);
   const isRunning = block.state === "running";
-  const isOk = block.state === "completed";
+  const isCompleted = block.state === "completed";
+  const isEvaluating = isCompleted && block.outcome === "evaluating";
+  // A row stuck in `evaluating` at turn end (dropped stream) renders the
+  // neutral "ran" treatment — never the live verifying beat, never green.
+  const isVerifying = isEvaluating && !turnEnded;
+  const isRanNeutral = isEvaluating && turnEnded;
+  const isOutcomeNotShown = isCompleted && block.outcome === "not_demonstrated";
+  const isOk = isBlockOk(block);
   const isFail = block.state === "failed";
   const isDraft = block.state === "drafted";
 
@@ -221,28 +221,36 @@ function FBlockRun({ block, onSelect }: FBlockRunProps) {
     ? "border-blue-400/60"
     : isOk
       ? "border-emerald-400/60"
-      : isFail
-        ? "border-rose-400/60"
-        : "border-slate-500/60";
+      : isOutcomeNotShown
+        ? "border-amber-400/60"
+        : isFail
+          ? "border-rose-400/60"
+          : "border-slate-500/60";
   const accentText = isRunning
     ? "text-blue-300"
     : isOk
       ? "text-emerald-300"
-      : isFail
-        ? "text-rose-300"
-        : "text-slate-400";
+      : isOutcomeNotShown
+        ? "text-amber-300"
+        : isFail
+          ? "text-rose-300"
+          : isVerifying || isRanNeutral
+            ? "text-slate-300"
+            : "text-slate-400";
   const puckBg = isRunning
     ? "bg-blue-500/15"
     : isOk
       ? "bg-emerald-500/15"
-      : isFail
-        ? "bg-rose-500/15"
-        : "bg-slate-elevation3";
+      : isOutcomeNotShown
+        ? "bg-amber-500/15"
+        : isFail
+          ? "bg-rose-500/15"
+          : "bg-slate-elevation3";
 
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const defaultOpen = isRunning || isFail;
   const open = userOpen === null ? defaultOpen : userOpen;
-  const toggleable = isOk;
+  const toggleable = isOk || isOutcomeNotShown || isVerifying || isRanNeutral;
   useSecondTick(isRunning);
   const elapsed = formatElapsed(block.startedAt, block.endedAt);
   const live = isRunning ? liveElapsed(block.startedAt) : null;
@@ -250,11 +258,15 @@ function FBlockRun({ block, onSelect }: FBlockRunProps) {
     ? (elapsed ?? "done")
     : isRunning
       ? `working${live ? ` · ${live}` : ""}`
-      : isFail
-        ? "halted"
-        : isDraft
-          ? "drafted"
-          : "queued";
+      : isVerifying
+        ? "ran · verifying outcome…"
+        : isRanNeutral || isOutcomeNotShown
+          ? `ran${elapsed ? ` · ${elapsed}` : ""}`
+          : isFail
+            ? "halted"
+            : isDraft
+              ? "drafted"
+              : "queued";
 
   return (
     <div className="flex flex-col">
@@ -275,7 +287,19 @@ function FBlockRun({ block, onSelect }: FBlockRunProps) {
           className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-bold ${accentBorder} ${accentText} ${puckBg}`}
           aria-hidden="true"
         >
-          {isOk ? "✓" : isFail ? "✕" : isRunning ? <Spinner /> : palette.glyph}
+          {isOk ? (
+            "✓"
+          ) : isOutcomeNotShown ? (
+            "!"
+          ) : isVerifying ? (
+            "…"
+          ) : isFail ? (
+            "✕"
+          ) : isRunning ? (
+            <Spinner />
+          ) : (
+            palette.glyph
+          )}
         </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
@@ -293,6 +317,12 @@ function FBlockRun({ block, onSelect }: FBlockRunProps) {
           {!open && isOk && block.activity.length > 0 ? (
             <div className="mt-0.5 text-[12px] leading-[1.5] text-slate-400">
               {block.activity[block.activity.length - 1]!.text}
+            </div>
+          ) : null}
+          {!open && isOutcomeNotShown ? (
+            <div className="mt-0.5 text-[12px] leading-[1.5] text-amber-200/80">
+              Outcome not confirmed — the run finished without showing the goal
+              was met.
             </div>
           ) : null}
         </div>
@@ -330,6 +360,15 @@ function FBlockRun({ block, onSelect }: FBlockRunProps) {
               <div className="text-[12px] leading-[1.5] text-rose-200/90">
                 {block.activity.find((e) => e.kind === "tool_result")?.text ??
                   "Halted — see run details."}
+              </div>
+            </div>
+          ) : null}
+          {isOutcomeNotShown ? (
+            <div className="mt-1 flex items-start gap-2 rounded-md border border-amber-400/30 bg-amber-500/10 px-2.5 py-1.5">
+              <span className="text-[11px] font-bold text-amber-300">!</span>
+              <div className="text-[12px] leading-[1.5] text-amber-200/90">
+                {block.outcomeReason ??
+                  "The step ran, but the run did not demonstrate the goal was met."}
               </div>
             </div>
           ) : null}
@@ -415,82 +454,6 @@ function FDesignRow({ done, blockLabels, activity }: FDesignRowProps) {
   );
 }
 
-interface TurnSummary {
-  headline: string;
-  stats: string[];
-  accent: "ok" | "fail" | "qa";
-  glyph: string;
-  isFail: boolean;
-  isQA: boolean;
-}
-
-function asksUserForInput(turn: TurnNarrativeState): boolean {
-  if (turn.responseType === "ASK_QUESTION") {
-    return true;
-  }
-  const text = `${turn.terminalMessage ?? ""} ${turn.narrativeSummary ?? ""}`
-    .toLowerCase()
-    .trim();
-  return (
-    text.includes("please provide") ||
-    text.includes("please share") ||
-    text.includes("could you provide") ||
-    text.includes("can you provide") ||
-    /^(which|what|where|who|when|how)\b[\s\S]*\?/.test(text)
-  );
-}
-
-function computeTurnSummary(turn: TurnNarrativeState): TurnSummary {
-  const isFail =
-    turn.terminal === "error" || turn.blocks.some((b) => b.state === "failed");
-  const mode = effectiveMode(turn);
-  const needsInput = asksUserForInput(turn);
-  const isQA =
-    mode === "docs_answer" ||
-    mode === "diagnose" ||
-    mode === "clarify" ||
-    mode === "refuse";
-  const hasDrafts = (turn.draft?.blockCount ?? 0) > 0;
-  const hasEdited = (turn.priorBlockCount ?? 0) > 0 && hasDrafts;
-
-  const headline = isFail
-    ? "Run halted"
-    : needsInput
-      ? "Question"
-      : isQA
-        ? mode === "refuse"
-          ? "Declined"
-          : mode === "clarify"
-            ? "Question"
-            : "Answered"
-        : hasEdited
-          ? "Applied edits and re-tested"
-          : hasDrafts
-            ? "Built and tested the workflow"
-            : "Completed the run";
-
-  const stats: string[] = [];
-  const turnElapsed = formatElapsed(turn.startedAt, turn.endedAt);
-  if (turnElapsed) stats.push(turnElapsed);
-  if (!isQA) {
-    const ok = turn.blocks.filter((b) => b.state === "completed").length;
-    const failed = turn.blocks.filter((b) => b.state === "failed").length;
-    const newBlocks = hasEdited ? 0 : (turn.draft?.blockCount ?? 0);
-    if (ok) stats.push(`${ok} block${ok === 1 ? "" : "s"} ran`);
-    if (newBlocks) stats.push(`${newBlocks} new`);
-    if (failed) stats.push(`${failed} failed`);
-  }
-
-  return {
-    headline,
-    stats,
-    accent: isFail ? "fail" : isQA ? "qa" : "ok",
-    glyph: isFail ? "✕" : isQA ? "✦" : "✓",
-    isFail,
-    isQA,
-  };
-}
-
 function accentBg(accent: TurnSummary["accent"]): string {
   if (accent === "fail") {
     return "border-rose-400/60 bg-rose-500/15 text-rose-300";
@@ -558,8 +521,9 @@ interface RollupCardProps {
 function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
   const closing =
     turn.narrativeSummary?.trim() || turn.terminalMessage?.trim() || "";
-  const completed = turn.blocks.filter((b) => b.state === "completed");
-  const failed = turn.blocks.filter((b) => b.state === "failed");
+  const rollupBlocks = latestBlocksByLabel(turn.blocks);
+  const completed = rollupBlocks.filter((b) => isBlockOk(b));
+  const failed = rollupBlocks.filter((b) => b.state === "failed");
   const showCommit = !summary.isQA && completed.length > 0;
 
   return (
@@ -572,7 +536,9 @@ function RollupCard({ turn, summary, onExpand }: RollupCardProps) {
           closing ? (
             <div
               className={`mt-0.5 text-[12.5px] leading-[1.5] ${
-                summary.isFail ? "text-rose-200/90" : "text-slate-400"
+                summary.isFail && !summary.isStoppedWithDraft
+                  ? "text-rose-200/90"
+                  : "text-slate-400"
               }`}
             >
               {closing}
@@ -697,6 +663,7 @@ function DetailView({ turn, onCollapse, onBlockSelect }: DetailViewProps) {
             <FBlockRun
               key={b.workflowRunBlockId || b.label}
               block={b}
+              turnEnded={turn.terminal !== null}
               onSelect={onBlockSelect}
             />
           ))}

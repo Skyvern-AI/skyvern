@@ -181,11 +181,28 @@ def test_turn_intent_gate_blocks_edit_without_target_context() -> None:
 def test_turn_intent_gate_allows_edit_with_target_context() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["wfp-1"]},
+        target_entities={"workflow_change": ["add_invoice_download_step"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
 
     assert _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks") is None
+
+
+def test_turn_intent_gate_blocks_edit_with_default_current_workflow_only() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.EDIT,
+        target_entities={"workflow": ["current_workflow"]},
+        authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
+    )
+
+    signal = _turn_intent_tool_error(_ctx(intent), "update_and_run_blocks")
+
+    _assert_signal(
+        signal,
+        internal_reason_code="turn_intent_missing_edit_target",
+        classifier_mode="edit",
+        blocked_tool="update_and_run_blocks",
+    )
 
 
 def test_turn_intent_gate_blocks_edit_with_unresolved_label_reference() -> None:
@@ -233,7 +250,7 @@ workflow_definition:
 def test_turn_intent_gate_does_not_scan_raw_user_message_for_snake_case_refs() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["current_workflow"]},
+        target_entities={"workflow_change": ["extract_last_name"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent)
@@ -245,7 +262,7 @@ def test_turn_intent_gate_does_not_scan_raw_user_message_for_snake_case_refs() -
 def test_turn_intent_gate_allows_edit_with_parameter_reference() -> None:
     intent = TurnIntent(
         mode=TurnIntentMode.EDIT,
-        target_entities={"workflow": ["current_workflow"]},
+        target_entities={"workflow_change": ["use_account_number_in_search"]},
         authority=TurnIntentAuthority(may_update_workflow=True, may_run_blocks=True),
     )
     ctx = _ctx(intent)
@@ -288,7 +305,7 @@ async def test_update_workflow_stops_before_persisting_for_answer_only_intent() 
     )
     ctx = _ctx(intent)
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app:
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": ctx.workflow_yaml}, ctx)
 
@@ -310,7 +327,7 @@ async def test_request_policy_refusal_wins_even_when_turn_intent_allows_update()
     )
     ctx = _ctx(intent, RequestPolicy(allow_update_workflow=False, allow_run_blocks=False))
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.workflow_update.app") as mock_app:
         mock_app.WORKFLOW_SERVICE.update_workflow_definition = AsyncMock()
         result = await _update_workflow({"workflow_yaml": ctx.workflow_yaml}, ctx)
 
@@ -498,7 +515,7 @@ async def test_get_run_results_defaults_to_successful_same_turn_run() -> None:
     )
     run = SimpleNamespace(workflow_run_id="wr_completed_this_turn", workflow_permanent_id="wfp-1", status="completed")
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
@@ -518,7 +535,7 @@ async def test_get_run_results_defaults_to_latest_same_turn_run_when_no_success(
     )
     run = SimpleNamespace(workflow_run_id="wr_failed_this_turn", workflow_permanent_id="wfp-1", status="canceled")
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         mock_app.WORKFLOW_SERVICE.get_workflow_runs_for_workflow_permanent_id = AsyncMock()
@@ -554,7 +571,7 @@ async def test_get_run_results_rejects_explicit_run_from_other_workflow() -> Non
     )
     run = SimpleNamespace(workflow_run_id="wr_other", workflow_permanent_id="wfp-other", status="failed")
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock()
         result = await _get_run_results({"workflow_run_id": "wr_other"}, ctx)
@@ -568,7 +585,7 @@ async def test_get_run_results_uses_pending_reconciliation_run_when_id_omitted()
     ctx = _ctx(TurnIntent(mode=TurnIntentMode.UNKNOWN), pending_reconciliation_run_id="wr_pending")
     run = SimpleNamespace(workflow_run_id="wr_pending", workflow_permanent_id="wfp-1", status="failed")
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock(return_value=run)
         mock_app.DATABASE.observer.get_workflow_run_blocks = AsyncMock(return_value=[])
         result = await _get_run_results({}, ctx)
@@ -585,7 +602,7 @@ async def test_get_run_results_uses_pending_reconciliation_run_when_id_omitted()
 async def test_get_run_results_rejects_different_run_while_reconciliation_pending() -> None:
     ctx = _ctx(TurnIntent(mode=TurnIntentMode.UNKNOWN), pending_reconciliation_run_id="wr_pending")
 
-    with patch("skyvern.forge.sdk.copilot.tools.app") as mock_app:
+    with patch("skyvern.forge.sdk.copilot.tools.run_execution.app") as mock_app:
         mock_app.DATABASE.workflow_runs.get_workflow_run = AsyncMock()
         result = await _get_run_results({"workflow_run_id": "wr_other"}, ctx)
 

@@ -1,7 +1,7 @@
 ---
 title: Run History
-subtitle: Find, filter, and inspect past task and workflow executions
-description: Search, filter, and inspect past task and workflow runs in the Skyvern Cloud UI Runs page, including filtering by status, trigger type, and run parameters.
+subtitle: Find, filter, and inspect past task and agent executions
+description: Search, filter, and inspect past task and agent runs in the Skyvern Cloud UI Runs page, including filtering by status, trigger type, and run parameters.
 slug: cloud/viewing-results/run-history
 keywords:
   - filter
@@ -12,13 +12,13 @@ keywords:
   - past runs
 ---
 
-The **Runs** page shows every task and workflow execution, sorted newest-first. Use it to check on past runs, find failures, or verify that a scheduled workflow completed.
+The **Runs** page shows every task and agent execution, sorted newest-first. Use it to check on past runs, find failures, or verify that a scheduled agent completed.
 
 <img src="/images/cloud/run-history-overview.png" alt="Run History page overview" />
 
 ## Finding a specific run
 
-**Search** narrows the list by run ID or workflow parameter value. Type part of an ID (e.g., `wr_49338`) or a parameter you passed (like a URL), and matching results appear as you type.
+**Search** narrows the list by run ID or agent parameter value. Type part of an ID (e.g., `wr_49338`) or a parameter you passed (like a URL), and matching results appear as you type.
 
 <img src="/images/cloud/run-history-search.png" alt="Searching for a run by ID" />
 
@@ -32,13 +32,13 @@ Each row is one run. The columns:
 
 | Column | What it shows |
 |--------|--------------|
-| **Run ID** | Workflow run (`wr_...`) or task (`tsk_...`) identifier. Hover for the full ID. |
-| **Detail** | Workflow title or task description. A lightning bolt icon means code generation was used. |
+| **Run ID** | Agent run (`wr_...`) or task (`tsk_...`) identifier. Hover for the full ID. |
+| **Detail** | Agent title or task description. A lightning bolt icon means code generation was used. |
 | **Status** | Color-coded badge: green (completed), yellow (running/queued/created), red (failed/timed_out), orange (terminated/canceled). |
 | **Trigger** | How the run was started: **Manual**, **API**, or **Scheduled** (calendar icon). |
 | **Created At** | Start time in your local timezone. Hover for UTC. |
 
-Workflow runs have a **settings icon** in the last column. Click it to expand the row and see the parameters passed to that run. If your search matches something inside the parameters, the row auto-expands so you can see the match in context.
+Agent runs have a **settings icon** in the last column. Click it to expand the row and see the parameters passed to that run. If your search matches something inside the parameters, the row auto-expands so you can see the match in context.
 
 ## Trigger type
 
@@ -48,7 +48,7 @@ Every run has a trigger type that indicates how it was started:
 |-------------|-------------|
 | **Manual** | Started by clicking **Run** in the Cloud UI |
 | **API** | Started via the REST API or SDK |
-| **Scheduled** | Started automatically by a [schedule](/cloud/building-workflows/scheduling) |
+| **Scheduled** | Started automatically by a [schedule](/cloud/building-agents/scheduling) |
 
 Scheduled runs display a **calendar icon badge** next to the run ID. Click the run to see the schedule name and cron expression in the run details.
 

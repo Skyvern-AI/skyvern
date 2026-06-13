@@ -1,5 +1,7 @@
 import { Skeleton } from "@/components/ui/skeleton";
+import { useRowSelection } from "@/hooks/useRowSelection";
 import { CredentialItem } from "./CredentialItem";
+import { CredentialsBulkBar } from "./CredentialsBulkBar";
 import { useCredentialsQuery } from "@/routes/workflows/hooks/useCredentialsQuery";
 import {
   Pagination,
@@ -17,6 +19,8 @@ type CredentialFilter = "password" | "credit_card" | "secret";
 type Props = {
   filter?: CredentialFilter;
   search?: string;
+  folderId?: string | null;
+  isResolvingFolder?: boolean;
   onStartBackgroundTest?: (
     credentialId: string,
     url: string,
@@ -35,16 +39,20 @@ const PAGE_SIZE = 25;
 function CredentialsList({
   filter,
   search,
+  folderId,
+  isResolvingFolder,
   onStartBackgroundTest,
 }: Props = {}) {
   const trimmedSearch = search?.trim() ?? "";
   const [page, setPage] = useState(1);
   const [prevSearch, setPrevSearch] = useState(trimmedSearch);
+  const [prevFolderId, setPrevFolderId] = useState(folderId);
 
-  // Reset to page 1 synchronously when the search changes — avoids the extra
-  // fetch with the stale page that a post-render effect would trigger.
-  if (prevSearch !== trimmedSearch) {
+  // Reset to page 1 synchronously when the search or folder filter changes —
+  // avoids the extra fetch with the stale page that a post-render effect would trigger.
+  if (prevSearch !== trimmedSearch || prevFolderId !== folderId) {
     setPrevSearch(trimmedSearch);
+    setPrevFolderId(folderId);
     setPage(1);
   }
 
@@ -53,9 +61,27 @@ function CredentialsList({
     page_size: PAGE_SIZE,
     credential_type: filter,
     search: trimmedSearch || undefined,
+    folder_id: folderId || undefined,
+    // Hold the query until a deep-linked ?folder= slug resolves, so the
+    // unfiltered credential bank doesn't flash before the filter applies.
+    enabled: !isResolvingFolder,
   });
 
-  if (isLoading) {
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
+  const {
+    selected,
+    selectedItems: selectedCredentials,
+    isSelected,
+    handleSelect,
+    clearSelection,
+    replaceSelection,
+  } = useRowSelection({
+    items: credentials ?? [],
+    getId: (credential) => credential.credential_id,
+    resetKey: JSON.stringify([page, trimmedSearch, folderId ?? null]),
+  });
+
+  if (isResolvingFolder || isLoading) {
     return (
       <div className="space-y-5">
         <Skeleton className="h-20 w-full" />
@@ -86,11 +112,15 @@ function CredentialsList({
   return (
     <div className="space-y-5">
       <div className="space-y-5">
-        {credentials.map((credential) => (
+        {credentials.map((credential, index) => (
           <CredentialItem
             key={credential.credential_id}
             credential={credential}
             onStartBackgroundTest={onStartBackgroundTest}
+            index={index}
+            selected={isSelected(credential.credential_id)}
+            hasSelection={selected.size > 0}
+            onSelect={handleSelect}
           />
         ))}
       </div>
@@ -122,6 +152,15 @@ function CredentialsList({
             </PaginationItem>
           </PaginationContent>
         </Pagination>
+      )}
+      {selectedCredentials.length > 0 && (
+        <CredentialsBulkBar
+          selectedCredentials={selectedCredentials}
+          isOperating={isBulkOperating}
+          onOperatingChange={setIsBulkOperating}
+          onClear={clearSelection}
+          onReplaceSelection={replaceSelection}
+        />
       )}
     </div>
   );

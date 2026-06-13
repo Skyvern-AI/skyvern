@@ -98,13 +98,14 @@ from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
 from skyvern.forge.sdk.experimentation.llm_prompt_config import resolve_check_user_goal_handler
+from skyvern.forge.sdk.experimentation.slim_llm_output import get_slim_output_template_value
 from skyvern.forge.sdk.log_artifacts import save_step_logs, save_task_logs
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import apply_context_attrs, traced
+from skyvern.forge.sdk.trace import VerificationTrigger, apply_context_attrs, traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -117,11 +118,7 @@ from skyvern.schemas.steps import AgentStepOutput
 from skyvern.services import run_service, service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
-from skyvern.services.otp_service import (
-    extract_totp_from_navigation_inputs,
-    poll_otp_value,
-    try_generate_totp_from_credential,
-)
+from skyvern.services.otp_service import poll_otp_value, resolve_otp_value
 from skyvern.services.webhook_delivery import WEBHOOK_DELIVERY_MAX_ATTEMPTS, deliver_webhook_with_retries
 from skyvern.utils.image_resizer import Resolution
 from skyvern.utils.prompt_engine import (
@@ -2756,8 +2753,15 @@ class ForgeAgent:
 
     @traced(name="skyvern.agent.complete_verify")
     async def complete_verify(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteVerifyResult:
+        otel_trace.get_current_span().set_attribute("verification.trigger", verification_trigger)
         LOG.debug(
             "Checking if user goal is achieved after re-scraping the page",
             workflow_run_id=task.workflow_run_id,
@@ -2768,6 +2772,12 @@ class ForgeAgent:
             scroll = False
             llm_key_override = None
 
+        _ctx = skyvern_context.current()
+        if _ctx:
+            _ctx.scrape_trigger = "verification"
+            _ctx.scrape_screenshots_consumed = bool(
+                _ctx.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
+            )
         scraped_page_refreshed = await scraped_page.refresh(draw_boxes=False, scroll=scroll)
 
         actions_and_results_str = ""
@@ -2803,6 +2813,8 @@ class ForgeAgent:
         template_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
         prompt_name = "check-user-goal-with-termination" if use_termination_prompt else "check-user-goal"
 
+        slim_output = await get_slim_output_template_value(template_name)
+
         # SKY-9718 Layer 1: gate the lean recipe on the PostHog flag at the
         # call site. complete_verify only needs the visual page state to
         # decide is_complete / is_terminate / continue — no element-id refs,
@@ -2819,12 +2831,14 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion,
             terminate_criterion=task.terminate_criterion,
             action_history=actions_and_results_str,
+            slim_output=slim_output,
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             without_screenshots=not llm_screenshots_enabled,
             html_need_skyvern_attrs=False,
             lean_compress_long_href=lean_enabled,
             lean_compress_image_src=lean_enabled,
             lean_strip_url_query_strings=lean_enabled,
+            lean_compress_nonnavigable_href=lean_enabled,
         )
 
         # This prompt is critical for our agent, we probably should use the primary LLM handler
@@ -2885,7 +2899,13 @@ class ForgeAgent:
         return result
 
     async def check_user_goal_complete(
-        self, page: Page, scraped_page: ScrapedPage, task: Task, step: Step
+        self,
+        page: Page,
+        scraped_page: ScrapedPage,
+        task: Task,
+        step: Step,
+        *,
+        verification_trigger: VerificationTrigger,
     ) -> CompleteAction | TerminateAction | None:
         try:
             verification_result = await self.complete_verify(
@@ -2893,6 +2913,7 @@ class ForgeAgent:
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger=verification_trigger,
             )
 
             # Check if we should terminate instead of complete
@@ -2962,6 +2983,10 @@ class ForgeAgent:
         engine: RunEngine,
         action: Action,
     ) -> None:
+        _span = otel_trace.get_current_span()
+        _span.set_attribute("action_type", str(action.action_type))
+        _span.set_attribute("step_order", step.order if step else -1)
+
         working_page = await browser_state.get_working_page()
         if not working_page:
             raise MissingBrowserStatePage()
@@ -2969,7 +2994,7 @@ class ForgeAgent:
         skyvern_frame: SkyvernFrame | None = None
         try:
             skyvern_frame = await SkyvernFrame.create_instance(frame=working_page)
-            await skyvern_frame.safe_wait_for_animation_end()
+            await skyvern_frame.safe_wait_for_animation_end(caller="post_action_artifact")
         except Exception:
             LOG.info("Failed to wait for animation end, ignore it", exc_info=True)
 
@@ -3009,6 +3034,7 @@ class ForgeAgent:
                     apply_context_attrs(_ss_art_span)
                     _ss_art_span.set_attribute("screenshot_bytes", len(screenshot))
                     _ss_art_span.set_attribute("bundled", _bundled)
+                    _ss_art_span.set_attribute("action_type", str(action.action_type))
                     if _bundled:
                         ids = app.ARTIFACT_MANAGER.accumulate_screenshot_to_step_archive(
                             step=step,
@@ -3279,11 +3305,12 @@ class ForgeAgent:
             if engine not in CUA_ENGINES:
                 self.async_operation_pool.run_operation(task.task_id, AgentPhase.scrape)
 
-            # Scrape the web page and get the screenshot and the elements
-            # HACK: try scrape_website three time to handle screenshot timeout
-            # first time: normal scrape to take screenshot
-            # second time: try again the normal scrape, (stopping window loading before scraping barely helps, but causing problem)
-            # third time: reload the page before scraping
+            if context:
+                context.scrape_trigger = "step_body"
+                context.scrape_screenshots_consumed = bool(
+                    context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
+                )
+
             extract_action_prompt = ""
             use_caching = False
             for idx, scrape_type in enumerate(SCRAPE_TYPE_ORDER):
@@ -3448,19 +3475,26 @@ class ForgeAgent:
         verification_code_check: bool,
         show_close_page_action: bool,
         complete_criterion: str | None,
+        show_new_tab_action: bool = False,
+        show_switch_tab_action: bool = False,
         enriched_tree_enabled: bool = False,
         llm_screenshots_enabled: bool = True,
+        slim_output: str | None = None,
     ) -> str:
         """
         Build a short-but-unique cache variant identifier so extract-action prompts that
-        differ meaningfully (OTP, close-page availability, complete criteria) do not reuse
-        the same Vertex cache object.
+        differ meaningfully (OTP, close-page availability, complete criteria, slim output)
+        do not reuse the same Vertex cache object.
         """
         variant_parts: list[str] = []
         if verification_code_check:
             variant_parts.append("vc")
         if show_close_page_action:
             variant_parts.append("cp")
+        if show_new_tab_action:
+            variant_parts.append("nt")
+        if show_switch_tab_action:
+            variant_parts.append("st")
         if enriched_tree_enabled:
             variant_parts.append("et")
         if enriched_tree_enabled and not llm_screenshots_enabled:
@@ -3469,6 +3503,8 @@ class ForgeAgent:
             normalized = " ".join(complete_criterion.split())
             digest = hashlib.sha256(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
             variant_parts.append(f"cc{digest}")
+        if slim_output:
+            variant_parts.append(f"slim_{slim_output}")
         return "-".join(variant_parts) if variant_parts else "std"
 
     async def _create_vertex_cache_for_task(
@@ -3684,6 +3720,8 @@ class ForgeAgent:
 
         context = skyvern_context.ensure_context()
 
+        slim_output = await get_slim_output_template_value(template)
+
         # Reset cached prompt and cache reference by default; we will set them below if caching is enabled.
         # This prevents extract-action cache from being attached to other prompts like decisive-criterion-validate.
         context.cached_static_prompt = None
@@ -3701,7 +3739,7 @@ class ForgeAgent:
         cache_enabled = prompt_caching_settings.get(EXTRACT_ACTION_PROMPT_NAME) or prompt_caching_settings.get(
             EXTRACT_ACTION_TEMPLATE
         )
-        LOG.info(
+        LOG.debug(
             "Extract-action prompt caching evaluation",
             template=template,
             cache_enabled=cache_enabled,
@@ -3722,12 +3760,20 @@ class ForgeAgent:
                 compress_long_href=False,
                 compress_image_src=True,
                 strip_url_query_strings=True,
+                # non-navigable hrefs (javascript:/empty/'#') carry no
+                # destination signal, so they're safe to drop for the planner.
+                compress_nonnavigable_href=True,
             )
         else:
             elements_for_prompt = scraped_page.build_element_tree(element_tree_format)
 
         open_tabs_context = await _build_open_tabs_context(browser_state, page)
         show_close_page_action = open_tabs_context is not None
+        # NEW_TAB/SWITCH_TAB are gated behind a flag (default off) so single-tab tasks are
+        # unaffected. SWITCH_TAB additionally requires >= 2 open tabs, like CLOSE_PAGE.
+        multi_tab_enabled = await self._is_multi_tab_control_enabled(context)
+        show_new_tab_action = multi_tab_enabled
+        show_switch_tab_action = multi_tab_enabled and open_tabs_context is not None
         llm_screenshots_enabled = context.llm_screenshots_enabled_for_prompt(retry_index=step.retry_index)
         enriched_tree_enabled = context.enriched_tree_enabled()
 
@@ -3755,17 +3801,23 @@ class ForgeAgent:
                     "complete_criterion": task.complete_criterion.strip() if task.complete_criterion else None,
                     "terminate_criterion": task.terminate_criterion.strip() if task.terminate_criterion else None,
                     "show_close_page_action": show_close_page_action,
+                    "show_new_tab_action": show_new_tab_action,
+                    "show_switch_tab_action": show_switch_tab_action,
                     "open_tabs_context": open_tabs_context,
                     "recent_dialog_messages_str": recent_dialog_messages_str,
                     "llm_screenshots_enabled": llm_screenshots_enabled,
                     "enriched_tree_enabled": enriched_tree_enabled,
+                    "slim_output": slim_output,
                 }
                 cache_variant = self._build_extract_action_cache_variant(
                     verification_code_check=verification_code_check,
                     show_close_page_action=show_close_page_action,
+                    show_new_tab_action=show_new_tab_action,
+                    show_switch_tab_action=show_switch_tab_action,
                     complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
                     enriched_tree_enabled=enriched_tree_enabled,
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    slim_output=slim_output,
                 )
                 static_prompt = prompt_engine.load_prompt(f"{template}-static", **prompt_kwargs)
                 dynamic_prompt = prompt_engine.load_prompt(
@@ -3851,13 +3903,17 @@ class ForgeAgent:
             complete_criterion=task.complete_criterion.strip() if task.complete_criterion else None,
             terminate_criterion=task.terminate_criterion.strip() if task.terminate_criterion else None,
             show_close_page_action=show_close_page_action,
+            show_new_tab_action=show_new_tab_action,
+            show_switch_tab_action=show_switch_tab_action,
             open_tabs_context=open_tabs_context,
             recent_dialog_messages_str=recent_dialog_messages_str,
             llm_screenshots_enabled=llm_screenshots_enabled,
             enriched_tree_enabled=enriched_tree_enabled,
+            slim_output=slim_output,
             lean_compress_long_href=False,
             lean_compress_image_src=context.enable_lean_element_tree,
             lean_strip_url_query_strings=context.enable_lean_element_tree,
+            lean_compress_nonnavigable_href=context.enable_lean_element_tree,
         )
 
         # Map template to prompt_name for logging/caching guards
@@ -3923,6 +3979,26 @@ class ForgeAgent:
             )
 
         return context.prompt_caching_settings
+
+    async def _is_multi_tab_control_enabled(self, context: SkyvernContext) -> bool:
+        distinct_id = context.run_id or context.workflow_run_id or context.task_id
+        organization_id = context.organization_id
+        if not distinct_id or not organization_id:
+            return False
+        try:
+            return await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+                "MULTI_TAB_CONTROL",
+                distinct_id,
+                properties={"organization_id": organization_id},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to evaluate multi-tab control experiment; defaulting to disabled",
+                distinct_id=distinct_id,
+                organization_id=organization_id,
+                error=str(exc),
+            )
+            return False
 
     def _should_process_totp(self, scraped_page: ScrapedPage | None) -> bool:
         """Detect TOTP pages by checking for multiple input fields or verification keywords."""
@@ -4780,18 +4856,13 @@ class ForgeAgent:
         Note: This should only be called when verification is needed (i.e., when
         the standard flow would have called check_user_goal_complete in agent_step).
         """
-        LOG.info(
-            "Starting parallel user goal verification with speculative extract-actions",
-            step_id=step.step_id,
-            task_id=task.task_id,
-        )
-
         verification_task = asyncio.create_task(
             self.check_user_goal_complete(
                 page=page,
                 scraped_page=scraped_page,
                 task=task,
                 step=step,
+                verification_trigger="periodic_after_step",
             ),
             name=f"verify_goal_{step.step_id}",
         )
@@ -5854,25 +5925,7 @@ class ForgeAgent:
             return json_response
 
         LOG.info("Need verification code")
-        otp_value = extract_totp_from_navigation_inputs(task.navigation_payload)
-        if not otp_value and (task.totp_verification_url or task.totp_identifier) and task.organization_id:
-            workflow_id = workflow_permanent_id = None
-            if task.workflow_run_id:
-                workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(task.workflow_run_id)
-                if workflow_run:
-                    workflow_id = workflow_run.workflow_id
-                    workflow_permanent_id = workflow_run.workflow_permanent_id
-            otp_value = await poll_otp_value(
-                organization_id=task.organization_id,
-                task_id=task.task_id,
-                workflow_id=workflow_id,
-                workflow_run_id=task.workflow_run_id,
-                workflow_permanent_id=workflow_permanent_id,
-                totp_verification_url=task.totp_verification_url,
-                totp_identifier=task.totp_identifier,
-            )
-        if not otp_value:
-            otp_value = try_generate_totp_from_credential(task.workflow_run_id)
+        otp_value = await resolve_otp_value(task)
 
         if not otp_value or otp_value.get_otp_type() != OTPType.TOTP:
             return json_response

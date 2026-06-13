@@ -250,13 +250,21 @@ class SkyvernElement:
     def is_interactable(self) -> bool:
         return self.__static_element.get("interactable", False)
 
-    async def is_disabled(self, dynamic: bool = False) -> bool:
-        # if attr not exist, return None
-        # if attr is like 'disabled', return empty string or True
-        # if attr is like `disabled=false`, return the value
-        disabled = False
-        aria_disabled = False
+    @staticmethod
+    def _disabled_attrs_indicate_disabled(attrs: dict) -> bool:
+        for key in ("disabled", "aria-disabled"):
+            val = attrs.get(key)
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                if val is True:
+                    return True
+            elif isinstance(val, str):
+                if val.lower() != "false":
+                    return True
+        return False
 
+    async def is_disabled(self, dynamic: bool = False) -> bool:
         disabled_attr: bool | str | None = None
         aria_disabled_attr: bool | str | None = None
         style_disabled: bool = False
@@ -269,28 +277,22 @@ class SkyvernElement:
             style_disabled = await skyvern_frame.get_disabled_from_style(await self.get_element_handler())
 
         except Exception:
-            # FIXME: maybe it should be considered as "disabled" element if failed to get the attributes?
+            # Preserve existing fail-open behavior when disabled attributes cannot be read.
             LOG.exception(
                 "Failed to get the disabled attribute",
                 element=self.__static_element,
                 element_id=self.get_id(),
             )
 
-        if disabled_attr is not None:
-            # disabled_attr should be bool or str
-            if isinstance(disabled_attr, bool):
-                disabled = disabled_attr
-            if isinstance(disabled_attr, str):
-                disabled = disabled_attr.lower() != "false"
-
-        if aria_disabled_attr is not None:
-            # aria_disabled_attr should be bool or str
-            if isinstance(aria_disabled_attr, bool):
-                aria_disabled = aria_disabled_attr
-            if isinstance(aria_disabled_attr, str):
-                aria_disabled = aria_disabled_attr.lower() != "false"
-
-        return disabled or aria_disabled or style_disabled
+        return (
+            self._disabled_attrs_indicate_disabled(
+                {
+                    "disabled": disabled_attr,
+                    "aria-disabled": aria_disabled_attr,
+                }
+            )
+            or style_disabled
+        )
 
     async def is_readonly(self, dynamic: bool = False) -> bool:
         # if attr not exist, return None
@@ -538,6 +540,63 @@ class SkyvernElement:
                 return child.get("id")
 
         return None
+
+    def find_deepest_interactable_descendant_in_single_chain(self) -> str | None:
+        children = self.__static_element.get("children")
+        if not isinstance(children, list):
+            return None
+        entries: list[tuple[tuple[int, ...], str]] = []
+
+        # Descendants are raw static dicts, not SkyvernElement instances; use the shared attr parser.
+        def _walk(nodes: list[dict], path: tuple[int, ...]) -> None:
+            for idx, item in enumerate(nodes):
+                if not isinstance(item, dict):
+                    continue
+                child_path = (*path, idx)
+                node_id = item.get("id")
+                if not (isinstance(node_id, str) and node_id):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                if not (item.get("interactable", False) and not item.get("hoverOnly", False)):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                attrs = item.get("attributes")
+                # Static children expose attrs only; CSS style-disabled is caught by the later dynamic check.
+                if isinstance(attrs, dict) and self._disabled_attrs_indicate_disabled(attrs):
+                    grandchildren = item.get("children")
+                    if isinstance(grandchildren, list):
+                        _walk(grandchildren, child_path)
+                    continue
+                entries.append((child_path, node_id))
+                grandchildren = item.get("children")
+                if isinstance(grandchildren, list):
+                    _walk(grandchildren, child_path)
+
+        _walk(children, ())
+        if not entries:
+            return None
+
+        # When viable candidates appear in separate ancestor-descendant
+        # branches there is no unambiguous target — retargeting would
+        # guess.  Keep the original disabled-element failure instead.
+        for i in range(len(entries)):
+            pi = entries[i][0]
+            for j in range(i + 1, len(entries)):
+                pj = entries[j][0]
+                if not (pi[: len(pj)] == pj or pj[: len(pi)] == pi):
+                    LOG.warning(
+                        "Multiple viable single-chain descendants in separate branches; no retarget",
+                        parent_id=self.get_id(),
+                        candidate_ids=[e[1] for e in entries],
+                    )
+                    return None
+
+        entries.sort(key=lambda x: len(x[0]), reverse=True)
+        return entries[0][1]
 
     async def find_children_element_id_by_callback(
         self, cb: typing.Callable[[dict], typing.Awaitable[bool]]
@@ -841,9 +900,13 @@ class SkyvernElement:
         if await self.is_disabled(dynamic=True):
             raise InteractWithDisabledElement(element_id=self.get_id())
 
-        await EventStrategyFactory.move_to_element(page, self.get_locator())
         try:
-            await self.get_locator().click(timeout=timeout)
+            # Route through the active cursor strategy so alternate profiles can
+            # dispatch their own click sequence (explicit mouse.down/up).
+            # The strategy is responsible for moving to the element first; the
+            # DEFAULT path still ends up calling locator.click(timeout=timeout)
+            # so Playwright actionability is preserved.
+            await EventStrategyFactory.click_element(page, self.get_locator(), timeout=timeout)
             return
         except Exception:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())

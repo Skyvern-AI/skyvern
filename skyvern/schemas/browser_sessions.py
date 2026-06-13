@@ -5,6 +5,7 @@ from skyvern.client.types.workflow_definition_yaml_parameters_item import Workfl
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserType
 from skyvern.schemas.docs.doc_strings import PROXY_LOCATION_DOC_STRING
 from skyvern.schemas.runs import GeoTarget, ProxyLocationInput
+from skyvern.services.browser_recording.types import RecordingDraftStep
 
 MIN_TIMEOUT = 5
 MAX_TIMEOUT = 60 * 24  # 24 hours
@@ -52,6 +53,21 @@ class CreateBrowserSessionRequest(BaseModel):
         pattern=r"^bp_",
     )
 
+    generate_browser_profile: bool = Field(
+        default=False,
+        description="When true, the session's browser profile (cookies, localStorage, etc.) is saved to storage "
+        "when the session ends so it can be turned into a reusable browser profile. Defaults to false to avoid "
+        "storing profiles for sessions that never need them. Sessions started with a browser_profile_id always "
+        "persist their profile regardless of this flag.",
+    )
+
+
+class UpdateBrowserSessionRequest(BaseModel):
+    generate_browser_profile: bool = Field(
+        description="Enable or disable saving this session's browser profile when it ends. Can be toggled while "
+        "the session is still alive; the value is read at session teardown.",
+    )
+
 
 class ProcessBrowserSessionRecordingRequest(BaseModel):
     compressed_chunks: list[str] = Field(
@@ -61,6 +77,10 @@ class ProcessBrowserSessionRecordingRequest(BaseModel):
     workflow_permanent_id: str = Field(
         default="no-such-wpid",
         description="Permanent ID of the workflow associated with the browser session recording.",
+    )
+    draft_steps: list[RecordingDraftStep] | None = Field(
+        default=None,
+        description="Optional live interpretation drafts to commit instead of reprocessing the compressed recording.",
     )
 
 

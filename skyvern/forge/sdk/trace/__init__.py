@@ -6,6 +6,9 @@ from opentelemetry import trace
 
 SpanRole = Literal["wrapper"]
 
+VerificationTrigger = Literal["periodic_after_step", "complete_action_forced"]
+
+
 # Context fields to auto-attach to every span. Deliberately minimal — each
 # attribute is paid for in storage and index cardinality, so only IDs we
 # actively query on during profiling / Milestone 2 aggregations belong here.

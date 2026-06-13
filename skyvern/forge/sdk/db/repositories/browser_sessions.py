@@ -148,6 +148,21 @@ class BrowserSessionsRepository(BaseRepository):
             await session.refresh(browser_profile)
             return BrowserProfile.model_validate(browser_profile)
 
+    @db_operation("touch_browser_profile")
+    async def touch_browser_profile(self, profile_id: str, organization_id: str) -> None:
+        async with self.Session() as session:
+            query = (
+                select(BrowserProfileModel)
+                .filter_by(browser_profile_id=profile_id)
+                .filter_by(organization_id=organization_id)
+                .filter(BrowserProfileModel.deleted_at.is_(None))
+            )
+            browser_profile = (await session.scalars(query)).first()
+            if not browser_profile:
+                raise BrowserProfileNotFound(profile_id=profile_id, organization_id=organization_id)
+            browser_profile.modified_at = naive_utc_now()
+            await session.commit()
+
     @db_operation("get_active_persistent_browser_sessions")
     async def get_active_persistent_browser_sessions(
         self,
@@ -252,6 +267,7 @@ class BrowserSessionsRepository(BaseRepository):
         extensions: list[Extensions] | None = None,
         browser_type: PersistentBrowserType | None = None,
         browser_profile_id: str | None = None,
+        generate_browser_profile: bool = False,
     ) -> PersistentBrowserSession:
         """Create a new persistent browser session."""
         extensions_str: list[str] | None = (
@@ -267,6 +283,7 @@ class BrowserSessionsRepository(BaseRepository):
                 extensions=extensions_str,
                 browser_type=browser_type.value if browser_type else None,
                 browser_profile_id=browser_profile_id,
+                generate_browser_profile=generate_browser_profile,
             )
             session.add(browser_session)
             await session.commit()
@@ -283,6 +300,7 @@ class BrowserSessionsRepository(BaseRepository):
         organization_id: str | None = None,
         completed_at: datetime | None = None,
         started_at: datetime | None = None,
+        generate_browser_profile: bool | None = None,
     ) -> PersistentBrowserSession:
         async with self.Session() as session:
             persistent_browser_session = (
@@ -304,6 +322,8 @@ class BrowserSessionsRepository(BaseRepository):
                 persistent_browser_session.completed_at = to_naive_utc(completed_at)
             if started_at:
                 persistent_browser_session.started_at = to_naive_utc(started_at)
+            if generate_browser_profile is not None:
+                persistent_browser_session.generate_browser_profile = generate_browser_profile
 
             await session.commit()
             await session.refresh(persistent_browser_session)

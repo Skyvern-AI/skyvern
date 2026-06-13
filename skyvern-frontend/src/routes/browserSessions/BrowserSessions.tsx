@@ -76,6 +76,7 @@ const EXTENSION_OPTIONS: Array<{
   value: BrowserSessionExtension;
   label: string;
   description: string;
+  enterprise?: boolean;
 }> = [
   {
     value: "ad-blocker",
@@ -86,6 +87,7 @@ const EXTENSION_OPTIONS: Array<{
     value: "captcha-solver",
     label: "Captcha Solver",
     description: "Enables automated captcha solving when available.",
+    enterprise: true,
   },
 ];
 
@@ -178,8 +180,9 @@ function BrowserSessions() {
           <h1 className="text-2xl">Browsers</h1>
         </div>
         <p className="text-sm leading-6 text-muted-foreground">
-          Create your own live browsers to interact with websites, or run agents
-          in.
+          Live browser instances you can drive interactively or attach to agent
+          runs. They stay warm between runs — best for fast, back-to-back runs
+          as the same user. You're billed while a browser is alive.
         </p>
       </div>
 
@@ -465,7 +468,14 @@ function BrowserSessions() {
                             htmlFor={`extension-${extension.value}`}
                             className="font-medium"
                           >
-                            {extension.label}
+                            <span className="inline-flex items-center gap-2">
+                              <span>{extension.label}</span>
+                              {extension.enterprise ? (
+                                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+                                  Enterprise
+                                </span>
+                              ) : null}
+                            </span>
                           </Label>
                           <p className="text-xs text-muted-foreground">
                             {extension.description}

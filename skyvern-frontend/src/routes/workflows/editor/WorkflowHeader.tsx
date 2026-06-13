@@ -256,18 +256,18 @@ function RunButton() {
 
 function EditorActionToolbar() {
   return (
-    <div className="flex items-center gap-2">
+    <div data-tour="editor-actions" className="flex items-center gap-2">
       <BrowserModeButton />
       <SaveButton />
-      <EditorOverflowMenu />
-      <div className="mx-1 h-6 w-px bg-slate-700" aria-hidden="true" />
-      <PanelToggleButton content="parameters" label="Inputs" />
       <PanelToggleButton
         content="schedules"
         label="Schedule"
         leadingIcon={<CalendarIcon className="h-5 w-5" />}
         iconOnly
       />
+      <EditorOverflowMenu />
+      <div className="mx-1 h-6 w-px bg-slate-700" aria-hidden="true" />
+      <PanelToggleButton content="parameters" label="Inputs" />
       <RunButton />
     </div>
   );

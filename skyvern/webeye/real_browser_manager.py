@@ -15,6 +15,7 @@ from skyvern.webeye.browser_factory import BrowserContextFactory
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
+from skyvern.webeye.session_cookies import persist_session_cookies
 from skyvern.webeye.video_utils import finalize_webm
 
 LOG = structlog.get_logger()
@@ -462,7 +463,12 @@ class RealBrowserManager(BrowserManager):
                 LOG.info("Stopped tracing", trace_path=trace_path)
 
             if streams_active:
-                # Defer close until the last stream disconnects
+                # Defer close until the last stream disconnects. Persist session cookies first: the
+                # deferred close() runs after store_browser_session archives the dir, too late for it.
+                await persist_session_cookies(
+                    browser_state_to_close.browser_context,
+                    browser_state_to_close.browser_artifacts.browser_session_dir,
+                )
                 LOG.info(
                     "Deferring browser close — active CDP streams",
                     workflow_run_id=workflow_run_id,

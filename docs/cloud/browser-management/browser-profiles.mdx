@@ -18,7 +18,7 @@ Profiles are ideal when you:
 
 - Run the same automation repeatedly with the same account (daily reports, scheduled data extraction)
 - Want to skip login steps that consume credits and time
-- Need multiple workflows to share the same authenticated state
+- Need multiple agents to share the same authenticated state
 
 <Note>
 Looking to manage profiles from code? See the [API & SDK guide](/developers/optimization/browser-profiles) instead.
@@ -56,7 +56,7 @@ Browser profiles are created automatically when you test a password credential w
 </Steps>
 
 <Tip>
-The **Save browser session** flow is the easiest way to create a profile. It handles the full lifecycle: open browser, log in, save state. No workflows or API calls required.
+The **Save browser session** flow is the easiest way to create a profile. It handles the full lifecycle: open browser, log in, save state. No agents or API calls required.
 </Tip>
 
 ---
@@ -87,7 +87,7 @@ For sites with short-lived sessions (banks, healthcare portals), refresh profile
 | **Lifetime** | Minutes to hours | Days to months |
 | **State** | Current page, cookies, open connections | Cookies, localStorage, session files |
 | **Billing** | Charged while open | No cost when not in use |
-| **Best for** | Back-to-back tasks, human-in-the-loop | Repeated logins, scheduled workflows |
+| **Best for** | Back-to-back tasks, human-in-the-loop | Repeated logins, scheduled agents |
 
 ---
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -118,10 +119,22 @@ class SkyvernContext:
     enrich_tree_mode: EnrichTreeMode = EnrichTreeMode.CONTROL
     step_retry_index: int = 0
 
+    # Run-level SLIM_LLM_OUTPUT_PROMPTS assignment, resolved once by slim_llm_output.
+    # The lock makes first-use resolution single-flight under parallel prompt builds.
+    slim_output_variant_assigned: str | None = None
+    slim_output_variant_resolved: bool = False
+    slim_output_variant_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
     # Trigger type of the enclosing workflow run (manual/api/scheduled/webhook).
     # Routed through SkyvernContext so non-API entry points (workers, scripts) can populate it
     # without taking a dependency on the public-API request shape.
     trigger_type: WorkflowRunTriggerType | None = None
+
+    # Screenshot attribution: set by the agent before calling scrape so the
+    # scraper can tag screenshot spans with the originating workflow phase
+    # and whether the LLM will consume the screenshots.
+    scrape_trigger: str | None = None
+    scrape_screenshots_consumed: bool | None = None
     # When true, downstream LLM handler selection may swap the resolved handler to a
     # flex-tier router. Cloud sets this at run boot via a PostHog flag for non-UI runs;
     # OSS keeps it False because OSS has no flex routers registered.

@@ -3,7 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.workflow.models.run_limits import (
@@ -208,8 +216,16 @@ class TaskRunRequest(BaseModel):
 
 
 class WorkflowRunRequest(BaseModel):
+    # An agent *is* a workflow, so `agent_id` and `workflow_id` carry the same `wpid_` value. `agent_id`
+    # is listed first so the public request schema advertises the agent-named field, while `workflow_id`
+    # stays accepted for backwards compatibility. `populate_by_name` keeps internal
+    # `WorkflowRunRequest(workflow_id=...)` construction working alongside the aliases.
+    model_config = ConfigDict(populate_by_name=True)
+
     workflow_id: str = Field(
-        description="ID of the workflow to run. Workflow ID starts with `wpid_`.", examples=["wpid_123"]
+        validation_alias=AliasChoices("agent_id", "workflow_id"),
+        description="ID of the agent to run. Starts with `wpid_`. `workflow_id` is accepted as an alias.",
+        examples=["wpid_123"],
     )
     parameters: dict[str, Any] | None = Field(default=None, description="Parameters to pass to the workflow")
     title: str | None = Field(default=None, description="The title for this workflow run")
@@ -462,6 +478,10 @@ class WorkflowRunResponse(BaseRunResponse):
     run_request: WorkflowRunRequest | None = Field(
         default=None, description="The original request parameters used to start this workflow run"
     )
+    # NOTE: no top-level `agent_id` here on purpose. This model has no reliable permanent-id field
+    # (only `run_request.workflow_id`, which is absent on some reads and is a version id on the
+    # login/download paths), so a computed alias would echo null/wrong values. The reliable agent_id
+    # alias lives on WorkflowRunResponseBase / Workflow / RunWorkflowResponse instead.
 
 
 RunResponse = Annotated[Union[TaskRunResponse, WorkflowRunResponse], Field(discriminator="run_type")]

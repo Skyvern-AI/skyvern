@@ -240,6 +240,46 @@ def test_shim_preserves_workflow_draft_when_signal_opts_in() -> None:
     assert overridden.user_response != ctx.blocker_signal.user_facing_reason
 
 
+def test_shim_preserves_staged_workflow_draft_when_verified_result_is_empty() -> None:
+    """Active-run terminal evidence can leave the verified workflow empty while
+    the keepable draft remains staged. That draft must still surface for
+    explicit user review instead of clearing the proposal controls."""
+    ctx = _ctx()
+    fake_workflow: Any = object()
+    ctx.staged_workflow = fake_workflow
+    ctx.staged_workflow_yaml = "title: Staged\n"
+    ctx.has_staged_proposal = True
+    ctx.blocker_signal = CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text="Stop and reply with the staged draft.",
+        user_facing_reason=(
+            "I reached the requested browser state, but the reusable workflow "
+            "still needs a clean verification run before it is ready."
+        ),
+        recovery_hint="stop",
+        preserves_workflow_draft=True,
+        internal_reason_code="tool_error_active_run_terminal_evidence",
+        blocked_tool="update_and_run_blocks",
+    )
+    result = AgentResult(
+        user_response="agent reply",
+        updated_workflow=None,
+        global_llm_context=None,
+        workflow_yaml=None,
+        staged_workflow_yaml=ctx.staged_workflow_yaml,
+        staged_workflow=fake_workflow,
+        has_staged_proposal=True,
+    )
+    overridden = _finalize_result_with_blocker_override(ctx, result)
+    assert overridden.updated_workflow is fake_workflow
+    assert overridden.workflow_yaml == ctx.staged_workflow_yaml
+    assert overridden.clear_proposed_workflow is False
+    assert overridden.proposal_disposition == "review_untested"
+    assert overridden.narrative_payload is not None
+    assert overridden.narrative_payload["proposalDisposition"] == "review_untested"
+    assert "Accept to save" in overridden.user_response
+
+
 def test_shim_keeps_model_reply_when_signal_opts_out_of_final_rendering() -> None:
     """Some tool guards are steering-only: they block a tool call but still let
     the model answer from evidence already gathered in the turn."""

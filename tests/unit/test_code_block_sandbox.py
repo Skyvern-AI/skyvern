@@ -7,11 +7,15 @@ Verifies that the CodeBlock safety layer:
 """
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
+from skyvern.schemas.workflows import BlockStatus
 
 # ---------------------------------------------------------------------------
 # is_safe_code — rejection tests
@@ -359,6 +363,22 @@ class TestIsSafeCodeAcceptsLegitimateCode:
     def test_for_loop(self) -> None:
         CodeBlock.is_safe_code("for i in range(10):\n    x = i")
 
+    def test_enumerate_loop(self) -> None:
+        CodeBlock.is_safe_code("for i, value in enumerate(values):\n    x = i")
+
+    def test_exposes_safe_iteration_and_regex_aliases(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+
+        assert safe_vars["enumerate"] is enumerate
+        assert safe_vars["isinstance"] is isinstance
+        assert safe_vars["any"] is any
+        assert safe_vars["all"] is all
+        assert safe_vars["max"] is max
+        assert safe_vars["min"] is min
+        assert safe_vars["sum"] is sum
+        assert safe_vars["sorted"] is sorted
+        assert safe_vars["re"].I == safe_vars["re"].IGNORECASE
+
     def test_try_except(self) -> None:
         CodeBlock.is_safe_code("try:\n    x = 1\nexcept Exception:\n    x = 0")
 
@@ -411,7 +431,25 @@ class TestBuildSafeVars:
 
     def test_expected_builtins_present(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
-        expected = {"len", "range", "str", "int", "float", "dict", "list", "tuple", "set", "bool"}
+        expected = {
+            "len",
+            "range",
+            "str",
+            "int",
+            "float",
+            "dict",
+            "list",
+            "tuple",
+            "set",
+            "bool",
+            "isinstance",
+            "any",
+            "all",
+            "max",
+            "min",
+            "sum",
+            "sorted",
+        }
         for name in expected:
             assert name in safe_vars, f"{name} missing from safe_vars"
 
@@ -423,6 +461,12 @@ class TestBuildSafeVars:
         assert not hasattr(safe_vars["json"], "codecs")
         assert not hasattr(safe_vars["json"], "decoder")
         assert not hasattr(safe_vars["json"], "encoder")
+
+    def test_html_is_restricted_namespace(self) -> None:
+        safe_vars = CodeBlock.build_safe_vars()
+        assert safe_vars["html"].escape("<RBT>") == "&lt;RBT&gt;"
+        assert not hasattr(safe_vars["html"], "unescape")
+        assert not hasattr(safe_vars["html"], "entities")
 
     def test_re_is_restricted_namespace(self) -> None:
         safe_vars = CodeBlock.build_safe_vars()
@@ -521,6 +565,17 @@ result = stdout.decode()
         assert safe_vars["asyncio"] is not asyncio_mod
         assert not hasattr(safe_vars["asyncio"], "create_subprocess_shell")
 
+    def test_runtime_re_namespace_has_common_safe_regex_helpers(self) -> None:
+        """Generated code can use normal safe regex idioms without importing re."""
+        safe_vars = CodeBlock.build_safe_vars()
+        re_helper = safe_vars["re"]
+
+        assert re_helper.escape("a+b") == "a\\+b"
+        assert re_helper.search("a.*b", "a\nb", re_helper.S)
+        assert re_helper.findall("a", "A", re_helper.I) == ["A"]
+        assert re_helper.fullmatch(r"\d+", "123")
+        assert [match.group(0) for match in re_helper.finditer("a", "aba")] == ["a", "a"]
+
 
 # ---------------------------------------------------------------------------
 # generate_async_user_function — integration tests
@@ -538,6 +593,7 @@ class TestGenerateAsyncUserFunctionIntegration:
     @staticmethod
     def _exec_user_code(code: str, page: object = None, parameters: dict | None = None):
         """Build and return the async wrapper using CodeBlock's actual method."""
+        import keyword
         import textwrap
 
         if page is None:
@@ -546,21 +602,38 @@ class TestGenerateAsyncUserFunctionIntegration:
             page = MagicMock()
 
         indented = textwrap.indent(code, "    ")
-        full_code = f"""
-async def wrapper():
-{indented}
-    return __capture_locals()
-"""
         runtime_variables: dict = {}
         safe_vars = CodeBlock.build_safe_vars()
+        parameter_defaults: dict = {}
         if parameters:
             for key, value in parameters.items():
                 if key not in safe_vars:
                     safe_vars[key] = value
+                    if key.isidentifier() and not keyword.iskeyword(key) and not key.startswith("__"):
+                        parameter_defaults[key] = value
+        default_args = ", ".join(f"{key}=__param_defaults[{key!r}]" for key in parameter_defaults)
+        full_code = f"""
+async def wrapper({default_args}):
+{indented}
+    return __capture_locals()
+"""
         safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
+        safe_vars["__param_defaults"] = parameter_defaults
         exec(full_code, safe_vars, runtime_variables)
-        return runtime_variables["wrapper"]
+        user_function = runtime_variables["wrapper"]
+        if not parameter_defaults:
+            return user_function
+
+        excluded_parameter_keys = frozenset(parameter_defaults)
+
+        async def filtered_user_function():
+            result = await user_function()
+            if not isinstance(result, dict):
+                return result
+            return {key: value for key, value in result.items() if key not in excluded_parameter_keys}
+
+        return filtered_user_function
 
     @pytest.mark.asyncio
     async def test_safe_code_runs_successfully(self) -> None:
@@ -568,6 +641,12 @@ async def wrapper():
         fn = self._exec_user_code("x = 1 + 2")
         result = await fn()
         assert result["x"] == 3
+
+    @pytest.mark.asyncio
+    async def test_safe_code_with_isinstance_shape_check(self) -> None:
+        fn = self._exec_user_code("value = {'downloads': 123}\nok = isinstance(value, dict)")
+        result = await fn()
+        assert result["ok"] is True
 
     @pytest.mark.asyncio
     async def test_safe_code_with_json(self) -> None:
@@ -581,6 +660,77 @@ async def wrapper():
         fn = self._exec_user_code("await sleep(0)")
         result = await fn()
         assert isinstance(result, dict)
+
+    @pytest.mark.asyncio
+    async def test_user_function_timeout_bounds_execution(self) -> None:
+        """A stuck code block must fail promptly instead of holding a workflow run open."""
+        fn = self._exec_user_code("await sleep(10)")
+        with pytest.raises(asyncio.TimeoutError):
+            await CodeBlock.execute_user_function_with_timeout(fn, timeout_seconds=1)
+
+    @pytest.mark.asyncio
+    async def test_user_function_timeout_can_be_disabled(self) -> None:
+        fn = self._exec_user_code("await sleep(0)\ncompleted = True")
+        result = await CodeBlock.execute_user_function_with_timeout(fn, timeout_seconds=0)
+        assert result["completed"] is True
+
+    @pytest.mark.asyncio
+    async def test_execute_uses_configured_code_block_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FakeBrowserState:
+            async def get_working_page(self) -> object:
+                return object()
+
+        class FakeWorkflowRunContext:
+            values: dict[str, object] = {}
+            secrets: dict[str, object] = {}
+            include_secrets_in_templates = False
+            workflow_title = "Test Workflow"
+            workflow_id = "w_test"
+            workflow_permanent_id = "wpid_test"
+            workflow_run_id = "wrid_test"
+            browser_session_id = None
+            workflow_run_outputs: list[object] = []
+
+            def get_block_metadata(self, label: str | None) -> dict[str, object]:
+                return {}
+
+            def build_workflow_run_summary(self) -> str:
+                return ""
+
+        async def validate_code_block(*args: object, **kwargs: object) -> None:
+            return None
+
+        async def get_browser_state(*args: object, **kwargs: object) -> FakeBrowserState:
+            return FakeBrowserState()
+
+        async def record_output(*args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "skyvern.forge.sdk.workflow.models.block.app.AGENT_FUNCTION.validate_code_block",
+            validate_code_block,
+        )
+        monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", get_browser_state)
+        monkeypatch.setattr(CodeBlock, "get_workflow_run_context", lambda *args: FakeWorkflowRunContext())
+        monkeypatch.setattr(CodeBlock, "record_output_parameter_value", record_output)
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="test_code_output",
+            description="test output",
+            output_parameter_id="op_test_code",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        block = CodeBlock(label="test_code", code="value = 'ok'", output_parameter=output_parameter)
+        result = await block.execute(workflow_run_id="wrid_test", workflow_run_block_id="")
+
+        assert settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS > 0
+        assert result.success is True
+        assert result.status == BlockStatus.completed
+        assert result.output_parameter_value == {"value": "ok"}
 
     def test_poc_blocked_at_is_safe_code_gate(self) -> None:
         """The PoC payload is rejected before exec() is ever called."""
@@ -631,6 +781,28 @@ async def wrapper():
         assert result["x"] == '{"a": 1}'
 
     @pytest.mark.asyncio
+    async def test_parameter_can_be_normalized_with_same_local_name(self) -> None:
+        """Workflow parameters are usable without leaking wrapper defaults into output."""
+        fn = self._exec_user_code(
+            "person_name = person_name.strip()\nnormalized = person_name.upper()",
+            parameters={"person_name": " Noor Assi "},
+        )
+        result = await fn()
+
+        assert "person_name" not in result
+        assert result["normalized"] == "NOOR ASSI"
+
+    @pytest.mark.asyncio
+    async def test_parameter_defaults_do_not_leak_into_implicit_output(self) -> None:
+        fn = self._exec_user_code(
+            "visible = public_value.upper()",
+            parameters={"public_value": "ok", "secret_token": "sensitive"},
+        )
+        result = await fn()
+
+        assert result == {"visible": "OK"}
+
+    @pytest.mark.asyncio
     async def test_parameters_cannot_override_builtins(self) -> None:
         """A parameter named __builtins__ must not re-enable builtins."""
         import builtins
@@ -641,6 +813,47 @@ async def wrapper():
         )
         with pytest.raises(NameError, match="open"):
             await fn()
+
+    @pytest.mark.asyncio
+    async def test_real_method_explicit_list_return_passes_through(self) -> None:
+        """SKY-10789 regression: a parameterized code block ending in an explicit
+        `return <list>` must yield the list, not crash on result.items().
+
+        Exercises the real CodeBlock.generate_async_user_function (not the helper)
+        so the fix is locked at the source. #11869 introduced the regression;
+        without this guard it raised AttributeError: 'list' object has no attribute 'items'.
+        """
+        from unittest.mock import MagicMock
+
+        now = datetime.now(timezone.utc)
+        output_parameter = OutputParameter(
+            parameter_type=ParameterType.OUTPUT,
+            key="check_max_docs_output",
+            description="test output",
+            output_parameter_id="op_test_return",
+            workflow_id="w_test",
+            created_at=now,
+            modified_at=now,
+        )
+        code = "candidates = diff_documents_output.get('candidates') or []\nreturn list(candidates)"
+        block = CodeBlock(label="check_max_docs", code=code, output_parameter=output_parameter)
+        fn = block.generate_async_user_function(
+            block.code,
+            MagicMock(),
+            parameters={"diff_documents_output": {"candidates": [{"name": "a"}, {"name": "b"}]}},
+        )
+        result = await fn()
+        assert result == [{"name": "a"}, {"name": "b"}]
+
+    @pytest.mark.asyncio
+    async def test_explicit_non_dict_return_does_not_leak_parameters(self) -> None:
+        """A parameterized block returning a non-dict passes the value through verbatim."""
+        fn = self._exec_user_code(
+            "rows = [public_value, public_value]\nreturn rows",
+            parameters={"public_value": "x", "secret_token": "sensitive"},
+        )
+        result = await fn()
+        assert result == ["x", "x"]
 
     def test_wrapper_uses_capture_locals_not_locals(self) -> None:
         """Regression: the wrapper template must use __capture_locals(), not return locals()."""

@@ -20,6 +20,10 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_gate_decision
 from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
 from skyvern.forge.sdk.copilot.streaming_adapter import parse_tool_output
+from skyvern.forge.sdk.copilot.turn_halt import (
+    raise_if_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -88,6 +92,17 @@ class CopilotRunHooks(RunHooksBase):
                 total_tokens=getattr(self._ctx, "total_tokens_used", None),
             )
 
+            if tool_name == "list_credentials" and parsed.get("ok"):
+                data = parsed.get("data") or {}
+                listed = data.get("credentials", []) if isinstance(data, dict) else []
+                resolved = [
+                    {"credential_id": c.get("credential_id"), "name": c.get("name")}
+                    for c in listed
+                    if isinstance(c, dict) and isinstance(c.get("credential_id"), str)
+                ]
+                if resolved:
+                    activity_entry["credentials"] = resolved
+
             if tool_name in _BLOCK_OUTPUT_TOOLS and parsed.get("ok"):
                 data = parsed.get("data") or {}
                 blocks = data.get("blocks", []) if isinstance(data, dict) else []
@@ -112,6 +127,13 @@ class CopilotRunHooks(RunHooksBase):
                 exc_info=True,
             )
             return
+
+        stash_turn_halt_from_blocker_signal(
+            self._ctx,
+            getattr(self._ctx, "latest_tool_blocker_signal", None) or getattr(self._ctx, "blocker_signal", None),
+            source="hook",
+        )
+        raise_if_turn_halt(self._ctx)
 
         if _tool_completion_satisfies_turn(self._ctx, tool_name, parsed):
             LOG.info(

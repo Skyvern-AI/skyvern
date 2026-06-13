@@ -15,6 +15,9 @@ from agents.run import Runner
 
 from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
+from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
+from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import (
     DEFAULT_ENFORCEMENT_NUDGES,
     DEFAULT_TOKEN_BUDGET,
@@ -36,8 +39,11 @@ from skyvern.forge.sdk.copilot.config import (
     POST_REPEATED_NULL_DATA_NUDGE,
     POST_SUSPICIOUS_SUCCESS_NUDGE,
     POST_UPDATE_NUDGE,
+    PRE_DISCOVERY_URL_QUESTION_NUDGE,
     SCREENSHOT_DROPPED_NUDGE,
+    BlockAuthoringPolicy,
     CopilotConfig,
+    normalize_block_authoring_policy,
 )
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
@@ -50,6 +56,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
+from skyvern.forge.sdk.copilot.turn_halt import raise_if_turn_halt, stash_turn_halt_from_blocker_signal
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -71,6 +78,7 @@ MAX_FAILED_TEST_NUDGES = 2
 MAX_FORMAT_NUDGES = 2
 MAX_NO_WORKFLOW_NUDGES = 2
 MAX_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGES = 2
+MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES = 2
 MAX_EXPLORE_WITHOUT_WORKFLOW_NUDGES = 2
 # Stops the suspicious-success nudge from re-firing forever when the agent has
 # correctly diagnosed an unrecoverable block (anti-bot, paywall) and is no
@@ -189,6 +197,13 @@ def _probable_site_block_stop_nudge(ctx: Any, config: CopilotConfig | None = Non
     return _nudge(config, "post_probable_site_block_stop_prefix") + _probable_site_block_proxy_options(ctx)
 
 
+def _probable_site_block_stop_agent_text(ctx: Any, config: CopilotConfig | None = None) -> str:
+    return (
+        f"{_probable_site_block_stop_nudge(ctx, config)}\n"
+        f"Latest internal failure reason: {_single_line_failure_reason(ctx)}"
+    )
+
+
 def _single_line_failure_reason(ctx: Any) -> str:
     reason = getattr(ctx, "last_test_failure_reason", None)
     if not isinstance(reason, str) or not reason.strip():
@@ -206,8 +221,28 @@ def build_probable_site_block_user_question(ctx: Any) -> str | None:
     return (
         "The site could not be loaded after repeated attempts. "
         f'The latest failure_reason was: "{failure_reason}". '
-        "Repeating the same IP/workflow shape is unlikely to help, so I should stop retrying that path.\n\n"
+        "Repeating the same IP/workflow shape is unlikely to help, so I should stop this path.\n\n"
         f"Would you like me to {options}"
+    )
+
+
+def _probable_site_block_stop_signal(ctx: Any, config: CopilotConfig | None = None) -> CopilotToolBlockerSignal:
+    user_facing = build_probable_site_block_user_question(ctx)
+    if user_facing is None:
+        user_facing = (
+            "The site could not be loaded after repeated attempts. Tell me whether to try a different URL, "
+            "configure a proxy, or use an alternate entry point."
+        )
+    return CopilotToolBlockerSignal(
+        blocker_kind="tool_error",
+        agent_steering_text=_probable_site_block_stop_agent_text(ctx, config),
+        user_facing_reason=user_facing,
+        recovery_hint="ask_user_clarifying",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=True,
+        renders_final_reply=True,
+        internal_reason_code="probable_site_block_stop",
+        blocked_tool="update_and_run_blocks",
     )
 
 
@@ -569,6 +604,46 @@ def _has_candidate_bound_page_evidence(ctx: Any, candidate_url: str) -> bool:
     return False
 
 
+def _pre_discovery_url_question_nudge(
+    ctx: Any,
+    parsed: dict[str, Any],
+    config: CopilotConfig | None = None,
+) -> str | None:
+    """Steer the model to discovery when it asks before discovery has run.
+
+    INITIAL/DISCOVERING phase with zero discovery calls means the model went
+    straight to asking instead of resolving the entrypoint itself. Credential,
+    loop, and conditional clarifications carry a non-default
+    request_policy.clarification_reason and are let through; the structural
+    triple (phase + zero discovery calls + default clarification_reason) already
+    excludes them. The post-discovery could-not-resolve ask happens after
+    discovery ran (discovery_calls_this_turn > 0) and so never reaches this gate.
+    Steering any remaining pre-discovery ASK to discovery is correct: discovery
+    is cheap, and if the site cannot resolve the model re-asks afterward.
+    """
+    if parsed.get("type") != "ASK_QUESTION":
+        return None
+    if getattr(ctx, "build_phase", None) not in DISCOVERY_PERMITTED_PHASES:
+        return None
+    if _get_int(ctx, "discovery_calls_this_turn") != 0:
+        return None
+    request_policy = getattr(ctx, "request_policy", None)
+    clarification_reason = getattr(request_policy, "clarification_reason", "none")
+    if clarification_reason not in (None, "none"):
+        return None
+    nudge_count = _get_int(ctx, "pre_discovery_url_question_nudge_count")
+    if nudge_count >= MAX_PRE_DISCOVERY_URL_QUESTION_NUDGES:
+        return None
+    ctx.pre_discovery_url_question_nudge_count = nudge_count + 1
+    LOG.info(
+        "copilot.pre_discovery_url_question_nudge",
+        reason_code="pre_discovery_url_question_steer_to_discovery",
+        build_phase=getattr(getattr(ctx, "build_phase", None), "value", None),
+        nudge_count=ctx.pre_discovery_url_question_nudge_count,
+    )
+    return _nudge(config, "pre_discovery_url_question")
+
+
 def _post_discovery_entrypoint_url_question_nudge(
     ctx: Any,
     parsed: dict[str, Any],
@@ -601,6 +676,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
     Returns the nudge string to inject, or None to let the response through.
     """
     response_type = parsed.get("type")
+    pre_discovery_nudge = _pre_discovery_url_question_nudge(ctx, parsed, config)
+    if pre_discovery_nudge is not None:
+        return pre_discovery_nudge
+
     discovery_entrypoint_nudge = _post_discovery_entrypoint_url_question_nudge(ctx, parsed, config)
     if discovery_entrypoint_nudge is not None:
         return discovery_entrypoint_nudge
@@ -864,6 +943,10 @@ def _check_enforcement(
     config: CopilotConfig | None = None,
 ) -> str | None:
     # Terminal failure-mode signals must pre-empt tool-call hygiene nudges.
+    terminal_signal = getattr(ctx, "latest_tool_blocker_signal", None) or getattr(ctx, "blocker_signal", None)
+    if terminal_signal is not None:
+        stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
+    raise_if_turn_halt(ctx)
     _raise_if_unrecoverable_contract_stop(ctx)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
@@ -938,7 +1021,10 @@ def _check_enforcement(
     # failed_test_nudge_count slot.
     if _needs_probable_site_block_stop_nudge(ctx):
         ctx.probable_site_block_stop_nudge_count = getattr(ctx, "probable_site_block_stop_nudge_count", 0) + 1
-        return _probable_site_block_stop_nudge(ctx, config)
+        signal = _probable_site_block_stop_signal(ctx, config)
+        stash_blocker_signal(ctx, signal)
+        stash_turn_halt_from_blocker_signal(ctx, signal, source="enforcement")
+        raise_if_turn_halt(ctx)
 
     if _needs_failed_test_nudge(ctx):
         ctx.failed_test_nudge_count += 1
@@ -1246,6 +1332,7 @@ _NUDGE_TYPE_BY_MESSAGE: dict[str, str] = {
     POST_PER_TOOL_BUDGET_STOP_NUDGE: "per_tool_budget_stop",
     POST_NO_WORKFLOW_DELIVERY_NUDGE: "no_workflow_delivery",
     POST_DISCOVERY_ENTRYPOINT_URL_QUESTION_NUDGE: "discovery_entrypoint_url_question",
+    PRE_DISCOVERY_URL_QUESTION_NUDGE: "pre_discovery_url_question",
     POST_FAILED_TEST_NUDGE: "post_failed_test",
     POST_FAILED_TEST_INSPECT_FIRST_NUDGE: "post_failed_test_inspect_first",
     SCREENSHOT_DROPPED_NUDGE: "screenshot_dropped_on_recovery",
@@ -1270,6 +1357,7 @@ _NUDGE_TYPE_BY_KEY: dict[str, str] = {
     "post_per_tool_budget_stop": "per_tool_budget_stop",
     "post_no_workflow_delivery": "no_workflow_delivery",
     "post_discovery_entrypoint_url_question": "discovery_entrypoint_url_question",
+    "pre_discovery_url_question": "pre_discovery_url_question",
     "post_failed_test": "post_failed_test",
     "post_failed_test_inspect_first": "post_failed_test_inspect_first",
     "screenshot_dropped": "screenshot_dropped_on_recovery",
@@ -1446,6 +1534,52 @@ async def _run_streamed_with_deadline(
     return result
 
 
+def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
+    """Post-turn fallback offer of a deterministically synthesized code block, in code-only mode.
+
+    Returns a single user message wrapping the synthesized Playwright block, or
+    None when the policy/latch/empty-trajectory guards do not hold. Shares the
+    one-shot latch with the pre-authoring prompt-side offer, so whichever fires
+    first wins and the model sees the offer at most once.
+    """
+    if getattr(ctx, "synthesized_block_offered", False):
+        return None
+    if getattr(ctx, "update_workflow_called", False):
+        return None
+    if normalize_block_authoring_policy(getattr(ctx, "block_authoring_policy", None)) != (
+        BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    ):
+        return None
+    trajectory = getattr(ctx, "scout_trajectory", None) or []
+    if not trajectory:
+        return None
+    synthesized = synthesize_code_block(trajectory)
+    if synthesized is None:
+        return None
+
+    ctx.synthesized_block_offered = True
+    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory)}
+
+
+def _assemble_enforcement_messages(
+    screenshot_msg: dict[str, Any] | None,
+    nudge_content: str | None,
+    synthesized_msg: dict[str, Any] | None,
+) -> list[Any]:
+    """Build the extra messages for an enforcement retry, ordered so a nudge, when present, stays last.
+
+    The screenshot rides as its own user-role message because OpenAI rejects image parts inside a tool message.
+    """
+    extra_msgs: list[Any] = []
+    if screenshot_msg is not None:
+        extra_msgs.append(screenshot_msg)
+    if nudge_content is not None:
+        extra_msgs.append({"role": "user", "content": NUDGE_SENTINEL + nudge_content})
+    if synthesized_msg is not None:
+        extra_msgs.insert(0, synthesized_msg)
+    return extra_msgs
+
+
 async def run_with_enforcement(
     agent: Agent,
     initial_input: str | list,
@@ -1573,12 +1707,19 @@ async def run_with_enforcement(
             pending_recovery_nudge = None
         else:
             nudge = _check_enforcement(ctx, result, copilot_config)
-        if nudge is None:
+
+        # The offer is independent of the nudge: a clean scout-then-author turn
+        # finalizes with nudge=None, so injecting it only inside the nudge branch
+        # would never reach the model. Compute it once here so it rides both the
+        # nudge path and the finalize path.
+        synthesized_msg = _maybe_synthesized_block_offer_msg(ctx)
+
+        if nudge is None and synthesized_msg is None:
             _consume_pending_screenshots(ctx)
             _maybe_raise_non_retriable_nav(ctx)
             return result
 
-        if nudge == _nudge(copilot_config, "post_update"):
+        if nudge is not None and nudge == _nudge(copilot_config, "post_update"):
             if ctx.post_update_nudge_count >= MAX_POST_UPDATE_NUDGES:
                 LOG.warning(
                     "Enforcement exhausted post-update nudges, allowing response",
@@ -1589,7 +1730,7 @@ async def run_with_enforcement(
                 return result
             ctx.post_update_nudge_count += 1
 
-        nudge_type = _nudge_type_for_log(nudge, copilot_config)
+        nudge_type = _nudge_type_for_log(nudge, copilot_config) if nudge is not None else "synthesized_block_offer"
         LOG.info("Enforcement nudge", nudge_type=nudge_type, iteration=iteration)
 
         # OpenAI rejects images in tool messages, so a queued post-run
@@ -1599,8 +1740,7 @@ async def run_with_enforcement(
             LOG.info("Injecting screenshot user message", count=len(screenshot_msg["content"]) - 1)
 
         with copilot_span("enforcement_nudge", data={"nudge_type": nudge_type, "iteration": iteration}):
-            nudge_msg = {"role": "user", "content": NUDGE_SENTINEL + nudge}
-            extra_msgs = [nudge_msg] if screenshot_msg is None else [screenshot_msg, nudge_msg]
+            extra_msgs = _assemble_enforcement_messages(screenshot_msg, nudge, synthesized_msg)
             current_input = (
                 extra_msgs if session is not None else _prune_input_list(result.to_input_list()) + extra_msgs
             )

@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeAlias, cast
 
 import structlog
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -38,6 +38,7 @@ from skyvern.exceptions import (
     BrowserProfileNotFound,
     BrowserSessionNotFound,
     BrowserSessionNotRenewable,
+    DisabledBlockExecutionError,
     InvalidCredentialId,
     MissingValueForParameter,
     ScriptTerminationException,
@@ -61,12 +62,13 @@ from skyvern.forge.sdk.core.security import generate_skyvern_webhook_signature
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db._sentinels import _UNSET
 from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.enterprise_features import collect_enterprise_gated_run_features
 from skyvern.forge.sdk.experimentation.enrich_tree import resolve_enrich_tree_for_context
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
-from skyvern.forge.sdk.schemas.tasks import Task
+from skyvern.forge.sdk.schemas.tasks import Task, TaskStatus
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunBlock, WorkflowRunTimeline, WorkflowRunTimelineType
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.exceptions import (
@@ -74,13 +76,18 @@ from skyvern.forge.sdk.workflow.exceptions import (
     WorkflowVersionConflict,
 )
 from skyvern.forge.sdk.workflow.models.block import (
+    BaseTaskBlock,
     Block,
     BlockTypeVar,
     ConditionalBlock,
     ExtractionBlock,
+    FileParserBlock,
     ForLoopBlock,
+    LoginBlock,
     NavigationBlock,
+    PDFParserBlock,
     TaskV2Block,
+    TextPromptBlock,
     WhileLoopBlock,
     WorkflowTriggerBlock,
     compute_conditional_scopes,
@@ -110,6 +117,12 @@ from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowRunResponseBase,
     WorkflowRunStatus,
     is_adaptive_caching,
+)
+from skyvern.forge.sdk.workflow.status_mapping import (
+    BLOCK_STATUS_MAP,
+    NONFINAL_BLOCK_STATUSES,
+    STEP_STATUS_MAP,
+    TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
 from skyvern.schemas.runs import (
@@ -141,11 +154,21 @@ from skyvern.services.script_review_cap import (
 )
 from skyvern.services.script_reviewer_v3.cohort import is_v3_cohort
 from skyvern.services.script_reviewer_v3.postrun import v3_review_post_run
-from skyvern.services.webhook_delivery import PreparedWorkflowWebhook, deliver_webhook_with_retries
+from skyvern.services.webhook_delivery import (
+    WEBHOOK_DELIVERY_HTTP_TIMEOUT_SECONDS,
+    WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+    WEBHOOK_DELIVERY_MISSING_SIGNING_KEY_REASON,
+    WEBHOOK_DELIVERY_MISSING_WORKFLOW_REASON,
+    WEBHOOK_DELIVERY_SUCCESS_REASON,
+    PreparedWorkflowWebhook,
+    deliver_webhook_with_retries,
+    scrub_internal_webhook_delivery_state,
+)
 from skyvern.utils.css_selector import build_action_summaries_with_timing  # shared with script_service
 from skyvern.utils.secret_headers import merge_masked_headers
 from skyvern.utils.url_validators import validate_url as validate_url_with_blocked_host_check
 from skyvern.webeye.browser_state import BrowserState
+from skyvern.webeye.session_cookies import persist_session_cookies
 
 LOG = structlog.get_logger()
 
@@ -156,6 +179,7 @@ DEFAULT_WORKFLOW_TITLE = "New Workflow"
 RECORDING_WINDOW_END_BUFFER = timedelta(minutes=15)
 # Skip post-run work when only a sub-millisecond budget remains; asyncio.timeout would fire on the first await.
 POST_RUN_TIMEOUT_EXHAUSTED_THRESHOLD_SECONDS = 0.001
+WorkflowWebhookDeliveryStatus: TypeAlias = Literal["pending", "failed"]
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -174,18 +198,84 @@ def _format_workflow_run_elapsed_timeout_failure_reason(effective_minutes: int) 
     return f"Workflow run exceeded max elapsed runtime limit of {effective_minutes} {minute_label}."
 
 
+def _get_workflow_webhook_delivery_status(
+    *,
+    webhook_callback_url: str | None,
+    webhook_failure_reason: str | None,
+    workflow_run_status: WorkflowRunStatus,
+) -> WorkflowWebhookDeliveryStatus | None:
+    if not webhook_callback_url or not workflow_run_status.is_final():
+        return None
+    # Empty string is the persisted webhook delivery success sentinel.
+    if webhook_failure_reason == WEBHOOK_DELIVERY_SUCCESS_REASON:
+        return None
+    if webhook_failure_reason is None or webhook_failure_reason == WEBHOOK_DELIVERY_IN_PROGRESS_REASON:
+        return "pending"
+    return "failed"
+
+
+def _get_public_workflow_webhook_failure_reason(webhook_failure_reason: str | None) -> str | None:
+    if webhook_failure_reason in {
+        WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+        WEBHOOK_DELIVERY_SUCCESS_REASON,
+    }:
+        return None
+    return webhook_failure_reason
+
+
+def _collect_enterprise_gated_workflow_features(
+    workflow: Workflow,
+    *,
+    block_labels: list[str] | None = None,
+) -> set[str]:
+    # workflow.model is editor metadata today; executable blocks read their own model fields.
+    feature_names: set[str] = set()
+
+    all_blocks = get_all_blocks(workflow.workflow_definition.blocks)
+    if block_labels:
+        blocks_by_label = {block.label: block for block in all_blocks}
+        blocks_to_check = get_all_blocks([blocks_by_label[label] for label in block_labels if label in blocks_by_label])
+    else:
+        blocks_to_check = all_blocks
+
+    for block in blocks_to_check:
+        # TaskV2Block deliberately stays out of this set: its inherited model field is not consumed at runtime.
+        task_block_uses_engine_and_model = (
+            isinstance(block, BaseTaskBlock) and block.block_type != BlockType.HUMAN_INTERACTION
+        )
+        block_uses_model = task_block_uses_engine_and_model or isinstance(
+            block,
+            (TextPromptBlock, FileParserBlock, PDFParserBlock),
+        )
+        engine = block.engine if task_block_uses_engine_and_model else None
+        model = block.model if block_uses_model else None
+        feature_names.update(
+            collect_enterprise_gated_run_features(
+                engine=engine,
+                model=model,
+            )
+        )
+
+    return feature_names
+
+
 def _select_recording_urls_in_window(
     recordings: Sequence[FileInfo],
     lower_bound: datetime,
-    upper_bound: datetime,
+    upper_bound: datetime | None = None,
 ) -> list[str]:
-    """Filter recordings to [lower_bound, upper_bound] by modified_at (UTC), sort oldest-first."""
+    """Filter recordings to [lower_bound, upper_bound] by modified_at (UTC), sort oldest-first.
+
+    ``upper_bound=None`` keeps every recording from ``lower_bound`` on. A persistent browser
+    session finalizes its single continuous recording at session close — possibly hours after
+    a run ends — so the bounded window misses it; the unbounded form is the fallback.
+    """
     in_window: list[tuple[datetime, str]] = []
     for r in recordings:
         if r.modified_at is None:
             continue
         modified_utc = _as_utc(r.modified_at)
-        if lower_bound <= modified_utc <= upper_bound:
+        if modified_utc >= lower_bound and (upper_bound is None or modified_utc <= upper_bound):
             in_window.append((modified_utc, r.url))
     in_window.sort(key=lambda pair: pair[0])
     return [url for _, url in in_window]
@@ -1489,6 +1579,36 @@ class WorkflowService:
             )
             return workflow_run
 
+        enterprise_gated_features = _collect_enterprise_gated_workflow_features(workflow, block_labels=block_labels)
+        if enterprise_gated_features:
+            try:
+                await app.AGENT_FUNCTION.validate_enterprise_feature_access(
+                    organization_id=organization_id,
+                    feature_names=enterprise_gated_features,
+                )
+            except DisabledBlockExecutionError as e:
+                LOG.warning(
+                    "Workflow uses enterprise-gated features without access",
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    enterprise_gated_features=sorted(enterprise_gated_features),
+                    exc_info=True,
+                )
+                workflow_run = await self.mark_workflow_run_as_failed(
+                    workflow_run_id=workflow_run_id,
+                    failure_reason=get_user_facing_exception_message(e),
+                )
+                await self.clean_up_workflow(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    api_key=api_key,
+                    browser_session_id=browser_session_id,
+                    close_browser_on_completion=close_browser_on_completion,
+                    need_call_webhook=need_call_webhook,
+                )
+                return workflow_run
+
         # Set workflow run status to running, create workflow run parameters
         workflow_run = await self.mark_workflow_run_as_running(workflow_run_id=workflow_run_id)
         # Short-circuit when the conditional transition was refused (cron beat us
@@ -1653,6 +1773,14 @@ class WorkflowService:
             )
             timeout_failure_reason = _format_workflow_run_elapsed_timeout_failure_reason(effective_max_elapsed_minutes)
             max_elapsed_timeout_seconds = _get_workflow_run_max_elapsed_timeout_seconds(workflow_run)
+            LOG.debug(
+                "Workflow run elapsed timeout computed",
+                workflow_run_id=workflow_run_id,
+                max_elapsed_time_minutes_raw=workflow_run.max_elapsed_time_minutes,
+                effective_max_elapsed_minutes=effective_max_elapsed_minutes,
+                max_elapsed_timeout_seconds=max_elapsed_timeout_seconds,
+                started_at=workflow_run.started_at,
+            )
             blocks_to_update: set[str] = set()
             if max_elapsed_timeout_seconds <= 0:
                 workflow_run = await self.mark_workflow_run_as_timed_out(
@@ -3221,6 +3349,10 @@ class WorkflowService:
     ) -> str | None:
         """Inspect the block-level parameters and return the browser_profile_id
         from the credential parameter bound to this specific block."""
+        # A credential re-save logs in fresh so the new session persists via the normal path,
+        # so it must not reuse (and boot read-only from) the credential's saved profile.
+        if isinstance(block, LoginBlock) and block.skip_saved_profile:
+            return None
         params = block.parameters
 
         # Pre-fetch run parameters once (used by WorkflowParameter/CREDENTIAL_ID style).
@@ -4083,7 +4215,7 @@ class WorkflowService:
         search_key: str | None = None,
         folder_id: str | None = None,
         statuses: list[WorkflowStatus] | None = None,
-        workflow_tags: list[tuple[str, str]] | None = None,
+        workflow_tags: list[tuple[str | None, str | None]] | None = None,
     ) -> list[Workflow]:
         """
         Get all workflows with the latest version for the organization.
@@ -4091,7 +4223,8 @@ class WorkflowService:
         Args:
             search_key: Unified search term for title, folder name, and parameter metadata.
             folder_id: Filter workflows by folder ID.
-            workflow_tags: (key, value) tag filters; AND across keys, OR within a key.
+            workflow_tags: tag filter terms — exact (key, value), group-only (key, None),
+                or label-only (None, value). AND across distinct terms; OR within a key.
         """
         return await app.DATABASE.workflows.get_workflows_by_organization_id(
             organization_id=organization_id,
@@ -4559,6 +4692,51 @@ class WorkflowService:
             copilot_session_id=copilot_session_id,
         )
 
+    async def _cascade_child_entities_on_terminal(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+        if status != WorkflowRunStatus.timed_out:
+            return
+
+        try:
+            await self._do_cascade_child_entities(workflow_run_id, status)
+        except Exception:
+            LOG.exception("Failed to cascade child entity status", workflow_run_id=workflow_run_id)
+
+    async def _do_cascade_child_entities(self, workflow_run_id: str, status: WorkflowRunStatus) -> None:
+        block_status = BLOCK_STATUS_MAP[status]
+        task_status = TASK_STATUS_MAP[status]
+        step_status = STEP_STATUS_MAP[status]
+        failure_reason = f"Workflow run {status.value}: child entity cascade cleanup."
+
+        blocks_updated = await app.DATABASE.observer.bulk_update_workflow_run_blocks_by_workflow_run_id(
+            workflow_run_id=workflow_run_id,
+            new_status=block_status.value,
+            only_if_status_in=NONFINAL_BLOCK_STATUSES,
+            failure_reason=failure_reason,
+        )
+        tasks_updated = await app.DATABASE.tasks.bulk_update_tasks_by_workflow_run_ids(
+            workflow_run_ids=[workflow_run_id],
+            new_status=task_status,
+            only_if_status_in=[TaskStatus.created, TaskStatus.queued, TaskStatus.running],
+            failure_reason=failure_reason,
+        )
+        steps_updated = await app.DATABASE.tasks.bulk_update_steps_by_workflow_run_ids(
+            workflow_run_ids=[workflow_run_id],
+            new_status=step_status,
+            only_if_status_in=[StepStatus.created, StepStatus.running],
+        )
+        if blocks_updated or tasks_updated or steps_updated:
+            LOG.info(
+                "Cascaded terminal status to child entities",
+                workflow_run_id=workflow_run_id,
+                workflow_run_status=status,
+                block_target_status=block_status,
+                task_target_status=task_status,
+                step_target_status=step_status,
+                blocks_updated=blocks_updated,
+                tasks_updated=tasks_updated,
+                steps_updated=steps_updated,
+            )
+
     async def _update_workflow_run_status(
         self,
         workflow_run_id: str,
@@ -4603,6 +4781,7 @@ class WorkflowService:
                 app.AGENT_FUNCTION.on_workflow_run_completed(
                     organization_id=workflow_run.organization_id,
                     workflow_id=workflow_run.workflow_id,
+                    status=status,
                 ),
             )
             self._background_tasks.add(run_completed_task)
@@ -4688,12 +4867,14 @@ class WorkflowService:
             return await self.mark_workflow_run_as_completed(workflow_run_id)
 
         if workflow_run.status == WorkflowRunStatus.running:
-            # We temporarily set to running for finally block, restore terminal status
-            return await self._update_workflow_run_status(
+            workflow_run = await self._update_workflow_run_status(
                 workflow_run_id=workflow_run_id,
                 status=pre_finally_status,
                 failure_reason=pre_finally_failure_reason,
             )
+            if pre_finally_status == WorkflowRunStatus.timed_out:
+                await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+            return workflow_run
 
         return workflow_run
 
@@ -4935,13 +5116,15 @@ class WorkflowService:
             failure_category_source="code_level",
         )
 
-        return await self._update_workflow_run_status(
+        workflow_run = await self._update_workflow_run_status(
             workflow_run_id=workflow_run_id,
             status=WorkflowRunStatus.timed_out,
             failure_reason=failure_reason,
             run_with=run_with,
             failure_category=failure_category,
         )
+        await self._cascade_child_entities_on_terminal(workflow_run_id, WorkflowRunStatus.timed_out)
+        return workflow_run
 
     async def get_workflow_run(self, workflow_run_id: str, organization_id: str | None = None) -> WorkflowRun:
         workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(
@@ -5266,13 +5449,35 @@ class WorkflowService:
         task_v2: Any | None,
         organization_id: str | None,
     ) -> tuple[list[str], bool]:
-        """Fetch recording URLs, preferring browser-session recordings with artifact-store fallback.
+        """Fetch recording URLs, preferring precise run-scoped recordings over the shared
+        browser-session recording.
 
         Returns (recording_urls, recording_archived).
         """
         recording_urls: list[str] = []
         recording_archived = False
-        if workflow_run.browser_session_id:
+
+        # Prefer precise per-run clips over the shared browser-session recording (for a persistent
+        # session the latter is one continuous, often multi-hour video spanning every run). A
+        # non-clip run recording may be an in-progress per-step snapshot, so it does NOT pre-empt
+        # the finalized session recording below — only run_recordings/ clips do.
+        run_id = task_v2.observer_cruise_id if task_v2 else workflow_run.workflow_run_id
+        run_recording_artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
+            run_id=run_id,
+            artifact_type=ArtifactType.RECORDING,
+            organization_id=workflow_run.organization_id,
+        )
+        # "/run_recordings/" mirrors run_recording_clips.RUN_RECORDING_PATH_SEGMENT.
+        clip_artifacts = [a for a in run_recording_artifacts if a.uri and "/run_recordings/" in a.uri]
+        if clip_artifacts:
+            recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(clip_artifacts[0])
+            if not recording_archived:
+                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(clip_artifacts)
+                recording_urls = [u for u in urls if u is not None]
+
+        # Fall back to the shared browser-session recording (windowed, then unbounded for a
+        # persistent session whose continuous recording finalizes long after the run ends).
+        if not recording_urls and not recording_archived and workflow_run.browser_session_id:
             if workflow_run.started_at is None:
                 LOG.warning(
                     "Skipping recording fan-out: workflow run has browser_session_id but no started_at",
@@ -5290,20 +5495,21 @@ class WorkflowService:
                         run_end = _as_utc(workflow_run.finished_at) if workflow_run.finished_at else datetime.now(UTC)
                         upper_bound = run_end + RECORDING_WINDOW_END_BUFFER
                         recording_urls = _select_recording_urls_in_window(recordings, lower_bound, upper_bound)
+                        if not recording_urls and recordings:
+                            # Persistent sessions upload one continuous recording at session
+                            # close, often long after run_end, so it never lands in the bounded
+                            # window. Drop the upper bound rather than show "no recording".
+                            recording_urls = _select_recording_urls_in_window(recordings, lower_bound)
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting recordings", browser_session_id=workflow_run.browser_session_id)
 
-        if not recording_urls:
-            recording_artifacts = await app.DATABASE.artifacts.list_artifacts_for_run_by_type(
-                run_id=task_v2.observer_cruise_id if task_v2 else workflow_run.workflow_run_id,
-                artifact_type=ArtifactType.RECORDING,
-                organization_id=workflow_run.organization_id,
-            )
-            if recording_artifacts:
-                recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(recording_artifacts[0])
-                if not recording_archived:
-                    urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(recording_artifacts)
-                    recording_urls = [u for u in urls if u is not None]
+        # Last resort: a run's own recording — a non-session task recording, or a session run
+        # whose clip and finalized session recording are both unavailable.
+        if not recording_urls and not recording_archived and run_recording_artifacts and not clip_artifacts:
+            recording_archived = await app.ARTIFACT_MANAGER.is_recording_archived(run_recording_artifacts[0])
+            if not recording_archived:
+                urls = await app.ARTIFACT_MANAGER.get_share_links_with_bundle_support(run_recording_artifacts)
+                recording_urls = [u for u in urls if u is not None]
 
         return recording_urls, recording_archived
 
@@ -5463,7 +5669,12 @@ class WorkflowService:
             failure_category=workflow_run.failure_category,
             proxy_location=workflow_run.proxy_location,
             webhook_callback_url=workflow_run.webhook_callback_url,
-            webhook_failure_reason=workflow_run.webhook_failure_reason,
+            webhook_delivery_status=_get_workflow_webhook_delivery_status(
+                webhook_callback_url=workflow_run.webhook_callback_url,
+                webhook_failure_reason=workflow_run.webhook_failure_reason,
+                workflow_run_status=workflow_run.status,
+            ),
+            webhook_failure_reason=_get_public_workflow_webhook_failure_reason(workflow_run.webhook_failure_reason),
             totp_verification_url=workflow_run.totp_verification_url,
             totp_identifier=workflow_run.totp_identifier,
             extra_http_headers=workflow_run.extra_http_headers,
@@ -5554,6 +5765,13 @@ class WorkflowService:
                 and not workflow_run.browser_profile_id
             ):
                 if workflow_run.status == WorkflowRunStatus.completed:
+                    if not close_browser_on_completion:
+                        # Browser stays alive here, so close()'s cookie snapshot never ran; capture
+                        # session cookies now or they're missing from the archived profile on reuse.
+                        await persist_session_cookies(
+                            browser_state.browser_context,
+                            browser_state.browser_artifacts.browser_session_dir,
+                        )
                     await app.STORAGE.store_browser_session(
                         workflow_run.organization_id,
                         workflow.workflow_permanent_id,
@@ -5648,6 +5866,19 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 workflow_permanent_id=workflow_run.workflow_permanent_id,
             )
+            if workflow_run.webhook_callback_url and workflow_run.webhook_callback_url.strip():
+                try:
+                    await app.DATABASE.workflow_runs.update_workflow_run(
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        webhook_failure_reason=WEBHOOK_DELIVERY_MISSING_WORKFLOW_REASON,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record skipped workflow webhook delivery for missing workflow",
+                        workflow_id=workflow_id,
+                        workflow_run_id=workflow_run.workflow_run_id,
+                        exc_info=True,
+                    )
             return None
         if not workflow_run.webhook_callback_url:
             LOG.warning(
@@ -5676,6 +5907,18 @@ class WorkflowService:
                 workflow_run_id=workflow_run.workflow_run_id,
                 organization_id=workflow_run.organization_id,
             )
+            try:
+                await app.DATABASE.workflow_runs.update_workflow_run(
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    webhook_failure_reason=WEBHOOK_DELIVERY_MISSING_SIGNING_KEY_REASON,
+                )
+            except Exception:
+                LOG.warning(
+                    "Failed to record skipped workflow webhook delivery",
+                    workflow_id=workflow_id,
+                    workflow_run_id=workflow_run.workflow_run_id,
+                    exc_info=True,
+                )
             return None
 
         # build new schema for backward compatible webhook payload
@@ -5709,7 +5952,9 @@ class WorkflowService:
             errors=workflow_run_status_response.errors,
             step_count=workflow_run_status_response.total_steps,
         )
-        payload_dict: dict = json.loads(workflow_run_status_response.model_dump_json())
+        payload_dict: dict = scrub_internal_webhook_delivery_state(
+            json.loads(workflow_run_status_response.model_dump_json())
+        )
         workflow_run_response_dict = json.loads(workflow_run_response.model_dump_json())
         payload_dict.update(workflow_run_response_dict)
         signed_data = generate_skyvern_webhook_signature(
@@ -5734,7 +5979,25 @@ class WorkflowService:
             payload_for_log=signed_data.payload_for_log,
         )
 
-    async def deliver_prepared_workflow_webhook(self, webhook: PreparedWorkflowWebhook) -> None:
+    async def deliver_prepared_workflow_webhook(
+        self,
+        webhook: PreparedWorkflowWebhook,
+        *,
+        retry_claim_older_than: datetime | None = None,
+    ) -> None:
+        claimed = await app.DATABASE.workflow_runs.claim_workflow_run_webhook_delivery(
+            workflow_run_id=webhook.workflow_run_id,
+            in_progress_reason=WEBHOOK_DELIVERY_IN_PROGRESS_REASON,
+            claim_older_than=retry_claim_older_than,
+        )
+        if not claimed:
+            LOG.info(
+                "Skipping workflow webhook delivery because it was already claimed or recorded",
+                workflow_id=webhook.workflow_id,
+                workflow_run_id=webhook.workflow_run_id,
+            )
+            return
+
         LOG.info(
             "Sending webhook run status to webhook callback url",
             workflow_id=webhook.workflow_id,
@@ -5748,7 +6011,7 @@ class WorkflowService:
                 url=webhook.webhook_callback_url,
                 payload=webhook.signed_payload,
                 headers=webhook.headers,
-                timeout_seconds=30.0,
+                timeout_seconds=WEBHOOK_DELIVERY_HTTP_TIMEOUT_SECONDS,
                 organization_id=webhook.organization_id,
                 run_id=webhook.workflow_run_id,
             )
@@ -5785,7 +6048,8 @@ class WorkflowService:
             try:
                 await app.DATABASE.workflow_runs.update_workflow_run(
                     workflow_run_id=webhook.workflow_run_id,
-                    webhook_failure_reason="",
+                    # Empty string is the persisted successful-delivery sentinel.
+                    webhook_failure_reason=WEBHOOK_DELIVERY_SUCCESS_REASON,
                 )
             except Exception:
                 LOG.warning(
@@ -5821,11 +6085,12 @@ class WorkflowService:
         self,
         workflow_run: WorkflowRun,
         api_key: str | None = None,
+        retry_claim_older_than: datetime | None = None,
     ) -> None:
         webhook = await self.prepare_workflow_webhook(workflow_run, api_key)
         if webhook is None:
             return
-        await self.deliver_prepared_workflow_webhook(webhook)
+        await self.deliver_prepared_workflow_webhook(webhook, retry_claim_older_than=retry_claim_older_than)
 
     async def persist_video_data(
         self,
@@ -6133,6 +6398,7 @@ class WorkflowService:
                 title=title,
                 description=request.description,
                 workflow_definition=workflow_definition,
+                edited_by=edited_by,
             )
 
             await self.maybe_delete_cached_code(

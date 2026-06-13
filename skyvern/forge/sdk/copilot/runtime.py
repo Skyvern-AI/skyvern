@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, NotRequired, TypeAlias, TypedDict, cast
 
 import structlog
 
@@ -24,7 +24,9 @@ from skyvern.cli.core.session_manager import (
     scoped_session,
     unregister_copilot_session,
 )
+from skyvern.config import settings
 from skyvern.forge import app
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
@@ -35,6 +37,8 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
+    from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
+    from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream
     from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
 
@@ -46,6 +50,10 @@ _SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 _BROWSER_BOOT_WAIT_SECONDS = 30.0
 _BROWSER_BOOT_POLL_INTERVAL_SECONDS = 0.25
 _FINAL_BROWSER_SESSION_STATUSES: frozenset[str] = frozenset({"completed", "failed", "timeout"})
+CodeArtifactMetadataValue: TypeAlias = (
+    str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
+)
+CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -82,6 +90,10 @@ def _browser_context_is_attachable(browser_context: object | None) -> bool:
     return True
 
 
+def _copilot_session_can_access_localhost() -> bool:
+    return settings.ENV == "local"
+
+
 def _browser_session_status_is_final(status: str | None) -> bool:
     return status in _FINAL_BROWSER_SESSION_STATUSES
 
@@ -99,6 +111,22 @@ async def _get_persistent_browser_session(session_id: str, organization_id: str)
 class PendingBrowserInteractionObservation:
     tool_name: str
     url: str = ""
+
+
+class ScoutedInteraction(TypedDict):
+    tool_name: str
+    selector: NotRequired[str]
+    source_url: NotRequired[str]
+    value: NotRequired[str]
+    key: NotRequired[str]
+    typed_length: NotRequired[int]
+    role: NotRequired[str]
+    accessible_name: NotRequired[str]
+    trajectory_index: NotRequired[int]
+    # Credential fills carry references and metadata only — never secret values.
+    credential_id: NotRequired[str]
+    credential_field: NotRequired[str]
+    credential_name: NotRequired[str]
 
 
 @dataclass
@@ -153,9 +181,14 @@ class AgentContext:
     last_test_suspicious_success: bool = False
     last_test_anti_bot: str | None = None
     last_test_failure_reason: str | None = None
+    # Latest evaluated outcome-gate verdict this turn. Deliberately not reset
+    # per-run: a later run that fails before verification keeps the verdict.
+    last_outcome_gate_reason: str | None = None
     last_failure_category_top: str | None = None
     last_update_block_count: int | None = None
     last_failed_workflow_yaml: str | None = None
+    code_only_code_schema_seen: bool = False
+    code_only_target_page_evidence_seen: bool = False
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
     challenge_gated_proxy_retry_count: int = 0
@@ -170,6 +203,8 @@ class AgentContext:
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
     effective_workflow_proxy_location: Any | None = None
 
     copilot_run_start_monotonic: float | None = None
@@ -177,6 +212,10 @@ class AgentContext:
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
+    last_run_blocks_block_ids: list[str] = field(default_factory=list)
+    last_run_blocks_block_labels: list[str] = field(default_factory=list)
+    last_run_outcome: RecordedRunOutcome | None = None
+    last_run_outcome_block_labels: list[str] = field(default_factory=list)
     completion_verification_result: CompletionVerificationResult | None = None
     outcome_verification_trace_snapshot: dict[str, Any] = field(default_factory=dict)
     composition_page_evidence: dict[str, Any] | None = None
@@ -190,7 +229,11 @@ class AgentContext:
     block_observation_refs: dict[str, int] = field(default_factory=dict)
     # Raw tool input for block_observation_refs, retained only for diagnostics
     # when normalization drops malformed entries before composition validation.
-    raw_block_observation_refs: Any | None = None
+    raw_block_observation_refs: object | None = None
+    # Block-label keyed metadata describing authored code artifacts. This layer
+    # only normalizes and carries the metadata; sufficiency checks live elsewhere.
+    code_artifact_metadata: dict[str, CodeArtifactMetadataPayload] = field(default_factory=dict)
+    raw_code_artifact_metadata: object | None = None
     # Hydrated at turn start from StructuredContext.observed_acted_pages; lets the
     # composition gate credit a page observed on a prior turn when this turn's
     # flow_evidence does not cover it (closes the spent-inspection-budget
@@ -204,12 +247,28 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
+    observed_browser_urls: list[str] = field(default_factory=list)
+    # Ephemeral within-turn scout captures; not persisted across turns.
+    scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
+    # Append-only, non-deduped record of the scout's interaction sequence in
+    # acted order. Unlike scouted_interactions (deduped for auto-credit), this
+    # preserves repeats and ordering so code_block_synthesis can emit a faithful
+    # linear Playwright trajectory.
+    scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    synthesized_block_offered: bool = False
+    # Source page of an in-flight scout action, captured before it may navigate away.
+    pending_scout_source_url: str | None = None
+    # Exact secret strings filled into the live browser this turn (passwords,
+    # call-time-minted OTP codes). Page-readback tool results are exact-string
+    # scrubbed against this set before being recorded or returned to the model.
+    secret_scrub_values: list[str] = field(default_factory=list)
 
     # Set by tool gates / loop guards / tool-side error branches when a tool
     # dispatch is blocked. The finalization shim in agent.py reads this at
     # turn end and overrides the AgentResult with a deterministic
     # product-language reply. See blocker_signal.py for the contract.
     blocker_signal: CopilotToolBlockerSignal | None = None
+    turn_halt: TurnHalt | None = None
     # Most recently emitted blocker signal for the current tool output. Unlike
     # blocker_signal, this is last-wins so the activity-log projection can
     # render the current tool result from structured product text.
@@ -289,7 +348,11 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             browser_state.browser_context,
             browser_session_id=ctx.browser_session_id,
         )
-        mcp_ctx = MCPBrowserContext(mode="cloud_session", session_id=ctx.browser_session_id)
+        mcp_ctx = MCPBrowserContext(
+            mode="cloud_session",
+            session_id=ctx.browser_session_id,
+            can_access_localhost=_copilot_session_can_access_localhost(),
+        )
         active_key = get_active_api_key()
         state = SessionState(
             browser=skyvern_browser,

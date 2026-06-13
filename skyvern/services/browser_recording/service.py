@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import pathlib
+import re
 import typing as t
 import zlib
+from urllib.parse import urlparse
 
 import structlog
 
@@ -19,6 +21,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.services.browser_recording.types import (
     Action,
     ActionBlockable,
+    ActionInputText,
     ActionKind,
     ActionUrlChange,
     ActionWait,
@@ -26,6 +29,7 @@ from skyvern.services.browser_recording.types import (
     ExfiltratedConsoleEvent,
     ExfiltratedEvent,
     OutputBlock,
+    RecordingDraftStep,
 )
 
 
@@ -60,6 +64,74 @@ LOG = structlog.get_logger(__name__)
 
 # avoid decompression bombs
 MAX_BASE64_SIZE = 14 * 1024 * 1024  # ~10MB compressed + base64 overhead
+DEFAULT_DRAFT_ACTION_TITLE = "Browser Action"
+
+
+def _action_identity(action: Action) -> tuple[str, str, str, str]:
+    """Stable identity fields used for duplicate-action suppression."""
+    return (
+        str(action.kind),
+        action.url,
+        action.target.sky_id or "",
+        action.target.id or "",
+    )
+
+
+def _is_duplicate_action(candidate: Action, existing_actions: list[Action]) -> bool:
+    """
+    Suppress duplicate actions emitted from duplicate transport events.
+
+    We only dedupe when the latest action has the exact same identity and
+    timestamps, which keeps intentional repeated clicks intact.
+    """
+    if not existing_actions:
+        return False
+
+    previous = existing_actions[-1]
+    return (
+        _action_identity(previous) == _action_identity(candidate)
+        and previous.timestamp_start == candidate.timestamp_start
+        and previous.timestamp_end == candidate.timestamp_end
+    )
+
+
+def deterministic_goto_url_label(url: str) -> str:
+    host = ""
+    try:
+        host = urlparse(url).netloc
+    except ValueError:
+        pass
+
+    return normalize_recording_block_label(f"goto_{host}" if host else None, fallback="goto_url")
+
+
+def deterministic_wait_seconds(duration_ms: int) -> int:
+    return int(max(duration_ms / 1000.0, ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0))
+
+
+def deterministic_input_text_parameter_key(action: ActionInputText) -> str:
+    target = action.target
+    for candidate in (target.id, *(target.texts or []), target.sky_id):
+        if not candidate:
+            continue
+        key = normalize_recording_block_label(str(candidate), fallback="")
+        if key:
+            return key.lower()
+    return "input_value"
+
+
+def normalize_recording_block_label(label: str | None, *, fallback: str) -> str:
+    candidate = (label or "").strip()
+    candidate = re.sub(r"\W+", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate).strip("_")
+
+    if not candidate:
+        return fallback
+
+    if not re.match(r"^[A-Za-z_]", candidate):
+        candidate = f"{fallback}_{candidate}"
+
+    return candidate
 
 
 class Processor:
@@ -202,11 +274,12 @@ class Processor:
         self,
         events: list[ExfiltratedEvent],
         machines: list[sm.StateMachine] | None = None,
+        initial_actions: list[Action] | None = None,
     ) -> list[Action]:
         """
         Convert a list of `ExfiltratedEvent`s into `Action`s.
         """
-        actions: list[Action] = []
+        actions: list[Action] = list(initial_actions or [])
 
         machines = machines or [
             sm.Click(),
@@ -235,6 +308,14 @@ class Processor:
                         )
 
                 if allow_action:
+                    if _is_duplicate_action(action, actions):
+                        LOG.debug(
+                            f"{self.class_name} duplicate action suppressed",
+                            action=action,
+                            **self.identity,
+                        )
+                        continue
+
                     actions.append(action)
                 else:
                     # if an action was vetoed, we do not allow further processing
@@ -330,6 +411,57 @@ class Processor:
 
         return parameters
 
+    def drafts_to_blocks(self, draft_steps: list[RecordingDraftStep]) -> list[OutputBlock]:
+        """
+        Convert user-editable live recording drafts into workflow definition blocks.
+        """
+        blocks: list[OutputBlock] = []
+
+        for draft_step in draft_steps:
+            match draft_step.block_type:
+                case "action":
+                    block = WorkflowDefinitionYamlBlocksItem_Action(
+                        label=normalize_recording_block_label(draft_step.label, fallback="act"),
+                        title=draft_step.title or DEFAULT_DRAFT_ACTION_TITLE,
+                        navigation_goal=draft_step.navigation_goal or "",
+                        error_code_mapping=None,
+                        parameters=draft_step.parameters,
+                        parameter_keys=draft_step.parameter_keys,
+                    )
+                case "goto_url":
+                    url = (draft_step.url or "").strip()
+                    if not url:
+                        LOG.warning(
+                            "skipping draft goto_url block with empty URL",
+                            draft_step=draft_step.model_dump(mode="json"),
+                            **self.identity,
+                        )
+                        continue
+                    block = WorkflowDefinitionYamlBlocksItem_GotoUrl(
+                        label=normalize_recording_block_label(draft_step.label, fallback="goto_url"),
+                        url=url,
+                    )
+                case "wait":
+                    wait_sec = max(
+                        int(draft_step.wait_sec or 0),
+                        int(ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0),
+                    )
+                    block = WorkflowDefinitionYamlBlocksItem_Wait(
+                        label=normalize_recording_block_label(draft_step.label, fallback="wait"),
+                        wait_sec=wait_sec,
+                    )
+                case _:
+                    LOG.warning(
+                        "skipping unsupported draft block type",
+                        draft_step=draft_step.model_dump(mode="json"),
+                        **self.identity,
+                    )
+                    continue
+
+            blocks.append(block)
+
+        return self.dedupe_block_labels(blocks)
+
     async def create_action_block(self, action: ActionBlockable) -> WorkflowDefinitionYamlBlocksItem_Action:
         """
         Create a YAML action block from an `ActionBlockable`.
@@ -372,63 +504,48 @@ class Processor:
     async def create_url_block(self, action: ActionUrlChange) -> WorkflowDefinitionYamlBlocksItem_GotoUrl:
         """
         Create a YAML goto URL block from an `ActionUrlChange`.
+
+        Fully deterministic: goto blocks carry no LLM-generated metadata, so
+        skipping the LLM round-trip makes navigation drafts instant.
         """
-
-        prompt_name = "recording-go-to-url-block-prompt"
-
-        metadata_prompt = prompt_engine.load_prompt(
-            prompt_name,
-            action=action,
-        )
-
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            prompt_name=prompt_name,
-            organization_id=self.organization_id,
-        )
-
-        block_label: str = metadata_response.get("block_label", None) or "goto_url"
-
-        block = WorkflowDefinitionYamlBlocksItem_GotoUrl(
-            label=block_label,
+        return WorkflowDefinitionYamlBlocksItem_GotoUrl(
+            label=deterministic_goto_url_label(action.url),
             url=action.url,
         )
-
-        return block
 
     async def create_wait_block(self, action: ActionWait) -> WorkflowDefinitionYamlBlocksItem_Wait:
         """
         Create a YAML wait block from an `ActionWait`.
+
+        Fully deterministic: wait blocks carry no LLM-generated metadata, so
+        skipping the LLM round-trip makes wait drafts instant.
         """
+        wait_sec = deterministic_wait_seconds(action.duration_ms)
 
-        prompt_name = "recording-wait-block-prompt"
-
-        metadata_prompt = prompt_engine.load_prompt(
-            prompt_name,
-            action=action,
+        return WorkflowDefinitionYamlBlocksItem_Wait(
+            label=f"wait_{wait_sec}s",
+            wait_sec=wait_sec,
         )
-
-        metadata_response = await app.LLM_API_HANDLER(
-            prompt=metadata_prompt,
-            prompt_name=prompt_name,
-            organization_id=self.organization_id,
-        )
-
-        block_label: str = metadata_response.get("block_label", None) or "wait"
-
-        block = WorkflowDefinitionYamlBlocksItem_Wait(
-            label=block_label,
-            wait_sec=int(max(action.duration_ms / 1000.0, ActionWait.MIN_DURATION_THRESHOLD_MS / 1000.0)),
-        )
-
-        return block
 
     async def process(
-        self, compressed_chunks: list[str]
+        self,
+        compressed_chunks: list[str],
+        draft_steps: list[RecordingDraftStep] | None = None,
     ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process the compressed browser session recording into workflow definition blocks.
         """
+        # `is not None` (not truthiness): an empty list means the user deleted every
+        # live-interpreted step, which must not fall back to re-processing raw events.
+        if draft_steps is not None:
+            LOG.info(
+                "record_browser.process_recording_drafts",
+                recording_draft_step_count=len(draft_steps),
+                **self.identity,
+            )
+            blocks = self.drafts_to_blocks(draft_steps)
+            parameters = self.blocks_to_parameters(blocks)
+            return blocks, parameters
 
         events = self.compressed_chunks_to_events(compressed_chunks)
         LOG.info(
@@ -451,6 +568,7 @@ class BrowserSessionRecordingService:
         organization_id: str,
         workflow_permanent_id: str,
         compressed_chunks: list[str],
+        draft_steps: list[RecordingDraftStep] | None = None,
     ) -> tuple[list[OutputBlock], list[WorkflowDefinitionYamlParametersItem_Workflow]]:
         """
         Process compressed browser session recording events into workflow definition blocks.
@@ -461,7 +579,7 @@ class BrowserSessionRecordingService:
             workflow_permanent_id,
         )
 
-        return await processor.process(compressed_chunks)
+        return await processor.process(compressed_chunks, draft_steps=draft_steps)
 
 
 async def smoke() -> None:

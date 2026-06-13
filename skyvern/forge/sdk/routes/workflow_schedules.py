@@ -229,7 +229,7 @@ async def list_organization_schedules(
     response_model=WorkflowScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_create",
-    summary="Create a schedule for a workflow",
+    summary="Create a schedule for an agent",
 )
 async def create_workflow_schedule(
     workflow_permanent_id: str,
@@ -366,7 +366,7 @@ async def create_workflow_schedule(
     response_model=WorkflowScheduleListResponse,
     tags=["Schedules"],
     operation_id="schedules_list",
-    summary="List schedules for a workflow",
+    summary="List schedules for an agent",
 )
 async def list_workflow_schedules(
     workflow_permanent_id: str,
@@ -387,7 +387,7 @@ async def list_workflow_schedules(
     response_model=WorkflowScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_get",
-    summary="Get a workflow schedule by id",
+    summary="Get an agent schedule by id",
 )
 async def get_workflow_schedule(
     workflow_permanent_id: str,
@@ -414,7 +414,7 @@ async def get_workflow_schedule(
     response_model=WorkflowScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_update",
-    summary="Update a workflow schedule",
+    summary="Update an agent schedule",
 )
 async def update_workflow_schedule(
     workflow_permanent_id: str,
@@ -542,7 +542,7 @@ async def update_workflow_schedule(
     response_model=WorkflowScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_enable",
-    summary="Enable a workflow schedule",
+    summary="Enable an agent schedule",
 )
 async def enable_workflow_schedule(
     workflow_permanent_id: str,
@@ -567,7 +567,7 @@ async def enable_workflow_schedule(
     response_model=WorkflowScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_disable",
-    summary="Disable a workflow schedule",
+    summary="Disable an agent schedule",
 )
 async def disable_workflow_schedule(
     workflow_permanent_id: str,
@@ -591,7 +591,7 @@ async def disable_workflow_schedule(
     response_model=DeleteScheduleResponse,
     tags=["Schedules"],
     operation_id="schedules_delete",
-    summary="Delete a workflow schedule",
+    summary="Delete an agent schedule",
 )
 async def delete_workflow_schedule_route(
     workflow_permanent_id: str,

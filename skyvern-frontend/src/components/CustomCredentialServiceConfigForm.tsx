@@ -13,6 +13,7 @@ import {
   FormMessage,
   FormDescription,
 } from "@/components/ui/form";
+import { ClearCredentialDialog } from "@/components/ClearCredentialDialog";
 import { useCustomCredentialServiceConfig } from "@/hooks/useCustomCredentialServiceConfig";
 import { EyeOpenIcon, EyeClosedIcon, GlobeIcon } from "@radix-ui/react-icons";
 
@@ -46,6 +47,8 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
     isLoading,
     createOrUpdateConfig,
     isUpdating,
+    clearConfig,
+    isClearing,
     testConnection,
     isTesting,
   } = useCustomCredentialServiceConfig();
@@ -59,6 +62,7 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
       },
     },
   });
+  const isMutating = isUpdating || isClearing;
 
   const onSubmit = (data: FormData) => {
     createOrUpdateConfig(data, {
@@ -78,11 +82,10 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
   };
 
   useEffect(() => {
-    if (parsedConfig) {
-      form.reset({ config: parsedConfig });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [parsedConfig]);
+    form.reset({
+      config: parsedConfig || { api_base_url: "", api_token: "" },
+    });
+  }, [parsedConfig, form]);
 
   return (
     <div className="space-y-4">
@@ -124,7 +127,7 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
                       {...field}
                       type="url"
                       placeholder="https://credentials.company.com/api/v1"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                   <GlobeIcon className="absolute right-3 top-3 h-4 w-4 text-muted-foreground" />
@@ -150,7 +153,7 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
                       {...field}
                       type={showApiToken ? "text" : "password"}
                       placeholder="your_api_token_here"
-                      disabled={isLoading || isUpdating}
+                      disabled={isLoading || isMutating}
                     />
                   </FormControl>
                   <Button
@@ -159,7 +162,7 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
                     size="sm"
                     className="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
                     onClick={toggleApiTokenVisibility}
-                    disabled={isLoading || isUpdating}
+                    disabled={isLoading || isMutating}
                   >
                     {showApiToken ? (
                       <EyeClosedIcon className="h-4 w-4" />
@@ -176,18 +179,28 @@ export function CustomCredentialServiceConfigForm({ onSuccess }: Props = {}) {
           <div className="flex items-center gap-4">
             <Button
               type="submit"
-              disabled={isLoading || isUpdating || isTesting}
+              disabled={isLoading || isMutating || isTesting}
             >
               {isUpdating ? "Updating..." : "Update Configuration"}
             </Button>
             <Button
               type="button"
               variant="outline"
-              disabled={isLoading || isUpdating || isTesting}
+              disabled={isLoading || isMutating || isTesting}
               onClick={onTestConnection}
             >
               {isTesting ? "Testing..." : "Test Connection"}
             </Button>
+            {customCredentialServiceAuthToken && (
+              <ClearCredentialDialog
+                label="Clear Configuration"
+                title="Clear custom credential service configuration?"
+                description="Workflows that use the custom credential service will no longer be able to resolve credentials until a new configuration is added."
+                disabled={isLoading || isMutating || isTesting}
+                isPending={isClearing}
+                onConfirm={() => clearConfig()}
+              />
+            )}
 
             {customCredentialServiceAuthToken && (
               <div className="text-sm text-muted-foreground">

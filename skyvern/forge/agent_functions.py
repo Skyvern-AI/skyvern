@@ -26,7 +26,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.api.aws import AsyncAWSClient
 from skyvern.forge.sdk.api.azure import AzureClientFactory
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import CopilotConfig, block_authoring_policy_from_code_only_mode
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.db.agent_db import AgentDB
 from skyvern.forge.sdk.models import Step, StepStatus
@@ -44,7 +44,7 @@ from skyvern.webeye.utils.page import SkyvernFrame
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
-    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun
+    from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 
 LOG = structlog.get_logger()
 
@@ -646,6 +646,13 @@ class AgentFunction:
     ) -> None:
         return
 
+    async def validate_enterprise_feature_access(
+        self,
+        organization_id: str | None = None,
+        feature_names: set[str] | None = None,
+    ) -> None:
+        return
+
     async def prepare_step_execution(
         self,
         organization: Organization | None,
@@ -1069,8 +1076,11 @@ class AgentFunction:
 
         return cleanup_element_tree_func
 
+    async def has_code_block_access(self, organization_id: str | None = None) -> bool:
+        return settings.ENABLE_CODE_BLOCK
+
     async def validate_code_block(self, organization_id: str | None = None) -> None:
-        if not settings.ENABLE_CODE_BLOCK:
+        if not await self.has_code_block_access(organization_id):
             raise DisabledBlockExecutionError("CodeBlock is disabled")
 
     # TODO: Remove these methods if nothing calls them after verifying in production
@@ -1190,9 +1200,20 @@ class AgentFunction:
         """
         return ""
 
-    def get_copilot_config(self) -> CopilotConfig | None:
+    def get_copilot_config(self, code_block_mode: bool | None = None) -> CopilotConfig | None:
         """Return an optional workflow copilot config override."""
-        return None
+        resolved = settings.WORKFLOW_COPILOT_CODE_BLOCK_MODE if code_block_mode is None else code_block_mode
+        return CopilotConfig(
+            block_authoring_policy=block_authoring_policy_from_code_only_mode(resolved),
+            impose_synthesized_code_block=settings.WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS,
+        )
+
+    async def get_copilot_config_for_request(
+        self, organization_id: str | None = None, code_block_mode: bool | None = None
+    ) -> CopilotConfig | None:
+        """Return a request-scoped workflow copilot config override."""
+        del organization_id
+        return self.get_copilot_config(code_block_mode)
 
     def detect_ats_platform(self, url_or_domain: str | None) -> str | None:
         """Detect if a URL belongs to a known ATS platform.
@@ -1307,6 +1328,15 @@ class AgentFunction:
         """
         return None
 
+    async def validate_user_organization_membership(
+        self,
+        user_id: str,
+        organization_id: str,
+        bearer_token: str | None = None,
+    ) -> bool | None:
+        """Return whether the user belongs to the organization, or None when membership cannot be determined."""
+        return None
+
     async def on_workflow_saved(
         self,
         organization_id: str,
@@ -1319,6 +1349,7 @@ class AgentFunction:
         self,
         organization_id: str,
         workflow_id: str,
+        status: "WorkflowRunStatus | None" = None,
     ) -> None:
         """Fired after a workflow run reaches a final status. Overrides must be best-effort and never raise."""
         return None

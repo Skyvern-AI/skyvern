@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import NotRequired, TypedDict
 
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.verification_evidence import WorkflowVerificationEvidence
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
@@ -46,6 +47,8 @@ class NarrativeBlock(TypedDict):
     activity: list[NarrativeActivityEntry]
     startedAt: str | None
     endedAt: str | None
+    outcome: NotRequired[str]
+    outcomeReason: NotRequired[str]
 
 
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
@@ -54,6 +57,13 @@ class TurnNarrativePayload(TypedDict):
     turnIndex: int
     mode: str
     responseType: NotRequired[ResponseType]
+    cancelled: NotRequired[bool]
+    proposalDisposition: NotRequired[ProposalDisposition]
+    # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
+    responseKind: NotRequired[str]
+    # The ADR-0005 terminal adjudication (enforcement.verified_goal_satisfied_context):
+    # True only when outcome evidence authorizes a tested-success claim.
+    verifiedSuccess: NotRequired[bool]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -73,6 +83,7 @@ if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.turn_context import TurnContextPacket
+    from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
     from skyvern.forge.sdk.copilot.turn_intent import TurnIntent
     from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
 
@@ -149,9 +160,26 @@ class StructuredContext(BaseModel):
                     self.urls_visited.append(UrlVisit(url=url, summary=""))
 
             elif tool == "list_credentials":
-                match = re.search(r"Found (\d+)", summary)
-                found = int(match.group(1)) > 0 if match else False
-                self.credentials_checked.append(CredentialCheck(credential_name=summary, found=found))
+                resolved = entry.get("credentials")
+                if isinstance(resolved, list) and resolved:
+                    for credential in resolved:
+                        if not isinstance(credential, dict):
+                            continue
+                        credential_id = credential.get("credential_id")
+                        if not isinstance(credential_id, str):
+                            continue
+                        name = credential.get("name")
+                        self.credentials_checked.append(
+                            CredentialCheck(
+                                credential_name=name if isinstance(name, str) else "",
+                                credential_id=credential_id,
+                                found=True,
+                            )
+                        )
+                else:
+                    match = re.search(r"Found (\d+)", summary)
+                    found = int(match.group(1)) > 0 if match else False
+                    self.credentials_checked.append(CredentialCheck(credential_name=summary, found=found))
 
             elif tool == "type_text":
                 parts = summary.split("into ")
@@ -317,6 +345,8 @@ class CopilotContext(AgentContext):
     block_goal_main_goal: str = ""
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None
+    block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
+    impose_synthesized_code_block: bool = False
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
@@ -327,6 +357,7 @@ class CopilotContext(AgentContext):
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
+    turn_halt: TurnHalt | None = None
 
     # ``None`` until usage is observed; ``0`` only when a provider explicitly
     # reported zero. Distinct values let cost grading flag missing telemetry.
@@ -344,6 +375,8 @@ class CopilotContext(AgentContext):
     last_test_failure_reason: str | None = None
     failed_test_nudge_count: int = 0
     explore_without_workflow_nudge_count: int = 0
+    code_only_code_schema_seen: bool = False
+    code_only_target_page_evidence_seen: bool = False
     last_failed_workflow_yaml: str | None = None
     # Set when a block-running tool timed out and the run's true outcome
     # could not be reconciled (post-drain row was ``canceled``, non-final, or
@@ -463,6 +496,7 @@ class CopilotContext(AgentContext):
     resolved_discovery_failure_reason: str | None = None
     resolved_discovery_entrypoint_inspection_baseline: int = 0
     discovery_entrypoint_url_question_nudge_count: int = 0
+    pre_discovery_url_question_nudge_count: int = 0
     # Set in `_run_attempt` after SkyvernOverlayMCPServer is constructed.
     # The discovery tool reaches the connected FastMCP client through this.
     discovery_mcp_server: Any | None = None

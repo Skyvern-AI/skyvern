@@ -22,6 +22,8 @@ from mcp.types import (
 
 from skyvern.forge.sdk.copilot.blocker_signal import (
     build_loop_blocker_signal,
+    loop_blocker_evidence_from_ctx,
+    refresh_held_loop_blocker_evidence,
     stash_blocker_signal,
 )
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
@@ -38,6 +40,8 @@ from skyvern.forge.sdk.copilot.runtime import (
     mcp_to_copilot,
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import enqueue_screenshot_from_result
+from skyvern.forge.sdk.copilot.secret_scrub import scrub_secrets_from_structure
+from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
@@ -63,7 +67,10 @@ _INTERNAL_TOOL_ARG_KEYS = frozenset({"_summarized"})
 
 
 def _stash_and_emit_loop_blocker(ctx: Any, loop_message: str, tool_name: str) -> str:
-    return stash_blocker_signal(ctx, build_loop_blocker_signal(loop_message, tool_name=tool_name))
+    signal = build_loop_blocker_signal(loop_message, tool_name=tool_name, evidence=loop_blocker_evidence_from_ctx(ctx))
+    payload = stash_blocker_signal(ctx, signal)
+    stash_turn_halt_from_blocker_signal(ctx, signal, source="mcp_loop_blocker")
+    return payload
 
 
 def _apply_schema_overlay(
@@ -140,7 +147,7 @@ class SkyvernOverlayMCPServer(MCPServer):
         self._context_provider = context_provider
         self._client: Client | None = None
         self._exit_stack: AsyncExitStack | None = None
-        self._cached_tools: list[MCPTool] | None = None
+        self._cached_raw_tools: list[MCPTool] | None = None
 
     @property
     def name(self) -> str:
@@ -159,20 +166,19 @@ class SkyvernOverlayMCPServer(MCPServer):
             await self._exit_stack.__aexit__(None, None, None)
         self._client = None
         self._exit_stack = None
-        self._cached_tools = None
+        self._cached_raw_tools = None
 
     async def list_tools(
         self,
         run_context: RunContextWrapper[Any] | None = None,
         agent: AgentBase | None = None,
     ) -> list[MCPTool]:
-        if self._cached_tools is not None:
-            return self._cached_tools
-
         if not self._client:
             raise RuntimeError("Not connected — call connect() first")
 
-        raw_tools = await self._client.list_tools()
+        if self._cached_raw_tools is None:
+            self._cached_raw_tools = await self._client.list_tools()
+        raw_tools = self._cached_raw_tools
         result: list[MCPTool] = []
 
         for tool in raw_tools:
@@ -180,6 +186,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 continue
 
             copilot_name = self._reverse_alias.get(tool.name, tool.name)
+
             overlay = self._overlays.get(copilot_name, SchemaOverlay())
 
             schema = _apply_schema_overlay(tool.inputSchema, overlay)
@@ -192,7 +199,6 @@ class SkyvernOverlayMCPServer(MCPServer):
                     inputSchema=schema,
                 )
             )
-        self._cached_tools = result
         return result
 
     async def call_tool(
@@ -221,6 +227,7 @@ class SkyvernOverlayMCPServer(MCPServer):
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, {"ok": False, "error": payload})
             return _copilot_to_call_tool_result({"ok": False, "error": payload})
 
+        refresh_held_loop_blocker_evidence(copilot_ctx)
         loop_error = detect_failed_tool_step_loop_for_ctx(copilot_ctx, tool_name, arguments)
         if loop_error:
             LOG.warning(
@@ -269,7 +276,7 @@ class SkyvernOverlayMCPServer(MCPServer):
                 error=str(e),
                 exc_info=True,
             )
-            err = {"ok": False, "error": f"{tool_name} failed: {e}"}
+            err = scrub_secrets_from_structure(copilot_ctx, {"ok": False, "error": f"{tool_name} failed: {e}"})
             record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, err)
             return _copilot_to_call_tool_result(err)
 
@@ -283,6 +290,9 @@ class SkyvernOverlayMCPServer(MCPServer):
                 raw_mcp["error"] = " ".join(text_parts) if text_parts else "Unknown MCP error"
             else:
                 raw_mcp["error"] = raw_mcp.get("error") or "Unknown MCP error"
+        # Scrub before the post hook so evidence the hooks record from raw_mcp
+        # (flow evidence, scout observations) is scrubbed too.
+        raw_mcp = scrub_secrets_from_structure(copilot_ctx, raw_mcp)
         copilot_result = mcp_to_copilot(raw_mcp)
 
         if overlay.post_hook:

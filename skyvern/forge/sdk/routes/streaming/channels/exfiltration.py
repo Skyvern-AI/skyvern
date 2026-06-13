@@ -62,6 +62,7 @@ class ExfiltrationChannel(CdpChannel):
     BINDING_NAME: t.ClassVar[str] = "__skyvern_exfiltrate_event"
     CONSOLE_DEDUP_TTL_SECONDS: t.ClassVar[float] = 5.0
     REFRESH_INTERVAL_SECONDS: t.ClassVar[float] = 1.0
+    NETWORK_ACTIVITY_THROTTLE_SECONDS: t.ClassVar[float] = 1.0
     _active_binding_channels: t.ClassVar[weakref.WeakKeyDictionary[Page, "ExfiltrationChannel"]] = (
         weakref.WeakKeyDictionary()
     )
@@ -74,6 +75,9 @@ class ExfiltrationChannel(CdpChannel):
         self._recent_console_event_fingerprints: dict[str, float] = {}
         self._pending_event_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task | None = None
+        self._network_activity_count = 0
+        self._last_network_activity_emit = 0.0
+        self._network_activity_flush_task: asyncio.Task[None] | None = None
 
         super().__init__(vnc_channel=vnc_channel)
 
@@ -280,6 +284,32 @@ class ExfiltrationChannel(CdpChannel):
                         exc_info=True,
                     )
 
+    def _handle_network_activity(self) -> None:
+        self._network_activity_count += 1
+
+        now = time.monotonic()
+        elapsed = now - self._last_network_activity_emit
+        if elapsed < self.NETWORK_ACTIVITY_THROTTLE_SECONDS:
+            if not self._network_activity_flush_task or self._network_activity_flush_task.done():
+                delay = self.NETWORK_ACTIVITY_THROTTLE_SECONDS - elapsed
+                self._network_activity_flush_task = asyncio.create_task(self._flush_network_activity_after(delay))
+            return
+
+        self._emit_network_activity(now)
+
+    async def _flush_network_activity_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._emit_network_activity(time.monotonic())
+
+    def _emit_network_activity(self, now: float) -> None:
+        if self._network_activity_count == 0:
+            return
+
+        self._last_network_activity_emit = now
+        count = self._network_activity_count
+        self._network_activity_count = 0
+        self._handle_cdp_event("net:activity", {"count": count})
+
     def _handle_cdp_event(self, event_name: str, params: dict) -> None:
         LOG.debug(f"{self.class_name} cdp event captured: {event_name}", params=params)
 
@@ -406,6 +436,7 @@ class ExfiltrationChannel(CdpChannel):
             cdp_session.send("Runtime.enable"),
             cdp_session.send("DOM.enable"),
             cdp_session.send("Page.enable"),
+            cdp_session.send("Network.enable"),
             cdp_session.send("Target.setDiscoverTargets", {"discover": True}),
         ]
 
@@ -427,6 +458,9 @@ class ExfiltrationChannel(CdpChannel):
             "Page.navigatedWithinDocument",
             lambda params: self._handle_cdp_event("nav:navigated_within_document", params),
         )
+        cdp_session.on("Network.requestWillBeSent", lambda params: self._handle_network_activity())
+        cdp_session.on("Network.loadingFinished", lambda params: self._handle_network_activity())
+        cdp_session.on("Network.loadingFailed", lambda params: self._handle_network_activity())
 
         return self
 
@@ -499,6 +533,12 @@ class ExfiltrationChannel(CdpChannel):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._refresh_task
             self._refresh_task = None
+
+        if self._network_activity_flush_task and not self._network_activity_flush_task.done():
+            self._network_activity_flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._network_activity_flush_task
+            self._network_activity_flush_task = None
 
         pending_event_tasks = list(self._pending_event_tasks)
         for task in pending_event_tasks:

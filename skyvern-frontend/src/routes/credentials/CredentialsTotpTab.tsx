@@ -75,6 +75,18 @@ function CredentialsTotpTab() {
           Paste the verification message you received. Skyvern extracts the code
           and attaches it to the relevant run.
         </p>
+        <p className="mt-2 text-sm text-neutral-600 dark:text-slate-400">
+          Prefer to send codes programmatically? See the{" "}
+          <a
+            href="https://docs.skyvern.com/api-reference/credentials/send-totp-code"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-400 underline hover:text-blue-300"
+          >
+            API documentation
+          </a>
+          .
+        </p>
         <PushTotpCodeForm
           className="mt-4"
           showAdvancedFields

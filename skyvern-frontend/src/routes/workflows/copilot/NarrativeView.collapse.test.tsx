@@ -10,8 +10,11 @@ import {
   TurnNarrativeState,
 } from "./narrativeState";
 
-const completedBlock = (label: string): BlockState => ({
-  workflowRunBlockId: `wrb_${label}`,
+const completedBlock = (
+  label: string,
+  workflowRunBlockId = `wrb_${label}`,
+): BlockState => ({
+  workflowRunBlockId,
   label,
   blockType: "navigation",
   state: "completed",
@@ -19,6 +22,14 @@ const completedBlock = (label: string): BlockState => ({
   activity: [],
   startedAt: "2026-05-30T00:00:00Z",
   endedAt: "2026-05-30T00:00:10Z",
+});
+
+const failedBlock = (
+  label: string,
+  workflowRunBlockId = `wrb_failed_${label}`,
+): BlockState => ({
+  ...completedBlock(label, workflowRunBlockId),
+  state: "failed",
 });
 
 const terminalBuildTurn = (): TurnNarrativeState => ({
@@ -45,6 +56,8 @@ const inFlightTurn = (): TurnNarrativeState => ({
 });
 
 const HEADLINE = "Built and tested the workflow";
+const REVIEW_HEADLINE = "Draft needs review";
+const REVIEW_TESTED_HEADLINE = "Workflow ready for review";
 
 afterEach(() => {
   cleanup();
@@ -60,6 +73,43 @@ describe("NarrativeView collapse default", () => {
         .getByRole("button", { name: new RegExp(HEADLINE) })
         .getAttribute("aria-expanded"),
     ).toBe("false");
+  });
+
+  it("does not present an unverified review proposal as built and tested", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          proposalDisposition: "review_untested",
+          terminalMessage:
+            "I reached the requested browser state, but the reusable workflow still needs a clean verification run before it is ready.",
+          narrativeSummary:
+            "I reached the requested browser state, but the reusable workflow still needs a clean verification run before it is ready.",
+        }}
+      />,
+    );
+
+    expect(screen.getByText(REVIEW_HEADLINE)).toBeTruthy();
+    expect(screen.queryByText(HEADLINE)).toBeNull();
+  });
+
+  it("does not present a tested review proposal with a success badge", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          proposalDisposition: "review_tested",
+          narrativeSummary: "Workflow ready for review.",
+        }}
+      />,
+    );
+
+    const summaryButton = screen.getByRole("button", {
+      name: new RegExp(REVIEW_TESTED_HEADLINE),
+    });
+    expect(summaryButton.textContent).toContain("!");
+    expect(summaryButton.textContent).not.toContain("✓");
+    expect(screen.queryByText(HEADLINE)).toBeNull();
   });
 
   it("keeps the in-flight turn expanded in the detail view", () => {
@@ -105,5 +155,27 @@ describe("NarrativeView collapse default", () => {
     rerender(<NarrativeView turn={turn} />);
     expect(screen.getByRole("button", { name: "Collapse turn" })).toBeTruthy();
     expect(screen.queryByText(HEADLINE)).toBeNull();
+  });
+
+  it("summarizes the latest retry attempt for duplicate block labels", () => {
+    render(
+      <NarrativeView
+        turn={{
+          ...terminalBuildTurn(),
+          blocks: [
+            completedBlock("open_site", "wrb_open_first"),
+            failedBlock("add_to_cart", "wrb_add_first"),
+            completedBlock("open_site", "wrb_open_retry"),
+            completedBlock("add_to_cart", "wrb_add_retry"),
+            completedBlock("confirm_cart", "wrb_confirm_retry"),
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText(HEADLINE)).toBeTruthy();
+    expect(screen.queryByText("Run halted")).toBeNull();
+    expect(screen.queryByText("Halted")).toBeNull();
+    expect(screen.getAllByText("add_to_cart")).toHaveLength(1);
   });
 });

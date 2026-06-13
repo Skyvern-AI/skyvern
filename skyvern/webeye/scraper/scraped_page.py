@@ -157,8 +157,14 @@ class ElementTreeBuilder(ABC):
         compress_long_href: bool = False,
         compress_image_src: bool = False,
         strip_url_query_strings: bool = False,
+        compress_nonnavigable_href: bool = False,
     ) -> str:
         pass
+
+    # Sanitized HTML of the last element tree built for the LLM; None when the
+    # last build was JSON or none has run yet. Builders that never render HTML
+    # (e.g. IncrementalScrapePage) leave it None.
+    last_used_element_tree_html: str | None
 
 
 class ScrapedPage(BaseModel, ElementTreeBuilder):
@@ -182,15 +188,11 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
     element_tree: list[dict]
     element_tree_trimmed: list[dict]
     economy_element_tree: list[dict] | None = None
-    # SKY-9718 Layer 1: lazy cache for lean trees, keyed by the 3-flag combo
+    # SKY-9718 Layer 1: lazy cache for lean trees, keyed by the 4-flag combo
     # the caller asked for. Two call sites in one prompt build asking for
     # different combos each pay the walk cost once.
-    lean_element_tree_cache: dict[tuple[bool, bool, bool], list[dict]] = {}
+    lean_element_tree_cache: dict[tuple[bool, bool, bool, bool], list[dict]] = {}
     last_used_element_tree: list[dict] | None = None
-    # Last HTML variant built for the LLM (captures economy / truncation).
-    # None when the last build used fmt=JSON or no build has run yet. The
-    # extraction cache reads this to hash the exact HTML the LLM saw; JSON
-    # callers fall back to a fresh HTML rebuild at the cache callsite.
     last_used_element_tree_html: str | None = None
     screenshots: list[bytes] = []
     url: str = ""
@@ -410,6 +412,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
         compress_long_href: bool = False,
         compress_image_src: bool = False,
         strip_url_query_strings: bool = False,
+        compress_nonnavigable_href: bool = False,
     ) -> str:
         """SKY-9718 Layer 1 — deterministic lean element tree.
 
@@ -430,6 +433,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
             compress_long_href,
             compress_image_src,
             strip_url_query_strings,
+            compress_nonnavigable_href,
         )
         cached = self.lean_element_tree_cache.get(cache_key)
         if cached is None:
@@ -438,6 +442,7 @@ class ScrapedPage(BaseModel, ElementTreeBuilder):
                 compress_long_href=compress_long_href,
                 compress_image_src=compress_image_src,
                 strip_url_query_strings=strip_url_query_strings,
+                compress_nonnavigable_href=compress_nonnavigable_href,
             )
             self.lean_element_tree_cache[cache_key] = cached
 

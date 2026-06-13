@@ -36,6 +36,7 @@ _GOTO_URL_BLOCK_TYPE = "goto_url"
 _SCHEMA_EVIDENCE_TOOL = "inspect_page_for_composition"
 _STRUCTURED_BROWSER_EVIDENCE_TOOLS: frozenset[str] = frozenset({"evaluate"})
 _POST_RUN_CONTINUATION_EVIDENCE_TOOLS: frozenset[str] = frozenset({"inspect_page_for_composition", "evaluate"})
+SCOUT_INTERACTION_EVIDENCE_TOOL = "scout_interaction"
 _RESULT_CONTAINER_HINTS: frozenset[str] = frozenset({"result", "results", "record", "records", "row", "rows"})
 _MAX_FORMS = 5
 _MAX_FIELDS_PER_FORM = 20
@@ -61,7 +62,9 @@ _MODAL_DISMISS_HINTS: frozenset[str] = frozenset(
     }
 )
 _MODAL_DISMISS_SYMBOLS: frozenset[str] = frozenset({"x", "\u00d7"})
+_MAX_VISIBLE_TEXT_EXCERPT_CHARS = 3000
 DOM_EVIDENCE_SOURCE = "dom_html"
+DOM_STYLE_EVIDENCE_SOURCE = "dom_style"
 SCREENSHOT_EVIDENCE_SOURCE = "screenshot"
 VISION_EVIDENCE_SOURCE = "vision_summary"
 _ANTI_BOT_PATTERNS = (
@@ -75,6 +78,16 @@ _ANTI_BOT_PATTERNS = (
     "verify you are human",
     "access denied",
     "are you a robot",
+)
+_EMPTY_RESULT_TEXT_PATTERNS: frozenset[str] = frozenset(
+    {
+        "0 results",
+        "no matching records",
+        "no records found",
+        "no results",
+        "no results found",
+        "nothing found",
+    }
 )
 _MAX_VISUAL_SUMMARY_CHARS = 500
 _MAX_VISUAL_OMISSIONS = 5
@@ -108,22 +121,41 @@ def _challenge_kind(indicators: list[str]) -> str:
     return "unknown" if indicators else "none"
 
 
+# Tags that carry challenge-vendor markup without rendering a widget. A passive
+# script/meta tag ships on every page behind some CDNs, so it can trigger the
+# visual fallback but never assert human verification by itself.
+_PASSIVE_CHALLENGE_TAGS: frozenset[str] = frozenset({"script", "noscript", "style", "link", "meta"})
+
+
+def interactive_challenge_controls(challenge_controls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [
+        control
+        for control in challenge_controls or []
+        if isinstance(control, dict) and str(control.get("tag") or "").lower() not in _PASSIVE_CHALLENGE_TAGS
+    ]
+
+
 def _challenge_state(
     indicators: list[str],
     *,
     source: str = DOM_EVIDENCE_SOURCE,
     gated_submit_controls: list[dict[str, Any]] | None = None,
+    challenge_controls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     detected = bool(indicators)
     gated_controls = gated_submit_controls or []
+    # Raw-HTML token hits only mark `detected` (triggering the visual fallback);
+    # asserting human verification requires a rendered challenge control or a
+    # later vision confirmation.
+    semantic_challenge = bool(interactive_challenge_controls(challenge_controls))
     return {
         "detected": detected,
         "kind": _challenge_kind(indicators),
         "source": source if detected else "",
         "indicators": indicators[:8],
-        "requires_human_verification": detected,
+        "requires_human_verification": semantic_challenge,
         "visual_location": "",
-        "gates_submit_controls": bool(detected and gated_controls),
+        "gates_submit_controls": bool(semantic_challenge and gated_controls),
         "gated_submit_controls": gated_controls[:5] if detected else [],
     }
 
@@ -162,6 +194,7 @@ def _evidence_metadata(
     indicators: list[str] | None = None,
     *,
     forms: list[dict[str, Any]] | None = None,
+    challenge_controls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     gated_controls = _gated_submit_controls(forms or [])
     return {
@@ -173,6 +206,7 @@ def _evidence_metadata(
         "challenge_state": _challenge_state(
             indicators or [],
             gated_submit_controls=gated_controls,
+            challenge_controls=challenge_controls,
         ),
     }
 
@@ -214,7 +248,24 @@ def page_evidence_needs_visual_fallback(evidence: dict[str, Any]) -> bool:
     challenge_state = evidence.get("challenge_state")
     if isinstance(challenge_state, dict) and challenge_state.get("detected") is True:
         return True
+    visual_obstruction_candidates = evidence.get("visual_obstruction_candidates")
+    if isinstance(visual_obstruction_candidates, list) and visual_obstruction_candidates:
+        return True
     return bool(evidence.get("anti_bot_indicators") or evidence.get("challenge_controls"))
+
+
+# The vision classifier's typed non-challenge obstruction kind: a consent dialog
+# is dismissed, not solved, so it must never promote challenge state.
+CONSENT_OBSTRUCTION_KIND = "cookie_consent"
+
+
+def _confirmed_visual_challenge(evidence: dict[str, Any], visual_summary: dict[str, Any]) -> bool:
+    if visual_summary.get("challenge_detected") is not True:
+        return False
+    if interactive_challenge_controls(evidence.get("challenge_controls")):
+        return True
+    obstruction_kind = str(visual_summary.get("obstruction_kind") or "").strip().lower()
+    return obstruction_kind != CONSENT_OBSTRUCTION_KIND
 
 
 def merge_visual_composition_evidence(
@@ -255,28 +306,34 @@ def merge_visual_composition_evidence(
             if bounded:
                 omissions.append(bounded)
         challenge_state = dict(merged.get("challenge_state") or {})
-        if visual_summary.get("challenge_detected") is True:
+        challenge_confirmed = _confirmed_visual_challenge(evidence, visual_summary)
+        if challenge_confirmed:
             challenge_state["detected"] = True
             challenge_state["requires_human_verification"] = True
             challenge_state["source"] = (
                 "dom+screenshot" if challenge_state.get("source") else SCREENSHOT_EVIDENCE_SOURCE
             )
-        challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
-        if challenge_kind:
-            challenge_state["kind"] = challenge_kind
-        challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
-        if challenge_location:
-            challenge_state["visual_location"] = challenge_location
-        if visual_summary.get("submit_blocked") is True:
+        if challenge_confirmed or challenge_state.get("detected") is True:
+            challenge_kind = _bounded_string(visual_summary.get("challenge_kind"), 80)
+            if challenge_kind:
+                challenge_state["kind"] = challenge_kind
+            challenge_location = _bounded_string(visual_summary.get("challenge_location"), 180)
+            if challenge_location:
+                challenge_state["visual_location"] = challenge_location
+        if visual_summary.get("submit_blocked") is True and challenge_confirmed:
             challenge_state["gates_submit_controls"] = True
-        visual_blocked_controls = [
-            {
-                "text": _bounded_string(item, 120),
-                "disabled": True,
-            }
-            for item in visual_summary.get("blocked_submit_controls") or []
-            if _bounded_string(item, 120)
-        ]
+        visual_blocked_controls = (
+            [
+                {
+                    "text": _bounded_string(item, 120),
+                    "disabled": True,
+                }
+                for item in visual_summary.get("blocked_submit_controls") or []
+                if _bounded_string(item, 120)
+            ]
+            if challenge_confirmed
+            else []
+        )
         if visual_blocked_controls:
             existing_controls = [
                 item for item in challenge_state.get("gated_submit_controls") or [] if isinstance(item, dict)
@@ -574,6 +631,16 @@ def has_bounded_page_schema(evidence: dict[str, Any]) -> bool:
     return evidence.get("observed_empty_page") is True
 
 
+def _is_scout_interaction_evidence(evidence: dict[str, Any]) -> bool:
+    # A scout interaction that resolved a concrete selector proves the page rendered
+    # and the element was actionable, so it is non-hollow evidence of the reached
+    # page even without a captured page schema.
+    if evidence.get("source_tool") != SCOUT_INTERACTION_EVIDENCE_TOOL:
+        return False
+    selector = evidence.get("interaction_selector")
+    return isinstance(selector, str) and bool(selector.strip())
+
+
 def _evidence_matches_target(
     evidence: dict[str, Any] | None,
     target_url: str | None,
@@ -587,6 +654,13 @@ def _evidence_matches_target(
     inspected_url = evidence.get("inspected_url")
     current_url = current_url if isinstance(current_url, str) else None
     inspected_url = inspected_url if isinstance(inspected_url, str) else None
+    if _is_scout_interaction_evidence(evidence):
+        if _same_page(current_url, target_url) or _same_page(inspected_url, target_url):
+            return True
+        if allow_post_run_browser_observation and (
+            _same_origin(current_url, target_url) or _same_origin(inspected_url, target_url)
+        ):
+            return True
     # A hollow inspection (empty forms/links/result containers, no detected
     # challenge) is not observation — `inspect_page_for_composition` can return an
     # empty schema when the page had not rendered at capture time, so URL match
@@ -783,6 +857,32 @@ def _current_page_evidence_has_reached_page_credit(
     return False
 
 
+def _auto_credit_interaction_observation(
+    flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
+    consumed_steps: set[int],
+) -> bool:
+    # Bind by trajectory recency, never by source_url: a SPA holds one URL across
+    # interactions, so URL identity would mis-bind. Consume-once keeps each block on a
+    # distinct interaction.
+    for step in sorted(flow_evidence_by_step, reverse=True):
+        if step in consumed_steps:
+            continue
+        evidence, reached_via = flow_evidence_by_step[step]
+        if reached_via != "interaction":
+            continue
+        if not (_is_scout_interaction_evidence(evidence) or has_bounded_page_schema(evidence)):
+            continue
+        consumed_steps.add(step)
+        LOG.info(
+            "copilot_gate_auto_credited_interaction",
+            observation_step=step,
+            source_tool=evidence.get("source_tool"),
+            interaction_selector=evidence.get("interaction_selector"),
+        )
+        return True
+    return False
+
+
 def _block_has_observed_page(
     ctx: Any,
     block: dict[str, Any],
@@ -790,33 +890,37 @@ def _block_has_observed_page(
     allow_post_run: bool,
     flow_evidence_by_step: dict[int, tuple[dict[str, Any], str]],
     block_observation_refs: dict[str, int],
+    consumed_steps: set[int],
 ) -> bool:
     label = str(block.get("label") or "")
     if label and label in block_observation_refs:
-        evidence_entry = flow_evidence_by_step.get(block_observation_refs[label])
-        if evidence_entry is None:
-            return False
-        evidence, reached_via = evidence_entry
-        effective_reached_via = (
-            "interaction"
-            if _current_page_evidence_has_reached_page_credit(
-                evidence,
-                reached_via,
-                flow_evidence_by_step=flow_evidence_by_step,
+        step = block_observation_refs[label]
+        evidence_entry = flow_evidence_by_step.get(step)
+        if evidence_entry is not None:
+            evidence, reached_via = evidence_entry
+            effective_reached_via = (
+                "interaction"
+                if _current_page_evidence_has_reached_page_credit(
+                    evidence,
+                    reached_via,
+                    flow_evidence_by_step=flow_evidence_by_step,
+                )
+                else reached_via
             )
-            else reached_via
-        )
-        return _associated_observation_satisfies_block(
-            evidence,
-            block.get("target_url"),
-            acts_via=str(block.get("acts_via") or ""),
-            reached_via=effective_reached_via,
-            requires_observation_ref=block.get("requires_observation_ref") is True,
-            allow_post_run=allow_post_run,
-        )
+            if _associated_observation_satisfies_block(
+                evidence,
+                block.get("target_url"),
+                acts_via=str(block.get("acts_via") or ""),
+                reached_via=effective_reached_via,
+                requires_observation_ref=block.get("requires_observation_ref") is True,
+                allow_post_run=allow_post_run,
+            ):
+                if effective_reached_via == "interaction":
+                    consumed_steps.add(step)
+                return True
 
     if block.get("requires_observation_ref") is True:
-        return False
+        return _auto_credit_interaction_observation(flow_evidence_by_step, consumed_steps)
     return _page_observed(ctx, block.get("target_url"), allow_post_run=allow_post_run)
 
 
@@ -923,6 +1027,7 @@ def composition_page_evidence_error(
         )
     if block_observation_refs is None:
         block_observation_refs = _block_observation_refs(ctx)
+    consumed_steps: set[int] = set()
     for block in gated_blocks:
         target_url = block["target_url"]
         if not _block_has_observed_page(
@@ -931,6 +1036,7 @@ def composition_page_evidence_error(
             allow_post_run=allow_post_run,
             flow_evidence_by_step=flow_evidence_by_step,
             block_observation_refs=block_observation_refs,
+            consumed_steps=consumed_steps,
         ):
             missing_step = _missing_observation_ref_step(
                 block,
@@ -1001,10 +1107,12 @@ def _empty_evidence(inspected_url: str, current_url: str) -> dict[str, Any]:
         "forms": [],
         "navigation_targets": [],
         "result_containers": [],
+        "visible_text_excerpt": "",
         "anti_bot_indicators": [],
         "challenge_controls": [],
         "modal_overlays": [],
         "page_obstructions": [],
+        "visual_obstruction_candidates": [],
         "schema_empty_page": False,
         "observed_empty_page": False,
         "empty_page_visual_state": None,
@@ -1037,6 +1145,99 @@ def _classes_for(node: Any) -> list[str]:
     if isinstance(class_value, str):
         return [part for part in class_value.split() if part]
     return []
+
+
+def _inline_style_properties(node: Any) -> dict[str, str]:
+    style = _attr_value(node, "style")
+    if not style:
+        return {}
+    properties: dict[str, str] = {}
+    for declaration in style.split(";"):
+        if ":" not in declaration:
+            continue
+        key, value = declaration.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip().lower()
+        if key and value:
+            properties[key] = value
+    return properties
+
+
+def _css_zero(value: str) -> bool:
+    return value.replace(" ", "") in {"0", "0px", "0%", "0rem", "0em", "0vh", "0vw"}
+
+
+def _css_full_width(value: str) -> bool:
+    compact = value.replace(" ", "")
+    return compact in {"100%", "100vw", "100dvw", "100lvw", "100svw"}
+
+
+def _css_full_height(value: str) -> bool:
+    compact = value.replace(" ", "")
+    return compact in {"100%", "100vh", "100dvh", "100lvh", "100svh"}
+
+
+def _z_index_is_high(value: str) -> bool:
+    try:
+        return int(float(value)) >= 10
+    except (TypeError, ValueError):
+        return False
+
+
+def _style_covers_viewport(properties: dict[str, str]) -> bool:
+    inset = properties.get("inset")
+    if inset is not None and all(_css_zero(part) for part in inset.split()):
+        return True
+    covers_edges = all(_css_zero(properties.get(edge, "")) for edge in ("top", "right", "bottom", "left"))
+    if covers_edges:
+        return True
+    starts_at_origin = _css_zero(properties.get("top", "")) and _css_zero(properties.get("left", ""))
+    return (
+        starts_at_origin
+        and _css_full_width(properties.get("width", ""))
+        and _css_full_height(properties.get("height", "") or properties.get("min-height", ""))
+    )
+
+
+def _node_has_clickable_descendant(node: Any) -> bool:
+    if not hasattr(node, "find_all"):
+        return False
+    for control in node.find_all(["button", "a", "input"]):
+        tag_name = str(getattr(control, "name", "") or "").lower()
+        if tag_name == "input":
+            field_type = str(control.get("type") or "").lower()
+            if field_type not in {"button", "submit", "reset"}:
+                continue
+        if _node_text(control) or _attr_value(control, "value") or _attr_value(control, "aria-label"):
+            return True
+    for control in node.find_all(attrs={"role": "button"}):
+        if _node_text(control) or _attr_value(control, "aria-label"):
+            return True
+    return False
+
+
+def _visual_obstruction_candidates(soup: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for node in soup.find_all(True):
+        if len(candidates) >= _MAX_PAGE_OBSTRUCTIONS:
+            break
+        properties = _inline_style_properties(node)
+        position = properties.get("position", "")
+        if position not in {"fixed", "sticky"}:
+            continue
+        if not _z_index_is_high(properties.get("z-index", "")):
+            continue
+        if not _style_covers_viewport(properties):
+            continue
+        candidates.append(
+            {
+                "source": DOM_STYLE_EVIDENCE_SOURCE,
+                "position": position,
+                "coverage": "viewport",
+                "has_visible_controls": _node_has_clickable_descendant(node),
+            }
+        )
+    return candidates
 
 
 def _css_attr(value: str) -> str:
@@ -1159,6 +1360,11 @@ def _page_title(soup: Any) -> str:
     return " ".join(parts)[:240]
 
 
+def _result_row_text_is_content(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    return bool(normalized) and not any(pattern in normalized for pattern in _EMPTY_RESULT_TEXT_PATTERNS)
+
+
 def _result_container_entry(node: Any) -> dict[str, Any]:
     tag_name = str(getattr(node, "name", "") or "").lower()
     node_id = str(node.get("id") or "")
@@ -1177,6 +1383,18 @@ def _result_container_entry(node: Any) -> dict[str, Any]:
             f"{selector} tbody tr a",
             f"{selector} tbody tr td:first-child",
         ]
+        data_rows = [row for row in node.select("tbody tr") if row.find("td") is not None]
+        if not data_rows:
+            data_rows = [row for row in node.select("tr") if row.find("td") is not None]
+        sample_rows = [_schema_text(_node_text(row), 240) for row in data_rows]
+        sample_rows = [row for row in sample_rows if _result_row_text_is_content(row)][:5]
+        if sample_rows:
+            entry["row_count"] = len(sample_rows)
+            entry["sample_rows"] = sample_rows
+    else:
+        text_excerpt = _schema_text(_node_text(node), 240)
+        if text_excerpt:
+            entry["text_excerpt"] = text_excerpt
     return entry
 
 
@@ -1391,9 +1609,11 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
     for node in soup.find_all(["script", "style", "noscript"]):
         node.decompose()
 
+    visible_text = _node_text(soup.body if getattr(soup, "body", None) is not None else soup)
     all_nodes = soup.find_all(True)
     modal_overlays = _modal_overlays(all_nodes)
     page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
+    visual_obstruction_candidates = _visual_obstruction_candidates(soup)
 
     forms: list[dict[str, Any]] = []
     for form in soup.find_all("form")[:_MAX_FORMS]:
@@ -1501,14 +1721,309 @@ def parse_composition_html(html: str, *, inspected_url: str, current_url: str) -
         "forms": forms,
         "navigation_targets": navigation_targets,
         "result_containers": result_containers,
+        "visible_text_excerpt": _schema_text(visible_text, _MAX_VISIBLE_TEXT_EXCERPT_CHARS),
         "anti_bot_indicators": anti_bot_indicators,
         "challenge_controls": challenge_controls,
         "modal_overlays": modal_overlays,
         "page_obstructions": page_obstructions,
+        "visual_obstruction_candidates": visual_obstruction_candidates,
         "schema_empty_page": schema_empty_page,
         "observed_empty_page": False,
         "empty_page_visual_state": None,
         "evidence_confidence": confidence,
         "source_tool": "inspect_page_for_composition",
-        **_evidence_metadata(anti_bot_indicators, forms=forms),
+        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
+    }
+
+
+def _structured_str(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _structured_classes(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    classes = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+    return " ".join(classes[:5])[:160]
+
+
+def _structured_select_options(value: Any) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return options
+    for option in value[:_MAX_SELECT_OPTIONS]:
+        if not isinstance(option, dict):
+            continue
+        options.append(
+            {
+                "text": _structured_str(option.get("text"))[:120],
+                "value": _structured_str(option.get("value")).strip()[:160],
+                "selected": option.get("selected") is True,
+            }
+        )
+    return options
+
+
+def _structured_form(form: Any) -> dict[str, Any] | None:
+    if not isinstance(form, dict):
+        return None
+    fields: list[dict[str, Any]] = []
+    for node in form.get("fields") or []:
+        if not isinstance(node, dict) or len(fields) >= _MAX_FIELDS_PER_FORM:
+            continue
+        field_type = (_structured_str(node.get("type")) or "text").lower()
+        fields.append(
+            {
+                "name": _structured_str(node.get("name"))[:120],
+                "id": _structured_str(node.get("id"))[:120],
+                "label": _schema_text(_structured_str(node.get("label")), 240),
+                "type": field_type[:40],
+                "value": _structured_str(node.get("value")).strip()[:160],
+                "class": _structured_classes(node.get("class")),
+                "placeholder": _schema_text(_structured_str(node.get("placeholder")), 240),
+                "required": node.get("required") is True,
+                "disabled": node.get("disabled") is True,
+                "checked": node.get("checked") is True,
+                "options": _structured_select_options(node.get("options")),
+                "selector": _structured_str(node.get("selector"))[:160],
+            }
+        )
+    submit_controls: list[dict[str, Any]] = []
+    for control in form.get("submit_controls") or []:
+        if not isinstance(control, dict):
+            continue
+        submit_controls.append(
+            {
+                "text": _schema_text(_structured_str(control.get("text")), 120),
+                "name": _structured_str(control.get("name"))[:120],
+                "id": _structured_str(control.get("id"))[:120],
+                "value": _structured_str(control.get("value")).strip()[:160],
+                "class": _structured_classes(control.get("class")),
+                "type": (_structured_str(control.get("type")) or "").lower()[:40],
+                "disabled": control.get("disabled") is True,
+                "selector": _structured_str(control.get("selector"))[:160],
+            }
+        )
+    return {
+        "id": _structured_str(form.get("id"))[:120],
+        "name": _structured_str(form.get("name"))[:120],
+        "action": _structured_str(form.get("action"))[:240],
+        "method": _structured_str(form.get("method"))[:20],
+        "fields": fields,
+        "submit_controls": submit_controls[:10],
+    }
+
+
+def _structured_navigation_targets(value: Any, *, base_url: str) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return targets
+    for link in value:
+        if len(targets) >= _MAX_NAVIGATION_TARGETS:
+            break
+        if not isinstance(link, dict):
+            continue
+        href = _structured_str(link.get("href")).strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        if not _same_origin(href, base_url):
+            continue
+        targets.append(
+            {
+                "text": _schema_text(_structured_str(link.get("text")), 160),
+                "href": href[:300],
+                "selector": _structured_str(link.get("selector"))[:160],
+            }
+        )
+    return targets
+
+
+def _structured_result_containers(value: Any) -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return containers
+    for node in value:
+        if len(containers) >= _MAX_RESULT_CONTAINERS:
+            break
+        if not isinstance(node, dict):
+            continue
+        tag_name = (_structured_str(node.get("tag")) or "").lower()
+        selector = _structured_str(node.get("selector"))[:160]
+        entry: dict[str, Any] = {
+            "tag": tag_name,
+            "id": _structured_str(node.get("id"))[:120],
+            "selector": selector,
+        }
+        sample_rows = [
+            _schema_text(_structured_str(row), 240)
+            for row in (node.get("sample_rows") or [])
+            if isinstance(row, str) and _result_row_text_is_content(row)
+        ][:5]
+        if sample_rows:
+            row_count = node.get("row_count")
+            entry["row_count"] = row_count if isinstance(row_count, int) and row_count > 0 else len(sample_rows)
+            entry["sample_rows"] = sample_rows
+        text_excerpt = _schema_text(
+            _structured_str(
+                node.get("text_excerpt") or node.get("content_excerpt") or node.get("sample_text") or node.get("text")
+            ),
+            240,
+        )
+        if text_excerpt:
+            entry["text_excerpt"] = text_excerpt
+        if tag_name == "table" or node.get("is_table") is True:
+            entry["row_selector"] = f"{selector} tbody tr"
+            entry["expand_toggle_candidates"] = [
+                f"{selector} tbody tr [aria-expanded]",
+                f'{selector} tbody tr [role="button"]',
+                f"{selector} tbody tr button",
+                f"{selector} tbody tr a",
+                f"{selector} tbody tr td:first-child",
+            ]
+        containers.append(entry)
+    return containers
+
+
+def _structured_challenge_controls(value: Any) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return controls
+    for node in value[:_MAX_CHALLENGE_CONTROLS]:
+        if not isinstance(node, dict):
+            continue
+        entry: dict[str, Any] = {
+            "tag": (_structured_str(node.get("tag")) or "").lower(),
+            "id": _structured_str(node.get("id"))[:120],
+            "name": _structured_str(node.get("name"))[:120],
+            "class": _structured_classes(node.get("class")),
+            "type": _structured_str(node.get("type"))[:40],
+            "selector": _structured_str(node.get("selector"))[:160],
+            "text": _schema_text(_structured_str(node.get("text")), 200),
+        }
+        for key in ("src", "title", "data_sitekey", "data_callback", "data_expired_callback", "data_error_callback"):
+            field_value = _structured_str(node.get(key)).strip()
+            if field_value:
+                entry[key] = field_value[:300]
+        controls.append({k: v for k, v in entry.items() if v})
+    return controls
+
+
+def _structured_modal_dismiss_controls(value: Any) -> list[dict[str, Any]]:
+    controls: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return controls
+    for control in value[:_MAX_MODAL_DISMISS_CONTROLS]:
+        if not isinstance(control, dict):
+            continue
+        entry = {
+            "tag": (_structured_str(control.get("tag")) or "").lower()[:40],
+            "text": _schema_text(_structured_str(control.get("text")), 120),
+            "aria_label": _schema_text(_structured_str(control.get("aria_label")), 120),
+            "title": _schema_text(_structured_str(control.get("title")), 120),
+            "selector": _structured_str(control.get("selector"))[:160],
+            "type": _structured_str(control.get("type"))[:40],
+        }
+        controls.append({k: v for k, v in entry.items() if v})
+    return controls
+
+
+def _structured_modal_overlays(value: Any) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return overlays
+    for node in value[:_MAX_MODAL_OVERLAYS]:
+        if not isinstance(node, dict):
+            continue
+        entry = {
+            "role": _structured_str(node.get("role"))[:80],
+            "aria_modal": node.get("aria_modal") is True,
+            "id": _structured_str(node.get("id"))[:120],
+            "class": _structured_classes(node.get("class")),
+            "selector": _structured_str(node.get("selector"))[:160],
+            "text": _schema_text(_structured_str(node.get("text")), 240),
+            "dismiss_controls": _structured_modal_dismiss_controls(node.get("dismiss_controls")),
+        }
+        overlays.append(
+            {key: field_value for key, field_value in entry.items() if field_value or key == "dismiss_controls"}
+        )
+    return overlays
+
+
+def _structured_visual_obstruction_candidates(value: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return candidates
+    for item in value:
+        if len(candidates) >= _MAX_PAGE_OBSTRUCTIONS:
+            break
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position")
+        if position not in {"fixed", "sticky"} or item.get("coverage") != "viewport":
+            continue
+        candidates.append(
+            {
+                # computed_style: from getComputedStyle, matching the obstruction-augmentation path.
+                "source": "computed_style",
+                "position": position,
+                "coverage": "viewport",
+                "has_visible_controls": item.get("has_visible_controls") is True,
+            }
+        )
+    return candidates
+
+
+def parse_composition_structured(data: Any, *, inspected_url: str, current_url: str) -> dict[str, Any] | None:
+    """Map the structured-evidence JSON to the same PageEvidence dict; None falls back to the get_html path."""
+    if not isinstance(data, dict):
+        return None
+    base_url = current_url or inspected_url
+    page_title = _schema_text(_structured_str(data.get("page_title")), 240)
+    forms = [form for form in (_structured_form(item) for item in data.get("forms") or []) if form is not None]
+    forms = forms[:_MAX_FORMS]
+    navigation_targets = _structured_navigation_targets(data.get("navigation_targets"), base_url=base_url)
+    result_containers = _structured_result_containers(data.get("result_containers"))
+    challenge_controls = _structured_challenge_controls(data.get("challenge_controls"))
+    modal_overlays = _structured_modal_overlays(data.get("modal_overlays"))
+    page_obstructions = _page_obstructions_from_modal_overlays(modal_overlays)
+    visual_obstruction_candidates = _structured_visual_obstruction_candidates(data.get("visual_obstruction_candidates"))
+    visible_text = _schema_text(_structured_str(data.get("visible_text_excerpt")), _MAX_VISIBLE_TEXT_EXCERPT_CHARS)
+
+    # Re-validate JS-reported indicators against _ANTI_BOT_PATTERNS and union a title scan.
+    reported = {indicator for indicator in (data.get("anti_bot_indicators") or []) if isinstance(indicator, str)}
+    matched = reported | set(_anti_bot_indicators("", page_title))
+    anti_bot_indicators = [pattern for pattern in _ANTI_BOT_PATTERNS if pattern in matched]
+
+    field_count = sum(len(form.get("fields") or []) for form in forms)
+    control_count = sum(len(form.get("submit_controls") or []) for form in forms)
+    # body_has_markup mirrors the HTML path's html.strip() for schema-empty parity.
+    body_has_markup = data.get("body_has_markup") is True
+    schema_empty_page = bool(body_has_markup or visible_text or page_title) and not (
+        forms
+        or navigation_targets
+        or result_containers
+        or challenge_controls
+        or page_obstructions
+        or anti_bot_indicators
+    )
+    confidence = 0.85 if field_count and control_count else 0.6 if field_count else 0.3 if forms else 0.1
+    return {
+        "inspected_url": inspected_url,
+        "current_url": current_url,
+        "page_title": page_title,
+        "forms": forms,
+        "navigation_targets": navigation_targets,
+        "result_containers": result_containers,
+        "visible_text_excerpt": visible_text,
+        "anti_bot_indicators": anti_bot_indicators,
+        "challenge_controls": challenge_controls,
+        "modal_overlays": modal_overlays,
+        "page_obstructions": page_obstructions,
+        "visual_obstruction_candidates": visual_obstruction_candidates,
+        "schema_empty_page": schema_empty_page,
+        "observed_empty_page": False,
+        "empty_page_visual_state": None,
+        "evidence_confidence": confidence,
+        "source_tool": "inspect_page_for_composition",
+        **_evidence_metadata(anti_bot_indicators, forms=forms, challenge_controls=challenge_controls),
     }

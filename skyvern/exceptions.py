@@ -161,6 +161,19 @@ class InvalidOpenAIResponseFormat(SkyvernException):
         super().__init__(f"Invalid response format: {message}")
 
 
+class ConditionalBranchEvaluationError(SkyvernException):
+    """A conditional block could not resolve which branch to take."""
+
+
+class MalformedBranchEvaluationError(ConditionalBranchEvaluationError):
+    """The LLM's branch-evaluation output could not be safely aligned to the branches.
+
+    Raised for a wrong result count, a missing/duplicate condition_index, or an
+    unparseable shape. A distinct type lets the batch evaluator re-roll a fresh LLM call
+    instead of hard-failing immediately or silently routing to the wrong branch.
+    """
+
+
 class FailedToSendWebhook(SkyvernException):
     def __init__(
         self,

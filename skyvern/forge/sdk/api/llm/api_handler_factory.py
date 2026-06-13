@@ -45,6 +45,7 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import EnrichTreeMode, SkyvernContext
 from skyvern.forge.sdk.db.enums import WorkflowRunTriggerType
+from skyvern.forge.sdk.experimentation.prompt_families import effective_prompt_schema_variant
 from skyvern.forge.sdk.models import SpeculativeLLMMetadata, Step
 from skyvern.forge.sdk.schemas.ai_suggestions import AISuggestion
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, Thought
@@ -55,12 +56,19 @@ from skyvern.schemas.llm import (
     LLMRouterConfig,
 )
 from skyvern.utils.image_resizer import Resolution, get_resize_target_dimension, resize_screenshots
+from skyvern.utils.image_token_estimator import estimate_image_cost, estimate_image_tokens, provider_image_tokens
 
 # Keep this server-only side effect out of the package __init__ so the legacy
 # models shim can import without litellm. Legacy LLM calls enter this module.
 configure_litellm_transport()
 
 LOG = structlog.get_logger()
+
+# Vertex returns this trafficType for flex-tier calls. litellm (through 1.88.1 and
+# main) neither maps it nor applies tier pricing in completion_cost, so flex bills at
+# standard; we halve it at the cost sites (flex = 50% of standard, Google Vertex SKU).
+_VERTEX_FLEX_TRAFFIC_TYPE = "ON_DEMAND_FLEX"
+_VERTEX_FLEX_COST_MULTIPLIER = 0.5
 
 # Canonical span name for all LLM chokepoints. Milestone 1 of the agent
 # profiling project — keep consistent so SigNoz aggregations can query across
@@ -82,6 +90,17 @@ EXTRACT_ACTION_DEFAULT_THINKING_BUDGET = settings.EXTRACT_ACTION_THINKING_BUDGET
 DEFAULT_THINKING_BUDGET = settings.DEFAULT_THINKING_BUDGET
 
 
+def _set_llm_context_attrs(
+    span: otel_trace.Span,
+    *,
+    screenshots: list[bytes] | None,
+    is_speculative_step: bool,
+) -> None:
+    span.set_attribute("screenshots_included", bool(screenshots))
+    span.set_attribute("screenshot_count", len(screenshots) if screenshots else 0)
+    span.set_attribute("speculative", bool(is_speculative_step))
+
+
 def _enrich_llm_span(
     span: otel_trace.Span,
     *,
@@ -93,6 +112,9 @@ def _enrich_llm_span(
     cached_tokens: int = 0,
     latency_ms: int,
     llm_cost: float = 0.0,
+    image_tokens: int = 0,
+    image_cost: float = 0.0,
+    image_count: int = 0,
 ) -> None:
     """Set canonical attributes + emit llm.request.completed event on an LLM span.
 
@@ -109,6 +131,9 @@ def _enrich_llm_span(
     span.set_attribute("status", "ok")
     span.set_attribute("cache_hit", bool(cached_tokens))
     span.set_attribute("llm_cost", llm_cost)
+    span.set_attribute("image_tokens", image_tokens)
+    span.set_attribute("image_cost", image_cost)
+    span.set_attribute("image_count", image_count)
     # Gen AI OTEL semantic conventions — enables auto-dashboards in providers
     # that support the spec (Logfire, SigNoz gen_ai module).
     # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/
@@ -131,6 +156,9 @@ def _enrich_llm_span(
             "cached_tokens": cached_tokens,
             "latency_ms": latency_ms,
             "llm_cost": llm_cost,
+            "image_tokens": image_tokens,
+            "image_cost": image_cost,
+            "image_count": image_count,
             "prompt_name": prompt_name,
         },
     )
@@ -202,6 +230,29 @@ def _llm_screenshots_enabled_metric(
     return True
 
 
+def _image_metrics_for_call(
+    screenshots: list[bytes] | None, model: str | None, response: Any = None
+) -> tuple[int, int, float, str | None]:
+    """(image_count, image_tokens, image_cost, source) for the screenshots sent in one call.
+
+    Prefers the provider's billed image tokens (Gemini/Vertex report them) and falls back
+    to the deterministic estimator. Best-effort: failures degrade to zeros.
+    """
+    if not screenshots or not settings.LLM_IMAGE_COST_TRACKING_ENABLED:
+        return 0, 0, 0.0, None
+    try:
+        billed_tokens = provider_image_tokens(response)
+        if billed_tokens is not None:
+            image_tokens, source = billed_tokens, "provider"
+        else:
+            image_tokens, source = estimate_image_tokens(screenshots, model or ""), "estimate"
+        image_cost = estimate_image_cost(image_tokens, model or "")
+        return len(screenshots), image_tokens, image_cost, source
+    except Exception:
+        LOG.debug("Failed to compute image token cost", exc_info=True)
+        return len(screenshots), 0, 0.0, None
+
+
 def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = None) -> dict[str, Any]:
     if context is None:
         return {
@@ -215,6 +266,14 @@ def _enrich_tree_log_fields(context: SkyvernContext | None, step: Step | None = 
         "enrich_tree_mode": context.enrich_tree_mode.value,
         "enrich_tree_fallback_active": context.enrich_tree_fallback_active(retry_index=retry_index),
         "enriched_tree_enabled": context.enriched_tree_enabled(),
+    }
+
+
+def _slim_log_fields(context: SkyvernContext | None, prompt_name: str | None) -> dict[str, Any]:
+    assigned = context.slim_output_variant_assigned if context else None
+    return {
+        "prompt_schema_variant": effective_prompt_schema_variant(assigned, prompt_name),
+        "prompt_schema_variant_assigned": assigned,
     }
 
 
@@ -462,6 +521,44 @@ class LLMAPIHandlerFactory:
         return input_tokens, output_tokens, reasoning_tokens, cached_tokens
 
     @staticmethod
+    def _extract_reported_usage_cost(response: ModelResponse | CustomStreamWrapper) -> float | None:
+        """Return provider-reported cost from response.usage.cost when present."""
+        if not hasattr(response, "usage") or not response.usage:
+            return None
+
+        usage = response.usage
+        cost = getattr(usage, "cost", None)
+        if cost is None and isinstance(usage, dict):
+            cost = usage.get("cost")
+        if cost is None:
+            return None
+
+        try:
+            cost_value = float(cost)
+        except (TypeError, ValueError):
+            return None
+
+        return cost_value if cost_value >= 0 else None
+
+    @staticmethod
+    def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
+        """litellm completion cost, with the Vertex Gemini flex tier billed at 50%.
+
+        Flex is 50% of standard, but litellm reports both at the standard rate, so the
+        discount is applied here. Internal cost tracking only — never customer-facing.
+        """
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+        except Exception as e:
+            LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
+            return 0.0
+        hidden_params = getattr(response, "_hidden_params", None)
+        provider_specific = hidden_params.get("provider_specific_fields") if isinstance(hidden_params, dict) else None
+        if isinstance(provider_specific, dict) and provider_specific.get("traffic_type") == _VERTEX_FLEX_TRAFFIC_TYPE:
+            return cost * _VERTEX_FLEX_COST_MULTIPLIER
+        return cost
+
+    @staticmethod
     def _apply_thinking_budget_optimization(
         parameters: dict[str, Any], new_budget: int, llm_config: LLMConfig | LLMRouterConfig, prompt_name: str
     ) -> None:
@@ -542,10 +639,16 @@ class LLMAPIHandlerFactory:
 
     @staticmethod
     def requires_adaptive_thinking(model_name: str | None) -> bool:
-        # Claude Opus 4.7 rejects `thinking.type=enabled` and requires
+        # Newer direct Anthropic models reject `thinking.type=enabled` and require
         # `thinking.type=adaptive` + `output_config.effort`. Bedrock's translator
         # does not yet accept the new shape, so gate to direct Anthropic.
-        return model_name == "anthropic/claude-opus-4-7"
+        return model_name in {
+            "anthropic/claude-opus-4-7",
+            "anthropic/claude-opus-4-8",
+            "anthropic/claude-fable-5",
+            "anthropic-claude-opus-4-8",
+            "anthropic-claude-fable-5",
+        }
 
     @staticmethod
     def _apply_anthropic_thinking_optimization(
@@ -553,8 +656,9 @@ class LLMAPIHandlerFactory:
     ) -> None:
         """Apply thinking optimization for Anthropic/Claude models."""
         model_label = LLMAPIHandlerFactory._get_model_label(llm_config)
+        check_model = LLMAPIHandlerFactory._get_check_model(llm_config, model_label)
 
-        if LLMAPIHandlerFactory.requires_adaptive_thinking(model_label):
+        if LLMAPIHandlerFactory.requires_adaptive_thinking(check_model):
             parameters["thinking"] = {"type": "adaptive"}
             parameters.setdefault("output_config", {})["effort"] = LLMAPIHandlerFactory.ADAPTIVE_THINKING_EFFORT
             LOG.debug(
@@ -682,7 +786,8 @@ class LLMAPIHandlerFactory:
         check_model = model_label
         if isinstance(llm_config, LLMRouterConfig) and getattr(llm_config, "model_list", None):
             try:
-                check_model = llm_config.model_list[0].model_name or model_label  # type: ignore[attr-defined]
+                primary_model = llm_config.model_list[0]  # type: ignore[attr-defined]
+                check_model = primary_model.litellm_params.get("model") or primary_model.model_name or model_label
             except Exception:
                 check_model = model_label
         return check_model
@@ -1000,6 +1105,7 @@ class LLMAPIHandlerFactory:
                             )
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 # Build messages and apply caching in one step
                 messages = await llm_messages_builder(prompt, screenshots, llm_config.add_assistant_prefix)
@@ -1325,12 +1431,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1433,6 +1535,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, model_used or main_model_group, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1450,8 +1555,13 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
@@ -1466,6 +1576,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -1666,6 +1779,7 @@ class LLMAPIHandlerFactory:
 
                 screenshots = _llm_screenshots_for_call(screenshots, llm_config, context, prompt_name, step)
                 llm_screenshots_enabled = _llm_screenshots_enabled_metric(llm_config, context, prompt_name, step)
+                _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
                 model_name = llm_config.model_name
 
@@ -1875,12 +1989,8 @@ class LLMAPIHandlerFactory:
                 cached_tokens = 0
                 completion_token_detail = None
                 cached_token_detail = None
-                try:
-                    # FIXME: volcengine doesn't support litellm cost calculation.
-                    llm_cost = litellm.completion_cost(completion_response=response)
-                except Exception as e:
-                    LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                    llm_cost = 0
+                # FIXME: volcengine doesn't support litellm cost calculation.
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
                 prompt_tokens = 0
                 completion_tokens = 0
                 reasoning_tokens = 0
@@ -1975,6 +2085,9 @@ class LLMAPIHandlerFactory:
                     step.organization_id if step else (thought.organization_id if thought else None)
                 )
                 duration_seconds = time.perf_counter() - start_time
+                image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                    screenshots, actual_model or llm_config.model_name, response
+                )
                 LOG.info(
                     "LLM API handler duration metrics",
                     llm_key=llm_key,
@@ -1992,8 +2105,13 @@ class LLMAPIHandlerFactory:
                     reasoning_tokens=reasoning_tokens if reasoning_tokens > 0 else None,
                     cached_tokens=cached_tokens if cached_tokens > 0 else None,
                     llm_cost=llm_cost if llm_cost > 0 else None,
+                    image_count=image_count if image_count > 0 else None,
+                    image_tokens=image_tokens if image_tokens > 0 else None,
+                    image_cost=image_cost if image_cost > 0 else None,
+                    image_tokens_source=image_source,
                     service_tier=getattr(response, "service_tier", None),
                     llm_screenshots_enabled=llm_screenshots_enabled,
+                    **_slim_log_fields(context, prompt_name),
                     **_enrich_tree_log_fields(context, step),
                     **_consume_prompt_breakdown(context),
                 )
@@ -2012,6 +2130,9 @@ class LLMAPIHandlerFactory:
                     cached_tokens=int(cached_tokens or 0),
                     latency_ms=int(duration_seconds * 1000),
                     llm_cost=float(llm_cost or 0.0),
+                    image_tokens=int(image_tokens or 0),
+                    image_cost=float(image_cost or 0.0),
+                    image_count=int(image_count or 0),
                 )
 
                 if step and is_speculative_step:
@@ -2304,6 +2425,7 @@ class LLMCaller:
 
             screenshots = _llm_screenshots_for_call(screenshots, self.llm_config, context, prompt_name, step)
             llm_screenshots_enabled = _llm_screenshots_enabled_metric(self.llm_config, context, prompt_name, step)
+            _set_llm_context_attrs(_llm_span, screenshots=screenshots, is_speculative_step=is_speculative_step)
 
             message_pattern = "openai"
             if "ANTHROPIC" in self.llm_key:
@@ -2450,6 +2572,9 @@ class LLMCaller:
             )
             # Track LLM API handler duration, token counts, and cost
             duration_seconds = time.perf_counter() - start_time
+            image_count, image_tokens, image_cost, image_source = _image_metrics_for_call(
+                screenshots, actual_model or self.llm_config.model_name, response
+            )
             LOG.info(
                 "LLM API handler duration metrics",
                 llm_key=self.llm_key,
@@ -2469,7 +2594,12 @@ class LLMCaller:
                 else None,
                 cached_tokens=call_stats.cached_tokens if call_stats and call_stats.cached_tokens is not None else None,
                 llm_cost=call_stats.llm_cost if call_stats and call_stats.llm_cost is not None else None,
+                image_count=image_count if image_count > 0 else None,
+                image_tokens=image_tokens if image_tokens > 0 else None,
+                image_cost=image_cost if image_cost > 0 else None,
+                image_tokens_source=image_source,
                 llm_screenshots_enabled=llm_screenshots_enabled,
+                **_slim_log_fields(context, prompt_name),
                 **_enrich_tree_log_fields(context, step),
                 **_consume_prompt_breakdown(context),
             )
@@ -2486,6 +2616,9 @@ class LLMCaller:
                 cached_tokens=int(call_stats.cached_tokens or 0),
                 latency_ms=int(duration_seconds * 1000),
                 llm_cost=float(call_stats.llm_cost or 0.0),
+                image_tokens=int(image_tokens or 0),
+                image_cost=float(image_cost or 0.0),
+                image_count=int(image_count or 0),
             )
 
             # Raw response is used for CUA engine LLM calls.
@@ -2787,8 +2920,6 @@ class LLMCaller:
         self, response: ModelResponse | CustomStreamWrapper | AnthropicMessage | UITarsResponse
     ) -> LLMCallStats:
         empty_call_stats = LLMCallStats()
-        if self.original_llm_key.startswith("openrouter/"):
-            return empty_call_stats
 
         # Handle OPENAI_COMPATIBLE provider GitHub Copilot
         if self.original_llm_key == "OPENAI_COMPATIBLE" and isinstance(response, (ModelResponse, CustomStreamWrapper)):
@@ -2829,14 +2960,22 @@ class LLMCaller:
                 reasoning_tokens=0,
             )
         elif isinstance(response, (ModelResponse, CustomStreamWrapper)):
-            try:
-                llm_cost = litellm.completion_cost(completion_response=response)
-            except Exception as e:
-                LOG.debug("Failed to calculate LLM cost", error=str(e), exc_info=True)
-                llm_cost = 0
             input_tokens, output_tokens, reasoning_tokens, cached_tokens = LLMAPIHandlerFactory._extract_token_counts(
                 response
             )
+            llm_cost = 0.0
+            if self.original_llm_key.startswith("openrouter/"):
+                reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
+                if reported_cost is not None:
+                    llm_cost = reported_cost
+                else:
+                    LOG.warning(
+                        "OpenRouter response missing usage.cost; cost will be reported as 0",
+                        llm_key=self.original_llm_key,
+                        response_id=getattr(response, "id", None),
+                    )
+            else:
+                llm_cost = LLMAPIHandlerFactory._completion_cost(response)
             return LLMCallStats(
                 llm_cost=llm_cost,
                 input_tokens=input_tokens,

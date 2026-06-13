@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisFailureType,
@@ -114,6 +115,166 @@ def test_repairable_block_failure_contract_is_queryable_and_safe() -> None:
     assert contract.diagnosis_input.browser_page_state["current_origin"] == "https://example.test"
     assert "secret" not in contract.model_dump_json()
     assert "hunter2" not in contract.model_dump_json()
+
+
+def test_credentialed_runtime_auth_failure_repairs_failed_code_block() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="run_blocks_and_collect_debug",
+        result={
+            "ok": False,
+            "error": "The code block used saved credentials but the browser ended on Login Failure.",
+            "data": {
+                "workflow_run_id": "wr_auth",
+                "overall_status": "failed",
+                "requested_block_labels": ["login"],
+                "executed_block_labels": ["login"],
+                "frontier_start_label": "login",
+                "current_url": "https://example.test/loginFail/",
+                "page_title": "Login Failure",
+                "failure_categories": [{"category": "AUTH_FAILURE", "reasoning": "login rejected"}],
+                "blocks": [
+                    {
+                        "label": "login",
+                        "block_type": "CODE",
+                        "status": "failed",
+                        "failure_reason": "Saved credentials were submitted, but the page showed Login Failure.",
+                    }
+                ],
+            },
+        },
+        ctx=_ctx(),
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["login"]
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action != RepairNextAction.ASK
+
+
+def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None:
+    ctx = _ctx()
+    ctx.completion_verification_result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                satisfied=False,
+                reason_code="evidence_contradicts",
+                evidence_ref="current_url,page_title",
+            )
+        ],
+    )
+
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": (
+                "Completion verification contradicted code output: login_succeeded=True, "
+                "but saved credentials landed on /loginFail/ with Login Failure page evidence."
+            ),
+            "data": {
+                "workflow_run_id": "wr_outcome",
+                "overall_status": "completed",
+                "frontier_start_label": "login",
+                "current_url": "https://example.test/loginFail/",
+                "page_title": "Login Failure",
+                "failure_categories": [
+                    {
+                        "category": "OUTCOME_UNVERIFIED",
+                        "reasoning": "success flag contradicted by current page evidence",
+                    }
+                ],
+                "completion_verification": ctx.completion_verification_result.to_trace_data(),
+                "blocks": [{"label": "login", "block_type": "CODE", "status": "completed"}],
+            },
+        },
+        ctx=ctx,
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.REPAIRABLE_BLOCK_FAILURE
+    assert contract.repair_decision.next_action == RepairNextAction.REPAIR
+    assert contract.repair_decision.target_blocks == ["login"]
+    assert contract.verification_result.user_goal_satisfied is False
+    assert contract.verification_result.completion_contract_satisfied is False
+    assert contract.diagnosis_result.suspected_failure_type != DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT
+    assert contract.repair_decision.next_action != RepairNextAction.ASK
+
+
+def test_unbound_credential_skip_and_parameter_binding_errors_still_ask() -> None:
+    unbound = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": True,
+            "message": "Skipped test run: required credentials are not configured.",
+            "data": {
+                "workflow_updated": True,
+                "skipped_run": True,
+                "skip_reason": "workflow_credential_inputs_unbound",
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+    binding_error = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Missing required workflow parameter for credential binding.",
+            "data": {
+                "overall_status": "failed",
+                "failure_categories": [{"category": "PARAMETER_BINDING_ERROR"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert (
+        unbound.diagnosis_result.suspected_failure_type,
+        unbound.repair_decision.next_action,
+        binding_error.diagnosis_result.suspected_failure_type,
+        binding_error.repair_decision.next_action,
+    ) == (
+        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+        RepairNextAction.ASK,
+        DiagnosisFailureType.MISSING_CREDENTIAL_OR_INIT,
+        RepairNextAction.ASK,
+    )
+
+
+def test_active_run_terminal_evidence_contract_stops_without_marking_workflow_success() -> None:
+    contract = build_diagnosis_repair_contract(
+        source_tool="update_and_run_blocks",
+        result={
+            "ok": False,
+            "error": "Active run terminal evidence was observed.",
+            "data": {
+                "workflow_run_id": "wr_active",
+                "overall_status": "canceled",
+                "active_run_terminal_evidence_detected": True,
+                "active_run_terminal_completion_verification": {
+                    "status": "evaluated",
+                    "criterion_count": 1,
+                    "satisfied_count": 1,
+                    "fully_satisfied": True,
+                    "reason_codes": ["evidence_confirms"],
+                },
+                "failure_categories": [{"category": "ACTIVE_RUN_TERMINAL_EVIDENCE"}],
+            },
+        },
+        ctx=_ctx(),
+        workflow_updated=True,
+    )
+
+    assert contract.diagnosis_result.suspected_failure_type == DiagnosisFailureType.ACTIVE_RUN_TERMINAL_EVIDENCE
+    assert contract.repair_decision.next_action == RepairNextAction.STOP
+    assert contract.verification_result.user_goal_satisfied is True
+    assert contract.verification_result.completion_contract_satisfied is True
+    assert "not verified end-to-end" in contract.repair_decision.proposed_change_summary
 
 
 def test_anti_bot_suspicious_success_contract_stops_instead_of_repairing() -> None:

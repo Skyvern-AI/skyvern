@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.webeye import video_utils
-from skyvern.webeye.video_utils import finalize_webm
+from skyvern.webeye.video_utils import (
+    cut_recording_segment,
+    finalize_webm,
+    plan_run_segment,
+    prepare_recording_for_upload,
+    probe_media_duration_seconds,
+)
 
 
 def _write_unfinalized_webm(path: str) -> bytes:
@@ -71,7 +80,7 @@ async def test_finalize_webm_without_ffmpeg_returns_raw(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_finalize_webm_invokes_ffmpeg_with_cues_at_front(tmp_path) -> None:
+async def test_prepare_recording_for_upload_invokes_ffmpeg_with_h264_mp4_compression(tmp_path) -> None:
     src = str(tmp_path / "src.webm")
     _write_unfinalized_webm(src)
 
@@ -91,17 +100,87 @@ async def test_finalize_webm_invokes_ffmpeg_with_cues_at_front(tmp_path) -> None
 
     with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
         with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
-            result = await finalize_webm(src)
+            async with prepare_recording_for_upload(src) as prepared:
+                with open(prepared.path, "rb") as f:
+                    result = f.read()
+                extension = prepared.file_extension
 
     assert result == b"REMUXED_CONTENT"
-    assert "-c" in captured_args and "copy" in captured_args
-    assert "-cues_to_front" in captured_args
-    # cues_to_front must be followed by "1"
-    assert captured_args[captured_args.index("-cues_to_front") + 1] == "1"
-    assert "-reserve_index_space" in captured_args
+    assert extension == "mp4"
+    assert "-c:v" in captured_args
+    assert captured_args[captured_args.index("-c:v") + 1] == "libx264"
+    assert "-preset" in captured_args
+    assert captured_args[captured_args.index("-preset") + 1] == settings.VIDEO_COMPRESSION_PRESET
+    assert "-crf" in captured_args
+    assert captured_args[captured_args.index("-crf") + 1] == str(settings.VIDEO_COMPRESSION_CRF)
+    assert "-pix_fmt" in captured_args
+    assert captured_args[captured_args.index("-pix_fmt") + 1] == "yuv420p"
+    assert "-an" in captured_args
+    assert "-movflags" in captured_args
+    assert captured_args[captured_args.index("-movflags") + 1] == "+faststart"
     assert captured_args[0] == video_utils.FFMPEG_BINARY
     assert captured_args[-2] != src  # output path is the temp file, not input
+    assert captured_args[-1].endswith(".mp4")
     assert src in captured_args
+
+
+@pytest.mark.asyncio
+async def test_prepare_recording_for_upload_can_disable_compression_and_stream_copy_remux(tmp_path) -> None:
+    src = str(tmp_path / "src.webm")
+    _write_unfinalized_webm(src)
+
+    captured_args: list[str] = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.extend(args)
+        output_path = args[-1]
+        with open(output_path, "wb") as f:
+            f.write(b"REMUXED_CONTENT")
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.wait = AsyncMock(return_value=0)
+        return proc
+
+    with patch.object(settings, "VIDEO_COMPRESSION_ENABLED", False):
+        with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+                async with prepare_recording_for_upload(src) as prepared:
+                    with open(prepared.path, "rb") as f:
+                        result = f.read()
+                    extension = prepared.file_extension
+
+    assert result == b"REMUXED_CONTENT"
+    assert extension == "webm"
+    assert "-c" in captured_args and "copy" in captured_args
+    assert "-c:v" not in captured_args
+
+
+@pytest.mark.asyncio
+async def test_prepare_recording_for_upload_yields_temp_path_and_cleans_up(tmp_path) -> None:
+    src = str(tmp_path / "src.webm")
+    _write_unfinalized_webm(src)
+
+    async def fake_exec(*args, **kwargs):
+        output_path = args[-1]
+        with open(output_path, "wb") as f:
+            f.write(b"COMPRESSED_CONTENT")
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.wait = AsyncMock(return_value=0)
+        return proc
+
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
+        with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+            async with prepare_recording_for_upload(src) as prepared:
+                temp_path = prepared.path
+                assert prepared.path != src
+                assert prepared.file_extension == "mp4"
+                with open(prepared.path, "rb") as f:
+                    assert f.read() == b"COMPRESSED_CONTENT"
+
+    assert not os.path.exists(temp_path)
 
 
 @pytest.mark.asyncio
@@ -121,6 +200,54 @@ async def test_finalize_webm_falls_back_on_ffmpeg_error(tmp_path) -> None:
             result = await finalize_webm(src)
 
     assert result == expected
+
+
+@pytest.mark.asyncio
+async def test_finalize_webm_kills_ffmpeg_on_cancellation(tmp_path) -> None:
+    src = str(tmp_path / "src.webm")
+    _write_unfinalized_webm(src)
+
+    killed = False
+    waited = False
+    output_paths: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+
+        async def communicate(self):
+            return b"", b""
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            nonlocal waited
+            waited = True
+            return self.returncode
+
+    async def fake_exec(*args, **kwargs):
+        output_path = args[-1]
+        output_paths.append(output_path)
+        with open(output_path, "wb") as f:
+            f.write(b"PARTIAL_OUTPUT")
+        return FakeProcess()
+
+    async def immediate_cancel(coro, timeout):
+        coro.close()
+        raise asyncio.CancelledError()
+
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
+        with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+            with patch.object(video_utils.asyncio, "wait_for", side_effect=immediate_cancel):
+                with pytest.raises(asyncio.CancelledError):
+                    await finalize_webm(src)
+
+    assert killed
+    assert waited
+    assert output_paths
+    assert not any(os.path.exists(output_path) for output_path in output_paths)
 
 
 @pytest.mark.asyncio
@@ -176,5 +303,165 @@ async def test_finalize_webm_end_to_end_sets_duration(tmp_path) -> None:
     )
 
     output = await finalize_webm(src)
-    # Duration element tag is 0x4489 — must be present after remux.
+    # Duration element tag is 0x4489 — must be present after finalization.
     assert b"\x44\x89" in output[:4096]
+
+
+def test_plan_run_segment_clamps_leading_run_in_long_session() -> None:
+    # The production incident: a 29-min run is the first slice of a ~3h session recording.
+    video_start = datetime(2026, 6, 4, 15, 59, 0, tzinfo=UTC)
+    duration = 3 * 60 * 60  # 15:59 -> 18:59
+    run_started = datetime(2026, 6, 4, 15, 58, 42, tzinfo=UTC)  # 18s before the video began
+    run_finished = datetime(2026, 6, 4, 16, 27, 29, tzinfo=UTC)
+    segment = plan_run_segment(run_started, run_finished, video_start, duration)
+    assert segment is not None
+    start, clip_duration = segment
+    assert start == 0.0  # negative offset clamped to start of video
+    assert clip_duration == pytest.approx((run_finished - video_start).total_seconds())
+
+
+def test_plan_run_segment_run_fully_inside() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    segment = plan_run_segment(
+        datetime(2026, 1, 1, 10, 10, tzinfo=UTC), datetime(2026, 1, 1, 10, 20, tzinfo=UTC), video_start, 3600
+    )
+    assert segment == (600.0, 600.0)
+
+
+def test_plan_run_segment_no_overlap_returns_none() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    # Run finished before this video started — belongs to an earlier recording.
+    assert (
+        plan_run_segment(
+            datetime(2026, 1, 1, 9, 0, tzinfo=UTC), datetime(2026, 1, 1, 9, 30, tzinfo=UTC), video_start, 3600
+        )
+        is None
+    )
+
+
+def test_plan_run_segment_unfinished_run_extends_to_video_end() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    segment = plan_run_segment(datetime(2026, 1, 1, 10, 30, tzinfo=UTC), None, video_start, 3600)
+    assert segment == (1800.0, 1800.0)
+
+
+def test_plan_run_segment_too_short_returns_none() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    segment = plan_run_segment(
+        datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC),
+        datetime(2026, 1, 1, 10, 0, 0, 500000, tzinfo=UTC),  # 0.5s
+        video_start,
+        3600,
+    )
+    assert segment is None
+
+
+def test_plan_run_segment_zero_duration_video_returns_none() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    assert plan_run_segment(datetime(2026, 1, 1, 10, 5, tzinfo=UTC), None, video_start, 0) is None
+
+
+def test_plan_run_segment_treats_naive_as_utc() -> None:
+    video_start = datetime(2026, 1, 1, 10, 0)  # naive
+    segment = plan_run_segment(datetime(2026, 1, 1, 10, 10), datetime(2026, 1, 1, 10, 20), video_start, 3600)
+    assert segment == (600.0, 600.0)
+
+
+@pytest.mark.asyncio
+async def test_probe_media_duration_parses_seconds(tmp_path) -> None:
+    src = str(tmp_path / "v.mp4")
+    with open(src, "wb") as f:
+        f.write(b"x")
+
+    async def fake_exec(*args, **kwargs):
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"12.5\n", b""))
+        return proc
+
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffprobe"):
+        with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+            assert await probe_media_duration_seconds(src) == 12.5
+
+
+@pytest.mark.asyncio
+async def test_probe_media_duration_without_ffprobe_returns_none(tmp_path) -> None:
+    src = str(tmp_path / "v.mp4")
+    with open(src, "wb") as f:
+        f.write(b"x")
+    with patch.object(video_utils.shutil, "which", return_value=None):
+        assert await probe_media_duration_seconds(src) is None
+
+
+@pytest.mark.asyncio
+async def test_probe_media_duration_unparseable_returns_none(tmp_path) -> None:
+    src = str(tmp_path / "v.mp4")
+    with open(src, "wb") as f:
+        f.write(b"x")
+
+    async def fake_exec(*args, **kwargs):
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"N/A\n", b""))
+        return proc
+
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffprobe"):
+        with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+            assert await probe_media_duration_seconds(src) is None
+
+
+@pytest.mark.asyncio
+async def test_cut_recording_segment_reencodes_with_accurate_seek(tmp_path) -> None:
+    src = str(tmp_path / "session.mp4")
+    with open(src, "wb") as f:
+        f.write(b"src")
+
+    captured_args: list[str] = []
+
+    async def fake_exec(*args, **kwargs):
+        captured_args.extend(args)
+        with open(args[-1], "wb") as f:
+            f.write(b"CLIP")
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.wait = AsyncMock(return_value=0)
+        return proc
+
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
+        with patch.object(video_utils.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+            async with cut_recording_segment(src, start_seconds=12.0, duration_seconds=30.0) as clip_path:
+                assert clip_path is not None
+                temp_path = clip_path
+                with open(clip_path, "rb") as f:
+                    assert f.read() == b"CLIP"
+                assert clip_path.endswith(".mp4")
+
+    assert not os.path.exists(temp_path)  # cleaned up on exit
+    assert "-ss" in captured_args and captured_args[captured_args.index("-ss") + 1] == "12.000"
+    assert "-t" in captured_args and captured_args[captured_args.index("-t") + 1] == "30.000"
+    # Re-encode (not -c copy) so the cut is frame-accurate and never pulls in prior-run pre-roll.
+    assert "-c:v" in captured_args and captured_args[captured_args.index("-c:v") + 1] == "libx264"
+    assert "-an" in captured_args
+    # input-side seek: -ss must come before -i
+    assert captured_args.index("-ss") < captured_args.index("-i")
+
+
+@pytest.mark.asyncio
+async def test_cut_recording_segment_without_ffmpeg_yields_none(tmp_path) -> None:
+    src = str(tmp_path / "session.mp4")
+    with open(src, "wb") as f:
+        f.write(b"src")
+    with patch.object(video_utils.shutil, "which", return_value=None):
+        async with cut_recording_segment(src, start_seconds=0.0, duration_seconds=10.0) as clip_path:
+            assert clip_path is None
+
+
+@pytest.mark.asyncio
+async def test_cut_recording_segment_nonpositive_duration_yields_none(tmp_path) -> None:
+    src = str(tmp_path / "session.mp4")
+    with open(src, "wb") as f:
+        f.write(b"src")
+    with patch.object(video_utils.shutil, "which", return_value="/usr/bin/ffmpeg"):
+        async with cut_recording_segment(src, start_seconds=0.0, duration_seconds=0.0) as clip_path:
+            assert clip_path is None

@@ -27,17 +27,19 @@ exact threat the vault architecture is designed to prevent.
 
 import asyncio
 import json
-from datetime import datetime
+from typing import Annotated
 
 import structlog
-from fastapi import BackgroundTasks, Body, Depends, HTTPException, Path, Query
+from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
 from skyvern.exceptions import SkyvernHTTPException
 from skyvern.forge import app
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
-from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType, WorkflowRunTriggerType
+from skyvern.forge.sdk.db.datetime_utils import naive_utc_now, to_naive_utc
+from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
+from skyvern.forge.sdk.db.models import CredentialFolderModel
 from skyvern.forge.sdk.executor.factory import AsyncExecutorFactory
 from skyvern.forge.sdk.routes.code_samples import (
     CREATE_CREDENTIAL_CODE_SAMPLE_CREDIT_CARD_PYTHON,
@@ -56,6 +58,7 @@ from skyvern.forge.sdk.routes.code_samples import (
     UPDATE_CREDENTIAL_CODE_SAMPLE_TS,
 )
 from skyvern.forge.sdk.routes.routers import base_router, legacy_base_router
+from skyvern.forge.sdk.routes.trigger_type import workflow_run_trigger_type_from_user_agent
 from skyvern.forge.sdk.schemas.credentials import (
     CancelTestResponse,
     CreateCredentialRequest,
@@ -80,6 +83,7 @@ from skyvern.forge.sdk.schemas.organizations import (
     BitwardenCredentialSafe,
     BitwardenOrganizationAuthToken,
     BitwardenOrganizationAuthTokenSafe,
+    ClearOrganizationAuthTokenResponse,
     CreateAzureClientSecretCredentialRequest,
     CreateBitwardenCredentialRequest,
     CreateCustomCredentialServiceConfigRequest,
@@ -95,8 +99,17 @@ from skyvern.forge.sdk.services.bitwarden import BitwardenService
 from skyvern.forge.sdk.services.credential.credential_vault_service import CredentialVaultService
 from skyvern.forge.sdk.workflow.models.parameter import WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRequestBody, WorkflowRunStatus
+from skyvern.schemas.credential_folders import (
+    CredentialFolder,
+    CredentialFolderCreate,
+    CredentialFolderUpdate,
+    UpdateCredentialFolderRequest,
+)
 from skyvern.schemas.workflows import (
+    BLOCK_YAML_TYPES,
     LoginBlockYAML,
+    UrlBlockYAML,
+    ValidationBlockYAML,
     WorkflowCreateYAMLRequest,
     WorkflowDefinitionYAML,
     WorkflowParameterYAML,
@@ -116,6 +129,13 @@ _background_tasks: set[asyncio.Task] = set()
 # profile task waits; the status grace period derives from these to stay aligned.
 _SESSION_PERSIST_MAX_RETRIES = 20
 _SESSION_PERSIST_RETRY_INTERVAL_SECONDS = 3
+
+_ORG_AUTH_CREDENTIAL_TOKEN_TYPES = {
+    "onepassword": OrganizationAuthTokenType.onepassword_service_account,
+    "bitwarden": OrganizationAuthTokenType.bitwarden_credential,
+    "azure_credential": OrganizationAuthTokenType.azure_client_secret_credential,
+    "custom_credential": OrganizationAuthTokenType.custom_credential_service,
+}
 # -1 because no sleep follows the final attempt.
 _SESSION_PERSIST_MAX_WAIT_SECONDS = (_SESSION_PERSIST_MAX_RETRIES - 1) * _SESSION_PERSIST_RETRY_INTERVAL_SECONDS
 # Buffer over the max wait so the status endpoint doesn't misreport while the task still retries.
@@ -417,6 +437,50 @@ def _build_navigation_goal(base_prompt: str, user_context: str | None) -> str:
     )
 
 
+SESSION_VALIDATION_COMPLETE_CRITERION = (
+    "The user is logged in: the page shows authenticated content such as a dashboard, "
+    "account/profile menu, or user-specific data, and there is NO sign-in page or "
+    "username/password login form visible."
+)
+
+SESSION_VALIDATION_TERMINATE_CRITERION = (
+    "Terminate if a sign-in/login page or a username/password login form is visible, "
+    "or the page indicates the user is logged out or the session has expired. This means "
+    "the browser session is not authenticated and must not be saved."
+)
+
+
+def _build_login_test_blocks(
+    *,
+    url: str,
+    navigation_goal: str,
+    parameter_key: str,
+    totp_identifier: str | None,
+) -> list[BLOCK_YAML_TYPES]:
+    # Re-navigate after login so validation runs on a freshly fetched page, not a stale cached one.
+    blocks: list[BLOCK_YAML_TYPES] = [
+        LoginBlockYAML(
+            label="login",
+            title="login",
+            url=url,
+            navigation_goal=navigation_goal,
+            terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
+            max_steps_per_run=None,
+            parameter_keys=[parameter_key],
+            totp_verification_url=None,
+            totp_identifier=totp_identifier,
+            skip_saved_profile=True,
+        ),
+        UrlBlockYAML(label="verify_navigate", url=url),
+        ValidationBlockYAML(
+            label="verify_session",
+            complete_criterion=SESSION_VALIDATION_COMPLETE_CRITERION,
+            terminate_criterion=SESSION_VALIDATION_TERMINATE_CRITERION,
+        ),
+    ]
+    return blocks
+
+
 @base_router.patch(
     "/credentials/{credential_id}",
     response_model=CredentialResponse,
@@ -489,6 +553,7 @@ async def test_login(
         description="The login credentials and URL to test",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestLoginResponse:
     """Test a login with inline credentials without requiring a saved credential."""
     organization_id = current_org.organization_id
@@ -577,7 +642,7 @@ async def test_login(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
-            trigger_type=WorkflowRunTriggerType.api,
+            trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -673,6 +738,7 @@ async def test_credential(
         description="Test configuration including the login URL",
     ),
     current_org: Organization = Depends(org_auth_service.get_current_org),
+    x_user_agent: Annotated[str | None, Header()] = None,
 ) -> TestCredentialResponse:
     organization_id = current_org.organization_id
 
@@ -717,7 +783,6 @@ async def test_credential(
     navigation_goal = _build_navigation_goal(base_prompt, data.user_context)
 
     parameter_key = "credential"
-    label = "login"
 
     yaml_parameters = [
         WorkflowParameterYAML(
@@ -728,21 +793,14 @@ async def test_credential(
         )
     ]
 
-    login_block_yaml = LoginBlockYAML(
-        label=label,
-        title=label,
-        url=data.url,
-        navigation_goal=navigation_goal,
-        terminate_criterion=LOGIN_TEST_TERMINATE_CRITERION,
-        max_steps_per_run=None,
-        parameter_keys=[parameter_key],
-        totp_verification_url=None,
-        totp_identifier=credential.totp_identifier,
-    )
-
     workflow_definition_yaml = WorkflowDefinitionYAML(
         parameters=yaml_parameters,
-        blocks=[login_block_yaml],
+        blocks=_build_login_test_blocks(
+            url=data.url,
+            navigation_goal=navigation_goal,
+            parameter_key=parameter_key,
+            totp_identifier=credential.totp_identifier,
+        ),
     )
 
     workflow_create_request = WorkflowCreateYAMLRequest(
@@ -759,9 +817,10 @@ async def test_credential(
             request=workflow_create_request,
         )
 
-        run_request = WorkflowRequestBody(
-            browser_profile_id=existing_browser_profile_id,
-        )
+        # Boot fresh (don't seed the saved profile): a reused profile is loaded read-only and the
+        # refreshed session would never persist. A fresh login persists via the normal session path,
+        # which the saver then writes onto existing_browser_profile_id.
+        run_request = WorkflowRequestBody()
 
         workflow_run = await app.WORKFLOW_SERVICE.setup_workflow_run(
             request_id=None,
@@ -769,7 +828,7 @@ async def test_credential(
             workflow_permanent_id=workflow.workflow_permanent_id,
             organization=current_org,
             max_steps_override=None,
-            trigger_type=WorkflowRunTriggerType.api,
+            trigger_type=workflow_run_trigger_type_from_user_agent(x_user_agent),
         )
 
         await AsyncExecutorFactory.get_executor().execute_workflow(
@@ -803,6 +862,7 @@ async def test_credential(
                 organization_id=organization_id,
                 credential_name=credential.name,
                 test_url=data.url,
+                existing_browser_profile_id=existing_browser_profile_id,
             )
         )
         _background_tasks.add(task)
@@ -952,18 +1012,29 @@ async def get_test_credential_status(
     elif status == WorkflowRunStatus.canceled:
         failure_reason = "The login test was canceled."
 
-    # Only a real failure once the background task has had time to finish; grace must
-    # exceed its session-persist wait plus headroom, else mid-polls misread.
+    # The saver runs after the run reaches `completed`, and on a re-save it overwrites an
+    # already-linked profile in place — so a present id is not by itself proof this run's
+    # session was stored. Confirm via the profile's modified_at; until then withhold the id so
+    # the client keeps polling, and only surface failure once the saver's retry budget is spent.
     _PROFILE_GRACE_PERIOD_SECONDS = _SESSION_PERSIST_MAX_WAIT_SECONDS + _PROFILE_GRACE_PERIOD_HEADROOM_SECONDS
-    if (
-        status == WorkflowRunStatus.completed
-        and not browser_profile_id
-        and workflow_run.finished_at
-        and (datetime.utcnow() - workflow_run.finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS
-    ):
-        browser_profile_failure_reason = (
-            "Login succeeded but the browser profile could not be saved. Please try testing again."
-        )
+    if status == WorkflowRunStatus.completed and workflow_run.finished_at:
+        workflow = await app.DATABASE.workflows.get_workflow(workflow_run.workflow_id, organization_id)
+        # Only a save-enabled test has a saver; a plain login test must not report a save failure.
+        if workflow and workflow.persist_browser_session:
+            save_persisted = False
+            if browser_profile_id:
+                profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=browser_profile_id, organization_id=organization_id
+                )
+                saved_at = to_naive_utc(profile.modified_at) if profile else None
+                run_finished_at = to_naive_utc(workflow_run.finished_at)
+                save_persisted = bool(saved_at and run_finished_at and saved_at >= run_finished_at)
+            if not save_persisted:
+                browser_profile_id = None
+                if (naive_utc_now() - workflow_run.finished_at).total_seconds() > _PROFILE_GRACE_PERIOD_SECONDS:
+                    browser_profile_failure_reason = (
+                        "Login succeeded but the browser profile could not be saved. Please try testing again."
+                    )
 
     return TestCredentialStatusResponse(
         credential_id=credential_id,
@@ -1059,9 +1130,10 @@ async def _create_browser_profile_after_workflow(
     organization_id: str,
     credential_name: str,
     test_url: str,
+    existing_browser_profile_id: str | None = None,
 ) -> None:
-    """Background task that polls the workflow run status and creates a browser
-    profile from the persisted session when the run completes successfully."""
+    """Poll the run and persist the captured session on success: a re-save overwrites
+    ``existing_browser_profile_id`` in place, otherwise a new profile is created and linked."""
     max_polls = 120  # ~10 minutes at 5s intervals
     poll_interval = 5
 
@@ -1142,34 +1214,54 @@ async def _create_browser_profile_after_workflow(
                 )
                 return
 
-            # Create the browser profile in DB
-            profile_name = f"Profile - {credential_name} ({credential_id})"
-            profile = await app.DATABASE.browser_sessions.create_browser_profile(
-                organization_id=organization_id,
-                name=profile_name,
-                description=f"Browser profile from credential test for {credential_name}",
-            )
+            # Re-save overwrites the existing profile in place so references to its id keep
+            # working; a first-time save (or a since-deleted profile) creates a new one.
+            target_profile_id = existing_browser_profile_id
+            reused_existing = False
+            if target_profile_id:
+                existing_profile = await app.DATABASE.browser_sessions.get_browser_profile(
+                    profile_id=target_profile_id,
+                    organization_id=organization_id,
+                )
+                reused_existing = existing_profile is not None
+                if not reused_existing:
+                    target_profile_id = None
 
-            # Copy session data to the browser profile storage location
+            if not target_profile_id:
+                profile = await app.DATABASE.browser_sessions.create_browser_profile(
+                    organization_id=organization_id,
+                    name=f"Profile - {credential_name} ({credential_id})",
+                    description=f"Browser profile from credential test for {credential_name}",
+                )
+                target_profile_id = profile.browser_profile_id
+
+            # Overwrites in place when reusing an existing id.
             await app.STORAGE.store_browser_profile(
                 organization_id=organization_id,
-                profile_id=profile.browser_profile_id,
+                profile_id=target_profile_id,
                 directory=session_dir,
             )
+            if reused_existing:
+                # Bump modified_at so the status poll can tell this run's re-save actually landed.
+                await app.DATABASE.browser_sessions.touch_browser_profile(
+                    profile_id=target_profile_id,
+                    organization_id=organization_id,
+                )
 
-            # Link browser profile to credential
+            # Link browser profile to credential (refreshes tested_url; id unchanged on re-save).
             await app.DATABASE.credentials.update_credential(
                 credential_id=credential_id,
                 organization_id=organization_id,
-                browser_profile_id=profile.browser_profile_id,
+                browser_profile_id=target_profile_id,
                 tested_url=test_url,
             )
 
             LOG.info(
-                "Browser profile created from credential test",
+                "Browser profile saved from credential test",
                 credential_id=credential_id,
-                browser_profile_id=profile.browser_profile_id,
+                browser_profile_id=target_profile_id,
                 workflow_run_id=workflow_run_id,
+                overwrote_existing=target_profile_id == existing_browser_profile_id,
             )
             return
 
@@ -1470,6 +1562,12 @@ async def get_credentials(
         max_length=200,
         description="Case-insensitive search across credential name, username, secret label, and card details",
     ),
+    folder_id: str | None = Query(
+        default=None,
+        description="Filter credentials by folder ID",
+        examples=["cfld_1234567890"],
+        include_in_schema=False,
+    ),
 ) -> list[CredentialResponse]:
     """Return non-sensitive metadata for all credentials (paginated).
 
@@ -1483,8 +1581,214 @@ async def get_credentials(
         vault_type=vault_type.value if isinstance(vault_type, CredentialVaultType) else None,
         credential_type=credential_type.value if isinstance(credential_type, CredentialType) else None,
         search=search if isinstance(search, str) else None,
+        folder_id=folder_id if isinstance(folder_id, str) else None,
     )
     return [_convert_to_response(credential) for credential in credentials]
+
+
+def _to_credential_folder_response(folder: CredentialFolderModel, credential_count: int) -> CredentialFolder:
+    return CredentialFolder(
+        folder_id=folder.folder_id,
+        organization_id=folder.organization_id,
+        title=folder.title,
+        description=folder.description,
+        credential_count=credential_count,
+        created_at=folder.created_at,
+        modified_at=folder.modified_at,
+    )
+
+
+@legacy_base_router.post("/credential_folders")
+@legacy_base_router.post("/credential_folders/", include_in_schema=False)
+@base_router.post(
+    "/credential_folders",
+    response_model=CredentialFolder,
+    summary="Create credential folder",
+    description="Create a new folder to organize credentials",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully created credential folder"},
+        400: {"description": "Invalid request"},
+    },
+)
+@base_router.post("/credential_folders/", response_model=CredentialFolder, include_in_schema=False)
+async def create_credential_folder(
+    data: CredentialFolderCreate = Body(..., description="The credential folder to create"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialFolder:
+    folder = await app.DATABASE.credential_folders.create_credential_folder(
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    return _to_credential_folder_response(folder, 0)
+
+
+@legacy_base_router.get("/credential_folders/{folder_id}")
+@legacy_base_router.get("/credential_folders/{folder_id}/", include_in_schema=False)
+@base_router.get(
+    "/credential_folders/{folder_id}",
+    response_model=CredentialFolder,
+    summary="Get credential folder",
+    description="Get a specific credential folder by ID",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully retrieved credential folder"},
+        404: {"description": "Credential folder not found"},
+    },
+)
+@base_router.get("/credential_folders/{folder_id}/", response_model=CredentialFolder, include_in_schema=False)
+async def get_credential_folder(
+    folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialFolder:
+    folder = await app.DATABASE.credential_folders.get_credential_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
+
+    credential_count = await app.DATABASE.credential_folders.get_credential_folder_credential_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+    return _to_credential_folder_response(folder, credential_count)
+
+
+@legacy_base_router.get("/credential_folders")
+@legacy_base_router.get("/credential_folders/", include_in_schema=False)
+@base_router.get(
+    "/credential_folders",
+    response_model=list[CredentialFolder],
+    summary="Get credential folders",
+    description="Get all credential folders for the organization",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully retrieved credential folders"},
+    },
+)
+@base_router.get("/credential_folders/", response_model=list[CredentialFolder], include_in_schema=False)
+async def get_credential_folders(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=500, description="Number of folders per page"),
+    search: str | None = Query(None, description="Search folders by title or description"),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> list[CredentialFolder]:
+    folders = await app.DATABASE.credential_folders.get_credential_folders(
+        organization_id=current_org.organization_id,
+        page=page,
+        page_size=page_size,
+        search_query=search,
+    )
+
+    if folders:
+        folder_ids = [folder.folder_id for folder in folders]
+        credential_counts = await app.DATABASE.credential_folders.get_credential_folder_credential_counts_batch(
+            folder_ids=folder_ids,
+            organization_id=current_org.organization_id,
+        )
+    else:
+        credential_counts = {}
+
+    return [_to_credential_folder_response(folder, credential_counts.get(folder.folder_id, 0)) for folder in folders]
+
+
+@legacy_base_router.put("/credential_folders/{folder_id}")
+@legacy_base_router.put("/credential_folders/{folder_id}/", include_in_schema=False)
+@base_router.put(
+    "/credential_folders/{folder_id}",
+    response_model=CredentialFolder,
+    summary="Update credential folder",
+    description="Update a credential folder's title or description",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully updated credential folder"},
+        404: {"description": "Credential folder not found"},
+    },
+)
+@base_router.put("/credential_folders/{folder_id}/", response_model=CredentialFolder, include_in_schema=False)
+async def update_credential_folder(
+    folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
+    data: CredentialFolderUpdate = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialFolder:
+    folder = await app.DATABASE.credential_folders.update_credential_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+        title=data.title,
+        description=data.description,
+    )
+    if not folder:
+        raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
+
+    credential_count = await app.DATABASE.credential_folders.get_credential_folder_credential_count(
+        folder_id=folder.folder_id,
+        organization_id=current_org.organization_id,
+    )
+    return _to_credential_folder_response(folder, credential_count)
+
+
+@legacy_base_router.delete("/credential_folders/{folder_id}")
+@legacy_base_router.delete("/credential_folders/{folder_id}/", include_in_schema=False)
+@base_router.delete(
+    "/credential_folders/{folder_id}",
+    summary="Delete credential folder",
+    description="Delete a credential folder. Credentials in the folder are detached (unfiled), not deleted.",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully deleted credential folder"},
+        404: {"description": "Credential folder not found"},
+    },
+)
+@base_router.delete("/credential_folders/{folder_id}/", include_in_schema=False)
+async def delete_credential_folder(
+    folder_id: str = Path(..., description="Credential folder ID", examples=["cfld_123"]),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> dict:
+    success = await app.DATABASE.credential_folders.soft_delete_credential_folder(
+        folder_id=folder_id,
+        organization_id=current_org.organization_id,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Credential folder {folder_id} not found")
+
+    return {"status": "deleted", "folder_id": folder_id}
+
+
+@legacy_base_router.put("/credentials/{credential_id}/folder")
+@legacy_base_router.put("/credentials/{credential_id}/folder/", include_in_schema=False)
+@base_router.put(
+    "/credentials/{credential_id}/folder",
+    response_model=CredentialResponse,
+    summary="Update credential folder assignment",
+    description="Assign a credential to a folder, or remove it from its folder when folder_id is null",
+    include_in_schema=False,
+    responses={
+        200: {"description": "Successfully updated credential folder assignment"},
+        404: {"description": "Credential not found"},
+        400: {"description": "Folder not found"},
+    },
+)
+@base_router.put("/credentials/{credential_id}/folder/", response_model=CredentialResponse, include_in_schema=False)
+async def update_credential_folder_assignment(
+    credential_id: str = Path(..., description="The ID of the credential.", examples=["cred_1234567890"]),
+    data: UpdateCredentialFolderRequest = Body(...),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> CredentialResponse:
+    try:
+        credential = await app.DATABASE.credential_folders.set_credential_folder(
+            credential_id=credential_id,
+            organization_id=current_org.organization_id,
+            folder_id=data.folder_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if not credential:
+        raise HTTPException(status_code=404, detail=f"Credential {credential_id} not found")
+
+    return _convert_to_response(credential)
 
 
 @base_router.get(
@@ -1588,6 +1892,47 @@ async def update_onepassword_token(
             status_code=500,
             detail=f"Failed to create or update OnePassword service account token: {str(e)}",
         )
+
+
+@base_router.delete(
+    "/credentials/{credential_provider}",
+    response_model=ClearOrganizationAuthTokenResponse,
+    summary="Clear organization auth credential",
+    description="Clears the current organization auth credential for the current organization.",
+    include_in_schema=False,
+)
+@base_router.delete(
+    "/credentials/{credential_provider}/",
+    response_model=ClearOrganizationAuthTokenResponse,
+    include_in_schema=False,
+)
+async def clear_org_auth_credential(
+    credential_provider: str = Path(..., description="The organization auth credential provider to clear."),
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> ClearOrganizationAuthTokenResponse:
+    """
+    Clear the current organization auth credential for the organization.
+
+    This endpoint is idempotent; it succeeds even when no valid token exists.
+    """
+    token_type = _ORG_AUTH_CREDENTIAL_TOKEN_TYPES.get(credential_provider)
+    if not token_type:
+        raise HTTPException(status_code=404, detail="Unsupported organization auth credential provider")
+    try:
+        await app.DATABASE.organizations.invalidate_org_auth_tokens(
+            organization_id=current_org.organization_id,
+            token_type=token_type,
+        )
+        return ClearOrganizationAuthTokenResponse(success=True)
+    except Exception as e:
+        LOG.error(
+            "Failed to clear organization auth token",
+            organization_id=current_org.organization_id,
+            token_type=token_type.value,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to clear organization auth credential") from e
 
 
 def _to_safe_bitwarden_response(auth_token: BitwardenOrganizationAuthToken) -> BitwardenCredentialResponse:
@@ -2028,6 +2373,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            folder_id=credential.folder_id,
         )
     elif credential.credential_type == CredentialType.CREDIT_CARD:
         credential_response = CreditCardCredentialResponse(
@@ -2044,6 +2390,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            folder_id=credential.folder_id,
         )
     elif credential.credential_type == CredentialType.SECRET:
         credential_response = SecretCredentialResponse(secret_label=credential.secret_label)
@@ -2057,6 +2404,7 @@ def _convert_to_response(credential: Credential) -> CredentialResponse:
             tested_url=credential.tested_url,
             user_context=credential.user_context,
             save_browser_session_intent=credential.save_browser_session_intent,
+            folder_id=credential.folder_id,
         )
     else:
         raise HTTPException(status_code=400, detail="Credential type not supported")

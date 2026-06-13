@@ -28,6 +28,7 @@ _SENSITIVE_ENDPOINTS = {
     "GET /v1/credentials/totp",
 }
 _MAX_BODY_LENGTH = 1000
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_RESPONSE_READ_BYTES = 1024 * 1024  # 1 MB — skip logging bodies larger than this
 _BINARY_PLACEHOLDER = "<binary>"
 _REDACTED = "****"
@@ -76,8 +77,12 @@ def _client_ip_from_headers(headers: typing.Mapping[str, str]) -> str | None:
     return first_hop or None
 
 
+def _is_sensitive_endpoint(request: Request) -> bool:
+    return f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS
+
+
 def _sanitize_body(request: Request, body: bytes, content_type: str | None) -> str:
-    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
+    if _is_sensitive_endpoint(request):
         return _REDACTED
     if not body:
         return ""
@@ -124,7 +129,7 @@ def _is_loggable_content_type(content_type: str | None) -> bool:
 
 
 def _sanitize_response_body(request: Request, body_str: str | None, content_type: str | None) -> str:
-    if f"{request.method.upper()} {request.url.path.rstrip('/')}" in _SENSITIVE_ENDPOINTS:
+    if _is_sensitive_endpoint(request):
         return _REDACTED
     if body_str is None:
         return _BINARY_PLACEHOLDER
@@ -185,6 +190,19 @@ async def log_raw_request_middleware(request: Request, call_next: Callable[[Requ
 
     try:
         response = await call_next(request)
+
+        # Skip successful reads before buffering the response body: they are
+        # the bulk of request volume (health checks, status polling) and the
+        # 4xx/5xx and mutating paths below retain all audit/debugging value.
+        # Sensitive endpoints (credential/TOTP reads) always keep their
+        # redacted audit line.
+        if (
+            response.status_code < 400
+            and http_method in _READ_METHODS
+            and not settings.LOG_RAW_API_REQUESTS_SUCCESSFUL_READS
+            and not _is_sensitive_endpoint(request)
+        ):
+            return response
 
         if response.status_code >= 500:
             log_method = LOG.error

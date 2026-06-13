@@ -6,7 +6,7 @@ import enum
 import typing as t
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.client.types.workflow_definition_yaml_blocks_item import (
     WorkflowDefinitionYamlBlocksItem_Action,
@@ -21,6 +21,19 @@ class ActionKind(enum.StrEnum):
     INPUT_TEXT = "input_text"
     URL_CHANGE = "url_change"
     WAIT = "wait"
+
+
+class RecordingDraftStepStatus(enum.StrEnum):
+    INTERPRETING = "interpreting"
+    READY = "ready"
+
+
+class RecordingDraftStepEditableField(enum.StrEnum):
+    LABEL = "label"
+    TITLE = "title"
+    NAVIGATION_GOAL = "navigation_goal"
+    URL = "url"
+    WAIT_SEC = "wait_sec"
 
 
 class ActionBase(BaseModel):
@@ -92,6 +105,32 @@ OutputBlock = t.Union[
 ]
 
 
+class RecordingDraftStep(BaseModel):
+    step_id: str
+    action_kind: ActionKind
+    block_type: Literal["action", "goto_url", "wait"]
+    label: str
+    title: str | None = None
+    navigation_goal: str | None = None
+    url: str | None = None
+    wait_sec: int | None = None
+    status: RecordingDraftStepStatus = RecordingDraftStepStatus.READY
+    editable_fields: list[RecordingDraftStepEditableField] = Field(default_factory=list)
+    parameters: list[dict[str, t.Any]] = Field(default_factory=list)
+    parameter_keys: list[str] = Field(default_factory=list)
+    # Source-action event timestamps (ms epoch), so clients can correlate
+    # locally-captured artifacts (e.g. stream screenshots) with each step.
+    timestamp_start: float | None = None
+    timestamp_end: float | None = None
+
+
+class RecordingInterpretationUpdate(BaseModel):
+    session_revision: int
+    steps: list[RecordingDraftStep] = Field(default_factory=list)
+    pending: bool = False
+    finalized: bool = False
+
+
 class TargetInfo(BaseModel):
     attached: bool | None = None
     browserContextId: str | None = None
@@ -120,6 +159,9 @@ class ExfiltratedEventCdpParams(BaseModel):
 
     # frame_navigated events
     frame: CdpEventFrame | None = None
+
+    # net:activity events
+    count: int | None = None
 
 
 class EventTarget(BaseModel):

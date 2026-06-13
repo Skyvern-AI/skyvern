@@ -475,6 +475,28 @@ if settings.ENABLE_ANTHROPIC:
             temperature=1,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.8_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-8",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE5_FABLE",
+        LLMConfig(
+            "anthropic/claude-fable-5",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
     LLMConfigRegistry.register_config(
@@ -565,6 +587,28 @@ if settings.ENABLE_BEDROCK:
         "BEDROCK_ANTHROPIC_CLAUDE4.7_OPUS_INFERENCE_PROFILE",
         LLMConfig(
             "bedrock/us.anthropic.claude-opus-4-7",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.8_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-4-8",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE5_FABLE_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-fable-5",
             ["AWS_REGION"],
             supports_vision=True,
             add_assistant_prefix=False,
@@ -1166,6 +1210,19 @@ if settings.ENABLE_GEMINI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "GEMINI_3.5_FLASH",
+        LLMConfig(
+            "gemini/gemini-3.5-flash",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "GEMINI_3_PRO",
         LLMConfig(
             "gemini/gemini-3.1-pro-preview",
@@ -1563,15 +1620,31 @@ if settings.ENABLE_VERTEX_AI:
         ),
     )
     LLMConfigRegistry.register_config(
-        "VERTEX_GEMINI_3.1_FLASH_LITE",
+        "VERTEX_GEMINI_3.5_FLASH",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.5-flash",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.5-flash" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.1_FLASH_LITE",
+        LLMConfig(
+            "vertex_ai/gemini-3.1-flash-lite",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1684,13 +1757,13 @@ if settings.ENABLE_VERTEX_AI:
     LLMConfigRegistry.register_config(
         "VERTEX_GEMINI_3.1_FLASH_LITE_FLEX",
         LLMConfig(
-            "vertex_ai/gemini-3.1-flash-lite-preview",
+            "vertex_ai/gemini-3.1-flash-lite",
             [],
             supports_vision=True,
             add_assistant_prefix=False,
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
-                api_base=f"{api_base}/gemini-3.1-flash-lite-preview" if api_base else None,
+                api_base=f"{api_base}/gemini-3.1-flash-lite" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1729,6 +1802,25 @@ if settings.ENABLE_VERTEX_AI:
             max_completion_tokens=65536,
             litellm_params=LiteLLMParams(
                 api_base=f"{api_base}/gemini-3-flash-preview" if api_base else None,
+                vertex_location=settings.VERTEX_LOCATION,
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
+                vertex_credentials=settings.VERTEX_CREDENTIALS,
+                service_tier="SERVICE_TIER_FLEX",
+                extra_headers={"X-Vertex-AI-LLM-Shared-Request-Type": "flex", "X-Vertex-AI-LLM-Request-Type": "shared"},
+                timeout=FLEX_EXECUTION_TIMEOUT_SECONDS,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "VERTEX_GEMINI_3.5_FLASH_FLEX",
+        LLMConfig(
+            "vertex_ai/gemini-3.5-flash",
+            [],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                api_base=f"{api_base}/gemini-3.5-flash" if api_base else None,
                 vertex_location=settings.VERTEX_LOCATION,
                 thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
                 vertex_credentials=settings.VERTEX_CREDENTIALS,
@@ -1861,6 +1953,23 @@ if settings.ENABLE_OPENROUTER:
                 ),
             ),
         )
+
+    LLMConfigRegistry.register_config(
+        "OPENROUTER_DEEPSEEK_V4_FLASH",
+        LLMConfig(
+            "openrouter/deepseek/deepseek-v4-flash",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=False,
+            add_assistant_prefix=False,
+            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/deepseek/deepseek-v4-flash"},
+            ),
+        ),
+    )
 if settings.ENABLE_GROQ:
     # Register Groq model configured in settings
     if settings.GROQ_MODEL:

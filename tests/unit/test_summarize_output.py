@@ -18,7 +18,11 @@ from skyvern.forge.sdk.api.llm.exceptions import (
 )
 from skyvern.forge.sdk.routes.prompts import summarize_output
 from skyvern.forge.sdk.schemas.organizations import Organization
-from skyvern.forge.sdk.schemas.prompts import SummarizeOutputRequest, SummarizeOutputResponse
+from skyvern.forge.sdk.schemas.prompts import (
+    MAX_SUMMARIZE_OUTPUT_JSON_DEPTH,
+    SummarizeOutputRequest,
+    SummarizeOutputResponse,
+)
 from skyvern.utils.strings import escape_code_fences
 from tests.unit.helpers import make_organization
 
@@ -60,10 +64,24 @@ class TestSummarizeOutputRequest:
             SummarizeOutputRequest(output_json="{}", workflow_title="x" * 501)
 
     def test_deeply_nested_json_rejected(self) -> None:
-        # 10k levels of nesting exceeds Python's recursion limit inside json.loads.
+        # Far over the depth limit; rejected on every Python version, not just where
+        # json.loads happens to hit the recursion limit.
         deep = "[" * 10_000 + "]" * 10_000
         with pytest.raises(ValidationError):
             SummarizeOutputRequest(output_json=deep)
+
+    def test_nesting_just_over_limit_rejected(self) -> None:
+        depth = MAX_SUMMARIZE_OUTPUT_JSON_DEPTH + 1
+        with pytest.raises(ValidationError):
+            SummarizeOutputRequest(output_json="[" * depth + "]" * depth)
+
+    def test_nesting_within_limit_accepted(self) -> None:
+        depth = MAX_SUMMARIZE_OUTPUT_JSON_DEPTH
+        SummarizeOutputRequest(output_json="[" * depth + "]" * depth)
+
+    def test_brackets_inside_strings_not_counted_as_nesting(self) -> None:
+        # Brackets inside string literals must not count toward depth.
+        SummarizeOutputRequest(output_json='{"k": "' + "[" * 10_000 + '"}')
 
 
 def _fake_org() -> Organization:

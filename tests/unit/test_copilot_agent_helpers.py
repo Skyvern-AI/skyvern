@@ -14,7 +14,7 @@ import yaml
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
 from skyvern.forge.sdk.copilot import agent as agent_module
 from skyvern.forge.sdk.copilot.build_phase import BuildPhase
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisInput,
     DiagnosisRepairContract,
@@ -33,6 +33,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import build_recoverable_fail
 from skyvern.forge.sdk.copilot.request_policy import (
     _REDACTED_REFUSED_SECRET_TURN,
     TRANSCRIPT_ANCHOR_CHAR_CAP,
+    RequestPolicy,
     _classify_request,
     build_transcript_context,
     redact_raw_secrets_for_prompt,
@@ -1182,7 +1183,42 @@ workflow_definition:
         )
 
         process_mock.assert_not_called()
-        assert "inspect_page_for_composition" in agent_result.user_response
+        # The reject note must be product language, never the gate's
+        # agent-directed tool instruction.
+        assert "(Note:" in agent_result.user_response
+        assert "inspect_page_for_composition" not in agent_result.user_response
+        assert agent_result.updated_workflow is None
+        assert agent_result.workflow_yaml is None
+
+    def test_code_only_inline_replace_workflow_rejects_native_browser_block(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.output_policy import OutputPolicyVerdict
+
+        process_mock = MagicMock(return_value=SimpleNamespace(name="new"))
+        monkeypatch.setattr("skyvern.forge.sdk.copilot.tools._process_workflow_yaml", process_mock)
+        monkeypatch.setattr(agent_module, "evaluate_output_policy", lambda **kwargs: OutputPolicyVerdict())
+
+        submitted_yaml = """
+title: Navigation example
+workflow_definition:
+  blocks:
+    - block_type: navigation
+      label: open_step
+      navigation_goal: Open the example page.
+"""
+        ctx = _ctx(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        result = _fake_run_result(
+            {"type": "REPLACE_WORKFLOW", "user_response": "Here you go.", "workflow_yaml": submitted_yaml}
+        )
+
+        agent_result = asyncio.run(
+            agent_module._translate_to_agent_result(
+                result, ctx, global_llm_context=None, chat_request=_chat_request(), organization_id="org-1"
+            )
+        )
+
+        process_mock.assert_not_called()
+        assert "not available in the workflow copilot" in agent_result.user_response
+        assert "focused `code` blocks" in agent_result.user_response
         assert agent_result.updated_workflow is None
         assert agent_result.workflow_yaml is None
 
@@ -1881,6 +1917,19 @@ class TestCredentialRefusalReachesAgent:
         assert "DO NOT PROVIDE RAW LOGIN/PASSWORD" in prompt
         assert "MUST NOT build, update, or run a workflow" in prompt
         assert "redacted from the outbound client stream" not in prompt
+
+    def test_code_only_prompt_renders_policy_table_and_helper_validation_guidance(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_system_prompt
+
+        config = CopilotConfig(block_authoring_policy=BlockAuthoringPolicy.CODE_ONLY_BROWSER)
+        prompt = _build_system_prompt("", config=config)
+
+        assert "ACTIVE BLOCK AUTHORING POLICY: CODE-ONLY BROWSER MODE" in prompt
+        assert "credential-typed code" in prompt
+        assert "download registration" in prompt
+        assert "Use validate_block only for allowed non-browser helper blocks" in prompt
+        assert "Do not call `validate_block`" not in prompt
+        assert "native_allowed" not in prompt
 
     def test_native_tools_carry_refusal_reference(self) -> None:
         import re
@@ -2946,6 +2995,166 @@ workflow_definition:
         assert agent_result.proposal_disposition == "review_untested"
         assert "without testing it, as requested" in agent_result.user_response
 
+    @pytest.mark.asyncio
+    async def test_malformed_then_corrected_credential_id_resolves_when_valid(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_530299673029518520")
+        get_credentials_by_ids = AsyncMock(return_value=[credential])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        malformed = await build_request_policy(
+            user_message="Build it with cred 530299673029518520.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+        assert malformed.credential_input_kind == "credential_id"
+        assert malformed.resolved_credentials == [credential]
+        assert malformed.invalid_credential_ids == []
+        assert malformed.requires_user_clarification is False
+
+        corrected = await build_request_policy(
+            user_message="cred_530299673029518520",
+            workflow_yaml="",
+            chat_history=_history(
+                ("user", "Build it with cred 530299673029518520."),
+                ("ai", "The credential ID `530299673029518520` appears to be invalid."),
+            ),
+            global_llm_context="",
+            organization_id="org-1",
+            handler=None,
+        )
+        assert corrected.credential_input_kind == "credential_id"
+        assert corrected.resolved_credentials == [credential]
+        assert corrected.invalid_credential_ids == []
+        assert corrected.requires_user_clarification is False
+
+    @pytest.mark.asyncio
+    async def test_malformed_then_corrected_credential_id_blocks_authoritatively_when_invalid(
+        self, monkeypatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        get_credentials_by_ids = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+        )
+
+        for user_message, history in (
+            ("Build it with cred 530299673029518520.", []),
+            (
+                "cred_530299673029518520",
+                _history(
+                    ("user", "Build it with cred 530299673029518520."),
+                    ("ai", "The credential ID `530299673029518520` appears to be invalid."),
+                ),
+            ),
+        ):
+            policy = await build_request_policy(
+                user_message=user_message,
+                workflow_yaml="",
+                chat_history=history,
+                global_llm_context="",
+                organization_id="org-1",
+                handler=None,
+            )
+            assert policy.credential_input_kind == "credential_id"
+            assert policy.invalid_credential_ids == ["cred_530299673029518520"]
+            assert "not found in this organization" in (policy.clarification_question or "")
+            assert "previously identified" not in (policy.clarification_question or "")
+
+    @pytest.mark.asyncio
+    async def test_malformed_id_promotes_over_non_id_kind_without_competing_scope(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_530299673029518520")
+
+        for classifier_body in (
+            {"credential_input_kind": "credential_name", "credential_refs": []},
+            {"credential_input_kind": "website_stored_credential", "login_page_urls": []},
+        ):
+            get_credentials_by_ids = AsyncMock(return_value=[credential])
+            monkeypatch.setattr(
+                policy_module.app,
+                "DATABASE",
+                SimpleNamespace(credentials=SimpleNamespace(get_credentials_by_ids=get_credentials_by_ids)),
+            )
+
+            async def handler(*, prompt: str, prompt_name: str, _body=classifier_body) -> dict:
+                return {"testing_intent": "unspecified", **_body}
+
+            policy = await build_request_policy(
+                user_message="Build it with cred 530299673029518520.",
+                workflow_yaml="",
+                chat_history=[],
+                global_llm_context="",
+                organization_id="org-1",
+                handler=handler,
+            )
+            assert policy.credential_input_kind == "credential_id", classifier_body
+            assert policy.resolved_credentials == [credential], classifier_body
+            get_credentials_by_ids.assert_awaited_once_with(["cred_530299673029518520"], organization_id="org-1")
+
+    @pytest.mark.asyncio
+    async def test_contextual_credential_id_does_not_override_classifier_target(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        bank = SimpleNamespace(credential_id="cred_bank", name="Bank", tested_url="https://bank.example/login")
+        monkeypatch.setattr(
+            policy_module.app,
+            "DATABASE",
+            SimpleNamespace(
+                credentials=SimpleNamespace(
+                    get_credentials=AsyncMock(return_value=[bank]),
+                    get_credentials_by_ids=AsyncMock(side_effect=AssertionError("contextual id must not be resolved")),
+                )
+            ),
+        )
+
+        async def name_handler(*, prompt: str, prompt_name: str) -> dict:
+            return {"credential_input_kind": "credential_name", "credential_refs": ["Bank"]}
+
+        name_policy = await build_request_policy(
+            user_message="Replace cred_530299673029518520 with my saved credential named Bank.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=name_handler,
+        )
+        assert name_policy.credential_input_kind == "credential_name"
+        assert name_policy.resolved_credentials == [bank]
+
+        async def url_handler(*, prompt: str, prompt_name: str) -> dict:
+            return {
+                "credential_input_kind": "website_stored_credential",
+                "login_page_urls": ["https://bank.example/login"],
+            }
+
+        url_policy = await build_request_policy(
+            user_message="Use the saved login for https://bank.example/login instead of cred_530299673029518520.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=url_handler,
+        )
+        assert url_policy.credential_input_kind == "website_stored_credential"
+        assert url_policy.resolved_credentials == [bank]
+
 
 class TestNativeToolCredentialIdValidation:
     def test_extracts_credential_ids_from_nested_tool_values(self) -> None:
@@ -3052,11 +3261,11 @@ workflow_definition:
         workflow.sequential_key = None
 
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools._process_workflow_yaml",
+            "skyvern.forge.sdk.copilot.tools.workflow_update._process_workflow_yaml",
             lambda **kwargs: workflow,
         )
         monkeypatch.setattr(
-            "skyvern.forge.sdk.copilot.tools.resolve_copilot_created_by_stamp",
+            "skyvern.forge.sdk.copilot.tools.workflow_update.resolve_copilot_created_by_stamp",
             AsyncMock(return_value="copilot"),
         )
         workflow_service = MagicMock()
@@ -3086,6 +3295,349 @@ workflow_definition:
 
         assert result["ok"] is True
         get_credentials_by_ids.assert_not_called()
+
+
+class TestRunBlocksCredentialApproval:
+    @staticmethod
+    def _workflow(
+        credential_id: str | None = None,
+        *,
+        parameters: list[dict[str, object]] | None = None,
+        blocks: list[dict[str, object]] | None = None,
+    ) -> SimpleNamespace:
+        workflow_parameters = parameters
+        if workflow_parameters is None and credential_id is not None:
+            workflow_parameters = [
+                {
+                    "parameter_type": "workflow",
+                    "workflow_parameter_type": "credential_id",
+                    "key": "login_credentials",
+                    "default_value": credential_id,
+                }
+            ]
+        return SimpleNamespace(
+            workflow_id="wf-1",
+            workflow_definition={
+                "parameters": workflow_parameters or [],
+                "blocks": blocks or [{"label": "login"}],
+            },
+            get_output_parameter=lambda label: SimpleNamespace(label=label) if label == "login" else None,
+        )
+
+    @staticmethod
+    def _db(
+        *,
+        workflow: object,
+        credentials: list[object] | None = None,
+        organization_lookup: object = AssertionError("org lookup called"),
+    ) -> SimpleNamespace:
+        if isinstance(organization_lookup, BaseException):
+            get_organization = AsyncMock(side_effect=organization_lookup)
+        else:
+            get_organization = AsyncMock(return_value=organization_lookup)
+        return SimpleNamespace(
+            workflows=SimpleNamespace(get_workflow_by_permanent_id=AsyncMock(return_value=workflow)),
+            credentials=SimpleNamespace(get_credentials_by_ids=AsyncMock(return_value=credentials or [])),
+            organizations=SimpleNamespace(get_organization=get_organization),
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_rejects_unapproved_workflow_credential_before_dispatch(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow("cred_unapproved")
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
+        )
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_rejects_unapproved_runtime_parameter_before_dispatch(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow("cred_resolved")
+        database = self._db(workflow=workflow, credentials=[SimpleNamespace(credential_id="cred_resolved")])
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[SimpleNamespace(credential_id="cred_resolved")]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {"override_credentials": "cred_unapproved"}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_rejects_unapproved_block_credential_parameter_before_dispatch(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[
+                {
+                    "label": "login",
+                    "parameters": [
+                        {
+                            "parameter_type": "credential",
+                            "key": "login_credentials",
+                            "credential_id": "cred_unapproved",
+                        }
+                    ],
+                }
+            ],
+        )
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
+        )
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_rejects_unapproved_direct_block_credential_id_before_dispatch(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[{"label": "login", "block_type": "google_sheets_read", "credential_id": "cred_unapproved"}],
+        )
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
+        )
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_blocks_rejects_unapproved_branch_block_credential_before_dispatch(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow(
+            parameters=[],
+            blocks=[
+                {
+                    "label": "choose_path",
+                    "branch_conditions": [
+                        {
+                            "condition": "needs login",
+                            "blocks": [
+                                {
+                                    "label": "login",
+                                    "parameters": [
+                                        {
+                                            "parameter_type": "credential",
+                                            "key": "login_credentials",
+                                            "credential_id": "cred_unapproved",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
+        )
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert "unapproved_credential_reference" in result["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_and_run_blocks_rejects_unapproved_credential_at_shared_run_seam(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow("cred_unapproved")
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_unapproved")],
+        )
+        prepare_workflow = AsyncMock(side_effect=AssertionError("prepare_workflow called"))
+        execute_workflow = AsyncMock(side_effect=AssertionError("execute_workflow called"))
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+        monkeypatch.setattr(
+            run_execution_module.app,
+            "WORKFLOW_SERVICE",
+            SimpleNamespace(prepare_workflow=prepare_workflow, execute_workflow=execute_workflow),
+        )
+        monkeypatch.setattr(tools_module, "_request_policy_allows_update_and_skip_run", lambda *args: False)
+        monkeypatch.setattr(tools_module, "_authority_tool_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_tool_loop_error", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "_update_and_run_blocks_composition_evidence_precheck", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_get_prior_workflow_definition", AsyncMock(return_value=None))
+        monkeypatch.setattr(tools_module, "_pre_run_workflow_coverage_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_plan_frontier", lambda *args: (["login"], {}, "login"))
+        monkeypatch.setattr(tools_module, "_frontier_run_size_error", lambda *args: None)
+        monkeypatch.setattr(tools_module, "_verify_and_record_run_blocks_result", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            tools_module,
+            "_tool_visible_result_after_completion_verification",
+            lambda _ctx, result, _completion: result,
+        )
+        monkeypatch.setattr(tools_module, "_record_diagnosis_repair_contract", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tools_module, "enqueue_screenshot_from_result", lambda *args, **kwargs: None)
+
+        async def fake_update_workflow(*args: object, **kwargs: object) -> dict[str, object]:
+            ctx = args[1]
+            ctx.staged_workflow = workflow
+            ctx.last_workflow = workflow
+            ctx.last_update_block_count = 1
+            return {"ok": True, "_workflow": workflow, "data": {"block_count": 1}}
+
+        monkeypatch.setattr(tools_module, "_update_workflow", fake_update_workflow)
+
+        result = await tools_module.update_and_run_blocks_tool.on_invoke_tool(
+            SimpleNamespace(
+                context=_ctx(request_policy=RequestPolicy(resolved_credentials=[])),
+                tool_name="update_and_run_blocks",
+            ),
+            json.dumps(
+                {
+                    "workflow_yaml": """
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      workflow_parameter_type: credential_id
+      key: login_credentials
+      default_value: cred_unapproved
+  blocks:
+    - block_type: login
+      label: login
+""",
+                    "block_labels": ["login"],
+                    "parameters": {},
+                }
+            ),
+        )
+
+        payload = json.loads(result)
+        assert payload["ok"] is False
+        assert "unapproved_credential_reference" in payload["error"]
+        database.credentials.get_credentials_by_ids.assert_not_called()
+        database.organizations.get_organization.assert_not_called()
+        prepare_workflow.assert_not_called()
+        execute_workflow.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resolved_credential_reaches_existing_run_validation_path(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot.tools import _run_blocks_and_collect_debug
+        from skyvern.forge.sdk.copilot.tools import run_execution as run_execution_module
+
+        workflow = self._workflow("cred_resolved")
+        database = self._db(
+            workflow=workflow,
+            credentials=[SimpleNamespace(credential_id="cred_resolved")],
+            organization_lookup=None,
+        )
+        monkeypatch.setattr(run_execution_module.app, "DATABASE", database)
+
+        ctx = _ctx(request_policy=RequestPolicy(resolved_credentials=[SimpleNamespace(credential_id="cred_resolved")]))
+        result = await _run_blocks_and_collect_debug(
+            {"block_labels": ["login"], "parameters": {}},
+            ctx,
+        )
+
+        assert result["ok"] is False
+        assert result["error"] == "Organization not found"
+        database.credentials.get_credentials_by_ids.assert_awaited_once_with(["cred_resolved"], organization_id="org-1")
+        database.organizations.get_organization.assert_awaited_once_with(organization_id="org-1")
 
 
 class TestResponseTypeClassificationRuleReachesAgent:
