@@ -4,6 +4,80 @@ import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 
 type Location = ReturnType<typeof useLocation>;
 
+/**
+ * Keep JSON workflow parameters as editable strings in react-hook-form state.
+ * Parsed arrays/objects from API re-runs are stringified so CodeEditor state
+ * matches what the user sees (SKY-10854).
+ */
+export function normalizeJsonParameterFormValue(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+/**
+ * Parse a JSON workflow parameter for the run API. Only string values are
+ * passed through JSON.parse — already-parsed arrays/objects are returned as-is.
+ * Single-item arrays must not go through JSON.parse(Array) which coerces to a
+ * bare scalar (SKY-10854).
+ */
+export function parseJsonWorkflowParameterValue(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return value;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Validate JSON workflow parameter form values. `null` is valid JSON and is the
+ * default for params without a saved default; only empty/unparseable input fails.
+ */
+export function validateJsonWorkflowParameterValue(
+  value: unknown,
+): true | string {
+  if (value === null || value === undefined) {
+    return true;
+  }
+  if (typeof value !== "string") {
+    return true;
+  }
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return "This field is required";
+  }
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return "Invalid JSON";
+  }
+}
+
+function normalizeWorkflowParameterFormValue(
+  parameter: WorkflowParameter,
+  value: unknown,
+): unknown {
+  if (parameter.workflow_parameter_type === "json") {
+    return normalizeJsonParameterFormValue(value);
+  }
+  return value;
+}
+
 const getDefaultFormValueForParameter = (
   parameter: WorkflowParameter,
 ): unknown => {
@@ -50,7 +124,18 @@ export const getInitialValues = (
   lastRunValues?: Record<string, unknown> | null,
 ): Record<string, unknown> => {
   if (location.state?.data) {
-    return location.state.data as Record<string, unknown>;
+    const raw = {
+      ...(location.state.data as Record<string, unknown>),
+    };
+    for (const parameter of workflowParameters) {
+      if (Object.prototype.hasOwnProperty.call(raw, parameter.key)) {
+        raw[parameter.key] = normalizeWorkflowParameterFormValue(
+          parameter,
+          raw[parameter.key],
+        );
+      }
+    }
+    return raw;
   }
 
   const defaults = getDefaultsFromWorkflowParameters(workflowParameters);
@@ -65,7 +150,10 @@ export const getInitialValues = (
         lastRunValues,
         parameter.key,
       )
-        ? lastRunValues[parameter.key]
+        ? normalizeWorkflowParameterFormValue(
+            parameter,
+            lastRunValues[parameter.key],
+          )
         : defaults[parameter.key];
       return acc;
     },
