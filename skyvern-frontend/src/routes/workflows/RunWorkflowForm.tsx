@@ -66,6 +66,10 @@ import { WorkflowParameterInput } from "./WorkflowParameterInput";
 import { BrowserProfileSelector } from "./components/BrowserProfileSelector";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
 import * as env from "@/util/env";
+import {
+  parseJsonWorkflowParameterValue,
+  validateJsonWorkflowParameterValue,
+} from "./utils";
 
 /**
  * Recursively finds all login blocks that don't have any credential parameters selected.
@@ -141,12 +145,7 @@ function parseValuesForWorkflowRun(
         (parameter) => parameter.key === key,
       );
       if (parameter?.workflow_parameter_type === "json") {
-        try {
-          return [key, JSON.parse(value as string)];
-        } catch {
-          console.error("Invalid JSON"); // this should never happen, it should fall to form error
-          return [key, value];
-        }
+        return [key, parseJsonWorkflowParameterValue(value)];
       }
       // can improve this via the type system maybe
       if (
@@ -683,22 +682,7 @@ function RunWorkflowForm({
                 rules={{
                   validate: (value) => {
                     if (parameter.workflow_parameter_type === "json") {
-                      if (value === null || value === undefined) {
-                        return "This field is required";
-                      }
-                      if (typeof value === "string") {
-                        const trimmed = value.trim();
-                        if (trimmed === "") {
-                          return "This field is required";
-                        }
-                        try {
-                          JSON.parse(trimmed);
-                          return true;
-                        } catch (e) {
-                          return "Invalid JSON";
-                        }
-                      }
-                      return;
+                      return validateJsonWorkflowParameterValue(value);
                     }
 
                     // Boolean parameters are required - show error and block submission
