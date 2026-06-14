@@ -426,7 +426,14 @@ def evaluate_output_policy(
 
 def format_output_policy_tool_error(verdict: OutputPolicyVerdict) -> str:
     reasons = ", ".join(reason.value for reason in verdict.reason_codes) or "unknown"
-    return f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    message = f"Output policy blocked this Copilot output before persistence. Reason codes: {reasons}."
+    if OutputPolicyReason.RAW_SECRET_LEAK in verdict.reason_codes:
+        message += (
+            " For saved credentials, bind a credential_id workflow parameter and reference fields as "
+            "`<key>.username`, `<key>.password`, or `<key>.totp`; do not split, concatenate, or obfuscate "
+            "literal secrets in workflow code or YAML."
+        )
+    return message
 
 
 def _contains_raw_secret(value: Any) -> bool:

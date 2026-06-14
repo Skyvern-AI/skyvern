@@ -14,6 +14,7 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
+from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     artifact_dependency_id,
     artifact_observation_ref_id,
@@ -34,6 +35,8 @@ from skyvern.forge.sdk.copilot.enforcement import (
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
+    OutputPolicyReason,
+    OutputPolicyVerdict,
     evaluate_output_policy,
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
@@ -55,7 +58,6 @@ from ._shared import (
     _proxy_location_trace_value,
     _raw_yaml_proxy_location,
     _workflow_definition_as_dict,
-    _workflow_yaml_blocks_by_label,
 )
 from .banned_blocks import (
     _banned_block_reject_message,
@@ -639,10 +641,17 @@ def _code_artifact_metadata_items(raw_metadata: Any) -> list[Any]:
 
 
 def _workflow_yaml_code_blocks_by_label(workflow_yaml: str | None) -> dict[str, Mapping[str, Any]]:
+    if workflow_yaml is None:
+        return {}
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return {}
     blocks: dict[str, Mapping[str, Any]] = {}
-    for label, block in _workflow_yaml_blocks_by_label(workflow_yaml).items():
+    for block in workflow_blocks(parsed):
         if _enum_or_string_name(block.get("block_type")) == BlockType.CODE.value:
-            blocks[label] = block
+            label = block.get("label")
+            if isinstance(label, str) and label:
+                blocks[label] = block
     return blocks
 
 
@@ -662,7 +671,12 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
         if not code.strip():
             continue
         prior_block = prior_blocks.get(label)
-        if prior_block is not None and str(prior_block.get("code") or "") == code:
+        parameter_keys = _code_block_parameter_keys(block)
+        if (
+            prior_block is not None
+            and str(prior_block.get("code") or "") == code
+            and _code_block_parameter_keys(prior_block) == parameter_keys
+        ):
             continue
         try:
             CodeBlock.is_safe_code(code)
@@ -671,10 +685,22 @@ def _code_block_safety_errors(workflow_yaml: str | None, prior_yaml: str | None)
         except InsecureCodeDetected as exc:
             errors.append(
                 f"Code block `{label}` failed the sandbox safety check: {exc}. Rewrite without import "
-                "statements, dunder access, or private attributes; the sandbox already provides `page`, "
-                "`json`, `re`, `html`, `asyncio.sleep`, and common builtins."
+                "statements, dunder access, or private attributes; the sandbox provides `page`, declared "
+                "code-block parameter keys, `json`, `re`, `html`, `asyncio.sleep`, and its explicit safe helper "
+                "namespace. `Exception` is the only available exception type."
             )
+        unresolved_diagnostics = sandbox_unresolved_name_diagnostics(code, parameter_keys=parameter_keys)
+        errors.extend(
+            f"Code block `{label}` failed the sandbox name check: {item.message}" for item in unresolved_diagnostics
+        )
     return errors
+
+
+def _code_block_parameter_keys(block: Mapping[str, Any]) -> frozenset[str]:
+    raw_keys = block.get("parameter_keys")
+    if not isinstance(raw_keys, list):
+        return frozenset()
+    return frozenset(key for key in raw_keys if isinstance(key, str) and key)
 
 
 def _code_seam_rejection_user_summary(*, metadata_rejected: bool, code_rejected: bool) -> str:
@@ -1436,6 +1462,7 @@ async def _update_workflow(
         tool_arguments=params,
     )
     if not output_policy_verdict.allowed:
+        _record_code_only_raw_secret_reject_span(ctx, output_policy_verdict)
         LOG.info(
             "copilot output policy tool body verdict",
             **output_policy_verdict_to_trace_data(
@@ -1576,6 +1603,22 @@ def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow)
             "input_proxy_location_present": input_present,
             "input_proxy_location": input_proxy_location,
             "effective_proxy_location": effective_proxy_location,
+        },
+    ):
+        pass
+
+
+def _record_code_only_raw_secret_reject_span(ctx: AgentContext, verdict: OutputPolicyVerdict) -> None:
+    if OutputPolicyReason.RAW_SECRET_LEAK not in verdict.reason_codes:
+        return
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return
+    with copilot_span(
+        "update_workflow_code_only_raw_secret_reject",
+        data={
+            "tool_name": "update_workflow",
+            "reason_code": OutputPolicyReason.RAW_SECRET_LEAK.value,
+            "block_authoring_policy": BlockAuthoringPolicy.CODE_ONLY_BROWSER.value,
         },
     ):
         pass
