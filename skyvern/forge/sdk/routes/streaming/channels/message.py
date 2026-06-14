@@ -67,6 +67,8 @@ class MessageKind(enum.StrEnum):
     GO_FORWARD = "go-forward"
     NAVIGATE = "navigate"
     RELOAD = "reload"
+    RECORDING_CAPTURE_PAUSE = "recording-capture-pause"
+    RECORDING_CAPTURE_RESUME = "recording-capture-resume"
     RECORDING_INTERPRETATION_UPDATE = "recording-interpretation-update"
     SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
@@ -110,6 +112,8 @@ MessageKinds = t.Literal[
     MessageKind.GO_FORWARD,
     MessageKind.NAVIGATE,
     MessageKind.RELOAD,
+    MessageKind.RECORDING_CAPTURE_PAUSE,
+    MessageKind.RECORDING_CAPTURE_RESUME,
     MessageKind.RECORDING_INTERPRETATION_UPDATE,
     MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
@@ -132,6 +136,16 @@ class MessageInBeginExfiltration(Message):
 @dataclasses.dataclass
 class MessageInEndExfiltration(Message):
     kind: t.Literal[MessageKind.END_EXFILTRATION] = MessageKind.END_EXFILTRATION
+
+
+@dataclasses.dataclass
+class MessageInRecordingCapturePause(Message):
+    kind: t.Literal[MessageKind.RECORDING_CAPTURE_PAUSE] = MessageKind.RECORDING_CAPTURE_PAUSE
+
+
+@dataclasses.dataclass
+class MessageInRecordingCaptureResume(Message):
+    kind: t.Literal[MessageKind.RECORDING_CAPTURE_RESUME] = MessageKind.RECORDING_CAPTURE_RESUME
 
 
 @dataclasses.dataclass
@@ -244,6 +258,7 @@ class MessageOutExfiltratedEvent(Message):
 @dataclasses.dataclass
 class MessageOutRecordingInterpretationUpdate(Message):
     kind: t.Literal[MessageKind.RECORDING_INTERPRETATION_UPDATE] = MessageKind.RECORDING_INTERPRETATION_UPDATE
+    interpretation_session_id: str = ""
     session_revision: int = 0
     steps: list[RecordingDraftStep] = dataclasses.field(default_factory=list)
     pending: bool = False
@@ -270,6 +285,8 @@ MessageIn = (
     | MessageInGoBack
     | MessageInGoForward
     | MessageInNavigate
+    | MessageInRecordingCapturePause
+    | MessageInRecordingCaptureResume
     | MessageInReload
     | MessageInTakeControl
     | MessageInTakeScreenshot
@@ -317,6 +334,10 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInClipboardPaste(text=text)
         case MessageKind.END_EXFILTRATION:
             return MessageInEndExfiltration()
+        case MessageKind.RECORDING_CAPTURE_PAUSE:
+            return MessageInRecordingCapturePause()
+        case MessageKind.RECORDING_CAPTURE_RESUME:
+            return MessageInRecordingCaptureResume()
         case MessageKind.GET_BROWSER_URL:
             return MessageInGetBrowserUrl()
         case MessageKind.GO_BACK:
@@ -634,6 +655,7 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         message_channel.send_nowait(
                             messages=[
                                 MessageOutRecordingInterpretationUpdate(
+                                    interpretation_session_id=update.interpretation_session_id,
                                     session_revision=update.session_revision,
                                     steps=update.steps,
                                     pending=update.pending,
@@ -768,6 +790,18 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                 if live_interpretation_browser_session_id:
                     await interpretation_registry.stop_session(live_interpretation_browser_session_id)
                     live_interpretation_browser_session_id = None
+
+            case MessageKind.RECORDING_CAPTURE_PAUSE:
+                if exfiltration_channel is not None:
+                    exfiltration_channel.pause_capture()
+                if live_interpretation_browser_session_id:
+                    interpretation_registry.pause_capture(live_interpretation_browser_session_id)
+
+            case MessageKind.RECORDING_CAPTURE_RESUME:
+                if exfiltration_channel is not None:
+                    exfiltration_channel.resume_capture()
+                if live_interpretation_browser_session_id:
+                    interpretation_registry.resume_capture(live_interpretation_browser_session_id)
 
             case MessageKind.ERROR:
                 await send(message)
