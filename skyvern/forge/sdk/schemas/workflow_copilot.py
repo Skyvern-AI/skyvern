@@ -21,6 +21,27 @@ class WorkflowCopilotChat(BaseModel):
     modified_at: datetime = Field(..., description="When the chat was last modified")
 
 
+class WorkflowCopilotCompletionCriteriaSet(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completion_criteria_set_id: str
+    organization_id: str
+    workflow_copilot_chat_id: str
+    goal_epoch: int
+    status: str
+    criteria: list[dict]
+    source_turn_id: str | None = None
+    source_goal_text: str | None = None
+    consecutive_all_no_evidence: int = 0
+    tripwire_fired: bool = False
+    last_fully_satisfied_workflow_yaml: str | None = None
+    superseded_by_set_id: str | None = None
+    superseded_at: datetime | None = None
+    supersede_reason: str | None = None
+    created_at: datetime
+    modified_at: datetime
+
+
 class WorkflowCopilotChatSender(StrEnum):
     USER = "user"
     AI = "ai"

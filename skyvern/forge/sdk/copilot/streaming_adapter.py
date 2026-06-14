@@ -12,6 +12,7 @@ import structlog
 # Reuse the HTTP-logging redactor so SSE tool inputs and request-body logs
 # share one exact-match sensitive-key policy.
 from skyvern.forge.request_logging import redact_sensitive_fields
+from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
 from skyvern.forge.sdk.copilot.narration import (
     NarratorState,
     TransitionKind,
@@ -141,6 +142,9 @@ async def stream_to_sse(
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = _get_raw_field(raw, "name") or "unknown"
                 call_id_to_name[call_id] = tool_name
+                ctx.in_flight_stream_tool_call = InFlightStreamToolCall(
+                    call_id=call_id, tool_name=tool_name, iteration=iteration
+                )
                 narrator_state.record_activity(build_tool_call_activity(tool_name, iteration, call_id))
 
                 if not client_gone:
@@ -177,6 +181,7 @@ async def stream_to_sse(
                 raw = event.item.raw_item
                 call_id = _get_raw_field(raw, "call_id") or _get_raw_field(raw, "id") or ""
                 tool_name = call_id_to_name.get(call_id, "unknown")
+                ctx.in_flight_stream_tool_call = None
                 # Clear pending_tool_name so post-tool transitions describe
                 # what the agent just finished, not what it's still doing.
                 narrator_state.pending_tool_name = None
@@ -255,6 +260,44 @@ async def stream_to_sse(
         # Cancel any in-flight narration before the stream tears down so
         # tasks don't try to send on a disconnected channel.
         await cancel_in_flight(narrator_state)
+
+
+async def flush_goal_satisfied_tool_result(stream: EventSourceStream, ctx: CopilotContext) -> None:
+    """Emit the TOOL_RESULT frame for the goal-satisfying tool.
+
+    The goal-satisfied stop is raised from ``on_tool_end`` before the SDK
+    yields the matching ``tool_output`` event, so the frame the loop above
+    would have sent never streams; the exit path calls this instead.
+    """
+    pending = ctx.in_flight_stream_tool_call
+    parsed = ctx.goal_satisfied_tool_output
+    tool_name = ctx.goal_satisfied_tool_name
+    ctx.in_flight_stream_tool_call = None
+    ctx.goal_satisfied_tool_output = None
+    ctx.goal_satisfied_tool_name = None
+    if pending is None or parsed is None or tool_name != pending.tool_name:
+        return
+    blocker_signals = _tool_blocker_signal_candidates(ctx)
+    summary = format_tool_result_for_user(pending.tool_name, parsed, blocker_signal=blocker_signals)
+    success = parsed.get("ok", True)
+    narrator_state = ctx.narrator_state
+    if narrator_state is not None:
+        narrator_state.record_activity(
+            build_tool_result_activity(pending.tool_name, summary, success, pending.iteration, pending.call_id)
+        )
+    if await stream.is_disconnected():
+        return
+    await stream.send(
+        WorkflowCopilotToolResultUpdate(
+            type=WorkflowCopilotStreamMessageType.TOOL_RESULT,
+            tool_name=pending.tool_name,
+            success=success,
+            summary=summary,
+            iteration=pending.iteration,
+            tool_call_id=pending.call_id,
+            detail=summarize_tool_result_detail(parsed, tool_name=pending.tool_name, blocker_signal=blocker_signals),
+        )
+    )
 
 
 def _get_raw_field(raw: Any, key: str) -> Any:

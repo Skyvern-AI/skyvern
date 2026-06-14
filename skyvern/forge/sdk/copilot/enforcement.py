@@ -305,6 +305,18 @@ def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
     return not _verified_goal_likely_needs_more_work(ctx)
 
 
+def verified_goal_claim_authorized(ctx: CopilotContext) -> bool:
+    """Whether the terminal may CLAIM a tested success. Turn completion keeps
+    flowing through ``verified_goal_satisfied_context``; with persisted criteria
+    enabled, the claim tier additionally requires judge-confirmed outcome evidence —
+    criteria-less or judge-less terminals end the turn but render built-but-unverified.
+    With either flag off the judge cannot be authoritative, so the claim falls back
+    to the legacy gate."""
+    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
+        return verified_goal_satisfied_context(ctx)
+    return outcome_fully_verified(ctx)
+
+
 def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     """The terminal-gate decision plus the conjuncts that explain it.
 
@@ -315,6 +327,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
     """
     return {
         "gate_satisfied": verified_goal_satisfied_context(ctx),
+        "gate_claim_authorized": verified_goal_claim_authorized(ctx),
         "gate_last_test_ok": ctx.last_test_ok is True,
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
         "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),

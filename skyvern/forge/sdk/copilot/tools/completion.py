@@ -4,16 +4,21 @@ from typing import Any
 import structlog
 
 from skyvern.config import settings
+from skyvern.forge.sdk.copilot.completion_criteria_store import note_adjudication_on_turn_state
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     CriterionVerdict,
     RunEvidenceSnapshot,
+    combine_verification_results,
     evaluate_completion_criteria,
+    grade_definition_criteria,
+    resolve_unknown,
     summarize_unsatisfied_outcomes,
 )
 from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
+from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
 from ._shared import (
@@ -38,6 +43,34 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[Any]:
     # A method-mandated criterion asserts HOW the goal was reached; the outcome
     # judge sees only end-state evidence.
     return [c for c in (policy.completion_criteria if policy is not None else []) if not c.method_mandated]
+
+
+def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
+    if not settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED:
+        return list(criteria), []
+    run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
+    definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
+    return run_criteria, definition_criteria
+
+
+def _definition_plane_workflow_yaml(copilot_ctx: Any) -> str | None:
+    last_yaml = getattr(copilot_ctx, "last_workflow_yaml", None)
+    if isinstance(last_yaml, str) and last_yaml.strip():
+        return last_yaml
+    initial_yaml = getattr(copilot_ctx, "workflow_yaml", None)
+    return initial_yaml if isinstance(initial_yaml, str) else None
+
+
+def _record_adjudication_on_turn_state(copilot_ctx: Any, verification: CompletionVerificationResult | None) -> None:
+    if verification is None or verification.status != "evaluated":
+        return
+    note_adjudication_on_turn_state(
+        getattr(copilot_ctx, "completion_criteria_turn_state", None),
+        verification,
+        fully_satisfied_workflow_yaml=_definition_plane_workflow_yaml(copilot_ctx)
+        if verification.is_fully_satisfied()
+        else None,
+    )
 
 
 def _verified_context_block_labels_for_snapshot(
@@ -96,34 +129,45 @@ async def _maybe_run_completion_verification_from_page_observation(
     criteria = _completion_verification_criteria(copilot_ctx)
     if not criteria:
         return None
-    handler = await _completion_verification_handler(copilot_ctx)
-    if handler is None:
-        return None
-    remaining = _copilot_seconds_remaining(copilot_ctx)
-    if (
-        remaining is not None
-        and remaining
-        <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
-    ):
-        verification = CompletionVerificationResult(status="unavailable")
+    run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
+    criterion_ids = [criterion.id for criterion in criteria]
+    definition_verdicts = (
+        grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
+        if definition_criteria
+        else []
+    )
+    if not run_criteria:
+        verification = combine_verification_results(criterion_ids, None, definition_verdicts)
     else:
-        snapshot = _build_page_observation_evidence_snapshot(
-            copilot_ctx,
-            url=url,
-            title=title,
-            observed_data=observed_data,
-        )
-        if not snapshot.has_evidence():
-            verification = CompletionVerificationResult(
-                status="evaluated",
-                criterion_ids=[criterion.id for criterion in criteria],
-                verdicts=[
-                    CriterionVerdict(criterion_id=criterion.id, satisfied=False, reason_code="no_evidence")
-                    for criterion in criteria
-                ],
-            )
+        handler = await _completion_verification_handler(copilot_ctx)
+        if handler is None:
+            return None
+        remaining = _copilot_seconds_remaining(copilot_ctx)
+        if (
+            remaining is not None
+            and remaining
+            <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+        ):
+            verification = CompletionVerificationResult(status="unavailable")
         else:
-            verification = await evaluate_completion_criteria(criteria, snapshot, handler)
+            snapshot = _build_page_observation_evidence_snapshot(
+                copilot_ctx,
+                url=url,
+                title=title,
+                observed_data=observed_data,
+            )
+            if not snapshot.has_evidence():
+                run_result = CompletionVerificationResult(
+                    status="evaluated",
+                    criterion_ids=[criterion.id for criterion in run_criteria],
+                    verdicts=[
+                        CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
+                        for criterion in run_criteria
+                    ],
+                )
+            else:
+                run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
+            verification = combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
     if (
         isinstance(existing, CompletionVerificationResult)
@@ -134,6 +178,7 @@ async def _maybe_run_completion_verification_from_page_observation(
 
     copilot_ctx.completion_verification_result = verification
     record_completion_verification(copilot_ctx, verification)
+    _record_adjudication_on_turn_state(copilot_ctx, verification)
     if verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, verification)
     return verification
@@ -161,7 +206,7 @@ def _is_outcome_evidence_candidate(copilot_ctx: Any, result: dict[str, Any]) -> 
     """
     if not bool(result.get("ok", False)):
         return False
-    if _run_blocks_structured_blocker_message(result):
+    if _run_blocks_structured_blocker_message(result, copilot_ctx):
         return False
     _anti_bot, empty_data_blocks, _categories = _analyze_run_blocks(result, copilot_ctx)
     return not empty_data_blocks
@@ -177,7 +222,7 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
         return False
     if _active_run_terminal_evidence_detected(result):
         return False
-    if _run_blocks_structured_blocker_message(result):
+    if _run_blocks_structured_blocker_message(result, copilot_ctx):
         return False
     data = result.get("data")
     if not isinstance(data, dict):
@@ -236,6 +281,15 @@ async def _maybe_run_completion_verification(
         or _is_unfinished_run_verification_candidate(copilot_ctx, result)
     ):
         return None
+    run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
+    criterion_ids = [criterion.id for criterion in criteria]
+    definition_verdicts = (
+        grade_definition_criteria(definition_criteria, _definition_plane_workflow_yaml(copilot_ctx))
+        if definition_criteria
+        else []
+    )
+    if not run_criteria:
+        return combine_verification_results(criterion_ids, None, definition_verdicts)
     # A missing judge handler is an infra/config state, not a transient failure:
     # fall back to the prior gate rather than fail closed on every run.
     handler = await _completion_verification_handler(copilot_ctx)
@@ -248,15 +302,17 @@ async def _maybe_run_completion_verification(
         return CompletionVerificationResult(status="unavailable")
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
     if not snapshot.has_evidence():
-        return CompletionVerificationResult(
+        run_result = CompletionVerificationResult(
             status="evaluated",
-            criterion_ids=[criterion.id for criterion in criteria],
+            criterion_ids=[criterion.id for criterion in run_criteria],
             verdicts=[
-                CriterionVerdict(criterion_id=criterion.id, satisfied=False, reason_code="no_evidence")
-                for criterion in criteria
+                CriterionVerdict(criterion_id=criterion.id, state="unsatisfied", reason_code="no_evidence")
+                for criterion in run_criteria
             ],
         )
-    return await evaluate_completion_criteria(criteria, snapshot, handler)
+    else:
+        run_result = await evaluate_completion_criteria(run_criteria, snapshot, handler)
+    return combine_verification_results(criterion_ids, run_result, definition_verdicts)
 
 
 def _outcome_unverified_reason(
@@ -271,9 +327,17 @@ def _outcome_unverified_reason(
         criteria = list(policy.completion_criteria) if policy is not None else []
         unmet = summarize_unsatisfied_outcomes(completion_verification, criteria)
         detail = f": {unmet}" if unmet else ""
+        turn_state = getattr(copilot_ctx, "completion_criteria_turn_state", None)
+        known_good = (
+            " A previously tested revision of this workflow satisfied every criterion; if repairs regress "
+            "working blocks, prefer restoring that revision over rewriting them."
+            if turn_state is not None and getattr(turn_state, "known_good_yaml_available", False)
+            else ""
+        )
         return (
             f"The run completed but did not demonstrate the goal outcome(s){detail}. "
-            "Add an end-state confirmation (an extraction or validation block) that observes the outcome, then re-run."
+            "Add an end-state confirmation (an extraction or validation block) that observes the outcome, "
+            f"then re-run.{known_good}"
         )
     # An 'unavailable' result reaches here only when verification was required;
     # fail closed and ask for a re-run rather than claim an unverified success.
@@ -299,6 +363,12 @@ def _outcome_failure_warrants_repair(
         return False
     if any(verdict.reason_code == "evidence_contradicts" for verdict in completion_verification.verdicts):
         return True
+    # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
+    # (absent judge signal, unmappable definition checks) never warrants repair.
+    if settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and not any(
+        resolve_unknown(verdict.state) == "unsatisfied" for verdict in completion_verification.verdicts
+    ):
+        return False
     return _current_workflow_has_evidence_block(copilot_ctx)
 
 

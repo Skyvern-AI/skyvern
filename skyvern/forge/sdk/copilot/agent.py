@@ -30,6 +30,7 @@ import yaml
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -40,6 +41,11 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
 from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    StoredCriteriaSnapshot,
+    build_turn_state,
+    reconcile_completion_criteria,
+)
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import (
     COPILOT_RESPONSE_TYPES,
@@ -48,15 +54,20 @@ from skyvern.forge.sdk.copilot.context import (
     NarrativeActivityEntry,
     NarrativeBlock,
     NarrativeDraft,
+    NarrativeOutcomeAdjudication,
     ResponseType,
     StructuredContext,
     TurnNarrativePayload,
     finalize_discovery_counter_in_global_llm_context,
 )
-from skyvern.forge.sdk.copilot.enforcement import outcome_fully_verified, verified_goal_satisfied_context
+from skyvern.forge.sdk.copilot.enforcement import (
+    outcome_fully_verified,
+    verified_goal_claim_authorized,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
+    record_criteria_lifecycle,
     record_gate_decision,
 )
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -87,6 +98,7 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
 )
 from skyvern.forge.sdk.copilot.request_policy import (
     RAW_SECRET_REFUSAL_SENTINEL,
+    CompletionCriterion,
     RequestPolicy,
     build_request_policy,
     redact_raw_secrets_for_prompt,
@@ -95,6 +107,7 @@ from skyvern.forge.sdk.copilot.runtime import _browser_context_is_attachable
 from skyvern.forge.sdk.copilot.streaming_adapter import (
     emit_turn_start,
     emit_workflow_draft,
+    flush_goal_satisfied_tool_result,
     maybe_emit_design_end,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import _copilot_model_name, ensure_tracing_initialized, is_tracing_enabled
@@ -215,6 +228,7 @@ class RequestPolicyGuardrailInputs:
     workflow_permanent_id: str | None = None
     workflow_run_id: str | None = None
     browser_session_id: str | None = None
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None
 
 
 class CopilotRequestPolicyMissingError(Exception):
@@ -343,6 +357,39 @@ def _request_policy_agent_inputs(
     return user_message, chat_history_text
 
 
+def _stored_active_completion_criteria(
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> list[CompletionCriterion] | None:
+    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
+        return None
+    snapshot = policy_inputs.stored_completion_criteria
+    if snapshot is None or snapshot.active is None:
+        return None
+    return list(snapshot.active.criteria)
+
+
+def _reconcile_completion_criteria_on_context(
+    ctx: CopilotContext,
+    policy: RequestPolicy,
+    policy_inputs: RequestPolicyGuardrailInputs,
+) -> None:
+    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
+        return
+    snapshot = policy_inputs.stored_completion_criteria
+    if snapshot is None:
+        return
+    decision = reconcile_completion_criteria(
+        snapshot,
+        list(policy.completion_criteria),
+        actionable=policy.user_response_policy != "ask_clarification",
+    )
+    if decision.action == "adopt_stored":
+        policy.completion_criteria = list(decision.criteria)
+    ctx.completion_criteria_turn_state = build_turn_state(snapshot, decision)
+    record_criteria_lifecycle(ctx, decision.to_trace_data())
+    LOG.info("copilot completion criteria reconciled", **decision.to_trace_data())
+
+
 def _store_request_policy_on_context(
     ctx: CopilotContext,
     policy: RequestPolicy,
@@ -355,6 +402,7 @@ def _store_request_policy_on_context(
         chat_history_text=policy_inputs.chat_history_text,
         previous_user_message=policy_inputs.previous_user_message,
     )
+    _reconcile_completion_criteria_on_context(ctx, policy, policy_inputs)
     ctx.request_policy = policy
     ctx.allow_untested_workflow_draft = policy.testing_intent == "skip_test"
     ctx.user_message = agent_user_message
@@ -890,10 +938,34 @@ def _make_agent_result(
         if turn_outcome is not None and "responseKind" not in narrative_payload:
             payload_updates["responseKind"] = turn_outcome.response_kind.value
         if ctx is not None and "verifiedSuccess" not in narrative_payload:
-            payload_updates["verifiedSuccess"] = bool(verified_goal_satisfied_context(ctx))
+            payload_updates["verifiedSuccess"] = bool(verified_goal_claim_authorized(ctx))
+        if ctx is not None and "outcomeAdjudication" not in narrative_payload:
+            adjudication = _build_outcome_adjudication_payload(ctx)
+            if adjudication is not None:
+                payload_updates["outcomeAdjudication"] = adjudication
         if payload_updates:
             kwargs["narrative_payload"] = {**narrative_payload, **payload_updates}
-    return AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+    result = AgentResult(global_llm_context=final_context, turn_outcome=turn_outcome, **kwargs)
+    if ctx is not None and result.completion_criteria_turn_state is None:
+        result.completion_criteria_turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    return result
+
+
+def _build_outcome_adjudication_payload(ctx: CopilotContext) -> NarrativeOutcomeAdjudication | None:
+    turn_state = getattr(ctx, "completion_criteria_turn_state", None)
+    if turn_state is None:
+        return None
+    counts = turn_state.last_verdict_state_counts or {}
+    payload: NarrativeOutcomeAdjudication = {
+        "satisfiedCount": int(counts.get("satisfied", 0)),
+        "unsatisfiedCount": int(counts.get("unsatisfied", 0)),
+        "unknownCount": int(counts.get("unknown", 0)),
+        "claimTier": "verified_goal_satisfied" if verified_goal_claim_authorized(ctx) else "built_unverified",
+    }
+    if turn_state.decision is not None:
+        payload["criteriaEpoch"] = turn_state.decision.epoch
+        payload["criteriaLifecycleReason"] = turn_state.decision.reason
+    return payload
 
 
 _BLOCK_STATUS_TO_UI_STATE: dict[str, str] = {
@@ -1070,11 +1142,22 @@ def _build_exit_result(
     )
 
 
-def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
+async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_context: str | None) -> AgentResult:
     # Bypass one extra LLM turn after a full workflow test already satisfies
     # the diagnosis contract.
+    if ctx.stream is not None:
+        try:
+            await flush_goal_satisfied_tool_result(ctx.stream, ctx)
+        except Exception as flush_err:
+            LOG.warning("copilot_goal_satisfied_tool_result_flush_failed", error=str(flush_err))
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    user_response = "I created and tested the workflow successfully."
+    if verified_goal_claim_authorized(ctx):
+        user_response = "I created and tested the workflow successfully."
+    else:
+        user_response = (
+            "I built the workflow and the test run completed, but the goal outcome was not "
+            "independently verified. Review the draft to confirm it does what you need."
+        )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
         attempted_kind=derive_response_kind(ctx.turn_intent),
@@ -2538,6 +2621,7 @@ def _build_copilot_input_guardrails(
                 global_llm_context=policy_inputs.global_llm_context,
                 organization_id=policy_inputs.organization_id,
                 handler=policy_inputs.handler,
+                active_criteria=_stored_active_completion_criteria(policy_inputs),
             )
             if isinstance(ctx, CopilotContext):
                 turn_intent_classification = None
@@ -2765,6 +2849,7 @@ async def run_copilot_agent(
     turn_id: str | None = None,
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None,
 ) -> AgentResult:
     # One id per turn — passed to every downstream AgentResult and
     # CopilotContext so the envelope and terminal frames correlate. The
@@ -2801,6 +2886,7 @@ async def run_copilot_agent(
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
                     ctx_sink=ctx_sink,
+                    stored_completion_criteria=stored_completion_criteria,
                 )
             except Exception as exc:
                 LOG.error(
@@ -2868,6 +2954,7 @@ async def _run_copilot_turn_impl(
     prior_copilot_workflow_yaml: str | None = None,
     prior_block_count: int | None = None,
     ctx_sink: list[CopilotContext] | None = None,
+    stored_completion_criteria: StoredCriteriaSnapshot | None = None,
 ) -> AgentResult:
     copilot_config = config or CopilotConfig(security_rules=security_rules)
     chat_history_text = _format_chat_history(chat_history)
@@ -2955,6 +3042,7 @@ async def _run_copilot_turn_impl(
         workflow_permanent_id=chat_request.workflow_permanent_id,
         workflow_run_id=getattr(chat_request, "workflow_run_id", None),
         browser_session_id=getattr(chat_request, "browser_session_id", None),
+        stored_completion_criteria=stored_completion_criteria,
     )
     request_policy_guardrails = _build_copilot_input_guardrails(
         InputGuardrail,
@@ -3273,7 +3361,7 @@ async def _run_copilot_turn_impl(
                     workflow_permanent_id=chat_request.workflow_permanent_id,
                     workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
                 )
-                return _build_goal_satisfied_exit_result(ctx, global_llm_context)
+                return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
             except CopilotTurnHalt as exc:
                 LOG.info(
                     "Copilot run stopped after typed turn halt",
@@ -3366,6 +3454,6 @@ async def _run_copilot_turn_impl(
                 workflow_run_id=ctx.last_successful_run_blocks_workflow_run_id,
                 error_type=type(e).__name__,
             )
-            return _build_goal_satisfied_exit_result(ctx, global_llm_context)
+            return await _build_goal_satisfied_exit_result(ctx, global_llm_context)
         LOG.error("Copilot agent error", error=str(e), exc_info=True)
         return _build_unexpected_error_exit_result(ctx, global_llm_context, error=e)
