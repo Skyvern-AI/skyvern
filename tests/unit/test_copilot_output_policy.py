@@ -1799,6 +1799,8 @@ workflow_definition:
 
     assert result["ok"] is False
     assert "raw_secret_leak" in result["error"]
+    assert "<key>.password" in result["error"]
+    assert "do not split, concatenate, or obfuscate" in result["error"]
     process_mock.assert_not_called()
 
 

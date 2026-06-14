@@ -9,6 +9,7 @@ import textwrap
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
@@ -50,6 +51,42 @@ _SAFE_CODE_YAML = _yaml(
           await page.goto("https://example.com/search")
     """
 )
+
+
+def _code_yaml(
+    code: str,
+    *,
+    parameter_keys: list[str] | None = None,
+    workflow_param: bool = False,
+    nested: bool = False,
+) -> str:
+    block: dict[str, object] = {
+        "block_type": "code",
+        "label": "nested_search" if nested else "search_registry",
+        "code": textwrap.dedent(code).strip(),
+    }
+    if parameter_keys is not None:
+        block["parameter_keys"] = parameter_keys
+    definition: dict[str, object] = {"blocks": [block]}
+    if workflow_param:
+        definition["parameters"] = [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "provider_query",
+                "default_value": "Taylor Brooks",
+            }
+        ]
+    if nested:
+        definition["blocks"] = [
+            {
+                "block_type": "conditional",
+                "label": "choose_path",
+                "branch_conditions": [{"condition": "{{ branch_name }} == 'search'", "blocks": [block]}],
+            }
+        ]
+    return yaml.safe_dump({"title": "Registry lookup", "workflow_definition": definition}, sort_keys=False)
+
 
 _SUBMITTED_LITERAL_YAML = _yaml(
     """
@@ -185,6 +222,8 @@ def _credential_code_yaml(*, code: str, credential_id: str = "cred_missing") -> 
         "  blocks:\n"
         "    - block_type: code\n"
         "      label: login_with_saved_credential\n"
+        "      parameter_keys:\n"
+        "        - login_credential\n"
         "      code: |\n"
         f"{indented_code}\n"
     )
@@ -262,6 +301,141 @@ class TestCodeSafetySeam:
 
     def test_safe_code_passes(self) -> None:
         assert _code_block_safety_errors(_SAFE_CODE_YAML, None) == []
+
+    def test_unresolved_sandbox_names_are_seam_errors(self) -> None:
+        errors = _code_block_safety_errors(
+            _code_yaml(
+                """
+                raise RuntimeError("not available")
+                raise ValueError("not available")
+                value = getattr(page, "url", "")
+                """
+            ),
+            None,
+        )
+        assert len(errors) == 1
+        for expected in ("search_registry", "RuntimeError", "ValueError", "getattr", "Exception"):
+            assert expected in errors[0]
+        assert _code_block_safety_errors(_code_yaml('raise Exception("allowed")'), None) == []
+
+    def test_parameter_contracts_use_block_keys_only_and_recheck_key_changes(self) -> None:
+        errors = _code_block_safety_errors(_code_yaml("print(provider_query)", workflow_param=True), None)
+        assert len(errors) == 1
+        assert "provider_query" in errors[0]
+
+        assert (
+            _code_block_safety_errors(
+                _code_yaml("print(provider_query)", parameter_keys=["provider_query"], workflow_param=True),
+                None,
+            )
+            == []
+        )
+
+        prior = _code_yaml("print(provider_query)", parameter_keys=["provider_query"], workflow_param=True)
+        current = _code_yaml("print(provider_query)", parameter_keys=[], workflow_param=True)
+        errors = _code_block_safety_errors(current, prior)
+        assert len(errors) == 1
+        assert "provider_query" in errors[0]
+
+    def test_branch_nested_blocks_and_existing_safety_errors_are_checked(self) -> None:
+        errors = _code_block_safety_errors(_code_yaml('raise RuntimeError("nested")', nested=True), None)
+        assert len(errors) == 1
+        assert all(expected in errors[0] for expected in ("nested_search", "RuntimeError"))
+
+        errors = _code_block_safety_errors(
+            _code_yaml(
+                """
+                import asyncio
+                raise RuntimeError("not available")
+                """
+            ),
+            None,
+        )
+        joined = "\n".join(errors)
+        assert "Not allowed to import modules" in joined
+        assert "RuntimeError" in joined
+
+    def test_name_analysis_accepts_safe_locals_and_rejects_runtime_hazards(self) -> None:
+        assert (
+            _code_block_safety_errors(_code_yaml('value = "row"\ncount = 1\ncount += 1\nprint(value, count)'), None)
+            == []
+        )
+
+        errors = _code_block_safety_errors(
+            _code_yaml(
+                """
+                value: str
+                print(value)
+                count += 1
+                page = page
+                x = 1
+                del x
+                print(x)
+                if page:
+                    branch_value = 1
+                print(branch_value)
+                class NotRunnable:
+                    pass
+                """
+            ),
+            None,
+        )
+        joined = "\n".join(errors)
+        for expected in (
+            "value",
+            "count",
+            "x",
+            "branch_value",
+            "NotRunnable",
+        ):
+            assert expected in joined
+        assert "unresolved names: `branch_value`, `count`, `page`, `value`, `x`" in joined
+
+    def test_name_analysis_allows_recursive_helpers(self) -> None:
+        assert (
+            _code_block_safety_errors(
+                _code_yaml(
+                    """
+                    def fact(n):
+                        if n <= 1:
+                            return 1
+                        return n * fact(n - 1)
+
+                    def is_even(n):
+                        if n == 0:
+                            return True
+                        return is_odd(n - 1)
+
+                    def is_odd(n):
+                        if n == 0:
+                            return False
+                        return is_even(n - 1)
+
+                    print(fact(4), is_even(4))
+                    """
+                ),
+                None,
+            )
+            == []
+        )
+
+    def test_name_analysis_handles_try_star_branching(self) -> None:
+        errors = _code_block_safety_errors(
+            _code_yaml(
+                """
+                try:
+                    risky()
+                except* Exception as group:
+                    recovered = group
+                print(recovered)
+                """
+            ),
+            None,
+        )
+        assert len(errors) == 1
+        assert "risky" in errors[0]
+        assert "recovered" in errors[0]
+        assert "group" not in errors[0]
 
     def test_syntax_error_is_a_seam_error(self) -> None:
         broken = _SAFE_CODE_YAML.replace('await page.goto("https://example.com/search")', "await page.goto(")
