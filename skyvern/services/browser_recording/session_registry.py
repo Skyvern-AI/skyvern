@@ -47,6 +47,20 @@ class RecordingInterpretationSessionRegistry:
         self._last_seen[browser_session_id] = time.monotonic()
         session.ingest_events(events)
 
+    def pause_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.pause_capture()
+
+    def resume_capture(self, browser_session_id: str) -> None:
+        session = self._sessions.get(browser_session_id)
+        if not session:
+            return
+
+        session.resume_capture()
+
     async def stop_session(self, browser_session_id: str) -> list[RecordingDraftStep]:
         session = self._sessions.pop(browser_session_id, None)
         self._last_seen.pop(browser_session_id, None)
