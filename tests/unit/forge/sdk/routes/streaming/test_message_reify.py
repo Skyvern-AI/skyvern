@@ -107,6 +107,7 @@ class TestReifyChannelMessage:
 class TestMessageSerialization:
     def test_recording_interpretation_update_serializes_pydantic_steps(self) -> None:
         message = MessageOutRecordingInterpretationUpdate(
+            interpretation_session_id="session-abc",
             session_revision=2,
             pending=False,
             finalized=True,
@@ -125,6 +126,7 @@ class TestMessageSerialization:
         serialized = message_to_dict(message)
 
         assert serialized["kind"] == "recording-interpretation-update"
+        assert serialized["interpretation_session_id"] == "session-abc"
         assert serialized["session_revision"] == 2
         assert serialized["finalized"] is True
         assert serialized["steps"][0]["action_kind"] == "click"

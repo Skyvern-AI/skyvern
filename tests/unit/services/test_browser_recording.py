@@ -417,6 +417,38 @@ async def test_live_interpretation_enrichment_failure_keeps_placeholder(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_live_interpretation_nav_then_click_emits_two_steps() -> None:
+    updates: list[RecordingInterpretationUpdate] = []
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=updates.append,
+        debounce_seconds=0.01,
+        max_wait_seconds=0.05,
+    )
+
+    try:
+        session.ingest_events(
+            [make_streaming_nav_event(url="https://example.com/home", timestamp=1.0)],
+        )
+        await asyncio.sleep(0.05)
+
+        click_event = make_streaming_console_click(timestamp_ms=2000.0)
+        click_event.params = {**click_event.params, "url": "https://example.com/home"}
+        session.ingest_events([click_event])
+
+        steps = await session.flush()
+        assert len(steps) == 2
+        assert steps[0].block_type == "goto_url"
+        assert steps[0].url == "https://example.com/home"
+        assert steps[1].block_type == "action"
+        assert steps[1].action_kind == ActionKind.CLICK
+    finally:
+        session.cancel()
+
+
+@pytest.mark.asyncio
 async def test_live_interpretation_max_wait_fires_during_continuous_events() -> None:
     updates: list[RecordingInterpretationUpdate] = []
     session = RecordingInterpretationSession(

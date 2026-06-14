@@ -117,6 +117,64 @@ def test_drafts_to_blocks_skips_empty_goto_url() -> None:
     assert processor.drafts_to_blocks(drafts) == []
 
 
+def test_drafts_to_blocks_goto_url_label_follows_edited_title_and_url() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.URL_CHANGE,
+            block_type="goto_url",
+            label="goto_wikipedia_com",
+            title="Go to wikipedia.org",
+            url="https://wikipedia.org/wiki/Foo",
+        )
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert len(blocks) == 1
+    assert blocks[0].label == "Go_to_wikipedia_org"
+    assert blocks[0].url == "https://wikipedia.org/wiki/Foo"
+
+
+def test_drafts_to_blocks_goto_url_label_derives_from_url_without_title_or_label() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.URL_CHANGE,
+            block_type="goto_url",
+            label="",
+            url="https://www.wikipedia.org/wiki/Foo",
+        )
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert len(blocks) == 1
+    assert blocks[0].label == "goto_www_wikipedia_org"
+    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
+
+
+def test_drafts_to_blocks_goto_url_label_preserves_edited_label_without_title() -> None:
+    processor = Processor(PBS_ID, ORG_ID, WP_ID)
+    drafts = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.URL_CHANGE,
+            block_type="goto_url",
+            label="Open Wikipedia",
+            url="https://www.wikipedia.org/wiki/Foo",
+        )
+    ]
+
+    blocks = processor.drafts_to_blocks(drafts)
+
+    assert len(blocks) == 1
+    assert blocks[0].label == "Open_Wikipedia"
+    assert blocks[0].url == "https://www.wikipedia.org/wiki/Foo"
+
+
 @pytest.mark.asyncio
 async def test_processor_process_uses_draft_steps_without_compressed_chunks() -> None:
     processor = Processor(PBS_ID, ORG_ID, WP_ID)
