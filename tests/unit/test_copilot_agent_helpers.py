@@ -122,6 +122,19 @@ class TestFailedTestResponseNormalization:
         assert "has not been run" in error
         assert ctx.coverage_nudge_count == 1
 
+    def test_pre_run_coverage_guard_skips_unknown_completion_contract(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
+
+        ctx = _ctx(
+            user_message="Go to https://example.com/contact. Fill out the contact form and submit it.",
+            request_policy=SimpleNamespace(completion_contract_status="unknown"),
+            last_update_block_count=1,
+            coverage_nudge_count=0,
+        )
+
+        assert _pre_run_workflow_coverage_error(ctx) is None
+        assert ctx.coverage_nudge_count == 0
+
     def test_pre_run_coverage_guard_allows_single_final_action_contract(self) -> None:
         from skyvern.forge.sdk.copilot.tools import _pre_run_workflow_coverage_error
 
@@ -2089,6 +2102,88 @@ class TestNativeToolSurface:
 
 class TestRequestPolicyCredentialResolution:
     @pytest.mark.asyncio
+    async def test_request_policy_classifier_timeout_retries_once(self, monkeypatch) -> None:
+        from skyvern.config import settings
+
+        monkeypatch.setattr(settings, "COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS", 0.01)
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.sleep(0.05)
+            return {"credential_input_kind": "none", "completion_contract": None}
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 2
+        assert policy.classifier_status == "success"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "absent"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_malformed_payload_falls_back_without_retry(self) -> None:
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "I can build that workflow."
+
+        policy = await _classify_request(
+            user_message="Build a workflow for https://example.com.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 1
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.classifier_retry_count == 0
+        assert policy.completion_contract_status == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_request_policy_classifier_transient_provider_error_retries_once(self) -> None:
+        class RateLimitError(Exception):
+            __module__ = "openai"
+
+        calls = 0
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RateLimitError("rate limit")
+            return {
+                "credential_input_kind": "none",
+                "completion_contract": "complete when the account page is visible",
+            }
+
+        policy = await _classify_request(
+            user_message=(
+                "Build a workflow for https://example.com/account. complete when the account page is visible"
+            ),
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=handler,
+        )
+
+        assert calls == 2
+        assert policy.classifier_status == "success"
+        assert policy.classifier_retry_count == 1
+        assert policy.completion_contract_status == "present"
+
+    @pytest.mark.asyncio
     async def test_missing_user_supplied_credential_ids_ask_for_clarification(self, monkeypatch) -> None:
         from skyvern.forge.sdk.copilot import request_policy as policy_module
         from skyvern.forge.sdk.copilot.request_policy import build_request_policy
@@ -2546,6 +2641,65 @@ workflow_definition:
         assert policy.allow_run_blocks is False
         assert policy.allow_missing_credentials_in_draft is True
         assert policy.requires_user_clarification is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_policy_resolves_explicit_saved_credential_name(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(
+            credential_id="cred_portal",
+            name="mock-portal-login",
+            tested_url="https://portal.example/login",
+        )
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            raise ValueError("classifier unavailable")
+
+        policy = await build_request_policy(
+            user_message='Log into the portal with saved credential named "mock-portal-login".',
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.classifier_failure_kind == "provider_error"
+        assert policy.completion_contract_status == "unknown"
+        assert policy.credential_input_kind == "credential_name"
+        assert policy.credential_refs == ["mock-portal-login"]
+        assert policy.resolved_credentials == [credential]
+
+    @pytest.mark.asyncio
+    async def test_fallback_policy_does_not_substring_match_saved_credential_name(self, monkeypatch) -> None:
+        from skyvern.forge.sdk.copilot import request_policy as policy_module
+        from skyvern.forge.sdk.copilot.request_policy import build_request_policy
+
+        credential = SimpleNamespace(credential_id="cred_login", name="login", tested_url=None)
+        credentials = SimpleNamespace(get_credentials=AsyncMock(return_value=[credential]))
+        monkeypatch.setattr(policy_module.app, "DATABASE", SimpleNamespace(credentials=credentials))
+
+        async def handler(*, prompt: str, prompt_name: str) -> dict[str, object]:
+            raise ValueError("classifier unavailable")
+
+        policy = await build_request_policy(
+            user_message="Log in to the portal using my saved credential.",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=handler,
+        )
+
+        assert policy.classifier_status == "fallback"
+        assert policy.completion_contract_status == "unknown"
+        assert policy.credential_input_kind == "none"
+        assert policy.credential_refs == []
+        credentials.get_credentials.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_request_policy_url_matching_and_skip_draft(self, monkeypatch) -> None:

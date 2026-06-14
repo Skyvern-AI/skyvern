@@ -117,6 +117,15 @@ def test_reply_after_success_with_request_policy_completion_contract_passes_thro
     assert ctx.coverage_nudge_count == 0
 
 
+def test_reply_after_success_with_unknown_fallback_contract_passes_through() -> None:
+    ctx = _post_success_ctx("Go to https://example.com/contact. Fill out the contact form and submit it.")
+    ctx.request_policy = SimpleNamespace(completion_contract_status="unknown")
+    parsed = {"type": "REPLY", "user_response": "I created and tested the workflow."}
+
+    assert _response_coverage_nudge(ctx, parsed) is None
+    assert ctx.coverage_nudge_count == 0
+
+
 def test_coverage_nudge_respects_counter_cap() -> None:
     ctx = _post_success_ctx("go to X and download Y")
     parsed = {"type": "REPLY", "user_response": "one block draft"}
