@@ -560,6 +560,18 @@ def _request_completion_contract(ctx: Any) -> str | None:
     return None
 
 
+def _request_completion_contract_status(ctx: Any) -> str:
+    request_policy = getattr(ctx, "request_policy", None)
+    status = getattr(request_policy, "completion_contract_status", None)
+    if status in ("present", "absent", "unknown"):
+        return status
+    return "present" if _request_completion_contract(ctx) else "absent"
+
+
+def _completion_contract_unknown_due_to_policy_fallback(ctx: Any) -> bool:
+    return _request_completion_contract_status(ctx) == "unknown"
+
+
 def _nudge(config: CopilotConfig | None, key: str) -> str:
     if config is None:
         return DEFAULT_ENFORCEMENT_NUDGES[key]
@@ -721,8 +733,10 @@ def _response_coverage_nudge(ctx: Any, parsed: dict[str, Any], config: CopilotCo
         # (06c). The getattr default keeps this gate working on partial stacks.
         user_message = getattr(ctx, "user_message", "")
         completion_contract = _request_completion_contract(ctx)
-        if isinstance(block_count, int) and _goal_likely_needs_more_blocks(
-            user_message, block_count, completion_contract
+        if (
+            isinstance(block_count, int)
+            and not _completion_contract_unknown_due_to_policy_fallback(ctx)
+            and _goal_likely_needs_more_blocks(user_message, block_count, completion_contract)
         ):
             nudge_count = getattr(ctx, "coverage_nudge_count", 0)
             if nudge_count < MAX_INTERMEDIATE_NUDGES:

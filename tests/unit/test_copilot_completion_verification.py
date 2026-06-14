@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
@@ -146,6 +147,21 @@ async def test_evaluate_handler_exception_is_unavailable() -> None:
 
     snapshot = RunEvidenceSnapshot(current_url="https://example.com")
     result = await evaluate_completion_criteria([_criterion("c0", "x")], snapshot, boom)
+    assert result.status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_uses_completion_judge_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(settings, "COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS", 10.0)
+
+    async def handler(**_: object) -> dict[str, object]:
+        await asyncio.sleep(0.05)
+        return {"verdicts": [{"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"}]}
+
+    snapshot = RunEvidenceSnapshot(current_url="https://example.com/done")
+    result = await evaluate_completion_criteria([_criterion("c0", "done page visible")], snapshot, handler)
+
     assert result.status == "unavailable"
 
 

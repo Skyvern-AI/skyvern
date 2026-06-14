@@ -145,6 +145,8 @@ class Settings(BaseSettings):
     LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
+    COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
+    COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
     # Gate copilot verified-success on per-criterion outcome evidence.
     # Off restores the prior run-status/suspicious-success gate and classifier prompt.
     COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True

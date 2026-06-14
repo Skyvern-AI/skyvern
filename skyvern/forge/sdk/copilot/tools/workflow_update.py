@@ -30,6 +30,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.enforcement import (
     POST_INTERMEDIATE_SUCCESS_NUDGE,
+    _completion_contract_unknown_due_to_policy_fallback,
     _goal_likely_needs_more_blocks,
 )
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
@@ -1683,6 +1684,9 @@ def _pre_run_workflow_coverage_error(copilot_ctx: Any) -> str | None:
         completion_contract = completion_contract.strip() or None
     else:
         completion_contract = None
+
+    if _completion_contract_unknown_due_to_policy_fallback(copilot_ctx):
+        return None
 
     if not _goal_likely_needs_more_blocks(user_message, block_count, completion_contract):
         return None
