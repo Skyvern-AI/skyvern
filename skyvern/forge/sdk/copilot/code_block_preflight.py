@@ -9,8 +9,11 @@ import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Iterable
+
+from skyvern.forge.sdk.workflow.models.block import CodeBlock
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,13 @@ class CodeBlockPreflightDiagnostic:
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m|\x1b\([AB]")
 _MYPY_ERROR_RE = re.compile(r"^(?P<path>.*?):(?P<line>\d+): (?P<severity>error): (?P<message>.*)$")
 _LOCATOR_NOT_CALLABLE_RE = re.compile(r'"Locator" not callable\s+\[operator\]')
+
+
+@cache
+def _sandbox_global_names() -> frozenset[str]:
+    # Keep this derived from the runtime sandbox, but resolve it lazily so the
+    # analyzer does not bind itself to CodeBlock import-time behavior.
+    return frozenset(name for name in CodeBlock.build_safe_vars() if not name.startswith("__")) | {"page"}
 
 
 def preflight_code_block(
@@ -72,6 +82,51 @@ def preflight_code_block(
     return _parse_mypy_output(stdout)
 
 
+def sandbox_unresolved_name_diagnostics(
+    code: str,
+    *,
+    parameter_keys: Iterable[str] = (),
+) -> list[CodeBlockPreflightDiagnostic]:
+    """Find names that the generated code-block sandbox cannot resolve.
+
+    This models the runtime wrapper from ``CodeBlock.generate_async_user_function``:
+    sandbox helpers and ``page`` are exec globals, while valid block parameter
+    keys become wrapper default-argument locals. The analysis is conservative;
+    ambiguous control-flow bindings do not satisfy later reads.
+    """
+
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return []
+
+    unresolved_names, class_names = _SandboxNameAnalyzer(parameter_keys=parameter_keys).analyze(tree.body)
+    if not unresolved_names and not class_names:
+        return []
+
+    names = sorted(unresolved_names)
+    rejected_classes = sorted(class_names)
+    detail_parts: list[str] = []
+    if names:
+        detail_parts.append(f"unresolved names: {', '.join(f'`{name}`' for name in names)}")
+    if rejected_classes:
+        detail_parts.append(
+            "class definitions unavailable in the code sandbox: " + ", ".join(f"`{name}`" for name in rejected_classes)
+        )
+    detail = "; ".join(detail_parts)
+    return [
+        CodeBlockPreflightDiagnostic(
+            code="SANDBOX_UNRESOLVED_NAME",
+            message=(
+                f"Code block references names that are unavailable in the runtime code sandbox or are not "
+                f"definitely initialized before use ({detail}). The sandbox provides `page`, declared code-block "
+                "parameter keys, and its explicit safe helper namespace; `Exception` is the only available "
+                "exception type."
+            ),
+        )
+    ]
+
+
 def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
     try:
         tree = ast.parse(_build_typed_module(code, parameter_keys=()))
@@ -102,6 +157,343 @@ def _static_ast_diagnostics(code: str) -> list[CodeBlockPreflightDiagnostic]:
         if regex_diagnostic is not None:
             diagnostics.append(regex_diagnostic)
     return diagnostics
+
+
+class _SandboxNameAnalyzer:
+    def __init__(self, *, parameter_keys: Iterable[str], outer_names: Iterable[str] = ()) -> None:
+        self.parameter_names = {key for key in parameter_keys if _valid_python_identifier(key)}
+        self.outer_names = set(outer_names)
+        self.unresolved_names: set[str] = set()
+        self.class_names: set[str] = set()
+
+    def analyze(self, statements: list[ast.stmt]) -> tuple[set[str], set[str]]:
+        local_names = self._local_names(statements)
+        function_names = self._function_names(statements)
+        self._statements(
+            statements,
+            set(self.parameter_names),
+            local_names=local_names,
+            function_names=function_names,
+        )
+        return self.unresolved_names, self.class_names
+
+    def _report_name(self, name: str) -> None:
+        if not name.startswith("__"):
+            self.unresolved_names.add(name)
+
+    def _local_names(self, statements: list[ast.stmt]) -> set[str]:
+        names: set[str] = set()
+
+        class Collector(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                names.add(node.name)
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def _skip_nested_scope(self, node: ast.AST) -> None:
+                return
+
+            visit_Lambda = visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _skip_nested_scope
+
+            def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+                names.update(_target_names(node.target))
+                self.visit(node.value)
+
+            def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                if node.name:
+                    names.add(node.name)
+                if node.type is not None:
+                    self.visit(node.type)
+                for statement in node.body:
+                    self.visit(statement)
+
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".", 1)[0])
+
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                for alias in node.names:
+                    names.add(alias.asname or alias.name)
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                names.add(node.name)
+
+            def visit_Name(self, node: ast.Name) -> None:
+                if isinstance(node.ctx, (ast.Store, ast.Del)):
+                    names.add(node.id)
+
+        collector = Collector()
+        for statement in statements:
+            collector.visit(statement)
+        return names
+
+    def _function_names(self, statements: list[ast.stmt]) -> set[str]:
+        return {
+            statement.name for statement in statements if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def _statements(
+        self,
+        statements: list[ast.stmt],
+        initialized: set[str],
+        *,
+        local_names: set[str],
+        function_names: set[str],
+    ) -> set[str]:
+        current = set(initialized)
+        for statement in statements:
+            current = self._statement(
+                statement,
+                current,
+                local_names=local_names,
+                function_names=function_names,
+            )
+        return current
+
+    def _statement(
+        self,
+        node: ast.stmt,
+        initialized: set[str],
+        *,
+        local_names: set[str],
+        function_names: set[str],
+    ) -> set[str]:
+        if isinstance(node, ast.Assign):
+            self._expr(node.value, initialized, local_names=local_names)
+            return self._store(node.targets, initialized)
+        if isinstance(node, ast.AnnAssign):
+            if node.value is not None:
+                self._expr(node.value, initialized, local_names=local_names)
+                return self._store([node.target], initialized)
+            return initialized
+        if isinstance(node, ast.AugAssign):
+            self._augmented_target_read(node.target, initialized, local_names=local_names)
+            self._expr(node.value, initialized, local_names=local_names)
+            return self._store([node.target], initialized)
+        if isinstance(node, ast.Delete):
+            return initialized - {name for target in node.targets for name in _target_names(target)}
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            self._expr(node.iter, initialized, local_names=local_names)
+            self._statements(
+                node.body,
+                self._store([node.target], initialized),
+                local_names=local_names,
+                function_names=function_names,
+            )
+            self._statements(
+                node.orelse,
+                set(initialized),
+                local_names=local_names,
+                function_names=function_names,
+            )
+            return initialized
+        if isinstance(node, ast.While):
+            self._expr(node.test, initialized, local_names=local_names)
+            self._statements(node.body, set(initialized), local_names=local_names, function_names=function_names)
+            self._statements(node.orelse, set(initialized), local_names=local_names, function_names=function_names)
+            return initialized
+        if isinstance(node, ast.If):
+            self._expr(node.test, initialized, local_names=local_names)
+            body = self._statements(node.body, set(initialized), local_names=local_names, function_names=function_names)
+            orelse = self._statements(
+                node.orelse,
+                set(initialized),
+                local_names=local_names,
+                function_names=function_names,
+            )
+            return body & orelse
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            current = set(initialized)
+            for item in node.items:
+                self._expr(item.context_expr, current, local_names=local_names)
+                if item.optional_vars is not None:
+                    current = self._store([item.optional_vars], current)
+            return self._statements(node.body, current, local_names=local_names, function_names=function_names)
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            normal = self._statements(
+                node.orelse,
+                self._statements(
+                    node.body,
+                    set(initialized),
+                    local_names=local_names,
+                    function_names=function_names,
+                ),
+                local_names=local_names,
+                function_names=function_names,
+            )
+            branches = [normal]
+            for handler in node.handlers:
+                if handler.type is not None:
+                    self._expr(handler.type, initialized, local_names=local_names)
+                handler_state = set(initialized)
+                if handler.name:
+                    handler_state.add(handler.name)
+                handler_state = self._statements(
+                    handler.body,
+                    handler_state,
+                    local_names=local_names,
+                    function_names=function_names,
+                )
+                if handler.name:
+                    handler_state.discard(handler.name)
+                branches.append(handler_state)
+            return self._statements(
+                node.finalbody,
+                set.intersection(*branches),
+                local_names=local_names,
+                function_names=function_names,
+            )
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for expr in _definition_expressions(node):
+                self._expr(expr, initialized, local_names=local_names)
+            self._analyze_nested_function(node, initialized, sibling_function_names=function_names)
+            return {*initialized, node.name}
+        if isinstance(node, ast.ClassDef):
+            self.class_names.add(node.name)
+            for expr in [*node.decorator_list, *node.bases, *[keyword.value for keyword in node.keywords]]:
+                self._expr(expr, initialized, local_names=local_names)
+            return initialized
+
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                self._expr(child, initialized, local_names=local_names)
+            elif isinstance(child, ast.stmt):
+                initialized = self._statement(
+                    child,
+                    initialized,
+                    local_names=local_names,
+                    function_names=function_names,
+                )
+        return initialized
+
+    def _analyze_nested_function(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        initialized: set[str],
+        *,
+        sibling_function_names: set[str],
+    ) -> None:
+        parameter_names = _argument_names(node.args)
+        nested = _SandboxNameAnalyzer(
+            parameter_keys=parameter_names,
+            outer_names=initialized | self.outer_names | sibling_function_names | {node.name},
+        )
+        unresolved_names, class_names = nested.analyze(node.body)
+        self.unresolved_names.update(unresolved_names)
+        self.class_names.update(class_names)
+
+    def _expr(self, node: ast.expr, initialized: set[str], *, local_names: set[str]) -> None:
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                if node.id in initialized:
+                    return
+                if node.id in local_names:
+                    self._report_name(node.id)
+                elif node.id not in _sandbox_global_names() and node.id not in self.outer_names:
+                    self._report_name(node.id)
+            return
+        if isinstance(node, ast.NamedExpr):
+            self._expr(node.value, initialized, local_names=local_names)
+            # Named expressions bind into the surrounding scope immediately.
+            initialized.update(_target_names(node.target))
+            return
+        if isinstance(node, ast.Lambda):
+            for expr in [*node.args.defaults, *[default for default in node.args.kw_defaults if default is not None]]:
+                self._expr(expr, initialized, local_names=local_names)
+            parameters = _argument_names(node.args)
+            nested = _SandboxNameAnalyzer(parameter_keys=parameters, outer_names=initialized | self.outer_names)
+            nested._expr(node.body, set(parameters), local_names=nested._local_names([ast.Expr(value=node.body)]))
+            self.unresolved_names.update(nested.unresolved_names)
+            self.class_names.update(nested.class_names)
+            return
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            self._comprehension([node.elt], node.generators, initialized, local_names=local_names)
+            return
+        if isinstance(node, ast.DictComp):
+            self._comprehension([node.key, node.value], node.generators, initialized, local_names=local_names)
+            return
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.expr):
+                self._expr(child, initialized, local_names=local_names)
+
+    def _comprehension(
+        self,
+        values: list[ast.expr],
+        generators: list[ast.comprehension],
+        initialized: set[str],
+        *,
+        local_names: set[str],
+    ) -> None:
+        comp_state = set(initialized)
+        comp_locals = set(local_names)
+        for generator in generators:
+            self._expr(generator.iter, comp_state, local_names=local_names)
+            comp_state = self._store([generator.target], comp_state)
+            comp_locals.update(_target_names(generator.target))
+            for condition in generator.ifs:
+                self._expr(condition, comp_state, local_names=comp_locals)
+        for value in values:
+            self._expr(value, comp_state, local_names=comp_locals)
+
+    def _store(self, targets: list[ast.expr], initialized: set[str]) -> set[str]:
+        next_initialized = set(initialized)
+        for target in targets:
+            next_initialized.update(_target_names(target))
+        return next_initialized
+
+    def _augmented_target_read(self, node: ast.expr, initialized: set[str], *, local_names: set[str]) -> None:
+        if isinstance(node, ast.Name):
+            if node.id not in initialized:
+                self._report_name(node.id)
+            return
+        self._expr(node, initialized, local_names=local_names)
+
+
+def _argument_names(args: ast.arguments) -> set[str]:
+    return {
+        arg.arg
+        for arg in [
+            *args.posonlyargs,
+            *args.args,
+            *args.kwonlyargs,
+            *([args.vararg] if args.vararg is not None else []),
+            *([args.kwarg] if args.kwarg is not None else []),
+        ]
+    }
+
+
+def _definition_expressions(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.expr]:
+    args = node.args
+    annotations = [
+        arg.annotation
+        for arg in [
+            *args.posonlyargs,
+            *args.args,
+            *args.kwonlyargs,
+            *([args.vararg] if args.vararg is not None else []),
+            *([args.kwarg] if args.kwarg is not None else []),
+        ]
+        if arg.annotation is not None
+    ]
+    return [
+        *node.decorator_list,
+        *args.defaults,
+        *[default for default in args.kw_defaults if default is not None],
+        *annotations,
+        *([node.returns] if node.returns is not None else []),
+    ]
+
+
+def _target_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    if isinstance(node, ast.Name):
+        names.add(node.id)
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for element in node.elts:
+            names.update(_target_names(element))
+    elif isinstance(node, ast.Starred):
+        names.update(_target_names(node.value))
+    return names
 
 
 def _wizard_step_selector_diagnostic(node: ast.Call) -> CodeBlockPreflightDiagnostic | None:
