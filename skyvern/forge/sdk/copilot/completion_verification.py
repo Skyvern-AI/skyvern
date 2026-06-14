@@ -406,7 +406,7 @@ async def evaluate_completion_criteria(
     try:
         raw = await asyncio.wait_for(
             handler(prompt=prompt, prompt_name=PROMPT_TEMPLATE_NAME),
-            timeout=settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS,
+            timeout=settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         LOG.warning("completion-verification judge timed out")

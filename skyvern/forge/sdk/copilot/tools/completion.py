@@ -146,7 +146,7 @@ async def _maybe_run_completion_verification_from_page_observation(
         if (
             remaining is not None
             and remaining
-            <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
+            <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS
         ):
             verification = CompletionVerificationResult(status="unavailable")
         else:
@@ -298,7 +298,7 @@ async def _maybe_run_completion_verification(
     # Too little budget to verify a candidate run: fail closed (unavailable) rather
     # than let the run-status proxy claim an unverified outcome as success.
     remaining = RUN_BLOCKS_SAFETY_CEILING_SECONDS - (time.monotonic() - handler_start)
-    if remaining <= settings.COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS:
+    if remaining <= settings.COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS + _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS:
         return CompletionVerificationResult(status="unavailable")
     snapshot = _build_run_evidence_snapshot(copilot_ctx, result)
     if not snapshot.has_evidence():

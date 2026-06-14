@@ -65,6 +65,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     verified_goal_claim_authorized,
 )
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.llm_errors import is_retriable_llm_error as _is_retriable_llm_error
 from skyvern.forge.sdk.copilot.outcome_verification_trace import (
     finalize_outcome_verification_trace,
     record_criteria_lifecycle,
@@ -93,7 +94,6 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     build_recoverable_failure,
     clean_recorded_failure_text,
     format_recoverable_failure_reply,
-    iter_exception_chain,
     merge_failure_into_context,
 )
 from skyvern.forge.sdk.copilot.request_policy import (
@@ -2395,44 +2395,6 @@ def _build_feasibility_clarification_result(
         ),
         exit_site="feasibility_clarification",
     )
-
-
-_RETRIABLE_LLM_ERROR_NAMES = {
-    "APIConnectionError",
-    "APITimeoutError",
-    "APIError",
-    "InternalServerError",
-    "RateLimitError",
-    "ServiceUnavailableError",
-    "Timeout",
-}
-_RETRIABLE_LLM_ERROR_TEXT = (
-    "rate limit",
-    "timeout",
-    "timed out",
-    "temporarily unavailable",
-    "service unavailable",
-    "connection error",
-    "connection reset",
-    "internal server error",
-    "server error",
-    "overloaded",
-)
-_LLM_ERROR_MODULE_MARKERS = ("openai", "litellm", "anthropic")
-
-
-def _is_retriable_llm_error(exc: BaseException) -> bool:
-    for item in iter_exception_chain(exc):
-        module = type(item).__module__.lower()
-        name = type(item).__name__
-        text = str(item).lower()
-        if name in _RETRIABLE_LLM_ERROR_NAMES and any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS):
-            return True
-        if any(marker in module for marker in _LLM_ERROR_MODULE_MARKERS) and any(
-            phrase in text for phrase in _RETRIABLE_LLM_ERROR_TEXT
-        ):
-            return True
-    return False
 
 
 def _fallback_llm_key(config: CopilotConfig, current_llm_key: str) -> str | None:
