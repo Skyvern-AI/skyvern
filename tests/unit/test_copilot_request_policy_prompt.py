@@ -9,6 +9,7 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.request_policy import (
     PROMPT_NAME,
     RAW_SECRET_REFUSAL_SENTINEL,
+    CompletionCriterion,
     _classify_request,
     _credential_ids,
     _raw_secret_detected,
@@ -324,3 +325,42 @@ class TestMalformedCredentialIdExtraction:
             reason="none",
         )
         assert policy.credential_input_kind == "credential_id"
+
+
+def _capture_handler(captured: dict[str, str]):
+    async def handler(prompt: str, prompt_name: str) -> dict[str, object]:
+        captured["prompt"] = prompt
+        return {"testing_intent": "unspecified", "credential_input_kind": "none"}
+
+    return handler
+
+
+class TestActiveCriteriaPromptAnchor:
+    @pytest.mark.asyncio
+    async def test_active_criteria_render_verbatim(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="run it again to make sure it still works",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+            active_criteria=[
+                CompletionCriterion(id="c0", outcome="The main heading from https://example.com is extracted"),
+            ],
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" in captured["prompt"]
+        assert "The main heading from https://example.com is extracted" in captured["prompt"]
+        assert "COPIED VERBATIM" in captured["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_no_active_criteria_omits_anchor_section(self) -> None:
+        captured: dict[str, str] = {}
+        await _classify_request(
+            user_message="build a workflow",
+            workflow_yaml="",
+            chat_history=[],
+            global_llm_context="",
+            handler=_capture_handler(captured),
+        )
+        assert "ACTIVE COMPLETION CRITERIA (canonical phrasing for the current goal):" not in captured["prompt"]

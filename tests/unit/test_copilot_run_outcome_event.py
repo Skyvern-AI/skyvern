@@ -105,7 +105,9 @@ def _clean_run_result() -> dict[str, Any]:
 
 def _evaluated(satisfied: bool) -> CompletionVerificationResult:
     verdict = CriterionVerdict(
-        criterion_id="c0", satisfied=satisfied, reason_code="evidence_confirms" if satisfied else "no_evidence"
+        criterion_id="c0",
+        state="satisfied" if satisfied else "unsatisfied",
+        reason_code="evidence_confirms" if satisfied else "no_evidence",
     )
     return CompletionVerificationResult(status="evaluated", criterion_ids=["c0"], verdicts=[verdict])
 

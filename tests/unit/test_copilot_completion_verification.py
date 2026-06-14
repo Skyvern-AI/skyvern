@@ -66,7 +66,11 @@ def _criterion(cid: str, outcome: str, *, method_mandated: bool = False) -> Comp
 def _evaluated(*satisfied_by_id: tuple[str, bool]) -> CompletionVerificationResult:
     ids = [cid for cid, _ in satisfied_by_id]
     verdicts = [
-        CriterionVerdict(criterion_id=cid, satisfied=ok, reason_code="evidence_confirms" if ok else "no_evidence")
+        CriterionVerdict(
+            criterion_id=cid,
+            state="satisfied" if ok else "unsatisfied",
+            reason_code="evidence_confirms" if ok else "no_evidence",
+        )
         for cid, ok in satisfied_by_id
     ]
     return CompletionVerificationResult(status="evaluated", criterion_ids=ids, verdicts=verdicts)
@@ -101,9 +105,10 @@ def test_coerce_requires_evidence_confirms_for_satisfied() -> None:
     assert result.verdicts[0].satisfied is False
 
 
-def test_coerce_missing_criterion_defaults_to_no_evidence() -> None:
+def test_coerce_missing_criterion_defaults_to_unknown() -> None:
     result = _coerce_result({"verdicts": []}, ["c0", "c1"])
-    assert [v.reason_code for v in result.verdicts] == ["no_evidence", "no_evidence"]
+    assert [v.reason_code for v in result.verdicts] == ["unknown", "unknown"]
+    assert [v.state for v in result.verdicts] == ["unknown", "unknown"]
     assert result.is_fully_satisfied() is False
 
 
@@ -420,7 +425,7 @@ def _ctx_with_blocks(*block_types: str) -> CopilotContext:
 
 
 def _contradicted(cid: str) -> CompletionVerificationResult:
-    verdict = CriterionVerdict(criterion_id=cid, satisfied=False, reason_code="evidence_contradicts")
+    verdict = CriterionVerdict(criterion_id=cid, state="unsatisfied", reason_code="evidence_contradicts")
     return CompletionVerificationResult(status="evaluated", criterion_ids=[cid], verdicts=[verdict])
 
 

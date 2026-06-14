@@ -65,7 +65,7 @@ def _ctx(blocks: list[dict[str, Any]] | None = None) -> CopilotContext:
 
 
 def _no_evidence(cid: str) -> CompletionVerificationResult:
-    verdict = CriterionVerdict(criterion_id=cid, satisfied=False, reason_code="no_evidence")
+    verdict = CriterionVerdict(criterion_id=cid, state="unsatisfied", reason_code="no_evidence")
     return CompletionVerificationResult(status="evaluated", criterion_ids=[cid], verdicts=[verdict])
 
 
@@ -448,8 +448,45 @@ def test_flag_rule_requires_strict_blocker_terms() -> None:
     benign = _run_result([_code_block("notify", {"verification_passed": True})])
     assert _run_blocks_structured_blocker_message(benign) is None
 
-    string_rule_parity = _run_result([_code_block("notify", {"verification_code_sent": "yes"})])
-    assert _run_blocks_structured_blocker_message(string_rule_parity) == "yes"
+    # SKY-10916: broad terms like ``verification`` no longer key the code-block
+    # string arm; only the strict term set does.
+    broad_term_string = _run_result([_code_block("notify", {"verification_code_sent": "yes"})])
+    assert _run_blocks_structured_blocker_message(broad_term_string) is None
+
+    strict_term_string = _run_result([_code_block("notify", {"human_verification_step": "solve the puzzle"})])
+    assert _run_blocks_structured_blocker_message(strict_term_string) == "solve the puzzle"
+
+
+def test_verification_key_counts_as_goal_content_for_code_outputs() -> None:
+    # SKY-10916: an output key carrying ``verification`` is data, not a blocker —
+    # it must satisfy the emptiness denominator instead of being stripped.
+    result = _run_result(
+        [_code_block("verify_listing", {"verification_results": [{"name": "DOE, JANE", "verified": True}]})]
+    )
+    assert _run_blocks_structured_blocker_message(result) is None
+    _, empty_data_blocks, _ = _analyze_run_blocks(result)
+    assert empty_data_blocks is False
+
+
+class _MetadataCtx:
+    def __init__(self, metadata: dict) -> None:
+        self.code_artifact_metadata = metadata
+
+
+def test_declared_outcome_keys_exempt_from_blocker_term_matching() -> None:
+    # Metadata-declared goal keys (the #12034 typed source) override string
+    # matching even for strict terms.
+    metadata = {
+        "check_challenge": {
+            "claimed_outcomes": [{"id": "captcha_audit_log", "entities": ["challenge_summary"], "required_tokens": []}]
+        }
+    }
+    block = _code_block("check_challenge", {"captcha_audit_log": "3 challenges recorded this month"})
+    result = _run_result([block])
+    assert _run_blocks_structured_blocker_message(result) is not None
+    assert _run_blocks_structured_blocker_message(result, _MetadataCtx(metadata)) is None
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, _MetadataCtx(metadata))
+    assert empty_data_blocks is False
 
 
 def test_flag_rule_synthesizes_message_and_prefers_sibling_reason() -> None:

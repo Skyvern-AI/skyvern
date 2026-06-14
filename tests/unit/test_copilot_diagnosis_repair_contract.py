@@ -160,7 +160,7 @@ def test_contradictory_completion_auth_evidence_repairs_frontier_block() -> None
         verdicts=[
             CriterionVerdict(
                 criterion_id="c0",
-                satisfied=False,
+                state="unsatisfied",
                 reason_code="evidence_contradicts",
                 evidence_ref="current_url,page_title",
             )

@@ -559,6 +559,10 @@ class TestVerifiedGoalSatisfiedStop:
                 result=result,
             )
 
+        assert ctx.goal_satisfied_tool_name == "update_and_run_blocks"
+        assert ctx.goal_satisfied_tool_output is not None
+        assert ctx.goal_satisfied_tool_output["ok"] is True
+
         assert ctx.tool_activity[-1]["tool"] == "update_and_run_blocks"
 
     def test_wrapped_goal_satisfied_error_context_is_recognized(self) -> None:
@@ -599,7 +603,8 @@ class TestVerifiedGoalSatisfiedStop:
 
         assert not verified_goal_satisfied_context(ctx)
 
-    def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_surfaces_tested_workflow(self) -> None:
         from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
 
         workflow = object()
@@ -611,12 +616,62 @@ class TestVerifiedGoalSatisfiedStop:
             tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
         )
 
-        result = _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
 
         assert result.updated_workflow is workflow
         assert result.workflow_yaml == "workflow_definition:\n  blocks: []\n"
         assert result.proposal_disposition == "auto_applicable"
-        assert "tested" in result.user_response.lower()
+        # No adjudicated outcome evidence: the turn ends but the claim renders
+        # built-but-unverified instead of a tested-success claim.
+        assert "not independently verified" in result.user_response.lower()
+        assert result.narrative_payload is not None
+        assert result.narrative_payload["terminal"] == "response"
+        assert result.narrative_payload["verifiedSuccess"] is False
+
+        from skyvern.forge.sdk.copilot.completion_verification import (
+            CompletionVerificationResult,
+            CriterionVerdict,
+        )
+
+        ctx.completion_verification_result = CompletionVerificationResult(
+            status="evaluated",
+            criterion_ids=["c0"],
+            verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+        )
+        verified = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+        assert "tested" in verified.user_response.lower()
+        assert verified.narrative_payload is not None
+        assert verified.narrative_payload["verifiedSuccess"] is True
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_carries_outcome_adjudication(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_criteria_store import (
+            CompletionCriteriaTurnState,
+            ReconcileDecision,
+        )
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=True,
+            last_full_workflow_test_ok=True,
+            latest_diagnosis_repair_contract=_verified_goal_contract(),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "OK"}],
+        )
+        ctx.completion_criteria_turn_state = CompletionCriteriaTurnState(
+            decision=ReconcileDecision(action="create", reason="not_subset", epoch=2, criteria=()),
+            last_verdict_state_counts={"satisfied": 2, "unsatisfied": 0, "unknown": 0},
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        payload = result.narrative_payload
+        assert payload is not None
+        adjudication = payload["outcomeAdjudication"]
+        assert adjudication["criteriaEpoch"] == 2
+        assert adjudication["criteriaLifecycleReason"] == "not_subset"
+        assert adjudication["satisfiedCount"] == 2
 
 
 class TestSupersededAgentIntentGates:
@@ -676,7 +731,43 @@ class TestRequestPolicyInputGuardrail:
             global_llm_context="",
             organization_id="org-1",
             handler=policy_inputs.handler,
+            active_criteria=None,
         )
+
+    @pytest.mark.asyncio
+    async def test_sdk_input_guardrail_forwards_stored_active_criteria(self, monkeypatch) -> None:
+        from agents import GuardrailFunctionOutput, InputGuardrail
+        from agents.run_context import RunContextWrapper
+
+        from skyvern.forge.sdk.copilot.completion_criteria_store import StoredCriteriaSet, StoredCriteriaSnapshot
+        from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion, RequestPolicy
+
+        stored = StoredCriteriaSet(
+            set_id="wccs_1",
+            goal_epoch=1,
+            criteria=(CompletionCriterion(id="c0", outcome="The main heading is extracted into the run output"),),
+        )
+        build_request_policy = AsyncMock(return_value=RequestPolicy())
+        monkeypatch.setattr(agent_module, "build_request_policy", build_request_policy)
+        policy_inputs = agent_module.RequestPolicyGuardrailInputs(
+            user_message="run it again",
+            workflow_yaml="",
+            chat_history_text="",
+            chat_history_messages=[],
+            global_llm_context="",
+            organization_id="org-1",
+            handler=object(),
+            stored_completion_criteria=StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        )
+        guardrails = agent_module._build_copilot_input_guardrails(
+            InputGuardrail,
+            GuardrailFunctionOutput,
+            policy_inputs=policy_inputs,
+        )
+        await guardrails[0].run(SimpleNamespace(), "input", RunContextWrapper(context=_ctx()))
+
+        assert build_request_policy.await_args is not None
+        assert build_request_policy.await_args.kwargs["active_criteria"] == list(stored.criteria)
 
     @pytest.mark.asyncio
     async def test_sdk_input_guardrail_trips_after_computing_blocked_policy(self, monkeypatch) -> None:
