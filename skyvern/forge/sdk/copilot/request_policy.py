@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
@@ -127,6 +128,9 @@ _INVALID_CONDITIONAL_CONTAINER_MARKERS = (
 _MAX_COMPLETION_CRITERIA = 8
 _COMPLETION_CRITERION_OUTCOME_MAX_CHARS = 200
 
+CriterionLevel = Literal["definition", "run"]
+_CRITERION_LEVELS: frozenset[str] = frozenset({"definition", "run"})
+
 
 @dataclass(frozen=True)
 class CompletionCriterion:
@@ -134,6 +138,9 @@ class CompletionCriterion:
     outcome: str
     implicit: bool = False
     method_mandated: bool = False
+    # "definition": a property of the workflow definition itself, graded against the
+    # YAML; "run": an end state only a run can evidence. Invalid input coerces to "run".
+    level: CriterionLevel = "run"
 
 
 @dataclass
@@ -533,21 +540,46 @@ def _parse_completion_criteria(raw: Any) -> list[CompletionCriterion]:
         outcome = " ".join(outcome_raw.split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS].strip()
         if not outcome:
             continue
-        key = outcome.lower()
+        key = normalized_criterion_outcome_key(outcome)
         if key in seen:
             continue
         seen.add(key)
+        level_raw = item.get("level")
         criteria.append(
             CompletionCriterion(
                 id=f"c{len(criteria)}",
                 outcome=outcome,
                 implicit=bool(item.get("implicit")),
                 method_mandated=bool(item.get("method_mandated")),
+                level=cast(CriterionLevel, level_raw)
+                if isinstance(level_raw, str) and level_raw in _CRITERION_LEVELS
+                else "run",
             )
         )
         if len(criteria) >= _MAX_COMPLETION_CRITERIA:
             break
     return criteria
+
+
+def normalized_criterion_outcome_key(outcome: str) -> str:
+    collapsed = " ".join((outcome or "").split())[:_COMPLETION_CRITERION_OUTCOME_MAX_CHARS]
+    return collapsed.strip().lower().rstrip(".!?;:,").strip()
+
+
+def _render_active_criteria_for_prompt(criteria: list[CompletionCriterion] | None) -> str:
+    if not criteria:
+        return ""
+    return json.dumps(
+        [
+            {
+                "outcome": criterion.outcome,
+                "implicit": criterion.implicit,
+                "method_mandated": criterion.method_mandated,
+                "level": criterion.level,
+            }
+            for criterion in criteria
+        ]
+    )
 
 
 def _classifier_fallback_policy(ids: list[str], *, raw_secret_present: bool) -> RequestPolicy:
@@ -568,6 +600,8 @@ async def _classify_request(
     chat_history: list[WorkflowCopilotChatHistoryMessage],
     global_llm_context: str,
     handler: Any,
+    *,
+    active_criteria: list[CompletionCriterion] | None = None,
 ) -> RequestPolicy:
     ids = _credential_ids(user_message)
     raw_secret_present = _raw_secret_detected(user_message)
@@ -600,6 +634,7 @@ async def _classify_request(
         latest_assistant_turn=transcript.latest_assistant_turn,
         retained_history=transcript.retained_history,
         global_llm_context=escape_code_fences(redact_raw_secrets_for_prompt(global_llm_context)[:2048]),
+        active_completion_criteria=escape_code_fences(_render_active_criteria_for_prompt(active_criteria)),
     )
     try:
         raw = await asyncio.wait_for(
@@ -1078,8 +1113,16 @@ async def build_request_policy(
     global_llm_context: str,
     organization_id: str,
     handler: Any,
+    active_criteria: list[CompletionCriterion] | None = None,
 ) -> RequestPolicy:
-    policy = await _classify_request(user_message, workflow_yaml, chat_history, global_llm_context, handler)
+    policy = await _classify_request(
+        user_message,
+        workflow_yaml,
+        chat_history,
+        global_llm_context,
+        handler,
+        active_criteria=active_criteria,
+    )
     policy.raw_secret_detected = policy.raw_secret_detected or policy.credential_input_kind == "raw_secret"
     policy.existing_workflow_credential_ids = sorted(workflow_credential_ids(workflow_yaml))
     policy.existing_workflow_credential_origins = {

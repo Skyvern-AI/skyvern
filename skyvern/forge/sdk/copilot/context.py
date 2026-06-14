@@ -51,6 +51,16 @@ class NarrativeBlock(TypedDict):
     outcomeReason: NotRequired[str]
 
 
+class NarrativeOutcomeAdjudication(TypedDict):
+    satisfiedCount: int
+    unsatisfiedCount: int
+    unknownCount: int
+    # "verified_goal_satisfied" | "built_unverified".
+    claimTier: str
+    criteriaEpoch: NotRequired[int]
+    criteriaLifecycleReason: NotRequired[str]
+
+
 # Mirror of the FE TurnNarrativeState; camelCase keys match the wire shape.
 class TurnNarrativePayload(TypedDict):
     turnId: str | None
@@ -61,9 +71,11 @@ class TurnNarrativePayload(TypedDict):
     proposalDisposition: NotRequired[ProposalDisposition]
     # TurnOutcome.response_kind value: "build" | "clarify" | "diagnose" | "refuse" | "recover".
     responseKind: NotRequired[str]
-    # The ADR-0005 terminal adjudication (enforcement.verified_goal_satisfied_context):
+    # The ADR-0005 terminal adjudication (enforcement.verified_goal_claim_authorized):
     # True only when outcome evidence authorizes a tested-success claim.
     verifiedSuccess: NotRequired[bool]
+    # Verdict-state summary from the turn's latest evaluated adjudication.
+    outcomeAdjudication: NotRequired[NarrativeOutcomeAdjudication]
     designStarted: bool
     designEnded: bool
     draft: NarrativeDraft | None
@@ -79,6 +91,7 @@ class TurnNarrativePayload(TypedDict):
 
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+    from skyvern.forge.sdk.copilot.completion_criteria_store import CompletionCriteriaTurnState
     from skyvern.forge.sdk.copilot.diagnosis_repair_contract import DiagnosisRepairContract
     from skyvern.forge.sdk.copilot.narration import NarratorState
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
@@ -308,6 +321,16 @@ class AgentResult:
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False
+    # Criteria lifecycle decision + adjudication counters the route persists
+    # after the turn; None when persisted criteria are disabled.
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
+
+
+@dataclass(frozen=True)
+class InFlightStreamToolCall:
+    call_id: str
+    tool_name: str
+    iteration: int
 
 
 @dataclass
@@ -355,6 +378,12 @@ class CopilotContext(AgentContext):
     # Tool tracking
     consecutive_tool_tracker: list[str] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    # A goal-satisfied stop raised from on_tool_end ends the SDK stream before
+    # the satisfying tool's tool_output event flushes; these carry what the
+    # exit path needs to emit the missing TOOL_RESULT frame.
+    in_flight_stream_tool_call: InFlightStreamToolCall | None = None
+    goal_satisfied_tool_name: str | None = None
+    goal_satisfied_tool_output: dict[str, Any] | None = None
     latest_tool_blocker_signal: CopilotToolBlockerSignal | None = None
     tool_blocker_signals: list[CopilotToolBlockerSignal] = field(default_factory=list)
     turn_halt: TurnHalt | None = None
@@ -518,6 +547,7 @@ class CopilotContext(AgentContext):
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False
+    completion_criteria_turn_state: CompletionCriteriaTurnState | None = None
     prior_block_count: int | None = None
     block_state_map: dict[str, str] = field(default_factory=dict)
     block_started_at_map: dict[str, str] = field(default_factory=dict)

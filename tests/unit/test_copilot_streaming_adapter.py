@@ -697,3 +697,90 @@ class TestEnforcementStateUpdates:
             },
         )
         assert ctx.update_workflow_called is False
+
+
+class TestFlushGoalSatisfiedToolResult:
+    @staticmethod
+    def _ctx(**overrides: Any) -> SimpleNamespace:
+        from skyvern.forge.sdk.copilot.context import InFlightStreamToolCall
+
+        defaults: dict[str, Any] = dict(
+            in_flight_stream_tool_call=InFlightStreamToolCall(
+                call_id="c9", tool_name="update_and_run_blocks", iteration=3
+            ),
+            goal_satisfied_tool_name="update_and_run_blocks",
+            goal_satisfied_tool_output={"ok": True, "data": {"workflow_run_id": "wr_1"}},
+            narrator_state=None,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    @staticmethod
+    def _stream(sent: list[Any], *, disconnected: bool = False) -> MagicMock:
+        async def _send(payload: Any) -> bool:
+            sent.append(payload)
+            return True
+
+        stream = MagicMock()
+        stream.is_disconnected = AsyncMock(return_value=disconnected)
+        stream.send = _send
+        return stream
+
+    @pytest.mark.asyncio
+    async def test_emits_tool_result_for_goal_satisfying_call(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+        from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotStreamMessageType
+
+        sent: list[Any] = []
+        ctx = self._ctx()
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert len(sent) == 1
+        frame = sent[0]
+        assert frame.type == WorkflowCopilotStreamMessageType.TOOL_RESULT
+        assert frame.tool_call_id == "c9"
+        assert frame.tool_name == "update_and_run_blocks"
+        assert frame.success is True
+        assert frame.iteration == 3
+        assert ctx.in_flight_stream_tool_call is None
+        assert ctx.goal_satisfied_tool_output is None
+        assert ctx.goal_satisfied_tool_name is None
+
+    @pytest.mark.asyncio
+    async def test_noops_when_no_call_is_pending(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        ctx = self._ctx(in_flight_stream_tool_call=None)
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent == []
+
+    @pytest.mark.asyncio
+    async def test_noops_when_pending_call_is_a_different_tool(self) -> None:
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        ctx = self._ctx(goal_satisfied_tool_name="get_run_results")
+
+        await flush_goal_satisfied_tool_result(self._stream(sent), ctx)
+
+        assert sent == []
+        assert ctx.in_flight_stream_tool_call is None
+
+    @pytest.mark.asyncio
+    async def test_records_narrator_activity_but_skips_send_when_disconnected(self) -> None:
+        from skyvern.forge.sdk.copilot.narration import NarratorState
+        from skyvern.forge.sdk.copilot.streaming_adapter import flush_goal_satisfied_tool_result
+
+        sent: list[Any] = []
+        narrator_state = NarratorState()
+        ctx = self._ctx(narrator_state=narrator_state)
+
+        await flush_goal_satisfied_tool_result(self._stream(sent, disconnected=True), ctx)
+
+        assert sent == []
+        assert narrator_state.design_activity
+        assert narrator_state.design_activity[-1]["kind"] == "tool_result"

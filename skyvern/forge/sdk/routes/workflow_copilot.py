@@ -26,6 +26,14 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write, resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    CRITERIA_SET_STATUS_ACTIVE,
+    StoredCriteriaSet,
+    StoredCriteriaSnapshot,
+    criteria_from_json,
+    criteria_to_json,
+    plan_persistence,
+)
 from skyvern.forge.sdk.copilot.config import CopilotConfig
 from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
@@ -385,6 +393,87 @@ async def _clear_proposed_workflow(chat: Any) -> None:
     )
 
 
+async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapshot | None:
+    """None disables the lifecycle for this turn (flag off, or load failure —
+    which degrades to today's per-turn regeneration rather than risking a
+    duplicate-epoch write)."""
+    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
+        return None
+    try:
+        latest = await app.DATABASE.workflow_params.get_latest_workflow_copilot_completion_criteria_set(
+            organization_id=chat.organization_id,
+            workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+        )
+    except Exception:
+        LOG.warning("copilot completion criteria snapshot load failed", exc_info=True)
+        return None
+    if latest is None:
+        return StoredCriteriaSnapshot()
+    active = None
+    if latest.status == CRITERIA_SET_STATUS_ACTIVE:
+        active = StoredCriteriaSet(
+            set_id=latest.completion_criteria_set_id,
+            goal_epoch=latest.goal_epoch,
+            criteria=criteria_from_json(latest.criteria),
+            consecutive_all_no_evidence=latest.consecutive_all_no_evidence,
+            tripwire_fired=latest.tripwire_fired,
+            last_fully_satisfied_workflow_yaml=latest.last_fully_satisfied_workflow_yaml,
+        )
+    return StoredCriteriaSnapshot(active=active, next_epoch=latest.goal_epoch + 1)
+
+
+async def _persist_completion_criteria_state(chat: Any, agent_result: AgentResult, user_message: str) -> None:
+    plan = plan_persistence(getattr(agent_result, "completion_criteria_turn_state", None))
+    if plan is None:
+        return
+    try:
+        if plan.creates_set:
+            new_set = await app.DATABASE.workflow_params.create_workflow_copilot_completion_criteria_set(
+                organization_id=chat.organization_id,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                goal_epoch=plan.create_epoch or 1,
+                criteria=criteria_to_json(plan.create_criteria),
+                source_turn_id=agent_result.turn_id,
+                source_goal_text=user_message[:2000] if user_message else None,
+                consecutive_all_no_evidence=plan.counter_value,
+                last_fully_satisfied_workflow_yaml=plan.fully_satisfied_workflow_yaml,
+            )
+            if plan.supersede_set_id:
+                await app.DATABASE.workflow_params.supersede_workflow_copilot_completion_criteria_set(
+                    organization_id=chat.organization_id,
+                    completion_criteria_set_id=plan.supersede_set_id,
+                    supersede_reason=plan.supersede_reason or "not_subset",
+                    superseded_by_set_id=new_set.completion_criteria_set_id,
+                )
+        else:
+            if plan.counter_set_id:
+                await app.DATABASE.workflow_params.update_workflow_copilot_completion_criteria_set_state(
+                    organization_id=chat.organization_id,
+                    completion_criteria_set_id=plan.counter_set_id,
+                    consecutive_all_no_evidence=plan.counter_value,
+                    tripwire_fired=plan.tripwire_fired,
+                    last_fully_satisfied_workflow_yaml=plan.fully_satisfied_workflow_yaml,
+                )
+            if plan.supersede_set_id:
+                await app.DATABASE.workflow_params.supersede_workflow_copilot_completion_criteria_set(
+                    organization_id=chat.organization_id,
+                    completion_criteria_set_id=plan.supersede_set_id,
+                    supersede_reason=plan.supersede_reason or "tripwire",
+                )
+        LOG.info(
+            "copilot completion criteria persisted",
+            criteria_set_created=plan.creates_set,
+            criteria_epoch=plan.create_epoch,
+            criteria_superseded_set_id=plan.supersede_set_id,
+            criteria_supersede_reason=plan.supersede_reason,
+            criteria_consecutive_all_no_evidence=plan.counter_value,
+            criteria_tripwire_fired=plan.tripwire_fired,
+        )
+    except Exception:
+        # A failed persist degrades to per-turn regeneration on the next turn.
+        LOG.warning("copilot completion criteria persist failed", exc_info=True)
+
+
 def _build_proposed_workflow_data(updated_workflow: Workflow, agent_result: AgentResult) -> dict[str, Any]:
     proposed_data = dict(updated_workflow.model_dump(mode="json"))
     if agent_result.workflow_yaml:
@@ -593,6 +682,7 @@ async def _finalise_normal_turn(
             raise
 
     await _persist_proposed_workflow_state(chat, agent_result, restored)
+    await _persist_completion_criteria_state(chat, agent_result, chat_request.message)
     proposal_disposition = _proposal_disposition(agent_result)
     narrative_payload = _with_terminal_narrative_metadata(
         agent_result.narrative_payload,
@@ -1677,6 +1767,8 @@ async def _new_copilot_chat_post(
             elif original_workflow is not None and original_workflow.workflow_definition is not None:
                 prior_block_count = len(original_workflow.workflow_definition.blocks or [])
 
+            stored_completion_criteria = await _load_completion_criteria_snapshot(chat)
+
             with bind_copilot_session_id(chat.workflow_copilot_chat_id):
                 agent_result = await run_copilot_agent(
                     stream=stream,
@@ -1692,6 +1784,7 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
                     prior_block_count=prior_block_count,
+                    stored_completion_criteria=stored_completion_criteria,
                 )
 
             if getattr(agent_result, "cancelled", False):

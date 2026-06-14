@@ -29,6 +29,7 @@ from skyvern.forge.sdk.db.models import (
     TaskModel,
     WorkflowCopilotChatMessageModel,
     WorkflowCopilotChatModel,
+    WorkflowCopilotCompletionCriteriaSetModel,
     WorkflowParameterModel,
 )
 from skyvern.forge.sdk.db.utils import (
@@ -46,6 +47,7 @@ from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChat,
     WorkflowCopilotChatMessage,
     WorkflowCopilotChatSender,
+    WorkflowCopilotCompletionCriteriaSet,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
@@ -592,6 +594,114 @@ class WorkflowParametersRepository(BaseRepository):
             if not chat:
                 return None
             return WorkflowCopilotChat.model_validate(chat)
+
+    @db_operation("get_latest_workflow_copilot_completion_criteria_set")
+    async def get_latest_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+    ) -> WorkflowCopilotCompletionCriteriaSet | None:
+        async with self.Session() as session:
+            query = (
+                select(WorkflowCopilotCompletionCriteriaSetModel)
+                .filter(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                .filter(WorkflowCopilotCompletionCriteriaSetModel.workflow_copilot_chat_id == workflow_copilot_chat_id)
+                .order_by(WorkflowCopilotCompletionCriteriaSetModel.goal_epoch.desc())
+                .limit(1)
+            )
+            row = (await session.scalars(query)).first()
+            if not row:
+                return None
+            return WorkflowCopilotCompletionCriteriaSet.model_validate(row)
+
+    @db_operation("create_workflow_copilot_completion_criteria_set")
+    async def create_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        workflow_copilot_chat_id: str,
+        goal_epoch: int,
+        criteria: list[dict],
+        source_turn_id: str | None = None,
+        source_goal_text: str | None = None,
+        consecutive_all_no_evidence: int = 0,
+        last_fully_satisfied_workflow_yaml: str | None = None,
+    ) -> WorkflowCopilotCompletionCriteriaSet:
+        async with self.Session() as session:
+            new_set = WorkflowCopilotCompletionCriteriaSetModel(
+                organization_id=organization_id,
+                workflow_copilot_chat_id=workflow_copilot_chat_id,
+                goal_epoch=goal_epoch,
+                status="active",
+                criteria=criteria,
+                source_turn_id=source_turn_id,
+                source_goal_text=source_goal_text,
+                consecutive_all_no_evidence=consecutive_all_no_evidence,
+                tripwire_fired=False,
+                last_fully_satisfied_workflow_yaml=last_fully_satisfied_workflow_yaml,
+            )
+            session.add(new_set)
+            await session.commit()
+            await session.refresh(new_set)
+            return WorkflowCopilotCompletionCriteriaSet.model_validate(new_set)
+
+    @db_operation("supersede_workflow_copilot_completion_criteria_set")
+    async def supersede_workflow_copilot_completion_criteria_set(
+        self,
+        organization_id: str,
+        completion_criteria_set_id: str,
+        supersede_reason: str,
+        superseded_by_set_id: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowCopilotCompletionCriteriaSetModel)
+                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
+                        == completion_criteria_set_id
+                    )
+                )
+            ).first()
+            if not row:
+                return
+            row.status = "superseded"
+            row.supersede_reason = supersede_reason
+            row.superseded_by_set_id = superseded_by_set_id
+            row.superseded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            if supersede_reason == "tripwire":
+                row.tripwire_fired = True
+            await session.commit()
+
+    @db_operation("update_workflow_copilot_completion_criteria_set_state")
+    async def update_workflow_copilot_completion_criteria_set_state(
+        self,
+        organization_id: str,
+        completion_criteria_set_id: str,
+        consecutive_all_no_evidence: int | None = None,
+        tripwire_fired: bool | None = None,
+        last_fully_satisfied_workflow_yaml: str | None = None,
+    ) -> None:
+        async with self.Session() as session:
+            row = (
+                await session.scalars(
+                    select(WorkflowCopilotCompletionCriteriaSetModel)
+                    .where(WorkflowCopilotCompletionCriteriaSetModel.organization_id == organization_id)
+                    .where(
+                        WorkflowCopilotCompletionCriteriaSetModel.completion_criteria_set_id
+                        == completion_criteria_set_id
+                    )
+                )
+            ).first()
+            if not row:
+                return
+            if consecutive_all_no_evidence is not None:
+                row.consecutive_all_no_evidence = consecutive_all_no_evidence
+            if tripwire_fired is not None:
+                row.tripwire_fired = tripwire_fired
+            if last_fully_satisfied_workflow_yaml is not None:
+                row.last_fully_satisfied_workflow_yaml = last_fully_satisfied_workflow_yaml
+            await session.commit()
 
     @db_operation("get_task_generation_by_prompt_hash")
     async def get_task_generation_by_prompt_hash(

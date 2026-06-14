@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     # Off restores schema-less interaction packets plus standalone page inspects.
     COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
+    # Persist copilot completion criteria per goal epoch with tri-state verdicts
+    # and definition-plane grading. Off restores per-turn re-derivation, the legacy
+    # run-status success claim, and unknown-verdicts-as-unsatisfied consumer behavior.
+    COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED: bool = True
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.

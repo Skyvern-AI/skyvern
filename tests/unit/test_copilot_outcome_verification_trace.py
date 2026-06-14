@@ -26,8 +26,10 @@ def _evaluated_result() -> CompletionVerificationResult:
         status="evaluated",
         criterion_ids=["c0", "c1"],
         verdicts=[
-            CriterionVerdict(criterion_id="c0", satisfied=True, reason_code="evidence_confirms", evidence_ref="cart"),
-            CriterionVerdict(criterion_id="c1", satisfied=False, reason_code="no_evidence"),
+            CriterionVerdict(
+                criterion_id="c0", state="satisfied", reason_code="evidence_confirms", evidence_ref="cart"
+            ),
+            CriterionVerdict(criterion_id="c1", state="unsatisfied", reason_code="no_evidence"),
         ],
     )
 

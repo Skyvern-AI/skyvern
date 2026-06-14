@@ -863,16 +863,25 @@ def _looks_like_anti_bot_blocker(text: str) -> bool:
     return any(term in lowered for term in _ANTI_BOT_BLOCKER_TERMS)
 
 
-def _structured_blocker_message(value: object, *, depth: int = 0, include_flag_keys: bool = False) -> str | None:
+def _structured_blocker_message(
+    value: object,
+    *,
+    depth: int = 0,
+    include_flag_keys: bool = False,
+    key_terms: frozenset[str] = _STRUCTURED_BLOCKER_KEY_TERMS,
+    declared_keys: frozenset[str] = frozenset(),
+) -> str | None:
     if depth > 5:
         return None
     if isinstance(value, dict):
         for key, item in value.items():
             normalized_key = _normalize_structured_key(key)
+            if normalized_key in declared_keys:
+                continue
             if not isinstance(item, str) or not item.strip():
                 continue
             has_blocker_key = normalized_key in _STRUCTURED_BLOCKER_MESSAGE_KEYS or any(
-                term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS
+                term in normalized_key for term in key_terms
             )
             if has_blocker_key or (
                 normalized_key in {"message", "error", "failure_reason", "reason"}
@@ -884,12 +893,24 @@ def _structured_blocker_message(value: object, *, depth: int = 0, include_flag_k
             if flagged:
                 return flagged
         for item in value.values():
-            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
+            nested = _structured_blocker_message(
+                item,
+                depth=depth + 1,
+                include_flag_keys=include_flag_keys,
+                key_terms=key_terms,
+                declared_keys=declared_keys,
+            )
             if nested:
                 return nested
     elif isinstance(value, list):
         for item in value:
-            nested = _structured_blocker_message(item, depth=depth + 1, include_flag_keys=include_flag_keys)
+            nested = _structured_blocker_message(
+                item,
+                depth=depth + 1,
+                include_flag_keys=include_flag_keys,
+                key_terms=key_terms,
+                declared_keys=declared_keys,
+            )
             if nested:
                 return nested
     return None
@@ -917,7 +938,31 @@ def _blocker_flag_or_status_message(value: dict[str, Any]) -> str | None:
     return None
 
 
-def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None:
+def _declared_code_output_keys(copilot_ctx: Any, block_label: object) -> frozenset[str]:
+    """Output keys the block's code-artifact metadata declares as goal content
+    (claimed-outcome ids, entities, required tokens) — the #12034 typed source.
+    A declared key is never string-matched into a blocker signal."""
+    metadata = getattr(copilot_ctx, "code_artifact_metadata", None) if copilot_ctx is not None else None
+    if not isinstance(metadata, dict) or not isinstance(block_label, str):
+        return frozenset()
+    entry = metadata.get(block_label)
+    if not isinstance(entry, dict):
+        return frozenset()
+    declared: set[str] = set()
+    claims = entry.get("claimed_outcomes")
+    for claim in claims if isinstance(claims, list) else []:
+        if not isinstance(claim, dict):
+            continue
+        for field_name in ("id", "entities", "required_tokens"):
+            value = claim.get(field_name)
+            values = value if isinstance(value, list) else [value]
+            declared.update(
+                _normalize_structured_key(item) for item in values if isinstance(item, str) and item.strip()
+            )
+    return frozenset(declared)
+
+
+def _run_blocks_structured_blocker_message(result: dict[str, Any], copilot_ctx: Any = None) -> str | None:
     data = result.get("data")
     if not isinstance(data, dict):
         return None
@@ -934,7 +979,15 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None
         if block.get("status") != "completed":
             continue
         if _is_code_block_type(block_type):
-            blocker = _structured_blocker_message(block.get("extracted_data"), include_flag_keys=True)
+            # Code-block outputs are arbitrary JSON the model authored: key matching
+            # uses the strict term set (broad terms like ``verification`` belong to
+            # the page-text arms) and metadata-declared goal keys are exempt.
+            blocker = _structured_blocker_message(
+                block.get("extracted_data"),
+                include_flag_keys=True,
+                key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                declared_keys=_declared_code_output_keys(copilot_ctx, block.get("label")),
+            )
         elif block_type in _DATA_PRODUCING_BLOCK_TYPES:
             payload = _block_data_payload(block.get("extracted_data"), block_type)
             blocker = _structured_blocker_message(payload)
@@ -945,26 +998,30 @@ def _run_blocks_structured_blocker_message(result: dict[str, Any]) -> str | None
     return None
 
 
-def _is_blocker_term_key(key: object) -> bool:
+def _is_blocker_term_key(key: object, declared_keys: frozenset[str] = frozenset()) -> bool:
     normalized_key = _normalize_structured_key(key)
-    return any(term in normalized_key for term in _STRUCTURED_BLOCKER_KEY_TERMS)
+    if normalized_key in declared_keys:
+        return False
+    return any(term in normalized_key for term in _STRICT_BLOCKER_FLAG_TERMS)
 
 
-def _code_output_contains_collection(value: Any, *, depth: int = 0) -> bool:
+def _code_output_contains_collection(
+    value: Any, *, depth: int = 0, declared_keys: frozenset[str] = frozenset()
+) -> bool:
     if depth > 5:
         return False
     if isinstance(value, (list, tuple)):
         return True
     if isinstance(value, dict):
         return any(
-            _code_output_contains_collection(item, depth=depth + 1)
+            _code_output_contains_collection(item, depth=depth + 1, declared_keys=declared_keys)
             for key, item in value.items()
-            if not _is_blocker_term_key(key)
+            if not _is_blocker_term_key(key, declared_keys)
         )
     return False
 
 
-def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
+def _code_output_has_goal_content(value: Any, *, depth: int = 0, declared_keys: frozenset[str] = frozenset()) -> bool:
     """Goal content in a code block's output: a non-empty string, truthy number, or
     non-empty collection surviving after blocker-term, status, and boolean entries
     are stripped (status/state values are machine shape, not goal data)."""
@@ -980,9 +1037,10 @@ def _code_output_has_goal_content(value: Any, *, depth: int = 0) -> bool:
         return len(value) > 0
     if isinstance(value, dict):
         return any(
-            _code_output_has_goal_content(item, depth=depth + 1)
+            _code_output_has_goal_content(item, depth=depth + 1, declared_keys=declared_keys)
             for key, item in value.items()
-            if not _is_blocker_term_key(key) and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
+            if not _is_blocker_term_key(key, declared_keys)
+            and _normalize_structured_key(key) not in _BLOCKER_STATUS_KEYS
         )
     return False
 
@@ -1487,7 +1545,13 @@ def _analyze_run_blocks(
                 extracted = block.get("extracted_data")
                 if extracted is None:
                     continue
-                structured_blocker = _structured_blocker_message(extracted, include_flag_keys=True)
+                declared_keys = _declared_code_output_keys(copilot_ctx, block.get("label"))
+                structured_blocker = _structured_blocker_message(
+                    extracted,
+                    include_flag_keys=True,
+                    key_terms=_STRICT_BLOCKER_FLAG_TERMS,
+                    declared_keys=declared_keys,
+                )
                 if structured_blocker:
                     texts_to_scan.append(structured_blocker)
                 goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
@@ -1505,9 +1569,9 @@ def _analyze_run_blocks(
                     continue
                 # A code output joins the emptiness denominator only when it declares a
                 # collection shape; action-only outputs are exempt.
-                if _code_output_contains_collection(extracted):
+                if _code_output_contains_collection(extracted, declared_keys=declared_keys):
                     has_data_blocks = True
-                if _code_output_has_goal_content(extracted):
+                if _code_output_has_goal_content(extracted, declared_keys=declared_keys):
                     any_data_output = True
 
     combined = "\n".join(texts_to_scan)

@@ -143,4 +143,6 @@ class CopilotRunHooks(RunHooksBase):
                 if isinstance(parsed.get("data"), dict)
                 else None,
             )
+            self._ctx.goal_satisfied_tool_name = tool_name
+            self._ctx.goal_satisfied_tool_output = dict(parsed)
             raise CopilotGoalSatisfied()

@@ -1,0 +1,599 @@
+"""SKY-10931: persisted completion-criteria lifecycle (epoch/supersede/tripwire),
+definition-plane grading, tri-state verdict semantics, and the claim-side closure
+of the judge-unavailable success bypass."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from skyvern.config import settings
+from skyvern.forge.sdk.copilot.agent import (
+    RequestPolicyGuardrailInputs,
+    _reconcile_completion_criteria_on_context,
+    _stored_active_completion_criteria,
+)
+from skyvern.forge.sdk.copilot.completion_criteria_store import (
+    CompletionCriteriaTurnState,
+    ReconcileDecision,
+    StoredCriteriaSet,
+    StoredCriteriaSnapshot,
+    build_turn_state,
+    criteria_from_json,
+    criteria_to_json,
+    note_adjudication_on_turn_state,
+    plan_persistence,
+    reconcile_completion_criteria,
+)
+from skyvern.forge.sdk.copilot.completion_verification import (
+    CompletionVerificationResult,
+    CriterionVerdict,
+    _coerce_result,
+    combine_verification_results,
+    grade_definition_criteria,
+    resolve_unknown,
+    run_plane_all_no_evidence,
+)
+from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisInput,
+    DiagnosisRepairContract,
+    DiagnosisResult,
+    RepairDecision,
+    RepairNextAction,
+    VerificationResult,
+)
+from skyvern.forge.sdk.copilot.enforcement import (
+    verified_goal_claim_authorized,
+    verified_goal_satisfied_context,
+)
+from skyvern.forge.sdk.copilot.request_policy import (
+    CompletionCriterion,
+    RequestPolicy,
+    _parse_completion_criteria,
+    normalized_criterion_outcome_key,
+)
+from skyvern.forge.sdk.copilot.tools.completion import _outcome_failure_warrants_repair, _split_criteria_by_plane
+
+
+def _criterion(cid: str, outcome: str, *, level: str = "run") -> CompletionCriterion:
+    return CompletionCriterion(id=cid, outcome=outcome, level=level)  # type: ignore[arg-type]
+
+
+def _stored(
+    *outcomes: str,
+    set_id: str = "wccs_1",
+    epoch: int = 1,
+    counter: int = 0,
+    fired: bool = False,
+    known_good: str | None = None,
+) -> StoredCriteriaSet:
+    return StoredCriteriaSet(
+        set_id=set_id,
+        goal_epoch=epoch,
+        criteria=tuple(_criterion(f"c{i}", outcome) for i, outcome in enumerate(outcomes)),
+        consecutive_all_no_evidence=counter,
+        tripwire_fired=fired,
+        last_fully_satisfied_workflow_yaml=known_good,
+    )
+
+
+def _verdict(cid: str, state: str, reason: str) -> CriterionVerdict:
+    return CriterionVerdict(criterion_id=cid, state=state, reason_code=reason)  # type: ignore[arg-type]
+
+
+def _evaluated(*verdicts: CriterionVerdict) -> CompletionVerificationResult:
+    return CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=[v.criterion_id for v in verdicts],
+        verdicts=list(verdicts),
+    )
+
+
+def _all_no_evidence(*cids: str) -> CompletionVerificationResult:
+    return _evaluated(*[_verdict(cid, "unsatisfied", "no_evidence") for cid in cids])
+
+
+def test_reconcile_first_derivation_creates_epoch_one() -> None:
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(), [_criterion("c0", "the item is in the cart")], actionable=True
+    )
+    assert decision.action == "create"
+    assert decision.reason == "first"
+    assert decision.epoch == 1
+
+
+def test_reconcile_subset_keeps_stored_set() -> None:
+    stored = _stored("the item is in the cart", "the order total is extracted")
+    snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
+    decision = reconcile_completion_criteria(snapshot, [_criterion("x0", "The item is in the cart")], actionable=True)
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "kept"
+    assert decision.epoch == 1
+    assert decision.criteria == stored.criteria
+
+
+def test_normalized_outcome_key_ignores_trailing_punctuation() -> None:
+    assert normalized_criterion_outcome_key("The heading is extracted.") == "the heading is extracted"
+    assert normalized_criterion_outcome_key("  The   heading is extracted!  ") == "the heading is extracted"
+
+
+def test_reconcile_keeps_stored_set_on_trailing_punctuation_and_case_variance() -> None:
+    stored = _stored("The page's main heading is extracted from https://example.com")
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [_criterion("c0", "the page's main heading is extracted from https://example.com.")],
+        actionable=True,
+    )
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "kept"
+    assert decision.criteria == stored.criteria
+
+
+def test_reconcile_empty_fresh_never_supersedes() -> None:
+    stored = _stored("the item is in the cart")
+    decision = reconcile_completion_criteria(StoredCriteriaSnapshot(active=stored, next_epoch=2), [], actionable=True)
+    assert decision.action == "adopt_stored"
+    assert decision.reason == "empty_fresh"
+    assert decision.criteria == stored.criteria
+
+
+def test_reconcile_non_subset_supersedes_wholesale() -> None:
+    stored = _stored("the item is in the cart", set_id="wccs_old", epoch=3)
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=4),
+        [_criterion("c0", "the invoice totals are extracted")],
+        actionable=True,
+    )
+    assert decision.action == "create"
+    assert decision.reason == "not_subset"
+    assert decision.epoch == 4
+    assert decision.superseded_set_id == "wccs_old"
+
+
+def test_reconcile_epoch_stays_monotonic_after_supersede_chain() -> None:
+    # A superseded latest row still advances next_epoch, so a new set never
+    # reuses an epoch number.
+    decision = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=None, next_epoch=7),
+        [_criterion("c0", "the report is downloaded")],
+        actionable=True,
+    )
+    assert decision.epoch == 7
+
+
+def test_reconcile_clarification_turn_never_creates_or_supersedes() -> None:
+    no_store = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(), [_criterion("c0", "the item is in the cart")], actionable=False
+    )
+    assert no_store.action == "none"
+
+    stored = _stored("the item is in the cart")
+    with_store = reconcile_completion_criteria(
+        StoredCriteriaSnapshot(active=stored, next_epoch=2),
+        [_criterion("c0", "something entirely different")],
+        actionable=False,
+    )
+    assert with_store.action == "adopt_stored"
+    assert with_store.criteria == stored.criteria
+
+
+def test_reconcile_no_criteria_anywhere_is_noop() -> None:
+    decision = reconcile_completion_criteria(StoredCriteriaSnapshot(), [], actionable=True)
+    assert decision.action == "none"
+    assert plan_persistence(build_turn_state(StoredCriteriaSnapshot(), decision)) is None
+
+
+def test_criteria_json_round_trip_preserves_level_and_flags() -> None:
+    criteria = (
+        CompletionCriterion(id="c0", outcome="the item is in the cart", implicit=True),
+        CompletionCriterion(id="c1", outcome="inputs are reusable", method_mandated=True, level="definition"),
+    )
+    assert criteria_from_json(criteria_to_json(criteria)) == criteria
+
+
+def test_criteria_from_json_coerces_invalid_level_to_run() -> None:
+    (criterion,) = criteria_from_json([{"id": "c0", "outcome": "done", "level": "bogus"}])
+    assert criterion.level == "run"
+
+
+def _adopted_turn_state(stored: StoredCriteriaSet) -> CompletionCriteriaTurnState:
+    snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=stored.goal_epoch + 1)
+    decision = reconcile_completion_criteria(snapshot, [], actionable=True)
+    return build_turn_state(snapshot, decision)
+
+
+def test_tripwire_fires_after_two_consecutive_all_no_evidence_adjudications() -> None:
+    stored = _stored("the item is in the cart", counter=1)
+    turn_state = _adopted_turn_state(stored)
+    note_adjudication_on_turn_state(turn_state, _all_no_evidence("c0"))
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.counter_value == 2
+    assert plan.tripwire_fired is True
+    assert plan.supersede_set_id == stored.set_id
+    assert plan.supersede_reason == "tripwire"
+
+
+def test_tripwire_fires_at_most_once_per_epoch() -> None:
+    stored = _stored("the item is in the cart", counter=2, fired=True)
+    turn_state = _adopted_turn_state(stored)
+    note_adjudication_on_turn_state(turn_state, _all_no_evidence("c0"))
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.counter_value == 3
+    assert plan.supersede_set_id is None
+    assert plan.supersede_reason is None
+
+
+def test_tripwire_counter_resets_on_evidence() -> None:
+    stored = _stored("the item is in the cart", counter=1)
+    turn_state = _adopted_turn_state(stored)
+    note_adjudication_on_turn_state(turn_state, _evaluated(_verdict("c0", "satisfied", "evidence_confirms")))
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.counter_value == 0
+    assert plan.supersede_set_id is None
+
+
+def test_tripwire_never_fires_on_a_set_created_this_turn() -> None:
+    snapshot = StoredCriteriaSnapshot()
+    decision = reconcile_completion_criteria(snapshot, [_criterion("c0", "the item is in the cart")], actionable=True)
+    turn_state = build_turn_state(snapshot, decision)
+    note_adjudication_on_turn_state(turn_state, _all_no_evidence("c0"))
+    note_adjudication_on_turn_state(turn_state, _all_no_evidence("c0"))
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.creates_set is True
+    assert plan.counter_value == 2
+    assert plan.tripwire_fired is False
+    assert plan.supersede_reason is None
+
+
+def test_fully_satisfied_adjudication_records_known_good_yaml() -> None:
+    stored = _stored("the item is in the cart")
+    turn_state = _adopted_turn_state(stored)
+    note_adjudication_on_turn_state(
+        turn_state,
+        _evaluated(_verdict("c0", "satisfied", "evidence_confirms")),
+        fully_satisfied_workflow_yaml="title: test workflow",
+    )
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.fully_satisfied_workflow_yaml == "title: test workflow"
+
+
+def test_build_turn_state_exposes_known_good_availability() -> None:
+    stored = _stored("the item is in the cart", known_good="title: known good")
+    assert _adopted_turn_state(stored).known_good_yaml_available is True
+    assert _adopted_turn_state(_stored("the item is in the cart")).known_good_yaml_available is False
+
+
+def test_run_plane_all_no_evidence_ignores_definition_verdicts() -> None:
+    mixed = _evaluated(
+        _verdict("c0", "unsatisfied", "no_evidence"),
+        _verdict("c1", "satisfied", "definition_parameters_referenced"),
+    )
+    assert run_plane_all_no_evidence(mixed) is True
+    only_definition = _evaluated(_verdict("c0", "unknown", "definition_unknown"))
+    assert run_plane_all_no_evidence(only_definition) is False
+    confirmed = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
+    assert run_plane_all_no_evidence(confirmed) is False
+
+
+def test_coerce_result_tristate_mapping() -> None:
+    raw = {
+        "verdicts": [
+            {"criterion_id": "c0", "satisfied": True, "reason_code": "evidence_confirms"},
+            {"criterion_id": "c1", "satisfied": False, "reason_code": "no_evidence"},
+            {"criterion_id": "c2", "satisfied": False, "reason_code": "evidence_contradicts"},
+            {"criterion_id": "c3", "satisfied": False, "reason_code": "unknown"},
+            {"criterion_id": "c4", "satisfied": True, "reason_code": "no_evidence"},
+        ]
+    }
+    result = _coerce_result(raw, ["c0", "c1", "c2", "c3", "c4", "c5"])
+    states = {v.criterion_id: v.state for v in result.verdicts}
+    assert states == {
+        "c0": "satisfied",
+        "c1": "unsatisfied",
+        "c2": "unsatisfied",
+        "c3": "unknown",
+        "c4": "unsatisfied",
+        "c5": "unknown",
+    }
+    assert result.is_fully_satisfied() is False
+    assert result.verdict_state_counts() == {"satisfied": 1, "unsatisfied": 3, "unknown": 2}
+
+
+def test_resolve_unknown_collapses_to_unsatisfied_only_when_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert resolve_unknown("unknown") == "unknown"
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    assert resolve_unknown("unknown") == "unsatisfied"
+    assert resolve_unknown("satisfied") == "satisfied"
+
+
+_PARAMETERIZED_YAML = """\
+title: provider lookup
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: first_name
+    - parameter_type: workflow
+      key: npi_number
+  blocks:
+    - block_type: goto_url
+      label: open_portal
+      url: https://registry.example.com/search
+    - block_type: navigation
+      label: fill_search
+      navigation_goal: "Search for {{ first_name }} with NPI {{ npi_number }}"
+"""
+
+_UNREFERENCED_YAML = """\
+title: provider lookup
+workflow_definition:
+  parameters:
+    - parameter_type: workflow
+      key: first_name
+  blocks:
+    - block_type: goto_url
+      label: open_portal
+      url: https://registry.example.com/search
+"""
+
+_NO_PARAMS_YAML = """\
+title: provider lookup
+workflow_definition:
+  parameters: []
+  blocks:
+    - block_type: goto_url
+      label: open_portal
+      url: https://registry.example.com/search
+"""
+
+
+def test_definition_grading_satisfied_when_parameters_exist_and_are_referenced() -> None:
+    criteria = [_criterion("c0", "the workflow accepts first name and NPI as reusable inputs", level="definition")]
+    (verdict,) = grade_definition_criteria(criteria, _PARAMETERIZED_YAML)
+    assert verdict.state == "satisfied"
+    assert verdict.reason_code == "definition_parameters_referenced"
+
+
+def test_definition_grading_unsatisfied_when_parameters_missing_or_unreferenced() -> None:
+    criteria = [_criterion("c0", "the workflow accepts reusable inputs", level="definition")]
+    (missing,) = grade_definition_criteria(criteria, _NO_PARAMS_YAML)
+    assert missing.state == "unsatisfied"
+    assert missing.reason_code == "definition_parameters_missing"
+    (unreferenced,) = grade_definition_criteria(criteria, _UNREFERENCED_YAML)
+    assert unreferenced.state == "unsatisfied"
+    assert unreferenced.reason_code == "definition_parameters_unreferenced"
+
+
+def test_definition_grading_requires_every_named_input_to_match() -> None:
+    criteria = [
+        _criterion(
+            "c0",
+            "the workflow accepts first name, last name, and NPI number as reusable inputs",
+            level="definition",
+        )
+    ]
+    # _PARAMETERIZED_YAML defines first_name + npi_number but not last_name:
+    # a multi-input ask must not be satisfied by a partial parameter set.
+    (verdict,) = grade_definition_criteria(criteria, _PARAMETERIZED_YAML)
+    assert verdict.state == "unknown"
+    assert verdict.reason_code == "definition_parameters_unmatched"
+
+    full_yaml = _PARAMETERIZED_YAML.replace(
+        "    - parameter_type: workflow\n      key: npi_number",
+        "    - parameter_type: workflow\n      key: last_name\n    - parameter_type: workflow\n      key: npi_number",
+    )
+    (full,) = grade_definition_criteria(criteria, full_yaml)
+    assert full.state == "satisfied"
+
+
+def test_parse_completion_criteria_tolerates_unhashable_level() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {"outcome": "the item is in the cart", "level": ["definition"]},
+            {"outcome": "the order is placed", "level": {"value": "run"}},
+        ]
+    )
+    assert [c.level for c in parsed] == ["run", "run"]
+
+
+def test_definition_grading_unknown_when_no_deterministic_check_applies() -> None:
+    criteria = [_criterion("c0", "the summary email is well written", level="definition")]
+    (verdict,) = grade_definition_criteria(criteria, _PARAMETERIZED_YAML)
+    assert verdict.state == "unknown"
+    assert verdict.reason_code == "definition_unknown"
+
+
+def test_definition_grading_never_emits_no_evidence() -> None:
+    criteria = [
+        _criterion("c0", "inputs are reusable", level="definition"),
+        _criterion("c1", "something unmappable", level="definition"),
+    ]
+    for yaml_text in (_PARAMETERIZED_YAML, _UNREFERENCED_YAML, _NO_PARAMS_YAML, "not: [valid", ""):
+        for verdict in grade_definition_criteria(criteria, yaml_text):
+            assert verdict.reason_code != "no_evidence"
+
+
+def test_combine_results_keeps_unavailable_run_result_authoritative() -> None:
+    unavailable = CompletionVerificationResult(status="unavailable")
+    combined = combine_verification_results(
+        ["c0", "c1"], unavailable, [_verdict("c1", "satisfied", "definition_parameters_referenced")]
+    )
+    assert combined.status == "unavailable"
+    assert combined.verdicts == []
+
+
+def test_combine_results_merges_planes_and_fills_unknown() -> None:
+    run_result = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
+    combined = combine_verification_results(
+        ["c0", "c1", "c2"], run_result, [_verdict("c1", "unknown", "definition_unknown")]
+    )
+    assert combined.status == "evaluated"
+    assert [v.state for v in combined.verdicts] == ["satisfied", "unknown", "unknown"]
+    assert combined.criterion_ids == ["c0", "c1", "c2"]
+
+
+def test_split_criteria_by_plane_respects_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    criteria = [
+        _criterion("c0", "the item is in the cart"),
+        _criterion("c1", "inputs are reusable", level="definition"),
+    ]
+    run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
+    assert [c.id for c in run_criteria] == ["c0"]
+    assert [c.id for c in definition_criteria] == ["c1"]
+
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
+    assert [c.id for c in run_criteria] == ["c0", "c1"]
+    assert definition_criteria == []
+
+
+def test_parse_completion_criteria_coerces_level() -> None:
+    parsed = _parse_completion_criteria(
+        [
+            {"outcome": "the item is in the cart", "level": "run"},
+            {"outcome": "inputs are reusable", "level": "definition"},
+            {"outcome": "the order is placed", "level": "nonsense"},
+            {"outcome": "the page is reached"},
+        ]
+    )
+    assert [c.level for c in parsed] == ["run", "definition", "run", "run"]
+
+
+def _ctx(**overrides: object) -> CopilotContext:
+    defaults: dict = dict(
+        organization_id="org-1",
+        workflow_id="wf-1",
+        workflow_permanent_id="wfp-1",
+        workflow_yaml="",
+        browser_session_id=None,
+        stream=MagicMock(),
+    )
+    defaults.update(overrides)
+    return CopilotContext(**defaults)
+
+
+def _legacy_verified_ctx() -> CopilotContext:
+    return _ctx(
+        last_test_ok=True,
+        last_full_workflow_test_ok=True,
+        latest_diagnosis_repair_contract=DiagnosisRepairContract(
+            diagnosis_input=DiagnosisInput(source_tool="update_and_run_blocks"),
+            diagnosis_result=DiagnosisResult(),
+            repair_decision=RepairDecision(next_action=RepairNextAction.NO_CHANGE),
+            verification_result=VerificationResult(
+                user_goal_satisfied=True,
+                completion_contract_satisfied=True,
+            ),
+        ),
+    )
+
+
+def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
+    ctx = _legacy_verified_ctx()
+    # Turn completion is unchanged: the legacy conjunction still satisfies the gate.
+    assert verified_goal_satisfied_context(ctx) is True
+    # The claim tier is closed: no adjudicated evidence, no tested-success claim.
+    assert verified_goal_claim_authorized(ctx) is False
+
+
+def test_claim_authorized_with_flag_off_matches_legacy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    ctx = _legacy_verified_ctx()
+    assert verified_goal_claim_authorized(ctx) is True
+
+
+def test_claim_authorized_with_adjudicated_evidence() -> None:
+    ctx = _legacy_verified_ctx()
+    ctx.completion_verification_result = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
+    assert verified_goal_claim_authorized(ctx) is True
+
+
+def test_unknown_only_verdicts_never_route_to_repair() -> None:
+    ctx = _ctx(last_workflow_yaml="workflow_definition:\n  blocks:\n    - block_type: extraction\n      label: e\n")
+    all_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
+    assert _outcome_failure_warrants_repair(ctx, all_unknown) is False
+
+
+def test_unknown_verdicts_route_to_repair_with_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    ctx = _ctx(last_workflow_yaml="workflow_definition:\n  blocks:\n    - block_type: extraction\n      label: e\n")
+    all_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
+    assert _outcome_failure_warrants_repair(ctx, all_unknown) is True
+
+
+def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuardrailInputs:
+    return RequestPolicyGuardrailInputs(
+        user_message="build a workflow",
+        workflow_yaml="",
+        chat_history_text="",
+        chat_history_messages=[],
+        global_llm_context="",
+        organization_id="org-1",
+        handler=None,
+        stored_completion_criteria=snapshot,
+    )
+
+
+def test_reconcile_on_context_adopts_stored_criteria_onto_policy() -> None:
+    stored = _stored("the item is in the cart", "the order total is extracted")
+    policy = RequestPolicy(completion_criteria=[_criterion("x0", "the item is in the cart")])
+    ctx = _ctx()
+    _reconcile_completion_criteria_on_context(
+        ctx, policy, _policy_inputs(StoredCriteriaSnapshot(active=stored, next_epoch=2))
+    )
+    assert [c.outcome for c in policy.completion_criteria] == [c.outcome for c in stored.criteria]
+    assert ctx.completion_criteria_turn_state is not None
+    assert ctx.completion_criteria_turn_state.decision is not None
+    assert ctx.completion_criteria_turn_state.decision.reason == "kept"
+
+
+def test_reconcile_on_context_skips_without_snapshot_or_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    policy = RequestPolicy(completion_criteria=[_criterion("c0", "the item is in the cart")])
+    ctx = _ctx()
+    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(None))
+    assert ctx.completion_criteria_turn_state is None
+
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(StoredCriteriaSnapshot()))
+    assert ctx.completion_criteria_turn_state is None
+
+
+def test_stored_active_criteria_forwarded_only_with_active_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    stored = _stored("the item is in the cart")
+    snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
+    assert _stored_active_completion_criteria(_policy_inputs(snapshot)) == list(stored.criteria)
+    assert _stored_active_completion_criteria(_policy_inputs(StoredCriteriaSnapshot())) is None
+    assert _stored_active_completion_criteria(_policy_inputs(None)) is None
+
+    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
+    assert _stored_active_completion_criteria(_policy_inputs(snapshot)) is None
+
+
+def test_plan_persistence_for_supersede_creates_new_epoch_and_points_back() -> None:
+    stored = _stored("the item is in the cart", set_id="wccs_old", epoch=2)
+    snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=3)
+    decision = reconcile_completion_criteria(
+        snapshot, [_criterion("c0", "the invoice totals are extracted")], actionable=True
+    )
+    turn_state = build_turn_state(snapshot, decision)
+    plan = plan_persistence(turn_state)
+    assert plan is not None
+    assert plan.creates_set is True
+    assert plan.create_epoch == 3
+    assert plan.supersede_set_id == "wccs_old"
+    assert plan.supersede_reason == "not_subset"
+
+
+def test_plan_persistence_none_for_none_decision() -> None:
+    assert plan_persistence(None) is None
+    assert plan_persistence(CompletionCriteriaTurnState()) is None
+    none_state = CompletionCriteriaTurnState(
+        decision=ReconcileDecision(action="none", reason="no_criteria", epoch=0, criteria=())
+    )
+    assert plan_persistence(none_state) is None

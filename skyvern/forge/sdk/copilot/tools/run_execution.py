@@ -89,6 +89,7 @@ from .completion import (
     _maybe_run_completion_verification,
     _outcome_failure_warrants_repair,
     _outcome_unverified_reason,
+    _record_adjudication_on_turn_state,
 )
 from .composition_capture import (
     ActiveRunTerminalEvidenceSample,
@@ -1417,6 +1418,7 @@ def _record_run_blocks_result(
     run_id = data.get("workflow_run_id") if isinstance(data, dict) else None
     copilot_ctx.completion_verification_result = completion_verification
     record_completion_verification(copilot_ctx, completion_verification)
+    _record_adjudication_on_turn_state(copilot_ctx, completion_verification)
     if completion_verification is not None and completion_verification.status == "evaluated":
         _emit_completion_verification_trace(copilot_ctx, completion_verification)
     copilot_ctx.last_run_blocks_workflow_run_id = run_id if isinstance(run_id, str) else None
@@ -1445,7 +1447,7 @@ def _record_run_blocks_result(
     copilot_ctx.post_run_page_observation_after_failed_test = False
     copilot_ctx.post_run_current_page_inspection_workflow_run_id = None
 
-    structured_blocker = _run_blocks_structured_blocker_message(result)
+    structured_blocker = _run_blocks_structured_blocker_message(result, copilot_ctx)
     anti_bot_match, empty_data_blocks, failure_categories = _analyze_run_blocks(result, copilot_ctx)
     record_gate_decision(
         copilot_ctx,

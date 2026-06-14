@@ -62,6 +62,7 @@ from skyvern.forge.sdk.db.id import (
     generate_totp_code_id,
     generate_workflow_copilot_chat_id,
     generate_workflow_copilot_chat_message_id,
+    generate_workflow_copilot_completion_criteria_set_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -1492,6 +1493,36 @@ class WorkflowCopilotChatMessageModel(Base):
     global_llm_context = Column(UnicodeText, nullable=True)
     turn_outcome = Column(JSON, nullable=True)
     narrative_payload = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowCopilotCompletionCriteriaSetModel(Base):
+    __tablename__ = "workflow_copilot_completion_criteria_sets"
+    __table_args__ = (Index("wcccs_org_chat_index", "organization_id", "workflow_copilot_chat_id"),)
+
+    completion_criteria_set_id = Column(
+        String, primary_key=True, default=generate_workflow_copilot_completion_criteria_set_id
+    )
+    organization_id = Column(String, nullable=False)
+    workflow_copilot_chat_id = Column(String, nullable=False)
+    goal_epoch = Column(Integer, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    criteria = Column(JSON, nullable=False)
+    source_turn_id = Column(String, nullable=True)
+    source_goal_text = Column(UnicodeText, nullable=True)
+    consecutive_all_no_evidence = Column(Integer, nullable=False, default=0)
+    tripwire_fired = Column(Boolean, nullable=False, default=False)
+    last_fully_satisfied_workflow_yaml = Column(UnicodeText, nullable=True)
+    superseded_by_set_id = Column(String, nullable=True)
+    superseded_at = Column(DateTime, nullable=True)
+    supersede_reason = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(
