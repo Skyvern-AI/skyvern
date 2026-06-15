@@ -6,6 +6,7 @@ import json
 import time
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -1433,6 +1434,7 @@ def _record_run_blocks_result(
     copilot_ctx.last_test_failure_reason = None
     if completion_verification is not None and completion_verification.status == "evaluated":
         copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
+        copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
     copilot_ctx.last_test_suspicious_success = False
     copilot_ctx.last_run_outcome = None
     copilot_ctx.last_run_outcome_block_labels = []
@@ -1618,6 +1620,8 @@ def _record_run_blocks_result(
 
 
 def _stash_recorded_run_outcome(copilot_ctx: Any, outcome: RecordedRunOutcome) -> RecordedRunOutcome:
+    if outcome.workflow_run_id is None:
+        outcome = replace(outcome, workflow_run_id=getattr(copilot_ctx, "last_run_blocks_workflow_run_id", None))
     copilot_ctx.last_run_outcome = outcome
     copilot_ctx.last_run_outcome_block_labels = list(getattr(copilot_ctx, "last_run_blocks_block_labels", []) or [])
     return outcome

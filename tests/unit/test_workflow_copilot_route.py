@@ -36,6 +36,7 @@ from skyvern.forge.sdk.routes.workflow_copilot import (
 )
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotChatRequest,
+    WorkflowCopilotChatSender,
     WorkflowCopilotStreamErrorUpdate,
     WorkflowCopilotStreamResponseUpdate,
 )
@@ -913,13 +914,15 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
         description="Original description",
         workflow_definition=None,
     )
+    terminal_message = "I could not safely return that chat reply."
     agent_result = SimpleNamespace(
-        user_response="I could not safely return that chat reply.",
+        user_response=terminal_message,
         updated_workflow=None,
         global_llm_context=None,
         workflow_yaml=None,
         workflow_was_persisted=False,
         clear_proposed_workflow=False,
+        response_type="ASK_QUESTION",
         unvalidated=False,
         output_policy_diagnostics={
             "final_output_policy_allowed": False,
@@ -948,6 +951,23 @@ async def test_output_policy_block_preserves_unvalidated_prior_proposal_under_au
     update_calls = app.DATABASE.workflow_params.update_workflow_copilot_chat.await_args_list
     clear_calls = [c for c in update_calls if c.kwargs.get("proposed_workflow") is None]
     assert not clear_calls, f"did not expect a clear call, got {update_calls!r}"
+
+    assistant_call = next(
+        call
+        for call in app.DATABASE.workflow_params.create_workflow_copilot_chat_message.await_args_list
+        if call.kwargs.get("sender") == WorkflowCopilotChatSender.AI
+    )
+    assert assistant_call.kwargs["content"] == terminal_message
+
+    response_frames = [
+        call.args[0]
+        for call in stream.send.await_args_list
+        if isinstance(call.args[0], WorkflowCopilotStreamResponseUpdate)
+    ]
+    assert len(response_frames) == 1
+    frame = response_frames[0]
+    assert frame.message == terminal_message
+    assert frame.response_type == "ASK_QUESTION"
 
 
 @pytest.mark.asyncio

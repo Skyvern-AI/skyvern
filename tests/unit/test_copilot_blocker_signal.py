@@ -349,6 +349,8 @@ def test_stash_refreshes_held_loop_signal_with_evidence_recorded_after_the_stash
     assert dict(loop_signal.extra) == {}
 
     ctx.last_outcome_gate_reason = _LATE_RECORDED_REASON
+    ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+    ctx.last_run_blocks_workflow_run_id = "wr_latest"
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.has_staged_proposal = True
 

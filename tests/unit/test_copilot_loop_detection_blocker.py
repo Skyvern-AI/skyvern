@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.blocker_signal import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SkyvernOverlayMCPServer, _stash_and_emit_loop_blocker
 from skyvern.forge.sdk.copilot.output_policy import CopilotOutputKind, evaluate_output_policy
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import _build_loop_blocker_signal, _tool_loop_error
 from skyvern.forge.sdk.copilot.tools.mcp_hooks import get_skyvern_mcp_alias_map
 from skyvern.forge.sdk.copilot.turn_halt import TurnHaltKind
@@ -161,6 +162,8 @@ _FULL_EVIDENCE_REASON = (
 )
 _FULL_EVIDENCE = LoopBlockerEvidence(
     outcome_gate_reason=_FULL_EVIDENCE_REASON,
+    outcome_gate_workflow_run_id="wr_latest",
+    latest_workflow_run_id="wr_latest",
     anti_bot_blocked=True,
     has_draft=True,
 )
@@ -286,6 +289,50 @@ def test_raw_runtime_error_reason_drops_verdict_tier(raw_error_reason: str) -> N
     assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
 
 
+@pytest.mark.parametrize(
+    "recorded,latest_run_id,expected_tiers,expect_recorded_tier",
+    [
+        (
+            RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_new"),
+            "wr_new",
+            ["recorded_run_outcome", "draft"],
+            True,
+        ),
+        (None, None, ["draft"], False),
+        (
+            RecordedRunOutcome(verdict="not_demonstrated", reason_code="outcome_not_demonstrated"),
+            "wr_new",
+            ["draft"],
+            False,
+        ),
+    ],
+)
+def test_stale_outcome_gate_reason_only_keeps_matching_recorded_run(
+    recorded: RecordedRunOutcome | None,
+    latest_run_id: str | None,
+    expected_tiers: list[str],
+    expect_recorded_tier: bool,
+) -> None:
+    evidence = LoopBlockerEvidence(
+        outcome_gate_reason=(
+            "The run completed but did not demonstrate the goal outcome(s): stale criterion text from an older run."
+        ),
+        outcome_gate_workflow_run_id="wr_old",
+        recorded_run_outcome=recorded,
+        latest_workflow_run_id=latest_run_id,
+        has_draft=True,
+    )
+
+    signal = _build_loop_blocker_signal(
+        _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"], tool_name="evaluate", evidence=evidence
+    )
+
+    assert "stale criterion text" not in signal.user_facing_reason
+    assert ("latest run recorded workflow output" in signal.user_facing_reason) is expect_recorded_tier
+    assert dict(signal.extra) == {"loop_evidence_tiers": expected_tiers}
+    assert_clean_user_facing_text(signal.user_facing_reason, blocked_tool="evaluate")
+
+
 def test_evidence_verdict_sources_only_from_the_outcome_gate_field() -> None:
     ctx = _ctx()
     ctx.last_test_failure_reason = "Failed to execute code block. Reason: TimeoutError: Timeout 30000ms exceeded."
@@ -334,6 +381,8 @@ def test_native_and_mcp_paths_carry_equivalent_evidence_bearing_signals() -> Non
             "The run completed but did not demonstrate the goal outcome(s): the requested record is checked "
             "on a public registry site with a search form and expandable result rows."
         )
+        ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+        ctx.last_run_blocks_workflow_run_id = "wr_latest"
         ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
         ctx.has_staged_proposal = True
         return ctx
@@ -370,6 +419,8 @@ def test_tool_loop_error_entry_refreshes_stale_held_loop_signal() -> None:
     ctx.last_outcome_gate_reason = (
         "The run completed but did not demonstrate the goal outcome(s): the requested record is checked."
     )
+    ctx.last_outcome_gate_workflow_run_id = "wr_latest"
+    ctx.last_run_blocks_workflow_run_id = "wr_latest"
     ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
     ctx.staged_workflow_yaml = "blocks: []"
 
@@ -425,7 +476,13 @@ def test_composed_loop_reply_passes_output_policy_allow_verdict() -> None:
     signal = _build_loop_blocker_signal(
         _BRANCH_MESSAGES["loop_detected_consecutive_same_tool"],
         tool_name="evaluate",
-        evidence=LoopBlockerEvidence(outcome_gate_reason=_FULL_EVIDENCE_REASON, anti_bot_blocked=True, has_draft=False),
+        evidence=LoopBlockerEvidence(
+            outcome_gate_reason=_FULL_EVIDENCE_REASON,
+            outcome_gate_workflow_run_id="wr_latest",
+            latest_workflow_run_id="wr_latest",
+            anti_bot_blocked=True,
+            has_draft=False,
+        ),
     )
     verdict = evaluate_output_policy(
         request_policy=None,

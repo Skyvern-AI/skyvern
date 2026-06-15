@@ -14,6 +14,7 @@ from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
+from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     artifact_dependency_id,
@@ -1643,6 +1644,7 @@ def _record_workflow_update_result(
             copilot_ctx.last_update_block_count = block_count
     copilot_ctx.last_test_ok = None
     copilot_ctx.last_test_failure_reason = None
+    clear_terminal_evidence_on_workflow_edit(copilot_ctx)
     # A fresh workflow edit invalidates the prior test's failure state —
     # otherwise an exhausted POST_UPDATE_NUDGE on the new draft would raise
     # CopilotNonRetriableNavError with the old run's error, telling the user
