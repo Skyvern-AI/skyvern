@@ -32,7 +32,6 @@ from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     _verification_satisfaction,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
-    _outcome_criteria_evaluated,
     outcome_fully_verified,
     verified_goal_satisfied_context,
 )
@@ -358,14 +357,6 @@ def test_gate_bypasses_heuristic_only_on_evaluated_verdict() -> None:
     retained = _gate_ctx()
     retained.completion_verification_result = None
     assert verified_goal_satisfied_context(retained) is False
-
-
-def test_gate_flag_off_ignores_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", False)
-    ctx = _gate_ctx()
-    ctx.completion_verification_result = _evaluated(("c0", True))
-    assert _outcome_criteria_evaluated(ctx) is False
-    assert verified_goal_satisfied_context(ctx) is False
 
 
 def test_gate_withholds_on_evaluated_unconfirmed_even_with_clean_run_status() -> None:
@@ -826,16 +817,13 @@ def test_active_run_terminal_evidence_blocks_same_turn_mutation_tools() -> None:
     assert ctx.blocker_signal.internal_reason_code == "tool_error_active_run_terminal_evidence"
 
 
-def test_outcome_fully_verified_predicate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_outcome_fully_verified_predicate() -> None:
     ctx = _gate_ctx()
     ctx.completion_verification_result = _evaluated(("c0", True))
     assert outcome_fully_verified(ctx) is True
     ctx.completion_verification_result = _evaluated(("c0", True), ("c1", False))
     assert outcome_fully_verified(ctx) is False
     ctx.completion_verification_result = None
-    assert outcome_fully_verified(ctx) is False
-    ctx.completion_verification_result = _evaluated(("c0", True))
-    monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", False)
     assert outcome_fully_verified(ctx) is False
 
 
@@ -1272,7 +1260,6 @@ async def test_completion_verification_receives_verified_context_labels(monkeypa
         "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
         _completion_handler_lookup(handler),
     )
-    monkeypatch.setattr(settings, "COPILOT_OUTCOME_VERIFICATION_ENABLED", True)
     ctx = _run_ctx()
     ctx.request_policy = RequestPolicy(
         completion_criteria=[
@@ -1364,27 +1351,3 @@ def test_completion_contract_not_violated_unavailable_blocks_surfacing() -> None
     # An unavailable verdict means the outcome could not be verified: do not surface
     # the workflow as verified on run status alone.
     assert _completion_contract_not_violated(ctx) is False  # type: ignore[arg-type]
-
-
-def test_request_policy_prompt_gates_completion_criteria_on_flag() -> None:
-    from skyvern.forge.prompts import prompt_engine
-
-    common = dict(
-        user_message="",
-        raw_secret_present="false",
-        workflow_yaml="",
-        earliest_user_turn="",
-        latest_prior_user_turn="",
-        latest_assistant_turn="",
-        retained_history="",
-        global_llm_context="",
-    )
-    on = prompt_engine.load_prompt(
-        template="workflow-copilot-request-policy", outcome_verification_enabled=True, **common
-    )
-    off = prompt_engine.load_prompt(
-        template="workflow-copilot-request-policy", outcome_verification_enabled=False, **common
-    )
-    assert "completion_criteria" in on
-    # Flag off must not perturb the classifier prompt with the criteria contract.
-    assert "completion_criteria" not in off

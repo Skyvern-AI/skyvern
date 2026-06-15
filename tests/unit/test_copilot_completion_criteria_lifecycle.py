@@ -6,9 +6,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
-
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.agent import (
     RequestPolicyGuardrailInputs,
     _reconcile_completion_criteria_on_context,
@@ -32,7 +29,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     _coerce_result,
     combine_verification_results,
     grade_definition_criteria,
-    resolve_unknown,
     run_plane_all_no_evidence,
 )
 from skyvern.forge.sdk.copilot.context import CopilotContext
@@ -306,13 +302,6 @@ def test_coerce_result_tristate_mapping() -> None:
     assert result.verdict_state_counts() == {"satisfied": 1, "unsatisfied": 3, "unknown": 2}
 
 
-def test_resolve_unknown_collapses_to_unsatisfied_only_when_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert resolve_unknown("unknown") == "unknown"
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    assert resolve_unknown("unknown") == "unsatisfied"
-    assert resolve_unknown("satisfied") == "satisfied"
-
-
 _PARAMETERIZED_YAML = """\
 title: provider lookup
 workflow_definition:
@@ -438,7 +427,7 @@ def test_combine_results_merges_planes_and_fills_unknown() -> None:
     assert combined.criterion_ids == ["c0", "c1", "c2"]
 
 
-def test_split_criteria_by_plane_respects_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_split_criteria_by_plane() -> None:
     criteria = [
         _criterion("c0", "the item is in the cart"),
         _criterion("c1", "inputs are reusable", level="definition"),
@@ -446,11 +435,6 @@ def test_split_criteria_by_plane_respects_flag(monkeypatch: pytest.MonkeyPatch) 
     run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
     assert [c.id for c in run_criteria] == ["c0"]
     assert [c.id for c in definition_criteria] == ["c1"]
-
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    run_criteria, definition_criteria = _split_criteria_by_plane(criteria)
-    assert [c.id for c in run_criteria] == ["c0", "c1"]
-    assert definition_criteria == []
 
 
 def test_parse_completion_criteria_coerces_level() -> None:
@@ -502,12 +486,6 @@ def test_claim_closure_turn_still_ends_but_claim_downgrades() -> None:
     assert verified_goal_claim_authorized(ctx) is False
 
 
-def test_claim_authorized_with_flag_off_matches_legacy_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    ctx = _legacy_verified_ctx()
-    assert verified_goal_claim_authorized(ctx) is True
-
-
 def test_claim_authorized_with_adjudicated_evidence() -> None:
     ctx = _legacy_verified_ctx()
     ctx.completion_verification_result = _evaluated(_verdict("c0", "satisfied", "evidence_confirms"))
@@ -518,13 +496,6 @@ def test_unknown_only_verdicts_never_route_to_repair() -> None:
     ctx = _ctx(last_workflow_yaml="workflow_definition:\n  blocks:\n    - block_type: extraction\n      label: e\n")
     all_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
     assert _outcome_failure_warrants_repair(ctx, all_unknown) is False
-
-
-def test_unknown_verdicts_route_to_repair_with_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    ctx = _ctx(last_workflow_yaml="workflow_definition:\n  blocks:\n    - block_type: extraction\n      label: e\n")
-    all_unknown = _evaluated(_verdict("c0", "unknown", "unknown"))
-    assert _outcome_failure_warrants_repair(ctx, all_unknown) is True
 
 
 def _policy_inputs(snapshot: StoredCriteriaSnapshot | None) -> RequestPolicyGuardrailInputs:
@@ -553,26 +524,19 @@ def test_reconcile_on_context_adopts_stored_criteria_onto_policy() -> None:
     assert ctx.completion_criteria_turn_state.decision.reason == "kept"
 
 
-def test_reconcile_on_context_skips_without_snapshot_or_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reconcile_on_context_skips_without_snapshot() -> None:
     policy = RequestPolicy(completion_criteria=[_criterion("c0", "the item is in the cart")])
     ctx = _ctx()
     _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(None))
     assert ctx.completion_criteria_turn_state is None
 
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    _reconcile_completion_criteria_on_context(ctx, policy, _policy_inputs(StoredCriteriaSnapshot()))
-    assert ctx.completion_criteria_turn_state is None
 
-
-def test_stored_active_criteria_forwarded_only_with_active_set(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stored_active_criteria_forwarded_only_with_active_set() -> None:
     stored = _stored("the item is in the cart")
     snapshot = StoredCriteriaSnapshot(active=stored, next_epoch=2)
     assert _stored_active_completion_criteria(_policy_inputs(snapshot)) == list(stored.criteria)
     assert _stored_active_completion_criteria(_policy_inputs(StoredCriteriaSnapshot())) is None
     assert _stored_active_completion_criteria(_policy_inputs(None)) is None
-
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    assert _stored_active_completion_criteria(_policy_inputs(snapshot)) is None
 
 
 def test_plan_persistence_for_supersede_creates_new_epoch_and_points_back() -> None:

@@ -99,15 +99,6 @@ def test_backfill_verified_success_requires_adjudicated_evidence() -> None:
     assert result.narrative_payload["verifiedSuccess"] is False
 
 
-def test_backfill_verified_success_true_when_legacy_gate_passes_with_flag_off(monkeypatch) -> None:
-    from skyvern.config import settings
-
-    monkeypatch.setattr(settings, "COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED", False)
-    result = _result(_verified_goal_ctx(), turn_outcome=_outcome(ResponseKind.BUILD), narrative_payload=_payload())
-    assert result.narrative_payload is not None
-    assert result.narrative_payload["verifiedSuccess"] is True
-
-
 def test_backfill_verified_success_true_when_outcome_fully_verified() -> None:
     from skyvern.forge.sdk.copilot.completion_verification import (
         CompletionVerificationResult,
