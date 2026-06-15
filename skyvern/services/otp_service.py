@@ -79,8 +79,14 @@ async def parse_otp_login(
     resp = await app.SECONDARY_LLM_API_HANDLER(
         prompt=prompt, prompt_name="parse-otp-login", organization_id=organization_id
     )
-    LOG.info("OTP Login Parser Response", resp=resp, enforced_otp_type=enforced_otp_type)
     otp_result = OTPResultParsedByLLM.model_validate(resp)
+    LOG.info(
+        "OTP Login Parser Response",
+        enforced_otp_type=enforced_otp_type,
+        otp_type=otp_result.otp_type,
+        otp_value_found=otp_result.otp_value_found,
+        otp_length=len(otp_result.otp_value) if otp_result.otp_value else 0,
+    )
     if otp_result.otp_value_found and otp_result.otp_value:
         return OTPValue(value=otp_result.otp_value, type=otp_result.otp_type)
     return None
@@ -473,7 +479,15 @@ async def poll_otp_value(
         consecutive_failures = 0
         last_error_reason = None
         if otp_value:
-            LOG.info("Got otp value", otp_value=otp_value)
+            LOG.info(
+                "Got otp value",
+                task_id=task_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_permanent_id,
+                totp_identifier=totp_identifier,
+                otp_type=otp_value.get_otp_type().value,
+                otp_length=len(otp_value.value),
+            )
             return otp_value
 
 
@@ -579,7 +593,7 @@ async def _get_otp_value_from_url(
     if not otp_value:
         LOG.warning(
             "Failed to parse otp login from the totp url",
-            content_preview=_response_body_preview(content),
+            content_length=len(content) if isinstance(content, str) else None,
         )
         return None
 
