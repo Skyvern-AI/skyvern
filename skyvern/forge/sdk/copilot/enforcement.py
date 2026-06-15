@@ -1578,7 +1578,8 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
         return None
 
     ctx.synthesized_block_offered = True
-    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory)}
+    goal = getattr(ctx, "block_goal_main_goal", "") or getattr(ctx, "user_message", "") or ""
+    return {"role": "user", "content": render_synthesized_offer_text(synthesized, trajectory, goal=goal)}
 
 
 def _assemble_enforcement_messages(

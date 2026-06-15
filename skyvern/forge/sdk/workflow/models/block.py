@@ -86,7 +86,7 @@ from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
 from skyvern.forge.sdk.db.enums import TaskType
 from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
-from skyvern.forge.sdk.models import Step
+from skyvern.forge.sdk.models import Step, StepStatus
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
@@ -121,6 +121,11 @@ from skyvern.forge.sdk.workflow.models._jinja import (
     _json_type_filter,
     jinja_json_finalize_strict_env,
 )
+from skyvern.forge.sdk.workflow.models.code_block_recorder import (
+    CODE_BLOCK_FILENAME,
+    RecordingPage,
+    user_code_line_from_exception,
+)
 from skyvern.forge.sdk.workflow.models.parameter import (
     PARAMETER_TYPE,
     AWSSecretParameter,
@@ -131,6 +136,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
+from skyvern.schemas.steps import AgentStepOutput
 from skyvern.schemas.workflows import (
     AIFallbackMode,
     BlockResult,
@@ -146,6 +152,8 @@ from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
 from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
+from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.actions.actions import Action, ActionStatus
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -3351,6 +3359,14 @@ class Credential(SimpleNamespace):
     pass
 
 
+class CodeBlockStep(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    action_type: ActionType = ActionType.NULL_ACTION
+    line_start: int | None = None
+    line_end: int | None = None
+
+
 class CodeBlockOTPError(Exception):
     """Sanitized OTP-primitive error: never includes the identifier, URL, code, or seed."""
 
@@ -3458,6 +3474,8 @@ class CodeBlock(Block):
 
     code: str
     parameters: list[PARAMETER_TYPE] = []
+    prompt: str | None = None
+    steps: list[CodeBlockStep] | None = None
 
     # Dangerous attribute names that must never be accessed in user code.
     # This blocks subprocess creation, OS access, and sandbox-escape primitives.
@@ -3598,7 +3616,7 @@ class CodeBlock(Block):
         }
 
     def generate_async_user_function(
-        self, code: str, page: Page, parameters: dict[str, Any] | None = None
+        self, code: str, page: Page | RecordingPage, parameters: dict[str, Any] | None = None
     ) -> Callable[[], Awaitable[dict[str, Any]]]:
         # SECURITY: validate before exec(). The AST check must run on the raw
         # user code so it can block dunder identifiers like __capture_locals.
@@ -3622,7 +3640,9 @@ async def wrapper({default_args}):
         safe_vars["page"] = page
         safe_vars["__capture_locals"] = locals
         safe_vars["__param_defaults"] = parameter_defaults
-        exec(full_code, safe_vars, runtime_variables)
+        # Compile under a recognizable filename so tracebacks map back to user code lines.
+        compiled_code = compile(full_code, CODE_BLOCK_FILENAME, "exec")
+        exec(compiled_code, safe_vars, runtime_variables)  # nosemgrep
         user_function = runtime_variables["wrapper"]
         if not parameter_defaults:
             return user_function
@@ -3657,6 +3677,10 @@ async def wrapper({default_args}):
 
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
+        if self.prompt:
+            self.prompt = self.format_block_parameter_template_from_workflow_run_context(
+                self.prompt, workflow_run_context
+            )
 
     async def _register_downloaded_files(
         self,
@@ -3860,13 +3884,136 @@ async def wrapper({default_args}):
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
 
+        workflow_run_block = None
+
+        # A prompt-bearing code block gets a task v1 + step so its recorded calls render through
+        # the standard action/artifact timeline and the agent can later take over on failure.
+        # Promptless blocks have no task and persist neither actions nor screenshots.
+        task: Task | None = None
+        step: Step | None = None
+        if self.prompt:
+            task, step = await app.agent.create_task_and_step_from_code_block(
+                code_block=self,
+                organization_id=organization_id,
+                workflow_run_id=workflow_run_id,
+                task_url=page.url,
+            )
+
+        screenshot_tasks: list[asyncio.Task[None]] = []
+
+        async def _screenshot_sink(action: Action) -> None:
+            # No task means no action row will reference the screenshot, so skip it rather than orphan an artifact.
+            nonlocal workflow_run_block
+            if task is None:
+                return
+            if action.action_type not in (ActionType.GOTO_URL, ActionType.CLICK, ActionType.INPUT_TEXT):
+                return
+            # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
+            # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
+            # only the page-free S3 upload is deferred off the critical path.
+            try:
+                if workflow_run_block is None:
+                    workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                        workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+                    )
+                run_block = workflow_run_block
+                screenshot = await page.screenshot(timeout=settings.BROWSER_SCREENSHOT_TIMEOUT_MS)
+            except Exception:
+                LOG.warning(
+                    "Code block screenshot capture failed",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+                return
+
+            async def _upload() -> None:
+                try:
+                    action.screenshot_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                        workflow_run_block=run_block,
+                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                        data=screenshot,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Code block screenshot upload failed",
+                        workflow_run_block_id=workflow_run_block_id,
+                        exc_info=True,
+                    )
+
+            screenshot_tasks.append(asyncio.create_task(_upload()))
+
+        async def _drain_screenshots() -> None:
+            if screenshot_tasks:
+                await asyncio.gather(*screenshot_tasks, return_exceptions=True)
+
+        recording_page = RecordingPage(page, on_action=_screenshot_sink)
+
+        async def _persist_recorded_actions(recorded: list[Action]) -> None:
+            # Best-effort like the screenshot sink: recording must never change block outcome.
+            await _drain_screenshots()
+            if not recorded or task is None or step is None:
+                return
+            try:
+                masked = workflow_run_context.mask_secrets_in_data([a.model_dump(mode="json") for a in recorded])
+                for raw in masked:
+                    action = Action.model_validate(raw)
+                    action.task_id = task.task_id
+                    action.step_id = step.step_id
+                    action.step_order = step.order
+                    action.organization_id = organization_id
+                    await app.DATABASE.workflow_params.create_action(action)
+            except Exception:
+                LOG.warning(
+                    "Failed to persist recorded code block actions",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
+        finalized = False
+
+        async def _finalize_code_block_task(success: bool) -> None:
+            # Finalize both task and step on every exit path (incl. CancelledError via the finally); idempotent.
+            nonlocal finalized
+            if task is None or finalized:
+                return
+            finalized = True
+            try:
+                await app.DATABASE.tasks.update_task(
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                    status=TaskStatus.completed if success else TaskStatus.failed,
+                )
+                if step is not None:
+                    await app.DATABASE.tasks.update_step(
+                        task_id=task.task_id,
+                        step_id=step.step_id,
+                        status=StepStatus.completed if success else StepStatus.failed,
+                        output=AgentStepOutput(action_results=[]) if success else None,
+                        is_last=True,
+                        organization_id=organization_id,
+                    )
+            except Exception:
+                LOG.warning(
+                    "Failed to finalize code block task status",
+                    workflow_run_block_id=workflow_run_block_id,
+                    exc_info=True,
+                )
+
         try:
-            user_function = self.generate_async_user_function(self.code, page, parameter_values)
+            if task is not None:
+                await app.DATABASE.observer.update_workflow_run_block(
+                    workflow_run_block_id=workflow_run_block_id,
+                    task_id=task.task_id,
+                    organization_id=organization_id,
+                )
+            user_function = self.generate_async_user_function(self.code, recording_page, parameter_values)
             result = await self.execute_user_function_with_timeout(
                 user_function,
                 settings.CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS,
             )
         except InsecureCodeDetected as e:
+            await _drain_screenshots()
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=str(e),
@@ -3876,6 +4023,8 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
         except asyncio.TimeoutError:
+            await _persist_recorded_actions(recording_page.recorded_actions())
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=(
@@ -3889,9 +4038,25 @@ async def wrapper({default_args}):
             )
         except Exception as e:
             exc = CustomizedCodeException(e)
+            failing_line = user_code_line_from_exception(e)
             # User code can raise an exception carrying a resolved secret (e.g.
             # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
             failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
+            recorded = recording_page.recorded_actions()
+            if recording_page.last_recorded_exception() is not e:
+                # The exception did not come from a recorded page call; add a synthetic failure row.
+                recorded.append(
+                    Action(
+                        action_type=ActionType.NULL_ACTION,
+                        status=ActionStatus.failed,
+                        action_order=len(recorded),
+                        description=f"code error at line {failing_line}" if failing_line else "code error",
+                        response=(failure_reason or "")[:500],
+                        output={"code_line": failing_line},
+                    )
+                )
+            await _persist_recorded_actions(recorded)
+            await _finalize_code_block_task(success=False)
             return await self.build_block_result(
                 success=False,
                 failure_reason=failure_reason,
@@ -3900,6 +4065,13 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        else:
+            await _persist_recorded_actions(recording_page.recorded_actions())
+            await _finalize_code_block_task(success=True)
+        finally:
+            # Safety net for paths the except arms miss (CancelledError, update_workflow_run_block failure).
+            await _finalize_code_block_task(success=False)
 
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")

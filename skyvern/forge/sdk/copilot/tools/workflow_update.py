@@ -12,10 +12,12 @@ import structlog
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
+from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, fill_code_block_prompts_in_yaml
 from skyvern.forge.sdk.copilot.code_block_synthesis import (
     artifact_dependency_id,
     artifact_observation_ref_id,
@@ -34,6 +36,7 @@ from skyvern.forge.sdk.copilot.enforcement import (
     _completion_contract_unknown_due_to_policy_fallback,
     _goal_likely_needs_more_blocks,
 )
+from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.loop_detection import clear_failed_step_tracker_for_tools_in_ctx
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_code_artifact_violations
 from skyvern.forge.sdk.copilot.output_policy import (
@@ -1961,11 +1964,29 @@ async def _update_workflow(
         return {"ok": False, "error": composition_evidence_error}
 
     try:
+        # A code block renders code-first (goal + plain step timeline) only when it
+        # carries a `prompt`; the model authors the goal as artifact `declared_goal`
+        # and code regeneration drops it, so carry the goal onto the block here.
+        artifact_metadata = getattr(ctx, "code_artifact_metadata", None)
+        fallback_goals = {
+            label: str(meta["declared_goal"]).strip()
+            for label, meta in (artifact_metadata or {}).items()
+            if isinstance(meta, dict) and str(meta.get("declared_goal") or "").strip()
+        }
+        workflow_yaml = fill_code_block_prompts_in_yaml(
+            workflow_yaml, prior_yaml=prior_yaml, fallback_goals=fallback_goals
+        )
+        # Derive plain-language steps from each code block's code so the editor timeline
+        # mirrors the actual code (deterministic action_type + line ranges).
+        steps_handler = None
+        if settings.WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM:
+            steps_handler = await resolve_main_copilot_handler(ctx.workflow_permanent_id, ctx.organization_id)
+        workflow_yaml_with_steps = await apply_derived_code_block_steps(workflow_yaml, handler=steps_handler)
         workflow = _process_workflow_yaml(
             workflow_id=ctx.workflow_id,
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
-            workflow_yaml=workflow_yaml,
+            workflow_yaml=workflow_yaml_with_steps,
         )
         _record_workflow_proxy_location_span(workflow_yaml, workflow)
 

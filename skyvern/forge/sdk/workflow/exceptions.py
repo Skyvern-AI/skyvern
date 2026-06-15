@@ -157,6 +157,14 @@ class WorkflowDefinitionHasUndefinedParameters(WorkflowDefinitionValidationExcep
         )
 
 
+class InvalidCodeBlockStep(WorkflowDefinitionValidationException):
+    def __init__(self, block_label: str, step_index: int, detail: str) -> None:
+        super().__init__(
+            f"Invalid step at index {step_index} in code block '{block_label}': {detail}",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+
+
 class InvalidWaitBlockTime(SkyvernException):
     def __init__(self, max_sec: int) -> None:
         super().__init__(f"Invalid wait time for wait block, it should be a number between 0 and {max_sec}.")
