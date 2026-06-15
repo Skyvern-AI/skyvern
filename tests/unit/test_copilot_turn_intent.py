@@ -240,6 +240,43 @@ def test_build_turn_intent_llm_diagnose_outranks_skip_test_policy() -> None:
     assert TurnIntentReasonCode.TESTING_INTENT_SKIP_TEST not in intent.reason_codes
 
 
+def test_build_turn_intent_diagnose_with_require_test_keeps_run_authority() -> None:
+    intent = build_turn_intent(
+        user_message="Test it again and confirm what it extracted.",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(testing_intent="require_test", allow_update_workflow=True, allow_run_blocks=True),
+        workflow_run_id="wr_123",
+        classification=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_run_blocks is True
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_read_run_context is True
+    assert RequiredContextKey.LATEST_RUN_RESULT in intent.required_context
+    assert TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE in intent.reason_codes
+
+
+def test_build_turn_intent_diagnose_without_require_test_stays_answer_only() -> None:
+    intent = build_turn_intent(
+        user_message="What did the last run extract?",
+        workflow_yaml="title: Existing\nworkflow_definition:\n  blocks: []\n",
+        chat_history=[],
+        global_llm_context="",
+        request_policy=RequestPolicy(allow_update_workflow=False, allow_run_blocks=False),
+        workflow_run_id="wr_123",
+        classification=_classification(TurnIntentMode.DIAGNOSE),
+    )
+
+    assert intent.mode == TurnIntentMode.DIAGNOSE
+    assert intent.authority.may_run_blocks is False
+    assert intent.authority.may_update_workflow is False
+    assert intent.authority.may_read_run_context is True
+    assert TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE not in intent.reason_codes
+
+
 def test_build_turn_intent_uses_request_policy_clarification_over_llm_classification() -> None:
     policy = RequestPolicy(
         user_response_policy="ask_clarification",

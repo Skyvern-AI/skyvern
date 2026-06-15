@@ -368,6 +368,19 @@ def test_update_and_run_blocks_reports_both_blocked_authorities() -> None:
     )
 
 
+def test_turn_intent_gate_allows_diagnose_run_with_retest_authority() -> None:
+    intent = TurnIntent(
+        mode=TurnIntentMode.DIAGNOSE,
+        authority=TurnIntentAuthority(
+            may_update_workflow=False,
+            may_run_blocks=True,
+            may_read_run_context=True,
+        ),
+    )
+
+    assert _turn_intent_tool_error(_ctx(intent), "run_blocks_and_collect_debug") is None
+
+
 def test_get_run_results_routes_through_authority_dispatcher_but_request_policy_does_not_gate_it() -> None:
     """Pins the dispatcher routing: `get_run_results` flows through `_authority_tool_error` (not `_turn_intent_tool_error` directly), and current request-policy scope (`update_workflow` + `BLOCK_RUNNING_TOOLS`) does not include `get_run_results`, so the call passes through."""
     intent = TurnIntent(
