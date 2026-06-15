@@ -16,7 +16,7 @@ from skyvern.forge.sdk.workflow.exceptions import (
 from skyvern.forge.sdk.workflow.models.block import BlockTypeVar, ForLoopBlock, WhileLoopBlock, get_all_blocks
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, OutputParameter
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_metadata, normalize_run_with
@@ -36,7 +36,7 @@ class WorkflowRequestBody(BaseModel):
     browser_session_id: str | None = None
     browser_profile_id: str | None = None
     max_screenshot_scrolls: int | None = None
-    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     browser_address: str | None = None

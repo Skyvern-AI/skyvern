@@ -431,7 +431,7 @@ class Skyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.
@@ -3177,7 +3177,7 @@ class AsyncSkyvern:
             The maximum number of scrolls for the post action screenshot. When it's None or 0, it takes the current viewpoint screenshot.
 
         max_elapsed_time_minutes : typing.Optional[int]
-            Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+            Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
 
         extra_http_headers : typing.Optional[typing.Dict[str, typing.Optional[str]]]
             The extra HTTP headers for the requests in browser.

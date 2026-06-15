@@ -96,7 +96,7 @@ class WorkflowRunRequestOutput(UniversalBaseModel):
 
     max_elapsed_time_minutes: typing.Optional[int] = pydantic.Field(default=None)
     """
-    Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours.
+    Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes.
     """
 
     extra_http_headers: typing.Optional[typing.Dict[str, typing.Optional[str]]] = pydantic.Field(default=None)

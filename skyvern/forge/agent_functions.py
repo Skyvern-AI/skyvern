@@ -802,6 +802,7 @@ class AgentFunction:
         timezone: str,
         enabled: bool,
         parameters: dict[str, Any] | None = None,
+        max_elapsed_time_minutes: int | None = None,
     ) -> None:
         """Upsert a recurring schedule with the execution backend (e.g. Temporal).
 

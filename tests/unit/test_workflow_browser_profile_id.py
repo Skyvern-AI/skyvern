@@ -92,6 +92,9 @@ async def test_create_workflow_from_request_preserves_existing_max_elapsed_time_
     create_workflow_mock.assert_awaited_once()
     assert create_workflow_mock.await_args is not None
     assert create_workflow_mock.await_args.kwargs["max_elapsed_time_minutes"] == 90
+    refresh_schedules_mock = service._refresh_workflow_schedule_runtime_limits
+    assert isinstance(refresh_schedules_mock, AsyncMock)
+    refresh_schedules_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -116,6 +119,62 @@ async def test_create_workflow_from_request_allows_explicit_null_to_clear_existi
     create_workflow_mock.assert_awaited_once()
     assert create_workflow_mock.await_args is not None
     assert create_workflow_mock.await_args.kwargs["max_elapsed_time_minutes"] is None
+    refresh_schedules_mock = service._refresh_workflow_schedule_runtime_limits
+    assert isinstance(refresh_schedules_mock, AsyncMock)
+    refresh_schedules_mock.assert_awaited_once_with(
+        workflow_permanent_id="wpid_test",
+        organization_id="org_1",
+        max_elapsed_time_minutes=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_workflow_schedule_runtime_limits_reupserts_backend_schedules() -> None:
+    service = WorkflowService()
+    schedule_with_backend = SimpleNamespace(
+        backend_schedule_id="temporal_1",
+        workflow_schedule_id="wfs_1",
+        cron_expression="0 */6 * * *",
+        timezone="UTC",
+        enabled=True,
+        parameters={"url": "https://example.com"},
+    )
+    schedule_without_backend = SimpleNamespace(
+        backend_schedule_id=None,
+        workflow_schedule_id="wfs_local",
+        cron_expression="0 */12 * * *",
+        timezone="UTC",
+        enabled=False,
+        parameters=None,
+    )
+
+    with patch("skyvern.forge.sdk.workflow.service.app") as mock_app:
+        mock_app.DATABASE.schedules.get_workflow_schedules = AsyncMock(
+            return_value=[schedule_with_backend, schedule_without_backend]
+        )
+        mock_app.AGENT_FUNCTION.upsert_workflow_schedule = AsyncMock()
+
+        await service._refresh_workflow_schedule_runtime_limits(
+            workflow_permanent_id="wpid_test",
+            organization_id="org_1",
+            max_elapsed_time_minutes=360,
+        )
+
+    mock_app.DATABASE.schedules.get_workflow_schedules.assert_awaited_once_with(
+        workflow_permanent_id="wpid_test",
+        organization_id="org_1",
+    )
+    mock_app.AGENT_FUNCTION.upsert_workflow_schedule.assert_awaited_once_with(
+        backend_schedule_id="temporal_1",
+        organization_id="org_1",
+        workflow_permanent_id="wpid_test",
+        workflow_schedule_id="wfs_1",
+        cron_expression="0 */6 * * *",
+        timezone="UTC",
+        enabled=True,
+        parameters={"url": "https://example.com"},
+        max_elapsed_time_minutes=360,
+    )
 
 
 def _make_workflow_update_service(
@@ -131,7 +190,7 @@ def _make_workflow_update_service(
         max_elapsed_time_minutes=existing_max_elapsed_time_minutes,
     )
     potential_workflow = SimpleNamespace(workflow_id="wf_new")
-    updated_workflow = SimpleNamespace(workflow_id="wf_new")
+    updated_workflow = SimpleNamespace(workflow_id="wf_new", workflow_permanent_id="wpid_test")
 
     service.get_workflow_by_permanent_id = AsyncMock(return_value=existing_workflow)  # type: ignore[method-assign]
     service.create_workflow = AsyncMock(return_value=potential_workflow)  # type: ignore[method-assign]
@@ -142,6 +201,7 @@ def _make_workflow_update_service(
     service._validate_payload_templates = Mock()  # type: ignore[method-assign]
     service.update_workflow_definition = AsyncMock(return_value=updated_workflow)  # type: ignore[method-assign]
     service.maybe_delete_cached_code = AsyncMock()  # type: ignore[method-assign]
+    service._refresh_workflow_schedule_runtime_limits = AsyncMock()  # type: ignore[method-assign]
 
     return service, updated_workflow
 
