@@ -173,6 +173,9 @@ class Settings(BaseSettings):
     # Default-off companion to code-block mode. When enabled, Copilot can impose
     # strict scout-trajectory synthesis at the persist seam for the narrow PR-1 envelope.
     WORKFLOW_COPILOT_CODE_BLOCK_IMPOSE_SYNTHESIS: bool = False
+    # Flag-gate for the optional LLM pass that rewrites code-block step descriptions.
+    # Off (default) = deterministic templated descriptions; On = LLM rewrites descriptions only.
+    WORKFLOW_COPILOT_CODE_BLOCK_STEP_DESCRIPTIONS_LLM: bool = False
     PORT: int = 8000
     ALLOWED_ORIGINS: list[str] = ["*"]
     BLOCKED_HOSTS: list[str] = ["localhost"]

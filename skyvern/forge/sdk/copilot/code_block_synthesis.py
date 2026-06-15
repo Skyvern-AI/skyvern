@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.utils.strings import escape_code_fences
 
 _MAX_STEPS = 60
 _INDENT = "    "
@@ -91,6 +92,7 @@ class SynthesizedCodeBlock:
     parameters: list[dict[str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     diagnostics: SynthesisDiagnostics = field(default_factory=SynthesisDiagnostics)
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
 
 # str.splitlines() and several parsers treat these codepoints as line boundaries, so a raw one in a
@@ -280,6 +282,17 @@ def _unique_key(base: str, used: set[str]) -> str:
     return candidate
 
 
+def _step_target(interaction: Mapping[str, Any]) -> str:
+    """Plain-language anchor for a step description: accessible name, else selector, else role."""
+    name = str(interaction.get("accessible_name") or "").strip()
+    if name:
+        return name
+    selector = str(interaction.get("selector") or "").strip()
+    if selector:
+        return selector
+    return str(interaction.get("role") or "").strip() or "the element"
+
+
 def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
     name = str(interaction.get("accessible_name") or "").strip()
     role = str(interaction.get("role") or "").strip()
@@ -314,9 +327,21 @@ def synthesize_code_block(
     notes: list[str] = []
     parameters: list[dict[str, str]] = []
     diagnostics = SynthesisDiagnostics()
+    steps: list[dict[str, Any]] = []
     used_param_keys: set[str] = set()
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
+
+    def append_step(description: str, action_type: str, line_start: int) -> None:
+        steps.append(
+            {
+                "description": description,
+                "action_type": action_type,
+                "line_start": line_start,
+                # last line emitted for this step; append_step always runs before the next step's lines.
+                "line_end": len(lines),
+            }
+        )
 
     entry_url = ""
     entry_index = -1
@@ -329,8 +354,10 @@ def synthesize_code_block(
     if entry_url:
         if entry_index > 0:
             notes.append("entry URL taken from a later interaction; earlier steps had no source_url")
+        line_start = len(lines) + 1
         lines.append(f"{_INDENT}await page.goto({_py_str(_scrub_url_for_code_literal(entry_url))})")
         lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+        append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
     for trajectory_index, interaction in enumerate(trajectory):
@@ -359,6 +386,7 @@ def synthesize_code_block(
                 if interaction.get("selector")
                 else ""
             )
+            line_start = len(lines) + 1
             if locator:
                 lines.append(f"{_INDENT}await {locator}.press({_py_str(key)})")
             else:
@@ -373,6 +401,7 @@ def synthesize_code_block(
                     continue
                 lines.append(f"{_INDENT}await page.keyboard.press({_py_str(key)})")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+            append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
             continue
 
@@ -387,9 +416,11 @@ def synthesize_code_block(
         if not locator:
             continue
 
+        line_start = len(lines) + 1
         if tool_name == "click":
             lines.append(f"{_INDENT}await {locator}.click()")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+            append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
             typed_identity = _typed_value_identity(interaction)
             param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
@@ -403,6 +434,7 @@ def synthesize_code_block(
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
             lines.append(f"{_INDENT}await {locator}.fill(str({param_key}))")
+            append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
             credential_field = str(interaction.get("credential_field") or "").strip()
@@ -432,6 +464,7 @@ def synthesize_code_block(
                 continue
             lines.append(f"{_INDENT}await {locator}.select_option({_py_str(value)})")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+            append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
             diagnostics.dropped_interactions.append(
@@ -445,7 +478,7 @@ def synthesize_code_block(
 
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"
-    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics)
+    return SynthesizedCodeBlock(code=code, parameters=parameters, notes=notes, diagnostics=diagnostics, steps=steps)
 
 
 # Model-owned slots the synthesizer cannot prove; the model fills these.
@@ -544,6 +577,7 @@ def _render_artifact_metadata_block(metadata: Mapping[str, Any]) -> str:
 def render_synthesized_offer_text(
     synthesized: SynthesizedCodeBlock,
     trajectory: Sequence[Mapping[str, Any]] | None = None,
+    goal: str | None = None,
 ) -> str:
     """Render the offer body the copilot sees for a synthesized block (pure)."""
     param_keys = [p.get("key", "") for p in synthesized.parameters if p.get("key") and not p.get("credential_id")]
@@ -581,6 +615,17 @@ def render_synthesized_offer_text(
         )
     if synthesized.notes:
         parts.append("Synthesis notes: " + "; ".join(synthesized.notes) + ".")
+    if synthesized.steps:
+        # escape_quotes + whitespace collapse keep the goal inside its quoted span in the prompt.
+        goal_text = " ".join(escape_code_fences(goal or "", escape_quotes=True).split())
+        goal_part = f' and set the block\'s `prompt` field to "{goal_text}"' if goal_text else ""
+        parts.append(
+            "On the same block, set the `steps` field to the JSON list below VERBATIM (plain-language "
+            f"annotations mapping each step to the code lines it covers){goal_part}."
+        )
+        parts.append("```json")
+        parts.append(json.dumps(synthesized.steps, indent=2, sort_keys=True))
+        parts.append("```")
     if trajectory:
         metadata = build_synthesized_artifact_metadata(trajectory)
         parts.append(

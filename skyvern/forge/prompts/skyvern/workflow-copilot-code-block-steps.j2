@@ -1,0 +1,21 @@
+You are labeling a Playwright/SkyvernPage code block for a non-technical reader.
+
+You are given the block's goal and an ordered list of detected actions. Each action already has a
+fixed `action_type` and the code line(s) it covers. Rewrite ONLY the `description` of each action into
+a short, plain-language sentence (max ~8 words, imperative, no code, no selectors-as-jargon). Do not
+change `action_type`, `line_start`, or `line_end`, and do not add or remove actions.
+
+Goal: {{ goal }}
+
+Code:
+```python
+{{ code }}
+```
+
+Actions (JSON):
+```json
+{{ actions_json }}
+```
+
+Return ONLY a JSON array of objects with keys `line_start` and `description`, one per input action,
+in the same order. Example: [{"line_start": 2, "description": "Open the homepage"}]

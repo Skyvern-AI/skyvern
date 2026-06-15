@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import structlog
+from pydantic import ValidationError
 
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
@@ -20,6 +21,7 @@ from skyvern.forge.sdk.db.id import (
 )
 from skyvern.forge.sdk.workflow.exceptions import (
     ContextParameterSourceNotDefined,
+    InvalidCodeBlockStep,
     InvalidWaitBlockTime,
     InvalidWorkflowDefinition,
     WorkflowDefinitionHasDuplicateBlockLabels,
@@ -33,6 +35,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     BranchCondition,
     CodeBlock,
+    CodeBlockStep,
     ConditionalBlock,
     DownloadToS3Block,
     ExtractionBlock,
@@ -510,10 +513,26 @@ def block_yaml_to_block(
             branch_conditions=branch_conditions,
         )
     elif block_yaml.block_type == BlockType.CODE:
+        code_block_steps: list[CodeBlockStep] | None = None
+        if block_yaml.steps:
+            code_block_steps = []
+            for step_index, step_yaml in enumerate(block_yaml.steps):
+                try:
+                    code_block_steps.append(CodeBlockStep(**step_yaml.model_dump()))
+                except ValidationError as exc:
+                    first_error = exc.errors()[0]
+                    field = ".".join(str(part) for part in first_error["loc"])
+                    raise InvalidCodeBlockStep(
+                        block_label=block_yaml.label,
+                        step_index=step_index,
+                        detail=f"{field}: {first_error['msg']}",
+                    ) from exc
         return CodeBlock(
             **base_kwargs,
             code=block_yaml.code,
             parameters=_resolve_block_parameters(block_yaml, parameters),
+            prompt=block_yaml.prompt,
+            steps=code_block_steps,
         )
     elif block_yaml.block_type == BlockType.TEXT_PROMPT:
         return TextPromptBlock(

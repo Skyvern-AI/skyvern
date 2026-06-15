@@ -472,6 +472,8 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
         "version",
         "model",
     ]
+    # `steps` is a plain-language annotation, not execution input, so editing it must not bust the cached script.
+    code_block_annotation_fields = ("steps",)
 
     # Use BFS to recursively remove fields from all nested objects
 
@@ -485,6 +487,9 @@ def _get_workflow_definition_core_data(workflow_definition: WorkflowDefinition) 
             # Remove specified fields from current dictionary
             for field in fields_to_remove:
                 if field:  # Skip empty string
+                    current_obj.pop(field, None)
+            if current_obj.get("block_type") == BlockType.CODE.value:
+                for field in code_block_annotation_fields:
                     current_obj.pop(field, None)
 
             # Add all nested dictionaries and lists to queue for processing

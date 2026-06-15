@@ -26,6 +26,7 @@ from skyvern.forge.sdk.artifact.models import Artifact, ArtifactType, LogEntityT
 from skyvern.forge.sdk.copilot.agent import run_copilot_agent
 from skyvern.forge.sdk.copilot.attribution import is_copilot_born_initial_write, resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
+from skyvern.forge.sdk.copilot.code_block_steps import apply_derived_code_block_steps, derive_code_block_steps_in_yaml
 from skyvern.forge.sdk.copilot.completion_criteria_store import (
     CRITERIA_SET_STATUS_ACTIVE,
     StoredCriteriaSet,
@@ -1372,6 +1373,11 @@ def _process_workflow_yaml(
     organization_id: str,
     workflow_yaml: str,
 ) -> Workflow:
+    # Single seam every copilot YAML->Workflow conversion passes through, so code
+    # blocks get their plain-view steps regardless of which path produced the YAML
+    # (the update_workflow tool derives them upstream; the inline REPLACE_WORKFLOW
+    # fallbacks would otherwise surface "No steps yet").
+    workflow_yaml = derive_code_block_steps_in_yaml(workflow_yaml)
     workflow_yaml_request = _normalize_copilot_yaml(workflow_yaml)
 
     updated_workflow_definition = convert_workflow_definition(
@@ -2410,6 +2416,8 @@ async def workflow_copilot_apply_proposed_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Proposed workflow has no copilot YAML to apply",
         )
+
+    copilot_yaml = await apply_derived_code_block_steps(copilot_yaml)
 
     try:
         yaml_request = _normalize_copilot_yaml(copilot_yaml)

@@ -795,6 +795,15 @@ class ConditionalBlockYAML(BlockYAML):
         return self
 
 
+class CodeBlockStepYAML(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    # str (not ActionType) so this module does not import skyvern.webeye; the converter coerces to the enum.
+    action_type: str = "null_action"
+    line_start: int | None = None
+    line_end: int | None = None
+
+
 class CodeBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -804,6 +813,8 @@ class CodeBlockYAML(BlockYAML):
 
     code: str
     parameter_keys: list[str] | None = None
+    prompt: str | None = None
+    steps: list[CodeBlockStepYAML] | None = None
 
     @model_validator(mode="before")
     @classmethod
