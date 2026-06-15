@@ -11,6 +11,7 @@ import json
 import keyword
 import os
 import re
+import shutil
 import smtplib
 import textwrap
 import uuid
@@ -127,6 +128,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     OutputParameter,
     ParameterType,
     WorkflowParameter,
+    WorkflowParameterType,
 )
 from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import (
@@ -3656,6 +3658,94 @@ async def wrapper({default_args}):
     def format_potential_template_parameters(self, workflow_run_context: WorkflowRunContext) -> None:
         self.code = self.format_block_parameter_template_from_workflow_run_context(self.code, workflow_run_context)
 
+    async def _register_downloaded_files(
+        self,
+        *,
+        organization_id: str | None,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+    ) -> list[FileInfo]:
+        # Register up front so the block output carries downloaded_file_urls for
+        # downstream blocks in the same run; workflow finalization re-runs the save safely.
+        if not organization_id:
+            return []
+        try:
+            async with asyncio.timeout(SAVE_DOWNLOADED_FILES_TIMEOUT):
+                await app.STORAGE.save_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout to save downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "CodeBlock failed to register downloaded files; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+        try:
+            async with asyncio.timeout(GET_DOWNLOADED_FILES_TIMEOUT):
+                return await app.STORAGE.get_downloaded_files(
+                    organization_id=organization_id,
+                    run_id=workflow_run_id,
+                )
+        except asyncio.TimeoutError:
+            LOG.warning(
+                "Timeout getting downloaded files",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return []
+        except Exception:
+            LOG.warning(
+                "CodeBlock failed to read back downloaded files; will retry at workflow finalization",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _materialize_file_parameter_path(
+        self,
+        value: str | dict[str, Any] | None,
+        *,
+        workflow_run_id: str,
+        organization_id: str | None,
+    ) -> str | dict[str, Any] | None:
+        uri: str | None = None
+        if isinstance(value, str):
+            uri = value
+        elif isinstance(value, dict):
+            uri = value.get("s3uri")
+        if not uri or not str(uri).strip():
+            return value
+        try:
+            output_dir = get_download_dir(workflow_run_id)
+            local_path = await download_file(str(uri), output_dir=output_dir, organization_id=organization_id)
+            # download_file routes managed storage (s3/azure) to a temp file outside the run
+            # dir; copy it under the run dir so it passes validate_local_file_path containment.
+            resolved = os.path.realpath(local_path)
+            allowed_dir = os.path.realpath(output_dir)
+            if not resolved.startswith(allowed_dir + os.sep):
+                contained = os.path.join(output_dir, os.path.basename(local_path))
+                shutil.copyfile(local_path, contained)
+                local_path = contained
+            return validate_local_file_path(local_path, workflow_run_id)
+        except Exception:
+            LOG.warning(
+                "Failed to materialize file parameter to a local path; leaving the original value",
+                workflow_run_id=workflow_run_id,
+                exc_info=True,
+            )
+            return value
+
     async def execute(
         self,
         workflow_run_id: str,
@@ -3665,6 +3755,16 @@ async def wrapper({default_args}):
         **kwargs: dict,
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
+
+        block_context = skyvern_context.current()
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+        if block_context:
+            await capture_block_download_baseline(
+                block_context,
+                organization_id or workflow_run_context.organization_id or "",
+                workflow_run_id,
+                self.label,
+            )
 
         browser_state = await self.get_or_create_browser_state(
             workflow_run_id=workflow_run_id,
@@ -3692,8 +3792,6 @@ async def wrapper({default_args}):
                 organization_id=organization_id,
             )
 
-        # get workflow run context
-        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
         try:
             self.format_potential_template_parameters(workflow_run_context)
         except Exception as e:
@@ -3716,6 +3814,15 @@ async def wrapper({default_args}):
                 and parameter.workflow_parameter_type is not None
                 and parameter.workflow_parameter_type.is_credential_type()
             ):
+                if (
+                    isinstance(parameter, WorkflowParameter)
+                    and parameter.workflow_parameter_type == WorkflowParameterType.FILE_URL
+                ):
+                    value = await self._materialize_file_parameter_path(
+                        value,
+                        workflow_run_id=workflow_run_id,
+                        organization_id=organization_id,
+                    )
                 parameter_values[parameter.key] = value
                 continue
             if isinstance(value, dict):
@@ -3801,6 +3908,21 @@ async def wrapper({default_args}):
         # reach captured locals, the persisted output, or the logged value. Mirrors
         # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
         result = workflow_run_context.mask_secrets_in_data(result)
+
+        downloaded_files = await self._register_downloaded_files(
+            organization_id=organization_id or workflow_run_context.organization_id,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+        )
+        current_context = skyvern_context.current()
+        downloaded_files = filter_downloaded_files_for_current_iteration(
+            downloaded_files,
+            current_context.loop_internal_state if current_context else None,
+        )
+        if downloaded_files and isinstance(result, dict):
+            result["downloaded_files"] = [fi.model_dump() for fi in downloaded_files]
+            result["downloaded_file_urls"] = [fi.url for fi in downloaded_files]
+            result["downloaded_file_artifact_ids"] = [fi.artifact_id for fi in downloaded_files if fi.artifact_id]
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(

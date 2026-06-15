@@ -529,8 +529,9 @@ def render_synthesized_offer_text(
     parts = [
         "SYNTHESIZED CODE BLOCK (offered once). The page interactions you scouted were compiled into a "
         "deterministic Playwright snippet. Persist it VERBATIM as a `code` block labeled "
-        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks; only hand-author the "
-        "extract/report steps it does not cover.",
+        f"`{_SYNTHESIZED_BLOCK_LABEL}` via update_workflow / update_and_run_blocks; hand-author the "
+        "data-capture step it does not cover so the block `return`s a keyed structure (a dict, or an array "
+        "of objects for repeated records) — never a flat `page.inner_text(...)` / `text_content(...)` blob.",
         "```python",
         synthesized.code.rstrip("\n"),
         "```",
@@ -559,5 +560,13 @@ def render_synthesized_offer_text(
         )
         parts.append("```json")
         parts.append(_render_artifact_metadata_block(metadata))
+        parts.append("```")
+        parts.append(
+            "Shape the data-capture `return` so each `goal_value_paths` entry resolves to a named scalar field. "
+            "For `records[].field` paths, return an array of objects; for a single record, return a keyed dict. "
+            "Bind each `<fill: ...>` to the page text you captured. For example:"
+        )
+        parts.append("```python")
+        parts.append('return {"records": [{"field_a": "...", "field_b": "..."}]}')
         parts.append("```")
     return "\n".join(parts)
