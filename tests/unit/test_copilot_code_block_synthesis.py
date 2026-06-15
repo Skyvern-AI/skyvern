@@ -6,6 +6,7 @@ OSS-synced: only example.* / RFC-2606 placeholder targets.
 from __future__ import annotations
 
 import ast
+import json
 import keyword
 import sys
 from typing import Any
@@ -19,6 +20,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     synthesize_code_block,
 )
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
+from skyvern.forge.sdk.workflow.models.block import CodeBlockStep
 
 
 def _interaction(tool_name: str, **fields: Any) -> dict[str, Any]:
@@ -545,6 +547,140 @@ class TestDeterminismAndEmpty:
         assert first.notes == second.notes
 
 
+class TestStepEmission:
+    def test_synthesize_emits_goal_ready_steps(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com"),
+            _interaction("type_text", selector="#q", typed_length=5),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click", "input_text"]
+        assert all(s["description"] for s in block.steps)
+
+    def test_step_line_spans_cover_every_emitted_line(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/start"),
+            _interaction(
+                "type_text",
+                selector="#q",
+                typed_length=5,
+                role="textbox",
+                accessible_name="Search",
+            ),
+            _interaction("press_key", key="Enter"),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        code_lines = block.code.splitlines()
+        goto_step, click_step, fill_step, key_step = block.steps
+        assert (goto_step["line_start"], goto_step["line_end"]) == (1, 2)
+        assert code_lines[goto_step["line_start"] - 1].lstrip().startswith("await page.goto(")
+        assert (click_step["line_start"], click_step["line_end"]) == (3, 4)
+        assert ".click()" in code_lines[click_step["line_start"] - 1]
+        assert (fill_step["line_start"], fill_step["line_end"]) == (5, 5)
+        assert ".fill(" in code_lines[fill_step["line_start"] - 1]
+        assert key_step["action_type"] == "keypress"
+        assert (key_step["line_start"], key_step["line_end"]) == (6, 7)
+        assert "press" in code_lines[key_step["line_start"] - 1]
+        # Spans are contiguous and cover the whole block.
+        assert block.steps[0]["line_start"] == 1
+        assert block.steps[-1]["line_end"] == len(code_lines)
+        for previous, current in zip(block.steps, block.steps[1:]):
+            assert current["line_start"] == previous["line_end"] + 1
+
+    def test_select_option_and_press_key_action_types(self) -> None:
+        trajectory = [
+            _interaction(
+                "select_option",
+                selector='role=combobox[name="Size"]',
+                source_url="https://example.com/",
+                value="large",
+                role="combobox",
+                accessible_name="Size",
+            ),
+            _interaction("press_key", key="Enter"),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "select_option", "keypress"]
+
+    def test_skipped_interactions_emit_no_step(self) -> None:
+        trajectory = [
+            _interaction("click", selector="#go", source_url="https://example.com/"),
+            _interaction("hover", selector="#menu"),
+            _interaction("select_option", selector="#size"),
+            _interaction("click"),
+            _interaction("press_key", key=""),
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["goto_url", "click"]
+
+    def test_no_entry_url_means_no_goto_step(self) -> None:
+        block = synthesize_code_block([_interaction("press_key", key="Enter")])
+        assert block is not None
+        assert [s["action_type"] for s in block.steps] == ["keypress"]
+
+    def test_step_descriptions_prefer_accessible_name_over_selector(self) -> None:
+        block = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="div.list > button:nth-of-type(3)",
+                    source_url="https://example.com/",
+                    role="button",
+                    accessible_name="Add to cart",
+                )
+            ]
+        )
+        assert block is not None
+        click_step = next(s for s in block.steps if s["action_type"] == "click")
+        assert "Add to cart" in click_step["description"]
+        assert "nth-of-type" not in click_step["description"]
+
+    def test_entry_url_step_description_carries_url(self) -> None:
+        block = synthesize_code_block([_interaction("click", selector="#go", source_url="https://example.com/start")])
+        assert block is not None
+        goto_step = block.steps[0]
+        assert goto_step["action_type"] == "goto_url"
+        assert "https://example.com/start" in goto_step["description"]
+
+    def test_steps_are_byte_identical_per_trajectory(self) -> None:
+        trajectory = [
+            _interaction(
+                "type_text",
+                selector='role=textbox[name="Search"]',
+                source_url="https://example.com/",
+                typed_length=4,
+                role="textbox",
+                accessible_name="Search",
+            ),
+            _interaction("press_key", key="Enter"),
+        ]
+        first = synthesize_code_block(trajectory)
+        second = synthesize_code_block(trajectory)
+        assert first is not None and second is not None
+        assert first.steps == second.steps
+
+    def test_truncated_trajectory_caps_steps_with_code(self) -> None:
+        trajectory = [
+            _interaction("click", selector=f'role=button[name="b{i}"]', source_url="https://example.com/")
+            for i in range(_MAX_STEPS + 5)
+        ]
+        block = synthesize_code_block(trajectory)
+        assert block is not None
+        click_steps = [s for s in block.steps if s["action_type"] == "click"]
+        assert len(click_steps) == _MAX_STEPS
+        assert block.steps[-1]["line_end"] == len(block.code.splitlines())
+
+    def test_steps_validate_against_code_block_step_schema(self) -> None:
+        block = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert block is not None
+        validated = [CodeBlockStep(**step) for step in block.steps]
+        assert all(step.line_start is not None and step.line_end is not None for step in validated)
+
+
 class TestLineBoundaryEscaping:
     # str.splitlines() and several parsers treat each of these as a line boundary. An attacker-controlled
     # page can plant one in an accessible name or option value; left unescaped it splits the emitted
@@ -697,6 +833,46 @@ class TestRenderSynthesizedOfferText:
         assert "Synthesis notes: " in text
 
 
+class TestOfferTextGoalAndSteps:
+    def test_offer_text_carries_steps_json_and_goal(self) -> None:
+        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(
+            synthesized, _SCOUT_TRAJECTORY, goal="Search the catalog and add the item to the cart"
+        )
+        assert "`steps`" in text
+        assert "`prompt`" in text
+        assert "Search the catalog and add the item to the cart" in text
+        assert '"action_type": "goto_url"' in text
+        assert '"action_type": "input_text"' in text
+
+    def test_offer_text_omits_goal_mention_without_goal(self) -> None:
+        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY)
+        assert "`steps`" in text
+        assert "`prompt`" not in text
+
+    def test_offer_text_goal_quotes_and_newlines_stay_in_quoted_span(self) -> None:
+        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY, goal='find the "best" deal\nand report it')
+        assert "`prompt` field to \"find the 'best' deal and report it\"" in text
+
+    def test_offer_text_goal_code_fences_are_neutralized(self) -> None:
+        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY, goal="do this\n```python\nx\n```")
+        assert "\n```python\nx\n```" not in text
+
+    def test_offer_text_steps_json_matches_synthesized_steps(self) -> None:
+        synthesized = synthesize_code_block(_SCOUT_TRAJECTORY)
+        assert synthesized is not None
+        text = render_synthesized_offer_text(synthesized, _SCOUT_TRAJECTORY)
+        rendered = json.dumps(synthesized.steps, indent=2, sort_keys=True)
+        assert rendered in text
+
+
 def _code_block_yaml(label: str) -> str:
     return (
         "workflow_definition:\n"
@@ -756,8 +932,6 @@ class TestSynthesizedArtifactMetadata:
         assert metadata["claimed_outcomes"][0]["text"].startswith("<fill:")
 
     def test_skeleton_is_byte_identical_per_trajectory(self) -> None:
-        import json
-
         first = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
         second = build_synthesized_artifact_metadata(_SCOUT_TRAJECTORY)
         assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
@@ -781,7 +955,7 @@ class TestSynthesizedArtifactMetadata:
         assert synthesized is not None
         text = render_synthesized_offer_text(synthesized)
         assert "code_artifact_metadata" not in text
-        assert "```json" not in text
+        assert "observed_not_verified" not in text
 
 
 class TestCredentialFillSynthesis:
