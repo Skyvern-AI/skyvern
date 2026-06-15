@@ -19621,7 +19621,7 @@
           "max_iterations": {
             "type": "integer",
             "title": "Max Iterations",
-            "default": 10
+            "default": 50
           },
           "max_steps": {
             "type": "integer",
@@ -19729,7 +19729,7 @@
           "max_iterations": {
             "type": "integer",
             "title": "Max Iterations",
-            "default": 10
+            "default": 50
           },
           "max_steps": {
             "type": "integer",
@@ -22466,7 +22466,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
+                "maximum": 480.0,
                 "minimum": 1.0
               },
               {
@@ -24245,7 +24245,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
+                "maximum": 480.0,
                 "minimum": 1.0
               },
               {
@@ -24253,7 +24253,7 @@
               }
             ],
             "title": "Max Elapsed Time Minutes",
-            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours."
+            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes."
           },
           "extra_http_headers": {
             "anyOf": [
@@ -24490,7 +24490,7 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
+                "maximum": 480.0,
                 "minimum": 1.0
               },
               {
@@ -24498,7 +24498,7 @@
               }
             ],
             "title": "Max Elapsed Time Minutes",
-            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours."
+            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes."
           },
           "extra_http_headers": {
             "anyOf": [
