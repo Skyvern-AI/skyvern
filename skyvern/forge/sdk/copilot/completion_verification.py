@@ -53,14 +53,6 @@ VerificationStatus = Literal["evaluated", "unavailable"]
 CriterionState = Literal["satisfied", "unsatisfied", "unknown"]
 
 
-def resolve_unknown(state: CriterionState) -> CriterionState:
-    """Effective verdict state for consumers: with persisted-criteria off, ``unknown``
-    collapses to ``unsatisfied`` (the pre-tri-state equivalent of a missing verdict)."""
-    if state == "unknown" and not settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED:
-        return "unsatisfied"
-    return state
-
-
 @dataclass(frozen=True)
 class CriterionVerdict:
     criterion_id: str

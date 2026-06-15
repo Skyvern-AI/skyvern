@@ -30,7 +30,6 @@ import yaml
 from litellm.exceptions import NotFoundError as LiteLLMNotFoundError
 from pydantic import ValidationError
 
-from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -365,8 +364,6 @@ def _request_policy_agent_inputs(
 def _stored_active_completion_criteria(
     policy_inputs: RequestPolicyGuardrailInputs,
 ) -> list[CompletionCriterion] | None:
-    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
-        return None
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None or snapshot.active is None:
         return None
@@ -378,8 +375,6 @@ def _reconcile_completion_criteria_on_context(
     policy: RequestPolicy,
     policy_inputs: RequestPolicyGuardrailInputs,
 ) -> None:
-    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
-        return
     snapshot = policy_inputs.stored_completion_criteria
     if snapshot is None:
         return

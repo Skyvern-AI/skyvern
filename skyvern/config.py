@@ -151,17 +151,13 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Gate copilot verified-success on per-criterion outcome evidence.
-    # Off restores the prior run-status/suspicious-success gate and classifier prompt.
-    COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
+    # Capture bounded page evidence synchronously in scout interaction post-hooks.
+    # Off restores schema-less interaction packets plus standalone page inspects.
+    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # On a repeat evaluate of an unchanged page with exactly one safe target, click it in-process
     # instead of only advising. Off (default) leaves the advisory steer as the only response.
     COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED: bool = False
-    # Persist copilot completion criteria per goal epoch with tri-state verdicts
-    # and definition-plane grading. Off restores per-turn re-derivation, the legacy
-    # run-status success claim, and unknown-verdicts-as-unsatisfied consumer behavior.
-    COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED: bool = True
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.

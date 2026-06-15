@@ -716,7 +716,6 @@ async def _classify_request(
     transcript = build_transcript_context(chat_history, safe_user_message)
     prompt = prompt_engine.load_prompt(
         template=PROMPT_NAME,
-        outcome_verification_enabled=settings.COPILOT_OUTCOME_VERIFICATION_ENABLED,
         user_message=escape_code_fences(safe_user_message),
         raw_secret_present=str(raw_secret_present).lower(),
         workflow_yaml=escape_code_fences(redact_raw_secrets_for_prompt(workflow_yaml)[:2048]),

@@ -12,7 +12,6 @@ from skyvern.forge.sdk.copilot.completion_verification import (
     combine_verification_results,
     evaluate_completion_criteria,
     grade_definition_criteria,
-    resolve_unknown,
     summarize_unsatisfied_outcomes,
 )
 from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
@@ -46,8 +45,6 @@ def _completion_verification_criteria(copilot_ctx: Any) -> list[Any]:
 
 
 def _split_criteria_by_plane(criteria: list[Any]) -> tuple[list[CompletionCriterion], list[CompletionCriterion]]:
-    if not settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED:
-        return list(criteria), []
     run_criteria = [c for c in criteria if getattr(c, "level", "run") != "definition"]
     definition_criteria = [c for c in criteria if getattr(c, "level", "run") == "definition"]
     return run_criteria, definition_criteria
@@ -119,8 +116,6 @@ async def _maybe_run_completion_verification_from_page_observation(
 ) -> CompletionVerificationResult | None:
     """Verify completion only for post-run page observations after failed tests."""
 
-    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
-        return None
     existing = getattr(copilot_ctx, "completion_verification_result", None)
     if isinstance(existing, CompletionVerificationResult) and existing.is_fully_satisfied():
         return existing
@@ -269,8 +264,6 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
 async def _maybe_run_completion_verification(
     copilot_ctx: Any, result: dict[str, Any], handler_start: float
 ) -> CompletionVerificationResult | None:
-    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
-        return None
     if getattr(copilot_ctx, "copilot_total_timeout_exceeded", False):
         return None
     criteria = _completion_verification_criteria(copilot_ctx)
@@ -365,9 +358,7 @@ def _outcome_failure_warrants_repair(
         return True
     # Repair needs at least one affirmatively unsatisfied criterion; unknown alone
     # (absent judge signal, unmappable definition checks) never warrants repair.
-    if settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and not any(
-        resolve_unknown(verdict.state) == "unsatisfied" for verdict in completion_verification.verdicts
-    ):
+    if not any(verdict.state == "unsatisfied" for verdict in completion_verification.verdicts):
         return False
     return _current_workflow_has_evidence_block(copilot_ctx)
 
