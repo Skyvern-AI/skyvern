@@ -100,6 +100,7 @@ class TurnIntentReasonCode(StrEnum):
     REQUEST_POLICY_DERIVED = "request_policy_derived"
     REQUEST_POLICY_CLARIFICATION = "request_policy_clarification"
     TESTING_INTENT_SKIP_TEST = "testing_intent_skip_test"
+    TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE = "testing_intent_run_overrides_diagnose"
     WORKFLOW_CONTEXT_PRESENT = "workflow_context_present"
     CHAT_HISTORY_PRESENT = "chat_history_present"
     RUN_CONTEXT_PRESENT = "run_context_present"
@@ -800,13 +801,18 @@ def build_turn_intent(
         authority.may_update_workflow = False
         authority.may_run_blocks = False
         authority.requires_user_input = True
-    elif mode == TurnIntentMode.DIAGNOSE and RequiredContextKey.LATEST_RUN_RESULT not in required_context:
-        authority.may_update_workflow = False
-        authority.may_run_blocks = False
-        required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
     elif mode == TurnIntentMode.DIAGNOSE:
         authority.may_update_workflow = False
-        authority.may_run_blocks = False
+        retest_mandated = request_policy.testing_intent == "require_test" and request_policy.allow_run_blocks
+        if retest_mandated:
+            # RequestPolicy owns testing policy; an explicit require_test re-run must not be inverted
+            # by the diagnose classification.
+            authority.may_run_blocks = True
+            reason_codes.append(TurnIntentReasonCode.TESTING_INTENT_RUN_OVERRIDES_DIAGNOSE)
+        else:
+            authority.may_run_blocks = False
+        if RequiredContextKey.LATEST_RUN_RESULT not in required_context:
+            required_context.append(RequiredContextKey.LATEST_RUN_RESULT)
 
     authority.may_read_run_context = mode == TurnIntentMode.DIAGNOSE
 
