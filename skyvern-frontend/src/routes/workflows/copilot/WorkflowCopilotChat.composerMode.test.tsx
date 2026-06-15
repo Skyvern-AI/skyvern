@@ -159,16 +159,16 @@ async function submit(value: string) {
   });
 }
 
-async function switchToBuild() {
+async function selectMode(label: "Ask" | "Build" | "Build with code") {
   await act(async () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Switch mode" }), {
       button: 0,
       ctrlKey: false,
     });
   });
-  const buildItem = await screen.findByRole("menuitem", { name: /Build/ });
+  const item = await screen.findByRole("menuitem", { name: label });
   await act(async () => {
-    fireEvent.click(buildItem);
+    fireEvent.click(item);
   });
 }
 
@@ -252,18 +252,32 @@ describe("WorkflowCopilotChat — composer default mode variant", () => {
     expect(streamCalls[0]?.body.code_block).toBe(null);
   });
 
-  it("lands on code ON when ask_code switches to Build", async () => {
+  it("lands on code ON when selecting Build with code", async () => {
     await renderChat({
       copilotV2: true,
       codeBlockMode: true,
       defaultMode: "ask_code",
     });
-    await switchToBuild();
+    await selectMode("Build with code");
     await submit("build me a workflow");
     await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
 
     expect(streamCalls[0]?.body.mode).toBe("build");
     expect(streamCalls[0]?.body.code_block).toBe(true);
+  });
+
+  it("turns code OFF when selecting plain Build from a code default", async () => {
+    await renderChat({
+      copilotV2: true,
+      codeBlockMode: true,
+      defaultMode: "build_code",
+    });
+    await selectMode("Build");
+    await submit("build me a workflow");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    expect(streamCalls[0]?.body.mode).toBe("build");
+    expect(streamCalls[0]?.body.code_block).toBe(false);
   });
 
   it("sends code_block=null when the code-block flag is off, ignoring the variant", async () => {

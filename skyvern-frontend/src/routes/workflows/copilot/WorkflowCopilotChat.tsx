@@ -70,12 +70,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { cn } from "@/util/utils";
 
 // Cap on retained per-turn snap-back snapshots. A typical session has a
@@ -126,9 +120,11 @@ function isPictographic(glyph: string): boolean {
 function ModeGlyph({
   mode,
   tone = "light",
+  glow = false,
 }: {
   mode: "ask" | "build";
   tone?: "light" | "dark";
+  glow?: boolean;
 }) {
   const glyph = mode === "build" ? BUILD_GLYPH : ASK_GLYPH;
   const filter = isPictographic(glyph)
@@ -137,9 +133,22 @@ function ModeGlyph({
       : "grayscale(1) brightness(0) invert(1)"
     : undefined;
   return (
-    <span className="inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+    <span className="relative inline-flex h-[18px] w-[18px] items-center justify-center leading-none">
+      {glow ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-[-5px] rounded-full"
+          style={{
+            background:
+              "radial-gradient(circle, rgba(96,165,250,0.55) 0%, rgba(59,130,246,0.18) 45%, rgba(59,130,246,0) 72%)",
+          }}
+        />
+      ) : null}
       <span
-        className={cn(mode === "build" ? "text-[16px]" : "text-[15px]")}
+        className={cn(
+          "relative",
+          mode === "build" ? "text-[16px]" : "text-[15px]",
+        )}
         style={{ lineHeight: 1, filter }}
       >
         {glyph}
@@ -425,7 +434,11 @@ export function WorkflowCopilotChat({
   // Build can never be active unless the V2 flag is on.
   const isBuild = copilotV2Enabled && composerMode === "build";
   const codeToggleAllowed = effectiveDefaultVariant !== "build_no_code";
-  const showCodeToggle = isBuild && codeBlockModeEnabled && codeToggleAllowed;
+  // "Build with code" is offered as a third mode in the dropdown rather than a
+  // separate toggle; the code state only renders on the button while in Build.
+  const codeOptionAvailable =
+    copilotV2Enabled && codeBlockModeEnabled && codeToggleAllowed;
+  const codeStateActive = isBuild && codeWorkflow && codeOptionAvailable;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [proposedWorkflow, setProposedWorkflow] =
     useState<WorkflowApiResponse | null>(null);
@@ -2068,95 +2081,113 @@ export function WorkflowCopilotChat({
               Send
             </button>
           ) : (
-            <div className="flex items-end gap-2">
-              {showCodeToggle ? (
-                <TooltipProvider>
-                  <Tooltip delayDuration={300}>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        aria-pressed={codeWorkflow}
-                        onClick={() => setCodeWorkflow((v) => !v)}
-                        className={cn(
-                          "flex h-10 w-10 items-center justify-center rounded-lg border transition-colors hover:brightness-[1.18] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                          codeWorkflow
-                            ? "border-sky-300 bg-sky-300/15 text-sky-300"
-                            : "border-slate-600 bg-transparent text-slate-400",
-                        )}
-                      >
-                        <span
-                          className="text-[13px] font-semibold"
-                          style={{ lineHeight: 1 }}
-                        >
-                          {"</>"}
-                        </span>
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent className="max-w-[260px]">
-                      Build the workflow as code. Faster and more flexible, but
-                      may need extra detail to handle every edge case.
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              ) : null}
-              <div className="flex items-stretch">
-                <button
-                  onClick={() => handleSend()}
-                  className="flex h-10 items-center gap-1.5 rounded-l-lg bg-cta px-3 py-2 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <ModeGlyph mode={isBuild ? "build" : "ask"} tone="dark" />
-                  {isBuild ? "Build" : "Ask"}
-                </button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      title="Switch mode"
-                      aria-label="Switch mode"
-                      className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      <ChevronDownIcon className="h-3.5 w-3.5" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    side="top"
-                    align="end"
-                    className="w-[272px] p-1.5"
+            <div className="flex items-stretch">
+              <button
+                onClick={() => handleSend()}
+                className="flex h-10 items-center gap-2 rounded-l-lg bg-cta px-3 py-1.5 text-sm font-medium text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <ModeGlyph
+                  mode={isBuild ? "build" : "ask"}
+                  tone="dark"
+                  glow={codeStateActive}
+                />
+                {codeStateActive ? (
+                  <span className="flex flex-col items-start">
+                    <span className="text-sm font-medium leading-tight">
+                      Build
+                    </span>
+                    <span className="text-[10px] font-medium leading-tight text-cta-foreground/70">
+                      with code
+                    </span>
+                  </span>
+                ) : (
+                  <span>{isBuild ? "Build" : "Ask"}</span>
+                )}
+              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    title="Switch mode"
+                    aria-label="Switch mode"
+                    className="flex h-10 w-8 items-center justify-center rounded-r-lg border-l border-black/20 bg-cta text-cta-foreground hover:bg-cta-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
+                    <ChevronDownIcon className="h-3.5 w-3.5" />
+                  </button>
+                </DropdownMenuTrigger>
+                {/* onCloseAutoFocus: don't return focus to the caret on close,
+                    so its focus ring doesn't linger after a click. */}
+                <DropdownMenuContent
+                  side="top"
+                  align="end"
+                  className="w-[272px] p-1.5"
+                  onCloseAutoFocus={(event) => event.preventDefault()}
+                >
+                  <DropdownMenuItem
+                    aria-label="Ask"
+                    onSelect={() => {
+                      setComposerMode("ask");
+                      setCodeWorkflow(false);
+                    }}
+                    className="flex items-start gap-2.5"
+                  >
+                    <ModeGlyph mode="ask" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Ask</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Answer questions and make quick workflow edits.
+                      </span>
+                    </span>
+                    {!isBuild ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    aria-label="Build"
+                    onSelect={() => {
+                      setComposerMode("build");
+                      setCodeWorkflow(false);
+                    }}
+                    className="flex items-start gap-2.5"
+                  >
+                    <ModeGlyph mode="build" />
+                    <span className="flex flex-1 flex-col">
+                      <span className="text-sm font-medium">Build</span>
+                      <span className="text-xs leading-snug text-muted-foreground">
+                        Navigates the site to design your workflow, then tests
+                        that it works.
+                      </span>
+                    </span>
+                    {isBuild && !codeWorkflow ? (
+                      <CheckIcon className="h-4 w-4 text-sky-400" />
+                    ) : null}
+                  </DropdownMenuItem>
+                  {codeOptionAvailable ? (
                     <DropdownMenuItem
-                      onSelect={() => setComposerMode("ask")}
+                      aria-label="Build with code"
+                      onSelect={() => {
+                        setComposerMode("build");
+                        setCodeWorkflow(true);
+                      }}
                       className="flex items-start gap-2.5"
                     >
-                      <ModeGlyph mode="ask" />
+                      <ModeGlyph mode="build" glow />
                       <span className="flex flex-1 flex-col">
-                        <span className="text-sm font-medium">Ask</span>
+                        <span className="text-sm font-medium">
+                          Build with code
+                        </span>
                         <span className="text-xs leading-snug text-muted-foreground">
-                          Answer questions and make quick workflow edits.
+                          Build the workflow as code. Faster and more flexible,
+                          but may need extra detail to handle every edge case.
                         </span>
                       </span>
-                      {!isBuild ? (
+                      {isBuild && codeWorkflow ? (
                         <CheckIcon className="h-4 w-4 text-sky-400" />
                       ) : null}
                     </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onSelect={() => setComposerMode("build")}
-                      className="flex items-start gap-2.5"
-                    >
-                      <ModeGlyph mode="build" />
-                      <span className="flex flex-1 flex-col">
-                        <span className="text-sm font-medium">Build</span>
-                        <span className="text-xs leading-snug text-muted-foreground">
-                          Navigates the site to design your workflow, then tests
-                          that it works.
-                        </span>
-                      </span>
-                      {isBuild ? (
-                        <CheckIcon className="h-4 w-4 text-sky-400" />
-                      ) : null}
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
+                  ) : null}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           )}
         </div>
