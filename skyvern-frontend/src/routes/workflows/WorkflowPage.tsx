@@ -104,13 +104,9 @@ function WorkflowPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch] = useDebounce(search, 500);
   const [openRunParams, setOpenRunParams] = useState<string | null>(null);
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-  } = useParameterExpansion();
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   const { data: workflowRuns, isLoading } = useWorkflowRunsQuery({
     workflowPermanentId,
@@ -150,20 +146,6 @@ function WorkflowPage() {
       ),
     [tagKeys],
   );
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      return;
-    }
-
-    const runIds =
-      workflowRuns
-        ?.map((run) => run.workflow_run_id)
-        .filter((id): id is string => Boolean(id)) ?? [];
-
-    setAutoExpandedRows(runIds);
-  }, [isSearchActive, workflowRuns, setAutoExpandedRows]);
 
   if (!workflowPermanentId) {
     return null; // this should never happen

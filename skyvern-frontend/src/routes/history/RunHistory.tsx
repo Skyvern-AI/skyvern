@@ -49,7 +49,7 @@ import {
 } from "@/util/timeFormat";
 import { cn } from "@/util/utils";
 import { useQuery } from "@tanstack/react-query";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { getClient } from "@/api/AxiosClient";
 import { useCredentialGetter } from "@/hooks/useCredentialGetter";
@@ -183,28 +183,9 @@ function RunHistory() {
   const isNextDisabled =
     isFetching || !nextPageRuns || nextPageRuns.length === 0;
 
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-  } = useParameterExpansion();
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      return;
-    }
-
-    const workflowRunIds =
-      runs
-        ?.filter((run) => run.task_run_type === TaskRunType.WorkflowRun)
-        .map((run) => run.run_id)
-        .filter((id): id is string => Boolean(id)) ?? [];
-
-    setAutoExpandedRows(workflowRunIds);
-  }, [isSearchActive, runs, setAutoExpandedRows]);
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   function handleNavigate(event: React.MouseEvent, path: string) {
     if (event.ctrlKey || event.metaKey) {

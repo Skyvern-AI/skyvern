@@ -75,7 +75,6 @@ vi.mock("./hooks/useTagKeysQuery", () => ({
 vi.mock("./hooks/useKeywordSearch", () => ({
   useKeywordSearch: () => ({
     matchesParameter: () => false,
-    isSearchActive: false,
   }),
 }));
 
@@ -83,7 +82,6 @@ vi.mock("./hooks/useParameterExpansion", () => ({
   useParameterExpansion: () => ({
     expandedRows: new Set<string>(),
     toggleExpanded: vi.fn(),
-    setAutoExpandedRows: vi.fn(),
   }),
 }));
 
