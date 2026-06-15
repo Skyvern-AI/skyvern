@@ -159,6 +159,43 @@ class TestActionSynthesis:
         # Raw typed value is never captured.
         assert "value" not in result.code
 
+    def test_type_text_defaults_are_private_reused_only_for_same_field_identity(self) -> None:
+        def typed(selector: str, name: str, url: str = "https://example.com/") -> dict[str, Any]:
+            return _interaction(
+                "type_text",
+                selector=selector,
+                source_url=url,
+                typed_length=15,
+                typed_value="example_sku_123",
+                role="textbox",
+                accessible_name=name,
+            )
+
+        safe = synthesize_code_block([typed('role=textbox[name="Search"]', "Search")])
+        assert safe is not None
+        assert 'await page.get_by_role("textbox", name="Search").fill(str(search))' in safe.code
+        assert "example_sku_123" not in safe.code
+        assert safe.parameters == [{"key": "search", "default_value": "example_sku_123"}]
+
+        offer_text = render_synthesized_offer_text(safe)
+        assert "workflow_parameter_type: string" in offer_text
+        assert "default_value" in offer_text
+        assert "example_sku_123" not in offer_text
+
+        reused = synthesize_code_block(
+            [typed("#search", "Search"), typed("#search", "Search", "https://example.com/results")]
+        )
+        assert reused is not None
+        assert reused.parameters == [{"key": "search", "default_value": "example_sku_123"}]
+        assert reused.code.count("fill(str(search))") == 2
+
+        distinct = synthesize_code_block([typed("#part-number", "Part Number"), typed("#coupon", "Coupon Code")])
+        assert distinct is not None
+        assert distinct.parameters == [
+            {"key": "part_number", "default_value": "example_sku_123"},
+            {"key": "coupon_code", "default_value": "example_sku_123"},
+        ]
+
     def test_goto_entry_url_and_load_state(self) -> None:
         result = synthesize_code_block([_interaction("click", selector="#go", source_url="https://example.com/start")])
         assert result is not None
