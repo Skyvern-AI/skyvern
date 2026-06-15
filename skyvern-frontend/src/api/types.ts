@@ -537,6 +537,12 @@ export type DebugSessionApiResponse = {
   created_at: string;
   modified_at: string;
   vnc_streaming_supported: boolean | null;
+  pbs_browser_profile_id: string | null;
+};
+
+export type DebugLoginBlockCompatibilityResponse = {
+  compatible: boolean;
+  reason: "pbs_no_profile" | "pbs_different_profile" | null;
 };
 
 export type WorkflowRunApiResponse = {
