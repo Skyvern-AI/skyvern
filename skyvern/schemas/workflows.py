@@ -12,7 +12,7 @@ from skyvern.forge.sdk.api.llm.config_registry import LLMConfigRegistry
 from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType, WorkflowParameterType
 from skyvern.forge.sdk.workflow.models.run_limits import (
-    DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
     reject_bool_max_elapsed_time_minutes,
 )
 from skyvern.forge.sdk.workflow.models.validators import normalize_run_with
@@ -1219,7 +1219,7 @@ class WorkflowCreateYAMLRequest(BaseModel):
     workflow_definition: WorkflowDefinitionYAML
     is_saved_task: bool = False
     max_screenshot_scrolls: int | None = None
-    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=DEFAULT_WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
+    max_elapsed_time_minutes: int | None = Field(default=None, ge=1, le=WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES)
     extra_http_headers: dict[str, str] | None = None
     cdp_connect_headers: dict[str, str] | None = None
     status: WorkflowStatus = WorkflowStatus.published

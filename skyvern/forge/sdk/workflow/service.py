@@ -198,6 +198,13 @@ def _format_workflow_run_elapsed_timeout_failure_reason(effective_minutes: int) 
     return f"Workflow run exceeded max elapsed runtime limit of {effective_minutes} {minute_label}."
 
 
+def _require_elapsed_timeout_failure_reason(timeout_failure_reason: str | None) -> str:
+    if timeout_failure_reason is None:
+        LOG.error("timeout_failure_reason missing when workflow elapsed timeout is set")
+        return "Workflow run exceeded max elapsed runtime limit."
+    return timeout_failure_reason
+
+
 def _get_workflow_webhook_delivery_status(
     *,
     webhook_callback_url: str | None,
@@ -1782,43 +1789,48 @@ class WorkflowService:
                 started_at=workflow_run.started_at,
             )
             blocks_to_update: set[str] = set()
+
+            async def execute_workflow_blocks() -> None:
+                nonlocal workflow_run, blocks_to_update
+                # Check if there's a related workflow script that should be used instead.
+                workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
+                    workflow, workflow_run, block_labels
+                )
+                current_context = skyvern_context.current()
+                if current_context:
+                    if workflow_script:
+                        current_context.generate_script = False
+                    if workflow_run.code_gen:
+                        current_context.generate_script = True
+                workflow_run, blocks_to_update = await self._execute_workflow_blocks(
+                    workflow=workflow,
+                    workflow_run=workflow_run,
+                    organization=organization,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=browser_profile_id,
+                    block_labels=block_labels,
+                    block_outputs=block_outputs,
+                    script=workflow_script,
+                    script_is_pinned=script_is_pinned,
+                )
+
             if max_elapsed_timeout_seconds <= 0:
                 workflow_run = await self.mark_workflow_run_as_timed_out(
                     workflow_run_id=workflow_run_id,
-                    failure_reason=timeout_failure_reason,
+                    failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                 )
                 return workflow_run
             else:
                 timeout_context = asyncio.timeout(max_elapsed_timeout_seconds)
                 try:
                     async with timeout_context:
-                        # Check if there's a related workflow script that should be used instead.
-                        workflow_script, _, script_is_pinned = await workflow_script_service.get_workflow_script(
-                            workflow, workflow_run, block_labels
-                        )
-                        current_context = skyvern_context.current()
-                        if current_context:
-                            if workflow_script:
-                                current_context.generate_script = False
-                            if workflow_run.code_gen:
-                                current_context.generate_script = True
-                        workflow_run, blocks_to_update = await self._execute_workflow_blocks(
-                            workflow=workflow,
-                            workflow_run=workflow_run,
-                            organization=organization,
-                            browser_session_id=browser_session_id,
-                            browser_profile_id=browser_profile_id,
-                            block_labels=block_labels,
-                            block_outputs=block_outputs,
-                            script=workflow_script,
-                            script_is_pinned=script_is_pinned,
-                        )
+                        await execute_workflow_blocks()
                 except TimeoutError:
                     if not timeout_context.expired():
                         raise
                     workflow_run = await self.mark_workflow_run_as_timed_out(
                         workflow_run_id=workflow_run_id,
-                        failure_reason=timeout_failure_reason,
+                        failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                     )
                     return workflow_run
 
@@ -1834,7 +1846,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     pre_finally_status=pre_finally_status,
                     pre_finally_failure_reason=pre_finally_failure_reason,
-                    timeout_failure_reason=timeout_failure_reason,
+                    timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                 )
                 return workflow_run
 
@@ -1962,7 +1974,7 @@ class WorkflowService:
                     workflow_run=workflow_run,
                     pre_finally_status=pre_finally_status,
                     pre_finally_failure_reason=pre_finally_failure_reason,
-                    timeout_failure_reason=timeout_failure_reason,
+                    timeout_failure_reason=_require_elapsed_timeout_failure_reason(timeout_failure_reason),
                 )
         finally:
             # Shielded finalize runs even when the try body was cancelled
@@ -6276,6 +6288,8 @@ class WorkflowService:
             title=title,
         )
         new_workflow_id: str | None = None
+        refresh_schedule_runtime_limits = False
+        effective_max_elapsed_time_minutes: int | None = None
 
         if workflow_permanent_id:
             # Would return 404: WorkflowNotFound to the client if wpid does not match the organization
@@ -6305,6 +6319,9 @@ class WorkflowService:
                     request.max_elapsed_time_minutes
                     if "max_elapsed_time_minutes" in request.model_fields_set
                     else existing_latest_workflow.max_elapsed_time_minutes
+                )
+                refresh_schedule_runtime_limits = (
+                    effective_max_elapsed_time_minutes != existing_latest_workflow.max_elapsed_time_minutes
                 )
 
                 # NOTE: it's only potential, as it may be immediately deleted!
@@ -6408,6 +6425,13 @@ class WorkflowService:
                 delete_script=delete_script,
             )
 
+            if refresh_schedule_runtime_limits:
+                await self._refresh_workflow_schedule_runtime_limits(
+                    workflow_permanent_id=updated_workflow.workflow_permanent_id,
+                    organization_id=organization_id,
+                    max_elapsed_time_minutes=effective_max_elapsed_time_minutes,
+                )
+
             return updated_workflow
         except SkyvernHTTPException:
             # Bubble up well-formed client errors (e.g. WorkflowNotFound 404)
@@ -6425,6 +6449,39 @@ class WorkflowService:
             else:
                 LOG.exception(f"Failed to create workflow from request, title: {title}")
             raise e
+
+    async def _refresh_workflow_schedule_runtime_limits(
+        self,
+        *,
+        workflow_permanent_id: str,
+        organization_id: str,
+        max_elapsed_time_minutes: int | None,
+    ) -> None:
+        schedules = await app.DATABASE.schedules.get_workflow_schedules(
+            workflow_permanent_id=workflow_permanent_id,
+            organization_id=organization_id,
+        )
+        for schedule in schedules:
+            if not schedule.backend_schedule_id:
+                continue
+            try:
+                await app.AGENT_FUNCTION.upsert_workflow_schedule(
+                    backend_schedule_id=schedule.backend_schedule_id,
+                    organization_id=organization_id,
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_schedule_id=schedule.workflow_schedule_id,
+                    cron_expression=schedule.cron_expression,
+                    timezone=schedule.timezone,
+                    enabled=schedule.enabled,
+                    parameters=schedule.parameters,
+                    max_elapsed_time_minutes=max_elapsed_time_minutes,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to refresh workflow schedule runtime limit",
+                    workflow_permanent_id=workflow_permanent_id,
+                    workflow_schedule_id=schedule.workflow_schedule_id,
+                )
 
     @staticmethod
     async def create_output_parameter_for_block(workflow_id: str, block_yaml: BLOCK_YAML_TYPES) -> OutputParameter:

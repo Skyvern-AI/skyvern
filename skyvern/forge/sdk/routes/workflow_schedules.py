@@ -326,6 +326,7 @@ async def create_workflow_schedule(
             timezone=body.timezone,
             enabled=body.enabled,
             parameters=stored_parameters,
+            max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
         )
     except Exception as e:
         LOG.exception(
@@ -492,6 +493,7 @@ async def update_workflow_schedule(
             timezone=body.timezone,
             enabled=body.enabled,
             parameters=stored_parameters,
+            max_elapsed_time_minutes=workflow.max_elapsed_time_minutes,
         )
     except Exception as e:
         LOG.exception(
