@@ -8,16 +8,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pyotp
 import pytest
+import structlog.testing
 
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.skyvern_context import SkyvernContext
+from skyvern.forge.sdk.schemas.totp_codes import OTPType
 from skyvern.services.otp_service import (
     OTPValue,
     _get_otp_value_from_db,
     _get_otp_value_from_url,
     _is_mfa_like_parameter_key,
     extract_totp_from_navigation_inputs,
+    parse_otp_login,
     poll_otp_value,
     try_generate_totp_from_credential,
 )
@@ -358,6 +361,84 @@ class TestGetOtpValueFromUrl:
 
         assert result == OTPValue(value="654321", type="totp")
 
+    @pytest.mark.asyncio
+    async def test_parse_failure_warning_omits_raw_content_keeps_length(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.services import otp_service
+
+        raw_content = "this-is-a-relayed-email-with-code-135790-inside"
+        _patch_totp_url_response(
+            monkeypatch,
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            response_body={"verification_code": raw_content},
+            is_json_response=True,
+        )
+
+        async def fake_parse_otp_login(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(otp_service, "parse_otp_login", fake_parse_otp_login)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await _get_otp_value_from_url(
+                organization_id="o_test",
+                url="https://example.com/totp",
+                api_key="api-key",
+                task_id="tsk_test",
+            )
+
+        assert result is None
+
+        warning = next((r for r in logs if r.get("event") == "Failed to parse otp login from the totp url"), None)
+        assert warning is not None
+        assert "content_preview" not in warning
+        assert warning["content_length"] == len(raw_content)
+        for record in logs:
+            assert raw_content not in repr(record)
+            for value in record.values():
+                assert raw_content not in str(value)
+
+
+class TestParseOtpLogin:
+    @pytest.mark.asyncio
+    async def test_parser_log_omits_raw_code_and_reasoning_keeps_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.services import otp_service
+
+        raw = "135790"
+        resp = {
+            "reasoning": f"the code is {raw}",
+            "otp_type": "totp",
+            "otp_value_found": True,
+            "otp_value": raw,
+        }
+
+        async def fake_handler(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return resp
+
+        monkeypatch.setattr(otp_service.prompt_engine, "load_prompt", lambda *a, **k: "prompt")
+        monkeypatch.setattr(otp_service.app, "SECONDARY_LLM_API_HANDLER", fake_handler, raising=False)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await parse_otp_login(content="raw email body", organization_id="o_test")
+
+        assert result == OTPValue(value=raw, type="totp")
+
+        for record in logs:
+            assert raw not in repr(record)
+            for value in record.values():
+                assert raw not in str(value)
+
+        parser = next((r for r in logs if r.get("event") == "OTP Login Parser Response"), None)
+        assert parser is not None
+        assert "resp" not in parser
+        assert "reasoning" not in parser
+        assert "otp_value" not in parser
+        assert parser["otp_type"] == "totp"
+        assert parser["otp_value_found"] is True
+        assert parser["otp_length"] == len(raw)
+
 
 class TestPollOtpValueRetry:
     """poll_otp_value retries fetch failures across the full wall-clock timeout window."""
@@ -510,6 +591,59 @@ class TestPollOtpValueRetry:
                     task_id="tsk_test",
                     totp_verification_url="https://example.com/mfa",
                 )
+
+    @pytest.mark.asyncio
+    @patch("skyvern.services.otp_service.asyncio.sleep", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service._get_otp_value_from_url", new_callable=AsyncMock)
+    @patch("skyvern.services.otp_service.app")
+    @patch("skyvern.services.otp_service.settings")
+    async def test_success_log_omits_raw_otp_code_but_keeps_ids_and_type(
+        self, mock_settings: MagicMock, mock_app: MagicMock, mock_fetch: AsyncMock, mock_sleep: AsyncMock
+    ) -> None:
+        """SKY-11011: the success log must not emit the raw OTP code, only ids + OTP type."""
+        import structlog.testing
+
+        raw = "135790"
+        mock_settings.VERIFICATION_CODE_POLLING_TIMEOUT_MINS = 15
+        mock_app.DATABASE.organizations.get_valid_org_auth_token = AsyncMock(return_value=_mock_org_token())
+        mock_fetch.return_value = OTPValue(value=raw, type=OTPType.TOTP)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await poll_otp_value(
+                organization_id="o_test",
+                task_id="tsk_test",
+                workflow_run_id="wr_test",
+                workflow_permanent_id="wpid_test",
+                totp_identifier="otp@example.com",
+                totp_verification_url="https://example.com/mfa",
+            )
+
+        assert result is not None
+        assert result.value == raw
+
+        for record in logs:
+            assert raw not in repr(record)
+            assert raw not in str(record.values())
+            for value in record.values():
+                assert raw not in str(value)
+            assert "otp_value" not in record
+            assert record.get("value") != raw
+
+        success = next((r for r in logs if r.get("event") == "Got otp value"), None)
+        assert success is not None
+        assert success["task_id"] == "tsk_test"
+        assert success["workflow_run_id"] == "wr_test"
+        assert success["workflow_permanent_id"] == "wpid_test"
+        assert success["totp_identifier"] == "otp@example.com"
+        assert success["otp_type"] == "totp"
+        assert success["otp_length"] == 6
+        assert isinstance(success["otp_length"], int)
+        assert str(success["otp_length"]) != raw
+
+        polling = next((r for r in logs if r.get("event") == "Polling otp value"), None)
+        assert polling is not None
+        assert polling["totp_identifier"] == "otp@example.com"
+        assert raw not in str(polling.values())
 
 
 class _FakeWorkflowRunContext:
