@@ -1155,6 +1155,8 @@ def _iter_top_level_scope(statements: list[ast.stmt]) -> Iterator[ast.stmt]:
         for child in ast.iter_child_nodes(statement):
             if isinstance(child, ast.stmt):
                 yield from _iter_top_level_scope([child])
+            elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
+                yield from _iter_top_level_scope(child.body)
 
 
 def _code_block_returns_flat_string(code: str) -> bool:
@@ -1170,8 +1172,11 @@ def _code_block_returns_flat_string(code: str) -> bool:
     string_locals: set[str] = set()
     for node in scope_statements:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
             if _expr_is_flat_string(node.value, string_locals):
-                string_locals.add(node.targets[0].id)
+                string_locals.add(name)
+            else:
+                string_locals.discard(name)
 
     returns = [node for node in scope_statements if isinstance(node, ast.Return) and node.value is not None]
     if not returns:
@@ -1182,12 +1187,16 @@ def _code_block_returns_flat_string(code: str) -> bool:
 
 
 def _function_body_has_structured_return(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    own_scope = list(_iter_top_level_scope(node.body))
     structured_locals: set[str] = set()
-    for inner in ast.walk(node):
+    for inner in own_scope:
         if isinstance(inner, ast.Assign) and len(inner.targets) == 1 and isinstance(inner.targets[0], ast.Name):
+            name = inner.targets[0].id
             if _expr_is_structured(inner.value):
-                structured_locals.add(inner.targets[0].id)
-    for inner in ast.walk(node):
+                structured_locals.add(name)
+            else:
+                structured_locals.discard(name)
+    for inner in own_scope:
         if not isinstance(inner, ast.Return) or inner.value is None:
             continue
         if _expr_is_structured(inner.value):
@@ -1214,6 +1223,8 @@ def _code_block_returns_uninvoked_structured_function(code: str) -> bool:
     the function object instead of its data. Top-level structured returns or structured
     local bindings (legit implicit capture) are not flagged, and anything indeterminate
     returns False."""
+    # CodeBlock wraps the snippet and appends `return __capture_locals()`, so a nested
+    # function defined-but-never-called is captured as a function object, not its data.
     try:
         tree = ast.parse(textwrap.dedent(code).strip() or "pass")
     except SyntaxError:
