@@ -805,6 +805,16 @@ class CodeBlockYAML(BlockYAML):
     code: str
     parameter_keys: list[str] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_parameters_field(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "parameters" in data:
+            raise ValueError(
+                "Code blocks do not accept a 'parameters' field; use 'parameter_keys' "
+                "(a list of workflow parameter names) to inject parameters into the code block."
+            )
+        return data
+
 
 class TextPromptBlockYAML(BlockYAML):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
