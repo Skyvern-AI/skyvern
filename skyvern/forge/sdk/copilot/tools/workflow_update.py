@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import Annotated, Any, Literal, NamedTuple
@@ -394,6 +394,9 @@ def _normalize_code_artifact_metadata_detailed(
                 reject_unfilled_goal_value_paths=impose_defaults,
             )
         )
+        return_shape_error = _extraction_return_shape_error(label, dumped, str(code_blocks[label].get("code") or ""))
+        if return_shape_error is not None:
+            item_violations.append(return_shape_error)
         if item_violations:
             violations.extend(item_violations)
             offending_labels.append(label)
@@ -1099,6 +1102,172 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
         workflow_yaml=yaml.safe_dump(parsed, sort_keys=False),
         substitutions=substitutions,
     )
+
+
+_FLAT_STRING_TEXT_METHODS = frozenset({"inner_text", "text_content", "inner_html", "content"})
+
+
+def _expr_is_flat_string(node: ast.expr, string_locals: set[str]) -> bool:
+    """True only for expressions that are unambiguously a single text blob: a string
+    literal/f-string, a `.inner_text()/.text_content()/.inner_html()` read, a
+    `str(...)` cast, a `str.join(...)`, string concatenation, or a local bound to one
+    of those. Anything ambiguous returns False so the validator never false-positives."""
+    if isinstance(node, ast.Await):
+        return _expr_is_flat_string(node.value, string_locals)
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.Name):
+        return node.id in string_locals
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _expr_is_flat_string(node.left, string_locals) or _expr_is_flat_string(node.right, string_locals)
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if func.attr in _FLAT_STRING_TEXT_METHODS:
+                return True
+            if func.attr == "join":
+                return True
+            if func.attr in {"strip", "lstrip", "rstrip", "lower", "upper"}:
+                return _expr_is_flat_string(func.value, string_locals)
+        if isinstance(func, ast.Name) and func.id == "str":
+            return True
+    return False
+
+
+def _expr_is_structured(node: ast.expr) -> bool:
+    if isinstance(node, ast.Await):
+        return _expr_is_structured(node.value)
+    return isinstance(node, (ast.Dict, ast.List, ast.DictComp, ast.ListComp, ast.SetComp, ast.Set, ast.Tuple))
+
+
+_NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _iter_top_level_scope(statements: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """Yield statements in the snippet's own scope, descending into control flow
+    (if/for/while/with/try) but never into nested function/class bodies."""
+    for statement in statements:
+        yield statement
+        if isinstance(statement, _NESTED_SCOPE_NODES):
+            continue
+        for child in ast.iter_child_nodes(statement):
+            if isinstance(child, ast.stmt):
+                yield from _iter_top_level_scope([child])
+
+
+def _code_block_returns_flat_string(code: str) -> bool:
+    """True when every top-level `return` in the snippet yields a flat text blob and
+    none yields a structured value. Returns inside nested functions, and indeterminate
+    or structured returns, are not flagged."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+
+    scope_statements = list(_iter_top_level_scope(tree.body))
+    string_locals: set[str] = set()
+    for node in scope_statements:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if _expr_is_flat_string(node.value, string_locals):
+                string_locals.add(node.targets[0].id)
+
+    returns = [node for node in scope_statements if isinstance(node, ast.Return) and node.value is not None]
+    if not returns:
+        return False
+    if any(_expr_is_structured(node.value) for node in returns if node.value is not None):
+        return False
+    return all(_expr_is_flat_string(node.value, string_locals) for node in returns if node.value is not None)
+
+
+def _function_body_has_structured_return(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    structured_locals: set[str] = set()
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Assign) and len(inner.targets) == 1 and isinstance(inner.targets[0], ast.Name):
+            if _expr_is_structured(inner.value):
+                structured_locals.add(inner.targets[0].id)
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Return) or inner.value is None:
+            continue
+        if _expr_is_structured(inner.value):
+            return True
+        if isinstance(inner.value, ast.Name) and inner.value.id in structured_locals:
+            return True
+    return False
+
+
+def _name_loaded_in(statements: list[ast.stmt], name: str, *, skip: ast.AST) -> bool:
+    skip_nodes = set(ast.walk(skip))
+    for statement in statements:
+        for inner in ast.walk(statement):
+            if inner in skip_nodes:
+                continue
+            if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load) and inner.id == name:
+                return True
+    return False
+
+
+def _code_block_returns_uninvoked_structured_function(code: str) -> bool:
+    """True when the snippet's only structured data lives in a nested function that the
+    top-level scope never invokes, returns, or binds — the shared wrapper then captures
+    the function object instead of its data. Top-level structured returns or structured
+    local bindings (legit implicit capture) are not flagged, and anything indeterminate
+    returns False."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+
+    scope_statements = list(_iter_top_level_scope(tree.body))
+    for statement in scope_statements:
+        if isinstance(statement, ast.Return) and statement.value is not None and _expr_is_structured(statement.value):
+            return False
+        if isinstance(statement, ast.Assign) and _expr_is_structured(statement.value):
+            return False
+
+    structured_functions = [
+        statement
+        for statement in scope_statements
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and _function_body_has_structured_return(statement)
+    ]
+    if not structured_functions:
+        return False
+    return all(not _name_loaded_in(scope_statements, function.name, skip=function) for function in structured_functions)
+
+
+def _artifact_declares_goal_values(artifact: Mapping[str, Any]) -> bool:
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            if _artifact_goal_value_paths(row.get("goal_value_paths")):
+                return True
+    return False
+
+
+def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code: str) -> str | None:
+    """Reject an extraction-intent code block whose declared goal values do not reach
+    the block output as a keyed structure: a flat text blob, or structured data trapped
+    in an uninvoked nested function. Extraction-intent is the existing `goal_value_paths`
+    signal; non-extraction blocks are never subject to this."""
+    if not _artifact_declares_goal_values(artifact) or not code.strip():
+        return None
+    if _code_block_returns_flat_string(code):
+        return (
+            f"Code block `{label}` declares `goal_value_paths` but `return`s a flat text blob "
+            "(e.g. `page.inner_text(...)`/`text_content(...)`). Return a keyed structure instead: a dict, or an "
+            "array of objects for repeated records, whose declared goal values resolve to named scalar fields "
+            '(for example `return {"records": [{"number": "...", "expiration_date": "..."}]}`). A single value '
+            'is fine as a keyed scalar (`{"<field>": value}`); do not array-wrap it.'
+        )
+    if _code_block_returns_uninvoked_structured_function(code):
+        return (
+            f"Code block `{label}` declares `goal_value_paths` but its structured `return` sits inside a nested "
+            "function the top level never calls, so the block captures the function object instead of the data. "
+            "Call that function and return its result (e.g. `return await run(page)`), or build the keyed "
+            "structure at the top level so the declared goal values reach the block output."
+        )
+    return None
 
 
 def _code_artifact_metadata_shape_errors(
