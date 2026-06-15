@@ -42,10 +42,10 @@ from .scouting import (
     _consume_scout_source_url,
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
-    _maybe_steer_evaluate_to_action,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _resolve_scout_role_name,
+    _steer_evaluate_result,
 )
 
 LOG = structlog.get_logger()
@@ -537,7 +537,7 @@ async def _evaluate_post_hook(
             title=title,
             observed_data=result["data"],
         )
-        await _maybe_steer_evaluate_to_action(ctx, result, url=url)
+        await _steer_evaluate_result(ctx, result, url=url)
     return result
 
 

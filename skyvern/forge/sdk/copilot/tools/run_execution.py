@@ -47,6 +47,10 @@ from skyvern.forge.sdk.copilot.output_utils import (
     iter_failure_reasons,
     truncate_output,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    derive_from_block_outputs as _derive_reached_download_from_block_outputs,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.run_outcome import (
     RecordedRunOutcome,
     RunOutcomeReasonCode,
@@ -1187,6 +1191,11 @@ async def _run_blocks_and_collect_debug(
         "page_title": page_title,
         "action_trace_summary": action_trace_summary,
     }
+    if SettingsManager.get_settings().COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
+        reached_download = _derive_reached_download_from_block_outputs(block_outputs_by_label)
+        if reached_download is not None:
+            result_data["reached_download_target"] = reached_download.to_dict()
+            result_data["reached_download_guidance"] = _reached_download_guidance_for(reached_download)
     if runtime_frontier_anchor_url is not None:
         result_data["runtime_frontier_anchor_url"] = runtime_frontier_anchor_url
     if runtime_frontier_starter_url_seeded:
