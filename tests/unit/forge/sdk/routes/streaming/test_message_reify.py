@@ -22,6 +22,7 @@ from skyvern.forge.sdk.routes.streaming.channels.message import (
     MessageInGoBack,
     MessageInGoForward,
     MessageInNavigate,
+    MessageInRecordingRearmCapture,
     MessageInReload,
     MessageInTakeScreenshot,
     MessageKind,
@@ -102,6 +103,12 @@ class TestReifyChannelMessage:
         assert isinstance(msg, MessageInBeginExfiltration)
         assert msg.workflow_permanent_id == "wpid_123"
         assert msg.live_interpretation_enabled is True
+
+    def test_recording_rearm_capture(self) -> None:
+        assert isinstance(
+            reify_channel_message({"kind": "recording-rearm-capture"}),
+            MessageInRecordingRearmCapture,
+        )
 
 
 class TestMessageSerialization:

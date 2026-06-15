@@ -350,3 +350,105 @@ async def test_recording_interpretation_session_advances_past_unhandled_actions(
 
     assert session.emitted_action_count == 2
     assert len(session.steps) == 1
+
+
+def test_emit_snapshot_replays_current_revision_without_incrementing() -> None:
+    updates: list[int] = []
+
+    session = RecordingInterpretationSession(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: updates.append(update.session_revision),
+    )
+    session.session_revision = 2
+    session.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+            title="Click submit",
+            navigation_goal="Click submit",
+        )
+    ]
+
+    session.emit_snapshot()
+
+    assert updates == [2]
+    assert session.session_revision == 2
+
+
+def test_start_session_resumes_existing_interpretation_session() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    first_updates: list[int] = []
+    second_updates: list[int] = []
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: first_updates.append(update.session_revision),
+    )
+    session = registry._sessions[PBS_ID]
+    session.session_revision = 3
+    session.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+            title="Click submit",
+            navigation_goal="Click submit",
+        )
+    ]
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: second_updates.append(update.session_revision),
+    )
+
+    assert registry._sessions[PBS_ID] is session
+    assert first_updates == []
+    assert second_updates == [3]
+
+
+def test_start_session_resumes_after_websocket_disconnect_without_stop() -> None:
+    from skyvern.services.browser_recording.session_registry import RecordingInterpretationSessionRegistry
+
+    registry = RecordingInterpretationSessionRegistry()
+    reconnect_updates: list[int] = []
+
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda _: None,
+    )
+    session = registry._sessions[PBS_ID]
+    session.session_revision = 4
+    session.steps = [
+        RecordingDraftStep(
+            step_id="step-1",
+            action_kind=ActionKind.CLICK,
+            block_type="action",
+            label="click_submit",
+            title="Click submit",
+            navigation_goal="Click submit",
+        )
+    ]
+
+    # WebSocket loop teardown no longer calls stop_session; only end-exfiltration does.
+    registry.start_session(
+        browser_session_id=PBS_ID,
+        organization_id=ORG_ID,
+        workflow_permanent_id=WP_ID,
+        on_update=lambda update: reconnect_updates.append(update.session_revision),
+    )
+
+    assert registry._sessions[PBS_ID] is session
+    assert reconnect_updates == [4]
