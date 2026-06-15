@@ -51,6 +51,9 @@ const PREVENT_OVERLAPPING_RUNS_TOOLTIP =
 const SEQUENTIAL_KEY_TOOLTIP =
   "Scope the run queue. Runs with the same key are queued together; runs with different keys can still execute in parallel. Templated against agent inputs, for example {{ account_id }} to serialize per account.";
 
+const WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES = 4 * 60;
+const WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES = 8 * 60;
+
 function WorkflowSettingsEditor({ blockId }: { blockId: string }) {
   // Subscribe to the start node's data slice. The sidebar mount lives
   // outside the per-node renderer, and the body also subscribes to
@@ -396,14 +399,14 @@ function WorkflowSettingsEditorBody({
       <div className="space-y-2">
         <div className="flex items-center gap-2">
           <Label>Max Run Time (minutes)</Label>
-          <HelpTooltip content="Times out this workflow after the configured elapsed runtime. Maximum runtime is 4 hours (240 minutes)." />
+          <HelpTooltip content="Times out this workflow after the configured elapsed runtime. Leave blank to use the platform default of 4 hours. Maximum is 8 hours." />
         </div>
         <Input
           value={data.maxElapsedTimeMinutes ?? ""}
-          placeholder="Default: 4 hours"
+          placeholder={`Default: ${WORKFLOW_RUN_DEFAULT_MAX_ELAPSED_TIME_MINUTES} minutes`}
           type="number"
           min={1}
-          max={240}
+          max={WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES}
           step={1}
           onChange={(event) => {
             const rawValue = event.target.value;
@@ -411,7 +414,10 @@ function WorkflowSettingsEditorBody({
             const value =
               rawValue === "" || !Number.isFinite(parsedValue)
                 ? null
-                : Math.min(240, Math.max(1, Math.trunc(parsedValue)));
+                : Math.min(
+                    WORKFLOW_RUN_MAX_ELAPSED_TIME_MINUTES,
+                    Math.max(1, Math.trunc(parsedValue)),
+                  );
             update({ maxElapsedTimeMinutes: value });
           }}
         />
