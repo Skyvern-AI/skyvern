@@ -195,6 +195,7 @@ def _record_scouted_interaction(
     selector: str = "",
     source_url: str | None = None,
     value: str = "",
+    typed_value: str = "",
     key: str = "",
     typed_length: int = 0,
     role: str = "",
@@ -215,6 +216,8 @@ def _record_scouted_interaction(
         artifact["source_url"] = source_url.strip()
     if value:
         artifact["value"] = value
+    if typed_value:
+        artifact["typed_value"] = typed_value
     if key:
         artifact["key"] = key
     if typed_length:

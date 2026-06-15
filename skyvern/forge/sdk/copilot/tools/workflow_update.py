@@ -50,6 +50,7 @@ from skyvern.forge.sdk.copilot.workflow_credential_utils import credential_param
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
+from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS, is_sensitive_workflow_parameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
 from skyvern.schemas.proxy_location import ProxyLocation
 from skyvern.schemas.workflows import BlockType
@@ -868,6 +869,251 @@ def _safe_singleton_literal_for_parameter(
     return literal, None
 
 
+def _ast_column_offsets_are_utf8_bytes() -> bool:
+    probe_code = 'await page.locator("#café-search").fill("x")'
+    tree = _wrapped_code_ast(probe_code)
+    if tree is None:
+        LOG.debug("copilot_ast_column_offset_probe_fallback", reason="parse_failed")
+        return True
+    literal = next(
+        (
+            node.args[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fill"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "x"
+        ),
+        None,
+    )
+    if literal is None:
+        LOG.debug("copilot_ast_column_offset_probe_fallback", reason="literal_not_found")
+        return True
+    prefix = 'await page.locator("#café-search").fill('
+    return literal.col_offset == 4 + len(prefix.encode("utf-8"))
+
+
+_AST_COLUMN_OFFSETS_ARE_UTF8_BYTES = _ast_column_offsets_are_utf8_bytes()
+
+
+def _wrapped_position_to_original_offset(code: str, lineno: int, col_offset: int) -> int | None:
+    lines = code.splitlines(keepends=True)
+    line_index = lineno - 2
+    if line_index < 0 or line_index >= len(lines):
+        return None
+    column_offset = max(col_offset - 4, 0)
+    if _AST_COLUMN_OFFSETS_ARE_UTF8_BYTES:
+        # CPython reports AST column offsets as UTF-8 byte offsets in the
+        # parsed source on our supported runtime, even when ast.parse receives
+        # a str. Convert back to a Python string index after removing the
+        # wrapper indent.
+        column_chars = len(lines[line_index].encode("utf-8")[:column_offset].decode("utf-8", errors="ignore"))
+    else:
+        column_chars = column_offset
+    return sum(len(line) for line in lines[:line_index]) + column_chars
+
+
+def _rewrite_direct_literal_fills(code: str, value_to_key: Mapping[str, str]) -> tuple[str, list[str]]:
+    tree = _wrapped_code_ast(code)
+    if tree is None:
+        return code, []
+    replacements: list[tuple[int, int, str, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr not in _SUBMITTED_LITERAL_METHODS:
+            continue
+        if not _is_page_locator_expression(func.value) or not node.args:
+            continue
+        first_arg = node.args[0]
+        if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
+            continue
+        key = value_to_key.get(first_arg.value)
+        if key is None or first_arg.end_lineno is None or first_arg.end_col_offset is None:
+            continue
+        start = _wrapped_position_to_original_offset(code, first_arg.lineno, first_arg.col_offset)
+        end = _wrapped_position_to_original_offset(code, first_arg.end_lineno, first_arg.end_col_offset)
+        if start is None or end is None:
+            continue
+        replacements.append((start, end, f"str({key})", key))
+    if not replacements:
+        return code, []
+    rewritten = code
+    used_keys: list[str] = []
+    for start, end, replacement, key in sorted(replacements, key=lambda item: item[0], reverse=True):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+        if key not in used_keys:
+            used_keys.append(key)
+    return rewritten, list(reversed(used_keys))
+
+
+def _string_parameter_row(default_value: str, key: str) -> dict[str, Any]:
+    return {
+        "parameter_type": "workflow",
+        "workflow_parameter_type": "string",
+        "key": key,
+        "default_value": default_value,
+    }
+
+
+def _workflow_output_parameter_keys(parsed: dict[str, Any]) -> set[str]:
+    return {
+        f"{str(block.get('label') or '').strip()}_output"
+        for block in workflow_blocks(parsed)
+        if str(block.get("label") or "").strip()
+    }
+
+
+def _plain_parameter_conflicts(parameter: Mapping[str, Any], default_value: str) -> bool:
+    if is_sensitive_workflow_parameter(dict(parameter)):
+        return True
+    parameter_type = str(parameter.get("parameter_type") or "").lower()
+    workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
+    if parameter_type and parameter_type != "workflow":
+        return True
+    if workflow_parameter_type and workflow_parameter_type != "string":
+        return True
+    existing_default = parameter.get("default_value")
+    return isinstance(existing_default, str) and existing_default not in {"", default_value}
+
+
+def _normalize_plain_parameter_row(parameter: dict[str, Any], default_value: str) -> None:
+    if not isinstance(parameter.get("default_value"), str) or parameter.get("default_value") == "":
+        parameter["default_value"] = default_value
+    parameter["parameter_type"] = "workflow"
+    parameter["workflow_parameter_type"] = "string"
+
+
+def _allocate_promoted_parameter_key(
+    *,
+    base_key: str,
+    default_value: str,
+    parameters: list[Any],
+    reserved_keys: set[str],
+) -> tuple[str, bool]:
+    existing_by_key = {
+        str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
+    }
+    base = base_key if base_key and base_key.isidentifier() else "typed_value"
+    candidate = base
+    suffix = 2
+    while candidate in reserved_keys:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    # Termination is guaranteed because `existing_by_key` and `reserved_keys`
+    # are finite while `suffix` increases monotonically.
+    while True:
+        existing = existing_by_key.get(candidate)
+        if existing is None:
+            return candidate, True
+        if not _plain_parameter_conflicts(existing, default_value):
+            return candidate, False
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+        while candidate in reserved_keys:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+
+
+def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContext) -> tuple[str, list[str]]:
+    if not getattr(ctx, "impose_synthesized_code_block", False):
+        return workflow_yaml, []
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return workflow_yaml, []
+    scout_trajectory = ctx.scout_trajectory
+    if not isinstance(scout_trajectory, list) or not scout_trajectory:
+        return workflow_yaml, []
+    synthesized = synthesize_code_block(scout_trajectory)
+    if synthesized is None:
+        return workflow_yaml, []
+
+    defaults_by_value: dict[str, list[str]] = {}
+    for parameter in synthesized.parameters:
+        if parameter.get("credential_id"):
+            continue
+        key = str(parameter.get("key") or "").strip()
+        default_value = str(parameter.get("default_value") or "").strip()
+        if key and default_value and not _SECRET_LIKE_LITERAL_RE.search(default_value):
+            defaults_by_value.setdefault(default_value, []).append(key)
+    ambiguous_key_sets = [sorted(set(keys)) for keys in defaults_by_value.values() if len(set(keys)) > 1]
+    if ambiguous_key_sets:
+        LOG.debug(
+            "copilot_scouted_typed_default_promotion_ambiguous_values_skipped",
+            ambiguous_value_count=len(ambiguous_key_sets),
+            candidate_key_sets=ambiguous_key_sets,
+        )
+    value_to_key = {value: keys[0] for value, keys in defaults_by_value.items() if len(set(keys)) == 1}
+    if not value_to_key:
+        return workflow_yaml, []
+
+    parsed = parse_workflow_yaml(workflow_yaml)
+    if not isinstance(parsed, dict):
+        return workflow_yaml, []
+    workflow_definition = parsed.get("workflow_definition")
+    if not isinstance(workflow_definition, dict):
+        return workflow_yaml, []
+    parameters = workflow_definition.get("parameters")
+    if parameters is None:
+        parameters = []
+        workflow_definition["parameters"] = parameters
+    if not isinstance(parameters, list):
+        return workflow_yaml, ["Unable to bind typed workflow inputs: workflow_definition.parameters must be a list."]
+
+    reserved_keys = set(RESERVED_PARAMETER_KEYS) | _workflow_output_parameter_keys(parsed)
+    allocated_value_to_key: dict[str, str] = {}
+    default_by_allocated_key: dict[str, str] = {}
+    should_create_by_allocated_key: dict[str, bool] = {}
+    for value, base_key in value_to_key.items():
+        key, should_create = _allocate_promoted_parameter_key(
+            base_key=base_key,
+            default_value=value,
+            parameters=parameters,
+            reserved_keys=reserved_keys,
+        )
+        allocated_value_to_key[value] = key
+        default_by_allocated_key[key] = value
+        should_create_by_allocated_key[key] = should_create
+        reserved_keys.add(key)
+
+    any_rewrite = False
+    used_promoted_keys: set[str] = set()
+    for block in _workflow_code_blocks(parsed):
+        code = str(block.get("code") or "")
+        rewritten, used_keys = _rewrite_direct_literal_fills(code, allocated_value_to_key)
+        if not used_keys:
+            continue
+        block["code"] = rewritten
+        existing_keys = block.get("parameter_keys")
+        merged_keys = (
+            [str(key) for key in existing_keys if isinstance(key, str)] if isinstance(existing_keys, list) else []
+        )
+        for key in used_keys:
+            if key not in merged_keys:
+                merged_keys.append(key)
+            used_promoted_keys.add(key)
+        block["parameter_keys"] = merged_keys
+        any_rewrite = True
+
+    if not any_rewrite:
+        return workflow_yaml, []
+
+    existing_by_key = {
+        str(param.get("key")): param for param in parameters if isinstance(param, dict) and param.get("key")
+    }
+    for key in sorted(used_promoted_keys):
+        default_value = default_by_allocated_key.get(key, "")
+        if should_create_by_allocated_key.get(key):
+            parameters.append(_string_parameter_row(default_value, key))
+            continue
+        existing = existing_by_key.get(key)
+        if isinstance(existing, dict):
+            _normalize_plain_parameter_row(existing, default_value)
+    return yaml.safe_dump(parsed, sort_keys=False), []
+
+
 def _is_credential_parameter(parameter: Mapping[str, Any]) -> bool:
     parameter_type = str(parameter.get("parameter_type") or "").lower()
     workflow_parameter_type = str(parameter.get("workflow_parameter_type") or "").lower()
@@ -990,6 +1236,19 @@ def _reconcile_synthesized_parameters(
             violations.append(
                 f"Unable to bind synthesized parameter `{key}`: missing submitted workflow parameter and literal binding is ambiguous."
             )
+            continue
+
+        synthesized_default = str(synthesized_param.get("default_value") or "").strip()
+        if synthesized_default:
+            # Narrow defense-in-depth backstop for synthesized rows; values
+            # captured from live type_text scouting are fully screened by
+            # safe_typed_default_value before they enter the scout trajectory.
+            if _SECRET_LIKE_LITERAL_RE.search(synthesized_default):
+                violations.append(
+                    f"Unable to bind synthesized parameter `{key}`: synthesized default looks credential-like."
+                )
+                continue
+            parameters.append(_string_parameter_row(synthesized_default, key))
             continue
 
         typed_length = typed_lengths[0] if len(typed_lengths) == 1 else None
@@ -1571,6 +1830,13 @@ async def _update_workflow(
             "user_facing_summary": _compiled_authoring_user_summary(),
         }
     workflow_yaml = imposition.workflow_yaml
+    workflow_yaml, typed_default_violations = _apply_scouted_typed_default_promotions(workflow_yaml, ctx)
+    if typed_default_violations:
+        return {
+            "ok": False,
+            "error": "\n".join(typed_default_violations),
+            "user_facing_summary": _compiled_authoring_user_summary(),
+        }
     params["workflow_yaml"] = workflow_yaml
     scout_trajectory = getattr(ctx, "scout_trajectory", None)
     normalization = _normalize_code_artifact_metadata_detailed(

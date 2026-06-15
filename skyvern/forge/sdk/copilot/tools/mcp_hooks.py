@@ -16,6 +16,7 @@ from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.typed_value_policy import safe_typed_default_value, should_reject_type_text_value
 
 from ._shared import _DISCOVERY_PER_CALL_TIMEOUT_SECONDS
 from .banned_blocks import (
@@ -262,7 +263,27 @@ async def _type_text_pre_hook(
     ctx: AgentContext,
 ) -> dict[str, Any] | None:
     await _capture_scout_source_url(ctx)
-    return _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
+    ctx.pending_scout_typed_value = None
+    text = params.get("text")
+    selector = str(params.get("selector") or "")
+    intent = str(params.get("intent") or "")
+    if should_reject_type_text_value(value=text, selector=selector, intent=intent):
+        return {
+            "ok": False,
+            "error": (
+                "type_text cannot type raw credentials, secrets, OTP/TOTP codes, API keys, tokens, or "
+                "password-like values. Use the saved credential flow instead of inline secret text."
+            ),
+        }
+    if isinstance(text, str) and text:
+        ctx.pending_scout_typed_value = text
+    result = _strip_intent_for_code_only_selector_action(params, ctx, tool_name="type_text")
+    if result is not None:
+        # Non-None means the deterministic targeting guard is rejecting the
+        # tool call before browser execution; there will be no post-hook to
+        # consume this value.
+        ctx.pending_scout_typed_value = None
+    return result
 
 
 async def _select_option_pre_hook(
@@ -427,6 +448,8 @@ async def _type_text_post_hook(
 ) -> dict[str, Any]:
     _clear_pending_browser_interaction_observation(ctx)
     source_url = _consume_scout_source_url(ctx)
+    pending_typed_value = ctx.pending_scout_typed_value
+    ctx.pending_scout_typed_value = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
         selector = data.get("selector", "")
@@ -442,12 +465,26 @@ async def _type_text_post_hook(
             return landing_failure
         _mark_pending_browser_interaction_observation(ctx, tool_name="type_text", url=url)
         role, accessible_name = await _resolve_scout_role_name(ctx, selector)
+        typed_value = (
+            safe_typed_default_value(
+                pending_typed_value,
+                selector=selector,
+                role=role,
+                accessible_name=accessible_name,
+            )
+            if isinstance(typed_length, int)
+            and typed_length > 0
+            and isinstance(pending_typed_value, str)
+            and len(pending_typed_value) == typed_length
+            else None
+        )
         _record_scouted_interaction(
             ctx,
             tool_name="type_text",
             selector=selector,
             source_url=source_url,
             typed_length=typed_length,
+            typed_value=typed_value or "",
             role=role,
             accessible_name=accessible_name,
         )
