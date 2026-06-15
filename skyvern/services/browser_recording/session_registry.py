@@ -28,8 +28,20 @@ class RecordingInterpretationSessionRegistry:
         workflow_permanent_id: str,
         on_update: OnRecordingInterpretationUpdate,
     ) -> None:
-        self.discard_session(browser_session_id)
         self._prune_expired_sessions()
+        existing = self._sessions.get(browser_session_id)
+        if (
+            existing is not None
+            and existing.workflow_permanent_id == workflow_permanent_id
+            and existing.organization_id == organization_id
+            and not existing.finalized
+        ):
+            existing.on_update = on_update
+            self._last_seen[browser_session_id] = time.monotonic()
+            existing.emit_snapshot()
+            return
+
+        self.discard_session(browser_session_id)
         self._sessions[browser_session_id] = RecordingInterpretationSession(
             browser_session_id=browser_session_id,
             organization_id=organization_id,

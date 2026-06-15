@@ -483,6 +483,27 @@ class RecordingInterpretationSession:
             suffix += 1
         return f"{label}_{suffix}"
 
+    def emit_snapshot(self) -> None:
+        if self.session_revision == 0:
+            return
+
+        update = RecordingInterpretationUpdate(
+            interpretation_session_id=self.interpretation_session_id,
+            session_revision=self.session_revision,
+            steps=self.steps,
+            pending=self.pending,
+            finalized=self.finalized,
+        )
+
+        try:
+            self.on_update(update)
+        except Exception:
+            LOG.exception(
+                "Failed to emit recording interpretation snapshot",
+                browser_session_id=self.browser_session_id,
+                organization_id=self.organization_id,
+            )
+
     def _emit_update(self) -> None:
         self.session_revision += 1
         update = RecordingInterpretationUpdate(
