@@ -1989,11 +1989,11 @@
               }
             }
           },
-          "400": {
-            "description": "Timeline not available for this run type"
-          },
           "404": {
             "description": "Run not found"
+          },
+          "400": {
+            "description": "Timeline not available for this run type"
           },
           "422": {
             "description": "Validation Error",
@@ -3000,11 +3000,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "409": {
             "description": "Conflict - browser session has already ended and can no longer be updated"
@@ -3074,11 +3074,11 @@
               }
             }
           },
-          "403": {
-            "description": "Unauthorized - Invalid or missing authentication"
-          },
           "404": {
             "description": "Browser session not found"
+          },
+          "403": {
+            "description": "Unauthorized - Invalid or missing authentication"
           },
           "422": {
             "description": "Validation Error",
@@ -4521,11 +4521,11 @@
               }
             }
           },
-          "400": {
-            "description": "Folder not found"
-          },
           "404": {
             "description": "Workflow not found"
+          },
+          "400": {
+            "description": "Folder not found"
           },
           "422": {
             "description": "Validation Error",
@@ -5481,6 +5481,9 @@
           "404": {
             "description": "Workflow not found"
           },
+          "500": {
+            "description": "Storage deletion failed; retry"
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -5490,9 +5493,6 @@
                 }
               }
             }
-          },
-          "500": {
-            "description": "Storage deletion failed; retry"
           }
         },
         "x-hidden": true
@@ -8692,7 +8692,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -9267,8 +9267,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440,
-                "minimum": 5
+                "maximum": 1440.0,
+                "minimum": 5.0
               },
               {
                 "type": "null"
@@ -14134,7 +14134,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -17132,7 +17132,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -20390,7 +20390,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 10000
+            "default": 5000
           }
         },
         "type": "object",
@@ -20944,8 +20944,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1,
-            "minimum": 0,
+            "maximum": 1.0,
+            "minimum": 0.0,
             "title": "Confidence Float"
           },
           "error_type": {
@@ -22466,8 +22466,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
-                "minimum": 1
+                "maximum": 480.0,
+                "minimum": 1.0
               },
               {
                 "type": "null"
@@ -22538,8 +22538,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 2,
-                "minimum": 1
+                "maximum": 2.0,
+                "minimum": 1.0
               },
               {
                 "type": "null"
@@ -24245,15 +24245,15 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
-                "minimum": 1
+                "maximum": 480.0,
+                "minimum": 1.0
               },
               {
                 "type": "null"
               }
             ],
             "title": "Max Elapsed Time Minutes",
-            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours."
+            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes."
           },
           "extra_http_headers": {
             "anyOf": [
@@ -24490,15 +24490,15 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240,
-                "minimum": 1
+                "maximum": 480.0,
+                "minimum": 1.0
               },
               {
                 "type": "null"
               }
             ],
             "title": "Max Elapsed Time Minutes",
-            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. Maximum runtime is 4 hours."
+            "description": "Timeout this workflow run after the configured elapsed runtime in minutes. When omitted, the platform default is 240 minutes. The maximum configurable value is 480 minutes."
           },
           "extra_http_headers": {
             "anyOf": [
