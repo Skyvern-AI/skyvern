@@ -442,44 +442,9 @@ function Workflows() {
     };
   }, [workflowTagsMap]);
 
-  const { matchesParameter, isSearchActive } =
-    useKeywordSearch(debouncedSearch);
-  const {
-    expandedRows,
-    toggleExpanded: toggleParametersExpanded,
-    setAutoExpandedRows,
-    setManuallyExpandedRows,
-  } = useParameterExpansion();
-
-  useEffect(() => {
-    if (!isSearchActive) {
-      setAutoExpandedRows([]);
-      setManuallyExpandedRows(new Set());
-      return;
-    }
-
-    const matchingWorkflows = workflows.filter((workflow) =>
-      workflow.workflow_definition.parameters?.some((param) => {
-        const value =
-          param.parameter_type === "workflow" ? param.default_value : undefined;
-        return matchesParameter({
-          key: param.key,
-          value,
-          description: param.description ?? null,
-        });
-      }),
-    );
-
-    setAutoExpandedRows(
-      matchingWorkflows.map((workflow) => workflow.workflow_permanent_id),
-    );
-  }, [
-    isSearchActive,
-    workflows,
-    matchesParameter,
-    setAutoExpandedRows,
-    setManuallyExpandedRows,
-  ]);
+  const { matchesParameter } = useKeywordSearch(debouncedSearch);
+  const { expandedRows, toggleExpanded: toggleParametersExpanded } =
+    useParameterExpansion();
 
   function handleRowClick(
     event: React.MouseEvent<HTMLTableCellElement>,
