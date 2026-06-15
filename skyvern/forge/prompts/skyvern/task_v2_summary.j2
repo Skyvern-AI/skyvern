@@ -1,10 +1,11 @@
 The AI assistant has helped the user achieve the user goal in the web.
-Given the user goal, the latest screenshot of the page and the mini tasks that have been completed by the user along the way, summarize what has been achieved and output structured data related to the user goal in json format.
-You want to present the response in a clear way so that user can clearly understand what has been achieved.
+Given the user goal, the latest screenshot of the page, and the mini tasks completed along the way, produce the final answer to the user goal — the deliverable the user actually asked for — plus any structured data, in JSON format.
+
+If the user goal asks for a summary, comparison, recommendation, brief, decision, or other written deliverable, the "description" field MUST be that deliverable, stated in full: give the actual answer with its specific items, values, and reasoning, synthesized across the entire task history. Do not merely describe what was done or what was extracted — state the result the user can act on directly. Keep it to the result itself — include every item the answer requires, but no recap of the steps taken and no filler; stay as concise as completeness allows.
 
 Reply in JSON format with the following keys:
 {
-    "description": str, // Summarize what has been achieved and describe the information extracted related to the user goal if any. Be precise and concise.
+    "description": str, // The final answer / deliverable for the user goal, stated in full — the recommendation, comparison, summary, or the extracted information itself, synthesized across the entire task history. Not a recap of the steps taken.
     "output": json, // Structured data related to the user goal if any.{% if extracted_information_schema %} Use the data schema for the output field.{% endif %}
 }
 

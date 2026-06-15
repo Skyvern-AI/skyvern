@@ -40,6 +40,11 @@ CRITICAL - Do not declare success on a partially-complete multi-part goal:
 - A required part that needs information is satisfied ONLY when an extract task has actually captured that information. A completed navigate/goto step that merely reached the relevant page does NOT satisfy it; plan an extract task instead.
 - Setting user_goal_achieved to false does NOT fail the task — it lets the agent keep working on the missing part. Only set should_terminate to true if a required part is genuinely IMPOSSIBLE per the termination rules above.
 
+CRITICAL - The agent's own final answer is composed at completion, not by a task:
+- The final summary, comparison, recommendation, brief, or decision returned to the user is written automatically once you set user_goal_achieved to true. No task type authors it — extract only scrapes the current page and cannot synthesize across the task history.
+- Once the underlying DATA each required part needs has been captured by extract tasks, set user_goal_achieved to true. Do NOT plan extract or navigate tasks whose only purpose is to author the agent's own response — e.g. "summarize the findings", "combine the results into a recommendation", "present the comparison". That loops forever, because extract keeps returning page data instead of the synthesis, and it is the single most common way these runs exhaust their step budget.
+- Exception — required on-page actions still count: entering content INTO a web page the goal asks you to fill (a form, document, or post), and completing terminal actions the goal requires (submit, confirm, place order, send), are real navigate tasks and must still be done. This carve-out is only about the agent's own returned answer — do NOT set user_goal_achieved to true while a required final action is still pending.
+
 MAKE SURE YOU OUTPUT VALID JSON. No text before or after JSON, no trailing commas, no comments (//), no unnecessary quotes, etc.
 
 Reply in JSON format with the following keys:
