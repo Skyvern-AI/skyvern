@@ -110,6 +110,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
     BaseTaskBlock,
+    CodeBlock,
     ValidationBlock,
 )
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
@@ -554,6 +555,39 @@ class ForgeAgent:
             workflow_run_id=workflow_run.workflow_run_id,
             order=step.order,
             retry_index=step.retry_index,
+        )
+        return task, step
+
+    async def create_task_and_step_from_code_block(
+        self,
+        code_block: CodeBlock,
+        organization_id: str | None,
+        workflow_run_id: str,
+        task_url: str,
+    ) -> tuple[Task, Step]:
+        """Container task v1 for a code block's recorded actions, also the seat for future agent fallback."""
+        task_order, task_retry = await BaseTaskBlock.get_task_order(workflow_run_id, 0)
+        task = await app.DATABASE.tasks.create_task(
+            url=task_url,
+            title=code_block.label,
+            navigation_goal=code_block.prompt,
+            data_extraction_goal=None,
+            navigation_payload=None,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            order=task_order,
+            retry=task_retry,
+        )
+        task = await app.DATABASE.tasks.update_task(
+            task_id=task.task_id,
+            organization_id=organization_id,
+            status=TaskStatus.running,
+        )
+        step = await app.DATABASE.tasks.create_step(
+            task.task_id,
+            order=0,
+            retry_index=0,
+            organization_id=organization_id,
         )
         return task, step
 

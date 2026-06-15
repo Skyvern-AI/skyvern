@@ -541,7 +541,8 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
         trajectory_len=len(ctx.scout_trajectory),
         code_len=len(synthesized.code),
     )
-    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory)
+    goal = ctx.block_goal_main_goal or ctx.user_message or ""
+    return "\n\n" + render_synthesized_offer_text(synthesized, ctx.scout_trajectory, goal=goal)
 
 
 def _build_dynamic_system_prompt(tool_usage_guide: str, config: CopilotConfig) -> Callable[[object, object], str]:
@@ -3036,6 +3037,7 @@ async def _run_copilot_turn_impl(
         prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         block_authoring_policy=copilot_config.block_authoring_policy,
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
+        target_block_label=getattr(chat_request, "target_block_label", None),
     )
     # Fail loud if a future caller skips the kwarg and gets a fresh UUID from
     # the default_factory — the envelope and terminal frames would then carry
@@ -3210,10 +3212,21 @@ async def _run_copilot_turn_impl(
         if ctx.turn_context_packet.repeated_reply_context is not None:
             repeated_reply_warning = ctx.turn_context_packet.repeated_reply_context.rendered_summary
 
+    scoped_global_llm_context = safe_global_llm_context
+    if ctx.target_block_label:
+        # Defang the user-supplied label before embedding it in the instruction: collapse
+        # whitespace and drop quotes so it can't break out of the string or inject directives.
+        safe_target_block_label = re.sub(r"\s+", " ", ctx.target_block_label).replace('"', "").strip()[:200]
+        scoped_global_llm_context = (
+            f'CRITICAL: Regenerate ONLY the block labeled "{safe_target_block_label}". '
+            "Preserve every other block's code, goal, steps, and configuration exactly as-is.\n\n"
+            f"{safe_global_llm_context}"
+        )
+
     user_message = _build_user_context(
         workflow_yaml=safe_workflow_yaml,
         chat_history_text=safe_chat_history_text,
-        global_llm_context=safe_global_llm_context,
+        global_llm_context=scoped_global_llm_context,
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,

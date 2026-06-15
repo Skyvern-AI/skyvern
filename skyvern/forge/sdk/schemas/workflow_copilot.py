@@ -108,6 +108,13 @@ class WorkflowCopilotChatRequest(BaseModel):
             "Optional; legacy clients omit it and cancel becomes a no-op for those requests."
         ),
     )
+    target_block_label: str | None = Field(
+        None,
+        description=(
+            "When set, the copilot regenerates only this code block from its goal and leaves every "
+            "other block unchanged. Used by the block-level Generate action."
+        ),
+    )
 
 
 class WorkflowCopilotCancelRequest(BaseModel):

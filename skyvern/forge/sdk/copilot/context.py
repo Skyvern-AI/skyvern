@@ -370,6 +370,7 @@ class CopilotContext(AgentContext):
     request_policy: RequestPolicy | None = None
     block_authoring_policy: BlockAuthoringPolicy = BlockAuthoringPolicy.STANDARD
     impose_synthesized_code_block: bool = False
+    target_block_label: str | None = None
     turn_intent: TurnIntent | None = None
     turn_context_packet: TurnContextPacket | None = None
     latest_diagnosis_repair_contract: DiagnosisRepairContract | None = None
