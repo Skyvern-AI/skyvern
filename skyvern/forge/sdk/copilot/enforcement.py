@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 import structlog
 from agents.run import Runner
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
@@ -268,8 +267,6 @@ def latest_diagnosis_contract_satisfies_goal(ctx: CopilotContext) -> bool:
 
 
 def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
-    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
-        return False
     result = ctx.completion_verification_result
     return result is not None and result.status == "evaluated"
 
@@ -307,13 +304,9 @@ def verified_goal_satisfied_context(ctx: CopilotContext) -> bool:
 
 def verified_goal_claim_authorized(ctx: CopilotContext) -> bool:
     """Whether the terminal may CLAIM a tested success. Turn completion keeps
-    flowing through ``verified_goal_satisfied_context``; with persisted criteria
-    enabled, the claim tier additionally requires judge-confirmed outcome evidence —
-    criteria-less or judge-less terminals end the turn but render built-but-unverified.
-    With either flag off the judge cannot be authoritative, so the claim falls back
-    to the legacy gate."""
-    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
-        return verified_goal_satisfied_context(ctx)
+    flowing through ``verified_goal_satisfied_context``; the claim tier additionally
+    requires judge-confirmed outcome evidence — criteria-less or judge-less terminals
+    end the turn but render built-but-unverified."""
     return outcome_fully_verified(ctx)
 
 

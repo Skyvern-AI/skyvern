@@ -9,7 +9,6 @@ from urllib.parse import urlparse
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.completion_verification import (
     CompletionVerificationResult,
     RunEvidenceSnapshot,
@@ -73,8 +72,6 @@ class ActiveRunTerminalEvidenceSample:
 
 
 async def _active_run_terminal_monitor_enabled(copilot_ctx: Any) -> bool:
-    if not settings.COPILOT_OUTCOME_VERIFICATION_ENABLED:
-        return False
     if not getattr(copilot_ctx, "browser_session_id", None):
         return False
     if not getattr(copilot_ctx, "discovery_mcp_server", None):

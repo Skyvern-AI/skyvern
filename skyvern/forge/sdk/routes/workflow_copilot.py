@@ -394,11 +394,8 @@ async def _clear_proposed_workflow(chat: Any) -> None:
 
 
 async def _load_completion_criteria_snapshot(chat: Any) -> StoredCriteriaSnapshot | None:
-    """None disables the lifecycle for this turn (flag off, or load failure —
-    which degrades to today's per-turn regeneration rather than risking a
-    duplicate-epoch write)."""
-    if not (settings.COPILOT_PERSISTED_COMPLETION_CRITERIA_ENABLED and settings.COPILOT_OUTCOME_VERIFICATION_ENABLED):
-        return None
+    """None disables the lifecycle for this turn on load failure, which degrades to
+    today's per-turn regeneration rather than risking a duplicate-epoch write."""
     try:
         latest = await app.DATABASE.workflow_params.get_latest_workflow_copilot_completion_criteria_set(
             organization_id=chat.organization_id,
