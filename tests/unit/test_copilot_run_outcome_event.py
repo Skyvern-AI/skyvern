@@ -133,7 +133,10 @@ async def test_blocker_run_emits_hold_then_not_demonstrated() -> None:
     assert final.display_reason is not None and "human verification challenge" in final.display_reason
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_run_outcome == RecordedRunOutcome(
-        verdict=final.verdict, reason_code=final.reason_code, display_reason=final.display_reason
+        verdict=final.verdict,
+        reason_code=final.reason_code,
+        display_reason=final.display_reason,
+        workflow_run_id="wr_test",
     )
     assert ctx.last_run_outcome_block_labels == final.block_labels
 
@@ -286,6 +289,20 @@ def test_failed_rerun_clears_prior_recorded_outcome() -> None:
 
     assert ctx.last_run_outcome is None
     assert ctx.last_run_outcome_block_labels == []
+
+
+def test_recorded_run_outcome_carries_producing_workflow_run_id() -> None:
+    ctx = _ctx([_code_block("search_registry_person", {"records": []})])
+    outcome = _record_run_blocks_result(
+        ctx,
+        _run_result([_code_block("search_registry_person", {"records": []})]),
+        completion_verification=_evaluated(satisfied=False),
+    )
+
+    assert outcome is not None
+    assert outcome.workflow_run_id == "wr_test"
+    assert ctx.last_run_outcome is not None
+    assert ctx.last_run_outcome.workflow_run_id == "wr_test"
 
 
 def test_both_consumers_route_through_single_producer() -> None:

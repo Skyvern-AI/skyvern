@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.output_utils import (
     sanitize_tool_result_for_llm,
     summarize_tool_result,
 )
+from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
 from skyvern.forge.sdk.copilot.tools import (
     _find_invalidated_labels,
     _frontier_run_size_error,
@@ -1655,6 +1656,39 @@ def test_chokepoint_uses_passed_prior_when_last_workflow_absent() -> None:
     assert "extract" not in ctx.verified_prefix_labels
     assert "extract" not in ctx.verified_block_outputs
     assert "extract" in tools._unverified_current_workflow_labels(ctx)
+
+
+def test_workflow_update_clears_terminal_run_evidence() -> None:
+    new = _wf_def(
+        ("open", "goto_url", {"url": "https://example.com"}),
+        ("extract", "extraction", {"prompt": "extract CHANGED"}),
+    )
+    ctx = _make_ctx()
+    ctx.last_run_blocks_workflow_run_id = "wr_old"
+    ctx.last_successful_run_blocks_workflow_run_id = "wr_old"
+    ctx.last_run_blocks_block_ids = ["wrb_old"]
+    ctx.last_run_blocks_block_labels = ["extract"]
+    ctx.last_run_outcome = RecordedRunOutcome(verdict="not_evaluated", workflow_run_id="wr_old")
+    ctx.last_run_outcome_block_labels = ["extract"]
+    ctx.last_outcome_gate_reason = "The prior run did not demonstrate the goal."
+    ctx.last_outcome_gate_workflow_run_id = "wr_old"
+    ctx.last_test_anti_bot = "challenge-gated disabled submit/search control"
+    ctx.completion_verification_result = object()  # type: ignore[assignment]
+    ctx.outcome_verification_trace_snapshot = {"old": True}
+
+    _record_workflow_update_result(ctx, {"ok": True, "_workflow": _FakeWorkflow(new)}, None)
+
+    assert ctx.last_run_blocks_workflow_run_id is None
+    assert ctx.last_successful_run_blocks_workflow_run_id is None
+    assert ctx.last_run_blocks_block_ids == []
+    assert ctx.last_run_blocks_block_labels == []
+    assert ctx.last_run_outcome is None
+    assert ctx.last_run_outcome_block_labels == []
+    assert ctx.last_outcome_gate_reason is None
+    assert ctx.last_outcome_gate_workflow_run_id is None
+    assert ctx.last_test_anti_bot is None
+    assert ctx.completion_verification_result is None
+    assert ctx.outcome_verification_trace_snapshot == {}
 
 
 def test_unavailable_prior_with_trust_fails_closed() -> None:
