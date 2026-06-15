@@ -96,8 +96,7 @@ def _flow_by_step(ctx: SimpleNamespace) -> dict[int, tuple[dict[str, Any], str]]
 
 class TestActObserveSuccess:
     @pytest.mark.asyncio
-    async def test_schema_merged_into_interaction_packet_before_append(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_schema_merged_into_interaction_packet_before_append(self) -> None:
         ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
 
         result = await _run_click(ctx)
@@ -118,8 +117,7 @@ class TestActObserveSuccess:
         assert evidence["forms"][0]["fields"][0]["label"] == "NPI number"
 
     @pytest.mark.asyncio
-    async def test_pending_marker_cleared_and_result_carries_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_pending_marker_cleared_and_result_carries_summary(self) -> None:
         ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
 
         result = await _run_click(ctx)
@@ -149,7 +147,6 @@ class TestActObserveDegrade:
     async def test_timeout_degrades_to_schema_less_packet_and_keeps_marker(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
 
         async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
@@ -178,8 +175,7 @@ class TestActObserveDegrade:
         assert ctx.pending_browser_interaction_observation.url == _LANDING_URL
 
     @pytest.mark.asyncio
-    async def test_hollow_parse_degrades_to_schema_less_packet(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_hollow_parse_degrades_to_schema_less_packet(self) -> None:
         ctx = _ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
 
         result = await _run_click(ctx)
@@ -191,8 +187,7 @@ class TestActObserveDegrade:
         assert ctx.pending_browser_interaction_observation is not None
 
     @pytest.mark.asyncio
-    async def test_extractor_error_never_fails_the_click(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_extractor_error_never_fails_the_click(self) -> None:
         server = SimpleNamespace()
         server.call_internal_tool = AsyncMock(side_effect=RuntimeError("browser gone"))
         ctx = _ctx(server=server)
@@ -207,7 +202,6 @@ class TestActObserveDegrade:
 class TestActObserveNoRace:
     @pytest.mark.asyncio
     async def test_appended_entry_never_mutates_after_hook_returns(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS", 0.05)
 
         async def slow_extract(*_args: object, **_kwargs: object) -> dict[str, Any]:
@@ -229,8 +223,7 @@ class TestActObserveNoRace:
         assert not has_bounded_page_schema(ctx.flow_evidence[0]["evidence"])
 
     @pytest.mark.asyncio
-    async def test_successful_attach_credits_exactly_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_successful_attach_credits_exactly_once(self) -> None:
         ctx = _ctx(server=_server_returning(_bounded_extractor_payload()))
 
         await _run_click(ctx)
@@ -256,8 +249,7 @@ class TestActObserveNoRace:
         assert _auto_credit_interaction_observation(by_step, consumed) is False
 
     @pytest.mark.asyncio
-    async def test_degraded_path_preserves_pending_upgrade(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_degraded_path_preserves_pending_upgrade(self) -> None:
         ctx = _ctx(server=_server_returning({"page_title": "Loading", "forms": []}))
 
         await _run_click(ctx)
@@ -277,8 +269,7 @@ class TestActObserveNoRace:
 
 class TestActObserveSummaryBound:
     @pytest.mark.asyncio
-    async def test_adversarial_page_never_clips_serialized_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
+    async def test_adversarial_page_never_clips_serialized_result(self) -> None:
         payload = {
             "page_title": "R" * 300,
             "forms": [
@@ -333,33 +324,10 @@ class TestActObserveSummaryBound:
         assert len(ctx.flow_evidence[0]["evidence"]["forms"]) == 5
 
 
-class TestActObserveKillSwitch:
-    @pytest.mark.asyncio
-    async def test_disabled_restores_two_call_behavior(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", False)
-        server = _server_returning(_bounded_extractor_payload())
-        ctx = _ctx(server=server)
-
-        result = await _run_click(ctx)
-
-        server.call_internal_tool.assert_not_awaited()
-        assert result["ok"] is True
-        assert result["data"] == {
-            "selector": "#open-details",
-            "url": _LANDING_URL,
-            "title": "Results",
-            "observation_step": ctx.flow_evidence[0]["step"],
-        }
-        entry = ctx.flow_evidence[0]
-        assert entry["had_bounded_schema"] is False
-        assert set(entry["evidence"].keys()) == _SCHEMA_LESS_PACKET_KEYS
-        assert ctx.pending_browser_interaction_observation is not None
-
+class TestActObserveToolGate:
     @pytest.mark.asyncio
     async def test_non_click_tools_do_not_capture(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.forge.sdk.copilot import tools as tools_module
-
-        monkeypatch.setattr(settings, "COPILOT_SCOUT_ACT_OBSERVE_ENABLED", True)
 
         async def passes(*_args: object, **_kwargs: object) -> None:
             return None

@@ -317,7 +317,7 @@ async def _register_scout_interaction_observation(
     if source_url and source_url.strip():
         evidence["interaction_source_url"] = source_url.strip()
     page_evidence: dict[str, Any] | None = None
-    if settings.COPILOT_SCOUT_ACT_OBSERVE_ENABLED and tool_name in _ACT_OBSERVE_TOOLS:
+    if tool_name in _ACT_OBSERVE_TOOLS:
         parsed = await _scout_act_observe_page_evidence(ctx, url=url)
         if parsed is not None:
             # Identity keys overwrite the parsed packet so the entry stays a
@@ -724,8 +724,6 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
 
 
 async def _maybe_steer_evaluate_to_action(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
-    if not settings.COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED:
-        return
     data = result.get("data")
     if not isinstance(data, dict):
         return

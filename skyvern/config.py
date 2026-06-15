@@ -154,15 +154,9 @@ class Settings(BaseSettings):
     # Gate copilot verified-success on per-criterion outcome evidence.
     # Off restores the prior run-status/suspicious-success gate and classifier prompt.
     COPILOT_OUTCOME_VERIFICATION_ENABLED: bool = True
-    # Capture bounded page evidence synchronously in scout interaction post-hooks.
-    # Off restores schema-less interaction packets plus standalone page inspects.
-    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
-    # Steer a repeat evaluate on an unchanged page toward acting on an already-identified target.
-    # Off restores the raw evaluate result with no actionable-target naming or act instruction.
-    COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED: bool = True
     # On a repeat evaluate of an unchanged page with exactly one safe target, click it in-process
-    # instead of only advising. Off (default) keeps the advisory-only steer above.
+    # instead of only advising. Off (default) leaves the advisory steer as the only response.
     COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED: bool = False
     # Persist copilot completion criteria per goal epoch with tri-state verdicts
     # and definition-plane grading. Off restores per-turn re-derivation, the legacy

@@ -64,8 +64,6 @@ def test_signature_changes_when_controls_change() -> None:
 
 @pytest.mark.asyncio
 async def test_first_evaluate_names_targets_without_next_action(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
-
     async def fake_evidence(ctx, *, url):
         return _packet()
 
@@ -81,8 +79,6 @@ async def test_first_evaluate_names_targets_without_next_action(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_repeat_evaluate_same_page_steers_to_click(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
-
     async def fake_evidence(ctx, *, url):
         return _packet()
 
@@ -101,7 +97,6 @@ async def test_repeat_evaluate_same_page_steers_to_click(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_changed_signature_not_steered(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     packets = [
         _packet(),
         {"navigation_targets": [{"selector": "#other", "text": "Next"}], "forms": [], "result_containers": []},
@@ -126,20 +121,7 @@ async def test_changed_signature_not_steered(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_flag_off_restores_raw_result(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", False)
-    ctx = _ctx()
-    ctx.last_evaluate_actionable_signature = None
-    ctx.last_evaluate_actionable_url = None
-    result = {"ok": True, "data": {"url": "https://example.com/bill"}}
-    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/bill")
-    assert "actionable_targets" not in result["data"]
-    assert "next_action" not in result["data"]
-
-
-@pytest.mark.asyncio
 async def test_same_signature_different_url_not_steered(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -150,7 +132,6 @@ async def test_same_signature_different_url_not_steered(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_hash_route_change_not_steered(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -161,7 +142,6 @@ async def test_hash_route_change_not_steered(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -185,7 +165,6 @@ async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_repeat_nested_result_sheds_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -220,7 +199,6 @@ async def test_repeat_nested_result_sheds_under_cap(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_first_evaluate_large_result_not_shed(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -239,7 +217,6 @@ async def test_first_evaluate_large_result_not_shed(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_non_serializable_data_does_not_raise(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = "seed"
     ctx.last_evaluate_actionable_url = "https://app.example.com/bill"
@@ -263,7 +240,6 @@ def test_identities_cover_all_collections() -> None:
 
 @pytest.mark.asyncio
 async def test_probe_none_leaves_data_untouched_and_resets(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = "seed"
     ctx.last_evaluate_actionable_url = "https://app.example.com/x"
@@ -280,7 +256,6 @@ async def test_probe_none_leaves_data_untouched_and_resets(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_probe_empty_collections_no_steer(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -296,7 +271,6 @@ async def test_probe_empty_collections_no_steer(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_interaction_between_evaluates_suppresses_steer(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -313,7 +287,6 @@ async def test_interaction_between_evaluates_suppresses_steer(monkeypatch) -> No
 async def test_steer_front_runs_loop_guard(monkeypatch) -> None:
     from skyvern.forge.sdk.copilot.loop_detection import MAX_CONSECUTIVE_SAME_TOOL, detect_tool_loop
 
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     ctx = _ctx()
     ctx.last_evaluate_actionable_signature = None
     ctx.last_evaluate_actionable_url = None
@@ -468,7 +441,6 @@ def test_auto_act_candidate_rejects_javascript_href() -> None:
 
 @pytest.mark.asyncio
 async def test_multiple_candidates_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
@@ -489,7 +461,6 @@ async def test_multiple_candidates_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_high_tier_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
@@ -510,7 +481,6 @@ async def test_high_tier_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_bare_button_submit_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
@@ -531,7 +501,6 @@ async def test_bare_button_submit_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_empty_text_link_no_auto_act(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {}})
     ctx = _auto_act_ctx(server)
@@ -552,7 +521,6 @@ async def test_empty_text_link_no_auto_act(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -581,7 +549,6 @@ async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -611,7 +578,6 @@ async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypa
 
 @pytest.mark.asyncio
 async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -659,7 +625,6 @@ async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatc
 
 @pytest.mark.asyncio
 async def test_auto_act_re_arms_on_changed_signature(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -701,7 +666,6 @@ async def test_auto_act_re_arms_on_changed_signature(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -719,7 +683,6 @@ async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_flag_off_pure_advisory(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", False)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
@@ -740,7 +703,6 @@ async def test_auto_act_flag_off_pure_advisory(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_auto_act_click_failure_degrades_to_advisory(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": False, "error": "element not found"})
     ctx = _auto_act_ctx(server)
@@ -764,7 +726,6 @@ async def test_auto_act_click_failure_degrades_to_advisory(monkeypatch) -> None:
 async def test_auto_act_front_runs_the_third_evaluate(monkeypatch) -> None:
     from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
 
-    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
     monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
     server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
     ctx = _auto_act_ctx(server)
