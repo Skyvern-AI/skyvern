@@ -119,6 +119,7 @@ class ScoutedInteraction(TypedDict):
     selector: NotRequired[str]
     source_url: NotRequired[str]
     value: NotRequired[str]
+    typed_value: NotRequired[str]
     key: NotRequired[str]
     typed_length: NotRequired[int]
     role: NotRequired[str]
@@ -267,6 +268,7 @@ class AgentContext:
     synthesized_block_offered: bool = False
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
+    pending_scout_typed_value: str | None = None
     # Exact secret strings filled into the live browser this turn (passwords,
     # call-time-minted OTP codes). Page-readback tool results are exact-string
     # scrubbed against this set before being recorded or returned to the model.

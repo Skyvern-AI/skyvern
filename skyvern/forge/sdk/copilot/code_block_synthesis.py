@@ -286,6 +286,18 @@ def _param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
     return _unique_key(_safe_param_base(name or role or "value"), used)
 
 
+def _typed_value_identity(interaction: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    typed_value = str(interaction.get("typed_value") or "").strip()
+    if not typed_value:
+        return None
+    return (
+        typed_value,
+        str(interaction.get("selector") or "").strip(),
+        str(interaction.get("role") or "").strip(),
+        str(interaction.get("accessible_name") or "").strip(),
+    )
+
+
 def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str:
     name = str(interaction.get("credential_name") or "").strip()
     return _unique_key(_safe_param_base(name or "credential"), used)
@@ -303,6 +315,7 @@ def synthesize_code_block(
     parameters: list[dict[str, str]] = []
     diagnostics = SynthesisDiagnostics()
     used_param_keys: set[str] = set()
+    typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
 
     entry_url = ""
@@ -378,8 +391,17 @@ def synthesize_code_block(
             lines.append(f"{_INDENT}await {locator}.click()")
             lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
         elif tool_name == "type_text":
-            param_key = _param_key(interaction, used_param_keys)
-            parameters.append({"key": param_key})
+            typed_identity = _typed_value_identity(interaction)
+            param_key = typed_param_keys.get(typed_identity) if typed_identity is not None else None
+            if param_key is None:
+                param_key = _param_key(interaction, used_param_keys)
+                parameter = {"key": param_key}
+                typed_value = str(interaction.get("typed_value") or "").strip()
+                if typed_value:
+                    parameter["default_value"] = typed_value
+                parameters.append(parameter)
+                if typed_identity is not None:
+                    typed_param_keys[typed_identity] = param_key
             lines.append(f"{_INDENT}await {locator}.fill(str({param_key}))")
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
@@ -537,7 +559,16 @@ def render_synthesized_offer_text(
         "```",
     ]
     if param_keys:
-        parts.append("Workflow parameters referenced (bind these): " + ", ".join(param_keys) + ".")
+        default_keys = [
+            str(p.get("key") or "")
+            for p in synthesized.parameters
+            if p.get("key") and not p.get("credential_id") and p.get("default_value")
+        ]
+        line = "Workflow parameters referenced (bind these): " + ", ".join(param_keys) + "."
+        line += " Bind each as `workflow_parameter_type: string`."
+        if default_keys:
+            line += " Server-side `default_value` is available for: " + ", ".join(default_keys) + "."
+        parts.append(line)
     if credential_parameters:
         bindings = ", ".join(f"`{p['key']}` -> `{p['credential_id']}`" for p in credential_parameters)
         parts.append(
