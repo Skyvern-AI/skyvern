@@ -1,0 +1,797 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from skyvern.config import settings
+from skyvern.forge.sdk.copilot.runtime import AgentContext
+from skyvern.forge.sdk.copilot.tools import scouting
+
+
+def _packet() -> dict:
+    return {
+        "navigation_targets": [
+            {"selector": "#print", "text": "View Printable Statement"},
+            {"selector": "#download", "text": "Download"},
+        ],
+        "forms": [],
+        "result_containers": [],
+    }
+
+
+def _full_packet() -> dict:
+    return {
+        "forms": [
+            {
+                "fields": [{"selector": "#user", "text": "Username"}],
+                "submit_controls": [{"selector": "#login", "text": "Log In"}],
+            }
+        ],
+        "navigation_targets": [{"selector": "#print", "text": "View Printable Statement"}],
+        "result_containers": [{"selector": "#results", "text": "Results"}],
+        "modal_overlays": [{"dismiss_controls": [{"selector": "#close", "text": "Close"}]}],
+    }
+
+
+def _ctx() -> AgentContext:
+    return AgentContext.__new__(AgentContext)
+
+
+async def _seed(ctx, monkeypatch, packet, url):
+    async def fake(c, *, url):
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    result = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+    return result
+
+
+def test_signature_stable_across_equal_identity_sets() -> None:
+    a = scouting._actionable_target_identities(_packet())
+    b = scouting._actionable_target_identities(_packet())
+    assert scouting._actionable_target_signature(a) == scouting._actionable_target_signature(b)
+
+
+def test_signature_changes_when_controls_change() -> None:
+    base = scouting._actionable_target_identities(_packet())
+    mutated_packet = _packet()
+    mutated_packet["navigation_targets"][0]["selector"] = "#print-v2"
+    mutated = scouting._actionable_target_identities(mutated_packet)
+    assert scouting._actionable_target_signature(base) != scouting._actionable_target_signature(mutated)
+
+
+@pytest.mark.asyncio
+async def test_first_evaluate_names_targets_without_next_action(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+
+    async def fake_evidence(ctx, *, url):
+        return _packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    result = {"ok": True, "data": {"url": "https://example.com/bill"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/bill")
+    assert "actionable_targets" in result["data"]
+    assert "next_action" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_repeat_evaluate_same_page_steers_to_click(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+
+    async def fake_evidence(ctx, *, url):
+        return _packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://example.com/bill"
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert second["data"].get("next_action") == "click"
+    assert second["data"]["actionable_targets"]
+
+
+@pytest.mark.asyncio
+async def test_changed_signature_not_steered(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    packets = [
+        _packet(),
+        {"navigation_targets": [{"selector": "#other", "text": "Next"}], "forms": [], "result_containers": []},
+    ]
+    calls = {"i": 0}
+
+    async def fake_evidence(ctx, *, url):
+        packet = packets[calls["i"]]
+        calls["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake_evidence)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://example.com/bill"
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert "next_action" not in second["data"]
+
+
+@pytest.mark.asyncio
+async def test_flag_off_restores_raw_result(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", False)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    result = {"ok": True, "data": {"url": "https://example.com/bill"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://example.com/bill")
+    assert "actionable_targets" not in result["data"]
+    assert "next_action" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_same_signature_different_url_not_steered(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    await _seed(ctx, monkeypatch, _packet(), "https://app.example.com/a")
+    second = await _seed(ctx, monkeypatch, _packet(), "https://app.example.com/b")
+    assert "next_action" not in second["data"]
+
+
+@pytest.mark.asyncio
+async def test_hash_route_change_not_steered(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    await _seed(ctx, monkeypatch, _packet(), "https://app.example.com/wizard#/step1")
+    second = await _seed(ctx, monkeypatch, _packet(), "https://app.example.com/wizard#/step2")
+    assert "next_action" not in second["data"]
+
+
+@pytest.mark.asyncio
+async def test_repeat_scalar_result_sheds_under_cap(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/bill"
+
+    async def fake(c, *, url):
+        return _packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "x" * 6000
+    first = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    serialized = json.dumps(second, default=str)
+    assert second["data"].get("next_action") == "click"
+    assert second["data"].get("actionable_targets")
+    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+
+
+@pytest.mark.asyncio
+async def test_repeat_nested_result_sheds_under_cap(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/bill"
+
+    async def fake(c, *, url):
+        return _packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+
+    def payload() -> dict:
+        return {
+            "url": url,
+            "result": {
+                "html": "<html>" + ("<div>row</div>" * 600) + "</html>",
+                "text": "May 5 2026 $4,210.55 " * 80,
+                "buttons": [f"button-{i}" for i in range(50)],
+            },
+        }
+
+    first = {"ok": True, "data": payload()}
+    assert len(json.dumps(first, default=str)) > 8000
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": payload()}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    serialized = json.dumps(second, default=str)
+    assert second["data"].get("next_action") == "click"
+    assert second["data"].get("actionable_targets")
+    assert len(serialized) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+    assert '"next_action"' in serialized[: scouting._RECENT_TOOL_OUTPUT_CHAR_CAP]
+
+
+@pytest.mark.asyncio
+async def test_first_evaluate_large_result_not_shed(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/bill"
+
+    async def fake(c, *, url):
+        return _packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "x" * 6000
+    first = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    assert first["data"]["result"] == big
+    assert "next_action" not in first["data"]
+
+
+@pytest.mark.asyncio
+async def test_non_serializable_data_does_not_raise(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = "seed"
+    ctx.last_evaluate_actionable_url = "https://app.example.com/bill"
+
+    async def fake(c, *, url):
+        raise TypeError("boom")
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    result = {"ok": True, "data": {"url": "https://app.example.com/bill"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://app.example.com/bill")
+    assert "actionable_targets" not in result["data"]
+    assert "next_action" not in result["data"]
+    assert ctx.last_evaluate_actionable_signature is None
+
+
+def test_identities_cover_all_collections() -> None:
+    identities = scouting._actionable_target_identities(_full_packet())
+    selectors = {sel for sel, _ in identities}
+    assert {"#user", "#login", "#print", "#results", "#close"} <= selectors
+
+
+@pytest.mark.asyncio
+async def test_probe_none_leaves_data_untouched_and_resets(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = "seed"
+    ctx.last_evaluate_actionable_url = "https://app.example.com/x"
+
+    async def fake(c, *, url):
+        return None
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    result = {"ok": True, "data": {"url": "https://app.example.com/x"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://app.example.com/x")
+    assert result["data"] == {"url": "https://app.example.com/x"}
+    assert ctx.last_evaluate_actionable_signature is None
+
+
+@pytest.mark.asyncio
+async def test_probe_empty_collections_no_steer(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+
+    async def fake(c, *, url):
+        return {"forms": [], "navigation_targets": [], "result_containers": []}
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    result = {"ok": True, "data": {"url": "https://app.example.com/x"}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, result, url="https://app.example.com/x")
+    assert "actionable_targets" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_interaction_between_evaluates_suppresses_steer(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    ctx.scouted_interactions = []
+    ctx.scout_trajectory = []
+    url = "https://app.example.com/bill"
+    await _seed(ctx, monkeypatch, _packet(), url)
+    scouting._record_scouted_interaction(ctx, tool_name="click", selector="#print", source_url=url)
+    second = await _seed(ctx, monkeypatch, _packet(), url)
+    assert "next_action" not in second["data"]
+
+
+@pytest.mark.asyncio
+async def test_steer_front_runs_loop_guard(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot.loop_detection import MAX_CONSECUTIVE_SAME_TOOL, detect_tool_loop
+
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    url = "https://app.example.com/bill"
+    await _seed(ctx, monkeypatch, _packet(), url)
+    second = await _seed(ctx, monkeypatch, _packet(), url)
+    assert second["data"].get("next_action") == "click"
+
+    tracker: list[str] = []
+    assert detect_tool_loop(tracker, "evaluate") is None  # evaluate #1 post-hook runs
+    assert detect_tool_loop(tracker, "evaluate") is None  # evaluate #2 post-hook runs + steers
+    assert detect_tool_loop(tracker, "evaluate") is not None  # evaluate #3 trips the guard
+    assert MAX_CONSECUTIVE_SAME_TOOL == 3
+
+
+class _FakeDiscoveryServer:
+    def __init__(self, click_result: dict) -> None:
+        self.click_result = click_result
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_internal_tool(self, tool_name: str, args: dict) -> dict:
+        self.calls.append((tool_name, args))
+        return self.click_result
+
+
+def _auto_act_ctx(server: _FakeDiscoveryServer) -> AgentContext:
+    ctx = _ctx()
+    ctx.last_evaluate_actionable_signature = None
+    ctx.last_evaluate_actionable_url = None
+    ctx.last_auto_acted_signature = None
+    ctx.browser_session_id = None
+    ctx.scouted_interactions = []
+    ctx.scout_trajectory = []
+    ctx.discovery_mcp_server = server
+    return ctx
+
+
+def _single_link_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [
+            {"selector": "#stmt", "text": "Download Statement", "href": "https://apexbiz.example.com/apexbiz.pdf"}
+        ],
+        "result_containers": [],
+    }
+
+
+def _two_link_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [
+            {"selector": "#a", "text": "First Doc", "href": "https://apexbiz.example.com/a.pdf"},
+            {"selector": "#b", "text": "Second Doc", "href": "https://apexbiz.example.com/b.pdf"},
+        ],
+        "result_containers": [],
+    }
+
+
+def _pay_submit_packet() -> dict:
+    return {
+        "forms": [
+            {
+                "method": "post",
+                "fields": [],
+                "submit_controls": [{"selector": "#pay", "text": "Pay $4,210.55", "type": "submit"}],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+    }
+
+
+def _bare_button_submit_packet() -> dict:
+    # `<button>Continue</button>` (HTML-default submit) inside a method=post form:
+    # the structured-evidence producer reports type='button', so the writing-submit
+    # guard never fires. Nav-only candidacy is what keeps it from being auto-acted.
+    return {
+        "forms": [
+            {
+                "method": "post",
+                "fields": [],
+                "submit_controls": [{"selector": "#continue", "text": "Continue", "type": "button"}],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+    }
+
+
+def _type_button_packet() -> dict:
+    return {
+        "forms": [
+            {
+                "method": "post",
+                "fields": [],
+                "submit_controls": [{"selector": "#go", "text": "Go", "type": "button"}],
+            }
+        ],
+        "navigation_targets": [],
+        "result_containers": [],
+    }
+
+
+def _empty_text_link_packet() -> dict:
+    return {
+        "forms": [],
+        "navigation_targets": [{"selector": "#icon", "text": "   ", "href": "https://apexbiz.example.com/x"}],
+        "result_containers": [],
+    }
+
+
+def _post_click_packet() -> dict:
+    return {
+        "page_title": "Statement",
+        "forms": [],
+        "navigation_targets": [{"selector": "#back", "text": "Back", "href": "https://apexbiz.example.com/home"}],
+        "result_containers": [],
+    }
+
+
+def test_auto_act_candidate_rejects_multiple() -> None:
+    assert scouting._auto_act_candidate(_two_link_packet()) is None
+
+
+def test_auto_act_candidate_rejects_high_tier_submit() -> None:
+    assert scouting._auto_act_candidate(_pay_submit_packet()) is None
+
+
+def test_auto_act_candidate_rejects_bare_button_submit() -> None:
+    # A lone low-tier submit in a method=post form is a form submit, never a nav link.
+    assert scouting._auto_act_candidate(_bare_button_submit_packet()) is None
+
+
+def test_auto_act_candidate_rejects_type_button() -> None:
+    assert scouting._auto_act_candidate(_type_button_packet()) is None
+
+
+def test_auto_act_candidate_rejects_empty_text_link() -> None:
+    assert scouting._auto_act_candidate(_empty_text_link_packet()) is None
+
+
+def test_auto_act_candidate_accepts_single_low_tier_link() -> None:
+    candidate = scouting._auto_act_candidate(_single_link_packet())
+    assert candidate == {"selector": "#stmt", "text": "Download Statement"}
+
+
+def test_auto_act_candidate_rejects_javascript_href() -> None:
+    packet = _single_link_packet()
+    packet["navigation_targets"][0]["href"] = "javascript:void(0)"
+    assert scouting._auto_act_candidate(packet) is None
+
+
+@pytest.mark.asyncio
+async def test_multiple_candidates_no_auto_act(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _two_link_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert server.calls == []
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+
+
+@pytest.mark.asyncio
+async def test_high_tier_no_auto_act(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _pay_submit_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert server.calls == []
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+
+
+@pytest.mark.asyncio
+async def test_bare_button_submit_no_auto_act(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/checkout"
+
+    async def fake(c, *, url):
+        return _bare_button_submit_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert server.calls == []
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+
+
+@pytest.mark.asyncio
+async def test_empty_text_link_no_auto_act(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _empty_text_link_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert server.calls == []
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+
+
+@pytest.mark.asyncio
+async def test_single_low_tier_link_auto_acts(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+    packets = [_single_link_packet(), _single_link_packet(), _post_click_packet()]
+    idx = {"i": 0}
+
+    async def fake(c, *, url):
+        packet = packets[idx["i"]]
+        idx["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert server.calls[0][1] == {"selector": "#stmt", "selector_mode": "direct"}
+    assert second["data"]["auto_acted"] == {"tool": "click", "selector": "#stmt", "text": "Download Statement"}
+    assert second["data"]["page"]["page_title"] == "Statement"
+    assert "next_action" not in second["data"]
+    assert "actionable_targets" not in second["data"]
+    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_auto_act_post_evidence_none_sheds_bulky_result_under_cap(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+    # First two calls feed the steer probe; the third is the post-click extractor (None).
+    evidence_queue: list[dict | None] = [_single_link_packet(), _single_link_packet(), None]
+    idx = {"i": 0}
+
+    async def fake(c, *, url):
+        packet = evidence_queue[idx["i"]]
+        idx["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "x" * 10000
+    first = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert "auto_acted" in second["data"]
+    assert second["data"]["auto_acted"]["selector"] == "#stmt"
+    assert second["data"]["auto_acted"].get("note")
+    assert "page" not in second["data"]
+    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_auto_act_success_branch_sheds_oversized_page_under_cap(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    def fat_post_click() -> dict:
+        return {
+            "page_title": "Statement",
+            "forms": [
+                {
+                    "fields": [
+                        {"selector": f"#f{i}", "label": f"Field number {i} with a long label"} for i in range(40)
+                    ],
+                    "submit_controls": [{"selector": f"#s{i}", "text": f"Submit option {i}"} for i in range(20)],
+                }
+            ],
+            "navigation_targets": [
+                {"selector": f"#n{i}", "text": f"Navigation link number {i} on the page"} for i in range(40)
+            ],
+            "result_containers": [],
+            "modal_overlays": [
+                {"dismiss_controls": [{"selector": f"#d{i}", "text": f"Dismiss control {i}"} for i in range(10)]}
+            ],
+        }
+
+    evidence_queue: list[dict] = [_single_link_packet(), _single_link_packet(), fat_post_click()]
+    idx = {"i": 0}
+
+    async def fake(c, *, url):
+        packet = evidence_queue[idx["i"]]
+        idx["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    big = "x" * 10000
+    first = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url, "result": big}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert "auto_acted" in second["data"]
+    assert "page" in second["data"]
+    assert len(json.dumps(second, default=str)) <= scouting._RECENT_TOOL_OUTPUT_CHAR_CAP
+
+
+@pytest.mark.asyncio
+async def test_auto_act_re_arms_on_changed_signature(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    def second_page_link() -> dict:
+        return {
+            "forms": [],
+            "navigation_targets": [
+                {"selector": "#next-stmt", "text": "Next Statement", "href": "https://apexbiz.example.com/next.pdf"}
+            ],
+            "result_containers": [],
+        }
+
+    # eval1+eval2: page A (auto-acts) -> post-click evidence;
+    # eval3+eval4: page B (a genuinely changed page) re-arms and auto-acts again.
+    evidence_queue: list[dict] = [
+        _single_link_packet(),
+        _single_link_packet(),
+        _post_click_packet(),
+        second_page_link(),
+        second_page_link(),
+        _post_click_packet(),
+    ]
+    idx = {"i": 0}
+
+    async def fake(c, *, url):
+        packet = evidence_queue[idx["i"]]
+        idx["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    for _ in range(4):
+        result = {"ok": True, "data": {"url": url}}
+        await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+    clicked = [call[1]["selector"] for call in server.calls if call[0] == "skyvern_click"]
+    assert clicked == ["#stmt", "#next-stmt"]
+
+
+@pytest.mark.asyncio
+async def test_auto_act_idempotent_on_unchanged_signature(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _single_link_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    for _ in range(3):
+        result = {"ok": True, "data": {"url": url}}
+        await scouting._maybe_steer_evaluate_to_action(ctx, result, url=url)
+    assert [call[0] for call in server.calls] == ["skyvern_click"]
+
+
+@pytest.mark.asyncio
+async def test_auto_act_flag_off_pure_advisory(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", False)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _single_link_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert server.calls == []
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+
+
+@pytest.mark.asyncio
+async def test_auto_act_click_failure_degrades_to_advisory(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": False, "error": "element not found"})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+
+    async def fake(c, *, url):
+        return _single_link_packet()
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert [call[0] for call in server.calls] == ["skyvern_click"]
+    assert "auto_acted" not in second["data"]
+    assert second["data"].get("next_action") == "click"
+    assert second["data"].get("actionable_targets")
+
+
+@pytest.mark.asyncio
+async def test_auto_act_front_runs_the_third_evaluate(monkeypatch) -> None:
+    from skyvern.forge.sdk.copilot.loop_detection import detect_tool_loop
+
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_ACTIONABLE_TARGET_STEER_ENABLED", True)
+    monkeypatch.setattr(settings, "COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED", True)
+    server = _FakeDiscoveryServer({"ok": True, "data": {"selector": "#stmt"}})
+    ctx = _auto_act_ctx(server)
+    url = "https://apexbiz.example.com/bill"
+    packets = [_single_link_packet(), _single_link_packet(), _post_click_packet()]
+    idx = {"i": 0}
+
+    async def fake(c, *, url):
+        packet = packets[idx["i"]]
+        idx["i"] += 1
+        return packet
+
+    monkeypatch.setattr(scouting, "_scout_act_observe_page_evidence", fake)
+    first = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, first, url=url)
+    second = {"ok": True, "data": {"url": url}}
+    await scouting._maybe_steer_evaluate_to_action(ctx, second, url=url)
+    assert second["data"]["auto_acted"]["selector"] == "#stmt"
+    assert ctx.scouted_interactions and ctx.scouted_interactions[-1]["tool_name"] == "click"
+
+    # The auto-act click runs via call_internal_tool, which bypasses detect_tool_loop
+    # and never appends to the consecutive-tool tracker, so it does NOT reset the streak.
+    # The real front-run: the click changes the page, so evaluate #2 returns the post-click
+    # auto_acted result and the model sees new content rather than issuing a 3rd identical
+    # evaluate. If it did, SKY-10982's consecutive-same-tool guard still trips on evaluate #3
+    # as the safe backstop, shown here.
+    tripping: list[str] = []
+    detect_tool_loop(tripping, "evaluate")
+    detect_tool_loop(tripping, "evaluate")
+    assert detect_tool_loop(tripping, "evaluate") is not None
