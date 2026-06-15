@@ -10,8 +10,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from structlog.testing import capture_logs
 
+from skyvern.forge.sdk.copilot import hooks as hooks_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
 
@@ -19,6 +22,10 @@ from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_
 @dataclass
 class _FakeContext:
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
+    workflow_permanent_id: str = "wpid_example"
+    turn_id: str = "turn_example"
+    workflow_copilot_chat_id: str = "chat_example"
+    total_tokens_used: int | None = None
 
 
 # `on_tool_end(context, agent, tool, result)` only reads `tool` and `result`;
@@ -62,6 +69,21 @@ async def test_on_tool_end_appends_generic_tool_entry() -> None:
     assert entry["tool"] == "navigate_browser"
     assert "summary" in entry
     assert "output_preview" not in entry  # non-whitelisted tool
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_logs_copilot_turn_identifiers() -> None:
+    ctx = _FakeContext(total_tokens_used=123)
+    hooks = CopilotRunHooks(ctx)
+
+    output = _mcp_text_output({"ok": True, "data": {"url": "https://example.com"}})
+    with capture_logs() as logs:
+        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("navigate_browser"), output)
+
+    completed = next(log for log in logs if log["event"] == "copilot tool completed")
+    assert completed["workflow_permanent_id"] == "wpid_example"
+    assert completed["turn_id"] == "turn_example"
+    assert completed["workflow_copilot_chat_id"] == "chat_example"
 
 
 @pytest.mark.asyncio
@@ -193,12 +215,38 @@ async def test_on_tool_end_swallows_unserializable_output() -> None:
             raise RuntimeError("str boom")
 
     payload = {"ok": True, "data": {"blocks": [{"label": "bad", "output": _Unserializable()}]}}
-    await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), payload)
+    with capture_logs() as logs:
+        await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("run_blocks_and_collect_debug"), payload)
 
     # The recording path raised inside json.dumps before append. The guard
     # swallowed it, so the invariant is "the run did not crash" -- and the
     # activity entry was dropped. That is the acceptable trade for observability.
     assert ctx.tool_activity == []
+    warning = next(
+        log for log in logs if log["event"] == "CopilotRunHooks.on_tool_end recording failed, skipping entry"
+    )
+    assert warning["workflow_permanent_id"] == "wpid_example"
+    assert warning["turn_id"] == "turn_example"
+    assert warning["workflow_copilot_chat_id"] == "chat_example"
+
+
+@pytest.mark.asyncio
+async def test_on_tool_end_goal_satisfied_log_includes_copilot_turn_identifiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = _FakeContext()
+    hooks = CopilotRunHooks(ctx)
+    monkeypatch.setattr(hooks_module, "_tool_completion_satisfies_turn", lambda *_args: True)
+
+    output = _mcp_text_output({"ok": True, "data": {"workflow_run_id": "wrid_example"}})
+    with capture_logs() as logs:
+        with pytest.raises(CopilotGoalSatisfied):
+            await hooks.on_tool_end(_UNUSED, _UNUSED, _fake_tool("update_and_run_blocks"), output)
+
+    satisfied = next(log for log in logs if log["event"] == "copilot tool satisfied goal; stopping agent loop")
+    assert satisfied["workflow_permanent_id"] == "wpid_example"
+    assert satisfied["turn_id"] == "turn_example"
+    assert satisfied["workflow_copilot_chat_id"] == "chat_example"
 
 
 class TestCopilotToCallToolResult:
