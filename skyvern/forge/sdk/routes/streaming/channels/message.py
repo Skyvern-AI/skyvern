@@ -69,6 +69,7 @@ class MessageKind(enum.StrEnum):
     RELOAD = "reload"
     RECORDING_CAPTURE_PAUSE = "recording-capture-pause"
     RECORDING_CAPTURE_RESUME = "recording-capture-resume"
+    RECORDING_REARM_CAPTURE = "recording-rearm-capture"
     RECORDING_INTERPRETATION_UPDATE = "recording-interpretation-update"
     SCREENSHOT = "screenshot"
     TAKE_CONTROL = "take-control"
@@ -114,6 +115,7 @@ MessageKinds = t.Literal[
     MessageKind.RELOAD,
     MessageKind.RECORDING_CAPTURE_PAUSE,
     MessageKind.RECORDING_CAPTURE_RESUME,
+    MessageKind.RECORDING_REARM_CAPTURE,
     MessageKind.RECORDING_INTERPRETATION_UPDATE,
     MessageKind.SCREENSHOT,
     MessageKind.TAKE_CONTROL,
@@ -146,6 +148,11 @@ class MessageInRecordingCapturePause(Message):
 @dataclasses.dataclass
 class MessageInRecordingCaptureResume(Message):
     kind: t.Literal[MessageKind.RECORDING_CAPTURE_RESUME] = MessageKind.RECORDING_CAPTURE_RESUME
+
+
+@dataclasses.dataclass
+class MessageInRecordingRearmCapture(Message):
+    kind: t.Literal[MessageKind.RECORDING_REARM_CAPTURE] = MessageKind.RECORDING_REARM_CAPTURE
 
 
 @dataclasses.dataclass
@@ -287,6 +294,7 @@ MessageIn = (
     | MessageInNavigate
     | MessageInRecordingCapturePause
     | MessageInRecordingCaptureResume
+    | MessageInRecordingRearmCapture
     | MessageInReload
     | MessageInTakeControl
     | MessageInTakeScreenshot
@@ -338,6 +346,8 @@ def reify_channel_message(data: dict) -> ChannelMessage:
             return MessageInRecordingCapturePause()
         case MessageKind.RECORDING_CAPTURE_RESUME:
             return MessageInRecordingCaptureResume()
+        case MessageKind.RECORDING_REARM_CAPTURE:
+            return MessageInRecordingRearmCapture()
         case MessageKind.GET_BROWSER_URL:
             return MessageInGetBrowserUrl()
         case MessageKind.GO_BACK:
@@ -627,12 +637,6 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     await send_error(message.kind, "Failed to paste into browser.")
 
             case MessageKind.BEGIN_EXFILTRATION:
-                if exfiltration_channel is not None:
-                    LOG.error(
-                        "MessageChannel: cannot begin exfiltration: already active.", message_channel=message_channel
-                    )
-                    return
-
                 vnc_channel = get_vnc_channel(message_channel.client_id)
 
                 if not vnc_channel:
@@ -649,20 +653,26 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     else None
                 )
 
-                if browser_session_id and message.workflow_permanent_id and message.live_interpretation_enabled:
+                def on_interpretation_update(update: RecordingInterpretationUpdate) -> None:
+                    message_channel.send_nowait(
+                        messages=[
+                            MessageOutRecordingInterpretationUpdate(
+                                interpretation_session_id=update.interpretation_session_id,
+                                session_revision=update.session_revision,
+                                steps=update.steps,
+                                pending=update.pending,
+                                finalized=update.finalized,
+                            )
+                        ]
+                    )
 
-                    def on_interpretation_update(update: RecordingInterpretationUpdate) -> None:
-                        message_channel.send_nowait(
-                            messages=[
-                                MessageOutRecordingInterpretationUpdate(
-                                    interpretation_session_id=update.interpretation_session_id,
-                                    session_revision=update.session_revision,
-                                    steps=update.steps,
-                                    pending=update.pending,
-                                    finalized=update.finalized,
-                                )
-                            ]
-                        )
+                def ensure_live_interpretation() -> None:
+                    nonlocal live_interpretation_browser_session_id
+
+                    if not (
+                        browser_session_id and message.workflow_permanent_id and message.live_interpretation_enabled
+                    ):
+                        return
 
                     interpretation_registry.start_session(
                         browser_session_id=browser_session_id,
@@ -671,6 +681,13 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                         on_update=on_interpretation_update,
                     )
                     live_interpretation_browser_session_id = browser_session_id
+
+                if exfiltration_channel is not None:
+                    ensure_live_interpretation()
+                    await exfiltration_channel.rearm_all_pages()
+                    return
+
+                ensure_live_interpretation()
 
                 def on_event(events: list[ExfiltratedEvent]) -> None:
                     for event in events:
@@ -802,6 +819,10 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
                     exfiltration_channel.resume_capture()
                 if live_interpretation_browser_session_id:
                     interpretation_registry.resume_capture(live_interpretation_browser_session_id)
+
+            case MessageKind.RECORDING_REARM_CAPTURE:
+                if exfiltration_channel is not None:
+                    await exfiltration_channel.rearm_all_pages()
 
             case MessageKind.ERROR:
                 await send(message)
@@ -959,8 +980,8 @@ async def loop_stream_messages(message_channel: MessageChannel) -> None:
         LOG.debug(f"{class_name} Closing the message channel stream.", **message_channel.identity)
         if exfiltration_channel is not None:
             await exfiltration_channel.stop()
-        if live_interpretation_browser_session_id:
-            await interpretation_registry.stop_session(live_interpretation_browser_session_id)
+        # Live interpretation is torn down only on explicit end-exfiltration so a
+        # disconnect→reconnect can resume the same in-flight recording session.
         await message_channel.close(reason="loop-channel-closed")
 
 

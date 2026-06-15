@@ -68,7 +68,8 @@ class ExfiltrationChannel(CdpChannel):
     )
     _binding_registered_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
     _adorn_init_script_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
-    _rearm_in_flight_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
+    _rearm_in_flight_pages: t.ClassVar[weakref.WeakKeyDictionary[Page, bool]] = weakref.WeakKeyDictionary()
+    _rearm_pending_full_nav_pages: t.ClassVar[weakref.WeakSet[Page]] = weakref.WeakSet()
 
     def __init__(self, *, on_event: OnExfiltrationEvent, vnc_channel: VncChannel) -> None:
         self.cdp_session: CDPSession | None = None
@@ -339,21 +340,53 @@ class ExfiltrationChannel(CdpChannel):
 
         self._emit_events(messages)
 
-        if event_name == "nav:frame_navigated":
+        if event_name in ("nav:frame_navigated", "nav:navigated_within_document"):
             page = self.page
-            if not page or page.url.startswith("devtools:"):
-                return
+            if page and not page.url.startswith("devtools:"):
+                self._schedule_page_rearm(
+                    page,
+                    event_name=event_name,
+                    wait_for_load=event_name == "nav:frame_navigated",
+                )
 
-            if page in self._rearm_in_flight_pages:
-                return
-
-            self._track_event_task(self._rearm_page_after_navigation(page, event_name=event_name))
-
-    async def _rearm_page_after_navigation(self, page: Page, *, event_name: str) -> None:
+    def _schedule_page_rearm(self, page: Page, *, event_name: str, wait_for_load: bool) -> None:
         if page.url.startswith("devtools:"):
             return
 
-        self._rearm_in_flight_pages.add(page)
+        in_flight_wait_for_load = self._rearm_in_flight_pages.get(page)
+        if in_flight_wait_for_load is not None:
+            if wait_for_load and not in_flight_wait_for_load:
+                self._rearm_pending_full_nav_pages.add(page)
+            return
+
+        self._track_event_task(
+            self._rearm_page_after_navigation(page, event_name=event_name, wait_for_load=wait_for_load)
+        )
+
+    async def rearm_all_pages(self) -> None:
+        browser_context = self.browser_context
+        if not browser_context:
+            page = self.page
+            if page and not page.url.startswith("devtools:"):
+                self._schedule_page_rearm(page, event_name="recording:rearm", wait_for_load=False)
+            return
+
+        for page in list(browser_context.pages):
+            if page.url.startswith("devtools:"):
+                continue
+            self._schedule_page_rearm(page, event_name="recording:rearm", wait_for_load=False)
+
+    async def _rearm_page_after_navigation(
+        self,
+        page: Page,
+        *,
+        event_name: str,
+        wait_for_load: bool = True,
+    ) -> None:
+        if page.url.startswith("devtools:"):
+            return
+
+        self._rearm_in_flight_pages[page] = wait_for_load
         try:
             LOG.info(
                 "re-applying exfiltration and adornment after navigation",
@@ -362,16 +395,17 @@ class ExfiltrationChannel(CdpChannel):
                 url=page.url,
             )
 
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-            except Exception:
-                LOG.warning(
-                    "navigation re-arm timed out waiting for domcontentloaded",
-                    class_name=self.class_name,
-                    event_name=event_name,
-                    url=page.url,
-                    exc_info=True,
-                )
+            if wait_for_load:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+                except Exception:
+                    LOG.warning(
+                        "navigation re-arm timed out waiting for domcontentloaded",
+                        class_name=self.class_name,
+                        event_name=event_name,
+                        url=page.url,
+                        exc_info=True,
+                    )
 
             try:
                 await self._ensure_binding(page)
@@ -386,7 +420,10 @@ class ExfiltrationChannel(CdpChannel):
                     exc_info=True,
                 )
         finally:
-            self._rearm_in_flight_pages.discard(page)
+            self._rearm_in_flight_pages.pop(page, None)
+            if page in self._rearm_pending_full_nav_pages:
+                self._rearm_pending_full_nav_pages.discard(page)
+                self._schedule_page_rearm(page, event_name="nav:frame_navigated", wait_for_load=True)
 
     async def adorn(self, page: Page) -> t.Self:
         """Add a mouse-following follower to the page."""
