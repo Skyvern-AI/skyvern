@@ -50,10 +50,12 @@ from skyvern.exceptions import (
     ConditionalBranchEvaluationError,
     ContextParameterValueNotFound,
     DownloadFileMaxSizeExceeded,
+    FailedToGetTOTPVerificationCode,
     MalformedBranchEvaluationError,
     MissingBrowserState,
     MissingBrowserStatePage,
     MissingStarterUrl,
+    NoTOTPVerificationCodeFound,
     PDFParsingError,
     SkyvernException,
     TaskNotFound,
@@ -136,6 +138,7 @@ from skyvern.schemas.workflows import (
     FileType,
     FileUploadDestination,
 )
+from skyvern.services import otp_service
 from skyvern.services.error_detection_service import detect_user_defined_errors_for_task
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
@@ -3346,6 +3349,106 @@ class Credential(SimpleNamespace):
     pass
 
 
+class CodeBlockOTPError(Exception):
+    """Sanitized OTP-primitive error: never includes the identifier, URL, code, or seed."""
+
+
+def _register_code_block_secret(workflow_run_context: WorkflowRunContext, value: str) -> None:
+    fresh_key = workflow_run_context.generate_random_secret_id()
+    workflow_run_context.secrets[fresh_key] = value
+
+
+async def _resolve_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+    *,
+    budget_seconds: int,
+) -> str:
+    """Resolve a fresh OTP at call time for one credential: re-mint its TOTP (the staleness
+    fix) or poll its email/SMS/magic-link, registering the value as a secret before return.
+    The run context is re-resolved from workflow_run_id, never captured in the bound method's
+    closure, so user code cannot reach the seed through the method's cells."""
+    if not workflow_run_id:
+        raise CodeBlockOTPError("OTP is unavailable: no workflow run is associated with this code block.")
+
+    workflow_run_context = app.WORKFLOW_CONTEXT_MANAGER.get_workflow_run_context(workflow_run_id)
+    if workflow_run_context is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run context could not be resolved.")
+
+    otp_value = otp_service.try_generate_totp_for_credential(
+        workflow_run_context, credential_parameter_key, workflow_run_id
+    )
+    if otp_value is not None:
+        _register_code_block_secret(workflow_run_context, otp_value.value)
+        return otp_value.value
+
+    totp_identifier = workflow_run_context.get_credential_totp_identifier(credential_parameter_key)
+    if not totp_identifier:
+        raise CodeBlockOTPError(
+            "No OTP source is configured for this credential. "
+            "Add a TOTP secret or an email/SMS identifier to the credential."
+        )
+
+    if not organization_id:
+        raise CodeBlockOTPError("OTP is unavailable: no organization is associated with this code block.")
+
+    # Run-start anchor disqualifies codes that predate this run (identifiers are shared across runs).
+    workflow_run = await app.DATABASE.workflow_runs.get_workflow_run(workflow_run_id)
+    if workflow_run is None:
+        raise CodeBlockOTPError("OTP is unavailable: the workflow run could not be loaded.")
+
+    try:
+        polled = await asyncio.wait_for(
+            otp_service.poll_otp_value(
+                organization_id=organization_id,
+                workflow_id=workflow_run.workflow_id,
+                workflow_run_id=workflow_run_id,
+                workflow_permanent_id=workflow_run.workflow_permanent_id,
+                totp_identifier=totp_identifier,
+                created_after=workflow_run.started_at,
+            ),
+            timeout=budget_seconds,
+        )
+    except asyncio.TimeoutError:
+        raise CodeBlockOTPError(f"OTP was not received within {budget_seconds} seconds.")
+    except (NoTOTPVerificationCodeFound, FailedToGetTOTPVerificationCode):
+        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+
+    if polled is None:
+        raise CodeBlockOTPError("OTP could not be retrieved for this credential.")
+
+    _register_code_block_secret(workflow_run_context, polled.value)
+    return polled.value
+
+
+def _bind_code_block_otp(
+    credential_parameter_key: str,
+    organization_id: str | None,
+    workflow_run_id: str | None,
+) -> Callable[[], Awaitable[str]]:
+    """Build the awaitable ``otp`` method bound onto a code block's Credential, closing over
+    only opaque ids so the seed stays unreachable from the method's cells."""
+
+    async def otp() -> str:
+        return await _resolve_code_block_otp(
+            credential_parameter_key,
+            organization_id,
+            workflow_run_id,
+            budget_seconds=settings.CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS,
+        )
+
+    return otp
+
+
+async def _code_block_otp_builtin(credential: object) -> str:
+    """Top-level ``await otp(credential)`` sugar that forwards to the credential's bound otp()."""
+    bound = getattr(credential, "otp", None)
+    if not callable(bound):
+        raise CodeBlockOTPError("otp() expects a credential with an OTP source.")
+    return await bound()
+
+
 class CodeBlock(Block):
     # There is a mypy bug with Literal. Without the type: ignore, mypy will raise an error:
     # Parameter 1 of Literal[...] cannot be of type "Any"
@@ -3489,6 +3592,7 @@ class CodeBlock(Block):
             "json": SimpleNamespace(dumps=json.dumps, loads=json.loads),
             "html": SimpleNamespace(escape=html.escape),
             "Exception": Exception,
+            "otp": _code_block_otp_builtin,
         }
 
     def generate_async_user_function(
@@ -3630,6 +3734,9 @@ async def wrapper({default_args}):
                         totp_secret = workflow_run_context.get_original_secret_value_or_none(totp_secret_key)
                         if totp_secret:
                             secret_value = pyotp.TOTP(totp_secret).now()
+                            # The pre-minted .totp string is exposed to user code (legacy path),
+                            # so register it for masking like any other resolved secret.
+                            _register_code_block_secret(workflow_run_context, secret_value)
                         else:
                             LOG.warning(
                                 "No TOTP secret found, returning the parameter value as is",
@@ -3639,7 +3746,9 @@ async def wrapper({default_args}):
                     real_secret_value = secret_value if secret_value is not None else credential_place_holder
                     parameter_values[credential_field] = real_secret_value
                     real_secret_values[credential_field] = real_secret_value
-                parameter_values[parameter.key] = Credential(**real_secret_values)
+                credential_namespace = Credential(**real_secret_values)
+                credential_namespace.otp = _bind_code_block_otp(parameter.key, organization_id, workflow_run_id)
+                parameter_values[parameter.key] = credential_namespace
             else:
                 secret_value = workflow_run_context.get_original_secret_value_or_none(value)
                 parameter_values[parameter.key] = secret_value if secret_value is not None else value
@@ -3673,9 +3782,12 @@ async def wrapper({default_args}):
             )
         except Exception as e:
             exc = CustomizedCodeException(e)
+            # User code can raise an exception carrying a resolved secret (e.g.
+            # `raise Exception(await cred.otp())`); mask before it reaches the persisted reason.
+            failure_reason = workflow_run_context.mask_secrets_in_data(exc.message)
             return await self.build_block_result(
                 success=False,
-                failure_reason=exc.message,
+                failure_reason=failure_reason,
                 output_parameter_value=None,
                 status=BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -3685,6 +3797,10 @@ async def wrapper({default_args}):
         result = json.loads(
             json.dumps(result, default=lambda value: f"Object '{type(value)}' is not JSON serializable")
         )
+        # Mask resolved secrets (OTP codes, passwords) a user assigned to a local before they
+        # reach captured locals, the persisted output, or the logged value. Mirrors
+        # HttpRequestBlock and is stronger than the name-based excluded_parameter_keys filter.
+        result = workflow_run_context.mask_secrets_in_data(result)
 
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, result)
         return await self.build_block_result(

@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
     CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS: int = 300
+    # In-block OTP email/SMS poll budget; bounded under CODE_BLOCK_EXECUTION_TIMEOUT_SECONDS
+    # so one fetch can't consume the whole block. TOTP re-mint is instant and unaffected.
+    CODE_BLOCK_OTP_POLL_TIMEOUT_SECONDS: int = 120
     OPTION_LOADING_TIMEOUT_MS: int = 600000
     MAX_STEPS_PER_RUN: int = 10
     MAX_STEPS_PER_TASK_V2: int = 25
