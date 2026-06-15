@@ -36,7 +36,12 @@ from skyvern.forge.prompts import prompt_engine
 from skyvern.forge.sdk.copilot.blocker_signal import (
     CopilotToolBlockerSignal,
     assert_clean_user_facing_text,
+    clear_terminal_evidence_on_workflow_edit,
+    compose_terminal_evidence_user_facing_reason,
     contains_internal_machinery_leak,
+    refresh_held_loop_blocker_evidence,
+    terminal_evidence_from_ctx,
+    terminal_evidence_has_recorded_state,
 )
 from skyvern.forge.sdk.copilot.blocker_signal import to_trace_data as blocker_signal_to_trace_data
 from skyvern.forge.sdk.copilot.build_phase import initial_build_phase
@@ -1241,6 +1246,9 @@ def _build_turn_halt_exit_result(
     halt: TurnHalt,
 ) -> AgentResult:
     signal = halt.blocker_signal
+    if isinstance(signal, CopilotToolBlockerSignal) and signal.blocker_kind == "loop_detected":
+        refresh_held_loop_blocker_evidence(ctx)
+        signal = ctx.blocker_signal if isinstance(ctx.blocker_signal, CopilotToolBlockerSignal) else signal
     user_response = (
         signal.user_facing_reason
         if isinstance(signal, CopilotToolBlockerSignal)
@@ -2110,6 +2118,7 @@ async def _translate_to_agent_result(
         ctx.last_workflow = last_workflow
         ctx.last_workflow_yaml = last_workflow_yaml
         ctx.last_test_ok = None
+        clear_terminal_evidence_on_workflow_edit(ctx)
         # Inline REPLACE_WORKFLOW is untested by construction; emit a draft
         # envelope without staging onto ctx so terminal auto-accept can't fire,
         # and suppress the workflow payload so the canvas does not render it.
@@ -2714,6 +2723,9 @@ def _build_output_policy_blocked_result(
     )
     request_policy = ctx.request_policy if isinstance(ctx.request_policy, RequestPolicy) else None
     add_saved_draft_copy = False
+    fallback_user_response: str | None = None
+    composed_from_recorded_evidence = False
+    evidence = terminal_evidence_from_ctx(ctx)
     if (
         request_policy is not None
         and request_policy.clarification_question
@@ -2744,8 +2756,29 @@ def _build_output_policy_blocked_result(
             "I could not safely return that chat reply, but the workflow draft is still saved. "
             "Please review the draft or adjust the request and try again."
         )
+        fallback_user_response = user_response
+        if terminal_evidence_has_recorded_state(evidence):
+            composed_response, tiers = compose_terminal_evidence_user_facing_reason(
+                "I could not safely return that chat reply.",
+                "Please review the recorded evidence or adjust the request and try again.",
+                evidence,
+            )
+            if any(tier != "draft" for tier in tiers):
+                user_response = composed_response
+                add_saved_draft_copy = "draft" in tiers
+                composed_from_recorded_evidence = True
     else:
         user_response = "I could not safely return that chat reply. Please adjust the request and try again."
+        fallback_user_response = user_response
+        if terminal_evidence_has_recorded_state(evidence):
+            composed_response, tiers = compose_terminal_evidence_user_facing_reason(
+                "I could not safely return that chat reply.",
+                "Please review the recorded evidence or adjust the request and try again.",
+                evidence,
+            )
+            if any(tier != "draft" for tier in tiers):
+                user_response = composed_response
+                composed_from_recorded_evidence = True
     if preserved_workflow is not None and add_saved_draft_copy:
         user_response = f"{user_response} {_SAVED_DRAFT_OUTPUT_POLICY_SUFFIX}"
     final_user_response, output_policy_outcome = apply_repeated_reply_guard(
@@ -2755,6 +2788,31 @@ def _build_output_policy_blocked_result(
         reason_code="output_policy_block",
         terminal_reason="output_policy_block",
     )
+    if composed_from_recorded_evidence and fallback_user_response is not None:
+        composed_verdict = evaluate_output_policy(
+            request_policy=ctx.request_policy,
+            response_type="ASK_QUESTION",
+            user_response=final_user_response,
+            global_llm_context=None,
+            workflow_yaml=preserved_workflow_yaml or prior_workflow_yaml,
+            has_workflow_proposal=preserved_workflow is not None,
+            workflow_was_persisted=ctx.workflow_persisted,
+            workflow_attempted=bool(ctx.last_run_blocks_workflow_run_id),
+            unvalidated=ctx.last_test_ok is not True,
+            output_kind=verdict.output_kind,
+        )
+        if not composed_verdict.allowed:
+            LOG.warning(
+                "copilot output-policy recorded-evidence fallback failed output policy; using generic fallback",
+                output_policy_reasons=[code.value for code in composed_verdict.reason_codes],
+            )
+            final_user_response, output_policy_outcome = apply_repeated_reply_guard(
+                final_text=fallback_user_response,
+                attempted_kind=ResponseKind.CLARIFY,
+                blocked_signatures=ctx.blocked_reply_signatures,
+                reason_code="output_policy_block",
+                terminal_reason="output_policy_block",
+            )
     return _make_agent_result(
         ctx,
         user_response=final_user_response,

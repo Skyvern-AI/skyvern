@@ -18,6 +18,7 @@ class RecordedRunOutcome:
     verdict: RecordedRunOutcomeVerdict
     reason_code: RunOutcomeReasonCode | None = None
     display_reason: str | None = None
+    workflow_run_id: str | None = None
 
 
 def run_outcome_display_reason(text: str | None) -> str | None:

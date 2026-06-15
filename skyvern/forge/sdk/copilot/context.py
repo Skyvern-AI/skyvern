@@ -424,6 +424,7 @@ class CopilotContext(AgentContext):
     # after a watchdog reconciliation read has cleared the retry guard.
     last_run_blocks_workflow_run_id: str | None = None
     last_successful_run_blocks_workflow_run_id: str | None = None
+    last_outcome_gate_workflow_run_id: str | None = None
     # Consecutive test runs whose data-producing blocks completed with no
     # meaningful output (missing, empty, or all-null fields). Resets when a
     # run produces real data. Used to escalate when the agent is stuck
