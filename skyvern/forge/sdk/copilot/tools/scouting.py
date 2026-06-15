@@ -20,6 +20,10 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     has_bounded_page_schema,
 )
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
+from skyvern.forge.sdk.copilot.reached_download_target import (
+    derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
 from skyvern.forge.sdk.copilot.runtime import (
     AgentContext,
     PendingBrowserInteractionObservation,
@@ -723,19 +727,36 @@ async def _auto_act_on_repeat(ctx: AgentContext, result: dict[str, Any], *, url:
     return True
 
 
-async def _maybe_steer_evaluate_to_action(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+class _UnsetEvidence:
+    pass
+
+
+_EVIDENCE_UNSET = _UnsetEvidence()
+
+
+async def _maybe_steer_evaluate_to_action(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    url: str,
+    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
+) -> bool:
     data = result.get("data")
     if not isinstance(data, dict):
-        return
+        return False
     try:
-        parsed = await _scout_act_observe_page_evidence(ctx, url=url)
+        parsed = (
+            await _scout_act_observe_page_evidence(ctx, url=url)
+            if isinstance(page_evidence, _UnsetEvidence)
+            else page_evidence
+        )
         if parsed is None or not has_bounded_page_schema(parsed):
             _reset_evaluate_actionable_tracker(ctx)
-            return
+            return False
         identities = _actionable_target_identities(parsed)
         if not identities:
             _reset_evaluate_actionable_tracker(ctx)
-            return
+            return False
         signature = _actionable_target_signature(identities)
         # Strict full-URL match (fragment included): on an SPA a hash-route change
         # is a navigation, so a differing fragment must read as a different page.
@@ -755,7 +776,7 @@ async def _maybe_steer_evaluate_to_action(ctx: AgentContext, result: dict[str, A
                 ctx.last_auto_acted_signature = signature
                 if await _auto_act_on_repeat(ctx, result, url=url, target=candidate):
                     LOG.info("copilot_evaluate_actionable_target_steer", url=url, is_repeat=True, steered=True)
-                    return
+                    return True
         if targets:
             data["actionable_targets"] = targets
             if is_repeat:
@@ -775,6 +796,58 @@ async def _maybe_steer_evaluate_to_action(ctx: AgentContext, result: dict[str, A
         data.pop("next_action_reason", None)
         _reset_evaluate_actionable_tracker(ctx)
         LOG.warning("copilot_evaluate_actionable_target_steer_failed", exc_info=True)
+    return False
+
+
+async def _maybe_attach_reached_download_target(
+    ctx: AgentContext,
+    result: dict[str, Any],
+    *,
+    url: str,
+    page_evidence: dict[str, Any] | None | _UnsetEvidence = _EVIDENCE_UNSET,
+) -> None:
+    """Attach a typed reached-download target + guidance when the page exposes exactly one same-host
+    download affordance, matched on the captured selector (never URL — a download does not change the SPA URL)."""
+    if not settings.COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
+        return
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return
+    try:
+        parsed = (
+            await _scout_act_observe_page_evidence(ctx, url=url)
+            if isinstance(page_evidence, _UnsetEvidence)
+            else page_evidence
+        )
+        if parsed is None:
+            return
+        target = _derive_reached_download_from_nav_targets(parsed.get("navigation_targets"))
+        if target is None:
+            return
+        data["reached_download_target"] = target.to_dict()
+        data["reached_download_guidance"] = _reached_download_guidance_for(target)
+        LOG.info(
+            "copilot_reached_download_target_steer",
+            url=url,
+            download_kind=target.download_kind,
+            already_registered=target.already_registered,
+        )
+    except Exception:
+        data.pop("reached_download_target", None)
+        data.pop("reached_download_guidance", None)
+        LOG.warning("copilot_reached_download_target_steer_failed", exc_info=True)
+
+
+async def _steer_evaluate_result(ctx: AgentContext, result: dict[str, Any], *, url: str) -> None:
+    # Observe the bounded page evidence once and feed both evaluate steers; re-observe for the
+    # download steer only when the actionable steer auto-acted and may have changed the page.
+    if not isinstance(result.get("data"), dict):
+        return
+    page_evidence = await _scout_act_observe_page_evidence(ctx, url=url)
+    acted = await _maybe_steer_evaluate_to_action(ctx, result, url=url, page_evidence=page_evidence)
+    await _maybe_attach_reached_download_target(
+        ctx, result, url=url, page_evidence=_EVIDENCE_UNSET if acted else page_evidence
+    )
 
 
 def _mark_post_run_page_observed(ctx: AgentContext, *, source_tool: str, url: str) -> None:

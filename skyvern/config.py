@@ -158,6 +158,10 @@ class Settings(BaseSettings):
     # On a repeat evaluate of an unchanged page with exactly one safe target, click it in-process
     # instead of only advising. Off (default) leaves the advisory steer as the only response.
     COPILOT_EVALUATE_AUTO_ACT_ON_REPEAT_ENABLED: bool = False
+    # After a correct click reaches a same-host download affordance (or a browser download has
+    # already registered into a block output), attach a typed reached-download target and steer
+    # the agent to author one terminal download code block. Off (default) restores today's behavior.
+    COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
