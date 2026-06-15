@@ -56,7 +56,7 @@ local = [
     "pyotp>=2.9.0,<3",
     "json5>=0.13.0,<1",
     "json-repair>=0.59.5,<0.60",
-    "pypdf>=6.7.5,<7",
+    "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "psutil>=7.0.0",
     "tiktoken>=0.9.0",
@@ -131,7 +131,7 @@ server = [
     "asyncpg>=0.30.0,<0.32",
     "json5>=0.13.0,<1",
     "json-repair>=0.59.5,<0.60",
-    "pypdf>=6.7.5,<7",
+    "pypdf>=6.12.0,<7",
     "pdfplumber>=0.11.0,<0.12",
     "fastmcp>=3.2.0,<4",
     "psutil>=7.0.0",
@@ -260,6 +260,9 @@ override-dependencies = [
     "openai>=2.24.0",
     # yutori SDK pins httpx<0.28 but skyvern's fastmcp needs >=0.28.1
     "httpx[socks]>=0.26.0",
+    # litellm==1.83.14 exact-pins aiohttp==3.13.4; relax so the security-patched
+    # 3.14.x resolves for cloud/source installs (plain pip keeps litellm's pin).
+    "aiohttp>=3.14.0",
 ]
 constraint-dependencies = [
     "authlib>=1.7.1",
