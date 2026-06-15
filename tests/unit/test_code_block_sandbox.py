@@ -686,6 +686,7 @@ async def wrapper({default_args}):
             values: dict[str, object] = {}
             secrets: dict[str, object] = {}
             include_secrets_in_templates = False
+            organization_id = None
             workflow_title = "Test Workflow"
             workflow_id = "w_test"
             workflow_permanent_id = "wpid_test"
