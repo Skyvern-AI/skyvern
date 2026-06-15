@@ -54,6 +54,7 @@ CodeArtifactMetadataValue: TypeAlias = (
     str | int | float | bool | None | list["CodeArtifactMetadataValue"] | dict[str, "CodeArtifactMetadataValue"]
 )
 CodeArtifactMetadataPayload: TypeAlias = dict[str, CodeArtifactMetadataValue]
+SdkActionWorkflowRunCacheKey: TypeAlias = tuple[str, str]
 
 
 def _playwright_private_impl(browser_context: object) -> object | None:
@@ -138,6 +139,10 @@ class AgentContext:
     browser_session_id: str | None
     stream: EventSourceStream
     api_key: str | None = None
+    # Ephemeral carrier for SDK-action run reuse, bounded by browser sessions touched in one Copilot run.
+    sdk_action_workflow_run_ids_by_browser_session: dict[SdkActionWorkflowRunCacheKey, str] = field(
+        default_factory=dict
+    )
     supports_vision: bool = True
     pending_screenshots: list[ScreenshotEntry] = field(default_factory=list)
     tool_activity: list[dict[str, Any]] = field(default_factory=list)
@@ -313,6 +318,8 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     """Push copilot browser state into the MCP session ContextVar for tool calls."""
     if not ctx.browser_session_id:
         raise RuntimeError("No browser_session_id set on agent context")
+    browser_session_id = ctx.browser_session_id
+    sdk_action_workflow_run_cache_key: SdkActionWorkflowRunCacheKey = (ctx.organization_id, browser_session_id)
     # Validate api_key at the boundary, before touching any backend.
     #
     # The copilot FastAPI route runs outside MCPAPIKeyMiddleware, so the CLI
@@ -325,13 +332,13 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
     if not ctx.api_key:
         LOG.warning(
             "mcp_browser_context invoked without api_key",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
         raise RuntimeError("Copilot agent context missing api_key")
 
     browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(
-        session_id=ctx.browser_session_id,
+        session_id=browser_session_id,
         organization_id=ctx.organization_id,
     )
     if not browser_state or not _browser_context_is_attachable(browser_state.browser_context):
@@ -339,7 +346,7 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         # to LLM- or user-visible output -- but log it for operators.
         LOG.warning(
             "No browser context for copilot session",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             organization_id=ctx.organization_id,
         )
         raise RuntimeError("No browser context for copilot session")
@@ -350,11 +357,14 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
         skyvern_browser = SkyvernBrowser(
             skyvern_client,
             browser_state.browser_context,
-            browser_session_id=ctx.browser_session_id,
+            browser_session_id=browser_session_id,
+        )
+        skyvern_browser.workflow_run_id = ctx.sdk_action_workflow_run_ids_by_browser_session.get(
+            sdk_action_workflow_run_cache_key
         )
         mcp_ctx = MCPBrowserContext(
             mode="cloud_session",
-            session_id=ctx.browser_session_id,
+            session_id=browser_session_id,
             can_access_localhost=_copilot_session_can_access_localhost(),
         )
         active_key = get_active_api_key()
@@ -363,12 +373,18 @@ async def mcp_browser_context(ctx: AgentContext) -> AsyncIterator[None]:
             context=mcp_ctx,
             api_key_hash=hash_api_key_for_cache(active_key) if active_key else None,
         )
-        register_copilot_session(ctx.browser_session_id, state)
+        register_copilot_session(browser_session_id, state)
         try:
             async with scoped_session(state):
                 yield
         finally:
-            unregister_copilot_session(ctx.browser_session_id)
+            if skyvern_browser.workflow_run_id:
+                ctx.sdk_action_workflow_run_ids_by_browser_session[sdk_action_workflow_run_cache_key] = (
+                    skyvern_browser.workflow_run_id
+                )
+            else:
+                ctx.sdk_action_workflow_run_ids_by_browser_session.pop(sdk_action_workflow_run_cache_key, None)
+            unregister_copilot_session(browser_session_id)
     finally:
         reset_api_key_override(override_token)
 
