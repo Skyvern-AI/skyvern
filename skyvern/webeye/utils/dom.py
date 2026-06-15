@@ -36,6 +36,19 @@ LOG = structlog.get_logger()
 COMMON_INPUT_TAGS = {"input", "textarea", "select"}
 
 
+def is_post_dispatch_click_timeout(exc: BaseException) -> bool:
+    """A Playwright `TimeoutError` whose message references the post-click
+    auto-wait for scheduled navigations means the click was physically
+    dispatched (Playwright logs ``click action done`` immediately before this
+    wait) and only the post-action wait timed out — typical for clicks that
+    trigger downloads, dialogs, or pseudo-navigations. Retrying via a fallback
+    chain would duplicate the already-applied side effect.
+    """
+    if not isinstance(exc, TimeoutError):
+        return False
+    return "scheduled navigation" in str(exc).lower()
+
+
 async def resolve_locator(scrape_page: ScrapedPage, page: Page, frame: str, css: str) -> tuple[Locator, Page | Frame]:
     iframe_path: list[str] = []
 
@@ -908,8 +921,14 @@ class SkyvernElement:
             # so Playwright actionability is preserved.
             await EventStrategyFactory.click_element(page, self.get_locator(), timeout=timeout)
             return
-        except Exception:
+        except Exception as exc:
             LOG.info("Failed to click by playwright", exc_info=True, element_id=self.get_id())
+            if is_post_dispatch_click_timeout(exc):
+                LOG.info(
+                    "Click side effect detected via navigation-wait timeout — skipping fallback chain",
+                    element_id=self.get_id(),
+                )
+                return
 
         if dom is not None:
             # try to click on the blocking element

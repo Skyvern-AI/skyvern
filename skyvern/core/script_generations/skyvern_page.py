@@ -28,6 +28,7 @@ from skyvern.forge.sdk.event.factory import EventStrategyFactory
 from skyvern.library.ai_locator import AILocator
 from skyvern.webeye.actions import handler_utils
 from skyvern.webeye.actions.action_types import ActionType
+from skyvern.webeye.utils.dom import is_post_dispatch_click_timeout
 
 if TYPE_CHECKING:
     from skyvern.webeye.actions.actions import Action
@@ -379,6 +380,12 @@ class SkyvernPage(Page):
                     await locator.click(timeout=timeout, **kwargs)
                     return selector
                 except Exception as e:
+                    if is_post_dispatch_click_timeout(e):
+                        LOG.info(
+                            "CSS selector click dispatched; navigation-wait timed out — skipping fallback",
+                            selector=selector,
+                        )
+                        return selector
                     # The click may have failed because an autocomplete dropdown
                     # or other overlay is covering the target element.  Press
                     # Escape to dismiss it and retry once before falling to AI.

@@ -133,7 +133,13 @@ from skyvern.webeye.transient_page_observer import (
     TransientPageTextObserver,
     match_user_defined_errors_from_transient_text,
 )
-from skyvern.webeye.utils.dom import COMMON_INPUT_TAGS, DomUtil, InteractiveElement, SkyvernElement
+from skyvern.webeye.utils.dom import (
+    COMMON_INPUT_TAGS,
+    DomUtil,
+    InteractiveElement,
+    SkyvernElement,
+    is_post_dispatch_click_timeout,
+)
 from skyvern.webeye.utils.page import SkyvernFrame
 
 LOG = structlog.get_logger()
@@ -3471,6 +3477,15 @@ async def chain_click(
         return action_results
 
     except Exception as e:
+        if is_post_dispatch_click_timeout(e):
+            LOG.info(
+                "Chain click: physical click dispatched; navigation-wait timed out — skipping fallback",
+                action=action,
+                locator=locator,
+            )
+            action_results = [ActionSuccess()]
+            return action_results
+
         action_results = [ActionFailure(FailToClick(action.element_id, msg=str(e)))]
 
         if skyvern_element.get_tag_name() == "label":
