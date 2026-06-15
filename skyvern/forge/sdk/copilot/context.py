@@ -545,6 +545,8 @@ class CopilotContext(AgentContext):
     staged_workflow_yaml: str | None = None
     staged_workflow: Workflow | None = None
     has_staged_proposal: bool = False
+    # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
+    prior_copilot_workflow_yaml: str | None = None
     # Set when ``_update_workflow`` wrote canonical mid-turn (param / top-level
     # settings changes); terminal handlers roll back on non-auto-accept.
     canonical_was_persisted_due_to_param_change: bool = False

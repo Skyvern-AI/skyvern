@@ -606,6 +606,7 @@ def _build_user_context(
     user_message: str,
     request_policy_summary: str = "",
     user_workflow_change_summary: str = "",
+    runnable_draft_summary: str = "",
     repeated_reply_warning: str = "",
 ) -> str:
     """Render untrusted context into the user message with code fencing.
@@ -629,6 +630,7 @@ def _build_user_context(
         request_policy_summary=escape_code_fences(redact_raw_secrets_for_prompt(request_policy_summary)),
         user_message=escape_code_fences(redact_raw_secrets_for_prompt(user_message)),
         user_workflow_change_summary=escape_code_fences(user_workflow_change_summary or ""),
+        runnable_draft_summary=escape_code_fences(runnable_draft_summary or ""),
         repeated_reply_warning=escape_code_fences(repeated_reply_warning or ""),
     )
 
@@ -3036,6 +3038,7 @@ async def _run_copilot_turn_impl(
         turn_id=turn_id,
         turn_index=turn_index,
         prior_block_count=prior_block_count,
+        prior_copilot_workflow_yaml=prior_copilot_workflow_yaml,
         block_authoring_policy=copilot_config.block_authoring_policy,
         impose_synthesized_code_block=copilot_config.impose_synthesized_code_block,
     )
@@ -3202,10 +3205,13 @@ async def _run_copilot_turn_impl(
     )
 
     user_workflow_change_summary = ""
+    runnable_draft_summary = ""
     repeated_reply_warning = ""
     if isinstance(ctx.turn_context_packet, TurnContextPacket):
         if ctx.turn_context_packet.workflow_change_context is not None:
             user_workflow_change_summary = ctx.turn_context_packet.workflow_change_context.rendered_summary
+        if ctx.turn_context_packet.runnable_draft_context is not None:
+            runnable_draft_summary = ctx.turn_context_packet.runnable_draft_context.rendered_summary
         if ctx.turn_context_packet.repeated_reply_context is not None:
             repeated_reply_warning = ctx.turn_context_packet.repeated_reply_context.rendered_summary
 
@@ -3216,6 +3222,7 @@ async def _run_copilot_turn_impl(
         debug_run_info_text=redact_raw_secrets_for_prompt(debug_run_info_text),
         user_message=agent_user_message,
         user_workflow_change_summary=user_workflow_change_summary,
+        runnable_draft_summary=runnable_draft_summary,
         repeated_reply_warning=repeated_reply_warning,
     )
 
