@@ -242,7 +242,7 @@ async def _post_totp_verification_url(
     raise _TOTPWebhookRequestError(f"Failed post request url={url}")
 
 
-def _try_generate_totp_for_credential(
+def try_generate_totp_for_credential(
     workflow_run_context: "WorkflowRunContext",
     credential_key: str,
     workflow_run_id: str,
@@ -320,7 +320,7 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
     active_credential_key = current_context.active_credential_parameter_key if current_context else None
 
     if active_credential_key:
-        return _try_generate_totp_for_credential(workflow_run_context, active_credential_key, workflow_run_id)
+        return try_generate_totp_for_credential(workflow_run_context, active_credential_key, workflow_run_id)
 
     candidate_keys = [
         key
@@ -335,7 +335,7 @@ def try_generate_totp_from_credential(workflow_run_id: str | None) -> OTPValue |
                 candidate_credential_keys=candidate_keys,
             )
         return None
-    return _try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
+    return try_generate_totp_for_credential(workflow_run_context, candidate_keys[0], workflow_run_id)
 
 
 async def resolve_otp_value(task: "Task") -> OTPValue | None:
