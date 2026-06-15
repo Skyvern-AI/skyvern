@@ -522,6 +522,27 @@ class TestCompiledAuthoringImposition:
         }
 
     @pytest.mark.asyncio
+    async def test_imposition_appends_no_fill_skeleton_and_emits_no_skeleton_substitution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._provider_search_ctx()
+        metadata = [_terminal_metadata("search_registry", "search the registry")]
+
+        result = await _update_workflow(
+            {"workflow_yaml": _SUBMITTED_LITERAL_YAML, "code_artifact_metadata": metadata}, ctx
+        )
+
+        assert result["ok"] is True
+        assert "structured_return_skeleton" not in result["data"]["imposed_substitutions"]
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert "<fill" not in block["code"]
+        assert "<fill: captured value>" not in block["code"]
+        assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
+
+    @pytest.mark.asyncio
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()

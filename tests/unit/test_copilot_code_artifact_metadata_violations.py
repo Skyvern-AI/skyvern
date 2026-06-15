@@ -15,7 +15,11 @@ from skyvern.forge.sdk.copilot.outcome_verification_trace import (
 )
 from skyvern.forge.sdk.copilot.output_utils import _sanitize_failure_text
 from skyvern.forge.sdk.copilot.tools import _normalize_code_artifact_metadata
-from skyvern.forge.sdk.copilot.tools.workflow_update import _normalize_code_artifact_metadata_detailed
+from skyvern.forge.sdk.copilot.tools.workflow_update import (
+    _code_block_returns_flat_string,
+    _code_block_returns_uninvoked_structured_function,
+    _normalize_code_artifact_metadata_detailed,
+)
 
 
 def _code_block_yaml(label: str) -> str:
@@ -493,6 +497,285 @@ class TestStaleLabelRekey:
         normalized, error = _normalize_code_artifact_metadata([first, second], _code_block_yaml("my_block"))
         assert error is None
         assert normalized["my_block"]["declared_goal"] == "g"
+
+
+def _extraction_code_block_yaml(label: str, code: str) -> str:
+    indented = textwrap.indent(textwrap.dedent(code).strip(), " " * 16)
+    return textwrap.dedent(
+        f"""
+        workflow_definition:
+          blocks:
+            - block_type: code
+              label: {label}
+              code: |
+{indented}
+        """
+    ).strip()
+
+
+def _extraction_metadata(label: str, goal_value_paths: list[str]) -> dict:
+    metadata = _valid_metadata(label)
+    metadata["claimed_outcomes"][0]["goal_value_paths"] = list(goal_value_paths)
+    metadata["terminal_verifier_expectations"][0]["goal_value_paths"] = list(goal_value_paths)
+    return metadata
+
+
+def _non_extraction_metadata(label: str) -> dict:
+    return {
+        "block_label": label,
+        "artifact_id": f"code_artifact:{label}",
+        "declared_goal": "click submit",
+        "claimed_outcomes": [
+            {
+                "id": "claim:x",
+                "scope": "outcome",
+                "text": "submitted",
+                "status": "observed_not_verified",
+                "depends_on": ["dependency:p"],
+                "covered_criteria": ["criterion:c"],
+                "observation_refs": ["obs1"],
+            }
+        ],
+        "page_dependencies": [
+            {"id": "dependency:p", "scope": "page", "status": "observed_not_verified", "observation_refs": ["obs1"]}
+        ],
+        "completion_criteria": [{"id": "criterion:c", "text": "submitted", "level": "outcome", "terminal": False}],
+        "terminal_verifier_expectations": [{"id": "exp", "text": "e", "criteria_ids": ["criterion:c"]}],
+        "observation_refs": [
+            {
+                "observation_ref": "obs1",
+                "dependency_id": "dependency:p",
+                "status": "observed_not_verified",
+                "source_tool": "scout_interaction",
+            }
+        ],
+    }
+
+
+class TestExtractionReturnShape:
+    def test_flat_inner_text_return_is_rejected(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        return page.inner_text("#results")
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "flat text blob" in error
+        assert "array of objects" in error
+
+    def test_flat_string_local_return_is_rejected(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        text = await page.locator("#results").inner_text()
+        return text
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "flat text blob" in error
+
+    def test_keyed_dict_return_passes(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        return {"records": [{"number": "1-25-80030"}]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_array_of_objects_comprehension_return_passes(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        rows = await page.locator(".row").all()
+        return [{"number": await row.inner_text()} for row in rows]
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_single_scalar_passes_as_keyed_field_without_array_wrapping(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        return {"total": 5}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["total"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_non_extraction_block_with_flat_return_is_not_rejected(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        return page.inner_text("#status")
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_non_extraction_metadata("my_block")],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+
+class TestExtractionUninvokedNestedReturn:
+    def test_uninvoked_nested_structured_function_is_rejected(self) -> None:
+        code = """
+        async def run(page):
+            result = {"records": [{"number": "1-25-80030"}]}
+            return result
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "nested function" in error
+        assert "captures the function object" in error
+
+    def test_invoked_and_returned_nested_function_passes(self) -> None:
+        code = """
+        async def run(page):
+            return {"records": [{"number": "1-25-80030"}]}
+        return await run(page)
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_invoked_and_bound_nested_function_passes(self) -> None:
+        code = """
+        async def run(page):
+            return {"records": [{"number": "1-25-80030"}]}
+        data = await run(page)
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_top_level_structured_local_passes(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        records = [{"number": "1-25-80030"}]
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_indeterminate_nested_function_is_not_flagged(self) -> None:
+        code = """
+        def helper():
+            return "text"
+        await page.goto("https://example.com/")
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+
+class TestUninvokedStructuredFunctionClassifier:
+    def test_uninvoked_structured_function_with_literal_return_is_flagged(self) -> None:
+        assert _code_block_returns_uninvoked_structured_function("def run():\n    return {'a': 1}") is True
+
+    def test_uninvoked_structured_function_with_local_return_is_flagged(self) -> None:
+        code = """
+        async def run(page):
+            result = {"records": []}
+            return result
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is True
+
+    def test_invoked_function_is_not_flagged(self) -> None:
+        code = """
+        def run():
+            return {"a": 1}
+        data = run()
+        return data
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+    def test_top_level_structured_return_is_not_flagged(self) -> None:
+        code = """
+        async def run(page):
+            return {"x": 1}
+        return {"records": []}
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+    def test_top_level_structured_assignment_is_not_flagged(self) -> None:
+        assert _code_block_returns_uninvoked_structured_function("records = [{'number': '1'}]") is False
+
+    def test_function_returning_string_is_not_flagged(self) -> None:
+        code = """
+        def run():
+            return "text"
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+    def test_function_referenced_but_not_called_is_not_flagged(self) -> None:
+        code = """
+        def build():
+            return {"records": []}
+        callbacks = [build]
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+
+class TestFlatStringClassifier:
+    def test_string_literal_return_is_flat(self) -> None:
+        assert _code_block_returns_flat_string('return "hello"') is True
+
+    def test_fstring_return_is_flat(self) -> None:
+        assert _code_block_returns_flat_string('return f"{a} {b}"') is True
+
+    def test_join_return_is_flat(self) -> None:
+        assert _code_block_returns_flat_string('return " ".join(parts)') is True
+
+    def test_dict_return_is_not_flat(self) -> None:
+        assert _code_block_returns_flat_string('return {"a": 1}') is False
+
+    def test_list_return_is_not_flat(self) -> None:
+        assert _code_block_returns_flat_string("return [1, 2, 3]") is False
+
+    def test_unknown_name_return_is_indeterminate_not_flat(self) -> None:
+        assert _code_block_returns_flat_string("return some_unknown") is False
+
+    def test_no_return_is_not_flat(self) -> None:
+        assert _code_block_returns_flat_string('await page.goto("https://example.com/")') is False
+
+    def test_mixed_structured_and_flat_returns_are_not_flagged(self) -> None:
+        code = """
+        if condition:
+            return {"records": []}
+        return page.inner_text("#x")
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is False
 
 
 def _two_code_block_yaml(first: str, second: str) -> str:
