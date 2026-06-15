@@ -202,6 +202,67 @@ class TestMcpBrowserContextBridge:
         assert [c[0] for c in override_calls] == ["set", "reset"]
 
     @pytest.mark.asyncio
+    async def test_sdk_action_workflow_run_id_is_reused_across_tool_contexts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import skyvern.forge.sdk.copilot.runtime as runtime
+        from skyvern.forge.sdk.copilot.runtime import mcp_browser_context
+
+        _, register_mock, unregister_mock, _, _ = self._install_happy_path_mocks(monkeypatch)
+
+        first_browser = MagicMock()
+        first_browser.workflow_run_id = None
+        second_browser = MagicMock()
+        second_browser.workflow_run_id = None
+        third_browser = MagicMock()
+        third_browser.workflow_run_id = None
+        fourth_browser = MagicMock()
+        fourth_browser.workflow_run_id = None
+        fifth_browser = MagicMock()
+        fifth_browser.workflow_run_id = None
+        browsers = iter([first_browser, second_browser, third_browser, fourth_browser, fifth_browser])
+        monkeypatch.setattr(runtime, "SkyvernBrowser", lambda *a, **kw: next(browsers))
+
+        ctx = _make_ctx()
+        assert ctx.browser_session_id is not None
+        original_cache_key = (ctx.organization_id, ctx.browser_session_id)
+
+        async with mcp_browser_context(ctx):
+            first_state = register_mock.call_args.args[1]
+            assert first_state.browser.workflow_run_id is None
+            first_state.browser.workflow_run_id = "wr_sdk_action_1"
+
+        assert ctx.sdk_action_workflow_run_ids_by_browser_session[original_cache_key] == "wr_sdk_action_1"
+
+        async with mcp_browser_context(ctx):
+            second_state = register_mock.call_args.args[1]
+            assert second_state.browser.workflow_run_id == "wr_sdk_action_1"
+            second_state.browser.workflow_run_id = None
+
+        assert original_cache_key not in ctx.sdk_action_workflow_run_ids_by_browser_session
+
+        async with mcp_browser_context(ctx):
+            third_state = register_mock.call_args.args[1]
+            assert third_state.browser.workflow_run_id is None
+
+        ctx.browser_session_id = "pbs_test_456"
+        async with mcp_browser_context(ctx):
+            fourth_state = register_mock.call_args.args[1]
+            assert fourth_state.browser.workflow_run_id is None
+
+        assert (ctx.organization_id, "pbs_test_456") not in ctx.sdk_action_workflow_run_ids_by_browser_session
+
+        ctx.organization_id = "org-2"
+        ctx.browser_session_id = "pbs_test_123"
+        async with mcp_browser_context(ctx):
+            fifth_state = register_mock.call_args.args[1]
+            assert fifth_state.browser.workflow_run_id is None
+
+        assert ("org-2", "pbs_test_123") not in ctx.sdk_action_workflow_run_ids_by_browser_session
+        assert register_mock.call_count == 5
+        assert unregister_mock.call_count == 5
+
+    @pytest.mark.asyncio
     async def test_missing_browser_context_raises_without_leaking_session_id(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

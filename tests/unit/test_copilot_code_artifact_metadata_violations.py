@@ -698,6 +698,49 @@ class TestExtractionUninvokedNestedReturn:
         assert error is None
         assert list(normalized.keys()) == ["my_block"]
 
+    def test_flat_return_inside_except_block_is_rejected(self) -> None:
+        code = """
+        try:
+            data = page.locator("#results")
+        except Exception:
+            return page.inner_text("body")
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "flat text blob" in error
+
+    def test_structured_return_inside_except_block_passes(self) -> None:
+        code = """
+        try:
+            rows = await page.locator(".row").all()
+        except Exception:
+            rows = []
+        return {"records": [{"number": "1-25-80030"}]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
+    def test_capture_then_wrap_rebind_passes(self) -> None:
+        code = """
+        text = await page.locator("#results").inner_text()
+        text = {"records": [{"number": "1-25-80030"}]}
+        return text
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("my_block", ["records[].number"])],
+            _extraction_code_block_yaml("my_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["my_block"]
+
 
 class TestUninvokedStructuredFunctionClassifier:
     def test_uninvoked_structured_function_with_literal_return_is_flagged(self) -> None:
@@ -746,6 +789,47 @@ class TestUninvokedStructuredFunctionClassifier:
         """
         assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
 
+    def test_outer_with_only_deeper_nested_structured_return_is_not_flagged(self) -> None:
+        # The structured return lives in a doubly-nested helper, not in the
+        # uninvoked outer's own scope, so the outer must not look structured.
+        code = """
+        async def run(page):
+            def helper():
+                return {"records": []}
+            await page.goto("https://example.com/")
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+    def test_uninvoked_outer_with_own_structured_return_is_still_flagged(self) -> None:
+        code = """
+        async def run(page):
+            def helper():
+                return {"x": 1}
+            result = {"records": []}
+            return result
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is True
+
+    def test_top_level_structured_return_in_except_is_not_flagged(self) -> None:
+        code = """
+        try:
+            rows = page.locator(".row")
+        except Exception:
+            return {"records": []}
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
+    def test_nested_function_structured_local_rebound_to_flat_is_not_flagged(self) -> None:
+        # The nested function rebinds its structured local to a flat read before
+        # returning it, so it does not actually return structure and must not be flagged.
+        code = """
+        def run(page):
+            result = {"records": []}
+            result = page.inner_text("body")
+            return result
+        """
+        assert _code_block_returns_uninvoked_structured_function(textwrap.dedent(code)) is False
+
 
 class TestFlatStringClassifier:
     def test_string_literal_return_is_flat(self) -> None:
@@ -774,6 +858,50 @@ class TestFlatStringClassifier:
         if condition:
             return {"records": []}
         return page.inner_text("#x")
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is False
+
+    def test_capture_then_wrap_rebind_under_same_name_is_not_flat(self) -> None:
+        # Re-binding a flat local to a structured value must clear it from
+        # string_locals so the final structured return is not falsely rejected.
+        code = """
+        text = await page.inner_text("body")
+        text = {"records": [{"number": "1-25-80030"}]}
+        return text
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is False
+
+    def test_rebound_still_flat_local_is_flat(self) -> None:
+        code = """
+        text = "seed"
+        text = await page.inner_text("body")
+        return text
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is True
+
+    def test_flat_return_inside_except_block_is_flat(self) -> None:
+        code = """
+        try:
+            data = page.locator("#x")
+        except Exception:
+            return page.inner_text("body")
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is True
+
+    def test_flat_return_inside_match_case_is_flat(self) -> None:
+        code = """
+        match mode:
+            case "x":
+                return page.inner_text("body")
+        """
+        assert _code_block_returns_flat_string(textwrap.dedent(code)) is True
+
+    def test_structured_return_inside_except_block_is_not_flat(self) -> None:
+        code = """
+        try:
+            rows = page.locator(".row")
+        except Exception:
+            return {"records": []}
         """
         assert _code_block_returns_flat_string(textwrap.dedent(code)) is False
 
