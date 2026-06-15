@@ -1989,11 +1989,11 @@
               }
             }
           },
-          "404": {
-            "description": "Run not found"
-          },
           "400": {
             "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "422": {
             "description": "Validation Error",
@@ -3000,11 +3000,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "409": {
             "description": "Conflict - browser session has already ended and can no longer be updated"
@@ -3074,11 +3074,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -4521,11 +4521,11 @@
               }
             }
           },
-          "404": {
-            "description": "Workflow not found"
-          },
           "400": {
             "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
           },
           "422": {
             "description": "Validation Error",
@@ -5481,9 +5481,6 @@
           "404": {
             "description": "Workflow not found"
           },
-          "500": {
-            "description": "Storage deletion failed; retry"
-          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -5493,6 +5490,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Storage deletion failed; retry"
           }
         },
         "x-hidden": true
@@ -8692,7 +8692,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -9267,8 +9267,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
-                "minimum": 5.0
+                "maximum": 1440,
+                "minimum": 5
               },
               {
                 "type": "null"
@@ -14134,7 +14134,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -17132,7 +17132,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -19621,7 +19621,7 @@
           "max_iterations": {
             "type": "integer",
             "title": "Max Iterations",
-            "default": 10
+            "default": 50
           },
           "max_steps": {
             "type": "integer",
@@ -19729,7 +19729,7 @@
           "max_iterations": {
             "type": "integer",
             "title": "Max Iterations",
-            "default": 10
+            "default": 50
           },
           "max_steps": {
             "type": "integer",
@@ -20390,7 +20390,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -20944,8 +20944,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1.0,
-            "minimum": 0.0,
+            "maximum": 1,
+            "minimum": 0,
             "title": "Confidence Float"
           },
           "error_type": {
@@ -22466,8 +22466,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
-                "minimum": 1.0
+                "maximum": 240,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -22538,8 +22538,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 2.0,
-                "minimum": 1.0
+                "maximum": 2,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -24245,8 +24245,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
-                "minimum": 1.0
+                "maximum": 240,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -24490,8 +24490,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 240.0,
-                "minimum": 1.0
+                "maximum": 240,
+                "minimum": 1
               },
               {
                 "type": "null"
