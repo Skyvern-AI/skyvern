@@ -904,3 +904,26 @@ def test_code_block_preflight_restores_recursion_limit() -> None:
     preflight_code_block("await page.locator('button[type=submit]').first.click(timeout=5000)\n")
 
     assert sys.getrecursionlimit() == before
+
+
+class TestOfferDemonstratesStructuredReturn:
+    def test_offer_directs_keyed_return_not_inner_text_blob(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    "click",
+                    selector="#search-submit",
+                    source_url="https://example.com/search",
+                )
+            ]
+        )
+        assert result is not None
+        offer = render_synthesized_offer_text(
+            result,
+            trajectory=[
+                {"tool_name": "click", "selector": "#search-submit", "source_url": "https://example.com/search"}
+            ],
+        )
+        assert "keyed structure" in offer
+        assert "inner_text" in offer
+        assert 'return {"records":' in offer
