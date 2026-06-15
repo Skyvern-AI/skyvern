@@ -247,6 +247,9 @@ class AgentContext:
     post_run_page_observation_workflow_run_id: str | None = None
     post_run_page_observation_after_failed_test: bool = False
     post_run_current_page_inspection_workflow_run_id: str | None = None
+    last_evaluate_actionable_signature: str | None = None
+    last_evaluate_actionable_url: str | None = None
+    last_auto_acted_signature: str | None = None
     observed_browser_urls: list[str] = field(default_factory=list)
     # Ephemeral within-turn scout captures; not persisted across turns.
     scouted_interactions: list[ScoutedInteraction] = field(default_factory=list)
