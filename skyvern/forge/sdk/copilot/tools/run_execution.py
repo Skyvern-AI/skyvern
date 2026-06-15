@@ -12,6 +12,8 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import structlog
+import yaml
+from pydantic import ValidationError
 
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
@@ -57,9 +59,11 @@ from skyvern.forge.sdk.copilot.runtime import (
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
+from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException
+from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
 from skyvern.webeye.navigation import is_skip_inner_retry_error
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -614,6 +618,38 @@ def _watchdog_user_facing_summary(
     return "The run ended before recording a trustworthy terminal status."
 
 
+def _workflow_covers_labels(workflow: Workflow | None, labels: list[str]) -> bool:
+    return workflow is not None and all(workflow.get_output_parameter(label) for label in labels)
+
+
+def _workflow_has_blocks(workflow: Workflow | None) -> bool:
+    if workflow is None:
+        return False
+    definition = workflow.workflow_definition
+    if isinstance(definition, dict):
+        return bool(definition.get("blocks"))
+    return bool(definition.blocks)
+
+
+def _workflow_from_prior_draft(ctx: CopilotContext, labels: list[str]) -> Workflow | None:
+    """Returns None on empty/malformed yaml or when it still misses a label, so the
+    caller falls through to the existing not-found error."""
+    workflow_yaml = ctx.prior_copilot_workflow_yaml
+    if not workflow_yaml or not workflow_yaml.strip():
+        return None
+    try:
+        workflow = _process_workflow_yaml(
+            workflow_id=ctx.workflow_id,
+            workflow_permanent_id=ctx.workflow_permanent_id,
+            organization_id=ctx.organization_id,
+            workflow_yaml=workflow_yaml,
+        )
+    except (yaml.YAMLError, ValidationError, BaseWorkflowHTTPException):
+        LOG.warning("Could not parse prior copilot draft for run-tool label resolution", exc_info=True)
+        return None
+    return workflow if _workflow_covers_labels(workflow, labels) else None
+
+
 async def _run_blocks_and_collect_debug(
     params: dict[str, Any],
     ctx: CopilotContext,
@@ -651,6 +687,14 @@ async def _run_blocks_and_collect_debug(
             workflow_permanent_id=ctx.workflow_permanent_id,
             organization_id=ctx.organization_id,
         )
+    # Only an empty workflow borrows the uncommitted prior draft (ctx.prior_copilot_workflow_yaml);
+    # a populated workflow missing a requested label still reports not-found.
+    resolved_from_prior_draft = False
+    if not _workflow_has_blocks(workflow):
+        prior_draft_workflow = _workflow_from_prior_draft(ctx, block_labels)
+        if prior_draft_workflow is not None:
+            workflow = prior_draft_workflow
+            resolved_from_prior_draft = True
     if not workflow:
         return {"ok": False, "error": f"Workflow not found: {ctx.workflow_permanent_id}"}
 
@@ -702,7 +746,12 @@ async def _run_blocks_and_collect_debug(
 
     # Short-circuit before a wasted workflow execution when the definition
     # JSON has drifted from the persisted parameter rows that runtime reads.
-    invariant_error = _parameter_binding_invariant_error(workflow, all_workflow_params, all_output_params)
+    # Skipped for the prior-draft fallback: its in-memory params differ from the rolled-back canonical rows by design.
+    invariant_error = (
+        None
+        if resolved_from_prior_draft
+        else _parameter_binding_invariant_error(workflow, all_workflow_params, all_output_params)
+    )
     if invariant_error is not None:
         summary, missing_persisted, missing_from_definition = invariant_error
         return {

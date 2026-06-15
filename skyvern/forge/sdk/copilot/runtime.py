@@ -207,6 +207,8 @@ class AgentContext:
     staged_workflow_yaml: str | None = None
     staged_workflow: Any | None = None
     has_staged_proposal: bool = False
+    # Prior turn's uncommitted draft; carries blocks even when the request body and canonical row are empty.
+    prior_copilot_workflow_yaml: str | None = None
     canonical_was_persisted_due_to_param_change: bool = False
     allow_untested_workflow_draft: bool = False
     request_policy: RequestPolicy | None = None

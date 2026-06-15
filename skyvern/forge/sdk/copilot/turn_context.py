@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import structlog
+import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from skyvern.forge.sdk.copilot.repeated_reply_summary import RepeatedReplyKind, summarize_repeated_replies
@@ -15,6 +16,7 @@ from skyvern.forge.sdk.copilot.turn_intent import RequiredContextKey, TurnIntent
 from skyvern.forge.sdk.copilot.workflow_change_summary import WorkflowChangeKind, summarize_user_workflow_change
 from skyvern.forge.sdk.schemas.credentials import Credential
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotChatHistoryMessage, WorkflowCopilotChatSender
+from skyvern.utils.yaml_loader import safe_load_no_dates
 
 LOG = structlog.get_logger()
 
@@ -52,6 +54,11 @@ class WorkflowChangeContext(BaseModel):
     kind: str
     rendered_summary: str
     structural_diff_unavailable: bool = False
+
+
+class RunnableDraftContext(BaseModel):
+    rendered_summary: str
+    block_labels: list[str] = Field(default_factory=list)
 
 
 class RepeatedReplyContext(BaseModel):
@@ -101,6 +108,7 @@ class TurnContextPacket(BaseModel):
     workflow_context: WorkflowContext | None = None
     proposal_context: ProposalContext | None = None
     workflow_change_context: WorkflowChangeContext | None = None
+    runnable_draft_context: RunnableDraftContext | None = None
     transcript_context: TranscriptContext
     run_context: RunContext | None = None
     credential_context: CredentialContext | None = None
@@ -113,6 +121,7 @@ class TurnContextPacket(BaseModel):
             "workflow_context",
             "proposal_context",
             "workflow_change_context",
+            "runnable_draft_context",
             "run_context",
             "credential_context",
             "docs_context",
@@ -157,6 +166,28 @@ def _bounded_text(value: str, char_budget: int) -> tuple[str, int, bool]:
     if char_budget <= len(suffix):
         return redacted[:char_budget], original_chars, True
     return redacted[: char_budget - len(suffix)].rstrip() + suffix, original_chars, True
+
+
+def _top_level_block_labels(workflow_yaml: str) -> list[str]:
+    try:
+        parsed = safe_load_no_dates(workflow_yaml)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    definition = parsed.get("workflow_definition")
+    if not isinstance(definition, dict):
+        return []
+    blocks = definition.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+    labels: list[str] = []
+    for block in blocks:
+        if isinstance(block, dict):
+            label = block.get("label")
+            if isinstance(label, str) and label:
+                labels.append(label)
+    return labels
 
 
 def _latest_assistant_turn(chat_history: list[WorkflowCopilotChatHistoryMessage]) -> str:
@@ -206,6 +237,7 @@ class TurnContextAssembler:
         workflow_context: WorkflowContext | None = None
         proposal_context: ProposalContext | None = None
         workflow_change_context: WorkflowChangeContext | None = None
+        runnable_draft_context: RunnableDraftContext | None = None
         run_context: RunContext | None = None
         credential_context: CredentialContext | None = None
         docs_context: DocsContext | None = None
@@ -275,6 +307,8 @@ class TurnContextAssembler:
                     structural_diff_unavailable=change_summary.structural_diff_unavailable,
                 )
 
+        runnable_draft_context = self._runnable_draft_context(inputs)
+
         if self._should_include_run_context(inputs.turn_intent, required):
             if inputs.debug_run_info_text.strip():
                 summary, original_chars, truncated = _bounded_text(inputs.debug_run_info_text, self.run_char_budget)
@@ -323,6 +357,7 @@ class TurnContextAssembler:
             workflow_context=workflow_context,
             proposal_context=proposal_context,
             workflow_change_context=workflow_change_context,
+            runnable_draft_context=runnable_draft_context,
             transcript_context=transcript_context,
             run_context=run_context,
             credential_context=credential_context,
@@ -345,6 +380,23 @@ class TurnContextAssembler:
         return bool(required & {RequiredContextKey.CURRENT_WORKFLOW, RequiredContextKey.PROPOSED_WORKFLOW}) or (
             intent.mode in _WORKFLOW_MODES and intent.authority.may_update_workflow
         )
+
+    def _runnable_draft_context(self, inputs: TurnContextInputs) -> RunnableDraftContext | None:
+        if not inputs.turn_intent.authority.may_run_blocks:
+            return None
+        if _top_level_block_labels(inputs.workflow_yaml):
+            return None
+        labels = _top_level_block_labels(inputs.prior_workflow_yaml)
+        if not labels:
+            return None
+        labels_csv = ", ".join(labels)
+        summary = (
+            "A prior turn proposed a workflow draft that was never committed to the canvas, so the"
+            " CURRENT WORKFLOW YAML above is empty. The user is asking to run/re-test that draft. To"
+            " run it, call run_blocks_and_collect_debug with these block labels: "
+            f"{labels_csv}. Do not call update_and_run_blocks and do not ask the user to rebuild it."
+        )
+        return RunnableDraftContext(rendered_summary=summary, block_labels=labels)
 
     def _should_include_run_context(self, intent: TurnIntent, required: set[RequiredContextKey]) -> bool:
         if intent.mode == TurnIntentMode.DOCS_ANSWER:
