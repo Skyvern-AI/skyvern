@@ -839,6 +839,7 @@ class TestBrowserInteractionObservationHooks:
 
         ctx = SimpleNamespace(
             pending_browser_interaction_observation=None,
+            pending_scout_typed_value=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -869,6 +870,7 @@ class TestBrowserInteractionObservationHooks:
                 tool_name="click",
                 url="https://example.com/results",
             ),
+            pending_scout_typed_value=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -897,6 +899,7 @@ class TestBrowserInteractionObservationHooks:
         monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", fake_verify)
         ctx = SimpleNamespace(
             pending_browser_interaction_observation=None,
+            pending_scout_typed_value=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],
@@ -920,6 +923,7 @@ class TestScoutedInteractionCapture:
     def _ctx(self, *, policy: object = None, source_url: str | None = None) -> SimpleNamespace:
         ns = SimpleNamespace(
             pending_browser_interaction_observation=None,
+            pending_scout_typed_value=None,
             discovery_mcp_server=None,
             scouted_interactions=[],
             scout_trajectory=[],

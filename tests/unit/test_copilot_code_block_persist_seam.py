@@ -5,6 +5,7 @@ OSS-synced: only example.* / RFC-2606 placeholder targets and synthetic labels.
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from types import SimpleNamespace
 
@@ -153,6 +154,36 @@ _SUBMITTED_MIXED_LITERAL_YAML = _yaml(
         code: |
           await page.locator("input[placeholder='Search']").fill("Taylor Brooks")
           await page.locator("#other").fill(provider_name)
+    """
+)
+
+_SUBMITTED_TYPED_LITERAL_REWRITE_YAML = _yaml(
+    """
+    title: Product lookup
+    workflow_definition:
+      parameters:
+      - {parameter_type: workflow, workflow_parameter_type: string, key: existing_filter, default_value: active}
+      blocks:
+      - block_type: code
+        label: search_catalog
+        parameter_keys: [existing_filter]
+        code: |
+          await page.locator("#café-search").fill("example_sku_123")
+      - block_type: code
+        label: select_result
+        code: |
+          await page.get_by_role("textbox", name="Search").type("example_sku_123")
+      - block_type: loop
+        label: retry_search
+        loop_blocks:
+        - block_type: code
+          label: nested_search
+          code: |
+            await page.locator("#search").fill("example_sku_123")
+      - block_type: code
+        label: verify_cart
+        code: |
+          assert "example_sku_123" in await page.locator("#cart").inner_text()
     """
 )
 
@@ -480,6 +511,23 @@ class TestCompiledAuthoringImposition:
         ]
         return ctx
 
+    def _typed_default_ctx(self) -> CopilotContext:
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "type_text",
+                "selector": "#search",
+                "source_url": "https://example.com/catalog",
+                "typed_length": 15,
+                "typed_value": "example_sku_123",
+                "role": "textbox",
+                "accessible_name": "Search",
+                "trajectory_index": 0,
+            }
+        ]
+        return ctx
+
     @pytest.mark.asyncio
     async def test_imposes_strict_scout_selector_and_lifts_singleton_literal(
         self, monkeypatch: pytest.MonkeyPatch
@@ -567,6 +615,19 @@ class TestCompiledAuthoringImposition:
         assert ctx.workflow_yaml == _SUBMITTED_LITERAL_YAML
 
     @pytest.mark.asyncio
+    async def test_flag_off_code_only_mode_does_not_promote_scouted_typed_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._typed_default_ctx()
+        ctx.impose_synthesized_code_block = False
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_TYPED_LITERAL_REWRITE_YAML}, ctx)
+
+        assert result["ok"] is True
+        assert ctx.workflow_yaml == _SUBMITTED_TYPED_LITERAL_REWRITE_YAML
+
+    @pytest.mark.asyncio
     async def test_unbound_synthesized_parameter_rejects_before_persist(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
         ctx = self._provider_search_ctx()
@@ -640,6 +701,111 @@ class TestCompiledAuthoringImposition:
         assert result["ok"] is False
         assert "exactly one direct browser-locator string literal fill/type call" in result["error"]
         assert ctx.workflow_yaml == ""
+
+    @pytest.mark.asyncio
+    async def test_promotes_scouted_typed_literal_across_multiple_and_nested_code_blocks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._typed_default_ctx()
+
+        result = await _update_workflow({"workflow_yaml": _SUBMITTED_TYPED_LITERAL_REWRITE_YAML}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        blocks = {str(block.get("label")): block for block in workflow_blocks(parsed)}
+        assert "fill(str(search))" in blocks["search_catalog"]["code"]
+        assert "type(str(search))" in blocks["select_result"]["code"]
+        assert "fill(str(search))" in blocks["nested_search"]["code"]
+        assert '"example_sku_123"' in blocks["verify_cart"]["code"]
+        assert blocks["search_catalog"]["parameter_keys"] == ["existing_filter", "search"]
+        assert blocks["select_result"]["parameter_keys"] == ["search"]
+        assert blocks["nested_search"]["parameter_keys"] == ["search"]
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "existing_filter",
+                "default_value": "active",
+            },
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "search",
+                "default_value": "example_sku_123",
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_scouted_typed_default_without_literal_rewrite_does_not_create_orphan_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _stub_successful_update(monkeypatch)
+        ctx = self._typed_default_ctx()
+        submitted_yaml = _SUBMITTED_TYPED_LITERAL_REWRITE_YAML.replace("example_sku_123", "other_sku_456")
+
+        result = await _update_workflow({"workflow_yaml": submitted_yaml}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        assert parsed["workflow_definition"]["parameters"] == [
+            {
+                "parameter_type": "workflow",
+                "workflow_parameter_type": "string",
+                "key": "existing_filter",
+                "default_value": "active",
+            }
+        ]
+        for block in workflow_blocks(parsed):
+            if str(block.get("block_type") or "").lower() == "code":
+                assert "other_sku_456" in str(block.get("code") or "")
+                assert "str(search)" not in str(block.get("code") or "")
+
+
+def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:
+    code = textwrap.dedent(
+        """
+        await page.locator("#café-search-résumé").fill("example_sku_123")
+        await page.locator("#naïve-search").type("example_sku_123")
+        """
+    ).strip()
+
+    rewritten, used_keys = workflow_update_module._rewrite_direct_literal_fills(code, {"example_sku_123": "search"})
+
+    assert used_keys == ["search"]
+    assert (
+        rewritten
+        == textwrap.dedent(
+            """
+        await page.locator("#café-search-résumé").fill(str(search))
+        await page.locator("#naïve-search").type(str(search))
+        """
+        ).strip()
+    )
+
+
+def test_python_ast_offsets_are_utf8_byte_offsets_for_unicode_source() -> None:
+    code = 'await page.locator("#café-search-résumé").fill("example_sku_123")'
+    tree = workflow_update_module._wrapped_code_ast(code)
+    assert tree is not None
+    fill_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "fill"
+        and node.args
+    )
+    literal = fill_call.args[0]
+    assert isinstance(literal, ast.Constant)
+    assert literal.value == "example_sku_123"
+
+    prefix = 'await page.locator("#café-search-résumé").fill('
+    assert literal.col_offset == 4 + len(prefix.encode("utf-8"))
+    assert literal.col_offset != 4 + len(prefix)
+    assert workflow_update_module._AST_COLUMN_OFFSETS_ARE_UTF8_BYTES is True
 
 
 class TestSeamSalvageIntoContext:
