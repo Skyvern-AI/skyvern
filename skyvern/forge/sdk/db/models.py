@@ -574,6 +574,13 @@ class WorkflowRunModel(Base):
             "created_at",
             postgresql_where=text("status IN ('created', 'queued', 'running', 'paused')"),
         ),
+        Index(
+            "ix_workflow_runs_sequential_key_lookup",
+            "workflow_permanent_id",
+            "sequential_key",
+            "queued_at",
+            postgresql_where=text("status IN ('queued', 'running', 'paused') AND browser_session_id IS NULL"),
+        ),
     )
 
     workflow_run_id = Column(String, primary_key=True, default=generate_workflow_run_id)
