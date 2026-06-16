@@ -85,6 +85,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ForLoopBlock,
     LoginBlock,
     NavigationBlock,
+    PdfFillBlock,
     PDFParserBlock,
     TaskV2Block,
     TextPromptBlock,
@@ -125,6 +126,7 @@ from skyvern.forge.sdk.workflow.status_mapping import (
     TASK_STATUS_MAP,
 )
 from skyvern.forge.sdk.workflow.workflow_definition_converter import convert_workflow_definition
+from skyvern.schemas.run_enums import RunEngine
 from skyvern.schemas.runs import (
     ProxyLocationInput,
     RunStatus,
@@ -273,14 +275,15 @@ def _collect_enterprise_gated_workflow_features(
 
     for block in blocks_to_check:
         # TaskV2Block deliberately stays out of this set: its inherited model field is not consumed at runtime.
-        task_block_uses_engine_and_model = (
-            isinstance(block, BaseTaskBlock) and block.block_type != BlockType.HUMAN_INTERACTION
-        )
+        engine: RunEngine | None = None
+        task_block_uses_engine_and_model = False
+        if isinstance(block, BaseTaskBlock) and block.block_type != BlockType.HUMAN_INTERACTION:
+            task_block_uses_engine_and_model = True
+            engine = block.engine
         block_uses_model = task_block_uses_engine_and_model or isinstance(
             block,
-            (TextPromptBlock, FileParserBlock, PDFParserBlock),
+            (TextPromptBlock, FileParserBlock, PDFParserBlock, PdfFillBlock),
         )
-        engine = block.engine if task_block_uses_engine_and_model else None
         model = block.model if block_uses_model else None
         feature_names.update(
             collect_enterprise_gated_run_features(
