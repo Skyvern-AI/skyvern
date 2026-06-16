@@ -65,6 +65,7 @@ const NODE_TYPE_TO_BLOCK_TYPE: Record<
   workflowTrigger: "workflow_trigger",
   googleSheetsRead: "google_sheets_read",
   googleSheetsWrite: "google_sheets_write",
+  pdfFill: "pdf_fill",
 };
 
 function getBlockTypeFromNode(node: AppNode): WorkflowBlockType | null {

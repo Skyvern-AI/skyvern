@@ -78,7 +78,7 @@ describe("BLOCK_FORMS dispatcher", () => {
     }
   });
 
-  test("contains the 26 expected node.type keys", () => {
+  test("contains the 27 expected node.type keys", () => {
     expect(new Set(BLOCK_FORM_KEYS)).toEqual(
       new Set([
         "task",
@@ -107,9 +107,10 @@ describe("BLOCK_FORMS dispatcher", () => {
         "workflowTrigger",
         "googleSheetsRead",
         "googleSheetsWrite",
+        "pdfFill",
       ]),
     );
-    expect(BLOCK_FORM_KEYS).toHaveLength(26);
+    expect(BLOCK_FORM_KEYS).toHaveLength(27);
   });
 
   test("conditional routes to the sidebar placeholder (canvas tile owns BranchesEditor)", () => {

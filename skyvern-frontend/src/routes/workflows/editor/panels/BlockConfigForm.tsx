@@ -20,6 +20,7 @@ import { LoopBlockForm } from "./BlockConfigForm/LoopBlockForm";
 import { NavigationBlockForm } from "./BlockConfigForm/NavigationBlockForm";
 import { PDFParserBlockForm } from "./BlockConfigForm/PDFParserBlockForm";
 import { PrintPageBlockForm } from "./BlockConfigForm/PrintPageBlockForm";
+import { PdfFillBlockForm } from "./BlockConfigForm/PdfFillBlockForm";
 import { SendEmailBlockForm } from "./BlockConfigForm/SendEmailBlockForm";
 import { TaskBlockForm } from "./BlockConfigForm/TaskBlockForm";
 import { Taskv2BlockForm } from "./BlockConfigForm/Taskv2BlockForm";
@@ -73,6 +74,7 @@ const BLOCK_FORMS: Record<WorkflowBlockNodeType, BlockFormComponent> = {
   url: URLBlockForm,
   http_request: HttpRequestBlockForm,
   printPage: PrintPageBlockForm,
+  pdfFill: PdfFillBlockForm,
   workflowTrigger: WorkflowTriggerBlockForm,
   googleSheetsRead: GoogleSheetsReadBlockForm,
   googleSheetsWrite: GoogleSheetsWriteBlockForm,
