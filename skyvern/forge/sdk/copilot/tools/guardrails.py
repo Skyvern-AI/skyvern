@@ -14,6 +14,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     turn_has_scout_interaction,
     workflow_target_url,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
 from skyvern.forge.sdk.copilot.output_policy import (
     evaluate_output_policy,
@@ -46,6 +47,7 @@ from ._shared import (
     _emit_tool_blocker_signal,
     _workflow_yaml_blocks_by_label,
 )
+from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
 
@@ -172,8 +174,8 @@ def _download_intent_block_labels(workflow_yaml: str | None) -> list[str]:
 def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) -> str | None:
     """Reject authoring a download-intent code block until the affordance has been scout-acted
     this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
-    synthesizer can compile the terminal download step. Off unless the scout-act flag is set."""
-    if not settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+    synthesizer can compile the terminal download step. Active in code-only browser mode."""
+    if _copilot_block_authoring_policy(copilot_ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
         return None
     if not settings.COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
         # The gate is cleared by the reached-download scout interaction, which is only registered
