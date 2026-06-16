@@ -644,15 +644,17 @@ _EVALUATE_BASE_DESCRIPTION = (
     "Execute JavaScript in the browser and return the result. "
     "Use this to inspect DOM state, read values, or run arbitrary JS."
 )
-# Scout-ACT framing: an interaction-gated affordance (a download, a row-expand, a post-login
-# area) only reveals its result after it is clicked, so it must be acted on here rather than
-# inspected passively. For a download the copilot then compiles the terminal download step.
+# Scout-ACT framing: a download (or row-expand / post-login) affordance exposes its terminal
+# target only once its page is reached. The model reaches that page with navigate/click and
+# observes it here — evaluate cannot click — so the copilot can derive the target and compile
+# the terminal download step.
 _EVALUATE_SCOUT_ACT_DESCRIPTION = (
     _EVALUATE_BASE_DESCRIPTION
-    + " Some results only appear AFTER an interaction (a download, a row-expand, a post-login "
-    "area); scout-ACT those affordances here (click the control via JS) instead of inspecting "
-    "passively. For a download, click the download control with this tool rather than authoring "
-    "the download yourself — the copilot then compiles the terminal download step for you."
+    + " Some affordances (a download, a row-expand, a post-login area) only expose their target "
+    "once the page holding them is reached. Use this tool to OBSERVE that page — it cannot click; "
+    "reach the page with the navigate/click tools first. For a download, observe the page that "
+    "exposes the download control rather than authoring the download yourself; the copilot then "
+    "compiles the terminal download step for you."
 )
 
 
