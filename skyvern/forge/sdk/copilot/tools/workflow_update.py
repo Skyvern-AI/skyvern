@@ -56,7 +56,7 @@ from skyvern.forge.sdk.workflow.exceptions import BaseWorkflowHTTPException, Ins
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import RESERVED_PARAMETER_KEYS, is_sensitive_workflow_parameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow
-from skyvern.schemas.proxy_location import ProxyLocation
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.workflows import BlockType
 
 from ._shared import (
@@ -2180,7 +2180,7 @@ async def _update_workflow(
 
 def _record_workflow_proxy_location_span(workflow_yaml: str, workflow: Workflow) -> None:
     input_present, input_proxy_location = _raw_yaml_proxy_location(workflow_yaml)
-    effective_proxy_location = _proxy_location_trace_value(workflow.proxy_location)
+    effective_proxy_location = _proxy_location_trace_value(runtime_proxy_location(workflow.proxy_location))
     with copilot_span(
         "workflow_proxy_location_normalized",
         data={
@@ -2218,7 +2218,7 @@ def _record_workflow_update_result(
     copilot_ctx.last_workflow = wf
     _clear_resolved_per_tool_budget_problem_labels(copilot_ctx, wf)
     copilot_ctx.last_workflow_yaml = copilot_ctx.workflow_yaml or None
-    copilot_ctx.effective_workflow_proxy_location = getattr(wf, "proxy_location", None) or ProxyLocation.RESIDENTIAL
+    copilot_ctx.effective_workflow_proxy_location = runtime_proxy_location(getattr(wf, "proxy_location", None))
     data = result.get("data")
     if isinstance(data, dict):
         block_count = data.get("block_count")

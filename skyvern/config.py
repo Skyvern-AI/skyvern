@@ -180,6 +180,9 @@ class Settings(BaseSettings):
     # one with no scout_interaction this turn, and the evaluate tool is framed as the scout-act
     # path for interaction-gated affordances. Off (default) restores today's inspect-then-author.
     COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED: bool = False
+    # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
+    # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
+    RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.
