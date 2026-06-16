@@ -1970,6 +1970,23 @@ if settings.ENABLE_OPENROUTER:
             ),
         ),
     )
+
+    LLMConfigRegistry.register_config(
+        "OPENROUTER_XIAOMI_MIMO_V2_5",
+        LLMConfig(
+            "openrouter/xiaomi/mimo-v2.5",
+            ["OPENROUTER_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=settings.LLM_CONFIG_MAX_TOKENS,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENROUTER_API_KEY,
+                api_base=settings.OPENROUTER_API_BASE,
+                api_version=None,
+                model_info={"model_name": "openrouter/xiaomi/mimo-v2.5"},
+            ),
+        ),
+    )
 if settings.ENABLE_GROQ:
     # Register Groq model configured in settings
     if settings.GROQ_MODEL:
