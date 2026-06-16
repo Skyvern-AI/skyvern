@@ -11,7 +11,7 @@ from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun
 from skyvern.schemas.runs import ProxyLocation, ProxyLocationInput
 from skyvern.webeye.browser_artifacts import VideoArtifact
-from skyvern.webeye.browser_factory import BrowserContextFactory
+from skyvern.webeye.browser_factory import BrowserContextFactory, rebind_download_dir
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.real_browser_state import RealBrowserState
@@ -210,6 +210,18 @@ class RealBrowserManager(BrowserManager):
                 )
             else:
                 LOG.info("Used to occupy browser session here", browser_session_id=browser_session_id)
+                browser_context = browser_state.browser_context
+                adopted_browser = browser_context.browser if browser_context else None
+                if adopted_browser is not None:
+                    try:
+                        await rebind_download_dir(adopted_browser, run_id=workflow_run.workflow_run_id)
+                    except Exception:
+                        LOG.warning(
+                            "Failed to rebind download dir on adopted browser session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                            exc_info=True,
+                        )
                 page = await browser_state.get_working_page()
                 if page:
                     if url and navigate:

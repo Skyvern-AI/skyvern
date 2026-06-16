@@ -826,6 +826,14 @@ async def _maybe_attach_reached_download_target(
             return
         data["reached_download_target"] = target.to_dict()
         data["reached_download_guidance"] = _reached_download_guidance_for(target)
+        if settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED and not target.already_registered:
+            # The pure synthesizer compiles the terminal expect_download step from this typed object.
+            ctx.reached_download_target = target
+            if ctx.synthesized_block_offered and not ctx.update_workflow_called:
+                # The prompt-side offer latched before this download target resolved, so it rendered the
+                # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
+                ctx.synthesized_block_offered = False
+                LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
         LOG.info(
             "copilot_reached_download_target_steer",
             url=url,

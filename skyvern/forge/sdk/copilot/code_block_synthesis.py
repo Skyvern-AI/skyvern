@@ -16,11 +16,16 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.composition_evidence import SCOUT_INTERACTION_EVIDENCE_TOOL
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.utils.strings import escape_code_fences
 
 _MAX_STEPS = 60
 _INDENT = "    "
+
+# Base name for the download var bound by `async with page.expect_download() as <name>:`.
+_DOWNLOAD_VAR_BASE = "dl_info"
 
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
 _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
@@ -65,6 +70,8 @@ _RESERVED_PARAM_NAMES = frozenset(
         "json",
         "html",
         "Exception",
+        _DOWNLOAD_VAR_BASE,
+        f"{_DOWNLOAD_VAR_BASE}_file",
     }
 )
 
@@ -317,7 +324,10 @@ def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str
 
 
 def synthesize_code_block(
-    trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool = False
+    trajectory: Sequence[Mapping[str, Any]],
+    *,
+    strict_selectors: bool = False,
+    reached_download_target: ReachedDownloadTarget | None = None,
 ) -> SynthesizedCodeBlock | None:
     """Deterministically synthesize a code block from a scout trajectory, or None if empty."""
     if not trajectory:
@@ -331,6 +341,7 @@ def synthesize_code_block(
     used_param_keys: set[str] = set()
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
+    used_download_vars: set[str] = set()
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(
@@ -473,6 +484,26 @@ def synthesize_code_block(
             continue
         emitted += 1
 
+    if (
+        settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED
+        and reached_download_target is not None
+        and not reached_download_target.already_registered
+        and reached_download_target.selector
+    ):
+        # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
+        # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
+        download_var = _unique_key(_DOWNLOAD_VAR_BASE, used_download_vars)
+        download_obj = _unique_key(f"{download_var}_file", used_download_vars)
+        lines.append(f"{_INDENT}async with page.expect_download() as {download_var}:")
+        lines.append(f"{_INDENT * 2}await page.locator({_py_str(reached_download_target.selector)}).click()")
+        lines.append(f"{_INDENT}{download_obj} = await {download_var}.value")
+        # The captured file's parent is the persistent context's downloads_path (the run-scoped download
+        # dir), so save_as there materializes a named, scannable file the execution-layer dir-diff registers.
+        lines.append(
+            f"{_INDENT}await {download_obj}.save_as("
+            f"str((await {download_obj}.path()).parent / {download_obj}.suggested_filename))"
+        )
+
     if not lines:
         return None
 
@@ -612,6 +643,12 @@ def render_synthesized_offer_text(
             "credential ID in `default_value`; at runtime the key resolves to a credential object whose "
             "`.username` / `.password` / `.totp` attributes the snippet reads (`.totp` is a fresh one-time "
             "code generated when the block starts). Never replace these attribute reads with literal values."
+        )
+    if "page.expect_download()" in synthesized.code:
+        parts.append(
+            "The snippet already fires the browser download (`async with page.expect_download()`) to the "
+            "workflow output surface (`downloaded_files`). Do not re-fetch the file or place its bytes or URL "
+            "in the reply; the data-capture step only needs to name the downloaded artifact, not refetch it."
         )
     if synthesized.notes:
         parts.append("Synthesis notes: " + "; ".join(synthesized.notes) + ".")
