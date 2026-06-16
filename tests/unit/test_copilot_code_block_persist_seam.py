@@ -590,6 +590,91 @@ class TestCompiledAuthoringImposition:
         assert "<fill: captured value>" not in block["code"]
         assert 'await page.locator("#provInput").fill(str(provider_name))' in block["code"]
 
+    def _download_ctx(self) -> CopilotContext:
+        from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
+
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "#statement-row",
+                "source_url": "https://example.com/billing",
+                "trajectory_index": 0,
+            }
+        ]
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='a[href="/billing/statement.pdf"]',
+            affordance_text="View Printable Statement",
+            download_kind="attribute",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_imposition_forwards_reached_target_and_emits_download_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.config import settings
+
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+        ctx = self._download_ctx()
+        submitted = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        parsed = parse_workflow_yaml(ctx.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert "async with page.expect_download()" in block["code"]
+        assert "/billing/statement.pdf" in block["code"]
+        assert "save_as" not in block["code"]
+        assert result["data"]["imposed_substitutions"]["block_label"] == "download_statement"
+
+    @pytest.mark.asyncio
+    async def test_imposed_download_terminal_clears_binding_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.config import settings
+
+        _stub_successful_update(monkeypatch)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+        ctx = self._download_ctx()
+        ctx.flow_evidence = [
+            {
+                "evidence": {"source_tool": "scout_interaction", "interaction_selector": "#statement-row"},
+                "reached_via": "interaction",
+            }
+        ]
+        submitted = _yaml(
+            """
+            title: Statement download
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_statement
+                code: |
+                  await page.locator("#statement-row").click()
+            """
+        )
+
+        result = await _update_workflow({"workflow_yaml": submitted}, ctx)
+
+        assert result["ok"] is True
+        block = _single_code_block(parse_workflow_yaml(ctx.workflow_yaml))
+        assert "async with page.expect_download()" in block["code"]
+
     @pytest.mark.asyncio
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_successful_update(monkeypatch)
