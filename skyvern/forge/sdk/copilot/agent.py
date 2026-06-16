@@ -3186,7 +3186,7 @@ async def _run_copilot_turn_impl(
     output_guardrails = _build_copilot_output_guardrails(OutputGuardrail, GuardrailFunctionOutput)
 
     alias_map = get_skyvern_mcp_alias_map()
-    overlays = _build_skyvern_mcp_overlays()
+    overlays = _build_skyvern_mcp_overlays(copilot_config.block_authoring_policy)
     if _turn_intent_disables_tools(ctx.turn_intent):
         alias_map = {}
         overlays = {}

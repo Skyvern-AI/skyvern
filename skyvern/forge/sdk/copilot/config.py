@@ -28,6 +28,10 @@ def block_authoring_policy_from_code_only_mode(enabled: bool) -> BlockAuthoringP
     return BlockAuthoringPolicy.CODE_ONLY_BROWSER if enabled else BlockAuthoringPolicy.STANDARD
 
 
+def download_scout_act_required_for_policy(block_authoring_policy: BlockAuthoringPolicy | str | None) -> bool:
+    return normalize_block_authoring_policy(block_authoring_policy) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+
+
 DEFAULT_PROMPT_TEMPLATE = "workflow-copilot-agent.j2"
 DEFAULT_MAX_TURNS = 35
 DEFAULT_TOKEN_BUDGET = 90_000

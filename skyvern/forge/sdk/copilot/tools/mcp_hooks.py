@@ -7,13 +7,15 @@ from typing import Any
 
 import structlog
 
-from skyvern.config import settings
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
     advance_to_composing,
 )
-from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
+from skyvern.forge.sdk.copilot.config import (
+    BlockAuthoringPolicy,
+    download_scout_act_required_for_policy,
+)
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay
 from skyvern.forge.sdk.copilot.runtime import AgentContext
@@ -398,7 +400,7 @@ async def _click_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
-            if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+            if _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER:
                 await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
     return result
 
@@ -677,13 +679,17 @@ _EVALUATE_SCOUT_ACT_DESCRIPTION = (
 )
 
 
-def _evaluate_overlay_description() -> str:
-    if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+def _evaluate_overlay_description(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> str:
+    if download_scout_act_required_for_policy(block_authoring_policy):
         return _EVALUATE_SCOUT_ACT_DESCRIPTION
     return _EVALUATE_BASE_DESCRIPTION
 
 
-def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
+def _build_skyvern_mcp_overlays(
+    block_authoring_policy: BlockAuthoringPolicy | str | None = BlockAuthoringPolicy.STANDARD,
+) -> dict[str, SchemaOverlay]:
     return {
         "get_block_schema": SchemaOverlay(
             pre_hook=_get_block_schema_pre_hook,
@@ -711,7 +717,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
-            description=_evaluate_overlay_description(),
+            description=_evaluate_overlay_description(block_authoring_policy),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
             timeout=30,

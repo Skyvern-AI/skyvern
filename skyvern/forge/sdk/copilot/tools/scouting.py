@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
     SCOUT_INTERACTION_EVIDENCE_TOOL,
     has_bounded_page_schema,
 )
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.reached_download_target import (
     ReachedDownloadTarget,
@@ -40,6 +41,7 @@ from ._shared import (
     _same_page_ignoring_fragment,
     _workflow_verification_evidence,
 )
+from .banned_blocks import _copilot_block_authoring_policy
 
 LOG = structlog.get_logger()
 
@@ -866,7 +868,10 @@ async def _maybe_attach_reached_download_target(
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
                 ctx.synthesized_block_offered = False
                 LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
-        if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED and not target.already_registered:
+        if (
+            _copilot_block_authoring_policy(ctx) == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+            and not target.already_registered
+        ):
             _register_reached_download_scout_interaction(ctx, target, url=url)
         LOG.info(
             "copilot_reached_download_target_steer",
