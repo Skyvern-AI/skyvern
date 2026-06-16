@@ -163,6 +163,30 @@ function errorMessageForCode(error: string): string {
   return ERROR_MESSAGES[error] ?? "Voice input failed. Try again.";
 }
 
+function microphonePermissionErrorMessage(error: unknown): string {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError" || error.name === "SecurityError") {
+      return ERROR_MESSAGES["not-allowed"]!;
+    }
+    if (error.name === "NotFoundError") {
+      return ERROR_MESSAGES["audio-capture"]!;
+    }
+  }
+  return "Voice input failed to start. Try again.";
+}
+
+async function requestMicrophonePermission(): Promise<void> {
+  if (
+    typeof navigator === "undefined" ||
+    !navigator.mediaDevices?.getUserMedia
+  ) {
+    return;
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  stream.getTracks().forEach((track) => track.stop());
+}
+
 export function useSpeechToText(
   options: UseSpeechToTextOptions,
 ): UseSpeechToTextResult {
@@ -197,6 +221,7 @@ export function useSpeechToText(
   const audioStopResolverRef = useRef<((blob: Blob | null) => void) | null>(
     null,
   );
+  const isStartingRef = useRef(false);
 
   const onTranscriptRef = useRef(onTranscript);
   const onErrorRef = useRef(onError);
@@ -382,13 +407,13 @@ export function useSpeechToText(
     teardownRecognition,
   ]);
 
-  const start = useCallback(() => {
-    if (!isSupported || !enabledRef.current || isListeningRef.current) {
-      return;
-    }
-
+  const beginRecognition = useCallback(() => {
     const SpeechRecognitionCtor = getSpeechRecognitionConstructor();
-    if (!SpeechRecognitionCtor) {
+    if (
+      !SpeechRecognitionCtor ||
+      !enabledRef.current ||
+      isListeningRef.current
+    ) {
       return;
     }
 
@@ -512,13 +537,41 @@ export function useSpeechToText(
   }, [
     clearHearingSpeech,
     clearRestartTimeout,
-    isSupported,
     lang,
     markHearingSpeech,
     startAudioCapture,
     stopAudioCapture,
     teardownRecognition,
   ]);
+
+  const start = useCallback(() => {
+    if (
+      !isSupported ||
+      !enabledRef.current ||
+      isListeningRef.current ||
+      isStartingRef.current
+    ) {
+      return;
+    }
+
+    isStartingRef.current = true;
+
+    void (async () => {
+      try {
+        await requestMicrophonePermission();
+
+        if (!enabledRef.current || isListeningRef.current) {
+          return;
+        }
+
+        beginRecognition();
+      } catch (error) {
+        onErrorRef.current?.(microphonePermissionErrorMessage(error));
+      } finally {
+        isStartingRef.current = false;
+      }
+    })();
+  }, [beginRecognition, isSupported]);
 
   const toggle = useCallback(() => {
     if (isListeningRef.current) {

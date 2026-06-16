@@ -119,6 +119,20 @@ describe("isSpeechRecognitionSupported", () => {
   });
 });
 
+const mockGetUserMedia = vi.fn().mockResolvedValue({
+  getTracks: () => [{ stop: vi.fn() }],
+});
+
+async function startSpeech(
+  start: () => void,
+): Promise<MockSpeechRecognition | null> {
+  await act(async () => {
+    start();
+    await Promise.resolve();
+  });
+  return MockSpeechRecognition.lastInstance;
+}
+
 describe("useSpeechToText", () => {
   const trackStop = vi.fn();
 
@@ -127,6 +141,9 @@ describe("useSpeechToText", () => {
     MockSpeechRecognition.lastInstance = null;
     MockMediaRecorder.lastInstance = null;
     trackStop.mockClear();
+    mockGetUserMedia.mockResolvedValue({
+      getTracks: () => [{ stop: trackStop }],
+    });
     (
       window as { SpeechRecognition?: typeof MockSpeechRecognition }
     ).SpeechRecognition = MockSpeechRecognition;
@@ -136,13 +153,7 @@ describe("useSpeechToText", () => {
     });
     Object.defineProperty(navigator, "mediaDevices", {
       configurable: true,
-      value: {
-        getUserMedia: vi.fn(() =>
-          Promise.resolve({
-            getTracks: () => [{ stop: trackStop }],
-          } as unknown as MediaStream),
-        ),
-      },
+      value: { getUserMedia: mockGetUserMedia },
     });
   });
 
@@ -162,26 +173,25 @@ describe("useSpeechToText", () => {
     expect(result.current.isSupported).toBe(true);
   });
 
-  it("starts and stops recognition", () => {
+  it("starts and stops recognition", async () => {
     const { result } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    const instance = await startSpeech(() => result.current.start());
 
+    expect(mockGetUserMedia).toHaveBeenCalledWith({ audio: true });
     expect(result.current.isListening).toBe(true);
-    expect(MockSpeechRecognition.lastInstance?.start).toHaveBeenCalled();
-    expect(MockSpeechRecognition.lastInstance?.continuous).toBe(true);
-    expect(MockSpeechRecognition.lastInstance?.interimResults).toBe(true);
+    expect(instance?.start).toHaveBeenCalled();
+    expect(instance?.continuous).toBe(true);
+    expect(instance?.interimResults).toBe(true);
 
     act(() => {
       result.current.stop();
     });
 
     expect(result.current.isListening).toBe(false);
-    expect(MockSpeechRecognition.lastInstance?.stop).toHaveBeenCalled();
+    expect(instance?.stop).toHaveBeenCalled();
   });
 
   it("captures an audio blob while dictating", async () => {
@@ -250,14 +260,12 @@ describe("useSpeechToText", () => {
     expect(trackStop).toHaveBeenCalled();
   });
 
-  it("toggles listening on and off", () => {
+  it("toggles listening on and off", async () => {
     const { result } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.toggle();
-    });
+    await startSpeech(() => result.current.toggle());
     expect(result.current.isListening).toBe(true);
 
     act(() => {
@@ -266,7 +274,7 @@ describe("useSpeechToText", () => {
     expect(result.current.isListening).toBe(false);
   });
 
-  it("appends final transcript chunks with spacing", () => {
+  it("appends final transcript chunks with spacing", async () => {
     const onTranscript = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -275,9 +283,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("hello world");
@@ -294,7 +300,7 @@ describe("useSpeechToText", () => {
     );
   });
 
-  it("starts from an empty base text", () => {
+  it("starts from an empty base text", async () => {
     const onTranscript = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -303,9 +309,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("first phrase");
@@ -313,7 +317,49 @@ describe("useSpeechToText", () => {
     expect(onTranscript).toHaveBeenLastCalledWith("first phrase");
   });
 
-  it("surfaces permission errors", () => {
+  it("surfaces permission errors when microphone access is denied", async () => {
+    const onError = vi.fn();
+    mockGetUserMedia.mockRejectedValue(
+      new DOMException("Permission denied", "NotAllowedError"),
+    );
+    const { result } = renderHook(() =>
+      useSpeechToText({
+        onTranscript: vi.fn(),
+        onError,
+      }),
+    );
+
+    await startSpeech(() => result.current.start());
+
+    expect(onError).toHaveBeenCalledWith(
+      "Microphone access was denied. Allow microphone permission and try again.",
+    );
+    expect(result.current.isListening).toBe(false);
+    expect(MockSpeechRecognition.lastInstance).toBeNull();
+  });
+
+  it("surfaces no-microphone errors from getUserMedia", async () => {
+    const onError = vi.fn();
+    mockGetUserMedia.mockRejectedValue(
+      new DOMException("Requested device not found", "NotFoundError"),
+    );
+    const { result } = renderHook(() =>
+      useSpeechToText({
+        onTranscript: vi.fn(),
+        onError,
+      }),
+    );
+
+    await startSpeech(() => result.current.start());
+
+    expect(onError).toHaveBeenCalledWith(
+      "No microphone was found. Check your device and try again.",
+    );
+    expect(result.current.isListening).toBe(false);
+    expect(MockSpeechRecognition.lastInstance).toBeNull();
+  });
+
+  it("surfaces speech recognition permission errors", async () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -322,9 +368,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitError("not-allowed");
@@ -336,7 +380,7 @@ describe("useSpeechToText", () => {
     expect(result.current.isListening).toBe(false);
   });
 
-  it("stops when enabled becomes false", () => {
+  it("stops when enabled becomes false", async () => {
     const { result, rerender } = renderHook(
       ({ enabled }: { enabled: boolean }) =>
         useSpeechToText({
@@ -346,9 +390,7 @@ describe("useSpeechToText", () => {
       { initialProps: { enabled: true } },
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
     expect(result.current.isListening).toBe(true);
 
     rerender({ enabled: false });
@@ -356,14 +398,12 @@ describe("useSpeechToText", () => {
     expect(result.current.isListening).toBe(false);
   });
 
-  it("cleans up active recognition on unmount", () => {
+  it("cleans up active recognition on unmount", async () => {
     const { result, unmount } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     const instance = MockSpeechRecognition.lastInstance;
     unmount();
@@ -371,7 +411,7 @@ describe("useSpeechToText", () => {
     expect(instance?.abort).toHaveBeenCalled();
   });
 
-  it("updates transcript with interim results", () => {
+  it("updates transcript with interim results", async () => {
     const onTranscript = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -380,9 +420,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("hel", false);
@@ -390,14 +428,12 @@ describe("useSpeechToText", () => {
     expect(onTranscript).toHaveBeenLastCalledWith("base hel");
   });
 
-  it("pulses isHearingSpeech while interim speech is detected", () => {
+  it("pulses isHearingSpeech while interim speech is detected", async () => {
     const { result } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("hel", false);
@@ -410,14 +446,12 @@ describe("useSpeechToText", () => {
     expect(result.current.isHearingSpeech).toBe(false);
   });
 
-  it("clears isHearingSpeech when dictation stops", () => {
+  it("clears isHearingSpeech when dictation stops", async () => {
     const { result } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("hel", false);
@@ -430,14 +464,12 @@ describe("useSpeechToText", () => {
     expect(result.current.isHearingSpeech).toBe(false);
   });
 
-  it("restarts recognition when the browser ends the session while listening", () => {
+  it("restarts recognition when the browser ends the session while listening", async () => {
     const { result } = renderHook(() =>
       useSpeechToText({ onTranscript: vi.fn() }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     const instance = MockSpeechRecognition.lastInstance;
     expect(instance?.start).toHaveBeenCalledTimes(1);
@@ -456,7 +488,7 @@ describe("useSpeechToText", () => {
     expect(result.current.isListening).toBe(true);
   });
 
-  it("stops listening after too many rapid auto-restarts", () => {
+  it("stops listening after too many rapid auto-restarts", async () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -465,9 +497,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     const instance = MockSpeechRecognition.lastInstance;
     expect(instance).not.toBeNull();
@@ -485,7 +515,7 @@ describe("useSpeechToText", () => {
     );
   });
 
-  it("ignores no-speech errors while listening", () => {
+  it("ignores no-speech errors while listening", async () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -494,9 +524,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitError("no-speech");
@@ -522,7 +550,7 @@ describe("useSpeechToText", () => {
     expect(MockSpeechRecognition.lastInstance).toBeNull();
   });
 
-  it("uses cached finalized chunks for results before resultIndex", () => {
+  it("uses cached finalized chunks for results before resultIndex", async () => {
     const onTranscript = vi.fn();
     const { result } = renderHook(() =>
       useSpeechToText({
@@ -531,9 +559,7 @@ describe("useSpeechToText", () => {
       }),
     );
 
-    act(() => {
-      result.current.start();
-    });
+    await startSpeech(() => result.current.start());
 
     act(() => {
       MockSpeechRecognition.lastInstance?.emitResult("hello world");
