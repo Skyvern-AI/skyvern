@@ -52,6 +52,7 @@ import { useBlockScriptStore } from "@/store/BlockScriptStore";
 import { useBlockSidebarWidthStore } from "@/store/BlockSidebarWidthStore";
 import { useCacheKeyValueStore } from "@/store/CacheKeyValueStore";
 import { useRecordingStore } from "@/store/useRecordingStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { useShowAllCodeStore } from "@/store/ShowAllCodeStore";
 import { useSidebarSaveStateStore } from "@/store/SidebarSaveStateStore";
 import { useWorkflowHistoryAccessStore } from "@/store/WorkflowHistoryAccessStore";
@@ -408,6 +409,16 @@ function Workspace({
   const [isCopilotOpen, setIsCopilotOpen] = useState(
     () => !!initialCopilotMessage || !initialNodes.some(isWorkflowBlockNode),
   );
+  // Open the copilot panel when a code block requests a goal-driven (re)build,
+  // so the user can watch the scout and the generated block apply.
+  const copilotPendingBuild = useCopilotActionStore(
+    (state) => state.pendingBuild,
+  );
+  useEffect(() => {
+    if (copilotPendingBuild) {
+      setIsCopilotOpen(true);
+    }
+  }, [copilotPendingBuild]);
   const [copilotMessageCount, setCopilotMessageCount] = useState(0);
   const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [readyBrowserSessionId, setReadyBrowserSessionId] = useState<

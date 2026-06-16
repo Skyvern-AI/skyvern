@@ -1,5 +1,9 @@
 import { ProxyLocation, RunEngine } from "@/api/types";
-import { WorkflowBlockType, WorkflowModel } from "./workflowTypes";
+import {
+  CodeBlockStep,
+  WorkflowBlockType,
+  WorkflowModel,
+} from "./workflowTypes";
 
 export type WorkflowCreateYAMLRequest = {
   title: string;
@@ -309,6 +313,8 @@ export type CodeBlockYAML = BlockYAMLBase & {
   block_type: "code";
   code: string;
   parameter_keys?: Array<string> | null;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlockYAML = BlockYAMLBase & {

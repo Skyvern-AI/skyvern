@@ -377,10 +377,20 @@ export type WhileLoopBlock = WorkflowBlockBase & {
   condition: BranchCriteria;
 };
 
+export type CodeBlockStep = {
+  title?: string | null;
+  description?: string | null;
+  action_type: string;
+  line_start?: number | null;
+  line_end?: number | null;
+};
+
 export type CodeBlock = WorkflowBlockBase & {
   block_type: "code";
   code: string;
   parameters: Array<WorkflowParameter>;
+  prompt?: string | null;
+  steps?: Array<CodeBlockStep> | null;
 };
 
 export type TextPromptBlock = WorkflowBlockBase & {
