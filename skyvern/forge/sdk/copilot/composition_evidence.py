@@ -707,6 +707,13 @@ def _turn_evidence_sources(ctx: Any) -> list[dict[str, Any]]:
     return sources
 
 
+def turn_has_scout_interaction(ctx: Any) -> bool:
+    """True when this turn's evidence trajectory carries a scout_interaction observation that
+    resolved a concrete selector — proof the model scout-ACTED an affordance (clicked it) rather
+    than only inspecting the page passively."""
+    return any(_is_scout_interaction_evidence(evidence) for evidence in _turn_evidence_sources(ctx))
+
+
 def _prior_observed_pages(ctx: Any) -> list[dict[str, Any]]:
     return [page for page in (getattr(ctx, "prior_observed_acted_pages", None) or []) if isinstance(page, dict)]
 

@@ -3,6 +3,8 @@ selector and trajectory recency (never URL identity — a browser download does 
 
 from __future__ import annotations
 
+import ast
+import textwrap
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, cast
@@ -178,3 +180,68 @@ _CONFIRMED_DOWNLOAD_GUIDANCE = (
 
 def guidance_for(target: ReachedDownloadTarget) -> str:
     return _CONFIRMED_DOWNLOAD_GUIDANCE if target.already_registered else _AUTHOR_DOWNLOAD_GUIDANCE
+
+
+_EXPECT_DOWNLOAD_ATTR = "expect_download"
+_DOWNLOAD_EVENT_CAPTURE_ATTRS: frozenset[str] = frozenset({"wait_for_event", "expect_event"})
+_DOWNLOAD_EVENT_NAME = "download"
+_REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+
+
+def _call_is_expect_download(node: ast.expr) -> bool:
+    if isinstance(node, ast.Await):
+        return _call_is_expect_download(node.value)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return node.func.attr == _EXPECT_DOWNLOAD_ATTR
+    return False
+
+
+def _call_is_download_event_capture(node: ast.expr) -> bool:
+    """True for the event-based download idioms ``page.wait_for_event("download")`` /
+    ``page.expect_event("download")`` (await-unwrapped, first arg the literal ``"download"``).
+
+    A hand-rolled event capture registers the same browser download as ``expect_download`` but evades
+    the strict ``expect_download`` predicate, so the gate and contract treat it as download intent."""
+    if isinstance(node, ast.Await):
+        return _call_is_download_event_capture(node.value)
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    if node.func.attr not in _DOWNLOAD_EVENT_CAPTURE_ATTRS or not node.args:
+        return False
+    first = node.args[0]
+    return isinstance(first, ast.Constant) and first.value == _DOWNLOAD_EVENT_NAME
+
+
+def _dict_literal_keys(node: ast.expr) -> set[str]:
+    if isinstance(node, ast.Await):
+        return _dict_literal_keys(node.value)
+    if not isinstance(node, ast.Dict):
+        return set()
+    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+
+
+def code_is_download_intent(code: str) -> bool:
+    """True when a code block authors a download: it uses the `page.expect_download` context-manager
+    idiom or the event-based `page.wait_for_event("download")` / `page.expect_event("download")` idiom
+    anywhere, or returns/binds a dict literal carrying an execution-layer download registration key.
+    Used to require a scout-act before such a block may be authored."""
+    if not code.strip():
+        return False
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncWith, ast.With)):
+            for item in node.items:
+                if _call_is_expect_download(item.context_expr) or _call_is_download_event_capture(item.context_expr):
+                    return True
+        if isinstance(node, (ast.Call, ast.Await)) and _call_is_download_event_capture(node):
+            return True
+        if isinstance(node, ast.Return) and node.value is not None:
+            if _dict_literal_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
+                return True
+        if isinstance(node, ast.Assign):
+            if _dict_literal_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
+                return True
+    return False

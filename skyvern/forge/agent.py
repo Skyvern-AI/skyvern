@@ -526,6 +526,7 @@ class ForgeAgent:
         )
         LOG.info(
             "Created a new task for workflow run",
+            sampling=True,
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             task_id=task.task_id,
@@ -550,6 +551,7 @@ class ForgeAgent:
         )
         LOG.info(
             "Created new step for workflow run",
+            sampling=True,
             workflow_id=workflow.workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             order=step.order,
@@ -1379,6 +1381,7 @@ class ForgeAgent:
         try:
             LOG.info(
                 "Starting agent step",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
             )
@@ -1690,6 +1693,7 @@ class ForgeAgent:
             # Execute the actions
             LOG.info(
                 "Executing actions",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
                 actions=actions,
@@ -1905,6 +1909,7 @@ class ForgeAgent:
                         pdf_auto_download_src = None
                     LOG.info(
                         "Action succeeded",
+                        sampling=True,
                         step_order=step.order,
                         step_retry=step.retry_index,
                         action_idx=action_idx,
@@ -1974,6 +1979,7 @@ class ForgeAgent:
 
             LOG.info(
                 "Actions executed successfully, marking step as completed",
+                sampling=True,
                 step_order=step.order,
                 step_retry=step.retry_index,
                 action_results=action_results,
@@ -2567,6 +2573,7 @@ class ForgeAgent:
 
             LOG.info(
                 "Speculative extract-actions completed",
+                sampling=True,
                 current_step_id=current_step.step_id,
                 synthetic_step_id=next_step.step_id,
             )
@@ -3395,6 +3402,7 @@ class ForgeAgent:
             )
         LOG.info(
             "Scraped website",
+            sampling=True,
             step_order=step.order,
             step_retry=step.retry_index,
             num_elements=len(scraped_page.elements),
@@ -3908,6 +3916,7 @@ class ForgeAgent:
 
                 LOG.info(
                     "Using cached prompt",
+                    sampling=True,
                     task_id=task.task_id,
                     prompt_name=EXTRACT_ACTION_PROMPT_NAME,
                     cache_variant=cache_variant,
@@ -4427,6 +4436,7 @@ class ForgeAgent:
         if task.workflow_run_id:
             LOG.info(
                 "Task is part of a workflow run, not sending a webhook response",
+                sampling=True,
                 task_id=task.task_id,
                 workflow_run_id=task.workflow_run_id,
             )
@@ -4515,6 +4525,7 @@ class ForgeAgent:
             if resp.status_code >= 200 and resp.status_code < 300:
                 LOG.info(
                     "Webhook sent successfully",
+                    sampling=True,
                     task_id=task.task_id,
                     resp_code=resp.status_code,
                     resp_text=resp.text,
@@ -5030,6 +5041,7 @@ class ForgeAgent:
 
         LOG.info(
             "Parallel verification: goal not achieved, awaiting speculative extract-actions",
+            sampling=True,
             step_id=step.step_id,
             task_id=task.task_id,
         )

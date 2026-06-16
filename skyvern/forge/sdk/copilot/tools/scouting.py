@@ -21,6 +21,9 @@ from skyvern.forge.sdk.copilot.composition_evidence import (
 )
 from skyvern.forge.sdk.copilot.enforcement import _RECENT_TOOL_OUTPUT_CHAR_CAP
 from skyvern.forge.sdk.copilot.reached_download_target import (
+    ReachedDownloadTarget,
+)
+from skyvern.forge.sdk.copilot.reached_download_target import (
     derive_from_navigation_targets as _derive_reached_download_from_nav_targets,
 )
 from skyvern.forge.sdk.copilot.reached_download_target import guidance_for as _reached_download_guidance_for
@@ -799,6 +802,31 @@ async def _maybe_steer_evaluate_to_action(
     return False
 
 
+def _register_reached_download_scout_interaction(ctx: AgentContext, target: ReachedDownloadTarget, *, url: str) -> None:
+    """Record the evaluate-resolved download affordance as a scout_interaction observation.
+
+    The scout-act download gate is cleared by a scout_interaction this turn, but the reached-download
+    target is resolved on the evaluate post-hook (source_tool="evaluate"). Registering the affordance
+    here unifies the two: the same evaluate call that feeds the synthesizer also clears the gate, so
+    obeying the scout-act steering is sufficient and the gate cannot loop on a scouted download.
+    """
+    selector = target.selector.strip()
+    if not selector or not url.strip():
+        return
+    _append_flow_evidence(
+        ctx,
+        {
+            "inspected_url": url,
+            "current_url": url,
+            "source_tool": SCOUT_INTERACTION_EVIDENCE_TOOL,
+            "interaction_tool": "evaluate",
+            "interaction_selector": selector,
+            "download_kind": target.download_kind,
+        },
+        reached_via="interaction",
+    )
+
+
 async def _maybe_attach_reached_download_target(
     ctx: AgentContext,
     result: dict[str, Any],
@@ -834,6 +862,8 @@ async def _maybe_attach_reached_download_target(
                 # non-download idiom. Reopen the latch once so the post-turn fallback re-fires carrying it.
                 ctx.synthesized_block_offered = False
                 LOG.info("copilot_synthesized_block_offer_latch_reset_for_download", url=url)
+        if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED and not target.already_registered:
+            _register_reached_download_scout_interaction(ctx, target, url=url)
         LOG.info(
             "copilot_reached_download_target_steer",
             url=url,

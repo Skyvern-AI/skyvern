@@ -154,6 +154,7 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -400,6 +401,7 @@ class Block(BaseModel, abc.ABC):
         )
         LOG.info(
             "Registered output parameter value",
+            sampling=True,
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
             output_parameter_value=value,
@@ -466,6 +468,24 @@ class Block(BaseModel, abc.ABC):
 
         if browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+            if browser_state is not None:
+                adopted_context = browser_state.browser_context
+                adopted_browser = adopted_context.browser if adopted_context else None
+                if adopted_browser is not None:
+                    try:
+                        await rebind_download_dir(adopted_browser, run_id=workflow_run_id)
+                        LOG.info(
+                            "Rebound download dir on adopted persistent session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to rebind download dir on adopted persistent session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
@@ -724,6 +744,7 @@ class Block(BaseModel, abc.ABC):
             description = json_response.get("summary")
             LOG.info(
                 "Generated description for the workflow run block",
+                sampling=True,
                 description=description,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -812,7 +833,11 @@ class Block(BaseModel, abc.ABC):
                     )
 
             LOG.info(
-                "Executing block", workflow_run_id=workflow_run_id, block_label=self.label, block_type=self.block_type
+                "Executing block",
+                sampling=True,
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                block_type=self.block_type,
             )
             return await self.execute(
                 workflow_run_id,
@@ -1361,6 +1386,7 @@ class BaseTaskBlock(Block):
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
+                    sampling=True,
                     task_id=updated_task.task_id,
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,

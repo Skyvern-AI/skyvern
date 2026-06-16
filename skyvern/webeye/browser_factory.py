@@ -179,8 +179,9 @@ def set_download_file_listener(
     browser_context: BrowserContext, download_timeout: float | None = None, **kwargs: Any
 ) -> None:
     async def listen_to_download(download: Download) -> None:
-        workflow_run_id = kwargs.get("workflow_run_id")
-        task_id = kwargs.get("task_id")
+        context = current()
+        workflow_run_id = (context.workflow_run_id if context else None) or kwargs.get("workflow_run_id")
+        task_id = (context.task_id if context else None) or kwargs.get("task_id")
         try:
             async with asyncio.timeout(download_timeout or BROWSER_DOWNLOAD_TIMEOUT):
                 file_path = await download.path()
@@ -259,11 +260,8 @@ def initialize_download_dir() -> str:
     )
 
 
-async def _apply_download_behaviour(browser: Browser) -> None:
-    context = ensure_context()
-    download_dir = get_download_dir(
-        context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
-    )
+async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
+    download_dir = get_download_dir(run_id)
     cdp_session = await browser.new_browser_cdp_session()
     await cdp_session.send(
         "Browser.setDownloadBehavior",
@@ -273,7 +271,13 @@ async def _apply_download_behaviour(browser: Browser) -> None:
         },
     )
 
-    LOG.info("setDownloadBehavior applied", download_dir=download_dir)
+    LOG.info("setDownloadBehavior applied", download_dir=download_dir, run_id=run_id)
+
+
+async def _apply_download_behaviour(browser: Browser) -> None:
+    context = ensure_context()
+    run_id = context.run_id if context and context.run_id else context.workflow_run_id or context.task_id
+    await rebind_download_dir(browser, run_id)
 
 
 class BrowserContextCreator(Protocol):
