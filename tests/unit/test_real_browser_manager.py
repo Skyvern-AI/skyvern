@@ -518,3 +518,78 @@ async def test_cleanup_persists_session_cookies_when_close_deferred_for_streams(
 
     persist_mock.assert_awaited_once_with(browser_state.browser_context, "/tmp/fake_profile")
     browser_state.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_rebinds_download_dir_to_run_id() -> None:
+    """Adopting a persistent session must rebind its CDP download dir to the run's id (SKY-11083)."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_adopt")
+
+    adopted_browser = MagicMock()
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = adopted_browser
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_adopt",
+        )
+
+    mock_rebind.assert_awaited_once_with(adopted_browser, run_id="wfr_adopt")
+
+
+@pytest.mark.asyncio
+async def test_pbs_adoption_skips_rebind_when_no_browser() -> None:
+    """Rebind must no-op when the adopted context exposes no owning browser (e.g. launch_persistent_context)."""
+    manager = RealBrowserManager()
+    workflow_run = make_workflow_run("wfr_no_browser")
+
+    pbs_state = MagicMock()
+    pbs_state.browser_context.browser = None
+    pbs_state.get_working_page = AsyncMock(return_value=None)
+    pbs_state.get_or_create_page = AsyncMock()
+
+    with (
+        patch("skyvern.webeye.real_browser_manager.app") as mock_app,
+        patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind,
+    ):
+        mock_app.PERSISTENT_SESSIONS_MANAGER.get_browser_state = AsyncMock(return_value=pbs_state)
+        mock_app.PERSISTENT_SESSIONS_MANAGER.set_browser_state = AsyncMock()
+
+        await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id="bs_no_browser",
+        )
+
+    mock_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_pbs_workflow_run_does_not_rebind() -> None:
+    """The own-browser (no browser_session_id) path must run zero new download-rebind code (SKY-11083 regression guard)."""
+    manager = RealBrowserManager()
+    parent_state = MagicMock()
+    manager.pages["wfr_parent"] = parent_state
+
+    workflow_run = make_workflow_run("wfr_child", parent_workflow_run_id="wfr_parent")
+
+    with patch("skyvern.webeye.real_browser_manager.rebind_download_dir", new_callable=AsyncMock) as mock_rebind:
+        result = await manager.get_or_create_for_workflow_run(
+            workflow_run=workflow_run,
+            url=None,
+            browser_session_id=None,
+        )
+
+    assert result is parent_state
+    mock_rebind.assert_not_awaited()
