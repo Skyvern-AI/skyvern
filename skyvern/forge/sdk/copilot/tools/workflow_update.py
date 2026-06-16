@@ -46,6 +46,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.runtime import AgentContext, ScoutedInteraction
 from skyvern.forge.sdk.copilot.streaming_adapter import emit_workflow_draft, maybe_emit_design_end
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
@@ -398,9 +399,13 @@ def _normalize_code_artifact_metadata_detailed(
                 reject_unfilled_goal_value_paths=impose_defaults,
             )
         )
-        return_shape_error = _extraction_return_shape_error(label, dumped, str(code_blocks[label].get("code") or ""))
+        block_code = str(code_blocks[label].get("code") or "")
+        return_shape_error = _extraction_return_shape_error(label, dumped, block_code)
         if return_shape_error is not None:
             item_violations.append(return_shape_error)
+        download_shape_error = _download_return_shape_error(label, dumped, block_code)
+        if download_shape_error is not None:
+            item_violations.append(download_shape_error)
         if item_violations:
             violations.extend(item_violations)
             offending_labels.append(label)
@@ -1525,6 +1530,8 @@ def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code
     signal; non-extraction blocks are never subject to this."""
     if not _artifact_declares_goal_values(artifact) or not code.strip():
         return None
+    if _is_download_intent(artifact, code):
+        return None
     if _code_block_returns_flat_string(code):
         return (
             f"Code block `{label}` declares `goal_value_paths` but `return`s a flat text blob "
@@ -1539,6 +1546,110 @@ def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code
             "function the top level never calls, so the block captures the function object instead of the data. "
             "Call that function and return its result (e.g. `return await run(page)`), or build the keyed "
             "structure at the top level so the declared goal values reach the block output."
+        )
+    return None
+
+
+_EXPECT_DOWNLOAD_ATTR = "expect_download"
+
+
+def _call_is_expect_download(node: ast.expr) -> bool:
+    if isinstance(node, ast.Await):
+        return _call_is_expect_download(node.value)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        return node.func.attr == _EXPECT_DOWNLOAD_ATTR
+    return False
+
+
+def _code_uses_expect_download(code: str) -> bool:
+    """True only for the registering form: `expect_download()` called as the context
+    expression of an `async with`/`with`. A bare `page.expect_download` attribute or an
+    uncaptured call fires no download, so it does not count."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.AsyncWith, ast.With)):
+            for item in node.items:
+                if _call_is_expect_download(item.context_expr):
+                    return True
+    return False
+
+
+def _dict_keys(node: ast.expr) -> set[str]:
+    if isinstance(node, ast.Await):
+        return _dict_keys(node.value)
+    if not isinstance(node, ast.Dict):
+        return set()
+    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+
+
+_REGISTERED_DOWNLOAD_OUTPUT_KEY_SET = frozenset(REGISTERED_DOWNLOAD_OUTPUT_KEYS)
+
+
+def _code_returns_registration_keys(code: str) -> bool:
+    """True when a top-level `return`/binding emits a dict literal carrying any
+    execution-layer-owned registration key; writing those keys self-certifies a
+    download the runtime never observed."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return False
+    for node in _iter_top_level_scope(tree.body):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if _dict_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
+                return True
+        if isinstance(node, ast.Assign):
+            if _dict_keys(node.value) & _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
+                return True
+    return False
+
+
+def _artifact_declares_registration_keys(artifact: Mapping[str, Any]) -> bool:
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            for path in _artifact_goal_value_paths(row.get("goal_value_paths")):
+                head = path.split(".", 1)[0].split("[", 1)[0].strip()
+                if head in _REGISTERED_DOWNLOAD_OUTPUT_KEY_SET:
+                    return True
+    return False
+
+
+def _is_download_intent(artifact: Mapping[str, Any], code: str) -> bool:
+    """Disjoint from extraction-intent (`goal_value_paths` on non-registration keys):
+    a block is download-intent when it carries the expect_download idiom, self-asserts a
+    registration key in a top-level dict, or declares a registration key as a goal path."""
+    if not code.strip():
+        return False
+    return (
+        _code_uses_expect_download(code)
+        or _code_returns_registration_keys(code)
+        or _artifact_declares_registration_keys(artifact)
+    )
+
+
+def _download_return_shape_error(label: str, artifact: Mapping[str, Any], code: str) -> str | None:
+    """Fail closed on a download-intent code block that cannot register a real download:
+    one lacking the `page.expect_download` idiom (no browser download ever fires), or one
+    whose return writes the execution-layer-owned registration keys (self-certification)."""
+    if not _is_download_intent(artifact, code):
+        return None
+    if not _code_uses_expect_download(code):
+        return (
+            f"Code block `{label}` is a download block but does not fire the browser download with the "
+            "`page.expect_download` idiom (async with page.expect_download() as dl_info: await "
+            "page.click(<unique selector>)). A static fetch or a plain click registers no file. Author the "
+            "expect_download idiom against a unique target so the runtime registers the file into the workflow "
+            "output (downloaded_files); never place file bytes or URLs in the chat reply."
+        )
+    if _code_returns_registration_keys(code):
+        return (
+            f"Code block `{label}` `return`s the download registration keys "
+            f"({', '.join(REGISTERED_DOWNLOAD_OUTPUT_KEYS)}) itself. The execution layer injects those keys when a "
+            "browser download fires; writing them self-certifies a download that may never have happened. Return a "
+            'small keyed descriptor instead (for example `return {"saved_as": dl_info.value.suggested_filename}`) and '
+            "let the expect_download idiom register the file."
         )
     return None
 

@@ -1425,6 +1425,7 @@ class RealSkyvernPageAi(SkyvernPageAi):
         elif lookup_result is not None:
             LOG.info(
                 "ai_extract cache miss",
+                sampling=True,
                 workflow_run_id=workflow_run_id,
                 cache_key=cache_key,
                 cache_hit=False,

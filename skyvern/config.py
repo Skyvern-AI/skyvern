@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # log volume (health checks, polling) while carrying no mutation to audit.
     LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
+    # Opt-in INFO-log sampling for high-volume orgs. A log call marked
+    # sampling=True is dropped from stdout/Datadog with probability
+    # (1 - LOG_SAMPLING_RATE) when its org is in LOG_SAMPLING_ORG_IDS. The full
+    # line is still captured in the per-run S3 log artifact. Both defaults make
+    # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
+    LOG_SAMPLING_RATE: float = 1.0
+    LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0

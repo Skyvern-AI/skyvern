@@ -1181,7 +1181,7 @@ class DomUtil:
                 # It can only represent the element position in the DOM tree with tag name, it's not 100% reliable.
                 # As long as the current position has the same element with the tag name, the locator can be found.
                 # (maybe) we should validate the element hash to make sure the element is the same?
-                LOG.warning("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id)
+                LOG.info("Fallback to locator element by xpath.", xpath=xpath, element_id=element_id, sampling=True)
                 locator = frame_content.locator(f"xpath={xpath}")
                 num_elements = await locator.count()
                 if num_elements < 1:

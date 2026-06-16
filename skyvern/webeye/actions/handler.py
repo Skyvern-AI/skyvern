@@ -1095,6 +1095,7 @@ class ActionHandler:
         await app.AGENT_FUNCTION.wait_for_challenge_solver(page=page)
         LOG.info(
             "Handling action",
+            sampling=True,
             action_type=action.action_type,
             action_id=action.action_id,
             status=action.status,
@@ -1882,6 +1883,7 @@ async def handle_input_text_action(
         if len(incremental_element) == 0:
             LOG.info(
                 "No new element detected, indicating it couldn't be a selectable auto-completion input",
+                sampling=True,
                 element_id=skyvern_element.get_id(),
                 action=action,
             )
@@ -2458,6 +2460,7 @@ async def handle_select_option_action(
     element_dict = scraped_page.id_to_element_dict[action.element_id]
     LOG.info(
         "SelectOptionAction",
+        sampling=True,
         action=action,
         tag_name=tag_name,
         element_dict=element_dict,
@@ -3423,7 +3426,7 @@ async def chain_click(
     locator = skyvern_element.locator
     click_count = _get_click_count(action)
     # TODO (suchintan): This should likely result in an ActionFailure -- we can figure out how to do this later!
-    LOG.info("Chain click starts", action=action, locator=locator)
+    LOG.info("Chain click starts", action=action, locator=locator, sampling=True)
     file = pending_upload_files or []
     if not file and action.file_url:
         file_url = get_actual_value_of_parameter_if_secret_with_task(task, action.file_url)
@@ -3448,7 +3451,7 @@ async def chain_click(
 
     if not has_pending:
         page.on("filechooser", fc_func)
-        LOG.info("Registered file chooser listener", action=action, path=file)
+        LOG.info("Registered file chooser listener", action=action, path=file, sampling=True)
     else:
         LOG.info(
             "Skipping defensive file chooser listener — pending deferred listener exists",
@@ -3472,7 +3475,7 @@ async def chain_click(
             else:
                 await EventStrategyFactory.move_to_element(page, locator)
                 await _locator_click(locator, click_count, timeout=timeout)
-            LOG.info("Chain click: main element click succeeded", action=action, locator=locator)
+            LOG.info("Chain click: main element click succeeded", action=action, locator=locator, sampling=True)
         action_results = [ActionSuccess()]
         return action_results
 
@@ -3918,6 +3921,7 @@ async def choose_auto_completion_dropdown(
     except Exception as e:
         LOG.info(
             "Failed to choose the auto completion dropdown",
+            sampling=True,
             exc_info=True,
             input_value=text,
         )
@@ -3974,6 +3978,7 @@ async def input_or_auto_complete_input(
 
         LOG.info(
             "Try the potential value for auto completion",
+            sampling=True,
             input_value=current_value,
         )
         is_location = input_or_select_context.is_location_input or False
@@ -4038,6 +4043,7 @@ async def input_or_auto_complete_input(
                 continue
             LOG.info(
                 "Try the potential value for auto completion",
+                sampling=True,
                 input_value=value,
             )
             result = await choose_auto_completion_dropdown(

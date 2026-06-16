@@ -73,7 +73,7 @@ async def restore_session_cookies(browser_context: BrowserContext | None, user_d
             return
         try:
             await browser_context.add_cookies(sanitized)
-            LOG.info("Restored session cookies into browser profile", cookie_count=len(sanitized))
+            LOG.info("Restored session cookies into browser profile", cookie_count=len(sanitized), sampling=True)
         except Exception:
             restored = 0
             for cookie in sanitized:
