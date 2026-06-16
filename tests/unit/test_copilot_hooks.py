@@ -341,6 +341,148 @@ class TestSchemaOverlay:
 
 class TestMCPFailedStepLoopDetection:
     @pytest.mark.asyncio
+    async def test_post_hook_exception_preserves_successful_tool_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import mcp_adapter
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+        from skyvern.forge.sdk.copilot.output_utils import summarize_tool_result
+
+        class FakeRawResult:
+            structured_content = {
+                "ok": True,
+                "data": {"selector": None, "resolved_selector": "xpath=//button[2]", "status": "clicked"},
+            }
+            is_error = False
+            content: list[Any] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                return FakeRawResult()
+
+        async def raising_post_hook(
+            result: dict[str, Any],
+            raw: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, Any]:
+            ctx.scouted_interactions.append({"tool_name": "click", "selector": "#partial"})
+            ctx.scout_trajectory.append({"tool_name": "click", "selector": "#partial", "trajectory_index": 1})
+            ctx.flow_evidence.append({"step": 2, "evidence": {"source_tool": "partial"}})
+            ctx.pending_browser_interaction_observation = SimpleNamespace(tool_name="click", url="https://partial")
+            ctx.pending_scout_source_url = None
+            ctx.pending_scout_typed_value = "partial"
+            raise AttributeError("'NoneType' object has no attribute 'strip'")
+
+        recorded: list[dict[str, Any]] = []
+        screenshots: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            mcp_adapter,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, _tool, _args, result: recorded.append(dict(result)),
+        )
+        monkeypatch.setattr(
+            mcp_adapter,
+            "enqueue_screenshot_from_result",
+            lambda _ctx, result: screenshots.append(dict(result)),
+        )
+
+        initial_scouted_interactions = [{"tool_name": "click", "selector": "#existing"}]
+        initial_scout_trajectory = [{"tool_name": "click", "selector": "#existing", "trajectory_index": 0}]
+        initial_flow_evidence = [{"step": 1, "evidence": {"source_tool": "existing"}}]
+        initial_pending_observation = SimpleNamespace(tool_name="click", url="https://existing")
+        ctx = SimpleNamespace(
+            consecutive_tool_tracker=[],
+            failed_tool_step_tracker={},
+            scouted_interactions=list(initial_scouted_interactions),
+            scout_trajectory=list(initial_scout_trajectory),
+            flow_evidence=list(initial_flow_evidence),
+            pending_browser_interaction_observation=initial_pending_observation,
+            pending_scout_source_url="https://source",
+            pending_scout_typed_value="typed",
+        )
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay(post_hook=raising_post_hook)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("click", {"intent": "click the add button"})
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is False
+        assert parsed == {
+            "ok": True,
+            "data": {"selector": None, "resolved_selector": "xpath=//button[2]", "status": "clicked"},
+        }
+        assert summarize_tool_result("click", parsed) == "Clicked 'xpath=//button[2]'"
+        assert recorded == [parsed]
+        assert screenshots == [parsed]
+        assert ctx.scouted_interactions == initial_scouted_interactions
+        assert ctx.scout_trajectory == initial_scout_trajectory
+        assert ctx.flow_evidence == initial_flow_evidence
+        assert ctx.pending_browser_interaction_observation == initial_pending_observation
+        assert ctx.pending_scout_source_url == "https://source"
+        assert ctx.pending_scout_typed_value == "typed"
+
+    @pytest.mark.asyncio
+    async def test_post_hook_exception_preserves_failing_tool_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.forge.sdk.copilot import mcp_adapter
+        from skyvern.forge.sdk.copilot.mcp_adapter import SchemaOverlay, SkyvernOverlayMCPServer
+
+        class FakeRawResult:
+            structured_content = {"ok": False, "error": "element not found"}
+            is_error = True
+            content: list[Any] = []
+
+        class FakeClient:
+            async def call_tool(
+                self,
+                name: str,
+                args: dict[str, Any],
+                raise_on_error: bool = False,
+            ) -> FakeRawResult:
+                return FakeRawResult()
+
+        async def raising_post_hook(
+            result: dict[str, Any],
+            raw: dict[str, Any],
+            ctx: Any,
+        ) -> dict[str, Any]:
+            raise RuntimeError("post-hook failed")
+
+        recorded: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            mcp_adapter,
+            "record_tool_step_result_for_ctx",
+            lambda _ctx, _tool, _args, result: recorded.append(dict(result)),
+        )
+
+        ctx = MagicMock()
+        ctx.consecutive_tool_tracker = []
+        ctx.failed_tool_step_tracker = {}
+        server = SkyvernOverlayMCPServer(
+            transport=MagicMock(),
+            overlays={"click": SchemaOverlay(post_hook=raising_post_hook)},
+            alias_map={},
+            allowlist=frozenset(),
+            context_provider=lambda: ctx,
+        )
+        server._client = FakeClient()
+
+        result = await server.call_tool("click", {"selector": "#missing"})
+
+        parsed = json.loads(result.content[0].text)
+        assert result.isError is True
+        assert parsed == {"ok": False, "error": "element not found"}
+        assert recorded == [parsed]
+
+    @pytest.mark.asyncio
     async def test_browser_tool_call_is_created_inside_copilot_browser_context(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -853,6 +995,7 @@ class TestBrowserInteractionObservationHooks:
 
         assert result["data"] == {
             "selector": "#add-to-cart",
+            "effective_target": "#add-to-cart",
             "url": "https://example.com/results",
             "title": "Results",
         }
@@ -1172,6 +1315,134 @@ class TestScoutedInteractionCapture:
         assert entry["reached_via"] == "interaction"
         assert entry["evidence"]["interaction_selector"] == "#sort"
         assert result["data"]["observation_step"] == entry["step"]
+
+    @pytest.mark.asyncio
+    async def test_intent_click_uses_resolved_selector_when_raw_selector_is_none(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = self._ctx(source_url="https://example.com/product")
+        ctx.flow_evidence = []
+        result = await _click_post_hook(
+            {
+                "ok": True,
+                "data": {
+                    "selector": None,
+                    "intent": "click the add button",
+                    "resolved_selector": "xpath=//button[2]",
+                },
+            },
+            {"browser_context": {"url": "https://example.com/cart", "title": "Cart"}},
+            ctx,
+        )
+
+        assert result["ok"] is True
+        assert result["data"]["selector"] == "xpath=//button[2]"
+        assert result["data"]["effective_target"] == "xpath=//button[2]"
+        assert ctx.scouted_interactions == [
+            {
+                "tool_name": "click",
+                "selector": "xpath=//button[2]",
+                "source_url": "https://example.com/product",
+            }
+        ]
+        assert ctx.flow_evidence[0]["evidence"]["interaction_selector"] == "xpath=//button[2]"
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_preserves_raw_selector_over_resolved_selector(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import _click_post_hook
+
+        ctx = self._ctx()
+        result = await _click_post_hook(
+            {"ok": True, "data": {"selector": "#add-to-cart", "resolved_selector": "xpath=//button[2]"}},
+            {"browser_context": {"url": "https://example.com/product", "title": "Product"}},
+            ctx,
+        )
+
+        assert result["data"]["effective_target"] == "#add-to-cart"
+        assert ctx.scouted_interactions == [{"tool_name": "click", "selector": "#add-to-cart"}]
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_prefers_accessible_label_for_effective_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def resolved_label(*_a: object, **_k: object) -> tuple[str, str]:
+            return "button", "Accept"
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_resolve_scout_role_name", resolved_label)
+        ctx = self._ctx()
+
+        result = await tools_module._click_post_hook(
+            {"ok": True, "data": {"selector": None, "resolved_selector": "xpath=//button[2]"}},
+            {"browser_context": {"url": "https://example.com/product", "title": "Product"}},
+            ctx,
+        )
+
+        assert result["data"]["selector"] == "xpath=//button[2]"
+        assert result["data"]["effective_target"] == "button Accept"
+
+    @pytest.mark.asyncio
+    async def test_scout_helpers_tolerate_selector_none(self) -> None:
+        from skyvern.forge.sdk.copilot.tools import (
+            _record_scouted_interaction,
+            _register_scout_interaction_observation,
+            _resolve_scout_role_name,
+        )
+
+        ctx = self._ctx()
+        ctx.flow_evidence = []
+
+        assert await _resolve_scout_role_name(ctx, None) == ("", "")
+        _record_scouted_interaction(ctx, tool_name="click", selector=None)
+        observation_step, page_evidence = await _register_scout_interaction_observation(
+            ctx,
+            tool_name="click",
+            selector=None,
+            source_url="https://example.com/product",
+            url="https://example.com/cart",
+        )
+
+        assert ctx.scouted_interactions == []
+        assert ctx.flow_evidence == []
+        assert observation_step is None
+        assert page_evidence is None
+
+    @pytest.mark.asyncio
+    async def test_selector_none_interaction_hooks_degrade_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.forge.sdk.copilot import tools as tools_module
+
+        async def passes(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(tools_module.mcp_hooks, "_verify_scout_type_landed", passes)
+        ctx = self._ctx()
+
+        type_result = await tools_module._type_text_post_hook(
+            {"ok": True, "data": {"selector": None, "text_length": 8}},
+            {"browser_context": {"url": "https://example.com/form", "title": "Form"}},
+            ctx,
+        )
+        select_result = await tools_module._select_option_post_hook(
+            {"ok": True, "data": {"selector": None, "value": "large"}},
+            {"browser_context": {"url": "https://example.com/form", "title": "Form"}},
+            ctx,
+        )
+        press_result = await tools_module._press_key_post_hook(
+            {"ok": True, "data": {"selector": None, "key": "Enter"}},
+            {"browser_context": {"url": "https://example.com/results", "title": "Results"}},
+            ctx,
+        )
+
+        assert type_result["ok"] is True
+        assert type_result["data"]["selector"] == ""
+        assert select_result["ok"] is True
+        assert select_result["data"]["selector"] == ""
+        assert press_result["ok"] is True
+        assert press_result["data"]["selector"] == ""
+        assert ctx.scouted_interactions == [{"tool_name": "press_key", "key": "Enter"}]
 
 
 class TestAssembleEnforcementMessages:
