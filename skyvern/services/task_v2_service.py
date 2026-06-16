@@ -41,8 +41,8 @@ from skyvern.forge.sdk.workflow.models.block import (
 )
 from skyvern.forge.sdk.workflow.models.parameter import PARAMETER_TYPE, ContextParameter
 from skyvern.forge.sdk.workflow.models.workflow import Workflow, WorkflowRequestBody, WorkflowRun, WorkflowRunStatus
+from skyvern.schemas.proxy_location import runtime_proxy_location
 from skyvern.schemas.runs import (
-    ProxyLocation,
     ProxyLocationInput,
     RunEngine,
     RunStatus,
@@ -1020,7 +1020,7 @@ async def run_task_v2_helper(
         workflow_create_request = WorkflowCreateYAMLRequest(
             title=workflow.title,
             description=workflow.description,
-            proxy_location=task_v2.proxy_location or ProxyLocation.RESIDENTIAL,
+            proxy_location=runtime_proxy_location(task_v2.proxy_location),
             workflow_definition=workflow_definition_yaml,
             status=workflow.status,
             max_screenshot_scrolls=task_v2.max_screenshot_scrolls,

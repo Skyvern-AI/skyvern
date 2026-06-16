@@ -3,11 +3,28 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from skyvern.config import settings
 from skyvern.forge.sdk.routes import debug_sessions as debug_sessions_mod
+from skyvern.schemas.runs import ProxyLocation
 
 
+@pytest.mark.parametrize(
+    ("rollout_enabled", "workflow_proxy_location", "expected_proxy_location"),
+    [
+        (False, None, ProxyLocation.RESIDENTIAL),
+        (True, None, ProxyLocation.NONE),
+        (False, ProxyLocation.RESIDENTIAL_GB, ProxyLocation.RESIDENTIAL_GB),
+        (False, ProxyLocation.NONE, ProxyLocation.NONE),
+    ],
+)
 @pytest.mark.asyncio
-async def test_new_debug_session_skips_redundant_local_close_before_create() -> None:
+async def test_new_debug_session_uses_workflow_proxy_default_for_created_browser(
+    monkeypatch: pytest.MonkeyPatch,
+    rollout_enabled: bool,
+    workflow_proxy_location: ProxyLocation | None,
+    expected_proxy_location: ProxyLocation,
+) -> None:
+    monkeypatch.setattr(settings, "RUNTIME_PROXY_DEFAULT_NONE_ENABLED", rollout_enabled)
     created_debug_session = SimpleNamespace(debug_session_id="ds_new", pbs_browser_profile_id=None)
     new_browser_session = SimpleNamespace(
         persistent_browser_session_id="pbs_new",
@@ -24,7 +41,7 @@ async def test_new_debug_session_skips_redundant_local_close_before_create() -> 
     app_mock.DATABASE.debug.create_debug_session = AsyncMock(return_value=created_debug_session)
     app_mock.DATABASE.browser_sessions.get_persistent_browser_session = AsyncMock()
     app_mock.WORKFLOW_SERVICE.get_workflow_by_permanent_id = AsyncMock(
-        return_value=SimpleNamespace(proxy_location=None)
+        return_value=SimpleNamespace(proxy_location=workflow_proxy_location)
     )
     app_mock.PERSISTENT_SESSIONS_MANAGER.close_session = AsyncMock()
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session = AsyncMock(return_value=new_browser_session)
@@ -45,7 +62,7 @@ async def test_new_debug_session_skips_redundant_local_close_before_create() -> 
     app_mock.PERSISTENT_SESSIONS_MANAGER.create_session.assert_awaited_once_with(
         organization_id="org_123",
         timeout_minutes=debug_sessions_mod.settings.DEBUG_SESSION_TIMEOUT_MINUTES,
-        proxy_location=debug_sessions_mod.ProxyLocation.RESIDENTIAL,
+        proxy_location=expected_proxy_location,
         wait_for_startup=False,
     )
     app_mock.DATABASE.debug.create_debug_session.assert_awaited_once_with(

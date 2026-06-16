@@ -24,7 +24,7 @@ from skyvern.forge.sdk.workflow.service import (
     DEBUG_SESSION_PROFILE_REASON_DIFFERENT,
     DEBUG_SESSION_PROFILE_REASON_NO_PROFILE,
 )
-from skyvern.schemas.runs import ProxyLocation
+from skyvern.schemas.proxy_location import runtime_proxy_location
 
 LOG = structlog.get_logger()
 
@@ -285,7 +285,7 @@ async def new_debug_session(
         workflow_permanent_id=workflow_permanent_id,
         organization_id=current_org.organization_id,
     )
-    proxy_location = workflow.proxy_location or ProxyLocation.RESIDENTIAL
+    proxy_location = runtime_proxy_location(workflow.proxy_location)
 
     new_browser_session = await app.PERSISTENT_SESSIONS_MANAGER.create_session(
         organization_id=current_org.organization_id,
