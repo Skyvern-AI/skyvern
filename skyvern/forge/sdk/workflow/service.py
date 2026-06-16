@@ -6267,12 +6267,18 @@ class WorkflowService:
             finalize=close_browser_on_completion,
         )
         LOG.debug("Persisting video data", number_of_video_artifacts=len(video_artifacts))
+        # Flush here: code-block recordings key on the block/run id, which clean_up_workflow's task-id drain skips.
+        upload_keys: set[str] = set()
         for video_artifact in video_artifacts:
-            await app.ARTIFACT_MANAGER.update_artifact_data(
+            upload_key = await app.ARTIFACT_MANAGER.update_artifact_data(
                 artifact_id=video_artifact.video_artifact_id,
                 organization_id=workflow_run.organization_id,
                 data=video_artifact.video_data,
             )
+            if upload_key:
+                upload_keys.add(upload_key)
+        if upload_keys:
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks(list(upload_keys))
 
     async def persist_har_data(
         self,
