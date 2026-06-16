@@ -141,10 +141,11 @@ def _update_and_run_blocks_composition_evidence_precheck(
 
 
 _DOWNLOAD_SCOUT_REQUIRED_STEERING = (
-    "This block downloads a file, and a download fires only when the affordance is clicked. "
-    "Scout-act it first: call skyvern_evaluate to click the download control on the live page, then "
-    "re-author the block. The terminal download step will be compiled for you from the observed "
-    "target, so you do not author the expect_download idiom yourself."
+    "This block downloads a file, and the terminal download step is compiled from the observed "
+    "download affordance. Scout it first: reach the page that exposes the download control and "
+    "call skyvern_evaluate to observe it (skyvern_evaluate cannot click — use the click tool to "
+    "act), then re-author the block. The terminal download step will be compiled for you from the "
+    "observed target, so you do not author the expect_download idiom yourself."
 )
 # After this many scout-act rejections in a turn, stop blocking and let the model halt honestly: a
 # download whose affordance the scout never resolves is not authorable, so looping author->scout
@@ -173,6 +174,10 @@ def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) 
     this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
     synthesizer can compile the terminal download step. Off unless the scout-act flag is set."""
     if not settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+        return None
+    if not settings.COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED:
+        # The gate is cleared by the reached-download scout interaction, which is only registered
+        # when author-steer is on; enforcing it without that flag deadlocks until the retry cap.
         return None
     if copilot_ctx is None or workflow_yaml is None:
         return None

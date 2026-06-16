@@ -261,6 +261,11 @@ def initialize_download_dir() -> str:
 
 
 async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
+    if not run_id:
+        # No run_id means no run-scoped dir to bind to, so the session keeps its current download
+        # binding. Adoption callers always pass a run id, so warn on the unexpected miss.
+        LOG.warning("rebind_download_dir skipped: missing run_id")
+        return
     download_dir = get_download_dir(run_id)
     cdp_session = await browser.new_browser_cdp_session()
     await cdp_session.send(
@@ -270,8 +275,19 @@ async def rebind_download_dir(browser: Browser, run_id: str | None) -> None:
             "downloadPath": download_dir,
         },
     )
+    rebound_interceptors = 0
+    for context in browser.contexts:
+        interceptor = getattr(context, "_skyvern_cdp_download_interceptor", None)
+        if interceptor is not None:
+            interceptor.set_download_dir(download_dir)
+            rebound_interceptors += 1
 
-    LOG.info("setDownloadBehavior applied", download_dir=download_dir, run_id=run_id)
+    LOG.info(
+        "setDownloadBehavior applied",
+        download_dir=download_dir,
+        run_id=run_id,
+        rebound_interceptors=rebound_interceptors,
+    )
 
 
 async def _apply_download_behaviour(browser: Browser) -> None:
@@ -964,6 +980,7 @@ async def _connect_to_cdp_browser(
 
         browser_context.on("page", lambda page: asyncio.ensure_future(_on_new_page(page)))
         browser_context._skyvern_cdp_download_active = True  # type: ignore[attr-defined]
+        browser_context._skyvern_cdp_download_interceptor = interceptor  # type: ignore[attr-defined]
         LOG.info(
             "CDP download interceptor enabled",
             download_dir=download_dir,
