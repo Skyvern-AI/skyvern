@@ -2346,8 +2346,11 @@ class ForgeAgent:
         if output_config is not None:
             call_kwargs["output_config"] = output_config
         if not llm_caller.message_history:
+            # ExtractionBlock stores its prompt in data_extraction_goal rather than navigation_goal.
+            # Fall back so the first CUA turn still carries an instruction.
+            first_turn_prompt = task.navigation_goal or task.data_extraction_goal
             llm_response = await llm_caller.call(
-                prompt=task.navigation_goal,
+                prompt=first_turn_prompt,
                 **call_kwargs,
             )
         else:
