@@ -158,9 +158,6 @@ class Settings(BaseSettings):
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
     COPILOT_COMPLETION_JUDGE_TIMEOUT_SECONDS: float = 12.0
-    # Capture bounded page evidence synchronously in scout interaction post-hooks.
-    # Off restores schema-less interaction packets plus standalone page inspects.
-    COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
     # Consecutive repair runs that make no newly-verified forward progress before the
     # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
     COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
@@ -175,11 +172,6 @@ class Settings(BaseSettings):
     # On, a reached-download affordance compiles into the expect_download idiom in the code-block
     # synthesizer; off (default) restores today's bare-click synthesis. Per-rung gate.
     COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED: bool = False
-    # A download fires only when its affordance is clicked, so a download-intent code block must
-    # be scout-acted (skyvern_evaluate) before it can be authored: the guardrail rejects authoring
-    # one with no scout_interaction this turn, and the evaluate tool is framed as the scout-act
-    # path for interaction-gated affordances. Off (default) restores today's inspect-then-author.
-    COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED: bool = False
     # Staged rollout for treating omitted runtime workflow proxy values as direct/no-proxy.
     # Off preserves the historical implicit residential default for anti-bot-sensitive traffic.
     RUNTIME_PROXY_DEFAULT_NONE_ENABLED: bool = False
