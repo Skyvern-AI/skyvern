@@ -18,6 +18,7 @@ import { WorkflowRunStream } from "./WorkflowRunStream";
 import { useSearchParams } from "react-router-dom";
 import {
   findActiveItem,
+  findTimelineBlock,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
 } from "./workflowTimelineUtils";
@@ -155,16 +156,27 @@ function WorkflowRunOverview() {
           stepId={selection.step_id ?? ""}
         />
       )}
-      {isWorkflowRunBlock(selection) && !isStreamActive && (
-        <WorkflowRunBlockScreenshot
-          workflowRunBlockId={resolveScreenshotBlockId(
+      {isWorkflowRunBlock(selection) &&
+        !isStreamActive &&
+        (() => {
+          // A container selection (loop/conditional) resolves to a descendant leaf, so read the
+          // leaf's type rather than the container's so a nested code block is treated as one.
+          const screenshotBlockId = resolveScreenshotBlockId(
             workflowRunTimeline,
             selection,
             activeIteration,
-          )}
-          runStatus={workflowRun?.status}
-        />
-      )}
+          );
+          const screenshotBlockType =
+            findTimelineBlock(workflowRunTimeline, screenshotBlockId)
+              ?.block_type ?? selection.block_type;
+          return (
+            <WorkflowRunBlockScreenshot
+              workflowRunBlockId={screenshotBlockId}
+              blockType={screenshotBlockType}
+              runStatus={workflowRun?.status}
+            />
+          );
+        })()}
       {isObserverThought(selection) && (
         <ObserverThoughtScreenshot observerThoughtId={selection.thought_id} />
       )}

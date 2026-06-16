@@ -430,6 +430,14 @@ function findTimelineBlockItem(
   return null;
 }
 
+function findTimelineBlock(
+  items: Array<WorkflowRunTimelineItem>,
+  blockId: string,
+): WorkflowRunBlock | null {
+  const item = findTimelineBlockItem(items, blockId);
+  return item && isBlockItem(item) ? item.block : null;
+}
+
 function findFirstLeafBlockId(
   items: Array<WorkflowRunTimelineItem>,
 ): string | null {
@@ -617,6 +625,7 @@ export {
   findLastExecutedBlock,
   findRunningBlock,
   findThoughtsForBlock,
+  findTimelineBlock,
   flattenTimelineChronologically,
   parseActiveIterationParam,
   resolveScreenshotBlockId,
