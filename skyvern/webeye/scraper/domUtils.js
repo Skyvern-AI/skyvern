@@ -2383,8 +2383,11 @@ function addHintMarkersToPage(hintMarkers) {
 
 function removeBoundingBoxes() {
   var hintMarkerContainer = document.querySelector("#boundingBoxContainer");
-  if (hintMarkerContainer) {
-    hintMarkerContainer.remove();
+  // Avoid Element.prototype.remove(): pages that polyfill it Prototype.js-style
+  // expect a static `remove(element)` signature and crash when called as
+  // `el.remove()` with no arg. removeChild is DOM 1 and never polyfilled.
+  if (hintMarkerContainer && hintMarkerContainer.parentNode) {
+    hintMarkerContainer.parentNode.removeChild(hintMarkerContainer);
   }
 }
 
