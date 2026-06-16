@@ -21,6 +21,7 @@ _PAGE_ACTION_MAP: dict[str, ActionType] = {
     "go_back": ActionType.GO_BACK,
     "go_forward": ActionType.GO_FORWARD,
     "reload": ActionType.RELOAD_PAGE,
+    "evaluate": ActionType.EXECUTE_JS,
 }
 _LOCATOR_ACTION_MAP: dict[str, ActionType] = {
     "click": ActionType.CLICK,
