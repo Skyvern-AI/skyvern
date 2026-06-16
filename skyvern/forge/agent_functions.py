@@ -742,11 +742,7 @@ class AgentFunction:
         return
 
     async def wait_for_challenge_solver(self, page: Page) -> None:
-        """Wait for a cloud-managed challenge solver if one is attached to the page.
-
-        OSS no-op. Cloud overrides this so OSS-synced browser/action code can
-        wait at navigation/action boundaries without importing cloud modules.
-        """
+        """Wait for a cloud-managed challenge solver if one is attached to the page."""
         return None
 
     async def should_shadow_extraction_cache_hit(self, task: Task) -> bool:
@@ -758,14 +754,7 @@ class AgentFunction:
         workflow_permanent_id: str | None,
         cache_key: str,
     ) -> Any | None:
-        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op.
-
-        Cloud overrides this to consult the Redis tier (SKY-8873). Returns the
-        cached extraction value on a hit or None on a miss / error / disabled
-        flag. Implementations MUST swallow backend errors and return None so
-        the extract path always falls through to a fresh LLM call rather than
-        failing loud.
-        """
+        """Cross-run (wpid-scoped) extraction-cache read. OSS no-op."""
         return None
 
     async def store_cross_run_extraction_cache(
@@ -774,14 +763,7 @@ class AgentFunction:
         cache_key: str,
         value: Any,
     ) -> None:
-        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op.
-
-        Cloud overrides this to write to the Redis tier (SKY-8873) with a
-        long TTL. Called after a fresh LLM extraction so subsequent runs of
-        the same workflow against the same page content skip the LLM call.
-        Implementations MUST swallow backend errors — write-path failures
-        must never fail the user-visible request.
-        """
+        """Cross-run (wpid-scoped) extraction-cache write. OSS no-op."""
         return None
 
     def build_workflow_schedule_id(self, workflow_schedule_id: str) -> str | None:
@@ -817,11 +799,16 @@ class AgentFunction:
         return None
 
     async def delete_workflow_schedule(self, backend_schedule_id: str) -> None:
-        """Delete a schedule from the execution backend. OSS no-op.
+        """Delete a schedule from the execution backend. OSS no-op."""
+        return None
 
-        Implementations must be idempotent — deleting an already-absent schedule
-        should succeed silently rather than raising.
-        """
+    async def calculate_workflow_run_total_cost(
+        self,
+        organization_id: str | None,
+        credits_used: int,
+        cached_credits_used: int,
+    ) -> float | None:
+        """Compute the user-facing ``total_cost`` for a workflow run. OSS returns None."""
         return None
 
     async def auto_solve_captchas(self, page: Page) -> bool:

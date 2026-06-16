@@ -364,8 +364,11 @@ class WorkflowRunResponseBase(BaseModel):
     total_steps: int | None = None
     total_cost: float | None = Field(
         default=None,
-        deprecated=True,
-        description="Deprecated. Public workflow-run responses no longer expose cost; use credits_used fields instead.",
+        description=(
+            "Estimated workflow-run cost as the list-price value of credits consumed "
+            "(credits x list credit rate), not the amount invoiced; enterprise contract "
+            "pricing and legacy billing may differ. Null when cost is unavailable."
+        ),
     )
     credits_used: int = 0
     cached_credits_used: int = 0

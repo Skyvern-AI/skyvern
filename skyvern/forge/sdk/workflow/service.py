@@ -5818,14 +5818,19 @@ class WorkflowService:
         parameters_with_value = {wfp.key: wfrp.value for wfp, wfrp in workflow_parameter_tuples}
 
         total_steps = None
+        total_cost: float | None = None
         if include_step_count or include_cost:
-            # `include_cost` is retained as a legacy alias for callers that
-            # previously received `total_steps` alongside deprecated cost data.
             step_count, _ = await app.DATABASE.tasks.get_step_counts_by_task_ids(
                 task_ids=[task.task_id for task in workflow_run_tasks], organization_id=organization_id
             )
             total_steps = step_count
 
+            if include_cost:
+                total_cost = await app.AGENT_FUNCTION.calculate_workflow_run_total_cost(
+                    organization_id=organization_id,
+                    credits_used=workflow_run.credits_used,
+                    cached_credits_used=workflow_run.cached_credits_used,
+                )
         return WorkflowRunResponseBase(
             workflow_id=workflow.workflow_permanent_id,
             workflow_run_id=workflow_run_id,
@@ -5858,7 +5863,7 @@ class WorkflowService:
             downloaded_file_urls=downloaded_file_urls,
             outputs=outputs,
             total_steps=total_steps,
-            total_cost=None,
+            total_cost=total_cost,
             credits_used=workflow_run.credits_used,
             cached_credits_used=workflow_run.cached_credits_used,
             workflow_title=workflow.title,
