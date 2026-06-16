@@ -14,6 +14,7 @@ from structlog.testing import capture_logs
 
 from skyvern.forge.sdk.copilot import hooks as hooks_module
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.enforcement import CopilotGoalSatisfied
 from skyvern.forge.sdk.copilot.hooks import CopilotRunHooks
 from skyvern.forge.sdk.copilot.turn_halt import CopilotTurnHalt, turn_halt_from_blocker_signal
@@ -1522,7 +1523,7 @@ class TestClickPostHookReachedDownloadTarget:
         monkeypatch.setattr(mh, "_register_scout_interaction_observation", fake_register)
 
     @staticmethod
-    def _ctx() -> Any:
+    def _ctx(policy: BlockAuthoringPolicy = BlockAuthoringPolicy.CODE_ONLY_BROWSER) -> Any:
         from skyvern.forge.sdk.copilot.runtime import AgentContext
 
         return AgentContext(
@@ -1532,6 +1533,7 @@ class TestClickPostHookReachedDownloadTarget:
             workflow_yaml="",
             browser_session_id="pbs_copilot",
             stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+            block_authoring_policy=policy,
         )
 
     _SINGLE_DOWNLOAD_EVIDENCE = {
@@ -1552,7 +1554,6 @@ class TestClickPostHookReachedDownloadTarget:
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
         self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
@@ -1564,16 +1565,15 @@ class TestClickPostHookReachedDownloadTarget:
         assert ctx.reached_download_target.download_kind == "extension"
 
     @pytest.mark.asyncio
-    async def test_click_post_hook_is_noop_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_click_post_hook_is_noop_in_standard_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from skyvern.config import settings
         from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
 
         self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", False)
         monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
-        ctx = self._ctx()
+        ctx = self._ctx(BlockAuthoringPolicy.STANDARD)
         result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
         await _click_post_hook(result, {}, ctx)
 
@@ -1591,7 +1591,6 @@ class TestClickPostHookReachedDownloadTarget:
             ]
         }
         self._patch_scouting(monkeypatch, page_evidence=two)
-        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
         monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
 
