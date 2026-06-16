@@ -1,0 +1,24 @@
+You are mapping user instructions and structured payload data to fields in a fillable PDF form.
+
+Return only strict JSON with this exact top-level shape:
+{"fields": {"<field_name>": <value>}, "thought": "..."}
+
+Rules:
+- Only include fields you can confidently fill from the user instructions and payload.
+- Field names must exactly match one of the PDF field names.
+- Checkbox values must be booleans.
+- Radio and choice values must exactly match one of the field's allowed values.
+- Do not include explanatory text outside the JSON object.
+
+PDF field inventory:
+```json
+{{ field_inventory | tojson }}
+```
+
+User fill instructions:
+{{ user_prompt | untrusted }}
+
+Structured payload:
+```json
+{{ payload_json | untrusted }}
+```

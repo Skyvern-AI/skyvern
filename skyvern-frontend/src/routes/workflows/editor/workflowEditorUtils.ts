@@ -54,6 +54,7 @@ import {
   WorkflowTriggerBlockYAML,
   GoogleSheetsReadBlockYAML,
   GoogleSheetsWriteBlockYAML,
+  PdfFillBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -157,6 +158,11 @@ import {
   isGoogleSheetsWriteNode,
 } from "./nodes/GoogleSheetsWriteNode/types";
 import { validateGoogleSheetsWriteNode } from "./nodes/GoogleSheetsWriteNode/validate";
+import {
+  isPdfFillNode,
+  pdfFillNodeDefaultData,
+} from "./nodes/PdfFillNode/types";
+import { validatePdfFillNode } from "./nodes/PdfFillNode/validate";
 import {
   containsJinjaReference,
   getAffectedBlocks,
@@ -1101,6 +1107,24 @@ function convertToNode(
           format: block.format ?? "A4",
           landscape: block.landscape ?? false,
           printBackground: block.print_background ?? true,
+          parameterKeys: block.parameters.map((p) => p.key),
+        },
+      };
+    }
+    case "pdf_fill": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "pdfFill",
+        data: {
+          ...commonData,
+          fileUrl: block.file_url ?? "",
+          prompt: block.prompt ?? "",
+          payload:
+            typeof block.payload === "string"
+              ? block.payload
+              : JSON.stringify(block.payload || {}, null, 2),
+          llmKey: block.llm_key ?? "",
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -2509,6 +2533,17 @@ function createNode(
         },
       };
     }
+    case "pdfFill": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "pdfFill",
+        data: {
+          ...pdfFillNodeDefaultData,
+          label,
+        },
+      };
+    }
     case "workflowTrigger": {
       return {
         ...identifiers,
@@ -2570,6 +2605,19 @@ function JSONParseSafe(json: string): Record<string, unknown> | null {
 function JSONSafeOrString(
   json: string,
 ): Record<string, unknown> | string | null {
+  if (!json) {
+    return null;
+  }
+  try {
+    return JSON.parse(json);
+  } catch {
+    return json;
+  }
+}
+
+function JSONSafeOrStringAllowArrays(
+  json: string,
+): Record<string, unknown> | Array<unknown> | string | null {
   if (!json) {
     return null;
   }
@@ -3058,6 +3106,17 @@ function getWorkflowBlock(
         format: node.data.format,
         landscape: node.data.landscape,
         print_background: node.data.printBackground,
+        parameter_keys: node.data.parameterKeys,
+      };
+    }
+    case "pdfFill": {
+      return {
+        ...base,
+        block_type: "pdf_fill",
+        file_url: node.data.fileUrl,
+        prompt: node.data.prompt,
+        payload: JSONSafeOrStringAllowArrays(node.data.payload),
+        llm_key: node.data.llmKey || null,
         parameter_keys: node.data.parameterKeys,
       };
     }
@@ -4405,6 +4464,18 @@ function convertBlocksToBlockYAML(
         };
         return blockYaml;
       }
+      case "pdf_fill": {
+        const blockYaml: PdfFillBlockYAML = {
+          ...base,
+          block_type: "pdf_fill",
+          file_url: block.file_url,
+          prompt: block.prompt,
+          payload: block.payload,
+          llm_key: block.llm_key,
+          parameter_keys: block.parameters.map((p) => p.key),
+        };
+        return blockYaml;
+      }
       case "workflow_trigger": {
         const blockYaml: WorkflowTriggerBlockYAML = {
           ...base,
@@ -4718,6 +4789,10 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
   nodes
     .filter(isGoogleSheetsWriteNode)
     .forEach((node) => errors.push(...validateGoogleSheetsWriteNode(node)));
+
+  nodes
+    .filter(isPdfFillNode)
+    .forEach((node) => errors.push(...validatePdfFillNode(node)));
 
   return errors;
 }

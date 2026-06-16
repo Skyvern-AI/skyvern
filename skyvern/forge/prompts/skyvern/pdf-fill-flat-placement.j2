@@ -1,0 +1,26 @@
+You are filling a NON-INTERACTIVE (flat) PDF form by placing text values next to printed labels.
+
+Each anchor below is a line of text detected on the form via OCR. Coordinates are pixels with (0,0) at the top-left of each page image; page_width_px and page_height_px give the page bounds.
+
+Return only strict JSON with this exact top-level shape:
+{"placements": [{"anchor_id": <int>, "value": "<text>", "position": "right" | "below"}], "thought": "..."}
+
+Rules:
+- Only place values you can confidently derive from the user instructions and payload.
+- anchor_id must be the id of the detected label line the value belongs to.
+- Use "right" to put the value on the same line after the label (typical for "Label:" lines with empty space after them). Use "below" to put the value underneath the label inside its box.
+- Each value must be a plain single-line string. Do not invent values that are not in the payload or instructions.
+- Do not include explanatory text outside the JSON object.
+
+Detected anchors:
+```json
+{{ anchors | tojson }}
+```
+
+User fill instructions:
+{{ user_prompt | untrusted }}
+
+Structured payload:
+```json
+{{ payload_json | untrusted }}
+```

@@ -259,6 +259,17 @@ const nodeLibraryItems: Array<{
     description: "Print current page to PDF",
   },
   {
+    nodeType: "pdfFill",
+    icon: (
+      <WorkflowBlockIcon
+        workflowBlockType={WorkflowBlockTypes.PDFFill}
+        className="size-6"
+      />
+    ),
+    title: "PDF Fill Block",
+    description: "Fill a PDF form",
+  },
+  {
     nodeType: "workflowTrigger",
     icon: (
       <WorkflowBlockIcon
