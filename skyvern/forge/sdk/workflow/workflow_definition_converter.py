@@ -83,6 +83,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock
 from skyvern.forge.sdk.workflow.models.workflow import (
     WorkflowDefinition,
 )
@@ -790,6 +791,17 @@ def block_yaml_to_block(
             landscape=block_yaml.landscape,
             print_background=block_yaml.print_background,
             parameters=print_page_block_parameters,
+        )
+
+    elif block_yaml.block_type == BlockType.PDF_FILL:
+        pdf_fill_block_parameters = _resolve_block_parameters(block_yaml, parameters)
+        return PdfFillBlock(
+            **base_kwargs,
+            file_url=block_yaml.file_url,
+            prompt=block_yaml.prompt,
+            payload=block_yaml.payload,
+            llm_key=block_yaml.llm_key,
+            parameters=pdf_fill_block_parameters,
         )
 
     elif block_yaml.block_type == BlockType.WORKFLOW_TRIGGER:

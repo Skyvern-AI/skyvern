@@ -441,6 +441,7 @@ class BlockType(StrEnum):
     WORKFLOW_TRIGGER = "workflow_trigger"
     GOOGLE_SHEETS_READ = "google_sheets_read"
     GOOGLE_SHEETS_WRITE = "google_sheets_write"
+    PDF_FILL = "pdf_fill"
 
 
 class AIFallbackMode(StrEnum):
@@ -1112,6 +1113,49 @@ class PrintPageBlockYAML(BlockYAML):
     parameter_keys: list[str] | None = None
 
 
+class PdfFillBlockYAML(BlockYAML):
+    block_type: Literal[BlockType.PDF_FILL] = BlockType.PDF_FILL  # type: ignore
+    file_url: str
+    prompt: str
+    payload: dict[str, Any] | list | str | None = None
+    llm_key: str | None = None
+    parameter_keys: list[str] | None = None
+
+    @model_validator(mode="after")
+    def normalize_llm_selection(self) -> "PdfFillBlockYAML":
+        raw_llm_key = self.llm_key.strip() if self.llm_key else None
+
+        if self.model:
+            self.llm_key = None
+            return self
+
+        if not raw_llm_key:
+            self.llm_key = None
+            return self
+
+        if _has_jinja_syntax(raw_llm_key):
+            self.llm_key = raw_llm_key
+            return self
+
+        model_name = _get_text_prompt_model_name_by_llm_key().get(raw_llm_key)
+        if model_name:
+            self.model = {"model_name": model_name}
+            self.llm_key = None
+            return self
+
+        if raw_llm_key in LLMConfigRegistry.get_model_names():
+            self.llm_key = raw_llm_key
+            return self
+
+        LOG.warning(
+            "Unrecognized pdf fill llm_key; defaulting to Skyvern Optimized/default model path",
+            label=self.label,
+            llm_key=raw_llm_key,
+        )
+        self.llm_key = None
+        return self
+
+
 class WorkflowTriggerBlockYAML(BlockYAML):
     block_type: Literal[BlockType.WORKFLOW_TRIGGER] = BlockType.WORKFLOW_TRIGGER  # type: ignore
 
@@ -1191,6 +1235,7 @@ BLOCK_YAML_SUBCLASSES = (
     | HttpRequestBlockYAML
     | ConditionalBlockYAML
     | PrintPageBlockYAML
+    | PdfFillBlockYAML
     | WorkflowTriggerBlockYAML
     | GoogleSheetsReadBlockYAML
     | GoogleSheetsWriteBlockYAML

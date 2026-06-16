@@ -155,7 +155,8 @@ export type BlockYAML =
   | PrintPageBlockYAML
   | WorkflowTriggerBlockYAML
   | GoogleSheetsReadBlockYAML
-  | GoogleSheetsWriteBlockYAML;
+  | GoogleSheetsWriteBlockYAML
+  | PdfFillBlockYAML;
 
 export type BlockYAMLBase = {
   block_type: WorkflowBlockType;
@@ -469,5 +470,14 @@ export type GoogleSheetsWriteBlockYAML = BlockYAMLBase & {
   values: string;
   column_mapping: Record<string, string> | null;
   create_sheet_if_missing?: boolean;
+  parameter_keys?: Array<string> | null;
+};
+
+export type PdfFillBlockYAML = BlockYAMLBase & {
+  block_type: "pdf_fill";
+  file_url: string;
+  prompt: string;
+  payload: Record<string, unknown> | Array<unknown> | string | null;
+  llm_key?: string | null;
   parameter_keys?: Array<string> | null;
 };

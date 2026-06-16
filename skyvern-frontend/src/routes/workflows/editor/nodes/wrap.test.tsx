@@ -43,6 +43,7 @@ describe("nodeTypes composition order", () => {
         "workflowTrigger",
         "googleSheetsRead",
         "googleSheetsWrite",
+        "pdfFill",
       ]),
     );
   });

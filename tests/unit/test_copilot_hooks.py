@@ -1220,3 +1220,112 @@ class TestAssembleEnforcementMessages:
         assert offer_msg in msgs
         assert msgs.count(screenshot_msg) == 1
         assert not any(isinstance(m.get("content"), str) and m["content"].startswith(NUDGE_SENTINEL) for m in msgs)
+
+
+class TestClickPostHookReachedDownloadTarget:
+    """SKY-11081: a scout-CLICK of a single same-host download affordance populates the typed
+    reached_download_target from the click post-hook (not only the evaluate path), so the
+    synthesizer fires off the actual scout-act the model performs."""
+
+    @staticmethod
+    def _patch_scouting(monkeypatch: pytest.MonkeyPatch, *, page_evidence: dict[str, Any] | None) -> None:
+        from skyvern.forge.sdk.copilot.tools import mcp_hooks as mh
+
+        monkeypatch.setattr(mh, "_clear_pending_browser_interaction_observation", lambda *_a, **_k: None)
+        monkeypatch.setattr(mh, "_consume_scout_source_url", lambda *_a, **_k: "http://localhost:8901/x/")
+        monkeypatch.setattr(mh, "_mark_pending_browser_interaction_observation", lambda *_a, **_k: None)
+        monkeypatch.setattr(mh, "_record_scouted_interaction", lambda *_a, **_k: None)
+        monkeypatch.setattr(mh, "_attach_scout_page_summary", lambda *_a, **_k: None)
+
+        async def fake_resolve_url_title(_raw: Any, _ctx: Any) -> tuple[str, str]:
+            return "http://localhost:8901/x/statement", "Statement"
+
+        async def fake_resolve_role_name(*_a: Any, **_k: Any) -> tuple[str | None, str | None]:
+            return "link", "View Printable Statement"
+
+        async def fake_register(*_a: Any, **_k: Any) -> tuple[int | None, dict[str, Any] | None]:
+            return (1, page_evidence)
+
+        monkeypatch.setattr(mh, "_resolve_url_title", fake_resolve_url_title)
+        monkeypatch.setattr(mh, "_resolve_scout_role_name", fake_resolve_role_name)
+        monkeypatch.setattr(mh, "_register_scout_interaction_observation", fake_register)
+
+    @staticmethod
+    def _ctx() -> Any:
+        from skyvern.forge.sdk.copilot.runtime import AgentContext
+
+        return AgentContext(
+            organization_id="org-1",
+            workflow_id="wf-1",
+            workflow_permanent_id="wfp-1",
+            workflow_yaml="",
+            browser_session_id="pbs_copilot",
+            stream=MagicMock(is_disconnected=AsyncMock(return_value=False)),
+        )
+
+    _SINGLE_DOWNLOAD_EVIDENCE = {
+        "navigation_targets": [
+            {
+                "selector": 'a[href="/x/statement.pdf"]',
+                "text": "View Printable Statement",
+                "download_kind": "extension",
+            }
+        ],
+    }
+
+    @pytest.mark.asyncio
+    async def test_click_on_download_affordance_populates_reached_download_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from skyvern.config import settings
+        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
+
+        self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", True)
+        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+
+        ctx = self._ctx()
+        result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
+        await _click_post_hook(result, {}, ctx)
+
+        assert ctx.reached_download_target is not None
+        assert ctx.reached_download_target.download_kind == "extension"
+
+    @pytest.mark.asyncio
+    async def test_click_post_hook_is_noop_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.config import settings
+        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
+
+        self._patch_scouting(monkeypatch, page_evidence=self._SINGLE_DOWNLOAD_EVIDENCE)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", False)
+        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+
+        ctx = self._ctx()
+        result = {"ok": True, "data": {"selector": 'a[href="/x/statement.pdf"]'}}
+        await _click_post_hook(result, {}, ctx)
+
+        assert ctx.reached_download_target is None
+
+    @pytest.mark.asyncio
+    async def test_click_on_two_affordances_leaves_target_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from skyvern.config import settings
+        from skyvern.forge.sdk.copilot.tools.mcp_hooks import _click_post_hook
+
+        two = {
+            "navigation_targets": [
+                {"selector": 'a[href="/x/a.pdf"]', "text": "A", "download_kind": "extension"},
+                {"selector": 'a[href="/x/b.pdf"]', "text": "B", "download_kind": "extension"},
+            ]
+        }
+        self._patch_scouting(monkeypatch, page_evidence=two)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED", True)
+        monkeypatch.setattr(settings, "COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED", True)
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+
+        ctx = self._ctx()
+        result = {"ok": True, "data": {"selector": 'a[href="/x/a.pdf"]'}}
+        await _click_post_hook(result, {}, ctx)
+
+        assert ctx.reached_download_target is None

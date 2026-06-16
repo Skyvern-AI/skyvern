@@ -79,22 +79,30 @@ def _patch_skyvern_http(
     return request_mock
 
 
-def _google_sheets_definition(block_type: str) -> dict[str, object]:
+def _known_drift_definition(block_type: str) -> dict[str, object]:
     block: dict[str, object] = {
         "block_type": block_type,
         "label": f"{block_type}_step",
-        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit",
-        "sheet_name": "Sheet1",
-        "range": "A1:D100",
-        "credential_id": "{{ google_credential_id }}",
     }
     if block_type == "google_sheets_read":
+        block["spreadsheet_url"] = "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+        block["sheet_name"] = "Sheet1"
+        block["range"] = "A1:D100"
+        block["credential_id"] = "{{ google_credential_id }}"
         block["has_header_row"] = True
     elif block_type == "google_sheets_write":
+        block["spreadsheet_url"] = "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+        block["sheet_name"] = "Sheet1"
+        block["range"] = "A1:D100"
+        block["credential_id"] = "{{ google_credential_id }}"
         block["write_mode"] = "append"
         block["values"] = "{{ output_data | tojson }}"
+    elif block_type == "pdf_fill":
+        block["file_url"] = "{{ source_pdf }}"
+        block["prompt"] = "Fill the PDF using the payload."
+        block["payload"] = {"name": "{{ applicant.name }}"}
     else:
-        raise ValueError(f"Unsupported google sheets block type: {block_type}")
+        raise ValueError(f"Unsupported known drift block type: {block_type}")
 
     return {
         "title": f"{block_type} workflow",
@@ -155,13 +163,13 @@ def _heavy_workflow_run_payload(*, include_expanded_outputs: bool = True) -> dic
     }
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
 @pytest.mark.asyncio
-async def test_workflow_create_sends_google_sheets_json_definition_as_raw_dict(
+async def test_workflow_create_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
-    definition = _google_sheets_definition(block_type)
+    definition = _known_drift_definition(block_type)
 
     result = await workflow_tools.skyvern_workflow_create(definition=json.dumps(definition), format="json")
 
@@ -171,12 +179,15 @@ async def test_workflow_create_sends_google_sheets_json_definition_as_raw_dict(
     assert not hasattr(sent_definition, "model_dump")
     sent_block = sent_definition["workflow_definition"]["blocks"][0]
     assert sent_block["block_type"] == block_type
-    assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    if block_type.startswith("google_sheets"):
+        assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    else:
+        assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
-@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write"])
+@pytest.mark.parametrize("block_type", ["google_sheets_read", "google_sheets_write", "pdf_fill"])
 @pytest.mark.asyncio
-async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
+async def test_workflow_update_sends_known_drift_json_definition_as_raw_dict(
     monkeypatch: pytest.MonkeyPatch, block_type: str
 ) -> None:
     request_mock = _patch_skyvern_http(monkeypatch, response_payload=_fake_workflow_dict())
@@ -193,7 +204,7 @@ async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
         }
 
     _patch_get_workflow_by_id(monkeypatch, fake_get_workflow_by_id)
-    definition = _google_sheets_definition(block_type)
+    definition = _known_drift_definition(block_type)
 
     result = await workflow_tools.skyvern_workflow_update(
         workflow_id="wpid_test",
@@ -207,7 +218,10 @@ async def test_workflow_update_sends_google_sheets_json_definition_as_raw_dict(
     assert not hasattr(sent_definition, "model_dump")
     sent_block = sent_definition["workflow_definition"]["blocks"][0]
     assert sent_block["block_type"] == block_type
-    assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    if block_type.startswith("google_sheets"):
+        assert sent_block["spreadsheet_url"] == "https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit"
+    else:
+        assert sent_block["file_url"] == "{{ source_pdf }}"
 
 
 @pytest.mark.asyncio

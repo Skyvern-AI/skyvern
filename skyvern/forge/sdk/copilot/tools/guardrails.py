@@ -6,10 +6,12 @@ from typing import Any
 import structlog
 from agents import ToolGuardrailFunctionOutput, ToolInputGuardrail, ToolInputGuardrailData
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, RecoveryHint
 from skyvern.forge.sdk.copilot.build_phase import _phase_blocker_signal
 from skyvern.forge.sdk.copilot.composition_evidence import (
     composition_page_evidence_error,
+    turn_has_scout_interaction,
     workflow_target_url,
 )
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
@@ -18,6 +20,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
+from skyvern.forge.sdk.copilot.reached_download_target import code_is_download_intent
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.turn_intent import (
@@ -135,6 +138,69 @@ def _update_and_run_blocks_composition_evidence_precheck(
         return evidence_error
 
     return None
+
+
+_DOWNLOAD_SCOUT_REQUIRED_STEERING = (
+    "This block downloads a file, and a download fires only when the affordance is clicked. "
+    "Scout-act it first: call skyvern_evaluate to click the download control on the live page, then "
+    "re-author the block. The terminal download step will be compiled for you from the observed "
+    "target, so you do not author the expect_download idiom yourself."
+)
+# After this many scout-act rejections in a turn, stop blocking and let the model halt honestly: a
+# download whose affordance the scout never resolves is not authorable, so looping author->scout
+# wastes turns. A genuinely scoutable download clears the gate on the first re-author.
+_DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS = 3
+_DOWNLOAD_SCOUT_UNREACHABLE_HALT = (
+    "Repeated scout-acts did not resolve a single download affordance on this page, so the download "
+    "step cannot be compiled. Tell the user you could not locate the download control and ask them to "
+    "confirm where the file downloads from; do not author a hand-rolled download block."
+)
+
+
+def _download_intent_block_labels(workflow_yaml: str | None) -> list[str]:
+    labels: list[str] = []
+    for label, block in _workflow_yaml_blocks_by_label(workflow_yaml).items():
+        if block.get("block_type") != "code":
+            continue
+        code = block.get("code")
+        if isinstance(code, str) and code_is_download_intent(code):
+            labels.append(label)
+    return labels
+
+
+def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) -> str | None:
+    """Reject authoring a download-intent code block until the affordance has been scout-acted
+    this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
+    synthesizer can compile the terminal download step. Off unless the scout-act flag is set."""
+    if not settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+        return None
+    if copilot_ctx is None or workflow_yaml is None:
+        return None
+    download_labels = _download_intent_block_labels(workflow_yaml)
+    if not download_labels:
+        return None
+    if turn_has_scout_interaction(copilot_ctx):
+        return None
+    prior_rejections = int(getattr(copilot_ctx, "download_scout_required_rejections", 0) or 0)
+    if prior_rejections >= _DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS:
+        LOG.info(
+            "copilot download scout-act gate exhausted retries; halting honestly",
+            workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
+            download_intent_block_labels=download_labels,
+            download_scout_required_rejections=prior_rejections,
+            surface="tool_pre_side_effect",
+        )
+        return _DOWNLOAD_SCOUT_UNREACHABLE_HALT
+    if hasattr(copilot_ctx, "download_scout_required_rejections"):
+        copilot_ctx.download_scout_required_rejections = prior_rejections + 1
+    LOG.info(
+        "copilot download scout-act pre-side-effect rejected workflow",
+        workflow_permanent_id=getattr(copilot_ctx, "workflow_permanent_id", None),
+        download_intent_block_labels=download_labels,
+        download_scout_required_rejections=prior_rejections + 1,
+        surface="tool_pre_side_effect",
+    )
+    return _DOWNLOAD_SCOUT_REQUIRED_STEERING
 
 
 def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:

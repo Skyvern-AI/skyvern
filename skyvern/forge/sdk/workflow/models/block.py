@@ -120,6 +120,7 @@ from skyvern.forge.sdk.workflow.models._jinja import (
     _JSON_TYPE_MARKER,
     _json_type_filter,
     jinja_json_finalize_strict_env,
+    render_templates_in_json_value,
 )
 from skyvern.forge.sdk.workflow.models.code_block_recorder import (
     CODE_BLOCK_FILENAME,
@@ -264,6 +265,41 @@ TASKV2_TO_BLOCK_STATUS: dict[TaskV2Status, BlockStatus] = {
     TaskV2Status.canceled: BlockStatus.canceled,
     TaskV2Status.timed_out: BlockStatus.timed_out,
 }
+
+
+def extract_file_url_from_block_output(value: Any) -> str | None:
+    """Extract a file URL from block output values that wrap downloaded files."""
+    if isinstance(value, dict):
+        downloaded_files = value.get("downloaded_files")
+        if isinstance(downloaded_files, list) and downloaded_files:
+            first_file = downloaded_files[0]
+            if isinstance(first_file, dict):
+                return first_file.get("url") or first_file.get("file_path") or None
+
+        for key in ("artifact_url", "file_url", "file_path"):
+            extracted = value.get(key)
+            if isinstance(extracted, str) and extracted:
+                return extracted
+        return None
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return extract_file_url_from_block_output(parsed)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, dict):
+                return extract_file_url_from_block_output(parsed)
+        except (ValueError, SyntaxError):
+            pass
+    return None
+
+
+def sanitize_filename(filename: str, default: str = "document") -> str:
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename).strip(". ")
+    return sanitized[:200] if sanitized else default
 
 
 def _format_payload_path_segment(key: str) -> str:
@@ -5720,26 +5756,7 @@ class FileParserBlock(Block):
         - JSON string encoding such a dict
         - Python dict-repr string produced by Jinja's default ``str()`` rendering
         """
-        if isinstance(value, dict):
-            downloaded_files = value.get("downloaded_files")
-            if isinstance(downloaded_files, list) and downloaded_files:
-                first_file = downloaded_files[0]
-                if isinstance(first_file, dict):
-                    return first_file.get("url") or None
-            return None
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                return FileParserBlock._extract_file_url_from_block_output(parsed)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            try:
-                parsed = ast.literal_eval(value)
-                if isinstance(parsed, dict):
-                    return FileParserBlock._extract_file_url_from_block_output(parsed)
-            except (ValueError, SyntaxError):
-                pass
-        return None
+        return extract_file_url_from_block_output(value)
 
     async def execute(
         self,
@@ -6671,58 +6688,22 @@ class HttpRequestBlock(Block):
         """Format template parameters in the block fields"""
         template_kwargs = {"force_include_secrets": True}
 
-        def _render_templates_in_json(value: object) -> object:
-            """
-            Recursively render Jinja templates in nested JSON-like structures.
-
-            This is required because HTTP request bodies are often deeply nested
-            dict/list structures, and templates may appear at any depth.
-
-            Supports {{ expr | json }} filter for type-preserving JSON injection.
-            """
-            if isinstance(value, str):
-                rendered = self.format_block_parameter_template_from_workflow_run_context(
-                    value, workflow_run_context, **template_kwargs
-                )
-
-                if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
-                    json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
-                    try:
-                        return json.loads(json_str)
-                    except json.JSONDecodeError:
-                        raise FailedToFormatJinjaStyleParameter(
-                            value, f"Raw JSON filter produced invalid JSON: {json_str}"
-                        )
-                elif _JSON_TYPE_MARKER in rendered:
-                    raise FailedToFormatJinjaStyleParameter(
-                        value,
-                        "The '| json' filter can only be used for complete value replacement. "
-                        "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
-                        "Remove the surrounding text or remove the '| json' filter.",
-                    )
-                return rendered
-            if isinstance(value, list):
-                return [_render_templates_in_json(item) for item in value]
-            if isinstance(value, dict):
-                return {
-                    cast(str, _render_templates_in_json(key)): _render_templates_in_json(val)
-                    for key, val in value.items()
-                }
-            return value
-
-        if self.url:
-            self.url = self.format_block_parameter_template_from_workflow_run_context(
-                self.url, workflow_run_context, **template_kwargs
+        def _render_string(value: str) -> str:
+            return self.format_block_parameter_template_from_workflow_run_context(
+                value, workflow_run_context, **template_kwargs
             )
 
+        if self.url:
+            self.url = _render_string(self.url)
+
         if self.body:
-            self.body = cast(dict[str, Any], _render_templates_in_json(self.body))
+            self.body = cast(dict[str, Any], render_templates_in_json_value(self.body, _render_string))
 
         if self.files:
-            self.files = cast(dict[str, str], _render_templates_in_json(self.files))
+            self.files = cast(dict[str, str], render_templates_in_json_value(self.files, _render_string))
 
         if self.headers:
-            self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
+            self.headers = cast(dict[str, str], render_templates_in_json_value(self.headers, _render_string))
 
         if self.download_filename:
             self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
@@ -7107,9 +7088,7 @@ class PrintPageBlock(Block):
 
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
-        sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
-        sanitized = sanitized.strip(". ")
-        return sanitized[:200] if sanitized else "document"
+        return sanitize_filename(filename)
 
     def _build_pdf_options(self) -> dict[str, Any]:
         pdf_format = self.format if self.format in self.VALID_FORMATS else "A4"
@@ -9120,6 +9099,7 @@ from skyvern.forge.sdk.workflow.models.google_sheets_blocks import (  # noqa: E4
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
 )
+from skyvern.forge.sdk.workflow.models.pdf_fill_block import PdfFillBlock  # noqa: E402
 
 BlockSubclasses = Union[
     ConditionalBlock,
@@ -9149,6 +9129,7 @@ BlockSubclasses = Union[
     WorkflowTriggerBlock,
     GoogleSheetsReadBlock,
     GoogleSheetsWriteBlock,
+    PdfFillBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

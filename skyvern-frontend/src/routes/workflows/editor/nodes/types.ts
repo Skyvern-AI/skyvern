@@ -74,4 +74,5 @@ export const workflowBlockTitle: {
   workflow_trigger: "Agent Trigger",
   google_sheets_read: "Google Sheets Read",
   google_sheets_write: "Google Sheets Write",
+  pdf_fill: "PDF Fill",
 };

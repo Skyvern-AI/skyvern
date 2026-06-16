@@ -73,6 +73,16 @@ export const helpTooltips = {
     prompt:
       "Write a prompt you would like passed into the LLM and specify the output format, if applicable.",
   },
+  pdf_fill: {
+    ...baseHelpTooltipContent,
+    fileUrl:
+      "The source PDF URL, S3 URI, or file path from an earlier block output.",
+    prompt:
+      "Describe how to fill the PDF fields. Use {{ parameter_name }} references when needed.",
+    payload:
+      "Structured JSON data sent to the field-mapping model. Supports the {{ parameter | json }} filter.",
+    llmKey: "Optional LLM key override for the field-mapping step.",
+  },
   google_sheets_read: {
     ...baseHelpTooltipContent,
     spreadsheetUrl:

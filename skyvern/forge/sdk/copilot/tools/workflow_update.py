@@ -88,7 +88,7 @@ from .frontier import (
     _stale_block_metadata_message,
     _workflow_requires_canonical_persist,
 )
-from .guardrails import _authority_tool_error
+from .guardrails import _authority_tool_error, _download_scout_required_error
 
 LOG = structlog.get_logger()
 
@@ -2064,6 +2064,10 @@ async def _update_workflow(
     if banned_items:
         _record_banned_block_reject_span("_update_workflow", banned_items)
         return {"ok": False, "error": _banned_block_reject_message(banned_items, ctx)}
+
+    download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
+    if download_scout_error:
+        return {"ok": False, "error": download_scout_error}
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
     if composition_evidence_error:
