@@ -53,6 +53,23 @@ from .scouting import (
 LOG = structlog.get_logger()
 
 
+def _selector_from_tool_data(data: dict[str, Any], *, prefer_resolved_when_empty: bool = False) -> str:
+    raw_selector = data.get("selector")
+    selector = raw_selector if isinstance(raw_selector, str) else ""
+    if prefer_resolved_when_empty and not selector.strip():
+        resolved_selector = data.get("resolved_selector")
+        selector = resolved_selector if isinstance(resolved_selector, str) else ""
+    return selector.strip()
+
+
+def _effective_target_text(selector: str, role: str = "", accessible_name: str = "") -> str:
+    label = accessible_name.strip() if isinstance(accessible_name, str) else ""
+    role_text = role.strip() if isinstance(role, str) else ""
+    if label and role_text:
+        return f"{role_text} {label}"
+    return label or selector
+
+
 async def _get_block_schema_pre_hook(
     params: dict[str, Any],
     ctx: AgentContext,
@@ -354,27 +371,27 @@ async def _click_post_hook(
     source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data, prefer_resolved_when_empty=True)
         url, title = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="click", url=url)
         result["data"] = {
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "url": url,
             "title": title,
         }
         navigated = bool(source_url) and bool(url) and source_url != url
-        role, accessible_name = await _resolve_scout_role_name(
-            ctx, data.get("selector", ""), allow_browser_read=not navigated
-        )
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector, allow_browser_read=not navigated)
+        result["data"]["effective_target"] = _effective_target_text(selector, role, accessible_name)
         _record_scouted_interaction(
             ctx,
             tool_name="click",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             role=role,
             accessible_name=accessible_name,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
-            ctx, tool_name="click", selector=data.get("selector", ""), source_url=source_url, url=url
+            ctx, tool_name="click", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -456,7 +473,7 @@ async def _type_text_post_hook(
     ctx.pending_scout_typed_value = None
     if result.get("ok") and result.get("data"):
         data = result["data"]
-        selector = data.get("selector", "")
+        selector = _selector_from_tool_data(data)
         typed_length = data.get("text_length", 0)
         url, _ = await _resolve_url_title(raw, ctx)
         result["data"] = {
@@ -570,25 +587,26 @@ async def _select_option_post_hook(
     source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="select_option", url=url)
         result["data"] = {
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "value": data.get("value", ""),
             "url": url,
         }
-        role, accessible_name = await _resolve_scout_role_name(ctx, data.get("selector", ""))
+        role, accessible_name = await _resolve_scout_role_name(ctx, selector)
         _record_scouted_interaction(
             ctx,
             tool_name="select_option",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             value=data.get("value", ""),
             role=role,
             accessible_name=accessible_name,
         )
         observation_step, page_evidence = await _register_scout_interaction_observation(
-            ctx, tool_name="select_option", selector=data.get("selector", ""), source_url=source_url, url=url
+            ctx, tool_name="select_option", selector=selector, source_url=source_url, url=url
         )
         if observation_step is not None:
             result["observation_step"] = observation_step
@@ -607,17 +625,18 @@ async def _press_key_post_hook(
     source_url = _consume_scout_source_url(ctx)
     if result.get("ok") and result.get("data"):
         data = result["data"]
+        selector = _selector_from_tool_data(data)
         url, _ = await _resolve_url_title(raw, ctx)
         _mark_pending_browser_interaction_observation(ctx, tool_name="press_key", url=url)
         result["data"] = {
             "key": data.get("key", ""),
-            "selector": data.get("selector", ""),
+            "selector": selector,
             "url": url,
         }
         _record_scouted_interaction(
             ctx,
             tool_name="press_key",
-            selector=data.get("selector", ""),
+            selector=selector,
             source_url=source_url,
             key=data.get("key", ""),
         )

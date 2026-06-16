@@ -162,6 +162,7 @@ class TestActObserveDegrade:
         assert result["ok"] is True
         assert result["data"] == {
             "selector": "#open-details",
+            "effective_target": "#open-details",
             "url": _LANDING_URL,
             "title": "Results",
             "observation_step": ctx.flow_evidence[0]["step"],

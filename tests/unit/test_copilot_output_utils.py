@@ -757,6 +757,20 @@ class TestFormatToolResultForUser:
         )
         assert agent_summary == "Clicked '#submit'"
 
+    def test_summarize_tool_result_uses_effective_click_target(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": "", "effective_target": "xpath=//button[normalize-space(.)='Accept']"}},
+        )
+        assert agent_summary == "Clicked 'xpath=//button[normalize-space(.)='Accept']'"
+
+    def test_summarize_tool_result_falls_back_to_resolved_selector(self) -> None:
+        agent_summary = summarize_tool_result(
+            "click",
+            {"ok": True, "data": {"selector": None, "resolved_selector": "xpath=//button[2]"}},
+        )
+        assert agent_summary == "Clicked 'xpath=//button[2]'"
+
 
 class TestParseFinalResponse:
     """parse_final_response is the last mile between model output and the frontend.
