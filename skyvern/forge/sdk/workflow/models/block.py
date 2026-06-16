@@ -154,6 +154,7 @@ from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_factory import rebind_download_dir
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
 
@@ -466,6 +467,24 @@ class Block(BaseModel, abc.ABC):
 
         if browser_session_id and organization_id:
             browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+            if browser_state is not None:
+                adopted_context = browser_state.browser_context
+                adopted_browser = adopted_context.browser if adopted_context else None
+                if adopted_browser is not None:
+                    try:
+                        await rebind_download_dir(adopted_browser, run_id=workflow_run_id)
+                        LOG.info(
+                            "Rebound download dir on adopted persistent session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run_id,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to rebind download dir on adopted persistent session",
+                            browser_session_id=browser_session_id,
+                            workflow_run_id=workflow_run_id,
+                            exc_info=True,
+                        )
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
