@@ -188,6 +188,7 @@ function CodeBlockEditorBody({
   if (isCodeFirst && view === "code") {
     return (
       <div data-testid="code-block-block-form" className="space-y-4">
+        {inputsField}
         {codeEditorElement}
       </div>
     );
