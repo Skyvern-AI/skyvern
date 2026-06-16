@@ -18,6 +18,7 @@ from skyvern.forge.sdk.workflow.exceptions import InsecureCodeDetected
 from skyvern.forge.sdk.workflow.models.block import CodeBlock
 from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, ParameterType
 from skyvern.schemas.workflows import BlockStatus
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 # ---------------------------------------------------------------------------
 # is_safe_code — rejection tests
@@ -679,6 +680,9 @@ async def wrapper({default_args}):
     @pytest.mark.asyncio
     async def test_execute_uses_configured_code_block_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class FakeBrowserState:
+            def __init__(self) -> None:
+                self.browser_artifacts = BrowserArtifacts()
+
             async def get_working_page(self) -> object:
                 return object()
 
@@ -957,6 +961,9 @@ async def _run_credential_code_block(monkeypatch: "pytest.MonkeyPatch", wrc, cod
     )
 
     class FakeBrowserState:
+        def __init__(self) -> None:
+            self.browser_artifacts = BrowserArtifacts()
+
         async def get_working_page(self) -> object:
             return MagicMock()
 

@@ -25,6 +25,7 @@ from skyvern.forge.sdk.workflow.models.parameter import OutputParameter, Paramet
 from skyvern.schemas.workflows import BlockStatus
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import Action, ActionStatus
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
 class FakeLocator:
@@ -309,6 +310,9 @@ def _patch_execute_environment(
     context: FakeWorkflowRunContext,
 ) -> dict[str, AsyncMock]:
     class FakeBrowserState:
+        def __init__(self) -> None:
+            self.browser_artifacts = BrowserArtifacts()
+
         async def get_working_page(self):  # noqa: ANN201
             return page
 

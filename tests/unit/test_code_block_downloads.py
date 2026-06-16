@@ -27,6 +27,7 @@ from skyvern.forge.sdk.workflow.models.parameter import (
     WorkflowParameter,
     WorkflowParameterType,
 )
+from skyvern.webeye.browser_artifacts import BrowserArtifacts
 
 
 def _output_parameter(key: str) -> OutputParameter:
@@ -77,7 +78,7 @@ def _wire_block_runtime(
     values: dict[str, object] | None = None,
 ) -> None:
     page = SimpleNamespace()
-    browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=page))
+    browser_state = SimpleNamespace(get_working_page=AsyncMock(return_value=page), browser_artifacts=BrowserArtifacts())
     monkeypatch.setattr(CodeBlock, "get_or_create_browser_state", AsyncMock(return_value=browser_state))
 
     context = SimpleNamespace(
