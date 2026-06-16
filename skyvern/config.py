@@ -147,6 +147,13 @@ class Settings(BaseSettings):
     # log volume (health checks, polling) while carrying no mutation to audit.
     LOG_RAW_API_REQUESTS_SUCCESSFUL_READS: bool = False
     LOG_LEVEL: str = "INFO"
+    # Opt-in INFO-log sampling for high-volume orgs. A log call marked
+    # sampling=True is dropped from stdout/Datadog with probability
+    # (1 - LOG_SAMPLING_RATE) when its org is in LOG_SAMPLING_ORG_IDS. The full
+    # line is still captured in the per-run S3 log artifact. Both defaults make
+    # this a no-op: an empty org list samples nothing and rate 1.0 keeps all.
+    LOG_SAMPLING_RATE: float = 1.0
+    LOG_SAMPLING_ORG_IDS: list[str] = []
     COPILOT_FEASIBILITY_GATE_TIMEOUT_SECONDS: float = 12.0
     COPILOT_REQUEST_POLICY_CLASSIFIER_TIMEOUT_SECONDS: float = 6.0
     COPILOT_TURN_INTENT_CLASSIFIER_TIMEOUT_SECONDS: float = 12.0
@@ -168,6 +175,11 @@ class Settings(BaseSettings):
     # On, a reached-download affordance compiles into the expect_download idiom in the code-block
     # synthesizer; off (default) restores today's bare-click synthesis. Per-rung gate.
     COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED: bool = False
+    # A download fires only when its affordance is clicked, so a download-intent code block must
+    # be scout-acted (skyvern_evaluate) before it can be authored: the guardrail rejects authoring
+    # one with no scout_interaction this turn, and the evaluate tool is framed as the scout-act
+    # path for interaction-gated affordances. Off (default) restores today's inspect-then-author.
+    COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.

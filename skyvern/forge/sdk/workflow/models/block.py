@@ -401,6 +401,7 @@ class Block(BaseModel, abc.ABC):
         )
         LOG.info(
             "Registered output parameter value",
+            sampling=True,
             output_parameter_id=self.output_parameter.output_parameter_id,
             workflow_run_id=workflow_run_id,
             output_parameter_value=value,
@@ -743,6 +744,7 @@ class Block(BaseModel, abc.ABC):
             description = json_response.get("summary")
             LOG.info(
                 "Generated description for the workflow run block",
+                sampling=True,
                 description=description,
                 workflow_run_block_id=workflow_run_block_id,
             )
@@ -831,7 +833,11 @@ class Block(BaseModel, abc.ABC):
                     )
 
             LOG.info(
-                "Executing block", workflow_run_id=workflow_run_id, block_label=self.label, block_type=self.block_type
+                "Executing block",
+                sampling=True,
+                workflow_run_id=workflow_run_id,
+                block_label=self.label,
+                block_type=self.block_type,
             )
             return await self.execute(
                 workflow_run_id,
@@ -1380,6 +1386,7 @@ class BaseTaskBlock(Block):
             if updated_task.status == TaskStatus.completed or updated_task.status == TaskStatus.terminated:
                 LOG.info(
                     "Task completed",
+                    sampling=True,
                     task_id=updated_task.task_id,
                     task_status=updated_task.status,
                     workflow_run_id=workflow_run_id,

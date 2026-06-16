@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.block_type_aliases import normalize_copilot_block_type_alias
 from skyvern.forge.sdk.copilot.build_phase import (
     BuildPhase,
@@ -42,6 +43,7 @@ from .scouting import (
     _consume_scout_source_url,
     _mark_page_inspected,
     _mark_pending_browser_interaction_observation,
+    _maybe_attach_reached_download_target,
     _record_scouted_interaction,
     _register_scout_interaction_observation,
     _resolve_scout_role_name,
@@ -379,6 +381,8 @@ async def _click_post_hook(
             result["data"]["observation_step"] = observation_step
         if page_evidence is not None:
             _attach_scout_page_summary(result, page_evidence)
+            if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+                await _maybe_attach_reached_download_target(ctx, result, url=url, page_evidence=page_evidence)
     return result
 
 
@@ -636,6 +640,28 @@ def get_skyvern_mcp_alias_map() -> dict[str, str]:
     }
 
 
+_EVALUATE_BASE_DESCRIPTION = (
+    "Execute JavaScript in the browser and return the result. "
+    "Use this to inspect DOM state, read values, or run arbitrary JS."
+)
+# Scout-ACT framing: an interaction-gated affordance (a download, a row-expand, a post-login
+# area) only reveals its result after it is clicked, so it must be acted on here rather than
+# inspected passively. For a download the copilot then compiles the terminal download step.
+_EVALUATE_SCOUT_ACT_DESCRIPTION = (
+    _EVALUATE_BASE_DESCRIPTION
+    + " Some results only appear AFTER an interaction (a download, a row-expand, a post-login "
+    "area); scout-ACT those affordances here (click the control via JS) instead of inspecting "
+    "passively. For a download, click the download control with this tool rather than authoring "
+    "the download yourself — the copilot then compiles the terminal download step for you."
+)
+
+
+def _evaluate_overlay_description() -> str:
+    if settings.COPILOT_DOWNLOAD_SCOUT_ACT_REQUIRED_ENABLED:
+        return _EVALUATE_SCOUT_ACT_DESCRIPTION
+    return _EVALUATE_BASE_DESCRIPTION
+
+
 def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
     return {
         "get_block_schema": SchemaOverlay(
@@ -664,10 +690,7 @@ def _build_skyvern_mcp_overlays() -> dict[str, SchemaOverlay]:
             post_hook=_screenshot_post_hook,
         ),
         "evaluate": SchemaOverlay(
-            description=(
-                "Execute JavaScript in the browser and return the result. "
-                "Use this to inspect DOM state, read values, or run arbitrary JS."
-            ),
+            description=_evaluate_overlay_description(),
             hide_params=frozenset({"session_id", "cdp_url"}),
             requires_browser=True,
             timeout=30,

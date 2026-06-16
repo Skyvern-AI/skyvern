@@ -469,7 +469,7 @@ class RealBrowserState(BrowserState):
         )
 
     async def close(self, close_browser_on_completion: bool = True) -> None:
-        LOG.info("Closing browser state")
+        LOG.info("Closing browser state", sampling=True)
         try:
             async with asyncio.timeout(BROWSER_CLOSE_TIMEOUT):
                 if self.browser_context and close_browser_on_completion:
