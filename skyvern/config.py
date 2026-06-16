@@ -165,6 +165,9 @@ class Settings(BaseSettings):
     # already registered into a block output), attach a typed reached-download target and steer
     # the agent to author one terminal download code block. Off (default) restores today's behavior.
     COPILOT_REACHED_DOWNLOAD_TARGET_AUTHOR_STEER_ENABLED: bool = False
+    # On, a reached-download affordance compiles into the expect_download idiom in the code-block
+    # synthesizer; off (default) restores today's bare-click synthesis. Per-rung gate.
+    COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED: bool = False
     # Dispatch flag for the workflow copilot v2 (openai-agents-SDK rewrite).
     # Off = existing direct-LLM copilot at workflow_copilot_chat_post.
     # On = new agent-SDK path under skyvern.forge.sdk.copilot.

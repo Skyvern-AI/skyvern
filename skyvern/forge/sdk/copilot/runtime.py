@@ -36,6 +36,7 @@ from skyvern.library.skyvern_browser import SkyvernBrowser
 if TYPE_CHECKING:
     from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal
     from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
+    from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
     from skyvern.forge.sdk.copilot.request_policy import RequestPolicy
     from skyvern.forge.sdk.copilot.run_outcome import RecordedRunOutcome
     from skyvern.forge.sdk.copilot.turn_halt import TurnHalt
@@ -267,6 +268,9 @@ class AgentContext:
     # preserves repeats and ordering so code_block_synthesis can emit a faithful
     # linear Playwright trajectory.
     scout_trajectory: list[ScoutedInteraction] = field(default_factory=list)
+    # Latest typed reached-download target from the scout steer; the synthesizer compiles the terminal
+    # expect_download step from it. Selector is the observed download link, not necessarily a trajectory click.
+    reached_download_target: ReachedDownloadTarget | None = None
     synthesized_block_offered: bool = False
     # Source page of an in-flight scout action, captured before it may navigate away.
     pending_scout_source_url: str | None = None
