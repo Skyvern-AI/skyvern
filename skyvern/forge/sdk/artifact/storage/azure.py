@@ -257,6 +257,17 @@ class AzureStorage(BaseStorage):
         temp_zip_file.close()
         return temp_dir
 
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from Azure."""
+        profile_uri = f"azure://{settings.AZURE_STORAGE_CONTAINER_BROWSER_SESSIONS}/{settings.ENV}/{organization_id}/profiles/{profile_id}.zip"
+        LOG.info(
+            "Deleting browser profile",
+            organization_id=organization_id,
+            profile_id=profile_id,
+            profile_uri=profile_uri,
+        )
+        await self.async_client.delete_file(profile_uri)
+
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:

@@ -372,6 +372,20 @@ async def delete_browser_profile(
         )
         raise
 
+    # Reap the stored blob so soft-deleted profiles don't leave orphaned S3 objects behind.
+    # Best-effort: the soft-delete already succeeded, so a reap failure must not fail the request.
+    try:
+        await app.STORAGE.delete_browser_profile(
+            organization_id=organization_id,
+            profile_id=profile_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to delete browser profile blob after soft-delete",
+            organization_id=organization_id,
+            browser_profile_id=profile_id,
+        )
+
     LOG.info(
         "Deleted browser profile",
         organization_id=organization_id,
@@ -487,6 +501,22 @@ async def _create_profile_from_session(
             exc_info=True,
         )
         raise
+
+    # The promote copied the session's own export (profiles/{pbs_session}.zip) into the new bp_, so
+    # reap that source now that it's redundant. Keyed on the session id, never a reused bp_ profile.
+    # Best-effort: only after a successful promote, and a reap failure must not fail the request.
+    try:
+        await app.STORAGE.delete_browser_profile(
+            organization_id=organization_id,
+            profile_id=browser_session_id,
+        )
+    except Exception:
+        LOG.exception(
+            "Failed to delete source session profile blob after promote",
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+            browser_profile_id=profile.browser_profile_id,
+        )
 
     LOG.info(
         "Created browser profile from session",

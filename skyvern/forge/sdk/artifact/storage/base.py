@@ -201,6 +201,10 @@ class BaseStorage(ABC):
         """Retrieve a browser profile to a temporary directory."""
 
     @abstractmethod
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a stored browser profile. Best-effort: a missing object is not an error."""
+
+    @abstractmethod
     async def list_downloaded_files_in_browser_session(
         self, organization_id: str, browser_session_id: str
     ) -> list[str]:
