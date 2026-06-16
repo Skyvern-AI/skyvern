@@ -171,6 +171,13 @@ def _download_intent_block_labels(workflow_yaml: str | None) -> list[str]:
     return labels
 
 
+def _has_reached_download_target(ctx: Any) -> bool:
+    target = getattr(ctx, "reached_download_target", None)
+    if not isinstance(target, ReachedDownloadTarget):
+        return False
+    return target.already_registered or bool(target.selector.strip())
+
+
 def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) -> str | None:
     """Reject authoring a download-intent code block until the affordance has been scout-acted
     this turn, so the skyvern_evaluate post-hook can populate the reached-download target and the
@@ -185,6 +192,8 @@ def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) 
         return None
     download_labels = _download_intent_block_labels(workflow_yaml)
     if not download_labels:
+        return None
+    if _has_reached_download_target(copilot_ctx):
         return None
     if turn_has_scout_interaction(copilot_ctx):
         return None

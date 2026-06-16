@@ -23,12 +23,24 @@ from skyvern.utils.strings import escape_code_fences
 
 _MAX_STEPS = 60
 _INDENT = "    "
+_DOMCONTENTLOADED = "domcontentloaded"
+_ENTRY_TARGET_VAR = "_scout_entry_target"
+_ENTRY_REUSED_VAR = "_scout_entry_reused_current_page"
+_ENTRY_RESUME_AFTER_AUTH_VAR = "_scout_entry_resume_after_auth"
+_ENTRY_RESUME_TARGET_VAR = "_scout_entry_resume_target"
+_ENTRY_OPENER_VAR = "_scout_entry_opener"
+_ENTRY_LOCATOR_VARS = (_ENTRY_TARGET_VAR, _ENTRY_RESUME_TARGET_VAR, _ENTRY_OPENER_VAR)
 
 # Base name for the download var bound by `async with page.expect_download() as <name>:`.
 _DOWNLOAD_VAR_BASE = "dl_info"
+_DOWNLOAD_FILENAME_VAR_BASE = "downloaded_file_name"
+_DOWNLOAD_PATH_VAR_BASE = "_downloaded_file_path"
+_DOWNLOAD_OUTPUT_VAR_BASE = "downloaded_files"
 
 CREDENTIAL_FILL_TOOL_NAME = "fill_credential_field"
 _CREDENTIAL_FIELDS = frozenset({"username", "password", "totp"})
+_ENTRY_TARGET_TOOLS = frozenset({"click", "type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option", "press_key"})
+_DURABLE_FALLBACK_ENTRY_TARGET_TOOLS = frozenset({"type_text", CREDENTIAL_FILL_TOOL_NAME, "select_option"})
 
 _SYNTHESIZED_BLOCK_LABEL = "scout_synthesized_browser_steps"
 
@@ -70,8 +82,16 @@ _RESERVED_PARAM_NAMES = frozenset(
         "json",
         "html",
         "Exception",
+        _ENTRY_TARGET_VAR,
+        _ENTRY_REUSED_VAR,
+        _ENTRY_RESUME_AFTER_AUTH_VAR,
+        _ENTRY_RESUME_TARGET_VAR,
+        _ENTRY_OPENER_VAR,
         _DOWNLOAD_VAR_BASE,
         f"{_DOWNLOAD_VAR_BASE}_file",
+        _DOWNLOAD_FILENAME_VAR_BASE,
+        _DOWNLOAD_PATH_VAR_BASE,
+        _DOWNLOAD_OUTPUT_VAR_BASE,
     }
 )
 
@@ -323,6 +343,102 @@ def _credential_param_key(interaction: Mapping[str, Any], used: set[str]) -> str
     return _unique_key(_safe_param_base(name or "credential"), used)
 
 
+def _is_durable_fallback_entry_target(interaction: Mapping[str, Any]) -> bool:
+    tool_name = str(interaction.get("tool_name") or "")
+    if tool_name not in _DURABLE_FALLBACK_ENTRY_TARGET_TOOLS:
+        return False
+    if tool_name == CREDENTIAL_FILL_TOOL_NAME:
+        credential_id = str(interaction.get("credential_id") or "").strip()
+        credential_field = str(interaction.get("credential_field") or "").strip()
+        return bool(credential_id) and credential_field in _CREDENTIAL_FIELDS
+    if tool_name == "select_option":
+        return bool(str(interaction.get("value") or "").strip())
+    return True
+
+
+def _is_generic_entry_opener_click(interaction: Mapping[str, Any]) -> bool:
+    if str(interaction.get("tool_name") or "") != "click":
+        return False
+    if str(interaction.get("accessible_name") or "").strip():
+        return False
+    selector = str(interaction.get("selector") or "").strip().lower()
+    role = str(interaction.get("role") or "").strip().lower()
+    if role not in {"", "button"}:
+        return False
+    return selector == "button" or bool(re.match(r"^button(?:\\.icon|:nth-)", selector))
+
+
+def _should_prefer_durable_entry_target(trajectory: Sequence[Mapping[str, Any]]) -> bool:
+    if not trajectory or not _is_generic_entry_opener_click(trajectory[0]):
+        return False
+    first_source_url = str(trajectory[0].get("source_url") or "").strip()
+    for interaction in trajectory[1:]:
+        source_url = str(interaction.get("source_url") or "").strip()
+        if first_source_url and source_url and source_url != first_source_url:
+            continue
+        if _is_durable_fallback_entry_target(interaction):
+            return True
+    return False
+
+
+def _entry_target_locator(
+    trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool, prefer_durable: bool = False
+) -> tuple[str, int]:
+    first_locator = ""
+    first_index = -1
+    for index, interaction in enumerate(trajectory):
+        tool_name = str(interaction.get("tool_name") or "")
+        if tool_name not in _ENTRY_TARGET_TOOLS:
+            continue
+        if tool_name == "press_key" and not interaction.get("selector"):
+            continue
+        locator = _locator_expr(interaction, [], strict_selectors=strict_selectors)
+        if not locator:
+            continue
+        if not first_locator:
+            first_locator = locator
+            first_index = index
+        if prefer_durable and _is_durable_fallback_entry_target(interaction):
+            return locator, index
+        if not prefer_durable:
+            return locator, index
+    return first_locator, first_index
+
+
+def _entry_target_locator_expr(trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool) -> str:
+    locator, _index = _entry_target_locator(trajectory, strict_selectors=strict_selectors)
+    return locator
+
+
+def _post_auth_resume_locator(trajectory: Sequence[Mapping[str, Any]], *, strict_selectors: bool) -> tuple[str, int]:
+    last_credential_index = -1
+    for index, interaction in enumerate(trajectory):
+        if str(interaction.get("tool_name") or "") == CREDENTIAL_FILL_TOOL_NAME:
+            last_credential_index = index
+    if last_credential_index < 0:
+        return "", -1
+
+    submit_index = -1
+    for index in range(last_credential_index + 1, len(trajectory)):
+        if str(trajectory[index].get("tool_name") or "") == "click":
+            submit_index = index
+            break
+    if submit_index < 0:
+        return "", -1
+
+    for index in range(submit_index + 1, len(trajectory)):
+        interaction = trajectory[index]
+        tool_name = str(interaction.get("tool_name") or "")
+        if tool_name not in _ENTRY_TARGET_TOOLS or _is_generic_entry_opener_click(interaction):
+            continue
+        if tool_name == "press_key" and not interaction.get("selector"):
+            continue
+        locator = _locator_expr(interaction, [], strict_selectors=strict_selectors)
+        if locator:
+            return locator, index
+    return "", -1
+
+
 def synthesize_code_block(
     trajectory: Sequence[Mapping[str, Any]],
     *,
@@ -342,6 +458,12 @@ def synthesize_code_block(
     typed_param_keys: dict[tuple[str, str, str, str], str] = {}
     credential_param_keys: dict[str, str] = {}
     used_download_vars: set[str] = set()
+    compile_download_target = (
+        settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED
+        and reached_download_target is not None
+        and not reached_download_target.already_registered
+        and bool(reached_download_target.selector)
+    )
 
     def append_step(description: str, action_type: str, line_start: int) -> None:
         steps.append(
@@ -356,6 +478,9 @@ def synthesize_code_block(
 
     entry_url = ""
     entry_index = -1
+    entry_replay_condition_active = False
+    entry_replay_start_index = 0
+    entry_post_auth_resume_index = 0
     for index, interaction in enumerate(trajectory):
         candidate = str(interaction.get("source_url") or "").strip()
         if candidate:
@@ -363,19 +488,148 @@ def synthesize_code_block(
             entry_index = index
             break
     if entry_url:
+        entry_trajectory = trajectory[entry_index:]
+        prefer_durable_entry_target = compile_download_target or _should_prefer_durable_entry_target(entry_trajectory)
+        fallback_entry_target, fallback_entry_relative_index = _entry_target_locator(
+            entry_trajectory,
+            strict_selectors=strict_selectors,
+            prefer_durable=prefer_durable_entry_target,
+        )
+        fallback_entry_index = (
+            entry_index + fallback_entry_relative_index if fallback_entry_relative_index >= 0 else entry_index
+        )
+        post_auth_resume_target, post_auth_resume_relative_index = _post_auth_resume_locator(
+            entry_trajectory,
+            strict_selectors=strict_selectors,
+        )
+        entry_post_auth_resume_index = (
+            entry_index + post_auth_resume_relative_index
+            if post_auth_resume_relative_index > fallback_entry_relative_index
+            else 0
+        )
+        download_entry_target = (
+            f"page.locator({_py_str(reached_download_target.selector)})"
+            if compile_download_target and reached_download_target is not None
+            else ""
+        )
+        entry_target = download_entry_target if download_entry_target else fallback_entry_target
+        entry_replay_condition_active = bool(download_entry_target and fallback_entry_target)
+        entry_replay_start_index = fallback_entry_index if fallback_entry_index > entry_index else 0
         if entry_index > 0:
             notes.append("entry URL taken from a later interaction; earlier steps had no source_url")
+        if entry_replay_condition_active and fallback_entry_index > entry_index:
+            notes.append("download fallback entry target taken from a later durable interaction")
+        if entry_post_auth_resume_index:
+            notes.append("entry fallback can resume after authentication when login controls stay hidden")
+        elif fallback_entry_index > entry_index:
+            notes.append("entry replay starts at a later durable interaction")
+        entry_recovery_clicks: list[str] = []
+        if fallback_entry_index > entry_index:
+            for recovery_index in range(entry_index, fallback_entry_index):
+                recovery_interaction = trajectory[recovery_index]
+                if not _is_generic_entry_opener_click(recovery_interaction):
+                    continue
+                recovery_locator = _locator_expr(
+                    recovery_interaction,
+                    notes,
+                    diagnostics=diagnostics,
+                    trajectory_index=recovery_index,
+                    tool_name="click",
+                    strict_selectors=strict_selectors,
+                )
+                if recovery_locator:
+                    entry_recovery_clicks.append(recovery_locator)
+            if entry_recovery_clicks:
+                notes.append("entry fallback replays a generic opener only when the durable target stays hidden")
         line_start = len(lines) + 1
-        lines.append(f"{_INDENT}await page.goto({_py_str(_scrub_url_for_code_literal(entry_url))})")
-        lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+        if entry_target:
+            if entry_replay_condition_active:
+                lines.append(f"{_INDENT}{_ENTRY_REUSED_VAR} = False")
+            if entry_post_auth_resume_index:
+                lines.append(f"{_INDENT}{_ENTRY_RESUME_AFTER_AUTH_VAR} = False")
+            lines.append(f"{_INDENT}{_ENTRY_TARGET_VAR} = {entry_target}")
+            lines.append(f"{_INDENT}try:")
+            lines.append(f'{_INDENT * 2}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+            if entry_replay_condition_active:
+                lines.append(f"{_INDENT * 2}{_ENTRY_REUSED_VAR} = True")
+            lines.append(f"{_INDENT}except Exception:")
+            lines.append(
+                f"{_INDENT * 2}await page.goto("
+                f"{_py_str(_scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+            )
+            post_goto_indent = 2
+            if entry_replay_condition_active:
+                lines.append(f"{_INDENT * 2}try:")
+                lines.append(f'{_INDENT * 3}await {_ENTRY_TARGET_VAR}.wait_for(state="visible", timeout=1000)')
+                lines.append(f"{_INDENT * 3}{_ENTRY_REUSED_VAR} = True")
+                lines.append(f"{_INDENT * 2}except Exception:")
+                post_goto_indent = 3
+            if fallback_entry_target and fallback_entry_target != entry_target:
+                lines.append(f"{_INDENT * post_goto_indent}{_ENTRY_TARGET_VAR} = {fallback_entry_target}")
+            if entry_recovery_clicks or entry_post_auth_resume_index:
+                lines.append(f"{_INDENT * post_goto_indent}try:")
+                lines.append(
+                    f"{_INDENT * (post_goto_indent + 1)}await {_ENTRY_TARGET_VAR}.wait_for("
+                    f'state="visible", timeout=1000)'
+                )
+                lines.append(f"{_INDENT * post_goto_indent}except Exception:")
+                if entry_post_auth_resume_index:
+                    lines.append(
+                        f"{_INDENT * (post_goto_indent + 1)}{_ENTRY_RESUME_TARGET_VAR} = {post_auth_resume_target}"
+                    )
+                    lines.append(f"{_INDENT * (post_goto_indent + 1)}try:")
+                    lines.append(
+                        f"{_INDENT * (post_goto_indent + 2)}await {_ENTRY_RESUME_TARGET_VAR}.wait_for("
+                        f'state="visible", timeout=1000)'
+                    )
+                    lines.append(f"{_INDENT * (post_goto_indent + 2)}{_ENTRY_RESUME_AFTER_AUTH_VAR} = True")
+                    lines.append(f"{_INDENT * (post_goto_indent + 1)}except Exception:")
+                    recovery_indent = post_goto_indent + 2
+                else:
+                    recovery_indent = post_goto_indent + 1
+                for recovery_locator in entry_recovery_clicks:
+                    lines.append(f"{_INDENT * recovery_indent}{_ENTRY_OPENER_VAR} = {recovery_locator}")
+                    lines.append(f"{_INDENT * recovery_indent}if await {_ENTRY_OPENER_VAR}.count() == 1:")
+                    lines.append(f"{_INDENT * (recovery_indent + 1)}await {_ENTRY_OPENER_VAR}.click()")
+                    lines.append(
+                        f"{_INDENT * (recovery_indent + 1)}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})"
+                    )
+                lines.append(f'{_INDENT * recovery_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+            else:
+                lines.append(f'{_INDENT * post_goto_indent}await {_ENTRY_TARGET_VAR}.wait_for(state="visible")')
+        else:
+            lines.append(
+                f"{_INDENT}await page.goto("
+                f"{_py_str(_scrub_url_for_code_literal(entry_url))}, wait_until={_py_str(_DOMCONTENTLOADED)})"
+            )
+        if entry_replay_condition_active:
+            lines.append(f"{_INDENT}if not {_ENTRY_REUSED_VAR}:")
+            if entry_post_auth_resume_index:
+                lines.append(f"{_INDENT * 2}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
+                lines.append(f"{_INDENT * 3}pass")
+        elif entry_post_auth_resume_index:
+            lines.append(f"{_INDENT}if not {_ENTRY_RESUME_AFTER_AUTH_VAR}:")
         append_step(f"Open {entry_url}", "goto_url", line_start)
 
     emitted = 0
+
+    def action_indent_for(trajectory_index: int) -> str:
+        if entry_replay_condition_active:
+            if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
+                return _INDENT * 3
+            return _INDENT * 2
+        if entry_post_auth_resume_index and trajectory_index < entry_post_auth_resume_index:
+            return _INDENT * 2
+        return _INDENT
+
     for trajectory_index, interaction in enumerate(trajectory):
         if emitted >= _MAX_STEPS:
             diagnostics.truncated = True
             notes.append(f"trajectory truncated at {_MAX_STEPS} steps")
             break
+        if entry_replay_start_index and trajectory_index < entry_replay_start_index:
+            continue
+        action_indent = action_indent_for(trajectory_index)
         tool_name = str(interaction.get("tool_name") or "")
 
         if tool_name == "press_key":
@@ -399,7 +653,7 @@ def synthesize_code_block(
             )
             line_start = len(lines) + 1
             if locator:
-                lines.append(f"{_INDENT}await {locator}.press({_py_str(key)})")
+                lines.append(f"{action_indent}await {locator}.press({_py_str(key)})")
             else:
                 if strict_selectors:
                     diagnostics.dropped_interactions.append(
@@ -410,8 +664,8 @@ def synthesize_code_block(
                         }
                     )
                     continue
-                lines.append(f"{_INDENT}await page.keyboard.press({_py_str(key)})")
-            lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+                lines.append(f"{action_indent}await page.keyboard.press({_py_str(key)})")
+            lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Press {key}", "keypress", line_start)
             emitted += 1
             continue
@@ -429,8 +683,8 @@ def synthesize_code_block(
 
         line_start = len(lines) + 1
         if tool_name == "click":
-            lines.append(f"{_INDENT}await {locator}.click()")
-            lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+            lines.append(f"{action_indent}await {locator}.click()")
+            lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Click {_step_target(interaction)}", "click", line_start)
         elif tool_name == "type_text":
             typed_identity = _typed_value_identity(interaction)
@@ -444,7 +698,7 @@ def synthesize_code_block(
                 parameters.append(parameter)
                 if typed_identity is not None:
                     typed_param_keys[typed_identity] = param_key
-            lines.append(f"{_INDENT}await {locator}.fill(str({param_key}))")
+            lines.append(f"{action_indent}await {locator}.fill(str({param_key}))")
             append_step(f"Type into {_step_target(interaction)}", "input_text", line_start)
         elif tool_name == CREDENTIAL_FILL_TOOL_NAME:
             credential_id = str(interaction.get("credential_id") or "").strip()
@@ -464,7 +718,7 @@ def synthesize_code_block(
                 credential_param_key = _credential_param_key(interaction, used_param_keys)
                 credential_param_keys[credential_id] = credential_param_key
                 parameters.append({"key": credential_param_key, "credential_id": credential_id})
-            lines.append(f"{_INDENT}await {locator}.fill({credential_param_key}.{credential_field})")
+            lines.append(f"{action_indent}await {locator}.fill({credential_param_key}.{credential_field})")
         elif tool_name == "select_option":
             value = str(interaction.get("value") or "").strip()
             if not value:
@@ -473,8 +727,8 @@ def synthesize_code_block(
                     {"trajectory_index": trajectory_index, "tool_name": tool_name, "reason_code": "missing_value"}
                 )
                 continue
-            lines.append(f"{_INDENT}await {locator}.select_option({_py_str(value)})")
-            lines.append(f'{_INDENT}await page.wait_for_load_state("load")')
+            lines.append(f"{action_indent}await {locator}.select_option({_py_str(value)})")
+            lines.append(f"{action_indent}await page.wait_for_load_state({_py_str(_DOMCONTENTLOADED)})")
             append_step(f"Select {value} in {_step_target(interaction)}", "select_option", line_start)
         else:
             notes.append(f"skipped unsupported interaction tool_name={tool_name!r}")
@@ -484,12 +738,10 @@ def synthesize_code_block(
             continue
         emitted += 1
 
-    if (
-        settings.COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED
-        and reached_download_target is not None
-        and not reached_download_target.already_registered
-        and reached_download_target.selector
-    ):
+    if entry_replay_condition_active and emitted == 0 and not entry_post_auth_resume_index:
+        lines.append(f"{_INDENT * 2}pass")
+
+    if compile_download_target and reached_download_target is not None:
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
         # Awaiting the download value lands the file in the run-scoped downloads dir; the execution-layer
@@ -503,6 +755,8 @@ def synthesize_code_block(
 
     if not lines:
         return None
+    if steps:
+        steps[-1]["line_end"] = len(lines)
 
     diagnostics.emitted_interaction_count = emitted
     code = "\n".join(lines) + "\n"

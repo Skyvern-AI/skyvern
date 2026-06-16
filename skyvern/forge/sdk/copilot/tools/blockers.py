@@ -24,6 +24,7 @@ from skyvern.forge.sdk.copilot.failure_tracking import (
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
 )
 from skyvern.forge.sdk.copilot.loop_detection import detect_failed_tool_step_loop_for_ctx, detect_tool_loop
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.schemas.workflows import BlockType
@@ -1127,9 +1128,31 @@ def _iter_goal_value_path_values(value: Any, path_parts: list[str]) -> list[Any]
 def _code_output_goal_paths_have_content(value: Any, goal_value_paths: list[str]) -> bool:
     for path in goal_value_paths:
         values = _iter_goal_value_path_values(value, _normalize_goal_value_path(path))
+        if not values and _goal_value_path_targets_registered_download(path):
+            values = _registered_download_output_values(value)
         if not any(_code_output_has_goal_content(item) for item in values):
             return False
     return True
+
+
+def _goal_value_path_targets_registered_download(path: str) -> bool:
+    normalized = path.strip()
+    if normalized.startswith("$."):
+        normalized = normalized[2:]
+    elif normalized.startswith("$"):
+        normalized = normalized[1:]
+    head = normalized.split(".", 1)[0].split("[", 1)[0].strip()
+    return head in REGISTERED_DOWNLOAD_OUTPUT_KEYS
+
+
+def _registered_download_output_values(value: Any) -> list[Any]:
+    if not isinstance(value, Mapping):
+        return []
+    return [value[key] for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS if key in value]
+
+
+def _code_output_has_registered_download_content(value: Any) -> bool:
+    return any(_code_output_has_goal_content(item) for item in _registered_download_output_values(value))
 
 
 def _active_block_run_budget_seconds(ctx: AgentContext) -> int:
@@ -1557,7 +1580,9 @@ def _analyze_run_blocks(
                 goal_value_paths = _goal_value_paths_for_code_block(copilot_ctx, block.get("label"))
                 if goal_value_paths:
                     has_data_blocks = True
-                    if _code_output_goal_paths_have_content(extracted, goal_value_paths):
+                    if _code_output_has_registered_download_content(extracted) or _code_output_goal_paths_have_content(
+                        extracted, goal_value_paths
+                    ):
                         any_data_output = True
                     else:
                         # Terminal goal paths are conjunctive: one missing
