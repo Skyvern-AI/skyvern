@@ -88,7 +88,7 @@ from .frontier import (
     _stale_block_metadata_message,
     _workflow_requires_canonical_persist,
 )
-from .guardrails import _authority_tool_error, _download_scout_required_error
+from .guardrails import _authority_tool_error, _download_binding_required_error, _download_scout_required_error
 
 LOG = structlog.get_logger()
 
@@ -1319,7 +1319,11 @@ def _maybe_impose_synthesized_code_block(workflow_yaml: str, ctx: AgentContext) 
     if not _submitted_code_block_changed(code_block, prior_yaml):
         return _SynthesizedCodeImpositionResult(workflow_yaml=workflow_yaml)
 
-    synthesized = synthesize_code_block(scout_trajectory, strict_selectors=True)
+    synthesized = synthesize_code_block(
+        scout_trajectory,
+        strict_selectors=True,
+        reached_download_target=getattr(ctx, "reached_download_target", None),
+    )
     if synthesized is None:
         return _SynthesizedCodeImpositionResult(
             workflow_yaml=workflow_yaml,
@@ -2068,6 +2072,10 @@ async def _update_workflow(
     download_scout_error = _download_scout_required_error(ctx, workflow_yaml)
     if download_scout_error:
         return {"ok": False, "error": download_scout_error}
+
+    download_binding_error = _download_binding_required_error(ctx, workflow_yaml)
+    if download_binding_error:
+        return {"ok": False, "error": download_binding_error}
 
     composition_evidence_error = composition_page_evidence_error(ctx, workflow_yaml)
     if composition_evidence_error:

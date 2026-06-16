@@ -492,17 +492,14 @@ def synthesize_code_block(
     ):
         # The download affordance is observed in nav_targets, not necessarily a trajectory click, so the
         # download is an appended terminal step compiled from the typed target — never an in-place click upgrade.
+        # Awaiting the download value lands the file in the run-scoped downloads dir; the execution-layer
+        # dir-diff registers the single file, so the synthesizer never save_as (which would double-register).
         download_var = _unique_key(_DOWNLOAD_VAR_BASE, used_download_vars)
         download_obj = _unique_key(f"{download_var}_file", used_download_vars)
         lines.append(f"{_INDENT}async with page.expect_download() as {download_var}:")
         lines.append(f"{_INDENT * 2}await page.locator({_py_str(reached_download_target.selector)}).click()")
         lines.append(f"{_INDENT}{download_obj} = await {download_var}.value")
-        # The captured file's parent is the persistent context's downloads_path (the run-scoped download
-        # dir), so save_as there materializes a named, scannable file the execution-layer dir-diff registers.
-        lines.append(
-            f"{_INDENT}await {download_obj}.save_as("
-            f"str((await {download_obj}.path()).parent / {download_obj}.suggested_filename))"
-        )
+        lines.append(f"{_INDENT}await {download_obj}.path()")
 
     if not lines:
         return None
