@@ -6,6 +6,7 @@ the dir must be rebound to downloads/<workflow_run_id>/ so downloads land
 run-scoped and the listener logs the real run identity.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,7 @@ def _recording_browser() -> tuple[MagicMock, MagicMock]:
     cdp_session.send = AsyncMock()
     browser = MagicMock()
     browser.new_browser_cdp_session = AsyncMock(return_value=cdp_session)
+    browser.contexts = []
     return browser, cdp_session
 
 
@@ -38,6 +40,38 @@ async def test_rebind_binds_download_path_to_run_dir() -> None:
     assert method == "Browser.setDownloadBehavior"
     assert params["downloadPath"] == get_download_dir("wr_test")
     assert "None" not in params["downloadPath"]
+
+
+@pytest.mark.asyncio
+async def test_rebind_skips_when_run_id_none() -> None:
+    browser, cdp_session = _recording_browser()
+
+    await rebind_download_dir(browser, run_id=None)
+
+    cdp_session.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rebind_also_rebinds_cdp_download_interceptor() -> None:
+    browser, cdp_session = _recording_browser()
+    interceptor = MagicMock()
+    context = MagicMock()
+    context._skyvern_cdp_download_interceptor = interceptor
+    browser.contexts = [context]
+
+    await rebind_download_dir(browser, run_id="wr_test")
+
+    interceptor.set_download_dir.assert_called_once_with(get_download_dir("wr_test"))
+
+
+@pytest.mark.asyncio
+async def test_rebind_ignores_context_without_interceptor() -> None:
+    browser, cdp_session = _recording_browser()
+    browser.contexts = [SimpleNamespace()]
+
+    await rebind_download_dir(browser, run_id="wr_test")
+
+    cdp_session.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
