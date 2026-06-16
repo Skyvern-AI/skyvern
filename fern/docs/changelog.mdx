@@ -30,24 +30,32 @@ mode: custom
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
-<Update label="Week of June 15, 2026" description="OTP fill in code blocks, uncapped runtimes, smarter agent loop planning, live recording fixes">
+<Update label="Week of June 15, 2026" description="Code-first code block editor, analytics drill-down, copilot repair loop, OTP fill, uncapped runtimes, voice input fixes">
 
 ## New features
 
 - **OTP Fill at Runtime in Code-Block Sandbox** — Code blocks can now fill OTP fields using your stored TOTP credentials at runtime, enabling fully automated two-factor authentication flows without manual input. ([#6571](https://github.com/Skyvern-AI/skyvern/pull/6571))
 - **Uncapped Workflow Runtime** — Workflows can now be configured to run without a maximum time limit, enabling long-running automations that previously timed out. ([#6567](https://github.com/Skyvern-AI/skyvern/pull/6567))
+- **Code-First Code Block Editor** — Code blocks now feature a dedicated code editor with syntax highlighting, Jinja parameter hints, and a run timeline showing each action taken, giving developers full visibility and control over code-driven automations. ([#6604](https://github.com/Skyvern-AI/skyvern/pull/6604))
+- **Period-Aware Analytics Drill-Down** — The agent analytics drill-down panel now respects the selected time period (7/30/90/365 days or custom range) and shows per-agent average duration, credits per run, and period-over-period trends.
 
 ## Improvements
 
 - **Smarter Loop Planning for Repeated Work** — The task planner now prefers loop-based tasks when it detects repeated same-shaped operations, improving throughput on multi-item automation runs. ([#6575](https://github.com/Skyvern-AI/skyvern/pull/6575))
 - **Agent Auto-Acts on Stalled Pages** — When the agent re-evaluates a page that hasn't changed, it now applies steering heuristics and acts immediately instead of stalling. ([#6577](https://github.com/Skyvern-AI/skyvern/pull/6577))
 - **Final Answer Surfaced Directly** — The task agent now returns the final deliverable directly instead of spinning through redundant synthesis steps, reducing latency on completed tasks. ([#6574](https://github.com/Skyvern-AI/skyvern/pull/6574))
+- **Copilot Stops Stuck Repair Loops** — The Workflow Copilot now detects when consecutive repairs make no verified progress, halts after three attempts, and presents an honest escalation with the draft preserved for review. ([#6608](https://github.com/Skyvern-AI/skyvern/pull/6608))
+- **Voice Input Microphone Permission** — The browser microphone permission prompt now appears correctly when using voice dictation in the Prompt Box and Workflow Copilot. ([#6601](https://github.com/Skyvern-AI/skyvern/pull/6601))
+- **`page.evaluate` Recorded in Code Block Timeline** — JavaScript `page.evaluate(...)` calls made inside code blocks are now recorded as actions in the run timeline, filling a gap in execution visibility. ([#6600](https://github.com/Skyvern-AI/skyvern/pull/6600))
 
 ## Bug fixes
 
 - Fixed the Run Inputs panel collapsing unexpectedly when filtering Run History. ([#6573](https://github.com/Skyvern-AI/skyvern/pull/6573))
 - Fixed the agent incorrectly retrying click fallbacks after an action dispatch timed out, causing unintended interactions. ([#6569](https://github.com/Skyvern-AI/skyvern/pull/6569))
 - Fixed session recordings and page interpretation not resuming correctly after navigation, causing missed recording segments. ([#6568](https://github.com/Skyvern-AI/skyvern/pull/6568))
+- Fixed code block runs not generating a recording entry, causing the Recording tab to appear empty. ([#6607](https://github.com/Skyvern-AI/skyvern/pull/6607))
+- Fixed code block action screenshots not appearing on the run Overview page. ([#6605](https://github.com/Skyvern-AI/skyvern/pull/6605))
+- Fixed long usernames or email addresses hiding the sidebar collapse button on desktop.
 
 </Update>
 
