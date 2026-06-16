@@ -165,6 +165,10 @@ server = [
 
 [dependency-groups]
 cloud = [
+    # Cloud-only browser vendor SDK. Imported at module scope in
+    # cloud/webeye/cloud_browser_factory.py for the `browser-use` CloudBrowserType;
+    # no skyvern/ code path references it, so default OSS installs don't need it.
+    "browser-use-sdk>=3.8,<4",
     # Keep workflow-copilot on the newer Agents SDK for cloud/source installs.
     # uv's override-dependencies below relax LiteLLM's exact transitive pins,
     # but those overrides do not ship in public wheel metadata.
