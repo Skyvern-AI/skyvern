@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import AsyncExitStack
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -45,6 +46,46 @@ from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_sig
 
 PreHook = Callable[[dict[str, Any], AgentContext], Awaitable[dict[str, Any] | None]]
 PostHook = Callable[[dict[str, Any], dict[str, Any], AgentContext], Awaitable[dict[str, Any]]]
+
+_POST_HOOK_CONTEXT_ROLLBACK_FIELDS = (
+    "flow_evidence",
+    "composition_page_evidence",
+    "workflow_verification_evidence",
+    "pending_browser_interaction_observation",
+    "scouted_interactions",
+    "scout_trajectory",
+    "pending_scout_source_url",
+    "pending_scout_typed_value",
+    "post_budget_page_inspection_required",
+    "post_budget_page_inspection_url",
+    "post_budget_page_inspection_run_id",
+    "post_run_page_observation_tool",
+    "post_run_page_observation_url",
+    "post_run_page_observation_workflow_run_id",
+    "code_only_target_page_evidence_seen",
+    "last_evaluate_actionable_signature",
+    "last_evaluate_actionable_url",
+    "last_auto_acted_signature",
+    "reached_download_target",
+    "synthesized_block_offered",
+)
+
+
+@dataclass(frozen=True)
+class _PostHookContextSnapshot:
+    values: dict[str, Any]
+
+
+def _snapshot_post_hook_context(ctx: AgentContext) -> _PostHookContextSnapshot:
+    ctx_vars = vars(ctx)
+    return _PostHookContextSnapshot(
+        {field: deepcopy(ctx_vars[field]) for field in _POST_HOOK_CONTEXT_ROLLBACK_FIELDS if field in ctx_vars}
+    )
+
+
+def _restore_post_hook_context(ctx: AgentContext, snapshot: _PostHookContextSnapshot) -> None:
+    for field_name, value in snapshot.values.items():
+        setattr(ctx, field_name, deepcopy(value))
 
 
 @dataclass
@@ -296,7 +337,20 @@ class SkyvernOverlayMCPServer(MCPServer):
         copilot_result = mcp_to_copilot(raw_mcp)
 
         if overlay.post_hook:
-            copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+            base_copilot_result = deepcopy(copilot_result)
+            ctx_snapshot = _snapshot_post_hook_context(copilot_ctx)
+            try:
+                copilot_result = await overlay.post_hook(copilot_result, raw_mcp, copilot_ctx)
+            except Exception as e:
+                # A post-hook enriches evidence only; a crash must not fail the browser action or keep partial credit.
+                _restore_post_hook_context(copilot_ctx, ctx_snapshot)
+                LOG.warning(
+                    "MCP post-hook failed; returning base tool result",
+                    tool=tool_name,
+                    error=str(e),
+                    exc_info=True,
+                )
+                copilot_result = base_copilot_result
 
         record_tool_step_result_for_ctx(copilot_ctx, tool_name, arguments, copilot_result)
         enqueue_screenshot_from_result(copilot_ctx, copilot_result)
