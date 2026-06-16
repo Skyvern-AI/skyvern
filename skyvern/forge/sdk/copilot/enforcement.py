@@ -14,7 +14,12 @@ import structlog
 from agents.run import Runner
 
 from skyvern.forge.sdk.copilot import config as copilot_config_defaults
-from skyvern.forge.sdk.copilot.blocker_signal import CopilotToolBlockerSignal, stash_blocker_signal
+from skyvern.forge.sdk.copilot.blocker_signal import (
+    CopilotToolBlockerSignal,
+    compose_loop_blocker_user_facing_reason,
+    loop_blocker_evidence_from_ctx,
+    stash_blocker_signal,
+)
 from skyvern.forge.sdk.copilot.build_phase import DISCOVERY_PERMITTED_PHASES
 from skyvern.forge.sdk.copilot.code_block_synthesis import render_synthesized_offer_text, synthesize_code_block
 from skyvern.forge.sdk.copilot.config import (
@@ -44,7 +49,11 @@ from skyvern.forge.sdk.copilot.config import (
     CopilotConfig,
     normalize_block_authoring_policy,
 )
-from skyvern.forge.sdk.copilot.diagnosis_repair_contract import RepairNextAction
+from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
+    DiagnosisRepairContract,
+    RepairLoopState,
+    RepairNextAction,
+)
 from skyvern.forge.sdk.copilot.failure_tracking import PER_TOOL_BUDGET_FAILURE_CATEGORY, normalize_failure_reason
 from skyvern.forge.sdk.copilot.narration import TransitionKind
 from skyvern.forge.sdk.copilot.output_policy import normalize_response_scaffolding
@@ -55,7 +64,11 @@ from skyvern.forge.sdk.copilot.output_utils import (
 )
 from skyvern.forge.sdk.copilot.screenshot_utils import ScreenshotEntry
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import raise_if_turn_halt, stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_halt import (
+    raise_if_turn_halt,
+    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 from skyvern.utils.token_counter import count_tokens
 
 if TYPE_CHECKING:
@@ -241,6 +254,45 @@ def _probable_site_block_stop_signal(ctx: Any, config: CopilotConfig | None = No
         preserves_workflow_draft=True,
         renders_final_reply=True,
         internal_reason_code="probable_site_block_stop",
+        blocked_tool="update_and_run_blocks",
+    )
+
+
+def _repair_loop_state(ctx: Any) -> RepairLoopState | None:
+    contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+    state = getattr(contract, "repair_loop_state", None)
+    return state if isinstance(state, RepairLoopState) else None
+
+
+def _needs_repair_ceiling_halt(ctx: Any) -> bool:
+    state = _repair_loop_state(ctx)
+    return state is not None and state.ceiling_reached is True
+
+
+def repair_ceiling_stop_signal(
+    ctx: Any,
+    contract: DiagnosisRepairContract | None,
+    config: CopilotConfig | None = None,
+) -> CopilotToolBlockerSignal:
+    state = contract.repair_loop_state if isinstance(contract, DiagnosisRepairContract) else None
+    count = state.consecutive_identical_repair_count if state is not None else 0
+    evidence = loop_blocker_evidence_from_ctx(ctx)
+    user_facing, _tiers = compose_loop_blocker_user_facing_reason(
+        "repair_ceiling_reached", evidence, blocked_tool="update_and_run_blocks"
+    )
+    agent_steering = (
+        f"This repair has made no verified progress across {count} attempts; "
+        "stop retrying and report the recorded blocker from the preserved draft."
+    )
+    return CopilotToolBlockerSignal(
+        blocker_kind="loop_detected",
+        agent_steering_text=agent_steering,
+        user_facing_reason=user_facing,
+        recovery_hint="report_blocker_to_user",
+        cleared_by_tools=frozenset(),
+        preserves_workflow_draft=evidence.has_draft,
+        renders_final_reply=True,
+        internal_reason_code="repair_ceiling_reached",
         blocked_tool="update_and_run_blocks",
     )
 
@@ -968,6 +1020,19 @@ def _check_enforcement(
         stash_turn_halt_from_blocker_signal(ctx, terminal_signal, source="enforcement_backstop")
     raise_if_turn_halt(ctx)
     _raise_if_unrecoverable_contract_stop(ctx)
+
+    if _needs_repair_ceiling_halt(ctx):
+        contract = getattr(ctx, "latest_diagnosis_repair_contract", None)
+        state = _repair_loop_state(ctx)
+        # Backstop: the detection-time latch normally raises this above; this catches any increment path that bypassed the latch.
+        signal = repair_ceiling_stop_signal(ctx, contract, config)
+        stash_blocker_signal(ctx, signal)
+        stash_repair_ceiling_turn_halt(
+            ctx,
+            signal,
+            consecutive_identical_repair_count=(state.consecutive_identical_repair_count if state is not None else 0),
+        )
+        raise_if_turn_halt(ctx)
 
     # A permanent navigation error (DNS / cert / SSL / invalid URL) cannot be
     # resolved by observing a prior navigate or by testing an updated

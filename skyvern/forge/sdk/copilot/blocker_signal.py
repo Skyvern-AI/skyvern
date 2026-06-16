@@ -359,6 +359,10 @@ _LOOP_BRANCH_COPY: dict[str, tuple[str, str]] = {
         "I couldn't keep going on this turn.",
         "Tell me what to change and I'll try again.",
     ),
+    "repair_ceiling_reached": (
+        "I couldn't get past the same problem after several attempts.",
+        "Tell me what to change and I'll try a different approach.",
+    ),
 }
 _LOOP_ANTI_BOT_BLOCKER_COPY = "The site's verification challenge was still keeping the submit/search control disabled."
 _LOOP_VERDICT_MAX_CHARS = 240

@@ -19,6 +19,7 @@ class TurnHaltKind(StrEnum):
     LOOP_DETECTED = "loop_detected"
     ACTIVE_TERMINAL_CHALLENGE = "active_terminal_challenge"
     PROBABLE_SITE_BLOCK = "probable_site_block"
+    REPAIR_CEILING_REACHED = "repair_ceiling_reached"
 
 
 class TurnHaltVerdict(StrEnum):
@@ -94,6 +95,29 @@ def stash_turn_halt_from_blocker_signal(ctx: Any, signal: object, *, source: str
     halt = turn_halt_from_blocker_signal(signal, source=source)
     if halt is None:
         return None
+    ctx.turn_halt = halt
+    LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
+    return halt
+
+
+def stash_repair_ceiling_turn_halt(
+    ctx: Any,
+    signal: CopilotToolBlockerSignal,
+    *,
+    consecutive_identical_repair_count: int,
+) -> TurnHalt | None:
+    existing = getattr(ctx, "turn_halt", None)
+    if isinstance(existing, TurnHalt):
+        return existing
+    halt = TurnHalt(
+        kind=TurnHaltKind.REPAIR_CEILING_REACHED,
+        blocker_signal=signal,
+        draft_state={"preserves_workflow_draft": signal.preserves_workflow_draft},
+        extra={
+            "source": "enforcement",
+            "consecutive_identical_repair_count": consecutive_identical_repair_count,
+        },
+    )
     ctx.turn_halt = halt
     LOG.info("copilot turn halt stashed", **turn_halt_to_trace_data(halt))
     return halt

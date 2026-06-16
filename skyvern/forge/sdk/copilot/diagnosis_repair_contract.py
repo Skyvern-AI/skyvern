@@ -85,11 +85,18 @@ class VerificationResult(StrictModel):
     remaining_blocker: str | None = None
 
 
+class RepairLoopState(StrictModel):
+    streak_token: str | None = None
+    consecutive_identical_repair_count: int = 0
+    ceiling_reached: bool = False
+
+
 class DiagnosisRepairContract(StrictModel):
     diagnosis_input: DiagnosisInput
     diagnosis_result: DiagnosisResult
     repair_decision: RepairDecision
     verification_result: VerificationResult
+    repair_loop_state: RepairLoopState = Field(default_factory=RepairLoopState)
 
     def to_trace_data(self) -> dict[str, Any]:
         return {
@@ -105,6 +112,9 @@ class DiagnosisRepairContract(StrictModel):
             "missing_context": list(self.diagnosis_result.missing_context),
             "user_goal_satisfied": self.verification_result.user_goal_satisfied,
             "completion_contract_satisfied": self.verification_result.completion_contract_satisfied,
+            "consecutive_identical_repair_count": self.repair_loop_state.consecutive_identical_repair_count,
+            "ceiling_reached": self.repair_loop_state.ceiling_reached,
+            "streak_token": self.repair_loop_state.streak_token,
         }
 
 

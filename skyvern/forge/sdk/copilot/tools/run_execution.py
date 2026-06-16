@@ -15,6 +15,7 @@ import structlog
 import yaml
 from pydantic import ValidationError
 
+from skyvern.config import settings
 from skyvern.forge import app
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.copilot.blocker_signal import (
@@ -28,12 +29,17 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.context import CopilotContext
 from skyvern.forge.sdk.copilot.diagnosis_repair_contract import (
     DiagnosisRepairContract,
+    RepairLoopState,
+    RepairNextAction,
     build_diagnosis_repair_contract,
 )
+from skyvern.forge.sdk.copilot.enforcement import repair_ceiling_stop_signal
 from skyvern.forge.sdk.copilot.failure_tracking import (
     ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
     PER_TOOL_BUDGET_FAILURE_CATEGORY,
     compute_action_sequence_fingerprint,
+    made_newly_verified_progress,
+    satisfied_criterion_ids,
     update_repeated_failure_state,
 )
 from skyvern.forge.sdk.copilot.loop_detection import record_consecutive_tool_result_boundary_for_ctx
@@ -62,7 +68,10 @@ from skyvern.forge.sdk.copilot.runtime import (
     ensure_browser_session,
 )
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
-from skyvern.forge.sdk.copilot.turn_halt import stash_turn_halt_from_blocker_signal
+from skyvern.forge.sdk.copilot.turn_halt import (
+    stash_repair_ceiling_turn_halt,
+    stash_turn_halt_from_blocker_signal,
+)
 from skyvern.forge.sdk.routes.workflow_copilot import _process_workflow_yaml
 from skyvern.forge.sdk.schemas.workflow_copilot import WorkflowCopilotRunOutcomeUpdate, WorkflowCopilotStreamMessageType
 from skyvern.forge.sdk.settings_manager import SettingsManager
@@ -1772,6 +1781,73 @@ async def _verify_and_record_run_blocks_result(
     return completion_verification
 
 
+def _repair_non_convergence_signature(contract: DiagnosisRepairContract) -> str | None:
+    """A constant streak token for any REPAIR verdict, ``None`` otherwise. The trigger
+    is non-convergence (REPAIR with no verified progress), so the only thing the signature
+    must do is tell a contiguous repair streak from a reset on a non-REPAIR verdict."""
+    if contract.repair_decision.next_action is not RepairNextAction.REPAIR:
+        return None
+    # Constant by design: the streak only distinguishes a REPAIR run from a reset, so the failure specifics are ignored.
+    return "repair_no_verified_progress"
+
+
+def _update_repair_loop_state(copilot_ctx: Any, contract: DiagnosisRepairContract) -> None:
+    """Count consecutive REPAIR verdicts that made no newly-verified forward progress.
+
+    Progress is growth in the turn-scoped set of judge-confirmed completion criteria, or a
+    clean end-to-end run, or a grown verified block prefix — never the failure prose, the
+    failure_type, or which block label failed. The high-water marks must be read BEFORE the
+    current run's confirmations are folded in, else this run's own wins would already be
+    banked and never read as new.
+    """
+    current = satisfied_criterion_ids(getattr(copilot_ctx, "completion_verification_result", None))
+    high_water_raw: Any = getattr(copilot_ctx, "verified_criteria_high_water", frozenset())
+    high_water = high_water_raw if isinstance(high_water_raw, frozenset) else frozenset(high_water_raw or [])
+    prefix_len = len(getattr(copilot_ctx, "verified_prefix_labels", []) or [])
+    prefix_high_raw = getattr(copilot_ctx, "verified_prefix_high_water_len", 0)
+    prefix_high = prefix_high_raw if isinstance(prefix_high_raw, int) else 0
+    # A run-tied REPAIR verdict always sees this False (the failing run cleared it in
+    # _record_run_blocks_result); a True here is a stale carry-over from a prior clean
+    # pass on a non-run path, so latch it consumed and count it as progress only once.
+    full_pass = getattr(copilot_ctx, "last_full_workflow_test_ok", False) is True
+    consumed = getattr(copilot_ctx, "verified_full_pass_consumed", False) is True
+    progressed = made_newly_verified_progress(
+        current_satisfied=current,
+        high_water=high_water,
+        full_workflow_verified_this_run=full_pass and not consumed,
+        verified_prefix_grew=prefix_len > prefix_high,
+    )
+    copilot_ctx.verified_criteria_high_water = high_water | current
+    copilot_ctx.verified_prefix_high_water_len = max(prefix_high, prefix_len)
+    copilot_ctx.verified_full_pass_consumed = full_pass
+
+    signature = _repair_non_convergence_signature(contract)
+    if signature is None or progressed:
+        copilot_ctx.consecutive_non_converging_repair_count = 0
+        copilot_ctx.last_repair_non_convergence_signature = None
+        contract.repair_loop_state = RepairLoopState(
+            streak_token=None,
+            consecutive_identical_repair_count=0,
+            ceiling_reached=False,
+        )
+        return
+    prior_signature = getattr(copilot_ctx, "last_repair_non_convergence_signature", None)
+    prior_count = getattr(copilot_ctx, "consecutive_non_converging_repair_count", 0)
+    prior_count = prior_count if isinstance(prior_count, int) else 0
+    count = prior_count + 1 if signature == prior_signature else 1
+    copilot_ctx.consecutive_non_converging_repair_count = count
+    copilot_ctx.last_repair_non_convergence_signature = signature
+    contract.repair_loop_state = RepairLoopState(
+        streak_token=signature,
+        consecutive_identical_repair_count=count,
+        ceiling_reached=count >= settings.COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL,
+    )
+    if contract.repair_loop_state.ceiling_reached:
+        signal = repair_ceiling_stop_signal(copilot_ctx, contract)
+        stash_blocker_signal(copilot_ctx, signal)
+        stash_repair_ceiling_turn_halt(copilot_ctx, signal, consecutive_identical_repair_count=count)
+
+
 def _record_diagnosis_repair_contract(
     copilot_ctx: Any,
     *,
@@ -1785,6 +1861,7 @@ def _record_diagnosis_repair_contract(
         ctx=copilot_ctx,
         workflow_updated=workflow_updated,
     )
+    _update_repair_loop_state(copilot_ctx, contract)
     copilot_ctx.latest_diagnosis_repair_contract = contract
     trace_data = contract.to_trace_data()
     LOG.info(

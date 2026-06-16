@@ -25,6 +25,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult
     from skyvern.forge.sdk.copilot.context import CopilotContext
     from skyvern.forge.sdk.workflow.models.workflow import WorkflowDefinition
 
@@ -60,6 +61,26 @@ def _top_failure_category(failure_categories: list[dict] | None) -> str:
     return ""
 
 
+def _failure_identity_terms(
+    failure_reason: str | None,
+    failure_categories: list[dict] | None,
+    suspicious_success: bool,
+) -> list[str] | None:
+    """Category-stable failure half shared by both signatures, or ``None`` on a
+    real success. Per-call-data categories collapse to a constant so consecutive
+    trips hash identically."""
+    normalized = normalize_failure_reason(failure_reason)
+    has_signal = bool(normalized) or suspicious_success
+    if not has_signal:
+        return None
+    top_category = _top_failure_category(failure_categories)
+    if top_category == "PARAMETER_BINDING_ERROR":
+        normalized = "parameter_binding_error"
+    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
+        normalized = "per_tool_budget"
+    return [normalized, top_category, "suspicious" if suspicious_success else "failed"]
+
+
 def compute_failure_signature(
     frontier_start_label: str | None,
     failure_reason: str | None,
@@ -72,26 +93,30 @@ def compute_failure_signature(
     run (status=completed but data-producing blocks produced no output) still
     generates a signature so repeated no-data runs can be counted as repeats.
     """
-    normalized = normalize_failure_reason(failure_reason)
-    has_signal = bool(normalized) or suspicious_success
-    if not has_signal:
+    terms = _failure_identity_terms(failure_reason, failure_categories, suspicious_success)
+    if terms is None:
         return None
     safe_label = frontier_start_label if isinstance(frontier_start_label, str) else ""
-    top_category = _top_failure_category(failure_categories)
-    # Categories whose failure_reason embeds per-call data (key name, run id):
-    # collapse to a stable constant so consecutive trips hash to the same
-    # signature instead of each one looking unique.
-    if top_category == "PARAMETER_BINDING_ERROR":
-        normalized = "parameter_binding_error"
-    elif top_category == PER_TOOL_BUDGET_FAILURE_CATEGORY:
-        normalized = "per_tool_budget"
-    parts = [
-        safe_label,
-        normalized,
-        top_category,
-        "suspicious" if suspicious_success else "failed",
-    ]
-    return "|".join(parts)
+    return "|".join([safe_label, *terms])
+
+
+def satisfied_criterion_ids(result: CompletionVerificationResult | None) -> frozenset[str]:
+    """Criterion ids the outcome-verification judge confirmed satisfied (evidence_confirms),
+    or empty when no judge result is available for this run."""
+    if result is None or result.status != "evaluated":
+        return frozenset()
+    return frozenset(verdict.criterion_id for verdict in result.verdicts if verdict.reason_code == "evidence_confirms")
+
+
+def made_newly_verified_progress(
+    current_satisfied: frozenset[str],
+    high_water: frozenset[str],
+    full_workflow_verified_this_run: bool,
+    verified_prefix_grew: bool,
+) -> bool:
+    """Whether this run advanced verified progress past the turn high-water: a newly
+    confirmed criterion, a clean end-to-end run, or a grown verified block prefix."""
+    return bool(current_satisfied - high_water) or full_workflow_verified_this_run or verified_prefix_grew
 
 
 def _canonical_block_config(block: Any) -> dict[str, Any]:
