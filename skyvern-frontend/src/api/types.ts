@@ -696,6 +696,11 @@ export type ActionsApiResponse = {
   created_by: string | null;
   text: string | null;
   screenshot_artifact_id?: string | null;
+  // Code block recorded actions carry code_line and duration_ms here.
+  output?:
+    | { code_line?: number | null; duration_ms?: number | null }
+    | Record<string, unknown>
+    | null;
 };
 
 export type TaskV2 = {

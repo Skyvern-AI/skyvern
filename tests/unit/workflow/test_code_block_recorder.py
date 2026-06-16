@@ -92,6 +92,9 @@ class FakePage:
     async def screenshot(self, **kwargs):  # noqa: ANN003, ANN201
         return b"img"
 
+    async def evaluate(self, expression, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN201
+        return None
+
 
 @pytest.mark.asyncio
 async def test_records_goto_click_fill_with_types_and_order() -> None:
@@ -108,6 +111,16 @@ async def test_records_goto_click_fill_with_types_and_order() -> None:
     assert [a.action_order for a in recorded] == [0, 1, 2]
     assert all(a.status == ActionStatus.completed for a in recorded)
     assert recorded[0].description == "page.goto https://example.com"
+
+
+@pytest.mark.asyncio
+async def test_page_evaluate_records_execute_js_action() -> None:
+    page = RecordingPage(FakePage())
+    await page.evaluate("() => document.title")
+    recorded = page.recorded_actions()
+    assert [a.action_type for a in recorded] == [ActionType.EXECUTE_JS]
+    assert recorded[0].description == "page.evaluate () => document.title"
+    assert recorded[0].status == ActionStatus.completed
 
 
 @pytest.mark.asyncio

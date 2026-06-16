@@ -42,6 +42,7 @@ export interface WorkflowCopilotChatRequest {
   mode?: "ask" | "build" | null;
   code_block?: boolean | null;
   cancel_token?: string;
+  target_block_label?: string | null;
 }
 
 export interface WorkflowCopilotCancelRequest {

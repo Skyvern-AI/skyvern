@@ -176,6 +176,11 @@ function WorkflowPostRunParameters() {
             <CodeBlockParameters
               code={definitionBlock.code}
               parameters={definitionBlock.parameters}
+              prompt={definitionBlock.prompt}
+              steps={definitionBlock.steps}
+              blockStatus={activeBlock.status}
+              failureReason={activeBlock.failure_reason}
+              actions={activeBlock.actions}
             />
           </div>
         </div>

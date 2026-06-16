@@ -896,6 +896,8 @@ function convertToNode(
           ...commonData,
           code: block.code,
           parameterKeys: block.parameters.map((p) => p.key),
+          prompt: block.prompt ?? null,
+          steps: block.steps ?? null,
         },
       };
     }
@@ -2951,6 +2953,8 @@ function getWorkflowBlock(
         block_type: "code",
         parameter_keys: node.data.parameterKeys,
         code: node.data.code,
+        prompt: node.data.prompt,
+        steps: node.data.steps,
       };
     }
     case "download": {
@@ -4281,6 +4285,8 @@ function convertBlocksToBlockYAML(
           block_type: "code",
           code: block.code,
           parameter_keys: block.parameters.map((p) => p.key),
+          prompt: block.prompt,
+          steps: block.steps,
         };
         return blockYaml;
       }
