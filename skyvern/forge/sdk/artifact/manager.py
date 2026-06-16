@@ -1065,18 +1065,22 @@ class ArtifactManager:
         organization_id: str | None,
         data: bytes,
         primary_key: str = "task_id",
-    ) -> None:
+    ) -> str | None:
         if not artifact_id or not organization_id:
             return None
         artifact = await app.DATABASE.artifacts.get_artifact_by_id(artifact_id, organization_id)
         if not artifact:
-            return
+            return None
         # Fire and forget
         aio_task = asyncio.create_task(app.STORAGE.store_artifact(artifact, data))
 
-        if not artifact[primary_key]:
+        # A code-block recording artifact is workflow-run-block-scoped rather than task-scoped, so
+        # key the upload tracking on the first available scope id instead of failing on a null task_id.
+        aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
+        if not aio_task_key:
             raise ValueError(f"{primary_key} is required to update artifact data.")
-        self.upload_aiotasks_map[artifact[primary_key]].append(aio_task)
+        self.upload_aiotasks_map[aio_task_key].append(aio_task)
+        return aio_task_key
 
     async def retrieve_artifact(self, artifact: Artifact) -> bytes | None:
         return await app.STORAGE.retrieve_artifact(artifact)

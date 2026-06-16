@@ -3669,6 +3669,46 @@ async def wrapper({default_args}):
             return await user_function()
         return await asyncio.wait_for(user_function(), timeout=timeout_seconds)
 
+    async def _ensure_run_recording_artifact(
+        self,
+        browser_state: BrowserState,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> None:
+        """Register the run-scoped RECORDING row that a code block otherwise lacks.
+
+        The agent path creates it in ``initialize_execution_state``; a code block runs no agent
+        step, so ``_fetch_recording_urls`` finds nothing and the Recording tab is empty. The
+        workflow cleanup's ``persist_video_data`` backfills the finalized video. Best-effort and
+        idempotent across blocks sharing one browser.
+        """
+        browser_artifacts = browser_state.browser_artifacts
+        if not browser_artifacts or all(va.video_artifact_id for va in browser_artifacts.video_artifacts):
+            return
+        try:
+            video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
+                workflow_run_id=workflow_run_id, browser_state=browser_state, finalize=False
+            )
+            pending_indexes = [idx for idx, va in enumerate(video_artifacts) if not va.video_artifact_id]
+            if not pending_indexes:
+                return
+            workflow_run_block = await app.DATABASE.observer.get_workflow_run_block(
+                workflow_run_block_id=workflow_run_block_id, organization_id=organization_id
+            )
+            for idx in pending_indexes:
+                video_artifacts[idx].video_artifact_id = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact(
+                    workflow_run_block=workflow_run_block,
+                    artifact_type=ArtifactType.RECORDING,
+                    data=video_artifacts[idx].video_data,
+                )
+        except Exception:
+            LOG.warning(
+                "Failed to register run-scoped recording artifact for code block",
+                workflow_run_block_id=workflow_run_block_id,
+                exc_info=True,
+            )
+
     def get_all_parameters(
         self,
         workflow_run_id: str,
@@ -3815,6 +3855,13 @@ async def wrapper({default_args}):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+        await self._ensure_run_recording_artifact(
+            browser_state=browser_state,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
         try:
             self.format_potential_template_parameters(workflow_run_context)
