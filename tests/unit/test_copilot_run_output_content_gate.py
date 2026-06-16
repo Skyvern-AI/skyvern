@@ -388,6 +388,40 @@ def test_top_level_array_goal_value_paths_keep_clean_path() -> None:
     assert _is_outcome_evidence_candidate(ctx, result) is True
 
 
+def test_downloaded_files_satisfy_registered_download_goal_paths() -> None:
+    result = _run_result(
+        [
+            _code_block(
+                "download_statement",
+                {
+                    "downloaded_file_name": "statement.pdf",
+                    "downloaded_files": [{"filename": "statement.pdf"}],
+                },
+            )
+        ]
+    )
+    ctx = _ctx(result["data"]["blocks"])
+    entry = _terminal_metadata_entry("download_statement")
+    entry["claimed_outcomes"][0]["goal_value_paths"] = ["invoice_pdf"]
+    entry["terminal_verifier_expectations"] = [
+        {
+            "id": "expectation:download_statement_terminal",
+            "criteria_ids": ["criterion:goal_0"],
+            "goal_value_paths": ["invoice_pdf"],
+        }
+    ]
+    ctx.code_artifact_metadata = {"download_statement": entry}
+
+    _, empty_data_blocks, _ = _analyze_run_blocks(result, ctx)
+    assert empty_data_blocks is False
+    assert _is_outcome_evidence_candidate(ctx, result) is True
+
+    _record_run_blocks_result(ctx, result, completion_verification=None)
+    assert ctx.last_test_ok is True
+    assert ctx.last_test_suspicious_success is False
+    assert ctx.last_full_workflow_test_ok is True
+
+
 def test_array_goal_value_path_does_not_match_scalar_root() -> None:
     result = _run_result([_code_block("expand_result_rows", {"number": "12345"})])
     ctx = _ctx(result["data"]["blocks"])

@@ -12,9 +12,11 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from skyvern.config import settings
 from skyvern.forge.sdk.copilot.blocker_signal import assert_clean_user_facing_text
 from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy
 from skyvern.forge.sdk.copilot.context import CopilotContext
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget
 from skyvern.forge.sdk.copilot.tools import (
     _code_block_safety_errors,
     _detect_stale_block_metadata,
@@ -674,6 +676,50 @@ class TestCompiledAuthoringImposition:
         assert result["ok"] is True
         block = _single_code_block(parse_workflow_yaml(ctx.workflow_yaml))
         assert "async with page.expect_download()" in block["code"]
+
+    @pytest.mark.asyncio
+    async def test_imposition_carries_reached_download_target_to_synthesized_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
+        ctx = _code_only_ctx()
+        _enable_imposition(ctx)
+        ctx.scout_trajectory = [
+            {
+                "tool_name": "click",
+                "selector": "div.stmt-row",
+                "source_url": "https://example.com/bills",
+                "trajectory_index": 0,
+            }
+        ]
+        ctx.reached_download_target = ReachedDownloadTarget(
+            selector='[href="/files/report.pdf"]',
+            affordance_text="Download PDF",
+            download_kind="extension",
+            source_step="trajectory_recency",
+            already_registered=False,
+        )
+        workflow_yaml = _yaml(
+            """
+            title: Download report
+            workflow_definition:
+              blocks:
+              - block_type: code
+                label: download_report
+                code: |
+                  await page.goto("https://example.com/bills")
+                  await page.locator("div.stmt-row").click()
+            """
+        )
+
+        result = workflow_update_module._maybe_impose_synthesized_code_block(workflow_yaml, ctx)
+
+        assert result.violations == []
+        parsed = parse_workflow_yaml(result.workflow_yaml)
+        assert isinstance(parsed, dict)
+        block = _single_code_block(parsed)
+        assert "expect_download" in block["code"]
+        assert 'await page.locator("[href=\\"/files/report.pdf\\"]").click()' in block["code"]
 
     @pytest.mark.asyncio
     async def test_unchanged_prior_code_does_not_impose(self, monkeypatch: pytest.MonkeyPatch) -> None:

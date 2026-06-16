@@ -1034,7 +1034,10 @@ def _apply_scouted_typed_default_promotions(workflow_yaml: str, ctx: AgentContex
     scout_trajectory = ctx.scout_trajectory
     if not isinstance(scout_trajectory, list) or not scout_trajectory:
         return workflow_yaml, []
-    synthesized = synthesize_code_block(scout_trajectory)
+    synthesized = synthesize_code_block(
+        scout_trajectory,
+        reached_download_target=getattr(ctx, "reached_download_target", None),
+    )
     if synthesized is None:
         return workflow_yaml, []
 
