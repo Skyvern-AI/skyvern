@@ -122,7 +122,7 @@ def validate_download_url(url: str, organization_id: str | None = None) -> bool:
         if scheme in ("http", "https"):
             return True
 
-        if scheme in ("s3", "azure"):
+        if scheme in ("s3", "gs", "azure"):
             try:
                 if organization_id is None:
                     return False
@@ -175,7 +175,7 @@ async def download_file(
 
         # Check if URL is a cloud storage URI handled by the configured storage backend.
         parsed = urlparse(url)
-        if parsed.scheme in ("s3", "azure"):
+        if parsed.scheme in ("s3", "gs", "azure"):
             if organization_id is None:
                 raise PermissionError(f"No permission to access storage URI: {url}")
 
@@ -272,11 +272,11 @@ def unzip_files(zip_file_path: str, output_dir: str) -> None:
         zip_ref.extractall(output_dir)
 
 
-_REMOTE_URL_PREFIXES = ("http://", "https://", "s3://", "azure://", "www.")
+_REMOTE_URL_PREFIXES = ("http://", "https://", "s3://", "gs://", "azure://", "www.")
 
 
 def is_remote_url(path: str) -> bool:
-    """Return True if the path is a remote URL (HTTP, S3, Azure) rather than a local filesystem path."""
+    """Return True if the path is a remote URL (HTTP, S3, GCS, Azure) rather than a local filesystem path."""
     return path.startswith(_REMOTE_URL_PREFIXES)
 
 
@@ -351,9 +351,9 @@ async def wait_for_download_finished(downloading_files: list[str], timeout: floa
             while len(cur_downloading_files) > 0:
                 new_downloading_files: list[str] = []
                 for path in cur_downloading_files:
-                    # Check for cloud storage URIs (S3 or Azure)
+                    # Check for cloud storage URIs (S3, GCS, or Azure)
                     parsed = urlparse(path)
-                    if parsed.scheme in ("s3", "azure"):
+                    if parsed.scheme in ("s3", "gs", "azure"):
                         if not await app.STORAGE.file_exists(path):
                             LOG.debug(
                                 "downloading file is not found in cloud storage, means the file finished downloading",
