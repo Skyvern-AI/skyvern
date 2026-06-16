@@ -1174,11 +1174,9 @@ class TestDownloadRungSynthesis:
         assert f"async with page.expect_download() as {_DOWNLOAD_VAR_BASE}:" in result.code
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
         assert f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value" in result.code
-        assert (
-            f"await {download_obj}.save_as("
-            f"str((await {download_obj}.path()).parent / {download_obj}.suggested_filename))"
-        ) in result.code
-        assert ".value.save_as(" not in result.code
+        assert f"await {download_obj}.path()" in result.code
+        # The execution-layer dir-diff registers the single landed file, so the synthesizer never save_as.
+        assert "save_as" not in result.code
         # The click inside expect_download targets the TYPED download selector, not the navigation click.
         download_step = result.code.split("async with page.expect_download")[1]
         assert 'await page.locator("[href=\\"/files/report.pdf\\"]").click()' in download_step
@@ -1264,17 +1262,16 @@ class TestDownloadRungSynthesis:
         assert not any(d.code == "SYNTAX_ERROR" for d in preflight_code_block(result.code, parameter_keys=()))
         ast.parse(wrapped)
 
-    def test_download_snippet_save_as_lands_file_in_run_dir(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_download_snippet_awaits_completion_without_save_as(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
         assert result.code.count(f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value") == 1
-        assert (
-            f"await {download_obj}.save_as("
-            f"str((await {download_obj}.path()).parent / {download_obj}.suggested_filename))"
-        ) in result.code
-        assert ".value.path()" not in result.code
+        # Awaiting the path() completes the download into the run-scoped dir; the SKY-10937 dir-diff
+        # registers the single file, so a synthesizer save_as would double-register.
+        assert f"await {download_obj}.path()" in result.code
+        assert "save_as" not in result.code
         CodeBlock.is_safe_code("async def _block(page):\n" + result.code)
 
     def test_download_offer_text_only_present_for_download_snippet(self, monkeypatch: pytest.MonkeyPatch) -> None:

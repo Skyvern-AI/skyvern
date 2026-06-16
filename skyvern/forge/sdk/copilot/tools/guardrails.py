@@ -21,7 +21,7 @@ from skyvern.forge.sdk.copilot.output_policy import (
     format_output_policy_tool_error,
     output_policy_verdict_to_trace_data,
 )
-from skyvern.forge.sdk.copilot.reached_download_target import code_is_download_intent
+from skyvern.forge.sdk.copilot.reached_download_target import ReachedDownloadTarget, code_is_download_intent
 from skyvern.forge.sdk.copilot.request_policy import CREDENTIAL_DEFERRED_DRAFT_REASONS, RequestPolicy
 from skyvern.forge.sdk.copilot.runtime import AgentContext
 from skyvern.forge.sdk.copilot.turn_intent import (
@@ -208,6 +208,69 @@ def _download_scout_required_error(copilot_ctx: Any, workflow_yaml: str | None) 
         surface="tool_pre_side_effect",
     )
     return _DOWNLOAD_SCOUT_REQUIRED_STEERING
+
+
+def _submitted_code_blocks(workflow_yaml: str | None) -> list[str]:
+    codes: list[str] = []
+    for block in _workflow_yaml_blocks_by_label(workflow_yaml).values():
+        if block.get("block_type") != "code":
+            continue
+        code = block.get("code")
+        if isinstance(code, str):
+            codes.append(code)
+    return codes
+
+
+_DOWNLOAD_BINDING_REQUIRED_STEERING = (
+    "A correct scout-act reached a download affordance on the current page, but the authored block "
+    "does not fire the browser download. Author ONE terminal download code block that clicks the "
+    "captured target with the expect_download idiom; the captured selector is `{selector}`"
+    "{affordance_hint}. The terminal download step is compiled for you when you scout-act the "
+    "affordance, so re-author the block against the reached target rather than a static fetch."
+)
+_DOWNLOAD_BINDING_UNREACHABLE_HALT = (
+    "The reached download affordance could not be bound to a terminal download step after repeated "
+    "attempts. Tell the user you reached the download control but could not author the download step, "
+    "and ask them to confirm where the file downloads from; do not author a download-less block."
+)
+
+
+def _download_binding_required_error(ctx: AgentContext | None, workflow_yaml: str | None) -> str | None:
+    """Reject a code block authored after the scout reached a download affordance when that block does
+    not fire the browser download. Keyed on the typed `ctx.reached_download_target` the model cannot
+    edit, not on the submitted code form. Active in code-only browser mode."""
+    if _copilot_block_authoring_policy(ctx) != BlockAuthoringPolicy.CODE_ONLY_BROWSER:
+        return None
+    if ctx is None or workflow_yaml is None:
+        return None
+    target = getattr(ctx, "reached_download_target", None)
+    if not isinstance(target, ReachedDownloadTarget) or target.already_registered:
+        return None
+    if any(code_is_download_intent(code) for code in _submitted_code_blocks(workflow_yaml)):
+        return None
+    # Shared per-turn download-steering budget: this gate and _download_scout_required_error draw down the
+    # same ctx.download_scout_required_rejections counter (combined cap, not 3 per gate).
+    prior_rejections = int(getattr(ctx, "download_scout_required_rejections", 0) or 0)
+    if prior_rejections >= _DOWNLOAD_SCOUT_REQUIRED_MAX_REJECTIONS:
+        LOG.info(
+            "copilot download binding gate exhausted retries; halting honestly",
+            workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+            reached_download_selector=target.selector,
+            download_scout_required_rejections=prior_rejections,
+            surface="tool_pre_side_effect",
+        )
+        return _DOWNLOAD_BINDING_UNREACHABLE_HALT
+    if hasattr(ctx, "download_scout_required_rejections"):
+        ctx.download_scout_required_rejections = prior_rejections + 1
+    LOG.info(
+        "copilot download binding pre-side-effect rejected workflow",
+        workflow_permanent_id=getattr(ctx, "workflow_permanent_id", None),
+        reached_download_selector=target.selector,
+        download_scout_required_rejections=prior_rejections + 1,
+        surface="tool_pre_side_effect",
+    )
+    affordance_hint = f" (affordance text: {target.affordance_text})" if target.affordance_text else ""
+    return _DOWNLOAD_BINDING_REQUIRED_STEERING.format(selector=target.selector, affordance_hint=affordance_hint)
 
 
 def _request_policy_tool_error(ctx: AgentContext, tool_name: str) -> CopilotToolBlockerSignal | None:
