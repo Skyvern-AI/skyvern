@@ -323,6 +323,29 @@ class LocalStorage(BaseStorage):
             return None
         return str(stored_folder_path)
 
+    async def delete_browser_profile(self, organization_id: str, profile_id: str) -> None:
+        """Delete a browser profile from local storage. Best-effort: a missing profile is a no-op."""
+        stored_folder_path = self._resolve_browser_storage_path(organization_id, "profiles", profile_id)
+        if stored_folder_path is None:
+            LOG.warning(
+                "Refused to delete browser profile outside storage base path",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                base_path=settings.BROWSER_SESSION_BASE_PATH,
+            )
+            return
+        if not stored_folder_path.exists():
+            return
+        try:
+            shutil.rmtree(stored_folder_path)
+        except Exception:
+            LOG.exception(
+                "Failed to delete local browser profile",
+                organization_id=organization_id,
+                profile_id=profile_id,
+                path=str(stored_folder_path),
+            )
+
     async def save_downloaded_files(self, organization_id: str, run_id: str | None) -> None:
         pass
 
