@@ -13,6 +13,7 @@ keywords:
 <div className="cl-page">
   <div className="cl-sidebar">
     <p className="cl-sidebar-title">TIMELINE</p>
+    <a href="#week-jun-15-2026" className="cl-sidebar-link">Week of Jun 15, 2026</a>
     <a href="#week-jun-8-2026" className="cl-sidebar-link">Week of Jun 8, 2026</a>
     <a href="#week-jun-1-2026" className="cl-sidebar-link">Week of Jun 1, 2026</a>
     <a href="#week-may-25-2026" className="cl-sidebar-link">Week of May 25, 2026</a>
@@ -43,6 +44,28 @@ keywords:
     <h1 className="cl-title">Changelog</h1>
     <p className="cl-subtitle">New features, improvements, and fixes in Skyvern</p>
 
+<a id="week-jun-15-2026"></a>
+<Update label="Week of June 15, 2026" description="OTP fill in code blocks, uncapped runtimes, smarter agent loop planning, live recording fixes">
+
+## New features
+
+- **OTP Fill at Runtime in Code-Block Sandbox** — Code blocks can now fill OTP fields using your stored TOTP credentials at runtime, enabling fully automated two-factor authentication flows without manual input. ([#6571](https://github.com/Skyvern-AI/skyvern/pull/6571))
+- **Uncapped Workflow Runtime** — Workflows can now be configured to run without a maximum time limit, enabling long-running automations that previously timed out. ([#6567](https://github.com/Skyvern-AI/skyvern/pull/6567))
+
+## Improvements
+
+- **Smarter Loop Planning for Repeated Work** — The task planner now prefers loop-based tasks when it detects repeated same-shaped operations, improving throughput on multi-item automation runs. ([#6575](https://github.com/Skyvern-AI/skyvern/pull/6575))
+- **Agent Auto-Acts on Stalled Pages** — When the agent re-evaluates a page that hasn't changed, it now applies steering heuristics and acts immediately instead of stalling. ([#6577](https://github.com/Skyvern-AI/skyvern/pull/6577))
+- **Final Answer Surfaced Directly** — The task agent now returns the final deliverable directly instead of spinning through redundant synthesis steps, reducing latency on completed tasks. ([#6574](https://github.com/Skyvern-AI/skyvern/pull/6574))
+
+## Bug fixes
+
+- Fixed the Run Inputs panel collapsing unexpectedly when filtering Run History. ([#6573](https://github.com/Skyvern-AI/skyvern/pull/6573))
+- Fixed the agent incorrectly retrying click fallbacks after an action dispatch timed out, causing unintended interactions. ([#6569](https://github.com/Skyvern-AI/skyvern/pull/6569))
+- Fixed session recordings and page interpretation not resuming correctly after navigation, causing missed recording segments. ([#6568](https://github.com/Skyvern-AI/skyvern/pull/6568))
+
+</Update>
+
 <a id="week-jun-8-2026"></a>
 <Update label="Week of June 8, 2026" description="Multi-tab agent control, Gemini 3.5 Flash, GCP Vault, bulk agent actions, credential clears, code-block credentials">
 
@@ -59,6 +82,9 @@ keywords:
 - **Self-Service Credential Clears** — Saved credentials can now be individually cleared from the credentials settings page without deleting and recreating them. ([#6480](https://github.com/Skyvern-AI/skyvern/pull/6480))
 - **Per-Run Session Recordings as Artifacts** — Recordings are now clipped to each run's time window and stored as downloadable run-scoped artifacts. ([#6479](https://github.com/Skyvern-AI/skyvern/pull/6479))
 - **Credential-Aware Scouting in Code-Block Mode** — The Copilot now uses saved credentials while scouting pages for code-block generation and produces credential-typed code that fills login fields using your stored credentials. ([#6521](https://github.com/Skyvern-AI/skyvern/pull/6521))
+- **Claude Fable 5 Model Support** — Added Claude Fable 5 as a selectable model for agent runs. ([#6539](https://github.com/Skyvern-AI/skyvern/pull/6539))
+- **Live Browser Recording with Instant Placeholders** — Session recordings now commit navigation and wait blocks immediately as placeholders during live recording, with support for capture pause and draft interpretation. ([#6561](https://github.com/Skyvern-AI/skyvern/pull/6561))
+- **Act-and-Observe Copilot Scouting** — The Copilot's page scouting now uses act-and-observe interactions that return bounded page evidence alongside gathered actions, improving code-block generation accuracy. ([#6533](https://github.com/Skyvern-AI/skyvern/pull/6533))
 
 ## Improvements
 
@@ -75,6 +101,9 @@ keywords:
 - **Persistent Browser Session Profile Generation Now Opt-In** — Automatic browser profile generation during persistent sessions is now opt-in, giving you explicit control over when profiles are captured. ([#6489](https://github.com/Skyvern-AI/skyvern/pull/6489))
 - **Icon-Only Status Pills on Mobile Viewports** — Status badges now render in a compact icon-only format on small screen widths, preventing layout overflow on mobile devices. ([#6481](https://github.com/Skyvern-AI/skyvern/pull/6481))
 - **Hardened Webhook Delivery** — Workflow webhook delivery is now more reliable, with improved handling of transient failures and prioritized delivery ordering. ([#6478](https://github.com/Skyvern-AI/skyvern/pull/6478))
+- **Reduced Live Recording Draft Latency** — Live session recordings now appear almost instantly with placeholder entries, with final blocks committed after a short debounce window. ([#6553](https://github.com/Skyvern-AI/skyvern/pull/6553))
+- **Copilot Stops on Terminal Blockers** — The Copilot now correctly halts when it reaches a condition that blocks further progress, preventing runaway sessions. ([#6535](https://github.com/Skyvern-AI/skyvern/pull/6535))
+- **Copilot Chat Shows Run Outcome Verdict** — The Copilot chat timeline now reflects the actual run outcome verdict, giving a more accurate view of what the agent accomplished. ([#6532](https://github.com/Skyvern-AI/skyvern/pull/6532))
 
 ## Bug fixes
 
@@ -92,6 +121,14 @@ keywords:
 - Fixed Copilot failing to recognize and use a saved credential when the credential ID was typed with a space or hyphen separator instead of an underscore; malformed IDs are now normalized and resolved correctly. ([#6529](https://github.com/Skyvern-AI/skyvern/pull/6529))
 - Fixed Copilot chat showing workflow blocks as completed even when the overall run goal was not demonstrated — the recorded run outcome verdict is now surfaced in the chat narrative. ([#6528](https://github.com/Skyvern-AI/skyvern/pull/6528))
 - Fixed Copilot browser sessions incorrectly blocking localhost navigation during page scouting, which could prevent evidence from being gathered from locally-served pages. ([#6527](https://github.com/Skyvern-AI/skyvern/pull/6527))
+- Fixed single-element JSON arrays being unwrapped to a scalar when passed as workflow run inputs. ([#6560](https://github.com/Skyvern-AI/skyvern/pull/6560))
+- Fixed code blocks silently dropping non-dict return values instead of passing them through to downstream blocks. ([#6556](https://github.com/Skyvern-AI/skyvern/pull/6556))
+- Fixed the task agent ignoring the `max_iterations` override, causing runs to exceed their configured step limit. ([#6544](https://github.com/Skyvern-AI/skyvern/pull/6544))
+- Fixed generated workflow parameter keys being duplicated, which caused a hard failure when the workflow was run. ([#6543](https://github.com/Skyvern-AI/skyvern/pull/6543))
+- Fixed task runs completing successfully even when a required sub-goal had not been satisfied. ([#6546](https://github.com/Skyvern-AI/skyvern/pull/6546))
+- Fixed the credential-clear confirmation dialog being hidden behind other overlays. ([#6542](https://github.com/Skyvern-AI/skyvern/pull/6542))
+- Fixed click actions on elements wrapped in disabled containers not being retargeted to the clickable child element. ([#6540](https://github.com/Skyvern-AI/skyvern/pull/6540))
+- Fixed Copilot loop detector incorrectly triggering at block dispatch boundaries. ([#6550](https://github.com/Skyvern-AI/skyvern/pull/6550))
 
 </Update>
 
