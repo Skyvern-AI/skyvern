@@ -88,6 +88,7 @@ from skyvern.forge.sdk.api.llm.ui_tars_llm_caller import UITarsLLMCaller
 from skyvern.forge.sdk.api.llm.vertex_cache_manager import get_cache_manager
 from skyvern.forge.sdk.api.llm.yutori_navigator_llm_caller import YutoriNavigatorLLMCaller
 from skyvern.forge.sdk.api.llm.yutori_navigator_response import parse_navigator_response_to_actions
+from skyvern.forge.sdk.api.real_gcp import get_gcs_client
 from skyvern.forge.sdk.artifact.manager import BulkArtifactCreationRequest
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.cache import extraction_cache, extraction_shadow
@@ -416,8 +417,11 @@ class ForgeAgent:
             return []
         for file in files_to_rename:
             local_file_name = file
-            if file.startswith("s3://"):
-                file_data = await get_aws_client().download_file(file, log_exception=False)
+            if file.startswith(("s3://", "gs://")):
+                if file.startswith("s3://"):
+                    file_data = await get_aws_client().download_file(file, log_exception=False)
+                else:
+                    file_data = await get_gcs_client().download_file(file, log_exception=False)
                 if not file_data:
                     continue
                 local_file_name = file.split("/")[-1]

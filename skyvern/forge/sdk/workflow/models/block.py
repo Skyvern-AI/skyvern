@@ -5136,7 +5136,7 @@ class SendEmailBlock(Block):
         file_names_by_hash: dict[str, list[str]] = defaultdict(list)
 
         for filename in self._get_file_paths(workflow_run_context, workflow_run_id):
-            if filename.startswith(("s3://", "azure://", "http://", "https://")):
+            if filename.startswith(("s3://", "gs://", "azure://", "http://", "https://")):
                 path = await download_file(filename, organization_id=organization_id)
             else:
                 LOG.info("SendEmailBlock Looking for file locally", filename=filename)
@@ -6887,7 +6887,9 @@ class HttpRequestBlock(Block):
                 is_url = (
                     file_path.startswith("http://") or file_path.startswith("https://") or file_path.startswith("www.")
                 )
-                is_managed_storage_uri = file_path.startswith("s3://") or file_path.startswith("azure://")
+                is_managed_storage_uri = (
+                    file_path.startswith("s3://") or file_path.startswith("gs://") or file_path.startswith("azure://")
+                )
 
                 # Check if file is in allowed directories
                 is_allowed_local_file = False

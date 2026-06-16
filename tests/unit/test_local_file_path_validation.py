@@ -129,6 +129,9 @@ class TestIsRemoteUrl:
     def test_s3_uri(self) -> None:
         assert is_remote_url("s3://bucket/key/file.pdf") is True
 
+    def test_gs_uri(self) -> None:
+        assert is_remote_url("gs://bucket/key/file.pdf") is True
+
     def test_azure_uri(self) -> None:
         assert is_remote_url("azure://container/blob/file.pdf") is True
 
