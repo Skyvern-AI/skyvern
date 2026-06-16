@@ -1078,7 +1078,7 @@ class ArtifactManager:
         # key the upload tracking on the first available scope id instead of failing on a null task_id.
         aio_task_key = artifact[primary_key] or artifact["workflow_run_block_id"] or artifact["run_id"]
         if not aio_task_key:
-            raise ValueError(f"{primary_key} is required to update artifact data.")
+            raise ValueError("artifact must have a task_id, workflow_run_block_id, or run_id to track its upload.")
         self.upload_aiotasks_map[aio_task_key].append(aio_task)
         return aio_task_key
 
