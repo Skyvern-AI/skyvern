@@ -674,6 +674,19 @@ wheels = [
 ]
 
 [[package]]
+name = "browser-use-sdk"
+version = "3.8.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx", extra = ["socks"] },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1e/5b/9f52925c3dc1bc651a67031c3d456ce39731fbca870be55b3fedd5555498/browser_use_sdk-3.8.4.tar.gz", hash = "sha256:9dbabc8971e676c8c454b877ba87142a7cebc39c2b4c2888ff16ad3bed1412f6", size = 203882, upload-time = "2026-06-10T11:18:37.308Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0f/3e/67206e2526e73ad4e4064009d6216000fa5e09381681a11104b868592f30/browser_use_sdk-3.8.4-py3-none-any.whl", hash = "sha256:55f1fd41f6753529ace4b583377b5bf12d61bf85f32abf8bd458e8dd331efa83", size = 64702, upload-time = "2026-06-10T11:18:36.201Z" },
+]
+
+[[package]]
 name = "build"
 version = "1.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -5894,6 +5907,7 @@ server = [
 
 [package.dev-dependencies]
 cloud = [
+    { name = "browser-use-sdk" },
     { name = "kr8s" },
     { name = "openai-agents" },
     { name = "opentelemetry-distro" },
@@ -6090,6 +6104,7 @@ provides-extras = ["local", "server"]
 
 [package.metadata.requires-dev]
 cloud = [
+    { name = "browser-use-sdk", specifier = ">=3.8,<4" },
     { name = "kr8s", specifier = ">=0.20.14,<1" },
     { name = "openai-agents", specifier = ">=0.14.8,<0.15" },
     { name = "opentelemetry-distro", specifier = ">=0.60b1,<1" },
