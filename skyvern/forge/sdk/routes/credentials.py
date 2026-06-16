@@ -2341,6 +2341,10 @@ async def _get_credential_vault_service(
         if not app.AZURE_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Azure Vault credential is not supported")
         return app.AZURE_CREDENTIAL_VAULT_SERVICE
+    elif vault_type == CredentialVaultType.GCP:
+        if not app.GCP_CREDENTIAL_VAULT_SERVICE:
+            raise HTTPException(status_code=400, detail="GCP credential vault is not supported")
+        return app.GCP_CREDENTIAL_VAULT_SERVICE
     elif vault_type == CredentialVaultType.CUSTOM:
         if not app.CUSTOM_CREDENTIAL_VAULT_SERVICE:
             raise HTTPException(status_code=400, detail="Custom credential vault is not supported")
