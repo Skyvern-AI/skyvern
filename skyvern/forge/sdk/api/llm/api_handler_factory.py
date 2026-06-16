@@ -13,7 +13,7 @@ from anthropic.types.beta.beta_message import BetaMessage as AnthropicMessage
 from jinja2 import Template
 from litellm.types.router import AllowedFailsPolicy
 from litellm.utils import CustomStreamWrapper, ModelResponse
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI, RateLimitError
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from opentelemetry import trace as otel_trace
 from pydantic import BaseModel
@@ -539,6 +539,15 @@ class LLMAPIHandlerFactory:
             return None
 
         return cost_value if cost_value >= 0 else None
+
+    @staticmethod
+    def _openrouter_model_name(llm_key: str, llm_config: LLMConfig | LLMRouterConfig) -> str | None:
+        """Return the OpenRouter model id when the handler routes through OpenRouter."""
+        if llm_key.startswith("openrouter/"):
+            return llm_key
+        if isinstance(llm_config, LLMConfig) and llm_config.model_name.startswith("openrouter/"):
+            return llm_config.model_name
+        return None
 
     @staticmethod
     def _completion_cost(response: ModelResponse | CustomStreamWrapper) -> float:
@@ -1651,8 +1660,10 @@ class LLMAPIHandlerFactory:
         if LLMConfigRegistry.is_router_config(llm_key):
             return LLMAPIHandlerFactory.get_llm_api_handler_with_router(llm_key)
 
-        # For OpenRouter models, use LLMCaller which has native OpenRouter support
-        if llm_key.startswith("openrouter/"):
+        # For OpenRouter models, use LLMCaller which has native OpenRouter support.
+        # Registry keys (e.g. OPENROUTER_DEEPSEEK_V4_FLASH) also route here when their
+        # model_name is openrouter/* so usage.cost is tracked in get_call_stats.
+        if LLMAPIHandlerFactory._openrouter_model_name(llm_key, llm_config):
             llm_caller = LLMCaller(llm_key=llm_key, base_parameters=base_parameters)
             return llm_caller.call
 
@@ -2281,8 +2292,9 @@ class LLMCaller:
             self.screenshot_resize_target_dimension = get_resize_target_dimension(self.browser_window_dimension)
 
         self.openai_client = None
-        if self.llm_key.startswith("openrouter/"):
-            self.llm_key = self.llm_key.replace("openrouter/", "")
+        openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.llm_key, self.llm_config)
+        if openrouter_model_name:
+            self.llm_key = openrouter_model_name.replace("openrouter/", "")
             self.openai_client = AsyncOpenAI(
                 api_key=settings.OPENROUTER_API_KEY,
                 base_url=settings.OPENROUTER_API_BASE,
@@ -2328,7 +2340,8 @@ class LLMCaller:
         start_time = time.perf_counter()
         _llm_span = otel_trace.get_current_span()
         _llm_span.set_attribute("llm_key", self.llm_key)
-        _llm_span.set_attribute("llm_model", self.llm_config.model_name)
+        openrouter_model_name = LLMAPIHandlerFactory._openrouter_model_name(self.original_llm_key, self.llm_config)
+        _llm_span.set_attribute("llm_model", openrouter_model_name or self.llm_config.model_name)
         _llm_span.set_attribute("prompt_name", prompt_name or "<unknown>")
         # handler_type distinguishes the three LLM entry points that share
         # the skyvern.llm.request span name. Dashboards filter on this attr.
@@ -2450,7 +2463,7 @@ class LLMCaller:
                     message_pattern=message_pattern,
                 )
             llm_request_payload = {
-                "model": self.llm_config.model_name,
+                "model": self.llm_key if openrouter_model_name and self.openai_client else self.llm_config.model_name,
                 "messages": messages,
                 # we're not using active_parameters here because it may contain sensitive information
                 **parameters,
@@ -2484,9 +2497,6 @@ class LLMCaller:
                     self.message_history = messages
             # Error paths only set status=error, not token/cost attrs via
             # _enrich_llm_span — no response object exists so there's nothing to report.
-            except litellm.exceptions.APIError as e:
-                _llm_span.set_attribute("status", "error")
-                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except litellm.exceptions.ContextWindowExceededError as e:
                 _llm_span.set_attribute("status", "context_exceeded")
                 LOG.exception(
@@ -2495,6 +2505,13 @@ class LLMCaller:
                     model=self.llm_config.model_name,
                 )
                 raise SkyvernContextWindowExceededError(model=self.llm_config.model_name) from e
+            except litellm.exceptions.RateLimitError as e:
+                _llm_span.set_attribute("status", "rate_limited")
+                LOG.warning("LLM request rate limited", llm_key=self.llm_key)
+                raise LLMProviderError(self.llm_key, cause=e) from e
+            except litellm.exceptions.APIError as e:
+                _llm_span.set_attribute("status", "error")
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except CancelledError:
                 # Speculative steps are intentionally cancelled when goal verification returns completed,
                 # so we log at debug level. Non-speculative cancellations are unexpected errors.
@@ -2517,10 +2534,13 @@ class LLMCaller:
                         duration=t_llm_cancelled - t_llm_request,
                     )
                     raise LLMProviderError(self.llm_key) from None
-            except litellm.exceptions.RateLimitError as e:
+            except RateLimitError as e:
                 _llm_span.set_attribute("status", "rate_limited")
                 LOG.warning("LLM request rate limited", llm_key=self.llm_key)
                 raise LLMProviderError(self.llm_key, cause=e) from e
+            except APIError as e:
+                _llm_span.set_attribute("status", "error")
+                raise LLMProviderErrorRetryableTask(self.llm_key, cause=e) from e
             except Exception as e:
                 _llm_span.set_attribute("status", "error")
                 LOG.exception("LLM request failed unexpectedly", llm_key=self.llm_key)
@@ -2968,7 +2988,7 @@ class LLMCaller:
                 response
             )
             llm_cost = 0.0
-            if self.original_llm_key.startswith("openrouter/"):
+            if LLMAPIHandlerFactory._openrouter_model_name(self.original_llm_key, self.llm_config):
                 reported_cost = LLMAPIHandlerFactory._extract_reported_usage_cost(response)
                 if reported_cost is not None:
                     llm_cost = reported_cost
