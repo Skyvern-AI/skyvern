@@ -8,6 +8,8 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
+
 import type { WorkflowCopilotStreamResponseUpdate } from "./workflowCopilotTypes";
 
 // Capture every postStreaming call so a test can assert how many streams
@@ -211,6 +213,11 @@ beforeEach(() => {
     proposed_workflow: null,
     auto_accept: false,
   };
+  useCopilotActionStore.setState({
+    pendingBuild: null,
+    generatingBlockLabel: null,
+    cancelNonce: 0,
+  });
 });
 
 afterEach(() => {
@@ -296,6 +303,145 @@ describe("WorkflowCopilotChat — keep the chat live during a turn", () => {
     expect(textarea().disabled).toBe(false);
     expect(cancelPost).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Cancel run" })).toBeTruthy();
+  });
+
+  it("clears the queued block-build target on cancel so it cannot leak into the next message", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block-level Generate while the turn is in flight: it queues behind
+    // the active turn, capturing the target block label in a ref.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // Cancel the queued block-build before it sends.
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "Escape" });
+    });
+
+    // Finish the original turn and send an unrelated follow-up.
+    await completeOldestStream("first done");
+    await submit("a normal follow-up");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+
+    const followUp = streamCalls.find(
+      (call) => call.body.message === "a normal follow-up",
+    );
+    expect(followUp).toBeTruthy();
+    expect(
+      (followUp!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+  });
+
+  it("keeps the block generating label set while its build waits behind an in-flight turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block-level Generate while a turn is in flight: it queues behind it.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+
+    // The unrelated turn ends; the queued block build then drains into its own
+    // stream. The generating label must survive both events.
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+    expect(
+      (streamCalls[1]!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBe("open_page");
+
+    // The label clears only once the block-build turn itself finishes.
+    await act(async () => {
+      streamCalls[1]!.onMessage(terminalResponse("block rebuilt"));
+      streamCalls[1]!.resolve();
+    });
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+  });
+
+  it("does not arm a block-build target when its generate no-ops behind a queued prompt", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Queue a normal follow-up behind the in-flight turn.
+    await submit("second message");
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // A block Generate now no-ops (a prompt is already queued); it must neither
+    // arm the block target nor leave the block stuck generating.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    await waitFor(() =>
+      expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull(),
+    );
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+
+    // The queued follow-up drains normally, unscoped to any block.
+    await completeOldestStream("first done");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(2));
+    const drained = streamCalls.find(
+      (call) => call.body.message === "second message",
+    );
+    expect(drained).toBeTruthy();
+    expect(
+      (drained!.body as unknown as { target_block_label: string | null })
+        .target_block_label,
+    ).toBeNull();
+  });
+
+  it("drops a queued block build when its Stop is pressed, sparing the active turn", async () => {
+    await renderChat();
+    await submit("first message");
+    await waitFor(() => expect(postStreaming).toHaveBeenCalledTimes(1));
+
+    // Arm a block Generate while the turn is in flight: it queues behind it.
+    await act(async () => {
+      useCopilotActionStore
+        .getState()
+        .requestBuild({ blockLabel: "open_page", prompt: "open the page" });
+    });
+    expect(postStreaming).toHaveBeenCalledTimes(1);
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBe(
+      "open_page",
+    );
+
+    // Press the block's Stop: drop the queued build without cancelling the
+    // unrelated in-flight turn.
+    await act(async () => {
+      useCopilotActionStore.getState().requestCancel();
+    });
+    expect(useCopilotActionStore.getState().generatingBlockLabel).toBeNull();
+    expect(cancelPost).not.toHaveBeenCalledWith(
+      "/workflow/copilot/cancel",
+      expect.anything(),
+    );
+
+    // The original turn completes; the dropped build must not drain into a stream.
+    await completeOldestStream("first done");
+    await act(async () => {});
+    expect(postStreaming).toHaveBeenCalledTimes(1);
   });
 
   it("resets the live narrative when a stream throws without a terminal", async () => {

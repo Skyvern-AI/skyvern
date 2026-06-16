@@ -18,6 +18,7 @@ import {
 } from "@radix-ui/react-icons";
 import { stringify as convertToYAML } from "yaml";
 import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { useCopilotActionStore } from "@/store/useCopilotActionStore";
 import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
 import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
 import { toast } from "@/components/ui/use-toast";
@@ -1008,6 +1009,8 @@ export function WorkflowCopilotChat({
     }
 
     updateQueuedPrompt(null);
+    // Discard the queued block-build's target so it can't leak into the next normal message.
+    blockBuildTargetLabelRef.current = null;
     setMessages((prev) =>
       prev.filter((message) => message.id !== queuedPrompt.id),
     );
@@ -1037,6 +1040,11 @@ export function WorkflowCopilotChat({
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
+
+  // Set by a block's "Generate" arm step so the next send scopes regeneration to that block.
+  const blockBuildTargetLabelRef = useRef<string | null>(null);
+  // True only while a block-build turn is actually in flight (not a turn it queued behind).
+  const blockGenInFlightRef = useRef(false);
 
   const handleSend = useCallback(
     async (messageOverride?: string, options: SendOptions = {}) => {
@@ -1360,6 +1368,11 @@ export function WorkflowCopilotChat({
         };
 
         const client = await getSseClient(credentialGetter);
+        const targetBlockLabel = blockBuildTargetLabelRef.current;
+        blockBuildTargetLabelRef.current = null;
+        if (targetBlockLabel != null) {
+          blockGenInFlightRef.current = true;
+        }
         await client.postStreaming<WorkflowCopilotSsePayload>(
           "/workflow/copilot/chat-post",
           {
@@ -1374,6 +1387,7 @@ export function WorkflowCopilotChat({
             mode: copilotV2Enabled ? composerMode : null,
             code_block: isBuild && codeBlockModeEnabled ? codeWorkflow : null,
             cancel_token: cancelToken,
+            target_block_label: targetBlockLabel,
           } as WorkflowCopilotChatRequest,
           (payload) => {
             switch (payload.type) {
@@ -1502,6 +1516,93 @@ export function WorkflowCopilotChat({
       workflowRunId,
     ],
   );
+
+  // A code block's "Generate" button asks the copilot to (re)build that one block
+  // from its goal. Force build + code mode, then fire the send on the next tick.
+  const pendingBlockBuild = useCopilotActionStore(
+    (state) => state.pendingBuild,
+  );
+  const clearPendingBlockBuild = useCopilotActionStore(
+    (state) => state.clearPendingBuild,
+  );
+  const finishBlockGenerating = useCopilotActionStore(
+    (state) => state.finishGenerating,
+  );
+  const blockCancelNonce = useCopilotActionStore((state) => state.cancelNonce);
+  const blockBuildMessageRef = useRef<string | null>(null);
+  const [blockBuildArmNonce, setBlockBuildArmNonce] = useState(0);
+
+  useEffect(() => {
+    if (!pendingBlockBuild) {
+      return;
+    }
+    blockBuildMessageRef.current =
+      `Rebuild the "${pendingBlockBuild.blockLabel}" code block so it accomplishes ` +
+      `this goal, and update its code and steps accordingly: ${pendingBlockBuild.prompt}`;
+    blockBuildTargetLabelRef.current = pendingBlockBuild.blockLabel;
+    setComposerMode("build");
+    setCodeWorkflow(true);
+    setBlockBuildArmNonce((nonce) => nonce + 1);
+    clearPendingBlockBuild();
+  }, [pendingBlockBuild, clearPendingBlockBuild]);
+
+  useEffect(() => {
+    if (blockBuildArmNonce === 0 || blockBuildMessageRef.current === null) {
+      return;
+    }
+    if (composerMode !== "build" || !codeWorkflow) {
+      return;
+    }
+    const message = blockBuildMessageRef.current;
+    blockBuildMessageRef.current = null;
+    // A prompt is already queued, so this send no-ops. Disarm the block target
+    // (else the queued drain inherits it) and clear the stuck generating state.
+    if (queuedPromptRef.current) {
+      blockBuildTargetLabelRef.current = null;
+      finishBlockGenerating();
+      return;
+    }
+    void handleSend(message);
+  }, [
+    blockBuildArmNonce,
+    composerMode,
+    codeWorkflow,
+    handleSend,
+    finishBlockGenerating,
+  ]);
+
+  const blockGenLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    if (
+      blockGenLoadingRef.current &&
+      !isLoading &&
+      blockGenInFlightRef.current
+    ) {
+      blockGenInFlightRef.current = false;
+      finishBlockGenerating();
+    }
+    blockGenLoadingRef.current = isLoading;
+  }, [isLoading, finishBlockGenerating]);
+
+  const blockCancelNonceRef = useRef(blockCancelNonce);
+  useEffect(() => {
+    if (blockCancelNonce !== blockCancelNonceRef.current) {
+      blockCancelNonceRef.current = blockCancelNonce;
+      const queued = queuedPromptRef.current;
+      // A queued block build hasn't streamed yet, so cancelSend would no-op and
+      // let it drain later. Drop it (and its bubble), leaving any unrelated
+      // in-flight turn untouched.
+      if (queued && blockBuildTargetLabelRef.current != null) {
+        blockBuildTargetLabelRef.current = null;
+        updateQueuedPrompt(null);
+        setMessages((prev) =>
+          prev.filter((message) => message.id !== queued.id),
+        );
+        return;
+      }
+      void cancelSend();
+    }
+  }, [blockCancelNonce, cancelSend, updateQueuedPrompt]);
 
   const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {

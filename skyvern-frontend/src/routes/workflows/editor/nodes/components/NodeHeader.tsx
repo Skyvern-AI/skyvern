@@ -140,6 +140,7 @@ interface Props {
   totpUrl: string | null;
   transmutations?: Transmutations;
   type: WorkflowBlockType;
+  viewToggle?: React.ReactNode;
 }
 
 type Payload = Record<string, unknown> & {
@@ -234,6 +235,7 @@ function NodeHeader({
   totpUrl,
   transmutations,
   type,
+  viewToggle,
 }: Props) {
   const log = useLogging();
   const mode = useWorkflowEditorMode();
@@ -975,6 +977,7 @@ function NodeHeader({
           </div>
         </div>
         <div className="pointer-events-auto ml-auto flex items-center gap-2">
+          {viewToggle}
           {extraActions}
           {thisBlockIsPlaying && (
             <div className="ml-auto">

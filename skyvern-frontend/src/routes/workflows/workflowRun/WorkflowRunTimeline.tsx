@@ -23,6 +23,7 @@ import {
 import { ThoughtCard } from "./ThoughtCard";
 import { WorkflowRunTimelineBlockItem } from "./WorkflowRunTimelineBlockItem";
 import { WorkflowRunTimelineUnexecutedBlockItem } from "./WorkflowRunTimelineUnexecutedBlockItem";
+import { buildCodeStepsByLabel } from "../workflowBlockUtils";
 import {
   classifyUnexecutedDefinedBlocks,
   flattenTimelineChronologically,
@@ -98,6 +99,13 @@ function WorkflowRunTimeline({
   const blockOrder = useMemo(
     () => buildBlockOrderIndex(workflowRunTimeline ?? []),
     [workflowRunTimeline],
+  );
+  const codeStepsByLabel = useMemo(
+    () =>
+      buildCodeStepsByLabel(
+        workflowRun?.workflow?.workflow_definition?.blocks ?? [],
+      ),
+    [workflowRun],
   );
 
   // Track known item IDs so we can animate only newly-arrived items
@@ -230,6 +238,7 @@ function WorkflowRunTimeline({
                       activeIteration={activeIteration}
                       block={timelineItem.block}
                       blockOrder={blockOrder}
+                      codeStepsByLabel={codeStepsByLabel}
                       onActionClick={onActionItemSelected}
                       onBlockItemClick={onBlockItemSelected}
                       onIterationClick={onIterationSelected}
