@@ -1638,7 +1638,9 @@ def _maybe_synthesized_block_offer_msg(ctx: Any) -> dict[str, Any] | None:
     trajectory = getattr(ctx, "scout_trajectory", None) or []
     if not trajectory:
         return None
-    synthesized = synthesize_code_block(trajectory)
+    synthesized = synthesize_code_block(
+        trajectory, reached_download_target=getattr(ctx, "reached_download_target", None)
+    )
     if synthesized is None:
         return None
 
