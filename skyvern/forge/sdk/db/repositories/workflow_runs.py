@@ -715,6 +715,71 @@ class WorkflowRunsRepository(BaseRepository):
             workflow_run = (await session.scalars(query)).first()
             return convert_to_workflow_run(workflow_run) if workflow_run else None
 
+    @db_operation("get_blocking_sequential_workflow_run")
+    async def get_blocking_sequential_workflow_run(self, workflow_run_id: str) -> WorkflowRun | None:
+        # Sequential-execution gate: returns the earliest-queued run that shares this run's
+        # sequential identity and is still in flight (queued/running/paused) and was queued
+        # before it, or None when this run is clear to start. A direct scan over all
+        # same-identity runs — not a walk of one depends_on chain — so it holds when the
+        # dependency graph fans out (forest) or a queued predecessor is canceled.
+        # Ordering uses queued_at, not created_at: it is stamped at enqueue (before Temporal
+        # submission) so it reflects submit order. The no-double-start guarantee rests on the
+        # strict total order over (queued_at, workflow_run_id) below, not on any lock.
+        async with self.Session() as session:
+            run = (await session.scalars(select(WorkflowRunModel).filter_by(workflow_run_id=workflow_run_id))).first()
+            if run is None:
+                return None
+
+            # Lane resolution mirrors enqueue priority: browser_session_id > browser_address
+            # > sequential_key > whole workflow. A debug-session run carries a browser_session_id
+            # but is excluded from the session lane (as at enqueue), so it serializes on its key.
+            query = select(WorkflowRunModel).filter_by(organization_id=run.organization_id)
+            if run.browser_session_id and not run.debug_session_id:
+                query = query.filter_by(browser_session_id=run.browser_session_id)
+            elif run.browser_address:
+                query = query.filter_by(browser_address=run.browser_address)
+            elif run.sequential_key:
+                query = query.filter_by(
+                    workflow_permanent_id=run.workflow_permanent_id,
+                    sequential_key=run.sequential_key,
+                ).filter(WorkflowRunModel.browser_session_id.is_(None))
+            else:
+                query = query.filter_by(workflow_permanent_id=run.workflow_permanent_id).filter(
+                    WorkflowRunModel.browser_session_id.is_(None)
+                )
+
+            # Sequential runs are stamped queued_at before Temporal submission; the fallback
+            # only guards hand-created rows (e.g. tests) from comparing against None.
+            self_queued_at = run.queued_at if run.queued_at is not None else run.created_at
+
+            query = query.filter(
+                WorkflowRunModel.status.in_(
+                    [
+                        WorkflowRunStatus.queued,
+                        WorkflowRunStatus.running,
+                        WorkflowRunStatus.paused,
+                    ]
+                )
+            )
+            # Safe because a sequential run is always stamped queued_at (passes through queued)
+            # before it can reach running/paused, so this filter never hides a real blocker.
+            query = query.filter(WorkflowRunModel.queued_at.isnot(None))
+            query = query.filter(
+                or_(
+                    WorkflowRunModel.queued_at < self_queued_at,
+                    and_(
+                        WorkflowRunModel.queued_at == self_queued_at,
+                        WorkflowRunModel.workflow_run_id < run.workflow_run_id,
+                    ),
+                )
+            )
+            query = query.order_by(
+                WorkflowRunModel.queued_at.asc(),
+                WorkflowRunModel.workflow_run_id.asc(),
+            )
+            blocker = (await session.scalars(query)).first()
+            return convert_to_workflow_run(blocker) if blocker else None
+
     async def _get_last_workflow_run_by_filter(
         self,
         organization_id: str | None = None,
