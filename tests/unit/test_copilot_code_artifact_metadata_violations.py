@@ -997,3 +997,131 @@ class TestViolationBatchIsDurablyRecoverable:
         assert span.attrs["copilot.code_artifact_violations"] == ["only_one"]
         assert span.attrs["copilot.code_artifact_violation_count"] == 1
         assert span.attrs["copilot.code_artifact_violation_block_labels"] == ["b"]
+
+
+def _download_intent_metadata(label: str) -> dict:
+    metadata = _non_extraction_metadata(label)
+    metadata["claimed_outcomes"][0]["goal_value_paths"] = ["downloaded_files"]
+    metadata["terminal_verifier_expectations"][0]["goal_value_paths"] = ["downloaded_files"]
+    return metadata
+
+
+class TestDownloadReturnShape:
+    def test_expect_download_idiom_with_descriptor_passes(self) -> None:
+        code = """
+        async with page.expect_download() as dl_info:
+            await page.click("a#statement-pdf")
+        return {"saved_as": dl_info.value.suggested_filename}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["dl_block"]
+
+    def test_self_asserted_keys_without_idiom_is_rejected(self) -> None:
+        code = """
+        await page.click("a#statement-pdf")
+        return {"downloaded_files": ["/tmp/statement.pdf"]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "expect_download" in error
+
+    def test_plain_click_fabricated_dict_is_rejected(self) -> None:
+        code = """
+        await page.click("a#statement-pdf")
+        return {"downloaded_file_name": "statement.pdf", "evidence": "ok"}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "expect_download" in error
+
+    def test_static_fetch_body_is_rejected(self) -> None:
+        code = """
+        import requests
+        body = requests.get("https://example.com/statement.pdf").content
+        return {"downloaded_files": [body]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "expect_download" in error
+
+    def test_idiom_but_returns_registration_keys_is_rejected(self) -> None:
+        code = """
+        async with page.expect_download() as dl_info:
+            await page.click("a#statement-pdf")
+        return {"downloaded_files": [await dl_info.value.path()]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "downloaded_files" in error
+        assert "self-certifies" in error
+
+    def test_self_asserted_keys_detected_without_goal_path_declaration(self) -> None:
+        code = """
+        await page.click("a#statement-pdf")
+        return {"downloaded_files": ["/tmp/statement.pdf"]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_non_extraction_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "expect_download" in error
+
+    def test_extraction_block_is_not_treated_as_download_intent(self) -> None:
+        code = """
+        await page.goto("https://example.com/")
+        return {"records": [{"number": "1"}]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_extraction_metadata("ex_block", ["records[].number"])],
+            _extraction_code_block_yaml("ex_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["ex_block"]
+
+    def test_bare_expect_download_attribute_does_not_satisfy_the_idiom(self) -> None:
+        code = """
+        _ = page.expect_download
+        await page.click("a#statement-pdf")
+        return {"downloaded_files": ["/tmp/statement.pdf"]}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_download_intent_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert normalized == {}
+        assert error is not None
+        assert "expect_download" in error
+
+    def test_non_download_non_extraction_block_passes(self) -> None:
+        code = """
+        await page.click("a#statement-pdf")
+        return {"clicked": True}
+        """
+        normalized, error = _normalize_code_artifact_metadata(
+            [_non_extraction_metadata("dl_block")],
+            _extraction_code_block_yaml("dl_block", code),
+        )
+        assert error is None
+        assert list(normalized.keys()) == ["dl_block"]
