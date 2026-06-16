@@ -16,6 +16,7 @@ import {
   findBlockSurroundingThought,
   findLastExecutedBlock,
   findRunningBlock,
+  findTimelineBlock,
   flattenTimelineChronologically,
   resolveScreenshotBlockId,
 } from "./workflowTimelineUtils";
@@ -903,6 +904,28 @@ describe("classifyUnexecutedDefinedBlocks", () => {
     ]);
 
     expect(reasonsByLabel(result)).toEqual({ block_b: "not_reached" });
+  });
+});
+
+describe("findTimelineBlock", () => {
+  test("returns a nested leaf block by id so its real type is available", () => {
+    const codeLeaf = buildBlock({
+      workflow_run_block_id: "wrb_code_leaf",
+      block_type: "code",
+    });
+    const loop = buildBlock({
+      workflow_run_block_id: "wrb_loop",
+      block_type: "for_loop",
+    });
+    const timeline = [buildBlockItem(loop, [buildBlockItem(codeLeaf)])];
+    expect(findTimelineBlock(timeline, "wrb_code_leaf")?.block_type).toBe(
+      "code",
+    );
+  });
+
+  test("returns null for an unknown id", () => {
+    const leaf = buildBlock({ workflow_run_block_id: "wrb_leaf" });
+    expect(findTimelineBlock([buildBlockItem(leaf)], "wrb_missing")).toBeNull();
   });
 });
 
