@@ -3738,13 +3738,10 @@ async def wrapper({default_args}):
         workflow_run_block_id: str,
         organization_id: str | None,
     ) -> None:
-        """Register the run-scoped RECORDING row that a code block otherwise lacks.
-
-        The agent path creates it in ``initialize_execution_state``; a code block runs no agent
-        step, so ``_fetch_recording_urls`` finds nothing and the Recording tab is empty. The
-        workflow cleanup's ``persist_video_data`` backfills the finalized video. Best-effort and
-        idempotent across blocks sharing one browser.
-        """
+        """Register the run-scoped RECORDING row that a code block otherwise lacks so the recording is reachable."""
+        # get_video_artifacts returns the same VideoArtifact objects held on browser_state, so the id
+        # written below is observed by the early-return guard on later blocks sharing the browser.
+        # Idempotency assumes those blocks run sequentially (no concurrent first-time registration).
         browser_artifacts = browser_state.browser_artifacts
         if not browser_artifacts or all(va.video_artifact_id for va in browser_artifacts.video_artifacts):
             return
@@ -4015,8 +4012,10 @@ async def wrapper({default_args}):
             nonlocal workflow_run_block
             if task is None:
                 return
-            if action.action_type not in (ActionType.GOTO_URL, ActionType.CLICK, ActionType.INPUT_TEXT):
-                return
+            # Every action that reaches this sink is one the recorder chose to surface on the timeline
+            # (goto, click, input, page.evaluate, select, hover, ...), so each one earns a screenshot.
+            # Re-listing eligible types here only drifts from the recorder's maps — which is exactly how
+            # page.evaluate (EXECUTE_JS) ended up with no screenshot.
             # page.screenshot() shares the CDP channel with the user's page calls, so it must run synchronously
             # in the user-await chain (a backgrounded capture races the next action and clips a mid-nav frame);
             # only the page-free S3 upload is deferred off the critical path.
