@@ -471,6 +471,18 @@ class CopilotContext(AgentContext):
     last_frontier_fingerprint: str | None = None
     last_failure_signature: str | None = None
     repeated_failure_streak_count: int = 0
+    last_repair_non_convergence_signature: str | None = None
+    consecutive_non_converging_repair_count: int = 0
+    # Turn-scoped monotonic marks of verified forward progress: the union of
+    # completion criteria the judge confirmed satisfied so far this turn, and the
+    # high-water length of the verified block prefix. A repair that grows either
+    # made progress and resets the non-convergence streak.
+    verified_criteria_high_water: frozenset[str] = frozenset()
+    verified_prefix_high_water_len: int = 0
+    # A fresh clean full-workflow pass counts as progress exactly once: latched
+    # here so a stale carry-over ``last_full_workflow_test_ok`` on a later non-run
+    # REPAIR verdict cannot keep resetting the non-convergence streak.
+    verified_full_pass_consumed: bool = False
     # Highest streak level at which we've already emitted a repeated-failure
     # nudge. Prevents the warn nudge from re-firing every turn while the
     # streak is still at 2, and guarantees the stop nudge fires exactly once

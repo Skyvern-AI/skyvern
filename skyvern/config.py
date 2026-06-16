@@ -154,6 +154,9 @@ class Settings(BaseSettings):
     # Capture bounded page evidence synchronously in scout interaction post-hooks.
     # Off restores schema-less interaction packets plus standalone page inspects.
     COPILOT_SCOUT_ACT_OBSERVE_ENABLED: bool = True
+    # Consecutive repair runs that make no newly-verified forward progress before the
+    # copilot stops re-running and escalates honestly. Set very high to disable the ceiling.
+    COPILOT_REPAIR_CEILING_CONSECUTIVE_IDENTICAL: int = 3
     COPILOT_SCOUT_ACT_OBSERVE_TIMEOUT_SECONDS: float = 4.0
     # On a repeat evaluate of an unchanged page with exactly one safe target, click it in-process
     # instead of only advising. Off (default) leaves the advisory steer as the only response.
