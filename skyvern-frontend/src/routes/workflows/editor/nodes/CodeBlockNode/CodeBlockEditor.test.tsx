@@ -310,14 +310,14 @@ describe("CodeBlockEditor plain view", () => {
     expect(screen.queryByTestId("code-editor")).toBeNull();
   });
 
-  test("renders only the code editor when the view is code", () => {
+  test("renders inputs and the code editor when the view is code", () => {
     node.data = { ...baseData, ...codeFirstData };
     renderEditor(false, "code");
 
     expect(screen.getByTestId("code-editor")).toBeTruthy();
+    expect(screen.getByText("Inputs")).toBeTruthy();
     expect(screen.queryByText("Goal")).toBeNull();
     expect(screen.queryByText("What Skyvern will do")).toBeNull();
-    expect(screen.queryByText("Inputs")).toBeNull();
   });
 
   test("ignores the split view for a legacy block without a goal", () => {
