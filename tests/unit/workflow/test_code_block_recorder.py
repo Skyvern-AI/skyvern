@@ -543,6 +543,24 @@ async def test_backgrounded_screenshots_are_drained_and_linked_before_persist(
 
 
 @pytest.mark.asyncio
+async def test_page_evaluate_action_captures_and_links_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """page.evaluate (EXECUTE_JS) is a recorded, timeline-visible action and must get a screenshot
+    like clicks and navigations do, so the run detail panel can render it instead of "No screenshot"."""
+    page = FakePage()
+    context = FakeWorkflowRunContext()
+    mocks = _patch_execute_environment(monkeypatch, page, context)
+
+    block = _make_code_block("await page.evaluate('() => document.title')", goal="go")
+    result = await block.execute(workflow_run_id="wr_test", workflow_run_block_id="wrb_test", organization_id="o_test")
+
+    assert result.success is True
+    actions = _created_actions(mocks)
+    assert [a.action_type for a in actions] == [ActionType.EXECUTE_JS]
+    assert mocks["create_artifact"].await_count == 1
+    assert actions[0].screenshot_artifact_id == "artifact_1"
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_does_not_fail_the_block(monkeypatch: pytest.MonkeyPatch) -> None:
     page = FakePage()
     context = FakeWorkflowRunContext()

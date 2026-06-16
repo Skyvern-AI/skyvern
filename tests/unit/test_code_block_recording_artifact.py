@@ -152,6 +152,64 @@ async def test_artifact_failure_is_swallowed() -> None:
     assert video_artifacts[0].video_artifact_id is None
 
 
+@pytest.mark.asyncio
+async def test_second_call_skips_re_registration() -> None:
+    # get_video_artifacts returns the same VideoArtifact objects held on browser_state, so the id
+    # written on the first call is visible to the early-return guard and the second call is a no-op.
+    video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm", video_data=b"partial-video")]
+    browser_state = _browser_state(video_artifacts)
+    get_video = AsyncMock(return_value=video_artifacts)
+    get_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_1"))
+    create_artifact = AsyncMock(return_value="a_recording")
+
+    with (
+        patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
+        patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
+    ):
+        block = _code_block()
+        for _ in range(2):
+            await block._ensure_run_recording_artifact(
+                browser_state=browser_state,
+                workflow_run_id="wr_1",
+                workflow_run_block_id="wrb_1",
+                organization_id="o_1",
+            )
+
+    get_video.assert_awaited_once()
+    get_block.assert_awaited_once()
+    create_artifact.assert_awaited_once()
+    assert video_artifacts[0].video_artifact_id == "a_recording"
+
+
+@pytest.mark.asyncio
+async def test_registers_when_video_data_not_yet_captured() -> None:
+    # Registration happens before persist_video_data backfills the bytes, so video_data is still the
+    # empty default; the row must be created anyway so cleanup has an id to update.
+    video_artifacts = [VideoArtifact(video_path="/tmp/recording.webm")]
+    assert video_artifacts[0].video_data == b""
+    browser_state = _browser_state(video_artifacts)
+    get_video = AsyncMock(return_value=video_artifacts)
+    get_block = AsyncMock(return_value=SimpleNamespace(workflow_run_block_id="wrb_1"))
+    create_artifact = AsyncMock(return_value="a_recording")
+
+    with (
+        patch(f"{_BLOCK_PATH}.BROWSER_MANAGER.get_video_artifacts", get_video),
+        patch(f"{_BLOCK_PATH}.DATABASE.observer.get_workflow_run_block", get_block),
+        patch(f"{_BLOCK_PATH}.ARTIFACT_MANAGER.create_workflow_run_block_artifact", create_artifact),
+    ):
+        await _code_block()._ensure_run_recording_artifact(
+            browser_state=browser_state,
+            workflow_run_id="wr_1",
+            workflow_run_block_id="wrb_1",
+            organization_id="o_1",
+        )
+
+    create_artifact.assert_awaited_once()
+    assert create_artifact.call_args.kwargs["data"] == b""
+    assert video_artifacts[0].video_artifact_id == "a_recording"
+
+
 def _recording_artifact(
     *,
     task_id: str | None = None,
