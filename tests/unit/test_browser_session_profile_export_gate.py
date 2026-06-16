@@ -1,6 +1,9 @@
 from datetime import datetime
 
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    PersistentBrowserSession,
+    export_profile_storage_id,
+)
 from skyvern.schemas.browser_sessions import CreateBrowserSessionRequest, UpdateBrowserSessionRequest
 
 
@@ -38,3 +41,30 @@ def test_create_request_defaults_to_opt_out() -> None:
 def test_update_request_carries_flag() -> None:
     assert UpdateBrowserSessionRequest(generate_browser_profile=True).generate_browser_profile is True
     assert UpdateBrowserSessionRequest(generate_browser_profile=False).generate_browser_profile is False
+
+
+def test_export_profile_storage_id_pure_reuse_targets_profile() -> None:
+    assert (
+        export_profile_storage_id(session_id="pbs_1", browser_profile_id="bp_1", generate_browser_profile=False)
+        == "bp_1"
+    )
+
+
+def test_export_profile_storage_id_generate_targets_session_even_over_reused_profile() -> None:
+    assert (
+        export_profile_storage_id(session_id="pbs_1", browser_profile_id="bp_1", generate_browser_profile=True)
+        == "pbs_1"
+    )
+
+
+def test_export_profile_storage_id_falls_back_to_session_when_no_profile() -> None:
+    assert (
+        export_profile_storage_id(session_id="pbs_1", browser_profile_id=None, generate_browser_profile=False)
+        == "pbs_1"
+    )
+
+
+def test_export_profile_storage_id_generate_without_profile_targets_session() -> None:
+    assert (
+        export_profile_storage_id(session_id="pbs_1", browser_profile_id=None, generate_browser_profile=True) == "pbs_1"
+    )

@@ -1152,6 +1152,7 @@ class PersistentBrowserSessionModel(Base):
     browser_type = Column(String, nullable=True)
     browser_profile_id = Column(String, nullable=True, index=True)
     generate_browser_profile = Column(Boolean, default=False, nullable=False, server_default=sqlalchemy.false())
+    browser_profile_loaded = Column(Boolean, default=True, nullable=False, server_default=sqlalchemy.true())
     instance_type = Column(String, nullable=True)
     vcpu_millicores = Column(Integer, nullable=True)
     memory_mb = Column(Integer, nullable=True)
