@@ -1989,11 +1989,11 @@
               }
             }
           },
-          "404": {
-            "description": "Run not found"
-          },
           "400": {
             "description": "Timeline not available for this run type"
+          },
+          "404": {
+            "description": "Run not found"
           },
           "422": {
             "description": "Validation Error",
@@ -3000,11 +3000,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "409": {
             "description": "Conflict - browser session has already ended and can no longer be updated"
@@ -3074,11 +3074,11 @@
               }
             }
           },
-          "404": {
-            "description": "Browser session not found"
-          },
           "403": {
             "description": "Unauthorized - Invalid or missing authentication"
+          },
+          "404": {
+            "description": "Browser session not found"
           },
           "422": {
             "description": "Validation Error",
@@ -4521,11 +4521,11 @@
               }
             }
           },
-          "404": {
-            "description": "Workflow not found"
-          },
           "400": {
             "description": "Folder not found"
+          },
+          "404": {
+            "description": "Workflow not found"
           },
           "422": {
             "description": "Validation Error",
@@ -5481,9 +5481,6 @@
           "404": {
             "description": "Workflow not found"
           },
-          "500": {
-            "description": "Storage deletion failed; retry"
-          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -5493,6 +5490,9 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Storage deletion failed; retry"
           }
         },
         "x-hidden": true
@@ -8692,7 +8692,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -8848,6 +8848,31 @@
             "type": "array",
             "title": "Parameters",
             "default": []
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
           }
         },
         "type": "object",
@@ -8857,6 +8882,115 @@
           "code"
         ],
         "title": "CodeBlock"
+      },
+      "CodeBlockStep": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType",
+            "default": "null_action"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStep"
+      },
+      "CodeBlockStepYAML": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "action_type": {
+            "type": "string",
+            "title": "Action Type",
+            "default": "null_action"
+          },
+          "line_start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line Start"
+          },
+          "line_end": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line End"
+          }
+        },
+        "type": "object",
+        "title": "CodeBlockStepYAML"
       },
       "CodeBlockYAML": {
         "properties": {
@@ -8927,6 +9061,31 @@
               }
             ],
             "title": "Parameter Keys"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeBlockStepYAML"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps"
           }
         },
         "type": "object",
@@ -9267,8 +9426,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 1440.0,
-                "minimum": 5.0
+                "maximum": 1440,
+                "minimum": 5
               },
               {
                 "type": "null"
@@ -14134,7 +14293,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -17132,7 +17291,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -20390,7 +20549,7 @@
             "type": "number",
             "title": "Timeout",
             "description": "Timeout in milliseconds",
-            "default": 5000
+            "default": 10000
           }
         },
         "type": "object",
@@ -20944,8 +21103,8 @@
           },
           "confidence_float": {
             "type": "number",
-            "maximum": 1.0,
-            "minimum": 0.0,
+            "maximum": 1,
+            "minimum": 0,
             "title": "Confidence Float"
           },
           "error_type": {
@@ -22466,8 +22625,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -22538,8 +22697,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 2.0,
-                "minimum": 1.0
+                "maximum": 2,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -24245,8 +24404,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
@@ -24490,8 +24649,8 @@
             "anyOf": [
               {
                 "type": "integer",
-                "maximum": 480.0,
-                "minimum": 1.0
+                "maximum": 480,
+                "minimum": 1
               },
               {
                 "type": "null"
