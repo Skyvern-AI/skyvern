@@ -121,13 +121,17 @@ def _consume_scout_source_url(ctx: AgentContext) -> str | None:
 _ROLE_NAME_SELECTOR_RE = re.compile(r'^role=([a-zA-Z]+)(?:\[name="((?:[^"\\]|\\.)*)"\])?(.*)$')
 
 
-def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
+def _selector_text(selector: Any) -> str:
+    return selector.strip() if isinstance(selector, str) else ""
+
+
+def _role_name_from_selector(selector: str | None) -> tuple[str, str] | None:
     """Parse the ``role=<role>[name="<name>"]`` form (ref_to_selector) — TIER 1, no browser read.
 
     Returns (role, accessible_name) when the selector is a plain role/name locator;
     None for bare CSS/xpath or when an engine chain (`>> nth=`) trails the role/name.
     """
-    selector = selector.strip()
+    selector = _selector_text(selector)
     match = _ROLE_NAME_SELECTOR_RE.match(selector)
     if not match:
         return None
@@ -138,13 +142,13 @@ def _role_name_from_selector(selector: str) -> tuple[str, str] | None:
     return role, name
 
 
-async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tuple[str, str] | None:
+async def _capture_accessible_role_name(ctx: AgentContext, selector: str | None) -> tuple[str, str] | None:
     """TIER 2: read the element's role/accessible name for a bare CSS/xpath selector.
 
     A failed read degrades gracefully to None so the selector-only auto-credit
     path (SKY-10712) stays intact.
     """
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector:
         return None
     server = getattr(ctx, "discovery_mcp_server", None)
@@ -173,7 +177,7 @@ async def _capture_accessible_role_name(ctx: AgentContext, selector: str) -> tup
 
 
 async def _resolve_scout_role_name(
-    ctx: AgentContext, selector: str, *, allow_browser_read: bool = True
+    ctx: AgentContext, selector: str | None, *, allow_browser_read: bool = True
 ) -> tuple[str, str]:
     """Resolve (role, accessible_name) for a scouted selector. TIER 1 parse first;
     TIER 2 browser read only for bare CSS/xpath. Always degrades to ("", "").
@@ -181,7 +185,7 @@ async def _resolve_scout_role_name(
     ``allow_browser_read=False`` skips TIER 2 when the action navigated: a post-action
     read against the landing page would capture the wrong element's name, so the bare
     selector is kept verbatim (the synthesizer prefers it anyway)."""
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector:
         return "", ""
     parsed = _role_name_from_selector(selector)
@@ -199,7 +203,7 @@ def _record_scouted_interaction(
     ctx: AgentContext,
     *,
     tool_name: str,
-    selector: str = "",
+    selector: str | None = None,
     source_url: str | None = None,
     value: str = "",
     typed_value: str = "",
@@ -211,7 +215,7 @@ def _record_scouted_interaction(
     credential_field: str = "",
     credential_name: str = "",
 ) -> None:
-    selector = selector.strip()
+    selector = _selector_text(selector)
     # press_key may be page-level, so it is recorded by key even with no selector; other tools require one.
     if tool_name != "press_key" and not selector:
         return
@@ -306,12 +310,12 @@ async def _scout_act_observe_page_evidence(ctx: AgentContext, *, url: str) -> di
 
 
 async def _register_scout_interaction_observation(
-    ctx: AgentContext, *, tool_name: str, selector: str, source_url: str | None, url: str
+    ctx: AgentContext, *, tool_name: str, selector: str | None, source_url: str | None, url: str
 ) -> tuple[int | None, dict[str, Any] | None]:
     # A successful scout interaction reaches the post-action page; record it as an
     # interaction-reached observation so a click-reached block can be authored
     # against it without a separate inspect_page_for_composition.
-    selector = selector.strip()
+    selector = _selector_text(selector)
     if not selector or not url:
         return None, None
     evidence: dict[str, Any] = {
