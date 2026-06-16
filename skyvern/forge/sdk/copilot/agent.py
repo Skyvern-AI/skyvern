@@ -527,7 +527,7 @@ def _synthesized_block_offer_prompt(ctx: CopilotContext | None) -> str:
     if not ctx.scout_trajectory:
         LOG.debug("copilot_synthesized_block_offer_skipped", reason="empty_trajectory")
         return ""
-    synthesized = synthesize_code_block(ctx.scout_trajectory)
+    synthesized = synthesize_code_block(ctx.scout_trajectory, reached_download_target=ctx.reached_download_target)
     if synthesized is None:
         LOG.debug(
             "copilot_synthesized_block_offer_skipped",

@@ -163,8 +163,7 @@ def derive_from_block_outputs(block_outputs_by_label: Any) -> ReachedDownloadTar
 _AUTHOR_DOWNLOAD_GUIDANCE = (
     "A correct click reached a download affordance on the current page. Author ONE terminal "
     "download code block that fires the browser download for the captured target using the "
-    "expect_download idiom (async with page.expect_download() as dl_info: await "
-    "page.click(<selector>)), not a static-fetch request and not another page re-evaluation. "
+    "expect_download idiom, not a static-fetch request and not another page re-evaluation. "
     "The downloaded file is registered to the workflow output surface (downloaded_files); never "
     "place file bytes or URLs in the chat reply."
 )
