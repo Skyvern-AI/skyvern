@@ -1,4 +1,5 @@
 import logging
+import random
 import re
 import sys
 from pathlib import Path
@@ -115,7 +116,7 @@ def add_kv_pairs_to_msg(logger: logging.Logger, method_name: str, event_dict: Ev
     msg_field = event_dict.get("msg", "")
 
     # Add key-value pairs
-    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level"]}
+    kv_pairs = {k: v for k, v in event_dict.items() if k not in ["msg", "timestamp", "level", "sampling"]}
     if kv_pairs:
         additional_info = ", ".join(f"{k}={v}" for k, v in kv_pairs.items())
         msg_field += f" | {additional_info}"
@@ -182,6 +183,29 @@ def skyvern_logs_processor(logger: logging.Logger, method_name: str, event_dict:
         context.log.append(log_entry)
 
     return event_dict
+
+
+def sample_logs_processor(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
+    """Probabilistically drop INFO call sites marked ``sampling=True`` for configured orgs.
+
+    Placed after ``skyvern_logs_processor`` so the full line is still captured in
+    ``context.log`` (persisted to the per-run S3 log artifact); only the stdout /
+    Datadog stream is thinned. The ``sampling`` marker never ships downstream, and
+    WARN/ERROR are never dropped even when marked.
+    """
+    if not event_dict.pop("sampling", False):
+        return event_dict
+    if method_name != "info":
+        return event_dict
+
+    context = skyvern_context.current()
+    organization_id = context.organization_id if context else None
+    if organization_id not in settings.LOG_SAMPLING_ORG_IDS:
+        return event_dict
+
+    if random.random() < settings.LOG_SAMPLING_RATE:
+        return event_dict
+    raise structlog.DropEvent
 
 
 def add_filename_section(logger: logging.Logger, method_name: str, event_dict: EventDict) -> EventDict:
@@ -414,7 +438,7 @@ def setup_logger() -> None:
             structlog.processors.format_exc_info,
         ]
         + additional_processors
-        + [skyvern_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        + [skyvern_logs_processor, sample_logs_processor, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
     )
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -452,3 +476,6 @@ def setup_logger() -> None:
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
     logging.getLogger("websockets.legacy").setLevel(logging.WARNING)
     logging.getLogger("websockets.legacy.server").setLevel(logging.WARNING)
+
+    # Anthropic Bedrock SDK emits high-volume WARN noise; keep only its errors.
+    logging.getLogger("anthropic").setLevel(logging.ERROR)

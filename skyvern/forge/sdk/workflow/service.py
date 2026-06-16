@@ -2129,6 +2129,7 @@ class WorkflowService:
         if script:
             LOG.info(
                 "Loading script blocks for workflow execution",
+                sampling=True,
                 workflow_run_id=workflow_run_id,
                 script_id=script.script_id,
                 script_revision_id=script.script_revision_id,
@@ -2195,6 +2196,7 @@ class WorkflowService:
                                         pinned_ctx.is_static_script = True
                                 LOG.info(
                                     "Successfully loaded script module",
+                                    sampling=True,
                                     script_id=script.script_id,
                                     block_count=len(script_blocks_by_label),
                                 )
@@ -2754,6 +2756,7 @@ class WorkflowService:
             )
             LOG.info(
                 f"Executing root block {block.block_type} at index {block_idx}/{blocks_cnt - 1} for workflow run {workflow_run_id}",
+                sampling=True,
                 block_type=block.block_type,
                 workflow_run_id=workflow_run_id,
                 block_idx=block_idx,
@@ -3131,6 +3134,7 @@ class WorkflowService:
                     )
                     LOG.info(
                         "Executing block via agent",
+                        sampling=True,
                         block_label=block.label,
                         block_type=block.block_type,
                         agent_reason=agent_reason,
@@ -6121,6 +6125,7 @@ class WorkflowService:
         )
         LOG.info(
             "Prepared webhook run status for webhook callback url",
+            sampling=True,
             workflow_id=workflow_id,
             workflow_run_id=workflow_run.workflow_run_id,
             webhook_callback_url=workflow_run.webhook_callback_url,
@@ -6158,6 +6163,7 @@ class WorkflowService:
 
         LOG.info(
             "Sending webhook run status to webhook callback url",
+            sampling=True,
             workflow_id=webhook.workflow_id,
             workflow_run_id=webhook.workflow_run_id,
             webhook_callback_url=webhook.webhook_callback_url,
@@ -6198,6 +6204,7 @@ class WorkflowService:
         if resp.status_code >= 200 and resp.status_code < 300:
             LOG.info(
                 "Webhook sent successfully",
+                sampling=True,
                 workflow_id=webhook.workflow_id,
                 workflow_run_id=webhook.workflow_run_id,
                 resp_code=resp.status_code,
@@ -6787,6 +6794,7 @@ class WorkflowService:
 
         LOG.info(
             "Generate script?",
+            sampling=True,
             block_labels=block_labels,
             code_gen=code_gen,
             workflow_run_id=workflow_run.workflow_run_id,
@@ -6899,6 +6907,7 @@ class WorkflowService:
             if not should_regenerate:
                 LOG.info(
                     "Workflow script already up to date; skipping regeneration",
+                    sampling=True,
                     workflow_id=workflow.workflow_id,
                     workflow_run_id=workflow_run.workflow_run_id,
                     cache_key_value=rendered_cache_key_value,

@@ -1218,12 +1218,15 @@ class LLMAPIHandlerFactory:
                         )
 
                         if prompt_stripped:
-                            LOG.info("Stripped static prompt from cached request to avoid double-billing")
+                            LOG.info(
+                                "Stripped static prompt from cached request to avoid double-billing", sampling=True
+                            )
                         else:
                             LOG.warning("Could not find static prompt to strip from cached request")
 
                     LOG.info(
                         "Adding Vertex AI cache reference to primary Gemini request",
+                        sampling=True,
                         prompt_name=prompt_name,
                         primary_model=main_model_group,
                         fallback_model=llm_config.fallback_model_group,
@@ -1290,6 +1293,7 @@ class LLMAPIHandlerFactory:
                         if not LLMAPIHandlerFactory._models_equivalent(response_model, main_model_group):
                             LOG.info(
                                 "LLM router fallback succeeded",
+                                sampling=True,
                                 llm_key=llm_key,
                                 prompt_name=prompt_name,
                                 primary_model=main_model_group,
@@ -1891,7 +1895,7 @@ class LLMAPIHandlerFactory:
                     )
 
                     if prompt_stripped:
-                        LOG.info("Stripped static prompt from cached request to avoid double-billing")
+                        LOG.info("Stripped static prompt from cached request to avoid double-billing", sampling=True)
                     else:
                         LOG.warning("Could not find static prompt to strip from cached request")
 

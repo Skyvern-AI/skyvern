@@ -76,6 +76,7 @@ class RealBrowserManager(BrowserManager):
         if workflow_run_id and workflow_run_id in self.pages:
             LOG.info(
                 "Browser state for task not found. Using browser state for workflow run",
+                sampling=True,
                 task_id=task_id,
                 workflow_run_id=workflow_run_id,
             )
@@ -232,6 +233,7 @@ class RealBrowserManager(BrowserManager):
         if browser_state is None:
             LOG.info(
                 "Creating browser state for workflow run",
+                sampling=True,
                 workflow_run_id=workflow_run.workflow_run_id,
             )
             proxy_location = workflow_run.proxy_location
@@ -436,7 +438,7 @@ class RealBrowserManager(BrowserManager):
         organization_id: str | None = None,
         child_workflow_run_ids: list[str] | None = None,
     ) -> BrowserState | None:
-        LOG.info("Cleaning up for workflow run")
+        LOG.info("Cleaning up for workflow run", sampling=True)
         browser_state_to_close = self.pages.get(workflow_run_id)
 
         # Pop child workflow_run entries first — these are orphaned because child
@@ -459,6 +461,7 @@ class RealBrowserManager(BrowserManager):
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
+                    sampling=True,
                     workflow_run_id=workflow_run_id,
                 )
 
@@ -501,6 +504,7 @@ class RealBrowserManager(BrowserManager):
             if shared:
                 LOG.info(
                     "Browser state is shared with another workflow run, skipping browser close",
+                    sampling=True,
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
@@ -513,7 +517,7 @@ class RealBrowserManager(BrowserManager):
                     task_id=task_id,
                     workflow_run_id=workflow_run_id,
                 )
-        LOG.info("Workflow run is cleaned up")
+        LOG.info("Workflow run is cleaned up", sampling=True)
 
         if browser_session_id:
             if organization_id:
