@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.code_block_synthesis import (
     _DOWNLOAD_VAR_BASE,
     _MAX_STEPS,
     _SYNTHESIZED_BLOCK_LABEL,
+    CREDENTIAL_FILL_TOOL_NAME,
     build_synthesized_artifact_metadata,
     render_synthesized_offer_text,
     synthesize_code_block,
@@ -203,12 +204,16 @@ class TestActionSynthesis:
             {"key": "coupon_code", "default_value": "example_sku_123"},
         ]
 
-    def test_goto_entry_url_and_load_state(self) -> None:
+    def test_entry_url_is_selector_gated_and_uses_domcontentloaded(self) -> None:
         result = synthesize_code_block([_interaction("click", selector="#go", source_url="https://example.com/start")])
         assert result is not None
         lines = result.code.splitlines()
-        assert lines[0] == '    await page.goto("https://example.com/start")'
-        assert lines[1] == '    await page.wait_for_load_state("load")'
+        assert lines[0] == '    _scout_entry_target = page.locator("#go")'
+        assert lines[1] == "    try:"
+        assert lines[2] == '        await _scout_entry_target.wait_for(state="visible", timeout=1000)'
+        assert lines[3] == "    except Exception:"
+        assert lines[4] == '        await page.goto("https://example.com/start", wait_until="domcontentloaded")'
+        assert lines[5] == '        await _scout_entry_target.wait_for(state="visible")'
 
     def test_press_enter_uses_keyboard_when_no_selector(self) -> None:
         result = synthesize_code_block([_interaction("press_key", key="Enter")])
@@ -268,7 +273,7 @@ class TestParamKeySafety:
     def _emitted_wrapper(code: str, param_keys: list[str]) -> str:
         # Mirror block.py generate_async_user_function: the param keys become the wrapper signature.
         signature = ", ".join(f"{key}=None" for key in param_keys)
-        body = "\n".join(f"    {line.strip()}" for line in code.splitlines())
+        body = "\n".join(f"    {line}" for line in code.splitlines())
         return f"async def wrapper({signature}):\n{body or '    pass'}"
 
     def test_keyword_accessible_name_yields_bindable_identifier(self) -> None:
@@ -518,7 +523,10 @@ class TestTrajectoryFidelity:
 
         assert result is not None
         assert "secret-token-fragment" not in result.code
-        assert 'await page.goto("https://example.com/search?q=provider#__redacted__")' in result.code
+        assert (
+            'await page.goto("https://example.com/search?q=provider#__redacted__", wait_until="domcontentloaded")'
+            in result.code
+        )
         assert metadata["page_dependencies"][0]["url_hint"] == "https://example.com/search?q=provider#__redacted__"
 
 
@@ -579,14 +587,14 @@ class TestStepEmission:
         assert block is not None
         code_lines = block.code.splitlines()
         goto_step, click_step, fill_step, key_step = block.steps
-        assert (goto_step["line_start"], goto_step["line_end"]) == (1, 2)
-        assert code_lines[goto_step["line_start"] - 1].lstrip().startswith("await page.goto(")
-        assert (click_step["line_start"], click_step["line_end"]) == (3, 4)
+        assert (goto_step["line_start"], goto_step["line_end"]) == (1, 6)
+        assert code_lines[goto_step["line_start"] - 1].lstrip().startswith("_scout_entry_target = ")
+        assert (click_step["line_start"], click_step["line_end"]) == (7, 8)
         assert ".click()" in code_lines[click_step["line_start"] - 1]
-        assert (fill_step["line_start"], fill_step["line_end"]) == (5, 5)
+        assert (fill_step["line_start"], fill_step["line_end"]) == (9, 9)
         assert ".fill(" in code_lines[fill_step["line_start"] - 1]
         assert key_step["action_type"] == "keypress"
-        assert (key_step["line_start"], key_step["line_end"]) == (6, 7)
+        assert (key_step["line_start"], key_step["line_end"]) == (10, len(code_lines))
         assert "press" in code_lines[key_step["line_start"] - 1]
         # Spans are contiguous and cover the whole block.
         assert block.steps[0]["line_start"] == 1
@@ -695,9 +703,7 @@ class TestLineBoundaryEscaping:
 
     @staticmethod
     def _parses(code: str) -> ast.Module:
-        wrapper = "async def __wrapper__(payload=None):\n" + "\n".join(
-            f"    {line.strip()}" for line in code.splitlines()
-        )
+        wrapper = "async def __wrapper__(payload=None):\n" + "\n".join(f"    {line}" for line in code.splitlines())
         return ast.parse(wrapper)
 
     def test_accessible_name_boundary_codepoints_keep_block_parseable(self) -> None:
@@ -1167,10 +1173,49 @@ def _download_target(**fields: Any) -> ReachedDownloadTarget:
 
 
 class TestDownloadRungSynthesis:
+    def test_post_auth_resume_skips_login_prefix_without_download_target(self) -> None:
+        result = synthesize_code_block(
+            [
+                _interaction(
+                    CREDENTIAL_FILL_TOOL_NAME,
+                    selector="#user",
+                    source_url="https://example.com/bills",
+                    credential_id="cred_123",
+                    credential_name="mock_portal_login",
+                    credential_field="username",
+                ),
+                _interaction("click", selector="#contBtn"),
+                _interaction(
+                    CREDENTIAL_FILL_TOOL_NAME,
+                    selector="#pass",
+                    credential_id="cred_123",
+                    credential_name="mock_portal_login",
+                    credential_field="password",
+                ),
+                _interaction("click", selector="#signinBtn"),
+                _interaction("click", selector="#current-statement-row"),
+            ],
+        )
+        assert result is not None
+        lines = result.code.splitlines()
+        assert lines[0] == "    _scout_entry_resume_after_auth = False"
+        assert lines[1] == '    _scout_entry_target = page.locator("#user")'
+        assert '        await page.goto("https://example.com/bills", wait_until="domcontentloaded")' in lines
+        assert '            _scout_entry_resume_target = page.locator("#current-statement-row")' in lines
+        assert "                _scout_entry_resume_after_auth = True" in lines
+        assert "    if not _scout_entry_resume_after_auth:" in lines
+        assert '        await page.locator("#user").fill(mock_portal_login.username)' in lines
+        assert '    await page.locator("#current-statement-row").click()' in lines
+        assert "_scout_entry_reused_current_page" not in result.code
+        assert result.parameters == [{"key": "mock_portal_login", "credential_id": "cred_123"}]
+        ast.parse("async def _block(page):\n" + result.code)
+
     def test_appended_terminal_step_compiled_from_typed_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "COPILOT_DOWNLOAD_RUNG_SYNTHESIS_ENABLED", True)
         result = synthesize_code_block([_nav_click()], reached_download_target=_download_target())
         assert result is not None
+        assert "_scout_entry_reused_current_page = False" in result.code
+        assert 'await page.goto("https://example.com/bills", wait_until="domcontentloaded")' in result.code
         assert f"async with page.expect_download() as {_DOWNLOAD_VAR_BASE}:" in result.code
         download_obj = f"{_DOWNLOAD_VAR_BASE}_file"
         assert f"{download_obj} = await {_DOWNLOAD_VAR_BASE}.value" in result.code
