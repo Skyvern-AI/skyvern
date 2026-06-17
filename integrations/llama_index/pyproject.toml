@@ -54,6 +54,7 @@ override-dependencies = [
     # renders prompt templates with an unsandboxed Jinja2 environment (SSTI -> RCE).
     # Pulled in transitively via llama-index-core. Fixed in 2.4.2.
     "banks>=2.4.2",
+    "litellm>=1.84.0",
 ]
 
 [tool.uv.sources]
