@@ -917,6 +917,22 @@ def test_direct_literal_rewrite_preserves_unicode_prefix_offsets() -> None:
     )
 
 
+def test_literal_binding_sees_through_first_last_disambiguator() -> None:
+    code = textwrap.dedent(
+        """
+        await page.locator("input").first.fill("example_sku_123")
+        await page.get_by_role("textbox").last.type("example_sku_123")
+        """
+    ).strip()
+
+    assert workflow_update_module._submitted_fill_type_arguments(code) == ["example_sku_123", "example_sku_123"]
+
+    rewritten, used_keys = workflow_update_module._rewrite_direct_literal_fills(code, {"example_sku_123": "search"})
+    assert used_keys == ["search"]
+    assert 'await page.locator("input").first.fill(str(search))' in rewritten
+    assert 'await page.get_by_role("textbox").last.type(str(search))' in rewritten
+
+
 def test_python_ast_offsets_are_utf8_byte_offsets_for_unicode_source() -> None:
     code = 'await page.locator("#café-search-résumé").fill("example_sku_123")'
     tree = workflow_update_module._wrapped_code_ast(code)

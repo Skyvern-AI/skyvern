@@ -784,6 +784,10 @@ def _wrapped_code_ast(code: str) -> ast.AST | None:
 
 
 def _is_page_locator_expression(value: ast.AST) -> bool:
+    # Peel a trailing `.first`/`.last` (the synthesizer's disambiguator for a bare role/tag selector)
+    # so literal-fill parameter binding still recognizes the underlying page locator.
+    while isinstance(value, ast.Attribute) and value.attr in {"first", "last"}:
+        value = value.value
     if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Attribute):
         return False
     if value.func.attr not in {"locator", "get_by_role"}:
