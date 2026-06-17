@@ -114,6 +114,7 @@ def app_with_routes(repo: TagsRepository, monkeypatch: pytest.MonkeyPatch) -> Fa
 
     app_mock = MagicMock()
     app_mock.DATABASE = database_mock
+    app_mock.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=True)
 
     monkeypatch.setattr(ap, "app", app_mock)
 
@@ -292,6 +293,21 @@ def test_get_tags_includes_standalone_and_grouped(client: TestClient) -> None:
 def test_get_tags_404_when_workflow_not_in_org(client: TestClient) -> None:
     resp = client.get("/v1/workflows/wpid_missing/tags")
     assert resp.status_code == 404
+
+
+def test_tagging_gate_returns_403_when_disabled(client: TestClient) -> None:
+    from skyvern.forge.sdk.routes import agent_protocol as ap
+
+    ap.app.AGENT_FUNCTION.is_workflow_tagging_enabled = AsyncMock(return_value=False)
+    assert client.get(f"/v1/workflows/{WPID}/tags").status_code == 403
+    assert client.get("/v1/tag-keys").status_code == 403
+    assert (
+        client.post(
+            f"/v1/workflows/{WPID}/tags",
+            json={"tags": [{"key": "env", "value": "prod"}]},
+        ).status_code
+        == 403
+    )
 
 
 # ----------------------------- GET /workflows/{wpid}/tags/history --------------------

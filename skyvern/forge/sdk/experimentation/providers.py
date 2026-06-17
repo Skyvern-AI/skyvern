@@ -169,6 +169,7 @@ class BaseExperimentationProvider(ABC):
         self.result_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
         self.variant_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
         self.payload_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
+        self.tri_state_map: TTLCache = TTLCache(maxsize=EXPERIMENTATION_CACHE_MAX_SIZE, ttl=EXPERIMENTATION_CACHE_TTL)
 
     @abstractmethod
     async def _is_feature_enabled(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> bool:
@@ -206,6 +207,36 @@ class BaseExperimentationProvider(ABC):
             resolved_value=feature_flag_value,
         )
         return feature_flag_value
+
+    async def _resolve_feature_flag(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        """Tri-state flag resolution: True/False, or None when the flag is undefined/unknown.
+
+        Base implementation collapses to the boolean resolver; providers that can tell an
+        undefined flag apart from an explicit ``False`` override this to surface ``None``.
+        """
+        return await self._is_feature_enabled(feature_name, distinct_id, properties)
+
+    async def resolve_feature_flag_cached(
+        self, feature_name: str, distinct_id: str, properties: dict | None = None
+    ) -> bool | None:
+        cache_key = _make_cache_key(feature_name, distinct_id, properties)
+        if should_bypass_feature_flag_cache(feature_name):
+            await self._prepare_feature_flag_resolution(feature_name, cached=False)
+            resolved = await self._resolve_feature_flag(feature_name, distinct_id, properties)
+        elif cache_key in self.tri_state_map:
+            resolved = self.tri_state_map[cache_key]
+        else:
+            await self._prepare_feature_flag_resolution(feature_name, cached=True)
+            resolved = await self._resolve_feature_flag(feature_name, distinct_id, properties)
+            self.tri_state_map[cache_key] = resolved
+        record_feature_flag_resolution(
+            feature_name=feature_name,
+            resolution_kind="enabled",
+            resolved_value=resolved,
+        )
+        return resolved
 
     @abstractmethod
     async def _get_value(self, feature_name: str, distinct_id: str, properties: dict | None = None) -> str | None:
