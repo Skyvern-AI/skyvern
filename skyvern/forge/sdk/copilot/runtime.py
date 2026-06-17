@@ -197,6 +197,7 @@ class AgentContext:
     last_failed_workflow_yaml: str | None = None
     code_only_code_schema_seen: bool = False
     code_only_target_page_evidence_seen: bool = False
+    code_native_pending_capability: str | None = None
     repeated_failure_streak_count: int = 0
     repeated_failure_nudge_emitted_at_streak: int = 0
     challenge_gated_proxy_retry_count: int = 0

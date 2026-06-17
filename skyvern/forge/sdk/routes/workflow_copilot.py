@@ -16,6 +16,7 @@ from opentelemetry import trace as otel_trace
 from pydantic import ValidationError
 from sse_starlette import EventSourceResponse
 
+from skyvern import analytics
 from skyvern.config import settings
 from skyvern.constants import DEFAULT_LOGIN_PROMPT
 from skyvern.forge import app
@@ -35,7 +36,7 @@ from skyvern.forge.sdk.copilot.completion_criteria_store import (
     criteria_to_json,
     plan_persistence,
 )
-from skyvern.forge.sdk.copilot.config import CopilotConfig
+from skyvern.forge.sdk.copilot.config import BlockAuthoringPolicy, CopilotConfig, normalize_block_authoring_policy
 from skyvern.forge.sdk.copilot.context import AgentResult, ProposalDisposition, TurnNarrativePayload
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.output_utils import truncate_output
@@ -45,10 +46,15 @@ from skyvern.forge.sdk.copilot.recoverable_failure import (
     format_recoverable_failure_reply,
     merge_failure_into_context,
 )
+from skyvern.forge.sdk.copilot.turn_outcome import (
+    CopilotComposerMode,
+    build_minimal_turn_outcome,
+    with_copilot_code_mode_metadata,
+)
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.routes.event_source_stream import EventSourceStream, FastAPIEventSourceStream
 from skyvern.forge.sdk.routes.routers import base_router
-from skyvern.forge.sdk.schemas.copilot_turn_outcome import TurnOutcome
+from skyvern.forge.sdk.schemas.copilot_turn_outcome import ResponseKind, TurnOutcome
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.workflow_copilot import (
     WorkflowCopilotApplyProposedWorkflowRequest,
@@ -180,6 +186,155 @@ def bind_copilot_session_id(chat_id: str | None) -> Iterator[None]:
         yield
     finally:
         ctx.copilot_session_id = prev
+
+
+COPILOT_CODE_MODE_OPT_OUT_EVENT = "copilot_code_mode_opt_out"
+COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON = "copilot_recoverable_failure"
+
+
+def _effective_copilot_composer_mode(
+    chat_request: WorkflowCopilotChatRequest,
+    *,
+    uses_v2: bool,
+    code_mode_fallback: bool = False,
+) -> CopilotComposerMode:
+    if chat_request.mode == "ask":
+        return "ask"
+    if chat_request.mode == "build":
+        return "code" if chat_request.code_block is True else "build"
+    if uses_v2:
+        if chat_request.code_block is not None:
+            return "code" if chat_request.code_block is True else "build"
+        return "code" if code_mode_fallback else "build"
+    return "ask"
+
+
+def _latest_assistant_turn_outcome(chat_messages: list[WorkflowCopilotChatMessage]) -> TurnOutcome | None:
+    for message in reversed(chat_messages):
+        if message.sender == WorkflowCopilotChatSender.AI and message.turn_outcome is not None:
+            return message.turn_outcome
+    return None
+
+
+def _should_emit_copilot_code_mode_opt_out(
+    *,
+    prior_turn_outcome: TurnOutcome | None,
+    to_mode: CopilotComposerMode,
+    current_code_available: bool,
+) -> bool:
+    if prior_turn_outcome is None:
+        return False
+    from_mode = prior_turn_outcome.copilot_effective_mode
+    if from_mode is None or from_mode == to_mode:
+        return False
+    if from_mode == "code" and to_mode != "code":
+        return True
+    return (
+        from_mode == "build"
+        and to_mode == "ask"
+        and (prior_turn_outcome.copilot_code_available or current_code_available)
+    )
+
+
+def _reason_category_for_copilot_code_mode_opt_out(
+    prior_turn_outcome: TurnOutcome,
+) -> str:
+    if (
+        prior_turn_outcome.copilot_last_code_build_failed
+        or prior_turn_outcome.copilot_repair_ceiling_hit
+        or prior_turn_outcome.terminal_reason == COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON
+    ):
+        return "failure"
+    if prior_turn_outcome.copilot_pending_capability:
+        return "missing_capability"
+    return "confusion"
+
+
+def _capture_copilot_code_mode_opt_out(
+    *,
+    prior_turn_outcome: TurnOutcome | None,
+    to_mode: CopilotComposerMode,
+    current_code_available: bool,
+    workflow_copilot_chat_id: str,
+    workflow_permanent_id: str,
+    organization_id: str,
+    turn_id: str | None,
+) -> None:
+    if prior_turn_outcome is None or not _should_emit_copilot_code_mode_opt_out(
+        prior_turn_outcome=prior_turn_outcome,
+        to_mode=to_mode,
+        current_code_available=current_code_available,
+    ):
+        return
+    try:
+        analytics.capture(
+            COPILOT_CODE_MODE_OPT_OUT_EVENT,
+            data={
+                "from_mode": prior_turn_outcome.copilot_effective_mode,
+                "to_mode": to_mode,
+                "reason_category": _reason_category_for_copilot_code_mode_opt_out(prior_turn_outcome),
+                "last_code_build_failed": prior_turn_outcome.copilot_last_code_build_failed,
+                "repair_ceiling_hit": prior_turn_outcome.copilot_repair_ceiling_hit,
+                "pending_capability": prior_turn_outcome.copilot_pending_capability,
+                "org_id": organization_id,
+                "workflow_permanent_id": workflow_permanent_id,
+                "workflow_copilot_chat_id": workflow_copilot_chat_id,
+                "turn_id": turn_id,
+                "prior_turn_id": prior_turn_outcome.copilot_turn_id,
+            },
+            distinct_id=workflow_copilot_chat_id,
+        )
+    except Exception:
+        LOG.warning(
+            "Failed to capture copilot code mode opt-out event",
+            workflow_copilot_chat_id=workflow_copilot_chat_id,
+            organization_id=organization_id,
+            exc_info=True,
+        )
+
+
+async def _resolve_copilot_code_available(
+    organization_id: str,
+    chat_request: WorkflowCopilotChatRequest,
+) -> bool:
+    try:
+        has_code_block_access = await app.AGENT_FUNCTION.has_code_block_access(organization_id)
+    except Exception:
+        LOG.warning("Failed to resolve copilot code block access", organization_id=organization_id, exc_info=True)
+        return False
+    if not has_code_block_access:
+        return False
+    if chat_request.code_block is not None:
+        return True
+    try:
+        copilot_config = await app.AGENT_FUNCTION.get_copilot_config_for_request(
+            organization_id,
+            code_block_mode=None,
+        )
+    except Exception:
+        LOG.warning("Failed to resolve copilot code mode availability", organization_id=organization_id, exc_info=True)
+        return False
+    return (
+        normalize_block_authoring_policy(getattr(copilot_config, "block_authoring_policy", None))
+        == BlockAuthoringPolicy.CODE_ONLY_BROWSER
+    )
+
+
+def _with_current_copilot_code_mode_metadata(
+    turn_outcome: TurnOutcome | None,
+    *,
+    effective_mode: CopilotComposerMode,
+    code_available: bool,
+    turn_id: str | None,
+) -> TurnOutcome | None:
+    if turn_outcome is None:
+        return None
+    return with_copilot_code_mode_metadata(
+        turn_outcome,
+        effective_mode=effective_mode,
+        code_available=code_available,
+        turn_id=turn_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -381,6 +536,12 @@ def _build_recoverable_route_agent_result(
         clear_proposed_workflow=clear_proposed_workflow,
         turn_id=turn_id,
         narrative_payload=_make_error_narrative_payload(turn_id, turn_index, user_response),
+        turn_outcome=build_minimal_turn_outcome(
+            user_response,
+            response_kind=ResponseKind.RECOVER,
+            reason_code=failure.failure_kind,
+            terminal_reason=COPILOT_RECOVERABLE_FAILURE_TERMINAL_REASON,
+        ),
     )
     _record_recoverable_failure_span_attrs(failure, proposal_disposition="no_proposal")
     return agent_result, failure
@@ -1606,6 +1767,23 @@ async def _new_copilot_chat_post(
         global_llm_context: str | None = None
         terminal_frame_emitted = False
         cancel_watcher: asyncio.Task[None] | None = None
+        current_code_available = False
+        effective_mode = _effective_copilot_composer_mode(chat_request, uses_v2=True)
+        prior_turn_outcome: TurnOutcome | None = None
+
+        def capture_code_mode_opt_out_after_persist() -> None:
+            if chat is None:
+                return
+            _capture_copilot_code_mode_opt_out(
+                prior_turn_outcome=prior_turn_outcome,
+                to_mode=effective_mode,
+                current_code_available=current_code_available,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                workflow_permanent_id=chat.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                turn_id=turn_id,
+            )
+
         # Single-element list used as a closure flag (mutable bool by reference).
         # The watcher sets [0] = True before issuing handler_task.cancel() so the
         # except CancelledError block can distinguish a user-driven cancel from
@@ -1636,6 +1814,16 @@ async def _new_copilot_chat_post(
 
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
+            prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
+            current_code_available = await _resolve_copilot_code_available(
+                organization.organization_id,
+                chat_request,
+            )
+            effective_mode = _effective_copilot_composer_mode(
+                chat_request,
+                uses_v2=True,
+                code_mode_fallback=current_code_available,
             )
             for message in reversed(chat_messages):
                 if message.global_llm_context is not None:
@@ -1790,6 +1978,13 @@ async def _new_copilot_chat_post(
                     stored_completion_criteria=stored_completion_criteria,
                 )
 
+            agent_result.turn_outcome = _with_current_copilot_code_mode_metadata(
+                agent_result.turn_outcome,
+                effective_mode=effective_mode,
+                code_available=current_code_available,
+                turn_id=turn_id,
+            )
+
             if getattr(agent_result, "cancelled", False):
                 # The agent absorbed the CancelledError and returned a result
                 # carrying ``workflow_was_persisted`` so rollback proceeds normally.
@@ -1804,6 +1999,7 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                 )
                 terminal_frame_emitted = True
+                capture_code_mode_opt_out_after_persist()
                 LOG.info(
                     "Workflow copilot v2 cancelled by user",
                     workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -1824,6 +2020,7 @@ async def _new_copilot_chat_post(
                 )
             )
             terminal_frame_emitted = True
+            capture_code_mode_opt_out_after_persist()
         except HTTPException as exc:
             if chat is not None and _should_restore_persisted_workflow(chat.auto_accept, agent_result):
                 try:
@@ -1864,6 +2061,12 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     turn_index=turn_index,
                 )
+                recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
+                    recovered_result.turn_outcome,
+                    effective_mode=effective_mode,
+                    code_available=current_code_available,
+                    turn_id=turn_id,
+                )
                 LOG.error(
                     "LLM provider error translated to recoverable workflow copilot v2 reply",
                     organization_id=organization.organization_id,
@@ -1884,6 +2087,7 @@ async def _new_copilot_chat_post(
                     )
                 )
                 terminal_frame_emitted = True
+                capture_code_mode_opt_out_after_persist()
             else:
                 LOG.error(
                     "LLM provider error (copilot v2)",
@@ -1965,6 +2169,12 @@ async def _new_copilot_chat_post(
                     turn_id=turn_id,
                     turn_index=turn_index,
                 )
+                recovered_result.turn_outcome = _with_current_copilot_code_mode_metadata(
+                    recovered_result.turn_outcome,
+                    effective_mode=effective_mode,
+                    code_available=current_code_available,
+                    turn_id=turn_id,
+                )
                 LOG.error(
                     "Unexpected workflow copilot v2 error translated to recoverable reply",
                     organization_id=organization.organization_id,
@@ -1985,6 +2195,7 @@ async def _new_copilot_chat_post(
                     )
                 )
                 terminal_frame_emitted = True
+                capture_code_mode_opt_out_after_persist()
             else:
                 LOG.error(
                     "Unexpected error in workflow copilot v2",
@@ -2164,6 +2375,7 @@ async def workflow_copilot_chat_post(
         return await _new_copilot_chat_post(request, chat_request, organization)
 
     async def stream_handler(stream: EventSourceStream) -> None:
+        turn_id = uuid.uuid4().hex
         LOG.info(
             "Workflow copilot chat request",
             workflow_copilot_chat_id=chat_request.workflow_copilot_chat_id,
@@ -2197,6 +2409,16 @@ async def workflow_copilot_chat_post(
 
             chat_messages = await app.DATABASE.workflow_params.get_workflow_copilot_chat_messages(
                 workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+            )
+            prior_turn_outcome = _latest_assistant_turn_outcome(chat_messages)
+            current_code_available = await _resolve_copilot_code_available(
+                organization.organization_id,
+                chat_request,
+            )
+            effective_mode = _effective_copilot_composer_mode(
+                chat_request,
+                uses_v2=False,
+                code_mode_fallback=current_code_available,
             )
             global_llm_context = None
             for message in reversed(chat_messages):
@@ -2243,6 +2465,16 @@ async def workflow_copilot_chat_post(
                     debug_run_info_text,
                 )
 
+            legacy_turn_outcome = _with_current_copilot_code_mode_metadata(
+                build_minimal_turn_outcome(
+                    user_response,
+                    response_kind=ResponseKind.CLARIFY if effective_mode == "ask" else ResponseKind.BUILD,
+                ),
+                effective_mode=effective_mode,
+                code_available=current_code_available,
+                turn_id=turn_id,
+            )
+
             if updated_workflow and chat.auto_accept is not True:
                 proposed_data = updated_workflow.model_dump(mode="json")
                 # _copilot_yaml is what /apply-proposed-workflow re-parses into
@@ -2269,8 +2501,18 @@ async def workflow_copilot_chat_post(
                 sender=WorkflowCopilotChatSender.AI,
                 content=user_response,
                 global_llm_context=updated_global_llm_context,
+                turn_outcome=legacy_turn_outcome,
             )
 
+            _capture_copilot_code_mode_opt_out(
+                prior_turn_outcome=prior_turn_outcome,
+                to_mode=effective_mode,
+                current_code_available=current_code_available,
+                workflow_copilot_chat_id=chat.workflow_copilot_chat_id,
+                workflow_permanent_id=chat.workflow_permanent_id,
+                organization_id=organization.organization_id,
+                turn_id=turn_id,
+            )
             terminal_frame_emitted = True
             await stream.send(
                 WorkflowCopilotStreamResponseUpdate(
@@ -2318,7 +2560,7 @@ async def workflow_copilot_chat_post(
                 )
             )
         finally:
-            await _ensure_terminal_frame(stream, terminal_frame_emitted)
+            await _ensure_terminal_frame(stream, terminal_frame_emitted, turn_id=turn_id)
 
     return FastAPIEventSourceStream.create(request, stream_handler)
 

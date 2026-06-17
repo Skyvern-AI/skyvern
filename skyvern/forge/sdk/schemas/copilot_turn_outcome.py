@@ -8,7 +8,7 @@ in any ``copilot/`` business logic — derivation lives in
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,3 +33,9 @@ class TurnOutcome(BaseModel):
     tool_calls: list[str] = Field(default_factory=list)
     terminal_reason: str | None = None
     blocked_signatures: list[str] = Field(default_factory=list)
+    copilot_effective_mode: Literal["ask", "build", "code"] | None = None
+    copilot_code_available: bool = False
+    copilot_last_code_build_failed: bool = False
+    copilot_repair_ceiling_hit: bool = False
+    copilot_pending_capability: str | None = None
+    copilot_turn_id: str | None = None
