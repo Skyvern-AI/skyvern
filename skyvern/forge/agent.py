@@ -4866,7 +4866,7 @@ class ForgeAgent:
             )
 
         await save_task_logs(task.task_id)
-        LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison)
+        LOG.info("Updating task in db", task_id=task.task_id, diff=update_comparison, sampling=True)
         return await app.DATABASE.tasks.update_task(
             task.task_id,
             organization_id=task.organization_id,

@@ -1467,7 +1467,7 @@ async def handle_sequential_click_for_dropdown(
     if len(incremental_elements) == 0:
         return None
 
-    LOG.info("Detected new element after clicking", action=action)
+    LOG.info("Detected new element after clicking", action=action, sampling=True)
     scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
     new_element_ids = set(scraped_page_after_open.id_to_css_dict.keys()) - set(scraped_page.id_to_css_dict.keys())
 
@@ -3863,7 +3863,7 @@ async def choose_auto_completion_dropdown(
             local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
             slim_output=slim_output,
         )
-        LOG.info("Confirm if it's an auto completion dropdown")
+        LOG.info("Confirm if it's an auto completion dropdown", sampling=True)
         json_response = await app.AUTO_COMPLETION_LLM_API_HANDLER(
             prompt=auto_completion_confirm_prompt, step=step, prompt_name="auto-completion-choose-option"
         )
@@ -4598,13 +4598,14 @@ async def select_from_emerging_elements(
         elements=incremental_html,
         local_datetime=datetime.now(skyvern_context.ensure_context().tz_info).isoformat(),
     )
-    LOG.info("Calling LLM to find the match element")
+    LOG.info("Calling LLM to find the match element", sampling=True)
 
     llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(task.llm_key, default=app.LLM_API_HANDLER)
     json_response = await llm_api_handler(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     LOG.info(
         "LLM response for the matched element",
+        sampling=True,
         matched_value=value,
         response=json_response,
     )
@@ -4733,7 +4734,7 @@ async def select_from_dropdown(
         local_datetime=datetime.now(skyvern_context.tz_info).isoformat(),
     )
 
-    LOG.info("Calling LLM to find the match element")
+    LOG.info("Calling LLM to find the match element", sampling=True)
     json_response = await app.CUSTOM_SELECT_AGENT_LLM_API_HANDLER(prompt=prompt, step=step, prompt_name="custom-select")
     value: str | None = json_response.get("value", None)
     single_select_result.value = value
@@ -4742,6 +4743,7 @@ async def select_from_dropdown(
 
     LOG.info(
         "LLM response for the matched element",
+        sampling=True,
         matched_value=value,
         response=json_response,
     )
@@ -5003,6 +5005,7 @@ async def locate_dropdown_menu(
                 await SkyvernElement.create_from_incremental(incremental_scraped, ul_or_listbox_element_id)
                 LOG.info(
                     "Confirm it's an opened dropdown menu since it includes <ul> or <role='listbox'>",
+                    sampling=True,
                     element_id=element_id,
                 )
                 return await SkyvernElement.create_from_incremental(
