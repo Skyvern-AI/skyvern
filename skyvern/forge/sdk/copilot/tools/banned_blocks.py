@@ -176,6 +176,15 @@ def _render_block_policy_detail(block_type: str, policy: CopilotBlockPolicy) -> 
     return f"`{block_type}` is {policy.status.value} and requires {policy.required_capability}. {policy.guidance}"
 
 
+def _record_code_native_pending_capability(ctx: AgentContext | None, policy: CopilotBlockPolicy) -> None:
+    if (
+        ctx is not None
+        and policy.status == CopilotBlockPolicyStatus.CODE_NATIVE_PENDING
+        and ctx.code_native_pending_capability is None
+    ):
+        ctx.code_native_pending_capability = policy.required_capability
+
+
 def _code_only_browser_unavailable_types() -> list[str]:
     return sorted(
         block_type
@@ -273,6 +282,7 @@ def _banned_block_reject_message(items: list[tuple[str, str]], ctx: AgentContext
         if policy_entry is None:
             continue
         _normalized, policy = policy_entry
+        _record_code_native_pending_capability(ctx, policy)
         type_labels = ", ".join(sorted(grouped[block_type]))
         details.append(f"{block_type} [{type_labels}]: {_render_block_policy_detail(block_type, policy)}")
     details_part = " ".join(details)
