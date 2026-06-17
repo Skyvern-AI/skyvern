@@ -29,7 +29,12 @@ def _evaluated_result() -> CompletionVerificationResult:
             CriterionVerdict(
                 criterion_id="c0", state="satisfied", reason_code="evidence_confirms", evidence_ref="cart"
             ),
-            CriterionVerdict(criterion_id="c1", state="unsatisfied", reason_code="no_evidence"),
+            CriterionVerdict(
+                criterion_id="c1",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="block output containing the requested paragraph",
+            ),
         ],
     )
 
@@ -43,6 +48,16 @@ def test_record_completion_verification_populates_evaluated_block() -> None:
     assert snapshot["completion_verification_criterion_count"] == 2
     assert snapshot["completion_verification_satisfied_count"] == 1
     assert snapshot["completion_verification_fully_satisfied"] is False
+    assert snapshot["completion_verification_unmet_criterion_ids"] == ["c1"]
+    assert snapshot["completion_verification_missing_evidence"] == [
+        "c1: block output containing the requested paragraph"
+    ]
+    assert snapshot["completion_verification_verdict_1_criterion_id"] == "c1"
+    assert snapshot["completion_verification_verdict_1_reason_code"] == "no_evidence"
+    assert (
+        snapshot["completion_verification_verdict_1_missing_evidence"]
+        == "block output containing the requested paragraph"
+    )
     assert snapshot["completion_verification_evaluated_on_final_run"] is True
 
 

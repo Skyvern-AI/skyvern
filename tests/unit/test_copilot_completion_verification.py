@@ -105,10 +105,100 @@ def test_coerce_requires_evidence_confirms_for_satisfied() -> None:
     assert result.verdicts[0].satisfied is False
 
 
-def test_coerce_missing_criterion_defaults_to_unknown() -> None:
+def test_coerce_preserves_missing_evidence_for_unmet_verdict() -> None:
+    raw = {
+        "verdicts": [
+            {
+                "criterion_id": "c0",
+                "satisfied": False,
+                "reason_code": "no_evidence",
+                "missing_evidence": "block output containing the extracted first paragraph",
+                "evidence_ref": "extract_example_page",
+            }
+        ]
+    }
+
+    result = _coerce_result(raw, ["c0"])
+
+    assert result.verdicts[0].missing_evidence == "block output containing the extracted first paragraph"
+    trace = result.to_trace_data()
+    assert trace["unmet_criterion_ids"] == ["c0"]
+    assert trace["missing_evidence"] == ["c0: block output containing the extracted first paragraph"]
+    assert trace["verdict_0_criterion_id"] == "c0"
+    assert trace["verdict_0_reason_code"] == "no_evidence"
+    assert trace["verdict_0_missing_evidence"] == "block output containing the extracted first paragraph"
+    assert trace["verdict_0_evidence_ref"] == "extract_example_page"
+
+
+def test_coerce_bounds_and_redacts_missing_evidence_and_evidence_ref() -> None:
+    raw = {
+        "verdicts": [
+            {
+                "criterion_id": "c0",
+                "satisfied": False,
+                "reason_code": "unknown",
+                "evidence_ref": "https://example.test/callback?password=hunter2&token=abc " + ("y" * 700),
+                "missing_evidence": "password: hunter2 " + ("x" * 700),
+            }
+        ]
+    }
+
+    result = _coerce_result(raw, ["c0"])
+
+    missing = result.verdicts[0].missing_evidence
+    assert missing is not None
+    assert "hunter2" not in missing
+    assert len(missing) <= 500
+    evidence_ref = result.verdicts[0].evidence_ref
+    assert evidence_ref is not None
+    assert "hunter2" not in evidence_ref
+    assert "token=abc" not in evidence_ref
+    assert len(evidence_ref) <= 240
+
+
+def test_trace_redacts_direct_missing_evidence_and_evidence_ref_values() -> None:
+    result = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="unknown",
+                missing_evidence="password: hunter2 " + ("x" * 700),
+            )
+        ],
+    )
+
+    trace = result.to_trace_data()
+
+    assert "hunter2" not in trace["missing_evidence"][0]
+    assert "hunter2" not in trace["verdict_0_missing_evidence"]
+    assert len(trace["verdict_0_missing_evidence"]) <= 500
+    trace = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="unknown",
+                evidence_ref="password: hunter2 " + ("z" * 700),
+            )
+        ],
+    ).to_trace_data()
+    assert "hunter2" not in trace["verdict_0_evidence_ref"]
+    assert len(trace["verdict_0_evidence_ref"]) <= 240
+
+
+def test_coerce_missing_criterion_defaults_to_diagnosable_unknown() -> None:
     result = _coerce_result({"verdicts": []}, ["c0", "c1"])
     assert [v.reason_code for v in result.verdicts] == ["unknown", "unknown"]
     assert [v.state for v in result.verdicts] == ["unknown", "unknown"]
+    assert [v.missing_evidence for v in result.verdicts] == [
+        "judge did not return a verdict for this criterion",
+        "judge did not return a verdict for this criterion",
+    ]
     assert result.is_fully_satisfied() is False
 
 
@@ -389,6 +479,53 @@ def test_outcome_unverified_reason_for_unsatisfied_and_unavailable() -> None:
     assert unavailable is not None and "could not be verified" in unavailable
 
 
+def test_outcome_unverified_reason_uses_typed_missing_evidence_not_confirmation_block() -> None:
+    policy = RequestPolicy(completion_criteria=[_criterion("c0", "first paragraph text is reported")])
+    verification = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c0"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c0",
+                state="unsatisfied",
+                reason_code="no_evidence",
+                missing_evidence="block output containing the full first paragraph text",
+            )
+        ],
+    )
+    ctx = SimpleNamespace(request_policy=policy)
+
+    reason = _outcome_unverified_reason(ctx, verification)
+
+    assert reason is not None
+    assert "block output containing the full first paragraph text" in reason
+    assert "confirm" not in reason.lower()
+    assert "confirmation" not in reason.lower()
+    assert "boolean" not in reason.lower()
+
+    ctx.completion_criteria_turn_state = SimpleNamespace(known_good_yaml_available=True)
+    known_good_reason = _outcome_unverified_reason(ctx, verification)
+    assert known_good_reason is not None
+    assert "previously tested revision" in known_good_reason
+    assert "prefer restoring that revision" in known_good_reason
+
+    missing_metadata = CompletionVerificationResult(
+        status="evaluated",
+        criterion_ids=["c_missing"],
+        verdicts=[
+            CriterionVerdict(
+                criterion_id="c_missing",
+                state="unknown",
+                reason_code="unknown",
+                missing_evidence="judge did not return a verdict for this criterion",
+            )
+        ],
+    )
+    missing_metadata_reason = _outcome_unverified_reason(ctx, missing_metadata)
+    assert missing_metadata_reason is not None
+    assert "c_missing: judge did not return a verdict for this criterion" in missing_metadata_reason
+
+
 def _clean_success_result() -> dict:
     return {
         "ok": True,
@@ -458,6 +595,7 @@ def test_tool_visible_result_fails_when_confirmation_block_outcome_unmet() -> No
     assert result["ok"] is True
     assert visible["data"]["overall_status"] == "completed"
     assert visible["data"]["completion_verification"]["fully_satisfied"] is False
+    assert visible["data"]["completion_verification"]["missing_evidence"]
     assert visible["data"]["failure_categories"][0]["category"] == "OUTCOME_UNVERIFIED"
 
 
@@ -491,6 +629,94 @@ def test_record_run_blocks_downgrades_on_contradiction_without_confirmation_bloc
     _record_run_blocks_result(ctx, _clean_success_result(), completion_verification=_contradicted("c0"))
     assert ctx.last_test_suspicious_success is True
     assert ctx.last_full_workflow_test_ok is False
+
+
+def _goto_only_result() -> dict:
+    return {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_goto",
+            "overall_status": "completed",
+            "executed_block_labels": ["open_example"],
+            "current_url": "https://example.com/",
+            "page_title": "Example Domain",
+            "blocks": [
+                {
+                    "label": "open_example",
+                    "block_type": "GOTO_URL",
+                    "status": "completed",
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_goto_only_run_still_fails_extraction_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        return {
+            "verdicts": [
+                {
+                    "criterion_id": "c0",
+                    "satisfied": False,
+                    "reason_code": "no_evidence",
+                    "missing_evidence": "block output containing the requested heading and first paragraph text",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _ctx_with_blocks("goto_url")
+    ctx.request_policy = RequestPolicy(completion_criteria=[_criterion("c0", "heading and paragraph are extracted")])
+
+    verification = await _maybe_run_completion_verification(ctx, _goto_only_result(), time.monotonic())
+    assert verification is not None
+    assert verification.is_fully_satisfied() is False
+
+    _record_run_blocks_result(ctx, _goto_only_result(), completion_verification=verification)
+
+    assert ctx.last_full_workflow_test_ok is False
+    assert getattr(ctx, "last_good_workflow", None) is None
+    assert verified_goal_satisfied_context(ctx) is False
+
+
+@pytest.mark.asyncio
+async def test_structured_blocker_run_skips_completion_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def handler(**_: object) -> dict:
+        raise AssertionError("structured blocker runs must not be sent to the completion judge")
+
+    monkeypatch.setattr(
+        "skyvern.forge.sdk.copilot.tools.completion._completion_verification_handler",
+        _completion_handler_lookup(handler),
+    )
+    ctx = _ctx_with_blocks("code")
+    result = {
+        "ok": True,
+        "data": {
+            "workflow_run_id": "wr_blocked",
+            "overall_status": "completed",
+            "executed_block_labels": ["search"],
+            "current_url": "https://example.com/",
+            "blocks": [
+                {
+                    "label": "search",
+                    "block_type": "CODE",
+                    "status": "completed",
+                    "extracted_data": {
+                        "blocked_by_challenge": True,
+                        "reason": "The submit control stayed disabled by a challenge.",
+                    },
+                }
+            ],
+        },
+    }
+
+    verification = await _maybe_run_completion_verification(ctx, result, time.monotonic())
+
+    assert verification is None
 
 
 def _failed_code_block_result() -> dict:
