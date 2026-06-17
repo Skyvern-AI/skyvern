@@ -143,6 +143,7 @@ import { shouldKeepExistingEdgeForInsertion } from "./workflowInsertion";
 import { constructCacheKeyValue, getInitialParameters } from "./utils";
 import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
 import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
+import { resolveCopilotLiveBrowserReady } from "../copilot/browserReadiness";
 
 import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
@@ -312,6 +313,9 @@ function Workspace({
   }, [initialCopilotMessage, location.pathname, location.search, navigate]);
   const [searchParams] = useSearchParams();
   const cacheKeyValueParam = searchParams.get("cache-key-value");
+  const headlessTurnDrainEnabled = ["1", "true"].includes(
+    (searchParams.get("copilotHeadlessTurnDrain") ?? "").toLowerCase(),
+  );
   const [timelineMode, setTimelineMode] = useState("wide");
   const [page, setPage] = useState(1);
   const [nudge, setNudge] = useState(false);
@@ -650,9 +654,13 @@ function Workspace({
   // readyBrowserSessionId is keyed to the browser session id rather than a
   // bare boolean: when activeDebugSession's id changes, stale ready state
   // from the previous session cannot leak into the next render.
-  const copilotLiveBrowserReady = Boolean(
-    readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
-  );
+  const copilotLiveBrowserReady = resolveCopilotLiveBrowserReady({
+    displayReady: Boolean(
+      readyBrowserSessionId && readyBrowserSessionId === liveBrowserSessionId,
+    ),
+    hasBackendSession: Boolean(liveBrowserSessionId),
+    headlessTurnDrainEnabled,
+  });
 
   const handleLiveBrowserReadyChange = useCallback(
     (ready: boolean, sessionId: string | null) => {
