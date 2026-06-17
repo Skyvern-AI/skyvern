@@ -19,6 +19,7 @@ from skyvern.forge.sdk.copilot.completion_verification import (
 from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
+from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -27,6 +28,7 @@ from ._shared import (
     _copilot_seconds_remaining,
     _current_workflow_block_labels,
     _current_workflow_has_evidence_block,
+    _failed_run_block_labels,
     _is_meaningful_extracted_data,
     _valid_runtime_anchor_url,
 )
@@ -184,6 +186,28 @@ async def _maybe_run_completion_verification_from_page_observation(
 
 _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS = 5.0
 
+_ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
+    {
+        "ACTIVE_RUN_TERMINAL_EVIDENCE",
+        "ANTI_BOT_DETECTION",
+        "AUTH_FAILURE",
+        "BROWSER_ERROR",
+        "CREDENTIAL_ERROR",
+        "INFRASTRUCTURE_ERROR",
+        "NAVIGATION_FAILURE",
+        "PER_TOOL_BUDGET",
+        "PROXY_ERROR",
+    }
+)
+
+_TYPE_ERROR_GENERATED_CALL_MARKERS = (
+    "wait_for_function",
+    "positional argument",
+    "positional arguments",
+    "got an unexpected keyword",
+    "missing 1 required",
+)
+
 
 async def _completion_verification_handler(copilot_ctx: Any) -> Any | None:
     return await resolve_main_copilot_handler(
@@ -228,6 +252,67 @@ def _is_unfinished_run_verification_candidate(copilot_ctx: Any, result: dict[str
     return _valid_runtime_anchor_url(data.get("current_url")) is not None
 
 
+def _failure_category_names(result: dict[str, Any]) -> list[str]:
+    data = result.get("data")
+    data = data if isinstance(data, dict) else {}
+    raw_categories = data.get("failure_categories")
+    if not isinstance(raw_categories, list):
+        return []
+    categories: list[str] = []
+    for item in raw_categories:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        if isinstance(category, str) and category.strip():
+            categories.append(category.strip())
+    return list(dict.fromkeys(categories))
+
+
+def _artifact_health_failure_class(reason: str) -> str | None:
+    lowered = reason.lower()
+    if "syntaxerror" in lowered:
+        return "SyntaxError"
+    if "nameerror" in lowered:
+        return "NameError"
+    if "typeerror" in lowered and any(marker in lowered for marker in _TYPE_ERROR_GENERATED_CALL_MARKERS):
+        return "TypeError"
+    return None
+
+
+def _artifact_health_blocker_from_result(
+    result: dict[str, Any], failure_reasons: list[str] | None = None
+) -> tuple[str | None, list[str], list[str]]:
+    if bool(result.get("ok", False)):
+        return None, [], []
+    categories = _failure_category_names(result)
+    if categories and all(category in _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES for category in categories):
+        return None, [], []
+
+    failure_reasons = list(
+        dict.fromkeys(failure_reasons if failure_reasons is not None else iter_failure_reasons(result))
+    )
+    failure_classes = [
+        failure_class
+        for failure_class in dict.fromkeys(
+            _artifact_health_failure_class(reason) for reason in failure_reasons if isinstance(reason, str)
+        )
+        if failure_class is not None
+    ]
+    if not failure_classes:
+        return None, [], []
+
+    data = result.get("data")
+    data = data if isinstance(data, dict) else {}
+    failed_labels = _failed_run_block_labels(data)
+    label_detail = f" in block(s) {', '.join(failed_labels)}" if failed_labels else ""
+    reason_preview = " ".join(str(failure_reasons[0]).split())[:240] if failure_reasons else "unknown failure"
+    reason = (
+        f"Artifact-health blocker{label_detail}: deterministic generated-code/runtime "
+        f"{'/'.join(failure_classes)} failure: {reason_preview}"
+    )
+    return reason, failed_labels, failure_classes
+
+
 def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> RunEvidenceSnapshot:
     data = result.get("data")
     data = data if isinstance(data, dict) else {}
@@ -250,17 +335,30 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")
     run_id = data.get("workflow_run_id")
+    run_terminal_status = data.get("overall_status")
+    failure_reasons = [" ".join(reason.split()) for reason in iter_failure_reasons(result)]
+    _artifact_reason, artifact_failed_labels, artifact_failure_classes = _artifact_health_blocker_from_result(
+        result,
+        failure_reasons=failure_reasons,
+    )
+    failed_block_labels = artifact_failed_labels or _failed_run_block_labels(data)
     return RunEvidenceSnapshot(
         workflow_run_id=run_id if isinstance(run_id, str) else None,
         block_outputs=block_outputs,
         current_url=_valid_runtime_anchor_url(data.get("current_url")),
         page_title=page_title if isinstance(page_title, str) and page_title.strip() else None,
+        run_terminal_status=run_terminal_status
+        if isinstance(run_terminal_status, str) and run_terminal_status
+        else None,
         executed_block_labels=executed_block_labels,
         verified_context_block_labels=_verified_context_block_labels_for_snapshot(
             copilot_ctx,
             current_label_order,
             executed_block_labels,
         ),
+        failed_block_labels=failed_block_labels,
+        failure_classes=artifact_failure_classes,
+        failure_reasons=failure_reasons,
     )
 
 

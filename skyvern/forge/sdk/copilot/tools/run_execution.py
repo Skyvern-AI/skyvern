@@ -109,6 +109,7 @@ from .blockers import (
     _trusted_post_drain_status,
 )
 from .completion import (
+    _artifact_health_blocker_from_result,
     _emit_completion_verification_trace,
     _maybe_run_completion_verification,
     _outcome_failure_warrants_repair,
@@ -1562,6 +1563,9 @@ def _record_run_blocks_result(
     copilot_ctx.last_full_workflow_test_ok = False
     copilot_ctx.last_unverified_block_labels = _unverified_current_workflow_labels(copilot_ctx)
     copilot_ctx.last_test_failure_reason = None
+    copilot_ctx.last_artifact_health_blocker_reason = None
+    copilot_ctx.last_artifact_health_blocker_labels = []
+    copilot_ctx.last_artifact_health_failure_classes = []
     if completion_verification is not None and completion_verification.status == "evaluated":
         copilot_ctx.last_outcome_gate_reason = _outcome_unverified_reason(copilot_ctx, completion_verification)
         copilot_ctx.last_outcome_gate_workflow_run_id = copilot_ctx.last_run_blocks_workflow_run_id
@@ -1617,6 +1621,19 @@ def _record_run_blocks_result(
         data = result.get("data")
         if isinstance(data, dict):
             data["failure_categories"] = failure_categories
+
+    artifact_reason, artifact_labels, artifact_classes = _artifact_health_blocker_from_result(result)
+    if artifact_reason is not None:
+        copilot_ctx.last_artifact_health_blocker_reason = artifact_reason
+        copilot_ctx.last_artifact_health_blocker_labels = artifact_labels
+        copilot_ctx.last_artifact_health_failure_classes = artifact_classes
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["artifact_health_blocker"] = {
+                "reason": artifact_reason,
+                "failed_block_labels": artifact_labels,
+                "failure_classes": artifact_classes,
+            }
 
     if _active_run_terminal_evidence_detected(result):
         _update_verification_evidence_from_run_result(copilot_ctx, result)

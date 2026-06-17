@@ -874,6 +874,60 @@ class TestVerifiedGoalSatisfiedStop:
         assert adjudication["criteriaLifecycleReason"] == "not_subset"
         assert adjudication["satisfiedCount"] == 2
 
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_success_after_failed_test(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=False,
+            last_full_workflow_test_ok=False,
+            last_artifact_health_blocker_reason=(
+                "Artifact-health blocker in block(s) extract_results: deterministic generated-code/runtime SyntaxError"
+            ),
+            last_artifact_health_blocker_labels=["extract_results"],
+            last_artifact_health_failure_classes=["SyntaxError"],
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "failed"}],
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" in result.user_response.lower()
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_failed_test_when_not_tested(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        ctx = _ctx(
+            last_workflow=None,
+            last_workflow_yaml=None,
+            last_test_ok=None,
+            last_full_workflow_test_ok=False,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" not in result.user_response.lower()
+        assert "not been tested end-to-end" in result.user_response.lower()
+
 
 class TestSupersededAgentIntentGates:
     def test_agent_no_longer_owns_request_policy_classification(self) -> None:

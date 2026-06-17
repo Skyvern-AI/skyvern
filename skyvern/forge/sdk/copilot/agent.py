@@ -65,6 +65,7 @@ from skyvern.forge.sdk.copilot.context import (
     finalize_discovery_counter_in_global_llm_context,
 )
 from skyvern.forge.sdk.copilot.enforcement import (
+    artifact_health_blocked,
     outcome_fully_verified,
     verified_goal_claim_authorized,
 )
@@ -908,6 +909,8 @@ def _shape_ask_question_response(user_response: str, ctx: CopilotContext) -> str
 
 
 def _completion_contract_not_violated(ctx: CopilotContext) -> bool:
+    if artifact_health_blocked(ctx):
+        return False
     result = ctx.completion_verification_result
     if result is None:
         return True
@@ -1180,12 +1183,20 @@ async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_cont
         except Exception as flush_err:
             LOG.warning("copilot_goal_satisfied_tool_result_flush_failed", error=str(flush_err))
     verified_workflow, verified_yaml = _verified_workflow_or_none(ctx)
-    if verified_goal_claim_authorized(ctx):
+    clean_test = ctx.last_test_ok is True and ctx.last_full_workflow_test_ok is True
+    if clean_test and verified_goal_claim_authorized(ctx):
         user_response = "I created and tested the workflow successfully."
-    else:
+    elif clean_test:
         user_response = (
             "I built the workflow and the test run completed, but the goal outcome was not "
             "independently verified. Review the draft to confirm it does what you need."
+        )
+    elif ctx.last_test_ok is False:
+        user_response = "I reached the requested outcome, but the workflow test did not finish successfully."
+    else:
+        user_response = (
+            "I reached the requested outcome, but the workflow has not been tested end-to-end. "
+            "Review the draft before using it."
         )
     final_text, outcome = apply_repeated_reply_guard(
         final_text=user_response,
@@ -1249,7 +1260,7 @@ async def _build_goal_satisfied_exit_result(ctx: CopilotContext, global_llm_cont
             workflow_yaml=verified_yaml,
             workflow_was_persisted=ctx.workflow_persisted,
             total_tokens=ctx.total_tokens_used,
-            proposal_disposition="auto_applicable",
+            proposal_disposition="auto_applicable" if verified_workflow is not None else "no_proposal",
             turn_outcome=outcome,
             turn_id=ctx.turn_id,
             narrative_summary=ctx.narrative_summary,
