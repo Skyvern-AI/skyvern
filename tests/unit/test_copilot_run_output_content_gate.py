@@ -502,6 +502,33 @@ def test_verification_key_counts_as_goal_content_for_code_outputs() -> None:
     assert empty_data_blocks is False
 
 
+def test_anti_bot_value_under_broad_key_trips_code_block_blocker() -> None:
+    # SKY-10916: a broad/descriptive key carrying a real anti-bot phrase is caught
+    # for code outputs even though the key stays out of the strict term set.
+    result = _run_result([_code_block("check_access", {"verification": "verify you are human to continue"})])
+    assert _run_blocks_structured_blocker_message(result) == "verify you are human to continue"
+
+    status_detail = _run_result([_code_block("check_access", {"status_detail": "human verification required"})])
+    assert _run_blocks_structured_blocker_message(status_detail) == "human verification required"
+
+
+def test_descriptive_verification_key_with_benign_value_stays_exempt() -> None:
+    benign = _run_result([_code_block("plan_step", {"verification_method": "fill the login form"})])
+    assert _run_blocks_structured_blocker_message(benign) is None
+
+    boolean_flag = _run_result([_code_block("notify", {"verification_passed": True})])
+    assert _run_blocks_structured_blocker_message(boolean_flag) is None
+
+
+def test_anti_bot_value_scan_gated_on_phrases_not_bare_tokens() -> None:
+    # Extracted business text mentioning ``verification``/``challenge`` must not
+    # false-positive under the phrase-set gate.
+    result = _run_result(
+        [_code_block("summary", {"notes": "we need verification of the challenge results before May"})]
+    )
+    assert _run_blocks_structured_blocker_message(result) is None
+
+
 class _MetadataCtx:
     def __init__(self, metadata: dict) -> None:
         self.code_artifact_metadata = metadata
