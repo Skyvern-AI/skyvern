@@ -323,6 +323,11 @@ def _outcome_criteria_evaluated(ctx: CopilotContext) -> bool:
     return result is not None and result.status == "evaluated"
 
 
+def artifact_health_blocked(ctx: CopilotContext) -> bool:
+    reason = ctx.last_artifact_health_blocker_reason
+    return isinstance(reason, str) and bool(reason.strip())
+
+
 def outcome_fully_verified(ctx: CopilotContext) -> bool:
     """The judge confirmed every outcome criterion from the evidence this run produced.
 
@@ -330,6 +335,8 @@ def outcome_fully_verified(ctx: CopilotContext) -> bool:
     recognized even when it was canceled or only partially completed. Run status must
     never suppress recognition of an outcome the user can observe was achieved.
     """
+    if artifact_health_blocked(ctx):
+        return False
     if not _outcome_criteria_evaluated(ctx):
         return False
     result = ctx.completion_verification_result
@@ -377,6 +384,7 @@ def gate_decision_trace_fields(ctx: CopilotContext) -> dict[str, bool]:
         "gate_last_full_workflow_test_ok": ctx.last_full_workflow_test_ok is True,
         "gate_diagnosis_contract_satisfies_goal": latest_diagnosis_contract_satisfies_goal(ctx),
         "gate_outcome_criteria_evaluated": _outcome_criteria_evaluated(ctx),
+        "gate_artifact_health_blocked": artifact_health_blocked(ctx),
         "gate_likely_needs_more_work": _verified_goal_likely_needs_more_work(ctx),
         "gate_evaluated_this_turn": True,
     }

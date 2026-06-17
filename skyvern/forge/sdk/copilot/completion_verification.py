@@ -126,12 +126,24 @@ class RunEvidenceSnapshot:
     block_outputs: dict[str, Any] = field(default_factory=dict)
     current_url: str | None = None
     page_title: str | None = None
+    run_terminal_status: str | None = None
     executed_block_labels: list[str] = field(default_factory=list)
     verified_context_block_labels: list[str] = field(default_factory=list)
+    failed_block_labels: list[str] = field(default_factory=list)
+    failure_classes: list[str] = field(default_factory=list)
+    failure_reasons: list[str] = field(default_factory=list)
     page_evidence: dict[str, Any] = field(default_factory=dict)
 
     def has_evidence(self) -> bool:
-        return bool(self.block_outputs or self.current_url or self.page_title or self.page_evidence)
+        return bool(
+            self.block_outputs
+            or self.current_url
+            or self.page_title
+            or self.failed_block_labels
+            or self.failure_classes
+            or self.failure_reasons
+            or self.page_evidence
+        )
 
     def render_prompt_block(self) -> str:
         lines: list[str] = []
@@ -141,12 +153,23 @@ class RunEvidenceSnapshot:
             lines.append(f"observed_end_state_url: {self.current_url}")
         if self.page_title:
             lines.append(f"observed_end_state_page_title: {self.page_title}")
+        if self.run_terminal_status:
+            lines.append(f"run_terminal_status: {self.run_terminal_status}")
         if self.verified_context_block_labels:
             lines.append(
                 "verified_context_block_labels: " + ", ".join(self.verified_context_block_labels[:_MAX_BLOCK_OUTPUTS])
             )
         if self.executed_block_labels:
             lines.append("executed_block_labels: " + ", ".join(self.executed_block_labels[:_MAX_BLOCK_OUTPUTS]))
+        if self.failed_block_labels:
+            lines.append("failed_block_labels: " + ", ".join(self.failed_block_labels[:_MAX_BLOCK_OUTPUTS]))
+        if self.failure_classes:
+            lines.append("failure_classes: " + ", ".join(self.failure_classes[:_MAX_BLOCK_OUTPUTS]))
+        if self.failure_reasons:
+            lines.append("failure_reasons:")
+            for reason in self.failure_reasons[:_MAX_BLOCK_OUTPUTS]:
+                rendered_reason = " ".join(str(reason).split())[:_EVIDENCE_VALUE_MAX_CHARS]
+                lines.append(f"  - {rendered_reason}")
         if self.block_outputs:
             lines.append("produced_block_outputs:")
             for label, payload in list(self.block_outputs.items())[:_MAX_BLOCK_OUTPUTS]:

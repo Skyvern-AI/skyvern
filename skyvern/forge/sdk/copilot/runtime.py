@@ -223,6 +223,9 @@ class AgentContext:
     last_good_workflow: Any | None = None
     last_good_workflow_yaml: str | None = None
     last_run_blocks_workflow_run_id: str | None = None
+    last_artifact_health_blocker_reason: str | None = None
+    last_artifact_health_blocker_labels: list[str] = field(default_factory=list)
+    last_artifact_health_failure_classes: list[str] = field(default_factory=list)
     last_run_blocks_block_ids: list[str] = field(default_factory=list)
     last_run_blocks_block_labels: list[str] = field(default_factory=list)
     last_run_outcome: RecordedRunOutcome | None = None
