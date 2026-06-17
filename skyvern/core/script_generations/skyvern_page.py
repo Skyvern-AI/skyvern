@@ -554,6 +554,12 @@ class SkyvernPage(Page):
             timeout = kwargs.pop("timeout", settings.BROWSER_ACTION_TIMEOUT_MS)
             locator = self._locator_scope.locator(selector).first
             await locator.fill(value, timeout=timeout, **kwargs)
+            # locator.fill already emits `input`; only the change/blur a JS gate may also need are missing.
+            for event_name in ("change", "blur"):
+                try:
+                    await locator.dispatch_event(event_name, timeout=timeout)
+                except Exception:
+                    LOG.debug("direct fill: dispatch_event failed", dispatched_event=event_name, exc_info=True)
             return value
 
         # Backward compatibility
