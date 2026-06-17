@@ -525,6 +525,58 @@ class Block(BaseModel, abc.ABC):
         else:
             browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
 
+        # A reused browser state (a persistent debug session shared with the copilot, or a
+        # cached workflow-run browser) can have a dead Playwright driver after a prior owner
+        # stopped it — reusing it makes the block's first page.goto raise "Connection closed
+        # while reading from the driver". Rebuild a fresh connection to the same browser first.
+        if browser_state is not None and not browser_state.is_connected():
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            # Reconnect to the session's own remote browser, never the run's (possibly pooled)
+            # browser_address. get_browser_address_if_ready resolves a dead session to None
+            # instead of blocking on the workflow query, so a missing address aborts fast.
+            if browser_session_id and organization_id:
+                try:
+                    browser_address = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_address_if_ready(
+                        session_id=browser_session_id, organization_id=organization_id
+                    )
+                except Exception:
+                    browser_address = None
+                if not browser_address:
+                    LOG.warning(
+                        "No session browser address available to reconnect; aborting browser setup",
+                        workflow_run_id=workflow_run_id,
+                        browser_session_id=browser_session_id,
+                    )
+                    return None
+            else:
+                browser_address = workflow_run.browser_address
+            try:
+                await browser_state.reconnect(
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    workflow_permanent_id=workflow_run.workflow_permanent_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    cdp_connect_headers=workflow_run.cdp_connect_headers,
+                    browser_address=browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+                LOG.info(
+                    "Rebuilt a disconnected browser state before block execution",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to rebuild disconnected browser state",
+                    workflow_run_id=workflow_run_id,
+                    browser_session_id=browser_session_id,
+                )
+                return None
+
         if not browser_state:
             workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
                 workflow_run_id=workflow_run_id,
