@@ -452,6 +452,194 @@ workflow_definition:
         assert "verified block(s): extract_results" in rewritten
         assert "per-tool budget hit on: search_registry" in rewritten
 
+    def test_coverage_complete_adjudication_failure_drops_chain_coverage_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        failure_reason = (
+            "The run completed but did not demonstrate the goal outcome(s): "
+            "workflow title is 'Example Heading Extractor v2'. Add an end-state confirmation."
+        )
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_main_heading", "open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason=failure_reason,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("I verified the workflow end-to-end.", ctx)
+
+        assert "verified part of it" not in rewritten
+        assert "verified block(s)" not in rewritten
+        assert "extract_main_heading" in rewritten
+        assert "open_example_page" in rewritten
+        assert failure_reason in rewritten
+
+    def test_coverage_complete_appends_ellipsis_when_blocks_exceed_cap(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        blocks = [f"block_{i}" for i in range(8)]
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=blocks,
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason="The run completed but did not demonstrate the goal outcome(s): title check.",
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "ran all 8 blocks" in rewritten
+        assert "block_0, block_1, block_2, block_3, block_4, block_5, ..." in rewritten
+        assert "block_6" not in rewritten
+
+    def test_partial_frame_appends_ellipsis_when_unverified_blocks_exceed_cap(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[f"block_{i}" for i in range(7)],
+                per_tool_budget_on_block=[],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "unverified block(s): block_0, block_1, block_2, block_3, block_4, block_5, ..." in rewritten
+
+    def test_genuinely_partial_via_unverified_blocks_keeps_existing_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=["extract_main_heading"],
+                per_tool_budget_on_block=[],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "unverified block(s): extract_main_heading" in rewritten
+
+    def test_genuinely_partial_via_per_tool_budget_keeps_existing_frame(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=["search_block"],
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" in rewritten
+        assert "per-tool budget hit on: search_block" in rewritten
+
+    def test_coverage_complete_without_failure_reason_uses_no_details_fallback(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason=None,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "verified part of it" not in rewritten
+        assert "verified block(s): open_example_page" not in rewritten
+        assert "keep the draft" in rewritten.lower()
+
+    def test_empty_detail_evidence_keeps_bare_fallback(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        ctx = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                test_attempted_but_incomplete=True,
+            ),
+        )
+
+        rewritten = _rewrite_failed_test_response("done", ctx)
+
+        assert "full workflow chain has not been verified end-to-end" in rewritten
+        assert "verified part of it" not in rewritten
+        assert "verified block(s)" not in rewritten
+
+    def test_no_frame_asserts_end_to_end_verified_while_unverified(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _rewrite_failed_test_response
+
+        # Frame A renders execution vocabulary only; the word "verified" must never appear.
+        ctx_a = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["extract_main_heading", "open_example_page"],
+                unverified_block_labels=[],
+                per_tool_budget_on_block=[],
+                failure_reason="The run completed but did not demonstrate the goal outcome(s): title check.",
+            ),
+        )
+        reply_a = _rewrite_failed_test_response("done", ctx_a)
+        assert "ran all 2 blocks" in reply_a
+        assert "verified" not in reply_a.lower()
+
+        # Frame B keeps the partial frame; its only end-to-end claim is the truthful negation.
+        ctx_b = _ctx(
+            last_workflow=object(),
+            last_workflow_yaml="title: drafted",
+            last_test_ok=True,
+            last_full_workflow_test_ok=False,
+            workflow_verification_evidence=WorkflowVerificationEvidence(
+                block_verified=["open_example_page"],
+                unverified_block_labels=["extract_main_heading"],
+                per_tool_budget_on_block=[],
+            ),
+        )
+        reply_b = _rewrite_failed_test_response("done", ctx_b)
+        assert "verified part of it" in reply_b
+        assert "has not been verified end-to-end" in reply_b
+
     def test_runtime_verification_evidence_prompt_surfaces_state_for_agent(self) -> None:
         ctx = _ctx(
             workflow_verification_evidence=WorkflowVerificationEvidence(
@@ -685,6 +873,60 @@ class TestVerifiedGoalSatisfiedStop:
         assert adjudication["criteriaEpoch"] == 2
         assert adjudication["criteriaLifecycleReason"] == "not_subset"
         assert adjudication["satisfiedCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_success_after_failed_test(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        workflow = object()
+        ctx = _ctx(
+            last_workflow=workflow,
+            last_workflow_yaml="workflow_definition:\n  blocks: []\n",
+            last_test_ok=False,
+            last_full_workflow_test_ok=False,
+            last_artifact_health_blocker_reason=(
+                "Artifact-health blocker in block(s) extract_results: deterministic generated-code/runtime SyntaxError"
+            ),
+            last_artifact_health_blocker_labels=["extract_results"],
+            last_artifact_health_failure_classes=["SyntaxError"],
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+            tool_activity=[{"tool": "update_and_run_blocks", "summary": "failed"}],
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" in result.user_response.lower()
+        assert result.updated_workflow is None
+        assert result.proposal_disposition == "no_proposal"
+
+    @pytest.mark.asyncio
+    async def test_goal_satisfied_exit_result_does_not_claim_failed_test_when_not_tested(self) -> None:
+        from skyvern.forge.sdk.copilot.agent import _build_goal_satisfied_exit_result
+        from skyvern.forge.sdk.copilot.completion_verification import CompletionVerificationResult, CriterionVerdict
+
+        ctx = _ctx(
+            last_workflow=None,
+            last_workflow_yaml=None,
+            last_test_ok=None,
+            last_full_workflow_test_ok=False,
+            completion_verification_result=CompletionVerificationResult(
+                status="evaluated",
+                criterion_ids=["c0"],
+                verdicts=[CriterionVerdict(criterion_id="c0", state="satisfied", reason_code="evidence_confirms")],
+            ),
+        )
+
+        result = await _build_goal_satisfied_exit_result(ctx, global_llm_context=None)
+
+        assert "tested successfully" not in result.user_response.lower()
+        assert "did not finish successfully" not in result.user_response.lower()
+        assert "not been tested end-to-end" in result.user_response.lower()
 
 
 class TestSupersededAgentIntentGates:
