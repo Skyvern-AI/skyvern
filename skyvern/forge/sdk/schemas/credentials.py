@@ -203,6 +203,24 @@ class CredentialResponse(BaseModel):
     )
 
 
+class OnePasswordItemOverview(BaseModel):
+    """Response model for 1Password item metadata."""
+
+    item_id: str = Field(..., description="The 1Password item ID")
+    title: str = Field(..., description="The 1Password item title")
+    vault_id: str = Field(..., description="The ID of the vault containing the item")
+    vault_name: str = Field(..., description="The name of the vault containing the item")
+    category: str = Field(..., description="The 1Password item category")
+    url: str | None = Field(default=None, description="The primary website URL associated with the item, if any")
+
+
+class OnePasswordItemsResponse(BaseModel):
+    """Response model for listing 1Password item metadata."""
+
+    configured: bool = Field(..., description="Whether a 1Password service account token is configured")
+    items: list[OnePasswordItemOverview] = Field(..., description="The available 1Password item metadata")
+
+
 class Credential(BaseModel):
     """Database model for credentials."""
 

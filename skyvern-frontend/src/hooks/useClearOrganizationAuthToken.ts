@@ -7,6 +7,7 @@ import { useCredentialGetter } from "./useCredentialGetter";
 type ClearOrganizationAuthTokenOptions = {
   providerPath: string;
   queryKey: string;
+  invalidateQueryKeys?: string[];
   successDescription: string;
   errorDescription: string;
 };
@@ -14,6 +15,7 @@ type ClearOrganizationAuthTokenOptions = {
 export function useClearOrganizationAuthToken({
   providerPath,
   queryKey,
+  invalidateQueryKeys,
   successDescription,
   errorDescription,
 }: ClearOrganizationAuthTokenOptions) {
@@ -33,6 +35,9 @@ export function useClearOrganizationAuthToken({
     onSuccess: () => {
       queryClient.setQueryData([queryKey], null);
       queryClient.invalidateQueries({ queryKey: [queryKey] });
+      (invalidateQueryKeys ?? []).forEach((key) => {
+        queryClient.invalidateQueries({ queryKey: [key] });
+      });
       toast({
         title: "Success",
         description: successDescription,

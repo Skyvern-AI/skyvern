@@ -249,6 +249,20 @@ export type OnePasswordTokenApiResponse = {
   valid: boolean;
 };
 
+export type OnePasswordItemApiResponse = {
+  item_id: string;
+  title: string;
+  vault_id: string;
+  vault_name: string;
+  category: string;
+  url?: string | null;
+};
+
+export type OnePasswordItemsApiResponse = {
+  configured: boolean;
+  items: Array<OnePasswordItemApiResponse>;
+};
+
 export type CreateOnePasswordTokenRequest = {
   token: string;
 };

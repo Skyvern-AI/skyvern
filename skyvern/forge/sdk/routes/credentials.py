@@ -31,6 +31,7 @@ from typing import Annotated
 
 import structlog
 from fastapi import BackgroundTasks, Body, Depends, Header, HTTPException, Path, Query
+from onepassword.client import Client as OnePasswordClient
 
 from skyvern.config import settings
 from skyvern.exceptions import HttpException as SkyvernHttpException
@@ -68,6 +69,8 @@ from skyvern.forge.sdk.schemas.credentials import (
     CredentialVaultType,
     CreditCardCredentialResponse,
     NonEmptyPasswordCredential,
+    OnePasswordItemOverview,
+    OnePasswordItemsResponse,
     PasswordCredentialResponse,
     SecretCredentialResponse,
     TestCredentialRequest,
@@ -1835,6 +1838,83 @@ async def get_onepassword_token(
             status_code=500,
             detail=f"Failed to get OnePassword service account token: {str(e)}",
         )
+
+
+@base_router.get(
+    "/credentials/onepassword/items",
+    response_model=OnePasswordItemsResponse,
+    summary="List 1Password item metadata",
+    description="Lists 1Password item metadata for the current organization.",
+    include_in_schema=False,
+)
+@base_router.get(
+    "/credentials/onepassword/items/",
+    response_model=OnePasswordItemsResponse,
+    include_in_schema=False,
+)
+async def list_onepassword_items(
+    current_org: Organization = Depends(org_auth_service.get_current_org),
+) -> OnePasswordItemsResponse:
+    org_auth_token = await app.DATABASE.organizations.get_valid_org_auth_token(
+        current_org.organization_id,
+        OrganizationAuthTokenType.onepassword_service_account.value,
+    )
+    # Org-scoped only: never fall back to the global OP_SERVICE_ACCOUNT_TOKEN here. In a shared
+    # deployment that would let any org without its own token browse the instance/global account's
+    # 1Password item metadata. (Runtime resolution may still use the global token for an item the
+    # org explicitly configured by vault/item id; listing must not.)
+    if not org_auth_token:
+        return OnePasswordItemsResponse(configured=False, items=[])
+    token = org_auth_token.token
+
+    try:
+        client = await OnePasswordClient.authenticate(
+            auth=token,
+            integration_name="Skyvern",
+            integration_version="v1.0.0",
+        )
+        vaults = await client.vaults.list()
+        # Skip vaults the service-account token can't read instead of failing the whole listing.
+        vault_items_by_vault = await asyncio.wait_for(
+            asyncio.gather(
+                *(client.items.list(vault.id) for vault in vaults),
+                return_exceptions=True,
+            ),
+            timeout=20.0,
+        )
+
+        items: list[OnePasswordItemOverview] = []
+        for vault, vault_items in zip(vaults, vault_items_by_vault, strict=True):
+            if isinstance(vault_items, BaseException):
+                LOG.warning(
+                    "Skipping inaccessible 1Password vault while listing items",
+                    organization_id=current_org.organization_id,
+                    vault_id=vault.id,
+                    error=str(vault_items),
+                )
+                continue
+            # Metadata only: never fetch item field values.
+            for item in vault_items:
+                items.append(
+                    OnePasswordItemOverview(
+                        item_id=item.id,
+                        title=item.title,
+                        vault_id=vault.id,
+                        vault_name=vault.title,
+                        category=item.category.value,
+                        url=item.websites[0].url if item.websites else None,
+                    )
+                )
+
+        return OnePasswordItemsResponse(configured=True, items=items)
+    except Exception as e:
+        LOG.error(
+            "Failed to list 1Password items",
+            organization_id=current_org.organization_id,
+            error=str(e),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=502, detail="Failed to list 1Password items") from e
 
 
 @base_router.post(
