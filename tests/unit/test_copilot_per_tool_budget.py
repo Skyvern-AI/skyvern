@@ -394,9 +394,8 @@ def test_failure_signature_is_stable_across_budget_trips_with_different_run_ids(
     assert sig_a == sig_b
 
 
-def test_failure_signature_changes_when_frontier_label_differs() -> None:
-    """A budget trip on a different frontier should still produce a different
-    signature so the streak resets when the agent meaningfully changes shape."""
+def test_failure_signature_ignores_frontier_label_drift() -> None:
+    """Block labels are UI/editing affordances, not root-cause identity."""
     failure_categories = [{"category": PER_TOOL_BUDGET_FAILURE_CATEGORY, "confidence_float": 1.0}]
     sig_a = compute_failure_signature(
         frontier_start_label="block_a",
@@ -410,7 +409,8 @@ def test_failure_signature_changes_when_frontier_label_differs() -> None:
         failure_categories=failure_categories,
         suspicious_success=False,
     )
-    assert sig_a != sig_b
+    assert sig_a is not None
+    assert sig_a == sig_b
 
 
 def test_nudge_text_advises_splitting_chain() -> None:

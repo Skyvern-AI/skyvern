@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from skyvern.forge.sdk.copilot.failure_tracking import ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY
+from skyvern.forge.sdk.copilot.failure_tracking import (
+    ACTIVE_RUN_TERMINAL_EVIDENCE_FAILURE_CATEGORY,
+    RepairRootCauseIdentity,
+    compute_repair_root_cause_signature,
+)
 from skyvern.forge.sdk.copilot.output_policy import url_origin
 from skyvern.forge.sdk.copilot.request_policy import redact_raw_secrets_for_prompt
 from skyvern.forge.sdk.copilot.workflow_credential_utils import URL_CANDIDATE_RE
@@ -65,6 +69,7 @@ class DiagnosisInput(StrictModel):
 class DiagnosisResult(StrictModel):
     suspected_failure_type: DiagnosisFailureType = DiagnosisFailureType.UNKNOWN
     root_cause_summary: str = ""
+    root_cause_identity: RepairRootCauseIdentity = Field(default_factory=RepairRootCauseIdentity)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_references: list[str] = Field(default_factory=list)
     missing_context: list[str] = Field(default_factory=list)
@@ -99,8 +104,15 @@ class DiagnosisRepairContract(StrictModel):
     repair_loop_state: RepairLoopState = Field(default_factory=RepairLoopState)
 
     def to_trace_data(self) -> dict[str, Any]:
+        identity = self.diagnosis_result.root_cause_identity
         return {
             "failure_type": self.diagnosis_result.suspected_failure_type.value,
+            "root_cause_signature": identity.root_cause_signature,
+            "root_cause_primary_category": identity.primary_category,
+            "root_cause_categories": list(identity.failure_categories),
+            "root_cause_error_class": identity.error_class,
+            "root_cause_selector_kind": identity.selector_kind,
+            "root_cause_selector": identity.selector,
             "next_action": self.repair_decision.next_action.value,
             "confidence": self.diagnosis_result.confidence,
             "source_tool": self.diagnosis_input.source_tool,
@@ -136,6 +148,13 @@ def build_diagnosis_repair_contract(
     run_status = _safe_str(data.get("overall_status"))
     workflow_run_id = _safe_str(data.get("workflow_run_id"))
     summary = _failure_summary(result, data, blocks)
+    root_cause_identity = compute_repair_root_cause_signature(
+        failure_categories=categories,
+        failure_reason=_safe_str(data.get("failure_reason")),
+        error_texts=[_safe_str(result.get("error"))],
+        blocks=[block for block in blocks if isinstance(block, dict)],
+        detected_challenge=bool(getattr(ctx, "last_test_anti_bot", None)),
+    )
     failure_type = _failure_type(run_ok, suspicious, failed_blocks, categories, result, data)
     next_action = _next_action(failure_type, ctx, data)
     frontier = _safe_str(data.get("frontier_start_label"))
@@ -207,6 +226,7 @@ def build_diagnosis_repair_contract(
         diagnosis_result=DiagnosisResult(
             suspected_failure_type=failure_type,
             root_cause_summary=summary,
+            root_cause_identity=root_cause_identity,
             confidence=confidence,
             evidence_references=(
                 ([f"workflow_run:{workflow_run_id}"] if workflow_run_id else [])

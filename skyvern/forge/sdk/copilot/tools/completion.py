@@ -20,6 +20,7 @@ from skyvern.forge.sdk.copilot.enforcement import _goal_likely_needs_more_blocks
 from skyvern.forge.sdk.copilot.llm_config import resolve_main_copilot_handler
 from skyvern.forge.sdk.copilot.outcome_verification_trace import record_completion_verification
 from skyvern.forge.sdk.copilot.output_utils import iter_failure_reasons
+from skyvern.forge.sdk.copilot.reached_download_target import REGISTERED_DOWNLOAD_OUTPUT_KEYS
 from skyvern.forge.sdk.copilot.request_policy import CompletionCriterion
 from skyvern.forge.sdk.copilot.tracing_setup import copilot_span
 
@@ -185,6 +186,46 @@ async def _maybe_run_completion_verification_from_page_observation(
 
 
 _COMPLETION_VERIFICATION_BUDGET_MARGIN_SECONDS = 5.0
+_DOWNLOAD_EVIDENCE_FILE_NAME_KEYS = ("filename", "file_name", "name", "path")
+_MAX_EVIDENCE_FILE_NAMES = 5
+
+
+def _download_file_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in _DOWNLOAD_EVIDENCE_FILE_NAME_KEYS:
+            if name := _download_file_name(value.get(key)):
+                return name
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    name = value.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1].strip()
+    return name or None
+
+
+def _completion_evidence_payload(output: Any) -> Any:
+    if not isinstance(output, dict) or not any(output.get(key) for key in REGISTERED_DOWNLOAD_OUTPUT_KEYS):
+        return output
+    names: list[str] = []
+    if name := _download_file_name(output.get("downloaded_file_name")):
+        names.append(name)
+    files = output.get("downloaded_files")
+    if isinstance(files, list):
+        names.extend(name for item in files[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
+    urls = output.get("downloaded_file_urls")
+    if isinstance(urls, list):
+        names.extend(name for item in urls[:_MAX_EVIDENCE_FILE_NAMES] if (name := _download_file_name(item)))
+    payload: dict[str, Any] = {"download_registered": True}
+    if isinstance(files, list):
+        payload["downloaded_file_count"] = len(files)
+    if isinstance(urls, list):
+        payload["downloaded_file_url_count"] = len(urls)
+    artifacts = output.get("downloaded_file_artifact_ids")
+    if isinstance(artifacts, list):
+        payload["downloaded_file_artifact_count"] = len(artifacts)
+    if names:
+        payload["downloaded_file_names"] = list(dict.fromkeys(names))[:_MAX_EVIDENCE_FILE_NAMES]
+    return payload
+
 
 _ARTIFACT_HEALTH_EXCLUDED_CATEGORIES = frozenset(
     {
@@ -329,8 +370,9 @@ def _build_run_evidence_snapshot(copilot_ctx: Any, result: dict[str, Any]) -> Ru
                 continue
             label = block.get("label")
             output = block.get("extracted_data")
-            if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(output):
-                block_outputs[label] = output
+            evidence_output = _completion_evidence_payload(output)
+            if isinstance(label, str) and label in current_labels and _is_meaningful_extracted_data(evidence_output):
+                block_outputs[label] = evidence_output
     executed = data.get("executed_block_labels")
     executed_block_labels = [str(label) for label in executed] if isinstance(executed, list) else []
     page_title = data.get("page_title")

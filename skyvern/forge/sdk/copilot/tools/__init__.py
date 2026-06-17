@@ -352,6 +352,12 @@ async def update_workflow_tool(
         )
         _record_workflow_update_result(copilot_ctx, result, prior_definition)
         record_tool_step_result_for_ctx(copilot_ctx, "update_workflow", arguments, result)
+        if result.get("ok") is False:
+            _record_diagnosis_repair_contract(
+                copilot_ctx,
+                source_tool="update_workflow",
+                result=result,
+            )
     sanitized = sanitize_tool_result_for_llm("update_workflow", result)
     return json.dumps(sanitized)
 
