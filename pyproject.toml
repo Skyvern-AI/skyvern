@@ -14,7 +14,7 @@ dependencies = [
     "orjson>=3.9.10,<4",
     "structlog>=23.2.0,<24",
     "typer>=0.16.0,<0.26",
-    "click>=8,<8.2",
+    "click>=8,<9",
     "httpx[socks]>=0.27.0",
     "rich>=13.7.0,<14",
 ]

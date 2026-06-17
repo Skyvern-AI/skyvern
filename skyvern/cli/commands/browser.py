@@ -53,16 +53,17 @@ from skyvern.cli.core.guards import (
 from skyvern.cli.core.ngrok import check_ngrok_auth, detect_ngrok, offer_install_ngrok, offer_setup_auth
 from skyvern.cli.core.session_ops import do_session_close, do_session_create, do_session_list
 from skyvern.cli.core.telemetry import capture_cli_tool_call
+from skyvern.cli.lazy import SkyvernTyperGroup
 from skyvern.cli.mcp_tools.browser import skyvern_login as tool_login
 from skyvern.cli.mcp_tools.browser import skyvern_run_task as tool_run_task
 from skyvern.cli.mcp_tools.inspection import skyvern_har_start, skyvern_har_stop
 
-browser_app = typer.Typer(help="Browser automation commands.", no_args_is_help=True)
-session_app = typer.Typer(help="Manage browser sessions.", no_args_is_help=True)
-frame_app = typer.Typer(help="Manage iframe context.", no_args_is_help=True)
-state_app = typer.Typer(help="Save and load browser auth state.", no_args_is_help=True)
-storage_app = typer.Typer(help="Read, write, and clear web storage.", no_args_is_help=True)
-network_app = typer.Typer(help="Network inspection and interception.", no_args_is_help=True)
+browser_app = typer.Typer(cls=SkyvernTyperGroup, help="Browser automation commands.", no_args_is_help=True)
+session_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage browser sessions.", no_args_is_help=True)
+frame_app = typer.Typer(cls=SkyvernTyperGroup, help="Manage iframe context.", no_args_is_help=True)
+state_app = typer.Typer(cls=SkyvernTyperGroup, help="Save and load browser auth state.", no_args_is_help=True)
+storage_app = typer.Typer(cls=SkyvernTyperGroup, help="Read, write, and clear web storage.", no_args_is_help=True)
+network_app = typer.Typer(cls=SkyvernTyperGroup, help="Network inspection and interception.", no_args_is_help=True)
 browser_app.add_typer(session_app, name="session")
 browser_app.add_typer(frame_app, name="frame")
 browser_app.add_typer(state_app, name="state")
