@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import textwrap
 from collections.abc import Iterator, Mapping
@@ -13,6 +14,7 @@ import yaml
 from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
 from skyvern.forge import app
+from skyvern.forge.sdk.api.llm.schema_validator import validate_schema
 from skyvern.forge.sdk.copilot.attribution import resolve_copilot_created_by_stamp
 from skyvern.forge.sdk.copilot.blocker_signal import clear_terminal_evidence_on_workflow_edit
 from skyvern.forge.sdk.copilot.code_block_preflight import sandbox_unresolved_name_diagnostics
@@ -114,6 +116,15 @@ class CodeArtifactClaimedOutcome(BaseModel):
             "`records[].number` or `records[].expiration_date`."
         ),
     )
+    extraction_schema: str | None = Field(
+        default=None,
+        description=(
+            "JSON Schema the user confirmed for this claim's extraction shape, serialized as a JSON "
+            'string (an object, or `{"type":"array","items":{...}}` for repeated records). Named '
+            "fields, types, and nesting the `goal_value_paths` index into; the block return is conformed "
+            "and validated against it. Same dialect as the legacy `data_schema` lever."
+        ),
+    )
     evidence_refs: list[str] = Field(default_factory=list)
     observation_refs: list[str] = Field(default_factory=list)
     required_tokens: list[str] = Field(default_factory=list)
@@ -165,6 +176,10 @@ class CodeArtifactTerminalVerifierExpectation(BaseModel):
     goal_value_paths: list[str] = Field(
         default_factory=list,
         description="Output JSON paths terminal verification should treat as goal-value evidence.",
+    )
+    extraction_schema: str | None = Field(
+        default=None,
+        description="JSON Schema (serialized JSON string) of the confirmed extraction shape terminal verification expects.",
     )
 
 
@@ -401,6 +416,9 @@ def _normalize_code_artifact_metadata_detailed(
         return_shape_error = _extraction_return_shape_error(label, dumped, block_code)
         if return_shape_error is not None:
             item_violations.append(return_shape_error)
+        schema_conformance_error = _extraction_schema_conformance_error(label, dumped, block_code)
+        if schema_conformance_error is not None:
+            item_violations.append(schema_conformance_error)
         download_shape_error = _download_return_shape_error(label, dumped, block_code)
         if download_shape_error is not None:
             item_violations.append(download_shape_error)
@@ -1556,6 +1574,133 @@ def _extraction_return_shape_error(label: str, artifact: Mapping[str, Any], code
             "Call that function and return its result (e.g. `return await run(page)`), or build the keyed "
             "structure at the top level so the declared goal values reach the block output."
         )
+    return None
+
+
+def _parse_extraction_schema(value: Any) -> dict[str, Any] | None:
+    """Coerce a declared `extraction_schema` to a JSON-Schema object dict, or None when
+    absent / disabled (`null`, empty) / still an unfilled `<fill...>` placeholder / not a
+    parseable object. Accepts a JSON string (the tool-facing form) or an already-decoded
+    dict (FE / direct callers)."""
+    if isinstance(value, dict):
+        return value or None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.casefold() in {"null", "none"} or text.casefold().startswith("<fill"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _artifact_extraction_schema_values(artifact: Mapping[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    for field_name in ("claimed_outcomes", "terminal_verifier_expectations"):
+        for row in _artifact_rows(artifact.get(field_name)):
+            schema = row.get("extraction_schema")
+            if schema is not None and not (isinstance(schema, str) and not schema.strip()):
+                values.append(schema)
+    return values
+
+
+def _schema_object_property_names(schema: Mapping[str, Any]) -> tuple[set[str], set[str]] | None:
+    """Property names and required names for the record-level object of a data schema.
+
+    Returns the (properties, required) name sets for an `object` schema, or for the
+    `items` object of an `array` schema (records-style). Returns None when the schema
+    declares no statically-readable record object, so reconciliation degrades to tolerant."""
+    schema_type = schema.get("type")
+    if schema_type == "array":
+        items = schema.get("items")
+        if isinstance(items, Mapping):
+            return _schema_object_property_names(items)
+        return None
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return None
+    property_names = {str(name) for name in properties}
+    required = schema.get("required")
+    required_names = {str(name) for name in required} if isinstance(required, list) else set()
+    return property_names, required_names & property_names
+
+
+def _top_level_return_dict_keys(code: str) -> set[str] | None:
+    """Top-level string keys of the snippet's returned dict literal (or the record
+    objects inside a returned list literal). Returns None when no top-level dict/list
+    literal return is statically determinable, so a dynamically-built return is never
+    false-rejected and falls through to the runtime validate/fill pass."""
+    try:
+        tree = ast.parse(textwrap.dedent(code).strip() or "pass")
+    except SyntaxError:
+        return None
+
+    return_values: list[ast.expr] = []
+    for node in _iter_top_level_scope(tree.body):
+        if isinstance(node, ast.Return) and node.value is not None:
+            return_values.append(node.value)
+    if not return_values:
+        return None
+
+    keys: set[str] = set()
+    for value in return_values:
+        unwrapped = value.value if isinstance(value, ast.Await) else value
+        if isinstance(unwrapped, ast.Dict):
+            keys |= _dict_keys(unwrapped)
+        elif isinstance(unwrapped, ast.List):
+            for element in unwrapped.elts:
+                if isinstance(element, ast.Dict):
+                    keys |= _dict_keys(element)
+                else:
+                    return None
+        else:
+            return None
+    return keys
+
+
+def _extraction_schema_conformance_error(label: str, artifact: Mapping[str, Any], code: str) -> str | None:
+    """Enforce the confirmed `extraction_schema` against the authored return shape. Runs
+    in addition to (never instead of) `_extraction_return_shape_error`. A declared-but-malformed
+    schema is rejected; a top-level return dict literal whose keys omit a required schema field is
+    rejected; a dynamically-built return cannot be statically reconciled and defers to the
+    runtime validate/fill pass."""
+    declared = _artifact_extraction_schema_values(artifact)
+    schemas: list[dict[str, Any]] = []
+    for value in declared:
+        # An unfilled `<fill...>` slot is a not-yet-confirmed schema, not a malformed one;
+        # leave it for the model to fill, the same way unfilled goal_value_paths are tolerated.
+        if isinstance(value, str) and _is_unfilled_artifact_placeholder(value.strip()):
+            continue
+        parsed = _parse_extraction_schema(value)
+        if parsed is None or not validate_schema(parsed):
+            return (
+                f"Code block `{label}` declares an `extraction_schema` that is not valid JSON Schema. "
+                "Provide a JSON Schema (a JSON object with named fields and types, serialized as a string), or "
+                "remove `extraction_schema` to fall back to `goal_value_paths` alone."
+            )
+        schemas.append(parsed)
+    if not schemas:
+        return None
+    if _is_download_intent(artifact, code) or not code.strip():
+        return None
+    return_keys = _top_level_return_dict_keys(code)
+    if return_keys is None:
+        return None
+    for schema in schemas:
+        names = _schema_object_property_names(schema)
+        if names is None:
+            continue
+        _property_names, required_names = names
+        missing_required = sorted(required_names - return_keys)
+        if missing_required:
+            return (
+                f"Code block `{label}` `return`s a keyed structure missing required field(s) "
+                f"{', '.join(missing_required)} from the confirmed `extraction_schema`. Build the top-level "
+                "return so every required schema field is a named key (a dict for one record, or an array of "
+                "objects with those keys for repeated records)."
+            )
     return None
 
 
