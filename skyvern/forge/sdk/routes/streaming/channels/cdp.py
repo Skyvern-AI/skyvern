@@ -26,6 +26,7 @@ from skyvern.webeye.cdp_connection import (
     is_local_pbs_cdp_url,
     resolve_local_pbs_cdp_url,
 )
+from skyvern.webeye.main_world_eval import evaluate_in_main_world
 
 if t.TYPE_CHECKING:
     from skyvern.forge.sdk.routes.streaming.channels.vnc import VncChannel
@@ -185,7 +186,7 @@ class CdpChannel:
         LOG.info(f"{self.class_name} evaluating js", expression=expression[:100], **self.identity)
 
         try:
-            result = await self.page.evaluate(expression, arg)
+            result = await evaluate_in_main_world(self.page, expression, arg)
             LOG.info(f"{self.class_name} evaluated js successfully", **self.identity)
             return result
         except Exception:
